@@ -1,0 +1,126 @@
+import { test, expect } from '@playwright/test';
+import { execSync } from 'child_process';
+import {
+  navigateToApp, sendMessage, sendFollowUp, uniqueMessage,
+  assertHealthy, switchToClaudeMode, newThread,
+  waitForActionPanel, waitForCCToFinish, waitForCCToStart,
+  countVisibleResponses,
+} from './helpers';
+
+/**
+ * Reproduces the "stuck request after CC process exit" bug:
+ *
+ * 1. Start CC session → wait for idle (Done)
+ * 2. Kill the CC child process (simulates natural process exit after timeout)
+ * 3. Send follow-up message
+ * 4. Verify the follow-up gets an actual response (not silently dropped)
+ *
+ * Bug: when the CC process dies while idle and the user sends a follow-up,
+ * spawn_or_resume resumes with the stale session ID. The CC binary starts,
+ * emits Init + empty Result, then exits immediately. The engine treats the
+ * empty Result as a valid (empty) response — the user's message is silently
+ * dropped with no status label or error.
+ */
+test.describe('CC resume after process exit', () => {
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+  });
+
+  test('follow-up after CC process dies produces a non-empty response', async ({ page }) => {
+    await navigateToApp(page);
+    await newThread(page);
+    await switchToClaudeMode(page);
+
+    // Step 1: Send initial CC message and wait for idle
+    const msg1 = uniqueMessage('cc-resume-exit-1');
+    await sendMessage(page, `Say exactly: "first ${msg1}" and nothing else. Do not create any files.`);
+    await waitForActionPanel(page, 'Done', 120_000);
+
+    // Verify first response has content
+    const firstResponseCount = await countVisibleResponses(page);
+    expect(firstResponseCount).toBeGreaterThanOrEqual(1);
+
+    // Step 2: Find and kill the CC child process for this thread.
+    // The thread ID is in the URL or we can find it via DB.
+    // Kill all idle claude processes — in e2e there should only be ours.
+    try {
+      // Kill claude processes that are children of the engine (not the engine itself).
+      // The CC binary runs as a child process; killing it simulates natural timeout exit.
+      execSync(
+        `pgrep -f 'claude.*--resume\\|claude.*mcp' | xargs kill 2>/dev/null || true`,
+        { encoding: 'utf-8', timeout: 5_000 },
+      );
+    } catch {
+      // Process may already be gone — that's fine
+    }
+
+    // Give the engine a moment to notice the process exit
+    await page.waitForTimeout(2_000);
+
+    // Step 3: Send follow-up — this should trigger a fresh CC session, not a stale resume
+    const msg2 = uniqueMessage('cc-resume-exit-2');
+    await sendFollowUp(page, `Say exactly: "second ${msg2}" and nothing else. Do not create any files.`);
+
+    // Step 4: Verify the follow-up is processed
+    // The exchange should show "Requesting..." then "Working on it..." status labels
+    // (Bug: no status label was shown — request was silently dropped)
+    await waitForCCToStart(page, 120_000);
+
+    await waitForCCToFinish(page, 120_000);
+
+    // Verify the follow-up message produced an actual response (not empty)
+    const responseCount = await countVisibleResponses(page);
+    expect(responseCount).toBeGreaterThanOrEqual(2);
+
+    // Verify the second response contains our marker
+    const found = await page.evaluate((marker) => {
+      const els = document.querySelectorAll('.response-content');
+      return Array.from(els).some(el => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').includes(marker);
+      });
+    }, msg2);
+    expect(found).toBe(true);
+  });
+
+  test('status label shows Requesting during CC follow-up', async ({ page }) => {
+    await navigateToApp(page);
+    await newThread(page);
+    await switchToClaudeMode(page);
+
+    const msg1 = uniqueMessage('cc-status-label-1');
+    await sendMessage(page, `Say exactly: "first ${msg1}" and nothing else. Do not create any files.`);
+    await waitForActionPanel(page, 'Done', 120_000);
+
+    // Kill CC process to simulate natural exit
+    try {
+      execSync(
+        `pgrep -f 'claude.*--resume\\|claude.*mcp' | xargs kill 2>/dev/null || true`,
+        { encoding: 'utf-8', timeout: 5_000 },
+      );
+    } catch {
+      // Process may already be gone
+    }
+    await page.waitForTimeout(2_000);
+
+    // Send follow-up and immediately check for status label
+    const msg2 = uniqueMessage('cc-status-label-2');
+    await sendFollowUp(page, `Say exactly: "second ${msg2}" and nothing else. Do not create any files.`);
+
+    // The exchange should show a "Requesting" or "Working" status label
+    // Bug: no status label was shown at all
+    const hasStatusLabel = await page.waitForFunction(() => {
+      const labels = document.querySelectorAll('.exchange-status-label');
+      return Array.from(labels).some(el => {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return false;
+        const text = el.textContent ?? '';
+        return text.includes('Requesting') || text.includes('Working');
+      });
+    }, undefined, { timeout: 30_000 }).then(() => true).catch(() => false);
+
+    expect(hasStatusLabel).toBe(true);
+
+    await waitForCCToFinish(page, 120_000);
+  });
+});

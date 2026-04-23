@@ -1,0 +1,176 @@
+import {
+  repoFiles, repoDiff, repoViewMode, repoExpandedFolders,
+  repoSource, repoPending, panelOverlay, selectedLines, encodeRepoPath,
+  repoSelectedChangeId,
+} from '../../store/store';
+import type { DiffFile } from '../../store/store';
+import {
+  toggleRepoFolder, expandAllRepoFolders, collapseAllRepoFolders,
+} from '../../store/actions/repositories';
+import { buildFolderTree } from '../../store/actions/artifacts';
+import type { FolderNode } from '../../store/actions/artifacts';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { loadedOr } from '../../store/types';
+import { getEmojiForFile } from '../../utils/fileIcons';
+import { pushNavState } from '../../store/actions/navigation';
+import { TreeNode } from './FolderTree';
+import { changeBadgeLabel } from './changeBadge';
+import { diffStats } from './diffStats';
+import { DiffStatsInline } from './DiffView';
+
+export function RepoFilesView() {
+  const loadable = repoFiles.value;
+  const showLoading = useDelayedLoading(loadable);
+  const diffLoadable = repoDiff.value;
+  const pending = repoPending.value;
+  const mode = repoViewMode.value;
+
+  if (loadable.status === 'failed') {
+    return (
+      <div class="files-toolbar">
+        <span class="files-hint error-text">Failed to load: {loadable.error}</span>
+      </div>
+    );
+  }
+
+  if (loadable.status !== 'loaded') {
+    if (!showLoading) return null;
+    return <div class="loading-spinner" />;
+  }
+
+  if (diffLoadable.status === 'failed') {
+    return (
+      <div class="files-toolbar">
+        <span class="files-hint error-text">Failed to load diff: {diffLoadable.error}</span>
+      </div>
+    );
+  }
+
+  const diffLoaded = diffLoadable.status === 'loaded';
+  const changedFiles = diffLoaded ? diffLoadable.data.files : [];
+  const changedMap = new Map(changedFiles.map(f => [f.path, f]));
+
+  return (
+    <>
+      <div class="files-toolbar files-toolbar-bordered">
+        <span class="files-toolbar-actions">
+          {(pending || repoSelectedChangeId.value) && (
+            <span class="repo-view-toggle">
+              <button
+                class={`files-toolbar-btn ${mode === 'all' ? 'active' : ''}`}
+                onClick={() => { repoViewMode.value = 'all'; }}
+              >
+                All Files
+              </button>
+              <button
+                class={`files-toolbar-btn ${mode === 'changes' ? 'active' : ''}`}
+                onClick={() => { repoViewMode.value = 'changes'; }}
+              >
+                Changes {diffLoaded ? `(${changedFiles.length})` : '…'}
+              </button>
+            </span>
+          )}
+          {mode === 'all' && (
+            <>
+              <button class="files-toolbar-btn" onClick={expandAllRepoFolders} data-tooltip="Expand all folders">Expand All</button>
+              <button class="files-toolbar-btn" onClick={collapseAllRepoFolders} data-tooltip="Collapse all folders">Collapse All</button>
+            </>
+          )}
+        </span>
+      </div>
+      <div class="artifacts-desktop">
+        {mode === 'changes' ? (
+          <ChangesFileList files={changedFiles} />
+        ) : (
+          <RepoFolderTree changedMap={changedMap} />
+        )}
+      </div>
+    </>
+  );
+}
+
+function ChangesFileList({ files }: { files: DiffFile[] }) {
+  let totalAdd = 0;
+  let totalDel = 0;
+  const fileStats = files.map(f => {
+    const s = diffStats(f);
+    totalAdd += s.additions;
+    totalDel += s.deletions;
+    return s;
+  });
+
+  return (
+    <div class="folder-tree">
+      {files.length > 0 && (
+        <div class="diff-stats-total">
+          <DiffStatsInline additions={totalAdd} deletions={totalDel} />
+        </div>
+      )}
+      {files.map((f, i) => (
+        <div
+          key={f.path}
+          class="file-item repo-changed-file"
+          onClick={() => openRepoFilePreview(f.path, true)}
+        >
+          <span class="file-icon">{getEmojiForFile(f.path)}</span>
+          <span class="file-name">{f.path}</span>
+          <DiffStatsInline additions={fileStats[i].additions} deletions={fileStats[i].deletions} />
+          <span class={`change-badge change-badge-${f.status}`}>
+            {changeBadgeLabel(f.status)}
+          </span>
+        </div>
+      ))}
+      {files.length === 0 && (
+        <div class="empty-state">No changes</div>
+      )}
+    </div>
+  );
+}
+
+function folderHasChanges(n: FolderNode, changedMap: Map<string, DiffFile>): boolean {
+  for (const f of n.files) {
+    if (changedMap.has(f.path)) return true;
+  }
+  for (const child of Object.values(n.children)) {
+    if (folderHasChanges(child, changedMap)) return true;
+  }
+  return false;
+}
+
+function RepoFolderTree({ changedMap }: { changedMap: Map<string, DiffFile> }) {
+  const paths = loadedOr(repoFiles.value, []);
+  const tree = buildFolderTree(paths);
+
+  return (
+    <div class="folder-tree">
+      <TreeNode
+        node={tree}
+        indent={0}
+        isExpanded={(path) => repoExpandedFolders.value.has(path)}
+        onToggle={toggleRepoFolder}
+        onFileClick={(path) => openRepoFilePreview(path, !!changedMap.get(path))}
+        folderExtra={(folder) =>
+          folderHasChanges(folder, changedMap) ? <span class="folder-change-dot" /> : null
+        }
+        fileExtra={(file) => {
+          const info = changedMap.get(file.path);
+          return info ? (
+            <span class={`change-badge change-badge-${info.status}`}>
+              {changeBadgeLabel(info.status)}
+            </span>
+          ) : null;
+        }}
+        fileClass={(file) => changedMap.has(file.path) ? 'repo-changed-file' : ''}
+      />
+    </div>
+  );
+}
+
+function openRepoFilePreview(path: string, isDiff: boolean) {
+  selectedLines.value = null;
+  panelOverlay.value = {
+    type: 'file-preview',
+    path: encodeRepoPath(repoSource.value!, isDiff ? 'diff' : 'file', path),
+  };
+  pushNavState();
+}

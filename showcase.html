@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CognOS Component Showcase</title>
+
+<!-- Import actual project CSS files — changes on any branch are reflected immediately -->
+<link rel="stylesheet" href="crates/cognos-app/src/styles/global.css">
+<link rel="stylesheet" href="crates/cognos-app/src/styles/components.css">
+<link rel="stylesheet" href="crates/cognos-app/src/styles/chat.css">
+<link rel="stylesheet" href="crates/cognos-app/src/styles/panels.css">
+<link rel="stylesheet" href="crates/cognos-app/src/styles/header.css">
+<link rel="stylesheet" href="crates/cognos-app/src/styles/steps.css">
+<link rel="stylesheet" href="crates/cognos-app/src/styles/settings.css">
+<link rel="stylesheet" href="crates/cognos-app/src/styles/skills.css">
+<link rel="stylesheet" href="crates/cognos-app/src/styles/drawer.css">
+<link rel="stylesheet" href="crates/cognos-app/src/styles/pages.css">
+
+<style>
+  /* ========================================
+     SHOWCASE-ONLY LAYOUT (not from project)
+     ======================================== */
+  /* Override app-shell layout since we're not inside the app */
+  body {
+    overflow: auto !important;
+    min-height: auto !important;
+  }
+
+  .showcase {
+    max-width: 72rem;
+    margin: 0 auto;
+    padding: 2rem;
+  }
+
+  .showcase-header {
+    margin-bottom: 3rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  .showcase-title {
+    font-size: 1.5rem;
+    font-weight: 600;
+    margin: 0 0 0.5rem;
+  }
+
+  .showcase-subtitle {
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    line-height: 1.6;
+  }
+
+  .section {
+    margin-bottom: 3rem;
+  }
+
+  .section-title {
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-muted);
+    margin-bottom: 0.25rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  .section-desc {
+    font-size: 0.625rem;
+    color: color-mix(in srgb, var(--text-secondary) 70%, transparent);
+    margin-bottom: 1rem;
+    max-width: 40rem;
+    line-height: 1.5;
+    padding-top: 0.5rem;
+  }
+
+  .showcase-row {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .showcase-row + .showcase-row { margin-top: 0.75rem; }
+
+  .sub-label {
+    font-size: 0.5625rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    width: 100%;
+    margin-top: 0.75rem;
+    margin-bottom: 0.125rem;
+  }
+
+  .sub-label:first-child { margin-top: 0; }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+  }
+
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 1rem;
+  }
+
+  @media (max-width: 768px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+
+  .demo-box {
+    padding: 1rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    background: var(--bg-secondary);
+  }
+
+  .demo-box-title {
+    font-size: 0.625rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 0.75rem;
+  }
+
+  /* Toast demos — static versions (no animation/position) */
+  .toast-demo {
+    background: var(--bg-secondary);
+    border: 0.125rem solid var(--border-color);
+    border-radius: 0.375rem;
+    padding: 0 0.875rem;
+    min-height: 2.5rem;
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    max-width: 30rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .toast-demo svg { flex-shrink: 0; width: 1.125rem; height: 1.125rem; }
+
+  /* Notification demos — static (not inside panel) */
+  .notification-item-demo {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border-color);
+    opacity: 0.5;
+    transition: background-color 0.2s;
+  }
+  .notification-item-demo:hover { background: var(--bg-hover); opacity: 0.8; }
+  .notification-item-demo.unread {
+    opacity: 1;
+    background: rgba(88, 166, 255, 0.05);
+    border-left: 0.1875rem solid var(--accent);
+  }
+
+  /* Pane header demo — not absolute positioned */
+  .pane-header-demo {
+    display: flex;
+    align-items: center;
+    gap: 0.125rem;
+    padding: 0 0.625rem;
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-secondary);
+    height: 2.5rem;
+  }
+
+  /* Change banner demo — static version */
+  .change-banner-demo {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    background: var(--bg-secondary);
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.5rem;
+  }
+  .change-banner-demo .change-banner-icon { flex-shrink: 0; }
+
+  /* Prompt input demo — not inside the app layout */
+  .prompt-input-demo {
+    width: 100%;
+    padding: 0.75rem 1.6rem 0.75rem 1rem;
+    font-size: 0.875rem;
+    font-family: var(--font-mono);
+    background: var(--bg-secondary);
+    border: 0.125rem solid var(--border-color);
+    border-radius: 1rem;
+    color: var(--text-primary);
+    outline: none;
+    resize: none;
+    min-height: 2.75rem;
+    line-height: 1.4;
+  }
+  .prompt-input-demo::placeholder { color: var(--text-muted); }
+  .prompt-input-demo:focus { border-color: var(--accent); }
+
+  /* Label color variants (project .label only has blue) */
+  .label-green {
+    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
+    color: var(--accent-green);
+  }
+  .label-yellow {
+    background: color-mix(in srgb, var(--accent-yellow) 15%, transparent);
+    color: var(--accent-yellow);
+  }
+  .label-red {
+    background: color-mix(in srgb, var(--accent-red) 15%, transparent);
+    color: var(--accent-red);
+  }
+
+  /* Exchange status demo — inline display */
+  .exchange-status-demo {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+  }
+
+  /* Dropdown menu demo — static (not absolute positioned) */
+  .dropdown-menu-demo {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    margin-top: 0.25rem;
+    min-width: 10rem;
+  }
+
+  /* Confirm dialog demo — static (not in overlay) */
+  .confirm-dialog-demo {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    padding: 1.25rem 1.5rem;
+    max-width: 27.5rem;
+  }
+
+  svg { vertical-align: middle; }
+</style>
+</head>
+<body>
+
+<div class="showcase">
+  <div class="showcase-header">
+    <h1 class="showcase-title">CognOS Component Showcase</h1>
+    <p class="showcase-subtitle">
+      All UI components rendered with actual CSS from the project.
+      Edit styles in the source CSS files and reload this page to see changes instantly.
+      Open with: file:///path/to/repo/showcase.html
+    </p>
+  </div>
+
+  <!-- ========================================
+       COLORS & TOKENS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Design Tokens: Colors</div>
+    <div class="showcase-row" style="gap: 1.5rem; margin-top: 0.75rem;">
+      <div style="display:flex; align-items:center; gap:0.5rem;">
+        <div style="width:2rem; height:2rem; border-radius:0.25rem; background:var(--bg-primary); border:1px solid var(--border-color);"></div>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">bg-primary</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:0.5rem;">
+        <div style="width:2rem; height:2rem; border-radius:0.25rem; background:var(--bg-secondary);"></div>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">bg-secondary</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:0.5rem;">
+        <div style="width:2rem; height:2rem; border-radius:0.25rem; background:var(--bg-tertiary);"></div>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">bg-tertiary</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:0.5rem;">
+        <div style="width:2rem; height:2rem; border-radius:0.25rem; background:var(--bg-quaternary);"></div>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">bg-quaternary</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:0.5rem;">
+        <div style="width:2rem; height:2rem; border-radius:0.25rem; background:var(--border-color);"></div>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">border-color</span>
+      </div>
+    </div>
+    <div class="showcase-row" style="gap: 1.5rem; margin-top: 0.75rem;">
+      <div style="display:flex; align-items:center; gap:0.5rem;">
+        <div style="width:2rem; height:2rem; border-radius:0.25rem; background:var(--accent);"></div>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">accent (blue)</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:0.5rem;">
+        <div style="width:2rem; height:2rem; border-radius:0.25rem; background:var(--accent-green);"></div>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">accent-green</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:0.5rem;">
+        <div style="width:2rem; height:2rem; border-radius:0.25rem; background:var(--accent-yellow);"></div>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">accent-yellow</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:0.5rem;">
+        <div style="width:2rem; height:2rem; border-radius:0.25rem; background:var(--accent-red);"></div>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">accent-red</span>
+      </div>
+    </div>
+    <div class="showcase-row" style="gap: 1.5rem; margin-top: 0.75rem;">
+      <span style="font-size:0.8125rem; color:var(--text-primary);">text-primary</span>
+      <span style="font-size:0.8125rem; color:var(--text-secondary);">text-secondary</span>
+      <span style="font-size:0.8125rem; color:var(--text-muted);">text-muted</span>
+    </div>
+  </div>
+
+  <!-- ========================================
+       ACTION BUTTONS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Action Buttons (.action-btn)</div>
+    <div class="section-desc">Ghost buttons: transparent bg, colored border, muted text. Three variants: default (blue), confirm (green), danger (red).</div>
+
+    <div class="sub-label">Default</div>
+    <div class="showcase-row">
+      <button class="action-btn">Edit</button>
+      <button class="action-btn">Open</button>
+      <button class="action-btn">Restart</button>
+      <button class="action-btn" disabled>Disabled</button>
+    </div>
+
+    <div class="sub-label">Confirm</div>
+    <div class="showcase-row">
+      <button class="action-btn action-btn-confirm">Apply</button>
+      <button class="action-btn action-btn-confirm">Accept</button>
+      <button class="action-btn action-btn-confirm">Confirm</button>
+    </div>
+
+    <div class="sub-label">Danger</div>
+    <div class="showcase-row">
+      <button class="action-btn action-btn-danger">Delete</button>
+      <button class="action-btn action-btn-danger">Discard</button>
+      <button class="action-btn action-btn-danger">Remove</button>
+    </div>
+  </div>
+
+  <!-- ========================================
+       ICON BUTTONS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Icon Buttons (.icon-btn)</div>
+    <div class="section-desc">Transparent background, icon-only. .header-icon variant for header-level buttons (2.25rem tap target).</div>
+    <div class="showcase-row">
+      <button class="icon-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.32 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+      <button class="icon-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+      </button>
+      <button class="icon-btn pinned">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+      </button>
+      <button class="icon-btn" disabled>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+      </button>
+
+      <span style="color:var(--text-muted); font-size:0.625rem; margin-left:0.5rem;">|</span>
+
+      <button class="icon-btn header-icon">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+      </button>
+      <button class="icon-btn header-icon">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- ========================================
+       OTHER BUTTONS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Other Button Types</div>
+    <div class="grid-3">
+      <div class="demo-box">
+        <div class="demo-box-title">Settings Options</div>
+        <div class="showcase-row">
+          <button class="settings-option active">Small</button>
+          <button class="settings-option">Medium</button>
+          <button class="settings-option">Large</button>
+        </div>
+      </div>
+      <div class="demo-box">
+        <div class="demo-box-title">Confirm Dialog Buttons</div>
+        <div class="showcase-row">
+          <button class="confirm-btn confirm-btn-cancel">Cancel</button>
+          <button class="confirm-btn confirm-btn-ok">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       LABELS & BADGES
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Labels & Badges</div>
+    <div class="showcase-row">
+      <span class="label">Default</span>
+      <span class="label label-green">Active</span>
+      <span class="label label-yellow">Warning</span>
+      <span class="label label-red">Error</span>
+      <span style="margin-left:0.5rem;"></span>
+      <span class="badge">3</span>
+      <span class="badge">12</span>
+      <span style="margin-left:0.5rem;"></span>
+      <span class="url-context-pill">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+        https://example.com/article
+      </span>
+    </div>
+  </div>
+
+  <!-- ========================================
+       SEGMENTED CONTROLS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Segmented Controls</div>
+    <div class="showcase-row">
+      <div class="segmented-control">
+        <button class="segmented-btn active">All</button>
+        <button class="segmented-btn">Unread</button>
+      </div>
+      <span style="margin-left:1rem;"></span>
+      <div class="segmented-control">
+        <button class="segmented-btn">Chat</button>
+        <button class="segmented-btn active">Edit</button>
+        <button class="segmented-btn">Code</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       TOGGLE SWITCH
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Toggle Switch</div>
+    <div class="showcase-row" style="gap:1.5rem;">
+      <label class="toggle-switch">
+        <input type="checkbox">
+        <span class="toggle-slider"></span>
+      </label>
+      <label class="toggle-switch">
+        <input type="checkbox" checked>
+        <span class="toggle-slider"></span>
+      </label>
+      <span style="font-size:0.6875rem; color:var(--text-secondary);">Push notifications</span>
+    </div>
+  </div>
+
+  <!-- ========================================
+       DROPDOWN
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Dropdown</div>
+    <div class="grid-2">
+      <div class="demo-box">
+        <div class="demo-box-title">Trigger (closed)</div>
+        <button class="dropdown-trigger">claude-opus-4-6 <span style="font-size:0.5625rem; color:var(--text-muted);">&#9662;</span></button>
+      </div>
+      <div class="demo-box">
+        <div class="demo-box-title">Menu (open)</div>
+        <div class="dropdown-menu-demo">
+          <div class="dropdown-option active">claude-opus-4-6</div>
+          <div class="dropdown-option">claude-sonnet-4-6</div>
+          <div class="dropdown-option">gemini-2.5-pro</div>
+          <div class="dropdown-option">gpt-5.4</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       PROMPT INPUT
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Prompt Input</div>
+    <textarea class="prompt-input-demo" placeholder="Ask CognOS anything..." rows="1"></textarea>
+  </div>
+
+  <!-- ========================================
+       TOASTS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Toast Notifications</div>
+    <div style="display:flex; flex-direction:column; gap:0.5rem;">
+      <div class="toast-demo toast-success">
+        <svg class="toast-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 12l2.5 2.5L16 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Changes applied successfully</span>
+      </div>
+      <div class="toast-demo toast-info">
+        <svg class="toast-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><line x1="12" y1="16" x2="12" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="8" r="1" fill="currentColor"/></svg>
+        <span>Session resumed from previous state</span>
+      </div>
+      <div class="toast-demo toast-warning">
+        <svg class="toast-icon" viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><line x1="12" y1="14" x2="12" y2="10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="17" r="1" fill="currentColor"/></svg>
+        <span>Connection interrupted, reconnecting...</span>
+      </div>
+      <div class="toast-demo toast-error">
+        <svg class="toast-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><line x1="15" y1="9" x2="9" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="9" y1="9" x2="15" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        <span>Failed to apply changes: merge conflict</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       CONFIRM DIALOG
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Confirm Dialog</div>
+    <div class="confirm-dialog-demo">
+      <div class="confirm-message">Are you sure you want to discard these changes? This action cannot be undone.</div>
+      <div class="confirm-actions">
+        <button class="confirm-btn confirm-btn-cancel">Cancel</button>
+        <button class="confirm-btn confirm-btn-ok">Discard</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       LIST ROWS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">List Rows</div>
+    <div class="section-desc">Used by credentials, scheduled tasks, MCP servers, memory entries, and all other list views.</div>
+    <div style="border: 1px solid var(--border-color); border-radius: 0.375rem; overflow:hidden;">
+      <div class="list-rows">
+        <div class="list-row-add-card">
+          <span class="list-row-add-icon">+</span>
+          <span class="list-row-add-label">Add new credential</span>
+        </div>
+        <div class="list-section-title">Active</div>
+        <div class="list-row">
+          <div class="list-row-info">
+            <div class="list-row-name" style="font-weight:500;">Google OAuth</div>
+            <div class="list-row-details">
+              <span class="list-row-type">OAuth</span>
+              <span>google.com</span>
+            </div>
+          </div>
+          <div class="list-row-actions">
+            <button class="action-btn">Edit</button>
+            <button class="action-btn action-btn-danger">Delete</button>
+          </div>
+        </div>
+        <div class="list-row">
+          <div class="list-row-info">
+            <div class="list-row-name" style="font-weight:500;">OpenAI API Key</div>
+            <div class="list-row-details">
+              <span class="list-row-type">API Key</span>
+              <span>sk-...4f2a</span>
+            </div>
+          </div>
+          <div class="list-row-actions">
+            <button class="action-btn">Edit</button>
+            <button class="action-btn action-btn-danger">Delete</button>
+          </div>
+        </div>
+        <div class="list-section-title">Scheduled Tasks</div>
+        <div class="list-row">
+          <div class="list-row-info">
+            <div class="list-row-name" style="font-weight:500;">Daily standup summary</div>
+            <div class="list-row-label">Every day at 8:00 AM</div>
+            <div class="list-row-date">Last run: 2 hours ago</div>
+          </div>
+          <div class="list-row-actions">
+            <button class="action-btn">Edit</button>
+            <button class="action-btn action-btn-danger">Delete</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       BANNER CARDS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Banner Cards</div>
+    <div class="section-desc">Used for lifecycle events in the thread stream: idle sessions, changes, session end markers.</div>
+    <div style="display:flex; flex-direction:column; gap:0.5rem;">
+      <div class="banner-card">
+        <span style="display:flex; align-items:center; gap:0.375rem;">
+          <span style="color:var(--accent-yellow);">&#9679;</span>
+          <span>Claude Code is waiting for input</span>
+        </span>
+        <div style="display:flex; gap:0.5rem;">
+          <button class="action-btn">Follow up</button>
+          <button class="action-btn action-btn-danger">End session</button>
+        </div>
+      </div>
+      <div class="change-banner-demo">
+        <span class="change-banner-icon" style="color:var(--accent-green);">&#10003;</span>
+        <span style="font-weight:500;">Applied</span>
+        <span style="color:var(--text-muted);">&mdash;</span>
+        <span>Fix auth timeout in OAuth flow</span>
+        <span style="color:var(--text-muted); margin-left:auto;">3 files</span>
+      </div>
+      <div class="change-banner-demo" style="background:color-mix(in srgb, var(--accent-red) 12%, var(--bg-secondary)); border-color:color-mix(in srgb, var(--accent-red) 30%, var(--border-color));">
+        <span class="change-banner-icon" style="color:var(--accent-red);">&#10007;</span>
+        <span style="font-weight:500; color:var(--accent-red);">Failed</span>
+        <span style="color:var(--text-muted);">&mdash;</span>
+        <span>Merge conflict in engine.rs</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       CHAT MESSAGES
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Chat Messages</div>
+    <div style="max-width:40rem;">
+      <div class="user-message">Can you add a dark mode toggle to the settings panel?</div>
+      <div class="response-content" style="margin-top:0.75rem;">
+        <p>I'll add a dark mode toggle to the settings. The implementation needs two parts:</p>
+        <p><strong>1. CSS variable switching</strong> &mdash; We'll use a <code>data-theme</code> attribute on the root element.</p>
+        <p><strong>2. Settings UI</strong> &mdash; A toggle switch in the Appearance section that persists the preference.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       EXCHANGE STATES
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Exchange Status Indicators</div>
+    <div class="showcase-row" style="gap:2rem;">
+      <div class="exchange-status-demo">
+        <span class="typing-dots"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span>
+        <span>Requesting</span>
+      </div>
+      <div class="exchange-status-demo">
+        <span class="progress-dot progress-dot-loading"></span>
+        <span>Working</span>
+      </div>
+      <div class="exchange-status-demo">
+        <span style="color:var(--accent-green); font-weight:bold;">&#10003;</span>
+        <span>Complete</span>
+      </div>
+      <div class="exchange-status-demo">
+        <span style="color:var(--accent-red); font-weight:bold;">&#10007;</span>
+        <span>Error</span>
+      </div>
+    </div>
+
+    <div class="sub-label" style="margin-top:1rem;">Status dots</div>
+    <div class="showcase-row" style="gap:1.5rem;">
+      <div style="display:flex; align-items:center; gap:0.375rem;">
+        <span class="status-dot connected"></span>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">Connected</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:0.375rem;">
+        <span class="status-dot disconnected"></span>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">Disconnected</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:0.375rem;">
+        <span class="connection-status-inline"><span class="status-dot"></span></span>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">Unknown</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:0.375rem;">
+        <span class="progress-dot progress-dot-red"></span>
+        <span style="font-size:0.6875rem; color:var(--text-secondary);">Error pulse</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       INLINE STEPS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Inline Steps (tool execution)</div>
+    <div style="max-width:40rem;">
+      <div class="inline-step success">
+        <span class="step-icon">&#10003;</span>
+        <span>read_file</span>
+        <span style="color:var(--text-muted); font-size:0.85em;">&mdash; src/engine.rs</span>
+      </div>
+      <div class="inline-step success">
+        <span class="step-icon">&#10003;</span>
+        <span>write_file</span>
+        <span style="color:var(--text-muted); font-size:0.85em;">&mdash; src/api.rs (42 lines)</span>
+      </div>
+      <div class="inline-step error">
+        <span class="step-icon">&#10007;</span>
+        <span>bash</span>
+        <span style="color:var(--text-muted); font-size:0.85em;">&mdash; cargo test (exit code 1)</span>
+      </div>
+      <div class="inline-step pending">
+        <span class="step-icon">&#9679;</span>
+        <span>Thinking...</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       NOTIFICATIONS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Notification Items</div>
+    <div style="border:1px solid var(--border-color); border-radius:0.375rem; overflow:hidden; max-width:24rem;">
+      <div class="notification-item-demo unread">
+        <div class="notification-title">Daily standup summary</div>
+        <div class="notification-summary">3 PRs merged, 2 reviews pending. Build pipeline green. Sprint velocity on track.</div>
+        <div class="notification-time">5 minutes ago</div>
+      </div>
+      <div class="notification-item-demo">
+        <div class="notification-title">Memory rebuild complete</div>
+        <div class="notification-summary">Indexed 847 entries across 12 topics.</div>
+        <div class="notification-time">2 hours ago</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       ERROR STATES
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Error & Empty States</div>
+    <div class="grid-2">
+      <div class="demo-box" style="padding:0;">
+        <div class="demo-box-title" style="padding:0.75rem 1rem 0;">Error</div>
+        <div style="padding:0.75rem 1rem;">
+          <div class="error">Failed to load credentials. Check your connection and try again.</div>
+        </div>
+      </div>
+      <div class="demo-box" style="padding:0;">
+        <div class="demo-box-title" style="padding:0.75rem 1rem 0;">Exchange Error</div>
+        <div style="padding:0.75rem 1rem;">
+          <div class="exchange-error">
+            <strong>Error</strong>
+            <p>Model rate limit exceeded. Please wait a moment before retrying.</p>
+            <button class="action-btn" style="margin-top:0.625rem;">Retry</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:1rem; border:1px solid var(--border-color); border-radius:0.375rem;">
+      <div class="empty-state">No scheduled tasks yet. Create one to get started.</div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       PROGRESS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Progress Bars</div>
+    <div style="max-width:24rem; display:flex; flex-direction:column; gap:1rem;">
+      <div>
+        <div class="progress-bar"><div class="progress-bar-fill" style="width:25%;"></div></div>
+        <span class="progress-label">25% &mdash; Indexing memory entries</span>
+      </div>
+      <div>
+        <div class="progress-bar"><div class="progress-bar-fill" style="width:73%;"></div></div>
+        <span class="progress-label">73% &mdash; Rebuilding vectors</span>
+      </div>
+      <div>
+        <div class="progress-bar"><div class="progress-bar-fill" style="width:100%;"></div></div>
+        <span class="progress-label">Complete</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       MEMORY STATS
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Memory Inspector Stats</div>
+    <div class="memory-stats-bar">
+      <div class="memory-stat">
+        <span class="memory-stat-value">847</span>
+        <span class="memory-stat-label">Entries</span>
+      </div>
+      <div class="memory-stat">
+        <span class="memory-stat-value">12</span>
+        <span class="memory-stat-label">Topics</span>
+      </div>
+      <div class="memory-importance-bar">
+        <div class="memory-importance-segment low" style="width:40%;"></div>
+        <div class="memory-importance-segment medium" style="width:30%;"></div>
+        <div class="memory-importance-segment high" style="width:20%;"></div>
+        <div class="memory-importance-segment critical" style="width:10%;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       PANE HEADER
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Pane Headers</div>
+    <div style="border:1px solid var(--border-color); border-radius:0.375rem; overflow:hidden;">
+      <div class="pane-header-demo">
+        <button class="icon-btn header-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        </button>
+        <span class="pane-header-title" style="font-size:0.875rem;">CognOS</span>
+        <span class="connection-status-inline"><span class="status-dot connected"></span></span>
+        <span class="pane-header-spacer"></span>
+        <button class="icon-btn header-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+        </button>
+        <button class="icon-btn header-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.32 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       FULL COMPOSITION: Changes pending
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Full Composition: Pending Changes Panel</div>
+    <div style="border:1px solid var(--border-color); border-radius:0.375rem; overflow:hidden; max-width:30rem;">
+      <div class="pane-header-demo">
+        <span class="pane-header-title">Changes</span>
+        <span class="pane-header-spacer"></span>
+        <span class="badge" style="position:static;">2</span>
+      </div>
+      <div style="padding:0.625rem 0.75rem; border-bottom:1px solid var(--border-color); display:flex; gap:0.5rem;">
+        <button class="action-btn action-btn-confirm">Apply All</button>
+        <button class="action-btn action-btn-danger">Discard All</button>
+      </div>
+      <div class="list-rows">
+        <div class="list-row">
+          <div class="list-row-info">
+            <div class="list-row-name" style="font-weight:500;">Fix authentication timeout</div>
+            <div class="list-row-label">claude-code/fix-auth-timeout</div>
+            <div class="list-row-date">3 files &middot; 2 min ago</div>
+          </div>
+          <div class="list-row-actions">
+            <button class="action-btn action-btn-confirm">Apply</button>
+            <button class="action-btn action-btn-danger">Discard</button>
+          </div>
+        </div>
+        <div class="list-row">
+          <div class="list-row-info">
+            <div class="list-row-name" style="font-weight:500;">Add dark mode toggle</div>
+            <div class="list-row-label">claude-code/dark-mode</div>
+            <div class="list-row-date">5 files &middot; 8 min ago</div>
+          </div>
+          <div class="list-row-actions">
+            <button class="action-btn action-btn-confirm">Apply</button>
+            <button class="action-btn action-btn-danger">Discard</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       FULL COMPOSITION: Thread stream
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Full Composition: Thread Stream</div>
+    <div style="max-width:40rem; padding:0.75rem; border:1px solid var(--border-color); border-radius:0.375rem; background:var(--bg-primary);">
+      <div class="user-message">Add a caching layer for the embedding provider</div>
+
+      <div style="margin:0.5rem 0;">
+        <div class="inline-step success">
+          <span class="step-icon">&#10003;</span>
+          <span>read_file</span>
+          <span style="color:var(--text-muted); font-size:0.85em;">&mdash; src/memory/embedding.rs</span>
+        </div>
+        <div class="inline-step success">
+          <span class="step-icon">&#10003;</span>
+          <span>write_file</span>
+          <span style="color:var(--text-muted); font-size:0.85em;">&mdash; src/memory/cache.rs (new, 89 lines)</span>
+        </div>
+      </div>
+
+      <div class="response-content">
+        <p>I've added an in-memory LRU cache for the embedding provider. Key changes:</p>
+        <p><strong>New file:</strong> <code>src/memory/cache.rs</code> &mdash; wraps <code>EmbeddingProvider</code> with a 1000-entry LRU cache using content hash keys.</p>
+        <p>Cache hits skip the embedding computation entirely, giving ~100x speedup for repeated content.</p>
+      </div>
+
+      <div style="margin:0.75rem 0 0.5rem;">
+        <div class="banner-card">
+          <span style="display:flex; align-items:center; gap:0.375rem;">
+            <span style="color:var(--accent-green);">&#10003;</span>
+            <span style="font-weight:500;">Applied</span>
+            <span style="color:var(--text-muted);">&mdash;</span>
+            <span>Add embedding cache layer</span>
+          </span>
+          <span style="color:var(--text-muted);">2 files</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================
+       TYPOGRAPHY
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Typography Scale</div>
+    <div style="display:flex; flex-direction:column; gap:0.5rem;">
+      <span style="font-size:1.125rem; font-weight:600;">h1 &mdash; 1.125rem / 600</span>
+      <span style="font-size:1rem; font-weight:600;">h2 &mdash; 1rem / 600</span>
+      <span style="font-size:0.875rem; font-weight:600;">h3 / brand &mdash; 0.875rem / 600</span>
+      <span style="font-size:0.875rem; font-weight:500;">Title (.title) &mdash; 0.875rem / 500</span>
+      <span style="font-size:0.875rem;">Body / prompt &mdash; 0.875rem / 400</span>
+      <span style="font-size:0.8125rem; color:var(--text-secondary);">Panel header &mdash; 0.8125rem / 600</span>
+      <span style="font-size:0.75rem; color:var(--text-secondary);">Response content &mdash; 0.75rem / 400</span>
+      <span style="font-size:0.6875rem; color:var(--text-secondary);">Button / dropdown &mdash; 0.6875rem / 400</span>
+      <span style="font-size:0.625rem; color:var(--text-muted);">Date / timestamp &mdash; 0.625rem / 400</span>
+      <span style="font-size:0.5625rem; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.03125rem;">Label &mdash; 0.5625rem / 400 uppercase</span>
+    </div>
+  </div>
+
+  <!-- ========================================
+       SPACING REFERENCE
+       ======================================== -->
+  <div class="section">
+    <div class="section-title">Spacing Scale (rem)</div>
+    <div style="display:flex; gap:0.5rem; align-items:flex-end; flex-wrap:wrap;">
+      <div style="display:flex; flex-direction:column; align-items:center; gap:0.25rem;">
+        <div style="width:0.125rem; height:0.125rem; background:var(--accent);"></div>
+        <span style="font-size:0.5625rem; color:var(--text-muted);">0.125</span>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:center; gap:0.25rem;">
+        <div style="width:0.25rem; height:0.25rem; background:var(--accent);"></div>
+        <span style="font-size:0.5625rem; color:var(--text-muted);">0.25</span>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:center; gap:0.25rem;">
+        <div style="width:0.375rem; height:0.375rem; background:var(--accent);"></div>
+        <span style="font-size:0.5625rem; color:var(--text-muted);">0.375</span>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:center; gap:0.25rem;">
+        <div style="width:0.5rem; height:0.5rem; background:var(--accent);"></div>
+        <span style="font-size:0.5625rem; color:var(--text-muted);">0.5</span>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:center; gap:0.25rem;">
+        <div style="width:0.625rem; height:0.625rem; background:var(--accent);"></div>
+        <span style="font-size:0.5625rem; color:var(--text-muted);">0.625</span>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:center; gap:0.25rem;">
+        <div style="width:0.75rem; height:0.75rem; background:var(--accent);"></div>
+        <span style="font-size:0.5625rem; color:var(--text-muted);">0.75</span>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:center; gap:0.25rem;">
+        <div style="width:1rem; height:1rem; background:var(--accent);"></div>
+        <span style="font-size:0.5625rem; color:var(--text-muted);">1.0</span>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:center; gap:0.25rem;">
+        <div style="width:1.25rem; height:1.25rem; background:var(--accent);"></div>
+        <span style="font-size:0.5625rem; color:var(--text-muted);">1.25</span>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:center; gap:0.25rem;">
+        <div style="width:1.5rem; height:1.5rem; background:var(--accent);"></div>
+        <span style="font-size:0.5625rem; color:var(--text-muted);">1.5</span>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:center; gap:0.25rem;">
+        <div style="width:2rem; height:2rem; background:var(--accent);"></div>
+        <span style="font-size:0.5625rem; color:var(--text-muted);">2.0</span>
+      </div>
+      <div style="display:flex; flex-direction:column; align-items:center; gap:0.25rem;">
+        <div style="width:2.5rem; height:2.5rem; background:var(--accent);"></div>
+        <span style="font-size:0.5625rem; color:var(--text-muted);">2.5</span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>

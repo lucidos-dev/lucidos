@@ -1,0 +1,263 @@
+/* ===== Triggers ===== */
+
+.trigger-row .list-row-name {
+    white-space: normal;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.trigger-disabled > .list-row-info {
+    opacity: 0.55;
+}
+
+.trigger-disabled > .list-row-actions > .action-btn:not(.trigger-toggle-btn) {
+    opacity: 0.55;
+}
+
+.trigger-cron-list {
+    list-style: none;
+    margin: 0.125rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.0625rem;
+}
+
+.trigger-cron-item {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    font-size: 0.6875rem;
+}
+
+.trigger-cron-desc {
+    color: var(--text-secondary);
+}
+
+.trigger-cron {
+    font-family: var(--font-ui);
+    font-size: 0.625rem;
+    color: var(--text-muted);
+}
+
+.trigger-enabled {
+    color: var(--accent);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: 0.6875rem;
+}
+
+.trigger-paused {
+    color: var(--text-muted);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: 0.6875rem;
+}
+
+.trigger-no-more-runs {
+    color: var(--text-muted);
+    font-weight: 500;
+    font-size: 0.6875rem;
+    font-style: italic;
+}
+
+.trigger-type-schedule,
+.trigger-type-event,
+.trigger-type-hybrid {
+    font-size: 0.625rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    padding: 0.0625rem 0.3125rem;
+    border-radius: 0.1875rem;
+}
+
+.trigger-type-schedule {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.trigger-type-event,
+.trigger-type-hybrid {
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+}
+
+.trigger-event-info {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    font-size: 0.6875rem;
+    margin-top: 0.125rem;
+}
+
+.trigger-event-type {
+    color: var(--accent);
+    font-weight: 500;
+}
+
+.trigger-condition {
+    font-family: var(--font-ui);
+    font-size: 0.625rem;
+    color: var(--text-muted);
+}
+
+.inline-form-body {
+    padding: 1rem;
+}
+
+.form-group textarea {
+    width: 100%;
+    padding: 0.625rem 0.75rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: 0.8125rem;
+    outline: none;
+    transition: border-color 0.2s;
+    resize: vertical;
+    min-height: 5rem;
+}
+
+.form-group textarea:focus {
+    border-color: var(--accent);
+}
+
+.form-group textarea::placeholder {
+    color: var(--text-muted);
+}
+
+.form-group .auto-textarea {
+    resize: none;
+    overflow: hidden;
+    min-height: 0;
+}
+
+.form-group .code-textarea {
+    min-height: 7.5rem;
+    max-height: 60vh;
+    overflow-y: auto;
+    resize: vertical;
+    white-space: pre;
+    tab-size: 2;
+    line-height: 1.4;
+}
+
+.form-hint {
+    font-size: 0.625rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+}
+
+/* Cron expression list in modal */
+.cron-list {
+    list-style: none;
+    margin: 0 0 0.375rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.cron-list-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.25rem 0.5rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+}
+
+.cron-list-item-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.0625rem;
+}
+
+.cron-description {
+    font-size: 0.75rem;
+    color: var(--text-primary);
+}
+
+.cron-expression {
+    font-family: var(--font-ui);
+    font-size: 0.625rem;
+    color: var(--text-muted);
+}
+
+.cron-input-row {
+    display: flex;
+    gap: 0.375rem;
+    align-items: center;
+}
+
+.cron-input-row input {
+    flex: 1;
+}
+
+.cron-input-row input.input-error {
+    border-color: var(--accent-red);
+}
+
+.form-error {
+    font-size: 0.625rem;
+    color: var(--accent-red);
+    margin-top: 0.25rem;
+}
+
+/* ===== Apps ===== */
+
+/* Clickable list rows (e.g. single-UI apps) */
+.list-row.clickable {
+    cursor: pointer;
+}
+
+
+/* App edit modal — UI component list */
+.app-edit-ui-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+.app-edit-ui-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.375rem 0.5rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+}
+
+.app-edit-ui-name {
+    font-size: 0.75rem;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+
+/* App UI component sub-list inside app rows */
+.app-ui-sub-list {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+    padding-top: 0.25rem;
+    border-top: 1px solid var(--border-color);
+    margin-top: 0.25rem;
+}
+
+.app-ui-sub-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.1875rem 0 0.1875rem 0.5rem;
+}
+
+.app-ui-sub-name {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}

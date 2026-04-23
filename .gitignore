@@ -1,0 +1,60 @@
+# Build artifacts
+/target/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+
+# Archives
+*.tgz
+
+# CognOS local data (workspaces are external)
+data/
+.cognos/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Embedding model cache
+.fastembed_cache/
+
+# Runtime files
+*.pid
+*.log
+.cognos-engine.pid
+.frontend.pid
+cognos-engine.log
+.cognos-workspace
+.docker-workspace
+
+# Workspaces
+workspaces/
+
+# Worktrees
+.worktrees/
+.claude/worktrees/
+
+# TLS certs (mkcert, machine-specific)
+.certs/
+
+# Node.js
+node_modules/
+dist/
+.env
+
+# Compiled JS next to TS sources (Vite serves .js over .ts, breaking the app)
+crates/cognos-app/src/**/*.js
+
+# Playwright test artifacts
+test-results/
+playwright-report/
+
+# Version files and stamps (build.rs manages these — gitignored so worktrees
+# don't create merge conflicts. Only exist in main working directory.)
+VERSION
+crates/*/VERSION
+crates/*/.version_stamp

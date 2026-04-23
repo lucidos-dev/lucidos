@@ -1,0 +1,783 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+const VECTOR_DIM: i32 = 384;
+
+/// Format a vector as a pgvector literal — `[1.0,2.0,...]`.
+/// pgvector accepts this string form via the `::vector` cast in queries.
+fn to_pgvector_literal(v: &[f32]) -> String {
+    format!(
+        "[{}]",
+        v.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum MemorySource {
+    #[serde(rename = "artifact")]
+    Artifact { path: String, commit: String },
+    #[serde(rename = "event")]
+    Event { id: Uuid },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEntry {
+    pub id: Uuid,
+    pub source: MemorySource,
+    pub topic: String,
+    pub summary: String,
+    pub importance: f32,
+    pub entities: Vec<String>,
+    /// Timestamp from the source event or artifact (when the content was originally created)
+    pub src_created_at: DateTime<Utc>,
+    /// Timestamp when this memory entry row was inserted/updated
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+pub struct SearchResult {
+    pub entries: Vec<MemoryEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimilarEntry {
+    pub id: Uuid,
+    pub topic: String,
+    pub importance: f32,
+    pub entities: Vec<String>,
+    pub similarity: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportanceDistribution {
+    pub low: i64,
+    pub medium: i64,
+    pub high: i64,
+    pub critical: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicCount {
+    pub topic: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryStats {
+    pub total: i64,
+    pub event_count: i64,
+    pub artifact_count: i64,
+    pub importance_distribution: ImportanceDistribution,
+    pub top_topics: Vec<TopicCount>,
+}
+
+/// PostgreSQL + pgvector backed memory index
+/// Stores embeddings and summaries directly in PostgreSQL
+#[derive(Clone)]
+pub struct PgVectorIndex {
+    pool: PgPool,
+}
+
+impl PgVectorIndex {
+    /// Create a new pgvector index, initializing the schema.
+    pub async fn new(pool: PgPool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let index = Self { pool };
+        index.init_schema().await?;
+        Ok(index)
+    }
+
+    /// Initialize the pgvector extension and create tables.
+    async fn init_schema(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Enable pgvector extension
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+            .execute(&self.pool)
+            .await?;
+
+        // Create memory entries table
+        sqlx::query(&format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS memory_entries (
+                id UUID PRIMARY KEY,
+                source JSONB NOT NULL,
+                topic TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                importance REAL NOT NULL,
+                entities JSONB NOT NULL DEFAULT '[]',
+                embedding vector({}) NOT NULL,
+                embedding_model TEXT NOT NULL,
+                src_created_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL
+            )
+            "#,
+            VECTOR_DIM
+        ))
+        .execute(&self.pool)
+        .await?;
+
+        // HNSW index with tuned build parameters for better recall.
+        // m=24 (default 16): more connections per node = better recall, slightly more storage.
+        // ef_construction=200 (default 64): more candidates during build = higher quality graph.
+        // Drop the old default-params index if it exists (one-time migration to tuned params).
+        sqlx::query("DROP INDEX IF EXISTS memory_entries_embedding_idx")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS memory_entries_embedding_hnsw_idx
+            ON memory_entries
+            USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 24, ef_construction = 200)
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Create B-tree index on topic for filtering
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS memory_entries_topic_idx
+            ON memory_entries (topic)
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS memory_entries_embedding_model_idx
+            ON memory_entries (embedding_model)
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Create B-tree index on importance for filtering
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS memory_entries_importance_idx
+            ON memory_entries (importance)
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Index on src_created_at for chronological queries (source time)
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS memory_entries_src_created_at_idx
+            ON memory_entries (src_created_at DESC)
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Partial expression index on source->>'id' for event-source rows.
+        // Used by search_threads_by_text's entity_matches CTE to look up the
+        // event row for each memory entry. Partial (WHERE source->>'type' =
+        // 'event') keeps the index small since artifact-source rows are never
+        // joined this way.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS memory_entries_source_event_id_idx
+            ON memory_entries ((source->>'id'))
+            WHERE source->>'type' = 'event'
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Trigram index on summary for fast ILIKE keyword search
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS memory_entries_summary_trgm_idx
+            ON memory_entries USING gin (summary gin_trgm_ops)
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn index_entry(
+        &self,
+        id: Uuid,
+        source: &MemorySource,
+        topic: &str,
+        summary: &str,
+        importance: f32,
+        entities: &[String],
+        embedding: &[f32],
+        embedding_model: &str,
+        src_created_at: DateTime<Utc>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let source_json = serde_json::to_value(source)?;
+        let entities_json = serde_json::to_value(entities)?;
+        let created_at = Utc::now();
+        let embedding_str = to_pgvector_literal(embedding);
+
+        // Upsert: insert or update on conflict
+        sqlx::query(
+            r#"
+            INSERT INTO memory_entries (id, source, topic, summary, importance, entities, embedding, embedding_model, src_created_at, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10)
+            ON CONFLICT (id) DO UPDATE SET
+                source = EXCLUDED.source,
+                topic = EXCLUDED.topic,
+                summary = EXCLUDED.summary,
+                importance = EXCLUDED.importance,
+                entities = EXCLUDED.entities,
+                embedding = EXCLUDED.embedding,
+                embedding_model = EXCLUDED.embedding_model,
+                src_created_at = EXCLUDED.src_created_at,
+                created_at = EXCLUDED.created_at
+            "#,
+        )
+        .bind(id)
+        .bind(&source_json)
+        .bind(topic)
+        .bind(summary)
+        .bind(importance)
+        .bind(&entities_json)
+        .bind(&embedding_str)
+        .bind(embedding_model)
+        .bind(src_created_at)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn update_embedding(
+        &self,
+        id: Uuid,
+        embedding: &[f32],
+        embedding_model: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let embedding_str = to_pgvector_literal(embedding);
+        sqlx::query(
+            "UPDATE memory_entries SET embedding = $1::vector, embedding_model = $2 WHERE id = $3",
+        )
+        .bind(&embedding_str)
+        .bind(embedding_model)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn count_stale_embeddings(
+        &self,
+        current_model: &str,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_entries WHERE embedding_model <> $1")
+                .bind(current_model)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count)
+    }
+
+    pub async fn fetch_stale_embedding_batch(
+        &self,
+        current_model: &str,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let rows = sqlx::query_as(
+            "SELECT id, summary FROM memory_entries WHERE embedding_model <> $1 LIMIT $2",
+        )
+        .bind(current_model)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Search for similar entries using cosine similarity, filtered by minimum importance
+    pub async fn search(
+        &self,
+        query_embedding: &[f32],
+        min_importance: f32,
+        limit: usize,
+    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+        let embedding_str = to_pgvector_literal(query_embedding);
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source, topic, summary, importance, entities, src_created_at, created_at
+            FROM memory_entries
+            WHERE importance >= $1
+            ORDER BY embedding <=> $2::vector
+            LIMIT $3
+            "#,
+        )
+        .bind(min_importance)
+        .bind(&embedding_str)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let entries = rows
+            .iter()
+            .map(|row| row_to_memory_entry(row))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(SearchResult { entries })
+    }
+
+    /// Search by embedding and return cosine similarity scores alongside entries.
+    /// Similarity is 1.0 - cosine_distance (1.0 = identical, 0.0 = orthogonal).
+    pub async fn search_with_scores(
+        &self,
+        query_embedding: &[f32],
+        min_importance: f32,
+        limit: usize,
+    ) -> Result<Vec<(MemoryEntry, f64)>, Box<dyn std::error::Error + Send + Sync>> {
+        let embedding_str = to_pgvector_literal(query_embedding);
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source, topic, summary, importance, entities, src_created_at, created_at,
+                   1.0 - (embedding <=> $2::vector) AS similarity
+            FROM memory_entries
+            WHERE importance >= $1
+            ORDER BY embedding <=> $2::vector
+            LIMIT $3
+            "#,
+        )
+        .bind(min_importance)
+        .bind(&embedding_str)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        use sqlx::Row;
+        let results = rows
+            .iter()
+            .map(|row| {
+                let entry = row_to_memory_entry(row)?;
+                let similarity: f64 = row.try_get("similarity")?;
+                Ok((entry, similarity))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
+
+        Ok(results)
+    }
+
+    /// Search by keyword — matches against entities JSONB array and summary text (ILIKE)
+    pub async fn search_by_keyword(
+        &self,
+        keyword: &str,
+        min_importance: f32,
+        limit: usize,
+    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+        let like_pattern = format!("%{}%", keyword);
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source, topic, summary, importance, entities, src_created_at, created_at
+            FROM memory_entries
+            WHERE importance >= $1
+              AND (
+                  summary ILIKE $2
+                  OR EXISTS (
+                      SELECT 1 FROM jsonb_array_elements_text(entities) AS e
+                      WHERE e ILIKE $2
+                  )
+              )
+            ORDER BY importance DESC, src_created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(min_importance)
+        .bind(&like_pattern)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let entries = rows
+            .iter()
+            .map(|row| row_to_memory_entry(row))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(SearchResult { entries })
+    }
+
+    /// Get entry count
+    pub async fn len(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_entries")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count.0 as usize)
+    }
+
+    /// Check if index is empty
+    pub async fn is_empty(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.len().await? == 0)
+    }
+
+    /// Get an entry by ID
+    pub async fn get(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<MemoryEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, source, topic, summary, importance, entities, src_created_at, created_at
+            FROM memory_entries
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(ref r) => Ok(Some(row_to_memory_entry(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete an entry
+    pub async fn delete(&self, id: Uuid) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let result = sqlx::query("DELETE FROM memory_entries WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Find entries similar to the given embedding above a similarity threshold.
+    /// Uses the existing HNSW index for fast approximate nearest-neighbor search.
+    pub async fn find_similar(
+        &self,
+        embedding: &[f32],
+        min_similarity: f32,
+        limit: usize,
+    ) -> Result<Vec<SimilarEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        use sqlx::Row;
+
+        let embedding_str = to_pgvector_literal(embedding);
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, topic, importance, entities, 1 - (embedding <=> $1::vector) AS similarity
+            FROM memory_entries
+            WHERE 1 - (embedding <=> $1::vector) > $2
+            ORDER BY similarity DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(&embedding_str)
+        .bind(min_similarity)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let entries = rows
+            .iter()
+            .map(|row| {
+                let entities_json: serde_json::Value = row.try_get("entities")?;
+                let entities: Vec<String> =
+                    serde_json::from_value(entities_json).unwrap_or_default();
+                Ok(SimilarEntry {
+                    id: row.try_get("id")?,
+                    topic: row.try_get("topic")?,
+                    importance: row.try_get("importance")?,
+                    entities,
+                    similarity: row.try_get("similarity")?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
+
+        Ok(entries)
+    }
+
+    /// Delete multiple entries by ID in a single query (for batch supersession).
+    pub async fn delete_many(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query("DELETE FROM memory_entries WHERE id = ANY($1)")
+            .bind(ids)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete all memory entries (for full rebuild from scratch)
+    pub async fn clear(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let result = sqlx::query("DELETE FROM memory_entries")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    /// Get all entries (for debugging/export)
+    pub async fn all_entries(
+        &self,
+    ) -> Result<Vec<MemoryEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source, topic, summary, importance, entities, src_created_at, created_at
+            FROM memory_entries
+            ORDER BY src_created_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let entries = rows
+            .iter()
+            .map(|row| row_to_memory_entry(row))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
+    /// Batch-check which sources are already indexed in memory_entries.
+    /// Returns the set of source JSON values that already have entries.
+    /// Values are re-serialized via serde_json to normalize key order for comparison.
+    pub async fn sources_indexed(
+        &self,
+        sources: &[serde_json::Value],
+    ) -> Result<std::collections::HashSet<String>, Box<dyn std::error::Error + Send + Sync>> {
+        if sources.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+
+        let rows: Vec<(serde_json::Value,)> =
+            sqlx::query_as("SELECT DISTINCT source FROM memory_entries WHERE source = ANY($1)")
+                .bind(sources)
+                .fetch_all(&self.pool)
+                .await?;
+
+        // Re-serialize through serde_json to get consistent key ordering
+        Ok(rows
+            .into_iter()
+            .map(|(v,)| serde_json::to_string(&v).unwrap_or_default())
+            .collect())
+    }
+
+    /// Get a reference to the connection pool
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Paginated list of memory entries with optional source type filter.
+    /// `source_type` can be "event" or "artifact" to filter, or None for all.
+    /// `sort` can be "importance" to sort by importance desc, otherwise sorts by created_at desc.
+    pub async fn paginated_entries(
+        &self,
+        limit: i64,
+        offset: i64,
+        source_type: Option<&str>,
+        sort: Option<&str>,
+        importance_levels: Option<&[&str]>,
+    ) -> Result<(Vec<MemoryEntry>, i64), Box<dyn std::error::Error + Send + Sync>> {
+        let mut conditions: Vec<String> = Vec::new();
+
+        if let Some(st) = source_type {
+            let validated = match st {
+                "event" => "event",
+                "artifact" => "artifact",
+                other => {
+                    return Err(format!(
+                        "invalid source_type '{}': expected 'event' or 'artifact'",
+                        other
+                    )
+                    .into());
+                }
+            };
+            conditions.push(format!("source->>'type' = '{}'", validated));
+        }
+
+        if let Some(levels) = importance_levels {
+            if !levels.is_empty() {
+                let range_conditions: Vec<&str> = levels
+                    .iter()
+                    .filter_map(|l| match *l {
+                        "low" => Some("importance < 0.3"),
+                        "medium" => Some("(importance >= 0.3 AND importance < 0.6)"),
+                        "high" => Some("(importance >= 0.6 AND importance < 0.8)"),
+                        "critical" => Some("importance >= 0.8"),
+                        _ => None,
+                    })
+                    .collect();
+                if !range_conditions.is_empty() {
+                    conditions.push(format!("({})", range_conditions.join(" OR ")));
+                }
+            }
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let order_clause = if sort == Some("importance") {
+            "ORDER BY importance DESC, created_at DESC"
+        } else {
+            "ORDER BY created_at DESC"
+        };
+
+        let count_query = format!("SELECT COUNT(*) FROM memory_entries {}", where_clause);
+        let total: (i64,) = sqlx::query_as(&count_query).fetch_one(&self.pool).await?;
+
+        let entries_query = format!(
+            "SELECT id, source, topic, summary, importance, entities, src_created_at, created_at FROM memory_entries {} {} LIMIT $1 OFFSET $2",
+            where_clause, order_clause
+        );
+        let rows = sqlx::query(&entries_query)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let entries = rows
+            .iter()
+            .map(|row| row_to_memory_entry(row))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok((entries, total.0))
+    }
+
+    /// Get all memory entries extracted from a given source (by JSONB match).
+    pub async fn entries_for_source(
+        &self,
+        source: &serde_json::Value,
+    ) -> Result<Vec<MemoryEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source, topic, summary, importance, entities, src_created_at, created_at
+            FROM memory_entries
+            WHERE source @> $1
+            ORDER BY importance DESC
+            "#,
+        )
+        .bind(source)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let entries = rows
+            .iter()
+            .map(|row| row_to_memory_entry(row))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
+    /// Aggregate stats about memory entries.
+    pub async fn stats(&self) -> Result<MemoryStats, Box<dyn std::error::Error + Send + Sync>> {
+        use sqlx::Row;
+
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_entries")
+            .fetch_one(&self.pool)
+            .await?;
+
+        let event_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM memory_entries WHERE source->>'type' = 'event'")
+                .fetch_one(&self.pool)
+                .await?;
+
+        let artifact_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM memory_entries WHERE source->>'type' = 'artifact'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        // Importance distribution buckets
+        let importance_rows = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE importance < 0.3) AS low,
+                COUNT(*) FILTER (WHERE importance >= 0.3 AND importance < 0.6) AS medium,
+                COUNT(*) FILTER (WHERE importance >= 0.6 AND importance < 0.8) AS high,
+                COUNT(*) FILTER (WHERE importance >= 0.8) AS critical
+            FROM memory_entries
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let importance_distribution = ImportanceDistribution {
+            low: importance_rows.try_get::<i64, _>("low")?,
+            medium: importance_rows.try_get::<i64, _>("medium")?,
+            high: importance_rows.try_get::<i64, _>("high")?,
+            critical: importance_rows.try_get::<i64, _>("critical")?,
+        };
+
+        // Top 10 topics by count
+        let topic_rows = sqlx::query(
+            "SELECT topic, COUNT(*) as count FROM memory_entries GROUP BY topic ORDER BY count DESC LIMIT 10"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let top_topics = topic_rows
+            .iter()
+            .map(|row| {
+                Ok(TopicCount {
+                    topic: row.try_get("topic")?,
+                    count: row.try_get::<i64, _>("count")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+        Ok(MemoryStats {
+            total: total.0,
+            event_count: event_count.0,
+            artifact_count: artifact_count.0,
+            importance_distribution,
+            top_topics,
+        })
+    }
+}
+
+/// Extract a MemoryEntry from a sqlx Row using manual column access
+fn row_to_memory_entry(
+    row: &sqlx::postgres::PgRow,
+) -> Result<MemoryEntry, Box<dyn std::error::Error + Send + Sync>> {
+    use sqlx::Row;
+
+    let id: Uuid = row.try_get("id")?;
+    let source_json: serde_json::Value = row.try_get("source")?;
+    let topic: String = row.try_get("topic")?;
+    let summary: String = row.try_get("summary")?;
+    let importance: f32 = row.try_get("importance")?;
+    let entities_json: serde_json::Value = row.try_get("entities")?;
+    let src_created_at: DateTime<Utc> = row.try_get("src_created_at")?;
+    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+
+    let source: MemorySource = serde_json::from_value(source_json)?;
+    let entities: Vec<String> = serde_json::from_value(entities_json)?;
+
+    Ok(MemoryEntry {
+        id,
+        source,
+        topic,
+        summary,
+        importance,
+        entities,
+        src_created_at,
+        created_at,
+    })
+}

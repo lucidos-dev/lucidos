@@ -1,0 +1,27 @@
+{
+  "name": "cognos-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@cognos/sdk": "*",
+    "@preact/signals": "^2.0.2",
+    "@tauri-apps/api": "^2.10.1",
+    "highlight.js": "^11.11.1",
+    "marked": "^17.0.3",
+    "preact": "^10.25.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@preact/preset-vite": "^2.9.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0",
+    "vitest": "^4.0.18"
+  }
+}
