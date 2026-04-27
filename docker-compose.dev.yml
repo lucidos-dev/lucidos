@@ -1,0 +1,19 @@
+# Development mode: PostgreSQL with pgvector in Docker, engine runs natively on macOS
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: lucidos-pg-${LUCIDOS_PG_NAME:-default}
+    ports:
+      - "${LUCIDOS_PG_PORT:-5432}:5432"
+    volumes:
+      - ${LUCIDOS_WORKSPACE:-./workspace}/data/postgres:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=lucidos
+      - POSTGRES_PASSWORD=lucidos
+      - POSTGRES_DB=lucidos
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lucidos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: "no"
