@@ -2,8 +2,8 @@
 set -e
 
 PGDATA="/workspace/data/postgres"
-PGUSER="cognos"
-PGDATABASE="cognos"
+PGUSER="lucidos"
+PGDATABASE="lucidos"
 
 # Initialize PostgreSQL data directory if needed
 if [ ! -f "$PGDATA/PG_VERSION" ]; then
@@ -60,6 +60,6 @@ echo "PostgreSQL ready"
 # Set DATABASE_URL for the engine
 export DATABASE_URL="postgres://$PGUSER@localhost/$PGDATABASE"
 
-# Start CognOS engine
-echo "Starting CognOS engine..."
-exec /usr/bin/cognos-engine
+# Start Lucidos engine
+echo "Starting Lucidos engine..."
+exec /usr/bin/lucidos-engine

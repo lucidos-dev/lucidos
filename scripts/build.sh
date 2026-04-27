@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build CognOS engine Docker image
+# Build Lucidos engine Docker image
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,13 +28,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -n "$LOCAL" ]; then
-    echo "Building CognOS engine locally..."
-    cargo build -p cognos-engine -p cognos-cli --release
+    echo "Building Lucidos engine locally..."
+    cargo build -p lucidos-engine -p lucidos-cli --release
     echo ""
     echo "Build complete!"
-    echo "Binaries at: target/release/cognos-engine, target/release/cognos"
+    echo "Binaries at: target/release/lucidos-engine, target/release/lucidos"
 else
-    echo "Building CognOS Docker image..."
+    echo "Building Lucidos Docker image..."
     docker-compose build $NO_CACHE
     echo ""
     echo "Build complete!"

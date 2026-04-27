@@ -12,7 +12,7 @@
 # The script:
 # 1. Ensures the e2e workspace is running
 # 2. Boots an iOS Simulator (iPhone 17 Pro by default)
-# 3. Opens Safari to the CognOS URL
+# 3. Opens Safari to the Lucidos URL
 # 4. Optionally takes a screenshot or installs as PWA
 set -e
 
@@ -26,7 +26,7 @@ DEVICE_NAME="iPhone 17 Pro"
 TAKE_SCREENSHOT=""
 INSTALL_PWA=""
 KILL_SIM=""
-SCREENSHOT_DIR="$PROJECT_DIR/crates/cognos-app/e2e/screenshots"
+SCREENSHOT_DIR="$PROJECT_DIR/crates/lucidos-app/e2e/screenshots"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -107,7 +107,7 @@ sys.exit(1)
 ensure_workspace_running
 
 ENGINE_URL="${PROTO}://localhost:${VITE_PORT}"
-echo "CognOS URL: $ENGINE_URL"
+echo "Lucidos URL: $ENGINE_URL"
 
 DEVICE_RESULT=$(find_device "$DEVICE_NAME")
 if [ -z "$DEVICE_RESULT" ]; then

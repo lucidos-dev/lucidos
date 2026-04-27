@@ -4,15 +4,15 @@ Decisions and tradeoffs made while building the end-to-end test suite.
 
 ## Architecture: Three Layers
 
-1. **Browser E2E tests** (Playwright, `crates/cognos-app/e2e/`) — drive a real browser against the running CognOS UI. Three projects run by default: `chromium` (desktop), `mobile` (mobile Chromium), and `mobile-webkit` (iOS Safari emulation via WebKit).
-2. **HTTP API tests** (Rust, `crates/cognos-engine/tests/api_e2e*`) — hit the API directly without a browser
+1. **Browser E2E tests** (Playwright, `crates/lucidos-app/e2e/`) — drive a real browser against the running Lucidos UI. Three projects run by default: `chromium` (desktop), `mobile` (mobile Chromium), and `mobile-webkit` (iOS Safari emulation via WebKit).
+2. **HTTP API tests** (Rust, `crates/lucidos-engine/tests/api_e2e*`) — hit the API directly without a browser
 
-All layers require a running CognOS workspace (`~/workspaces/e2e-test` by default).
+All layers require a running Lucidos workspace (`~/workspaces/e2e-test` by default).
 
 ## Key Decisions
 
 ### Dual layout handling
-CognOS renders desktop and mobile layouts simultaneously — every DOM element exists twice. All Playwright selectors use `.first()` and visibility checks via `getBoundingClientRect()` to target only the visible (desktop) element. The `openThreadDrawer()` helper uses `page.evaluate()` with rect checks rather than Playwright's `.isVisible()` to avoid false positives from the hidden mobile layout.
+Lucidos renders desktop and mobile layouts simultaneously — every DOM element exists twice. All Playwright selectors use `.first()` and visibility checks via `getBoundingClientRect()` to target only the visible (desktop) element. The `openThreadDrawer()` helper uses `page.evaluate()` with rect checks rather than Playwright's `.isVisible()` to avoid false positives from the hidden mobile layout.
 
 ### Thread drawer is collapsed by default
 At 1280x800 viewport, the thread drawer starts collapsed. Tests that need it must call `openThreadDrawer()` which clicks the toggle button if the drawer isn't already visible.
@@ -27,10 +27,10 @@ After `page.reload()`, localStorage-based thread auto-focus is unreliable in hea
 This tests the important thing (data persistence) without depending on the auto-focus race condition.
 
 ### Self-signed TLS
-CognOS uses HTTPS even in dev (Vite TLS). Both Playwright (`ignoreHTTPSErrors: true`) and Rust tests (`danger_accept_invalid_certs`) accept self-signed certificates.
+Lucidos uses HTTPS even in dev (Vite TLS). Both Playwright (`ignoreHTTPSErrors: true`) and Rust tests (`danger_accept_invalid_certs`) accept self-signed certificates.
 
 ### Port discovery
-Both test layers read the workspace ports from `<workspace>/.cognos/ports`. The workspace path is configurable via `E2E_WORKSPACE` environment variable, defaulting to `~/workspaces/e2e-test`.
+Both test layers read the workspace ports from `<workspace>/.lucidos/ports`. The workspace path is configurable via `E2E_WORKSPACE` environment variable, defaulting to `~/workspaces/e2e-test`.
 
 ### Unknown API routes return SPA fallback
 The engine proxies unknown `/api/*` routes to Vite, which returns the SPA HTML fallback with status 200. The Rust error test verifies the response is not valid JSON (i.e., it's HTML) rather than asserting a specific HTTP status code.
@@ -48,7 +48,7 @@ The streaming test captures text at two points during response generation. It as
 Rust's module system doesn't allow both `tests/api_e2e.rs` and `tests/api_e2e/mod.rs`. The solution uses `#[path]` attributes in `api_e2e.rs` to include submodules from an `api_e2e_support/` directory.
 
 ### Single-writer lock on the e2e workspace
-Both `e2e-browser.sh` and `e2e-api.sh` acquire `~/workspaces/e2e-test/.cognos/e2e.lock` (PID + `$COGNOS_THREAD_ID` + worktree path + start time) before starting the workspace. A second invocation while the lock is held exits 1 with a message naming the holder; stale locks (dead PID) are reclaimed automatically. The lock exists because two CC sessions running Playwright concurrently against the shared workspace race on browser processes — on 2026-04-19 a WebKit GPU child leaked to 28 GB and OOM-rebooted a 32 GB Mac. Lock logic in `scripts/lib/e2e_lock.sh`; covered by `tests/e2e_lock_test.sh` (run directly, no harness).
+Both `e2e-browser.sh` and `e2e-api.sh` acquire `~/workspaces/e2e-test/.lucidos/e2e.lock` (PID + `$LUCIDOS_THREAD_ID` + worktree path + start time) before starting the workspace. A second invocation while the lock is held exits 1 with a message naming the holder; stale locks (dead PID) are reclaimed automatically. The lock exists because two CC sessions running Playwright concurrently against the shared workspace race on browser processes — on 2026-04-19 a WebKit GPU child leaked to 28 GB and OOM-rebooted a 32 GB Mac. Lock logic in `scripts/lib/e2e_lock.sh`; covered by `tests/e2e_lock_test.sh` (run directly, no harness).
 
 ## Test Coverage
 
@@ -74,7 +74,7 @@ Both `e2e-browser.sh` and `e2e-api.sh` acquire `~/workspaces/e2e-test/.cognos/e2
 ./scripts/web-dev.sh -w ~/workspaces/e2e-test -b
 
 # Browser E2E tests
-cd crates/cognos-app && npx playwright test
+cd crates/lucidos-app && npx playwright test
 
 # HTTP API tests (also boots the e2e workspace and passes --ignored)
 ./scripts/e2e-api.sh

@@ -1,10 +1,10 @@
 ---
 globs:
-  - "crates/cognos-app/e2e/**"
-  - "crates/cognos-app/src/**/*.test.ts"
-  - "crates/cognos-app/src/**/*.spec.ts"
-  - "crates/cognos-engine/tests/**"
-  - "crates/cognos-app/src/generated/**"
+  - "crates/lucidos-app/e2e/**"
+  - "crates/lucidos-app/src/**/*.test.ts"
+  - "crates/lucidos-app/src/**/*.spec.ts"
+  - "crates/lucidos-engine/tests/**"
+  - "crates/lucidos-app/src/generated/**"
 ---
 
 # E2E Testing
@@ -13,7 +13,7 @@ Three test suites. All run against the e2e workspace (`~/workspaces/e2e-test`).
 
 ## Browser E2E (Playwright)
 
-Tests in `crates/cognos-app/e2e/`. Chat, streaming, cancellation, CC sessions, changes UI, threads, reload resilience.
+Tests in `crates/lucidos-app/e2e/`. Chat, streaming, cancellation, CC sessions, changes UI, threads, reload resilience.
 
 ```bash
 ./scripts/e2e-browser.sh                        # Run all (chromium + mobile + iOS webkit)
@@ -36,7 +36,7 @@ DB helpers: `e2e/db-helpers.ts` — `psql()`, `git()`.
 
 ## API E2E (Rust)
 
-Tests in `crates/cognos-engine/tests/api_e2e_support/`. HTTP contracts, SSE, errors.
+Tests in `crates/lucidos-engine/tests/api_e2e_support/`. HTTP contracts, SSE, errors.
 
 ```bash
 ./scripts/e2e-api.sh                    # Run all
@@ -49,7 +49,7 @@ Tests in `crates/cognos-engine/tests/api_e2e_support/`. HTTP contracts, SSE, err
 
 Source of truth: `thread_lifecycle.rs`. TS is generated — never hand-edit.
 
-Regenerate: `cargo test -p cognos-engine generate_typescript_file -- --ignored && cargo test -p cognos-engine generate_cross_validation_fixture_file -- --ignored`
+Regenerate: `cargo test -p lucidos-engine generate_typescript_file -- --ignored && cargo test -p lucidos-engine generate_cross_validation_fixture_file -- --ignored`
 
 Staleness checks run as part of `cargo test`.
 

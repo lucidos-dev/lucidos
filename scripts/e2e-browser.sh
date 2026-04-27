@@ -67,7 +67,7 @@ trap 'exit 130' INT TERM
 
 echo "Running browser e2e tests (port $VITE_PORT)"
 
-cd "$PROJECT_DIR/crates/cognos-app"
+cd "$PROJECT_DIR/crates/lucidos-app"
 
 npm install
 

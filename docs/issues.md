@@ -4,24 +4,24 @@
 
 ### Multiple Workspaces
 
-**Problem:** Currently the scripts remember the last used workspace in `.cognos-workspace`, but there's no easy way to switch between workspaces or list available ones.
+**Problem:** Currently the scripts remember the last used workspace in `.lucidos-workspace`, but there's no easy way to switch between workspaces or list available ones.
 
 **Current workaround:** Always specify `-w <path>` when switching workspaces.
 
 **Proposed solutions:**
 
-1. **Named workspaces config file** - Store workspace aliases in `~/.cognos/workspaces.json`:
+1. **Named workspaces config file** - Store workspace aliases in `~/.lucidos/workspaces.json`:
    ```json
    {
-     "personal": "/Users/me/cognos-personal",
-     "work": "/Users/me/cognos-work"
+     "personal": "/Users/me/lucidos-personal",
+     "work": "/Users/me/lucidos-work"
    }
    ```
    Then: `./scripts/start.sh -w personal`
 
-2. **Workspace switcher command** - Add `./scripts/switch.sh <name>` that updates `.cognos-workspace`
+2. **Workspace switcher command** - Add `./scripts/switch.sh <name>` that updates `.lucidos-workspace`
 
-3. **Environment-based** - Use `COGNOS_WORKSPACE` env var, set per terminal/shell profile
+3. **Environment-based** - Use `LUCIDOS_WORKSPACE` env var, set per terminal/shell profile
 
 **Decision needed:** Which approach? (1) is most flexible, (3) is simplest.
 
@@ -49,7 +49,7 @@
 
 **Problem:** `populate.sh` uses `./test-workspace` (relative to project), but `start.sh` might use `~/test-workspace`.
 
-**Fix:** Make populate.sh use the saved workspace from `.cognos-workspace` like other scripts.
+**Fix:** Make populate.sh use the saved workspace from `.lucidos-workspace` like other scripts.
 
 ---
 

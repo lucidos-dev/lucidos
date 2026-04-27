@@ -12,9 +12,9 @@
 # Archives
 *.tgz
 
-# CognOS local data (workspaces are external)
+# Lucidos local data (workspaces are external)
 data/
-.cognos/
+.lucidos/
 
 # Claude Code local settings
 .claude/settings.local.json
@@ -25,10 +25,10 @@ data/
 # Runtime files
 *.pid
 *.log
-.cognos-engine.pid
+.lucidos-engine.pid
 .frontend.pid
-cognos-engine.log
-.cognos-workspace
+lucidos-engine.log
+.lucidos-workspace
 .docker-workspace
 
 # Workspaces
@@ -47,7 +47,7 @@ dist/
 .env
 
 # Compiled JS next to TS sources (Vite serves .js over .ts, breaking the app)
-crates/cognos-app/src/**/*.js
+crates/lucidos-app/src/**/*.js
 
 # Playwright test artifacts
 test-results/

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Populate CognOS with test data (2 years of history)
+# Populate Lucidos with test data (2 years of history)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,8 +8,10 @@ DEFAULT_WORKSPACE="$PROJECT_DIR/test-workspace"
 
 cd "$PROJECT_DIR"
 
+source "$SCRIPT_DIR/lib/workspace.sh"
+
 # Parse arguments
-WORKSPACE="${COGNOS_WORKSPACE:-$DEFAULT_WORKSPACE}"
+WORKSPACE="${LUCIDOS_WORKSPACE:-$DEFAULT_WORKSPACE}"
 CLEAN=""
 BUILD=""
 while [[ $# -gt 0 ]]; do
@@ -34,8 +36,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Best-effort: missing workspace is not fatal here (populate may bootstrap it).
+resolve_workspace_path 2>/dev/null || {
+    if [[ "$WORKSPACE" != */* ]]; then
+        WORKSPACE="$HOME/workspaces/$WORKSPACE"
+    fi
+}
+
 # Stop engine for this workspace if running
-if [ -f "$WORKSPACE/.cognos/engine.pid" ] && kill -0 "$(cat "$WORKSPACE/.cognos/engine.pid")" 2>/dev/null; then
+if [ -f "$WORKSPACE/.lucidos/engine.pid" ] && kill -0 "$(cat "$WORKSPACE/.lucidos/engine.pid")" 2>/dev/null; then
     echo "Stopping running engine for $WORKSPACE..."
     "$SCRIPT_DIR/stop.sh" -w "$WORKSPACE"
     sleep 2
@@ -45,7 +54,7 @@ fi
 if [ -n "$CLEAN" ]; then
     echo "Cleaning workspace data..."
     rm -rf "$WORKSPACE/data"
-    rm -rf "$WORKSPACE/.cognos"
+    rm -rf "$WORKSPACE/.lucidos"
 fi
 
 # Build if requested
@@ -59,7 +68,7 @@ echo "Populating test data..."
 echo "  Workspace: $WORKSPACE"
 echo ""
 
-COGNOS_WORKSPACE="$WORKSPACE" cargo run --bin populate_memory
+LUCIDOS_WORKSPACE="$WORKSPACE" cargo run --bin populate_memory
 
 echo ""
 echo "Done! Start the engine with:"

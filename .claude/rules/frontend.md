@@ -1,8 +1,8 @@
 ---
 globs:
-  - "crates/cognos-app/src/**/*.ts"
-  - "crates/cognos-app/src/**/*.tsx"
-  - "crates/cognos-app/src/**/*.css"
+  - "crates/lucidos-app/src/**/*.ts"
+  - "crates/lucidos-app/src/**/*.tsx"
+  - "crates/lucidos-app/src/**/*.css"
 ---
 
 # Frontend Conventions (TypeScript & CSS)
@@ -74,7 +74,7 @@ Tool called 3+ times on same target → force-break with error.
 
 ## CSS & Component Rules
 
-- **Tab title**: `(count) CognOS` (count first for narrow tabs)
+- **Tab title**: `(count) Lucidos` (count first for narrow tabs)
 - **No system dialogs**: Use `showToast(msg, type)` / `await showConfirm(msg, okLabel)`
 - **No native tooltips**: Use `data-tooltip="text"`. Desktop-only.
 - **List rows**: `.list-row` / `.list-row-info` / `.list-row-actions` from `global.css`

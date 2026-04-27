@@ -6,8 +6,8 @@
 # re-enables sleep.
 # macOS-only: uses `md5 -q` and `pmset` (no Linux equivalent needed).
 
-SLEEP_LOCK_DIR="/tmp/cognos-sleep-locks"
-SUDOERS_FILE="/etc/sudoers.d/cognos-pmset"
+SLEEP_LOCK_DIR="/tmp/lucidos-sleep-locks"
+SUDOERS_FILE="/etc/sudoers.d/lucidos-pmset"
 
 # Ensure passwordless sudo for pmset disablesleep.
 # Creates a sudoers.d entry on first run (requires one sudo prompt).
@@ -26,7 +26,7 @@ ensure_sudoers_pmset() {
 
     if [ -t 0 ]; then
         echo ""
-        echo "One-time setup: allow CognOS to prevent lid-close sleep without password."
+        echo "One-time setup: allow Lucidos to prevent lid-close sleep without password."
         echo "This creates $SUDOERS_FILE (only allows pmset disablesleep)."
         echo "$rule" | sudo tee "$SUDOERS_FILE" >/dev/null && sudo chmod 0440 "$SUDOERS_FILE"
         return $?

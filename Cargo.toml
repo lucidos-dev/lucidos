@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cognos-engine",
-    "crates/cognos-app",
-    "crates/cognos-cli",
+    "crates/lucidos-engine",
+    "crates/lucidos-app",
+    "crates/lucidos-cli",
 ]
 
 [workspace.package]

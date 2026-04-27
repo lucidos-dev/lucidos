@@ -7,14 +7,14 @@ _E2E_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _E2E_SCRIPTS_DIR="$(dirname "$_E2E_LIB_DIR")"
 _E2E_PROJECT_DIR="$(dirname "$_E2E_SCRIPTS_DIR")"
 
-# Use mock LLM provider by default for e2e tests (override with COGNOS_MODEL=... before calling)
-export COGNOS_MODEL="${COGNOS_MODEL:-mock}"
+# Use mock LLM provider by default for e2e tests (override with LUCIDOS_MODEL=... before calling)
+export LUCIDOS_MODEL="${LUCIDOS_MODEL:-mock}"
 
 # Source shared infrastructure — provides detect_tls, setup_postgres, start_engine,
 # start_vite, etc. Set the globals workspace.sh expects from its caller.
 SCRIPT_DIR="$_E2E_SCRIPTS_DIR"
 PROJECT_DIR="$_E2E_PROJECT_DIR"
-FRONTEND_DIR="$_E2E_PROJECT_DIR/crates/cognos-app"
+FRONTEND_DIR="$_E2E_PROJECT_DIR/crates/lucidos-app"
 SCRIPT_NAME="e2e"
 
 source "$_E2E_LIB_DIR/ports.sh"
@@ -23,7 +23,7 @@ source "$_E2E_LIB_DIR/e2e_lock.sh"
 
 # ── ensure_workspace_running ────────────────────────────────────────────
 # Starts the e2e workspace if not running. Ensures both engine AND Vite are up.
-# Uses COGNOS_MODEL=mock by default so tests don't hit real LLM APIs.
+# Uses LUCIDOS_MODEL=mock by default so tests don't hit real LLM APIs.
 ensure_workspace_running() {
     # Set up workspace globals (pidfiles, log path, PG_NAME)
     export WORKSPACE="$E2E_WORKSPACE"
@@ -43,11 +43,11 @@ ensure_workspace_running() {
         # Set up env vars that swap_ports normally provides
         swap_ports
     else
-        echo "Starting e2e workspace (COGNOS_MODEL=$COGNOS_MODEL)..."
+        echo "Starting e2e workspace (LUCIDOS_MODEL=$LUCIDOS_MODEL)..."
         setup_postgres
         purge_orphan_migrations
         # Apps loaded in iframes fetch /api/v1/sdk.js — without dist/sdk.js the
-        # engine serves a stub that lacks cognos.ui/data, breaking SDK e2e tests.
+        # engine serves a stub that lacks lucidos.ui/data, breaking SDK e2e tests.
         build_sdk
         BUILD="1"
         build_or_find_engine
@@ -110,8 +110,8 @@ cleanup_e2e_worktrees() {
     git branch --list 'e2e-test/*' 'claude-code/*' 'merge-tmp/*' 2>/dev/null | xargs -r git branch -D 2>/dev/null
 
     # CC test worktrees are physically inside this workspace but registered in
-    # the cognos repo (where `git worktree add` was run). Without this the
-    # cognos repo accumulates stale entries every test run; engine recovery
+    # the lucidos repo (where `git worktree add` was run). Without this the
+    # lucidos repo accumulates stale entries every test run; engine recovery
     # then iterates over hundreds of dead worktrees on next startup and
     # exceeds its 30s API readiness budget.
     cd "$_E2E_PROJECT_DIR" 2>/dev/null || { cd "$original_dir"; return; }
@@ -156,8 +156,8 @@ stop_e2e_workspace() {
 # without merging leave orphan migrations in the e2e DB; sqlx::Migrator then
 # refuses to start the engine with VersionMissing(...).
 purge_orphan_migrations() {
-    local migrations_dir="$_E2E_PROJECT_DIR/crates/cognos-engine/migrations"
-    local container="cognos-pg-$PG_NAME"
+    local migrations_dir="$_E2E_PROJECT_DIR/crates/lucidos-engine/migrations"
+    local container="lucidos-pg-$PG_NAME"
 
     local valid_versions
     valid_versions=$(ls "$migrations_dir" 2>/dev/null | grep -oE '^[0-9]{14}' | sort -u | paste -sd, -)
@@ -168,26 +168,26 @@ purge_orphan_migrations() {
     # errors out on a fresh DB. Two round trips lets the count query fail
     # loudly on a real psql/container problem instead of being masked.
     local table_exists
-    table_exists=$(docker exec "$container" psql -U cognos -d cognos -At -c \
+    table_exists=$(docker exec "$container" psql -U lucidos -d lucidos -At -c \
         "SELECT to_regclass('_sqlx_migrations') IS NOT NULL;")
     [ "$table_exists" = "t" ] || return 0
 
     local orphan_count
-    orphan_count=$(docker exec "$container" psql -U cognos -d cognos -At -c \
+    orphan_count=$(docker exec "$container" psql -U lucidos -d lucidos -At -c \
         "SELECT count(*) FROM _sqlx_migrations WHERE version NOT IN ($valid_versions);")
 
     if [ "${orphan_count:-0}" -gt 0 ]; then
         echo "Found $orphan_count orphan migration(s) from abandoned branches — resetting schema"
-        docker exec "$container" psql -U cognos -d cognos -q -c \
+        docker exec "$container" psql -U lucidos -d lucidos -q -c \
             "DROP SCHEMA public CASCADE; CREATE SCHEMA public; CREATE EXTENSION IF NOT EXISTS vector;"
     fi
 }
 
 reset_e2e_database() {
-    local container="cognos-pg-$PG_NAME"
+    local container="lucidos-pg-$PG_NAME"
 
     echo "Resetting database..."
-    docker exec "$container" psql -U cognos -q -c "
+    docker exec "$container" psql -U lucidos -q -c "
         DO \$\$
         DECLARE r RECORD;
         BEGIN

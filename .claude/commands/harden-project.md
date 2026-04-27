@@ -22,27 +22,27 @@ Split the codebase into 8 non-overlapping chunks. Launch ALL 8 agents **in a sin
 
 | Chunk | Directories |
 |-------|-------------|
-| core | `crates/cognos-engine/src/core/` |
-| engine | `crates/cognos-engine/src/engine/` |
-| api | `crates/cognos-engine/src/api/` + top-level `crates/cognos-engine/src/*.rs` |
-| llm-infra | `crates/cognos-engine/src/llm/`, `crates/cognos-engine/src/mcp/`, `crates/cognos-engine/src/memory/`, `crates/cognos-engine/src/runtime/`, `crates/cognos-engine/src/scheduler/`, `crates/cognos-engine/src/triggers/` |
+| core | `crates/lucidos-engine/src/core/` |
+| engine | `crates/lucidos-engine/src/engine/` |
+| api | `crates/lucidos-engine/src/api/` + top-level `crates/lucidos-engine/src/*.rs` |
+| llm-infra | `crates/lucidos-engine/src/llm/`, `crates/lucidos-engine/src/mcp/`, `crates/lucidos-engine/src/memory/`, `crates/lucidos-engine/src/runtime/`, `crates/lucidos-engine/src/scheduler/`, `crates/lucidos-engine/src/triggers/` |
 
 ### Frontend (TypeScript/CSS) — include the frontend checklist
 
 | Chunk | Directories |
 |-------|-------------|
-| components-core | `crates/cognos-app/src/components/chat/`, `crates/cognos-app/src/components/layout/`, `crates/cognos-app/src/components/shared/`, `crates/cognos-app/src/components/drawer/` |
-| components-features | All other subdirs under `crates/cognos-app/src/components/` NOT in components-core |
-| store | `crates/cognos-app/src/store/` |
-| frontend-infra | `crates/cognos-app/src/hooks/`, `crates/cognos-app/src/utils/`, `crates/cognos-app/src/api/`, `crates/cognos-app/src/styles/`, + top-level `crates/cognos-app/src/*.{ts,tsx,css}` |
+| components-core | `crates/lucidos-app/src/components/chat/`, `crates/lucidos-app/src/components/layout/`, `crates/lucidos-app/src/components/shared/`, `crates/lucidos-app/src/components/drawer/` |
+| components-features | All other subdirs under `crates/lucidos-app/src/components/` NOT in components-core |
+| store | `crates/lucidos-app/src/store/` |
+| frontend-infra | `crates/lucidos-app/src/hooks/`, `crates/lucidos-app/src/utils/`, `crates/lucidos-app/src/api/`, `crates/lucidos-app/src/styles/`, + top-level `crates/lucidos-app/src/*.{ts,tsx,css}` |
 
-**Exclude from all agents**: `crates/cognos-app/src/generated/` — auto-generated, never hand-edit.
+**Exclude from all agents**: `crates/lucidos-app/src/generated/` — auto-generated, never hand-edit.
 
 ### Agent Prompt
 
 Each agent prompt must be **self-contained** (agents have no conversation context). Include:
 
-1. **Role**: "You are hardening the `{chunk}` module of CognOS."
+1. **Role**: "You are hardening the `{chunk}` module of Lucidos."
 2. **Directories**: exact paths this agent owns
 3. **Rules checklist**: the full language-specific checklist from Phase 1
 4. **5-point scan** — check every file for ALL of these:
@@ -87,8 +87,8 @@ Use Grep across `crates/` to verify each item. Be conservative — only fix item
 
 Run tests based on which file types changed:
 
-- `.rs` files changed → `cargo check -p cognos-engine && cargo test -p cognos-engine`
-- `.ts`/`.tsx` files changed → `cd crates/cognos-app && npx tsc --noEmit && npm test`
+- `.rs` files changed → `cargo check -p lucidos-engine && cargo test -p lucidos-engine`
+- `.ts`/`.tsx` files changed → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
 - Both → run both
 
 If tests fail: diagnose root cause, revert or adjust aggressive fixes. All tests must pass.

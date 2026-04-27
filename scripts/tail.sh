@@ -1,5 +1,5 @@
 #!/bin/bash
-# Tail the CognOS engine log for a workspace.
+# Tail the Lucidos engine log for a workspace.
 #
 # Usage:
 #   tail.sh personal               # recent log lines from ~/workspaces/personal
@@ -11,6 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
+
+source "$SCRIPT_DIR/lib/workspace.sh"
 
 WORKSPACE=""
 LINES=100
@@ -25,7 +27,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: $0 <workspace> [OPTIONS]"
             echo ""
-            echo "Tail the CognOS engine log."
+            echo "Tail the Lucidos engine log."
             echo ""
             echo "  <workspace> can be a name (resolved via ~/workspaces/<name>),"
             echo "  an absolute path, or a relative path."
@@ -43,7 +45,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$WORKSPACE" ]; then
-    WORKSPACE="${COGNOS_WORKSPACE:-}"
+    WORKSPACE="${LUCIDOS_WORKSPACE:-}"
 fi
 if [ -z "$WORKSPACE" ]; then
     echo "Usage: $0 <workspace> [OPTIONS]"
@@ -51,13 +53,9 @@ if [ -z "$WORKSPACE" ]; then
     exit 1
 fi
 
-# Resolve workspace name to path
-if [ ! -d "$WORKSPACE" ] && [ -d "$HOME/workspaces/$WORKSPACE" ]; then
-    WORKSPACE="$HOME/workspaces/$WORKSPACE"
-fi
-[ -d "$WORKSPACE" ] && WORKSPACE="$(cd "$WORKSPACE" && pwd)"
+resolve_workspace_path
 
-ENGINE_LOG="$WORKSPACE/.cognos/engine.log"
+ENGINE_LOG="$WORKSPACE/.lucidos/engine.log"
 
 if [ ! -f "$ENGINE_LOG" ]; then
     echo "No engine log at: $ENGINE_LOG"

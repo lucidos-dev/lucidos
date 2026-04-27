@@ -19,7 +19,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MIGRATIONS_DIR="$SCRIPT_DIR/../crates/cognos-engine/migrations"
+MIGRATIONS_DIR="$SCRIPT_DIR/../crates/lucidos-engine/migrations"
 
 description="$*"
 slug="$(echo "$description" | tr '[:upper:] ' '[:lower:]_' | tr -cd 'a-z0-9_')"

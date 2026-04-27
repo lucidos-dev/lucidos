@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start CognOS and open a Tauri desktop window.
+# Start Lucidos and open a Tauri desktop window.
 #
 # Without -b: starts engine from latest build (or reuses if already running).
 # With -b: rebuilds engine first, then starts.
@@ -7,7 +7,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-FRONTEND_DIR="$PROJECT_DIR/crates/cognos-app"
+FRONTEND_DIR="$PROJECT_DIR/crates/lucidos-app"
 SCRIPT_NAME="tauri-dev.sh"
 
 source "$SCRIPT_DIR/lib/ports.sh"
@@ -31,7 +31,6 @@ build_or_find_engine
 ensure_frontend_deps
 build_sdk
 
-export COGNOS_LAUNCHER="tauri-dev"
 start_engine
 show_banner "tauri"
 

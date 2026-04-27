@@ -6,10 +6,10 @@
 # the kernel page-thrashed, and the OS rebooted. This lock makes the second
 # entrant exit cleanly instead of joining the pile-on.
 #
-# Lock file: <e2e-workspace>/.cognos/e2e.lock (or $E2E_LOCK_DIR_OVERRIDE for tests)
+# Lock file: <e2e-workspace>/.lucidos/e2e.lock (or $E2E_LOCK_DIR_OVERRIDE for tests)
 # Format:
 #   PID=12345
-#   THREAD_ID=<COGNOS_THREAD_ID or "unknown">
+#   THREAD_ID=<LUCIDOS_THREAD_ID or "unknown">
 #   WORKTREE=<pwd at acquire time>
 #   STARTED=<ISO 8601 UTC>
 #   SCRIPT=<entry-point name>
@@ -19,9 +19,9 @@
 E2E_LOCK_OWNED=""
 
 # Resolve the lock file path. $E2E_LOCK_DIR_OVERRIDE is for tests; otherwise
-# falls back to ~/workspaces/e2e-test/.cognos/.
+# falls back to ~/workspaces/e2e-test/.lucidos/.
 _e2e_lock_path() {
-    local dir="${E2E_LOCK_DIR_OVERRIDE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.cognos}"
+    local dir="${E2E_LOCK_DIR_OVERRIDE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos}"
     mkdir -p "$dir" 2>/dev/null
     echo "$dir/e2e.lock"
 }
@@ -29,7 +29,7 @@ _e2e_lock_path() {
 # Atomic create-or-fail using noclobber. Returns 0 on success, non-zero if file exists.
 _e2e_lock_write() {
     local lock_file="$1" script_name="$2"
-    local thread_id="${COGNOS_THREAD_ID:-unknown}"
+    local thread_id="${LUCIDOS_THREAD_ID:-unknown}"
     local started
     started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     (set -C; cat > "$lock_file" <<EOF

@@ -2,10 +2,10 @@
 set -e
 
 echo "Building Docker image..."
-docker build -t cognos-test .
+docker build -t lucidos-test .
 
 echo "Starting container..."
-docker run -d --name cognos-test-container -p 3000:3000 cognos-test
+docker run -d --name lucidos-test-container -p 3000:3000 lucidos-test
 
 echo "Waiting for API..."
 sleep 10
@@ -25,7 +25,7 @@ curl http://localhost:3000/artifacts
 
 echo ""
 echo "Cleaning up..."
-docker stop cognos-test-container
-docker rm cognos-test-container
+docker stop lucidos-test-container
+docker rm lucidos-test-container
 
 echo "All tests passed!"

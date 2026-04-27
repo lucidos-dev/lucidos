@@ -1259,77 +1259,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cognos-app"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-window-state",
-]
-
-[[package]]
-name = "cognos-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "cognos-engine"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "async-imap",
- "async-trait",
- "axum",
- "axum-server",
- "base64 0.22.1",
- "chromiumoxide",
- "chrono",
- "chrono-tz",
- "cron",
- "dotenvy",
- "fastembed",
- "futures",
- "git2",
- "glob",
- "image",
- "kamadak-exif",
- "lettre",
- "libc",
- "mail-parser",
- "native-tls",
- "ocr-rs",
- "p256",
- "pdf-extract",
- "regex",
- "reqwest 0.12.28",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tar",
- "tempfile",
- "tokio",
- "tokio-cron-scheduler",
- "tokio-native-tls",
- "tokio-stream",
- "tokio-util",
- "tower-http",
- "urlencoding",
- "uuid",
- "web-push",
- "zstd",
-]
-
-[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2492,6 +2421,16 @@ checksum = "73fde052dbfc920003cfd2c8e2c6e6d4cc7c1091538c3a24226cec0665ab08c0"
 dependencies = [
  "autocfg",
  "tokio",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -4184,6 +4123,82 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lucidos-app"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-window-state",
+]
+
+[[package]]
+name = "lucidos-cli"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "dirs",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "lucidos-engine"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "async-imap",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "chromiumoxide",
+ "chrono",
+ "chrono-tz",
+ "cron",
+ "dotenvy",
+ "fastembed",
+ "fs2",
+ "futures",
+ "git2",
+ "glob",
+ "image",
+ "kamadak-exif",
+ "lettre",
+ "libc",
+ "mail-parser",
+ "native-tls",
+ "ocr-rs",
+ "p256",
+ "pdf-extract",
+ "regex",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-cron-scheduler",
+ "tokio-native-tls",
+ "tokio-stream",
+ "tokio-util",
+ "tower-http",
+ "urlencoding",
+ "uuid",
+ "web-push",
+ "zstd",
+]
 
 [[package]]
 name = "mac"

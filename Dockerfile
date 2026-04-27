@@ -5,12 +5,12 @@ WORKDIR /app
 COPY . .
 
 # Build with release optimizations.
-# cognos-cli is built alongside the engine so the `cognos` binary lands in
-# /usr/bin (next to cognos-engine), matching what `cognos_cli_dir()` expects
+# lucidos-cli is built alongside the engine so the `lucidos` binary lands in
+# /usr/bin (next to lucidos-engine), matching what `lucidos_cli_dir()` expects
 # at runtime when prepending to spawned CC sessions' PATH.
-RUN cargo build -p cognos-engine -p cognos-cli --release
+RUN cargo build -p lucidos-engine -p lucidos-cli --release
 
-# Runtime stage - single container with PostgreSQL + pgvector + CognOS
+# Runtime stage - single container with PostgreSQL + pgvector + Lucidos
 FROM debian:bookworm-slim
 
 # Install PostgreSQL, pgvector, and other dependencies
@@ -42,12 +42,12 @@ RUN apt-get update && apt-get install -y \
     && sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml 2>/dev/null || true
 
 # Create workspace directory
-RUN mkdir -p /workspace/artifacts /workspace/.cognos /workspace/data/postgres
+RUN mkdir -p /workspace/artifacts /workspace/.lucidos /workspace/data/postgres
 
-# Copy the built binaries — `cognos` must live next to `cognos-engine` because
+# Copy the built binaries — `lucidos` must live next to `lucidos-engine` because
 # the engine resolves it relative to its own current_exe.
-COPY --from=builder /app/target/release/cognos-engine /usr/bin/cognos-engine
-COPY --from=builder /app/target/release/cognos /usr/bin/cognos
+COPY --from=builder /app/target/release/lucidos-engine /usr/bin/lucidos-engine
+COPY --from=builder /app/target/release/lucidos /usr/bin/lucidos
 
 # Copy entrypoint script
 COPY docker-entrypoint.sh /usr/bin/docker-entrypoint.sh

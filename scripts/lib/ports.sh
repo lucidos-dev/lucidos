@@ -1,10 +1,10 @@
 #!/bin/bash
 # Port allocation functions for multi-workspace support.
 # Each workspace gets a stable, incrementing port offset (0, 1, 2, ...) stored
-# in a global registry at ~/.cognos/port-registry.
+# in a global registry at ~/.lucidos/port-registry.
 # Ports: API=3000+offset, Vite=5173+offset, PostgreSQL=5432+offset
 
-COGNOS_PORT_REGISTRY="$HOME/.cognos/port-registry"
+LUCIDOS_PORT_REGISTRY="$HOME/.lucidos/port-registry"
 
 # Check if a port is available (not in use by another process).
 port_is_free() {
@@ -16,19 +16,19 @@ port_is_free() {
 # Returns the offset via stdout, or empty string if not found.
 registry_lookup() {
     local workspace="$1"
-    if [ -f "$COGNOS_PORT_REGISTRY" ]; then
-        awk -F'\t' -v ws="$workspace" '$1 == ws { print $2; exit }' "$COGNOS_PORT_REGISTRY"
+    if [ -f "$LUCIDOS_PORT_REGISTRY" ]; then
+        awk -F'\t' -v ws="$workspace" '$1 == ws { print $2; exit }' "$LUCIDOS_PORT_REGISTRY"
     fi
 }
 
 # Get the next available offset (max existing + 1, or 0 if registry is empty).
 registry_next_offset() {
-    if [ ! -f "$COGNOS_PORT_REGISTRY" ] || [ ! -s "$COGNOS_PORT_REGISTRY" ]; then
+    if [ ! -f "$LUCIDOS_PORT_REGISTRY" ] || [ ! -s "$LUCIDOS_PORT_REGISTRY" ]; then
         echo 0
         return
     fi
     local max
-    max=$(awk -F'\t' 'BEGIN{m=-1} {if($2+0>m) m=$2+0} END{print m}' "$COGNOS_PORT_REGISTRY")
+    max=$(awk -F'\t' 'BEGIN{m=-1} {if($2+0>m) m=$2+0} END{print m}' "$LUCIDOS_PORT_REGISTRY")
     echo $(( max + 1 ))
 }
 
@@ -36,25 +36,25 @@ registry_next_offset() {
 registry_save() {
     local workspace="$1"
     local offset="$2"
-    mkdir -p "$(dirname "$COGNOS_PORT_REGISTRY")"
+    mkdir -p "$(dirname "$LUCIDOS_PORT_REGISTRY")"
     # Remove any existing entry for this workspace, then append
-    if [ -f "$COGNOS_PORT_REGISTRY" ]; then
-        local tmp="$COGNOS_PORT_REGISTRY.tmp"
-        awk -F'\t' -v ws="$workspace" '$1 != ws' "$COGNOS_PORT_REGISTRY" > "$tmp"
-        mv "$tmp" "$COGNOS_PORT_REGISTRY"
+    if [ -f "$LUCIDOS_PORT_REGISTRY" ]; then
+        local tmp="$LUCIDOS_PORT_REGISTRY.tmp"
+        awk -F'\t' -v ws="$workspace" '$1 != ws' "$LUCIDOS_PORT_REGISTRY" > "$tmp"
+        mv "$tmp" "$LUCIDOS_PORT_REGISTRY"
     fi
-    printf '%s\t%s\n' "$workspace" "$offset" >> "$COGNOS_PORT_REGISTRY"
+    printf '%s\t%s\n' "$workspace" "$offset" >> "$LUCIDOS_PORT_REGISTRY"
 }
 
 # Allocate ports for a workspace.
-# Looks up stable offset from global registry (~/.cognos/port-registry).
+# Looks up stable offset from global registry (~/.lucidos/port-registry).
 # New workspaces get the next incrementing offset (0, 1, 2, ...).
 # Exports: API_PORT, VITE_PORT, PG_PORT
 allocate_ports() {
     local workspace="$1"
-    local ports_file="$workspace/.cognos/ports"
+    local ports_file="$workspace/.lucidos/ports"
 
-    mkdir -p "$workspace/.cognos"
+    mkdir -p "$workspace/.lucidos"
 
     # Look up or assign offset from global registry
     local offset
@@ -71,8 +71,8 @@ allocate_ports() {
     # Ensure ports are free — kill stale processes if needed (skip our own PG container)
     local pg_name
     pg_name=$(printf '%s' "$workspace" | cksum | awk '{print $1}')
-    local engine_pid_file="$workspace/.cognos/engine.pid"
-    local frontend_pid_file="$workspace/.cognos/frontend.pid"
+    local engine_pid_file="$workspace/.lucidos/engine.pid"
+    local frontend_pid_file="$workspace/.lucidos/frontend.pid"
 
     # In --engine-only mode, only clean up the engine port (VITE_PORT, which becomes
     # ENGINE_PORT after swap). API_PORT has Vite running — leave it alone.
@@ -87,7 +87,7 @@ allocate_ports() {
         # Check if it's our PG container — leave it alone
         if [ "$port" = "$PG_PORT" ]; then
             local container_port
-            container_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "cognos-pg-$pg_name" 2>/dev/null || echo "")
+            container_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "lucidos-pg-$pg_name" 2>/dev/null || echo "")
             [ "$container_port" = "$port" ] && continue
         fi
 

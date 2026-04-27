@@ -1,5 +1,5 @@
 #!/bin/bash
-# View CognOS engine Docker logs
+# View Lucidos engine Docker logs
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

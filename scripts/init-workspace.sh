@@ -10,7 +10,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-FRONTEND_DIR="$PROJECT_DIR/crates/cognos-app"
+FRONTEND_DIR="$PROJECT_DIR/crates/lucidos-app"
 SCRIPT_NAME="init-workspace.sh"
 
 source "$SCRIPT_DIR/lib/ports.sh"
@@ -41,7 +41,7 @@ fi
     setup_postgres
 } >&2
 
-echo "DATABASE_URL=postgres://cognos:cognos@localhost:$PG_PORT/cognos"
+echo "DATABASE_URL=postgres://lucidos:lucidos@localhost:$PG_PORT/lucidos"
 echo "PG_PORT=$PG_PORT"
 echo "API_PORT=$API_PORT"
 echo "VITE_PORT=$VITE_PORT"

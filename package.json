@@ -1,7 +1,7 @@
 {
   "private": true,
   "workspaces": [
-    "crates/cognos-app",
-    "packages/cognos-sdk"
+    "crates/lucidos-app",
+    "packages/lucidos-sdk"
   ]
 }

@@ -1,9 +1,9 @@
 ---
 globs:
-  - "crates/cognos-engine/**/*.rs"
+  - "crates/lucidos-engine/**/*.rs"
   - "Cargo.toml"
   - "Cargo.lock"
-  - "crates/cognos-engine/migrations/**"
+  - "crates/lucidos-engine/migrations/**"
 ---
 
 # Rust Conventions
@@ -19,12 +19,12 @@ globs:
 - **Never slice strings by byte index.** `&s[..n]` panics on multi-byte chars. Always use `s.floor_char_boundary(n)`.
 - **API returns raw markdown, frontend converts to HTML.** No `markdown_to_html` on backend. Error responses use `[ERROR]` prefix.
 - **ALL events go through EventBus.** `EventBus.emit()` is the sole entry point for event persistence. `EventStore::append()` and `append_thread_event()` have been deleted. Thread events use `BusEvent::Thread { .. }`, system events use `BusEvent::System(SystemEvent::...)`, and domain events (from `emit_event`) use `SystemEvent::DomainEvent { .. }` (persisted with the inner event_type, not "DomainEvent"). Never bypass EventBus to write directly to the events table.
-- **Mutating endpoints stamp the actor.** Any HTTP handler that mutates state (POST/PUT/PATCH/DELETE) must build an actor via `api::actor::user_actor(&headers, ..)` and pass it to the resulting event. For new `ThreadEvent` variants prefer `EventMeta::with_actor(actor)`. The four change events carry per-variant `actor` (predates EventMeta path); leave as-is. For `SystemEvent` add `actor: Option<MessageOrigin>` as a `#[serde(default, skip_serializing_if = "Option::is_none")]` field on the variant. Engine-internal emits (state-machine side effects, scheduler tick, recovery) pass `None`. The actor flows into the event payload as a stable `actor` field — frontend reads it without translation.
-- **Database schema changes must be migrations.** Always create with `./scripts/new-migration.sh <description>` — it stamps the file with the real wall-clock second and bumps if the slot is taken. Never hand-pick the timestamp (placeholders like `120000` collide across parallel CC branches and crash the engine on startup with a `_sqlx_migrations_pkey` duplicate). Format: `YYYYMMDDHHMMSS_description.sql` in `crates/cognos-engine/migrations/`. `build.rs` panics if two files share a version prefix. Never put ALTER TABLE in `init_schema`.
+- **Mutating endpoints stamp the actor.** Any HTTP handler that mutates state (POST/PUT/PATCH/DELETE) must build an actor and pass it to the resulting event. The canonical entry point is `api::actor::user_actor_resolved(&headers, &state.pool, device_id_override).await` — it reads the device-id header (or the explicit override, used by handlers that take device id in the request body) and looks up the device label from the `devices` table, so the popover renders a real name instead of the bare `device-<short>` fallback. Use the lower-level `user_actor(&headers, device_id, device_label)` only when you already have the label in hand. For new `ThreadEvent` variants prefer `EventMeta::with_actor(actor)`. The four change events carry per-variant `actor` (predates EventMeta path); leave as-is. For `SystemEvent` add `actor: Option<MessageOrigin>` as a `#[serde(default, skip_serializing_if = "Option::is_none")]` field on the variant. Engine-internal emits (state-machine side effects, scheduler tick, recovery) pass `None`. The actor flows into the event payload as a stable `actor` field — frontend reads it without translation.
+- **Database schema changes must be migrations.** Always create with `./scripts/new-migration.sh <description>` — it stamps the file with the real wall-clock second and bumps if the slot is taken. Never hand-pick the timestamp (placeholders like `120000` collide across parallel CC branches and crash the engine on startup with a `_sqlx_migrations_pkey` duplicate). Format: `YYYYMMDDHHMMSS_description.sql` in `crates/lucidos-engine/migrations/`. `build.rs` panics if two files share a version prefix. Never put ALTER TABLE in `init_schema`.
 
 ## Database Design
 
-CognOS uses **event sourcing** — the `events` table is the central source of truth. Thread metadata cached in `thread_summaries` (projection maintained by EventBus).
+Lucidos uses **event sourcing** — the `events` table is the central source of truth. Thread metadata cached in `thread_summaries` (projection maintained by EventBus).
 
 ### Key tables
 

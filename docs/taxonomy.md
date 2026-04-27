@@ -1,24 +1,24 @@
-# CognOS Workspace Taxonomy
+# Lucidos Workspace Taxonomy
 
-Source of truth for how workspace content is organized. Referenced by both the engine system prompt (for the CognOS LLM) and CLAUDE.md (for CC development sessions).
+Source of truth for how workspace content is organized. Referenced by both the engine system prompt (for the Lucidos LLM) and CLAUDE.md (for CC development sessions).
 
 ## Three Content Types
 
 | Type | Purpose | Stability | Who maintains | Example |
 |------|---------|-----------|--------------|---------|
 | **Intent** | What the user wants, in their terms. Goals, conditions, desired outcomes. | Stable — changes when the user's needs change | User | "Find relevant jobs, store them, notify me of new ones and deadlines" |
-| **Knowhow** | How to achieve it, in technical terms. API details, data formats, quirks, workarounds. | Evolves — refined every time CognOS learns something new | CognOS | "Use `.company-logo img` selector, FINN CDN requires base64 conversion" |
+| **Knowhow** | How to achieve it, in technical terms. API details, data formats, quirks, workarounds. | Evolves — refined every time Lucidos learns something new | Lucidos | "Use `.company-logo img` selector, FINN CDN requires base64 conversion" |
 | **Script** | Code invoked by intents or knowhow | Changes when tools or APIs change | Either | `download_images.py`, `validate_images.py` |
 
 ### Intent vs Knowhow
 
-The intent describes **what the user wants** — written in user terms, like what you'd tell a competent assistant. The knowhow describes **how to do it well** — technical details that CognOS accumulates over time.
+The intent describes **what the user wants** — written in user terms, like what you'd tell a competent assistant. The knowhow describes **how to do it well** — technical details that Lucidos accumulates over time.
 
 **Test: "Would a non-technical person understand this file?"**
 - Yes → it's an intent
 - No → it's knowhow
 
-Example: A job search intent says "find relevant jobs for me, store them, notify me if there are new ones or upcoming deadlines." The knowhow explains how FINN.no logos are extracted, how salary is estimated, what CORS workarounds are needed. When CognOS discovers a new quirk, it updates the knowhow — the intent stays the same.
+Example: A job search intent says "find relevant jobs for me, store them, notify me if there are new ones or upcoming deadlines." The knowhow explains how FINN.no logos are extracted, how salary is estimated, what CORS workarounds are needed. When Lucidos discovers a new quirk, it updates the knowhow — the intent stays the same.
 
 ### Frontmatter
 
@@ -47,7 +47,7 @@ description: Controls and monitors Panasonic heatpumps via Comfort Cloud API
 
 ### Continuous Learning
 
-When CognOS discovers something new during execution (a quirk, a better approach, a failure mode), it should update the relevant **knowhow** file. Knowhow is CognOS's living memory of how to do things well. Intents should only change when the user's goal itself changes — never put technical details in intents.
+When Lucidos discovers something new during execution (a quirk, a better approach, a failure mode), it should update the relevant **knowhow** file. Knowhow is Lucidos's living memory of how to do things well. Intents should only change when the user's goal itself changes — never put technical details in intents.
 
 ## Ownership Principle
 
@@ -92,7 +92,7 @@ data/
 
 - **File naming:** Never use generic names like `skill.md`, `knowhow.md`, or `intent.md`. Always name files by what they describe (e.g., `calendar-data-layout.md`, `finn-job-search.md`, `comfort-cloud-api.md`).
 - **Everything under `data/` (except `postgres/`) is git-tracked** — files persist and have version history.
-- **`.cognos/`** is ephemeral (runtime cache, temp files). Can be rebuilt. Not under `data/`.
+- **`.lucidos/`** is ephemeral (runtime cache, temp files). Can be rebuilt. Not under `data/`.
 - **Manifest vs knowhow:** `manifest.json` is for the user (UI display). Knowhow and intents are for the engine (LLM context). Don't put operational knowledge in manifests.
 - **Scripts belong with their consumer** — if only one trigger uses a script, it goes in that trigger's `scripts/`. If only one app uses it, it goes in that app's `scripts/`.
 
@@ -109,10 +109,54 @@ Data storage: pick artifacts (git) OR events (postgres), not both.
 
 ## Triggers
 
-Triggers are scheduled tasks that run on cron or in response to events. They contain:
+Triggers are scheduled tasks that run on cron or in response to events. The **intent** lives in the `TriggerCreated` event payload (`run.text`) — there is no `intent.md` file. The intent references **knowhow** by ID (`run.knowhow: ["openai-api"]`), which IS on disk under `data/knowhow/<id>.md` and gets concatenated onto the intent at fire time. Optional **scripts** live alongside the trigger.
 
-- An **intent** (`.md` file) — what the user wants done when the trigger fires.
-- Optional **scripts** — deterministic code invoked during execution.
+### Intent vs Knowhow Split (the rule everyone gets wrong)
 
-**App-specific triggers** (e.g., daily FINN job check) live in `apps/<name>/triggers/`.
-**Standalone triggers** (e.g., sleep reminder, Google Calendar sync) live in `triggers/<name>/`.
+Triggers tempt you to dump procedure into the intent — there's one big text field, the API doesn't enforce structure, and the procedure is fresh in your head when you create it. **Resist.** Every imperative verb about *how* (hit, parse, scan, fall back, retry, emit) belongs in knowhow, not intent.
+
+- **Intent**: a sentence the user would say. "Notify me when GPT-5.5 is available via the OpenAI API."
+- **Knowhow**: the recipe. "GET `/v1/models` with `Authorization: Bearer $OPENAI_API_KEY`; scan `data[].id` for ids starting with `gpt-5.5`; on 401/403/network error fall back to one `web_search` for ..."
+
+Test: would a non-technical person understand the intent? If no, knowhow has leaked.
+
+### Worked Example
+
+**Bad** (intent contains the recipe):
+```
+run.text: "Check whether gpt-5.5 is available. GET https://api.openai.com/v1/models
+with Authorization: Bearer $OPENAI_API_KEY. Scan data[].id for any id starting
+with gpt-5.5. If found, send_notification + update_trigger to disable. If 401/403
+or network error, fall back to web_search for 'gpt-5.5 OpenAI API available'.
+If not yet available, stay silent."
+run.knowhow: []
+```
+
+**Good** (recipe lives in a knowhow file):
+```
+# data/knowhow/openai-api-availability.md
+---
+name: OpenAI API Model Availability
+description: How to check whether a specific model is reachable via the OpenAI API.
+---
+GET `https://api.openai.com/v1/models` with `Authorization: Bearer $OPENAI_API_KEY`.
+On 200, scan `data[].id` for the requested model prefix. On 401/403/network error,
+fall back to one `web_search` distinguishing API availability from ChatGPT-only rollout.
+```
+```
+run.text: "Notify me when an OpenAI model with id prefix gpt-5.5 becomes available
+via the API. Once notified, disable this trigger."
+run.knowhow: ["openai-api-availability"]
+```
+
+When OpenAI changes their endpoint, you update one knowhow file — not every trigger that uses it. When a new model needs watching, you create a new trigger that points to the same knowhow.
+
+### Order of Operations
+
+When creating a trigger that needs knowhow, write the knowhow file first (so it exists when the trigger fires), then create the trigger referencing it by ID.
+
+### Locations
+
+- **Standalone triggers** live in `triggers/<name>/` (intent is event-sourced; the directory holds scripts and trigger-specific knowhow).
+- **App-specific triggers** live in `apps/<name>/triggers/`.
+- **Shared knowhow** lives in `data/knowhow/<id>.md` (or `data/knowhow/<id>/<descriptive>.md` for multi-file domains).

@@ -1,6 +1,6 @@
-Commit and push all changes in the cognos repo. Follow these steps exactly:
+Commit and push all changes in the lucidos repo. Follow these steps exactly:
 
-1. Run `git status -s` in the cognos repo root to see all changes.
+1. Run `git status -s` in the lucidos repo root to see all changes.
 
 2. **Check for unpushed commits**: Run `git log @{u}..HEAD --oneline` to see if there are commits that haven't been pushed yet. These may be from other sessions.
 
@@ -12,7 +12,7 @@ Commit and push all changes in the cognos repo. Follow these steps exactly:
    - Ask the user to confirm before proceeding: "Commit these files? (list them explicitly so the user can say which to include/exclude)"
    - If the user declines or excludes files, only stage/commit the approved files
 
-5. **Cognos repo changes**: If there are uncommitted changes (from step 1):
+5. **Lucidos repo changes**: If there are uncommitted changes (from step 1):
    - Run `git diff` to review what's being committed
    - Run `git log --oneline -3` for commit message style
    - Stage all non-workspace changed files by name (never use `git add -A` or `git add .`)
@@ -23,7 +23,7 @@ Commit and push all changes in the cognos repo. Follow these steps exactly:
    - Run `git status -s` to check for uncommitted changes
    - If there are changes: stage them by name, commit with a conventional commit message
    - Push the worktree branch to the remote: `git push -u origin <branch-name>`
-   - **Do NOT touch other worktrees.** Each session is responsible for its own worktree only. Never cd into, commit in, or push branches from worktrees you are not working in — they belong to other sessions (terminal Claude or CognOS).
+   - **Do NOT touch other worktrees.** Each session is responsible for its own worktree only. Never cd into, commit in, or push branches from worktrees you are not working in — they belong to other sessions (terminal Claude or Lucidos).
 
 7. **Push**: Push all commits on the current branch (both new and previously unpushed) to the remote.
 

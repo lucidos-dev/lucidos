@@ -1,11 +1,11 @@
 ---
 name: spawn-thread
-description: Use when a task should be handled in a separate CognOS thread — spawns a new thread (chat or CC session) in the same or a different workspace via the CognOS API
+description: Use when a task should be handled in a separate Lucidos thread — spawns a new thread (chat or CC session) in the same or a different workspace via the `lucidos send-thread` CLI
 ---
 
-# Spawn a CognOS Thread
+# Spawn a Lucidos Thread
 
-Start a new thread in a CognOS workspace by posting to its API. Use this when:
+Start a new thread in a Lucidos workspace by invoking the `lucidos send-thread` CLI. Use this when:
 
 - A sidequest arises that doesn't belong in the current changeset
 - The user asks you to send a task to another workspace (e.g., "do this in test ws")
@@ -14,71 +14,60 @@ Start a new thread in a CognOS workspace by posting to its API. Use this when:
 
 ## How It Works
 
-CognOS workspaces expose an HTTP API. The port is in `<workspace>/.cognos/ports`.
+The engine sets these env vars on every Claude Code subprocess — the CLI reads them automatically, so you don't pass them by hand:
 
-### 1. Find the port
+- `$LUCIDOS_WORKSPACE` — absolute path to the parent workspace; basename becomes `caller_workspace`
+- `$LUCIDOS_THREAD_ID` — current thread UUID; becomes `caller_thread_id` (or `parent_thread_id` with `--parent`)
+- `$LUCIDOS_EVENT_ID` — the tool-call event UUID; becomes `caller_event_id` (or `spawning_event_id` with `--parent`)
+
+### `--parent` vs no flag
+
+- **Same workspace, parent-with-callback** (most common from CC): pass `--parent`. The CLI emits `parent_thread_id` + `spawning_event_id` in the body, and the spawned thread will call back to the parent on completion. `--to` must resolve to the same workspace as `$LUCIDOS_WORKSPACE` (else error).
+- **Cross-workspace, fire-and-forget**: omit `--parent`. The CLI emits `caller_workspace` + `caller_thread_id` + `caller_event_id`. There is no callback — see "Fire-and-forget" below.
+
+### Examples
+
+**Same-workspace CC spawn** (parent-with-callback — the typical sidequest):
 
 ```bash
-# Same workspace (read from environment or ports file)
-API_PORT=$(grep API_PORT /path/to/workspace/.cognos/ports | cut -d= -f2)
-
-# Known workspaces
-# Personal: ~/workspaces/personal/.cognos/ports
-# Dev:     ~/workspaces/dev/.cognos/ports
+lucidos send-thread --parent --to "$(basename "$LUCIDOS_WORKSPACE")" --cc \
+  --message "task description" --title "Short title"
 ```
 
-### 2. Start a thread
+**Same-workspace chat thread spawn** (research/question, no code changes):
 
-This skill always sends `sender: "system"` because it's invoked by CC, never by a real user; the validator rejects system spawns missing `parent_thread_id`, so the link to the parent thread is guaranteed. CC exports `$COGNOS_THREAD_ID` into every Bash subprocess — use it as the `parent_thread_id`. Build the JSON with `jq -n --arg parent "$COGNOS_THREAD_ID"` to interpolate it safely.
-
-**CC session** (code changes, file edits):
 ```bash
-jq -n \
-  --arg parent "$COGNOS_THREAD_ID" \
-  --arg title "Short descriptive title" \
-  --arg message "your task description here" \
-  '{sender: "system", parent_thread_id: $parent, title: $title, message: $message, use_claude_code: true}' \
-| curl -s -X POST "https://localhost:${API_PORT}/api/chat/stream" \
-  -H "Content-Type: application/json" \
-  --insecure \
-  --data-binary @-
+lucidos send-thread --parent --to "$(basename "$LUCIDOS_WORKSPACE")" \
+  --message "question or task" --title "Short title"
 ```
 
-**Chat thread** (research, questions, planning — no code changes):
+**Cross-workspace CC spawn** (no callback):
+
 ```bash
-jq -n \
-  --arg parent "$COGNOS_THREAD_ID" \
-  --arg title "Short descriptive title" \
-  --arg message "your question or task here" \
-  '{sender: "system", parent_thread_id: $parent, title: $title, message: $message}' \
-| curl -s -X POST "https://localhost:${API_PORT}/api/chat/stream" \
-  -H "Content-Type: application/json" \
-  --insecure \
-  --data-binary @-
+lucidos send-thread --to dev --cc \
+  --message "task description" --title "Short title"
 ```
 
-One call. CognOS creates a new thread and returns `{"event_id": "..."}`. The thread appears in the target workspace's UI immediately.
+The CLI prints `{"event_id": "..."}` on success. The thread appears immediately in the target workspace's UI.
 
-### Options
+### Flags
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `sender` | string | **Required.** Always `"system"` for this skill — it's invoked by CC, never a real user. |
-| `parent_thread_id` | string (UUID) | **Required when `sender == "system"`.** The thread that's spawning this one. Read from `$COGNOS_THREAD_ID`. The validator returns 400 if missing. |
-| `spawning_event_id` | string (UUID) | Optional, only allowed when `sender == "system"`. **Omit it** — the Bash subprocess running this skill has no access to its own `ClaudeCodeToolCalled` event id (CC exports only `COGNOS_THREAD_ID`). |
-| `title` | string | **Required.** Short descriptive title for the thread (shown in thread list). |
-| `message` | string | **Required.** The task prompt. |
-| `use_claude_code` | bool | `true` = CC session (code changes). Omit or `false` = chat thread. |
-| `cc_model` | string | Optional CC model override (e.g., `"sonnet"`, `"opus"`, `"haiku"`). |
-| `model` | string | Optional chat model override. |
-
-### 3. Verify it started
-
-The curl returns `{"event_id": "..."}` on success. The thread will appear in the target workspace's thread list.
+| Flag | Purpose |
+|------|---------|
+| `--to <name\|path>` | **Required.** Target workspace name (resolved against `~/workspaces/<name>` or `$LUCIDOS_WORKSPACES_ROOT`) or absolute path. |
+| `--message <text>` | **Required.** Task prompt. |
+| `--title <text>` | **Required in practice** — the thread list shows titles, not message text. |
+| `--cc` | Spawn a Claude Code session instead of a chat thread. |
+| `--parent` | Same-workspace parent-with-callback semantics (see above). |
+| `--cc-model <m>` | Optional CC model (`sonnet`, `opus`, `haiku`). |
+| `--model <m>` | Optional chat model. |
+| `--mode <m>` | Override actor mode (defaults to `agent`, which is correct for CC-driven spawns). |
 
 ## Fire-and-forget — no callback
 
-Spawning a thread via this API is **fire-and-forget from your perspective**. The POST confirms the thread was created — nothing more. You will receive no callback, no status updates, and no completion notification when the spawned thread finishes (unlike `run_thread`, which only callbacks back within the SAME workspace). Do not promise the user you'll "let them know when it's done" or "check back later" — you have no way to know. Tell the user the thread was created and where to find it (target workspace's thread list).
+A cross-workspace POST (no `--parent`) is **fire-and-forget from your perspective**. The CLI confirms the thread was created — nothing more. You will receive no callback, no status updates, and no completion notification. Do not promise the user you'll "let them know when it's done" or "check back later" — you have no way to know. Tell the user the thread was created and where to find it (target workspace's thread list).
+
+`--parent` (same-workspace) does deliver a callback to the parent thread when the child finishes — that's the only mode where a follow-up signal exists.
 
 ## When to Suggest Spawning
 
@@ -88,34 +77,17 @@ If during your work you notice something that should be done separately, suggest
 
 Only spawn after the user confirms. Never spawn threads silently.
 
-## Cross-Workspace
-
-To send work to a different workspace, just read that workspace's ports file:
-
-```bash
-# From personal workspace, send task to dev workspace
-API_PORT=$(grep API_PORT ~/workspaces/dev/.cognos/ports | cut -d= -f2)
-jq -n \
-  --arg parent "$COGNOS_THREAD_ID" \
-  '{sender: "system", parent_thread_id: $parent, title: "Fix broken test in foo.rs", message: "fix the broken test in foo.rs", use_claude_code: true}' \
-| curl -s -X POST "https://localhost:${API_PORT}/api/chat/stream" \
-  -H "Content-Type: application/json" \
-  --insecure \
-  --data-binary @-
-```
-
 ## Writing the Prompt
 
-The spawned session is a fresh CC instance in a different worktree. It has none of your context. A few things look natural to write but are wrong in CognOS:
+The spawned session is a fresh CC instance in a different worktree. It has none of your context. A few things look natural to write but are wrong in Lucidos:
 
-- **Don't say "open a PR" / "submit a PR" / "branch off main".** The CognOS engine auto-merges every CC branch back to main when the session ends. There is no PR workflow. Instructing the spawned thread to open one will either confuse it or cause it to do redundant work and fight its own SessionStart guidance. Just describe the task; merging happens automatically.
-- **Don't reference paths inside your own worktree.** Your `.cognos/worktrees/cc-…` path doesn't exist in the spawned session. Use repo-relative paths (`crates/cognos-engine/src/foo.rs`) or paths anchored at the workspace root.
-- **Don't assume shared in-memory state, env vars, or running processes.** The spawned thread starts cold — it can't see your conversation, your TodoWrite list, your unstaged edits, or variables you exported. Everything it needs to act on must be in the `message` field.
+- **Don't say "open a PR" / "submit a PR" / "branch off main".** The Lucidos engine auto-merges every CC branch back to main when the session ends. There is no PR workflow. Instructing the spawned thread to open one will either confuse it or cause it to do redundant work and fight its own SessionStart guidance. Just describe the task; merging happens automatically.
+- **Don't reference paths inside your own worktree.** Your `.lucidos/worktrees/cc-…` path doesn't exist in the spawned session. Use repo-relative paths (`crates/lucidos-engine/src/foo.rs`) or paths anchored at the workspace root.
+- **Don't assume shared in-memory state, env vars, or running processes.** The spawned thread starts cold — it can't see your conversation, your TodoWrite list, your unstaged edits, or variables you exported. Everything it needs to act on must be in the `--message` argument.
 - **Do include the *why*, not just the *what*.** "Fix the broken test in foo.rs because the mock was removed in <commit>" gives the spawned thread enough to make judgment calls. "Fix foo.rs" doesn't.
 
 ## Important
 
 - **Always ask before spawning** — never create threads without user approval
-- **Always include a title** — the thread list shows titles, not message text
-- **Use `--insecure`** — CognOS uses self-signed TLS locally
+- **Always include `--title`** — the thread list shows titles, not message text
 - **Don't spawn for trivial things** — if it's a one-line fix in a file you're already editing, just do it

@@ -2,17 +2,17 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: cognos-pg-${COGNOS_PG_NAME:-default}
+    container_name: lucidos-pg-${LUCIDOS_PG_NAME:-default}
     ports:
-      - "${COGNOS_PG_PORT:-5432}:5432"
+      - "${LUCIDOS_PG_PORT:-5432}:5432"
     volumes:
-      - ${COGNOS_WORKSPACE:-./workspace}/data/postgres:/var/lib/postgresql/data
+      - ${LUCIDOS_WORKSPACE:-./workspace}/data/postgres:/var/lib/postgresql/data
     environment:
-      - POSTGRES_USER=cognos
-      - POSTGRES_PASSWORD=cognos
-      - POSTGRES_DB=cognos
+      - POSTGRES_USER=lucidos
+      - POSTGRES_PASSWORD=lucidos
+      - POSTGRES_DB=lucidos
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cognos"]
+      test: ["CMD-SHELL", "pg_isready -U lucidos"]
       interval: 5s
       timeout: 5s
       retries: 5

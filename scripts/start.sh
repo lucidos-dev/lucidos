@@ -1,15 +1,15 @@
 #!/bin/bash
-# Start CognOS engine in Docker
+# Start Lucidos engine in Docker
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-WORKSPACE_FILE="$PROJECT_DIR/.cognos-workspace"
+WORKSPACE_FILE="$PROJECT_DIR/.lucidos-workspace"
 
 cd "$PROJECT_DIR"
 
 # Parse arguments
-WORKSPACE="${COGNOS_WORKSPACE:-}"
+WORKSPACE="${LUCIDOS_WORKSPACE:-}"
 BUILD=""
 FOREGROUND=""
 while [[ $# -gt 0 ]]; do
@@ -27,13 +27,13 @@ while [[ $# -gt 0 ]]; do
             echo "  -h, --help            Show this help"
             echo ""
             echo "Environment:"
-            echo "  COGNOS_WORKSPACE              Workspace directory"
+            echo "  LUCIDOS_WORKSPACE              Workspace directory"
             echo "  VERTEX_PROJECT_ID             GCP project ID"
             echo "  VERTEX_REGION                 GCP region (default: europe-west1)"
             echo "  GOOGLE_APPLICATION_CREDENTIALS  Path to GCP credentials"
             echo ""
             echo "Example:"
-            echo "  $0 -w ~/.cognos/workspaces/personal"
+            echo "  $0 -w ~/.lucidos/workspaces/personal"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -51,7 +51,7 @@ if [ -z "$WORKSPACE" ]; then
         echo "Usage: $0 -w <workspace>"
         echo ""
         echo "Example:"
-        echo "  $0 -w ~/.cognos/workspaces/personal"
+        echo "  $0 -w ~/.lucidos/workspaces/personal"
         exit 1
     fi
 fi
@@ -61,14 +61,14 @@ WORKSPACE="$(cd "$WORKSPACE" 2>/dev/null && pwd || mkdir -p "$WORKSPACE" && cd "
 echo "$WORKSPACE" > "$WORKSPACE_FILE"
 
 # Check if already running
-if docker-compose ps --services --filter "status=running" 2>/dev/null | grep -q cognos; then
-    echo "CognOS engine already running in Docker"
+if docker-compose ps --services --filter "status=running" 2>/dev/null | grep -q lucidos; then
+    echo "Lucidos engine already running in Docker"
     echo "Use ./scripts/stop.sh to stop it first"
     exit 1
 fi
 
 # Export for docker-compose
-export COGNOS_WORKSPACE="$WORKSPACE"
+export LUCIDOS_WORKSPACE="$WORKSPACE"
 export VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-}"
 export VERTEX_REGION="${VERTEX_REGION:-europe-west1}"
 
@@ -83,7 +83,7 @@ if [ -z "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
     fi
 fi
 
-echo "Starting CognOS engine..."
+echo "Starting Lucidos engine..."
 echo "  Workspace: $WORKSPACE"
 echo "  Project:   ${VERTEX_PROJECT_ID:-<not set>}"
 echo "  Region:    $VERTEX_REGION"
@@ -107,7 +107,7 @@ else
     for i in {1..60}; do
         if curl -s http://localhost:3000/health >/dev/null 2>&1; then
             echo ""
-            echo "CognOS engine started"
+            echo "Lucidos engine started"
             echo "  API: http://localhost:3000"
             echo "  Logs: docker-compose logs -f"
             echo ""

@@ -34,8 +34,8 @@ This starts PostgreSQL in Docker, builds/runs the Rust engine natively, and laun
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `COGNOS_WORKSPACE` | — | Workspace directory |
-| `COGNOS_MODEL` | `claude-opus-4-7` | LLM model name |
+| `LUCIDOS_WORKSPACE` | — | Workspace directory |
+| `LUCIDOS_MODEL` | `claude-opus-4-7` | LLM model name |
 | `VERTEX_PROJECT_ID` | — | GCP project (for `claude-*`/`gemini-*`) |
 | `VERTEX_REGION` | `europe-west1` | Vertex AI region |
 | `OPENAI_API_KEY` | — | OpenAI key (for `gpt-*` models) |
@@ -108,7 +108,7 @@ After this, Safari and Chrome on iOS will trust your dev server's HTTPS certific
 
 ```
 /workspace/
-  .cognos/            # Ephemeral runtime (deletable)
+  .lucidos/            # Ephemeral runtime (deletable)
   data/
     artifacts/        # Git-tracked user files
     skills/           # Skill definitions + UIs
@@ -138,11 +138,11 @@ Two independent version axes:
 - **`RELEASE`** (repo root) — the umbrella user-facing version of the Lucidos
   release that bundles all crates. Currently `0.7`. Think Ubuntu 24.04: one
   number per shipped release, regardless of how the individual components
-  inside have moved. Exposed at runtime as `cognos_engine::LUCIDOS_RELEASE`,
+  inside have moved. Exposed at runtime as `lucidos_engine::LUCIDOS_RELEASE`,
   in the `release` field of `/api/health`, in the engine's `--version` output,
   and in the desktop app's control panel.
-- **Per-crate `Cargo.toml` versions** — semver per component (cognos-engine,
-  cognos-app, etc.), bumped on their own cadence by `build.rs`. Visible as
+- **Per-crate `Cargo.toml` versions** — semver per component (lucidos-engine,
+  lucidos-app, etc.), bumped on their own cadence by `build.rs`. Visible as
   `engine_version` / `latest_tauri_app_version` in `/api/health`.
 
 ### Cutting a Lucidos release

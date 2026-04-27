@@ -1,5 +1,5 @@
 #!/bin/bash
-# Restart CognOS engine for a specific workspace
+# Restart Lucidos engine for a specific workspace
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +20,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: $0 -w <workspace> [OPTIONS]"
             echo ""
-            echo "Stops and restarts CognOS for a specific workspace."
+            echo "Stops and restarts Lucidos for a specific workspace."
             echo ""
             echo "Options:"
             echo "  -w, --workspace DIR   Workspace directory (required)"

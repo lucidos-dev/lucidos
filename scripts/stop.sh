@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stop CognOS engine (workspace-aware, supports multiple concurrent workspaces)
+# Stop Lucidos engine (workspace-aware, supports multiple concurrent workspaces)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +17,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: $0 -w <workspace> [OPTIONS]"
             echo ""
-            echo "Stop CognOS engine and frontend for a single workspace."
+            echo "Stop Lucidos engine and frontend for a single workspace."
             echo ""
             echo "Options:"
             echo "  -w, --workspace DIR   Workspace to stop (required)"
@@ -36,14 +36,15 @@ if [ -z "$WORKSPACE" ]; then
 fi
 
 source "$SCRIPT_DIR/lib/sleep.sh"
+source "$SCRIPT_DIR/lib/workspace.sh"
 
 # Stop a single workspace by its path
 stop_workspace() {
     local ws="$1"
     local stopped=""
 
-    local engine_pid_file="$ws/.cognos/engine.pid"
-    local frontend_pid_file="$ws/.cognos/frontend.pid"
+    local engine_pid_file="$ws/.lucidos/engine.pid"
+    local frontend_pid_file="$ws/.lucidos/frontend.pid"
 
     # Stop engine
     if [ -f "$engine_pid_file" ]; then
@@ -73,9 +74,9 @@ stop_workspace() {
     if [ -n "$FORCE" ]; then
         local pg_name
         pg_name=$(printf '%s' "$ws" | cksum | awk '{print $1}')
-        if docker inspect "cognos-pg-$pg_name" >/dev/null 2>&1; then
-            echo "Stopping PostgreSQL container cognos-pg-$pg_name for $ws"
-            docker rm -f "cognos-pg-$pg_name" 2>/dev/null || true
+        if docker inspect "lucidos-pg-$pg_name" >/dev/null 2>&1; then
+            echo "Stopping PostgreSQL container lucidos-pg-$pg_name for $ws"
+            docker rm -f "lucidos-pg-$pg_name" 2>/dev/null || true
             stopped="1"
         fi
     fi
@@ -89,7 +90,5 @@ stop_workspace() {
     fi
 }
 
-if [ -d "$WORKSPACE" ]; then
-    WORKSPACE="$(cd "$WORKSPACE" && pwd)"
-fi
+resolve_workspace_path
 stop_workspace "$WORKSPACE"

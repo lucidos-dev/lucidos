@@ -151,8 +151,8 @@ authoritative answer.
 
 The apply endpoint refuses to silently apply a change with declared files
 when the branch ref has no commits — see `recover_no_commits_branch()` in
-`crates/cognos-engine/src/engine/git_ops.rs`, called from
-`crates/cognos-engine/src/engine/change_ops.rs` around the
+`crates/lucidos-engine/src/engine/git_ops.rs`, called from
+`crates/lucidos-engine/src/engine/change_ops.rs` around the
 `!has_branch_commits(...)` check. Before that fix, an
 empty branch could mark a change "applied" while uncommitted CC work in
 the worktree was silently discarded.
@@ -169,11 +169,11 @@ happened.
 - Event: `ChangeApplied` — emitted into the owning thread when the merge
   completes. Payload includes `commits` (subjects, oldest first) and
   `requires_restart`. Defined in
-  `crates/cognos-engine/src/engine/thread_events.rs`.
-- Engine method: `CognosEngine::apply_change` in
-  `crates/cognos-engine/src/engine/change_ops.rs` — the underlying logic
+  `crates/lucidos-engine/src/engine/thread_events.rs`.
+- Engine method: `LucidosEngine::apply_change` in
+  `crates/lucidos-engine/src/engine/change_ops.rs` — the underlying logic
   that the HTTP handler delegates to. Returns `ApplyResult` (defined in
-  `crates/cognos-engine/src/engine/types.rs`).
+  `crates/lucidos-engine/src/engine/types.rs`).
 - TypeScript client: `applyChange()` in
-  `crates/cognos-app/src/api/client.ts` — typed wrapper. The
+  `crates/lucidos-app/src/api/client.ts` — typed wrapper. The
   `ApplyChangeResult` interface mirrors the JSON shape above.

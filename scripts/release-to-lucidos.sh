@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Push the current tree as a single squashed commit to the `lucidos` git remote.
 #
-# Lucidos is the public, user-facing release of CognOS. Internal history,
+# Lucidos is the public, user-facing release of Lucidos. Internal history,
 # branches, and per-step commits stay on `origin`; the public mirror only ever
 # sees one orphan commit per release, tagged `v<RELEASE>`.
 #
@@ -20,6 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RELEASE_FILE="$REPO_ROOT/RELEASE"
 REMOTE="lucidos"
+REPO_SLUG="lucidos-dev/lucidos"
 BRANCH="main"
 
 step() { echo "==> $*"; }
@@ -37,7 +38,7 @@ if ! git -C "$REPO_ROOT" remote get-url "$REMOTE" >/dev/null 2>&1; then
 ERROR: git remote '$REMOTE' is not configured.
 
 To configure it:
-  git remote add $REMOTE git@github.com:lucidos-dev/lucidos.git
+  git remote add $REMOTE git@github.com:$REPO_SLUG.git
 
 Then re-run this script.
 EOF
@@ -94,6 +95,32 @@ step "Creating and pushing tag $tag"
 git -C "$REPO_ROOT" tag -f "$tag" "$commit"
 git -C "$REPO_ROOT" push --force "$REMOTE" "refs/tags/$tag"
 
+step "Extracting CHANGELOG.md section for v$release"
+NOTES_FILE="$(mktemp -t lucidos-release-notes)"
+trap 'rm -f "$RELEASE_INDEX" "$NOTES_FILE"' EXIT
+awk -v ver="$release" '
+  BEGIN { gsub(/\./, "\\.", ver) }
+  /^## v/ {
+    if (matched) { exit }
+    if ($0 ~ "^## v" ver "([^0-9.]|$)") { matched=1 }
+  }
+  matched { print }
+' "$REPO_ROOT/CHANGELOG.md" > "$NOTES_FILE"
+[[ -s "$NOTES_FILE" ]] || fail "No CHANGELOG.md section found for v$release"
+
+step "Creating GitHub Release $tag"
+if command -v gh >/dev/null; then
+  if gh release view "$tag" --repo "$REPO_SLUG" >/dev/null 2>&1; then
+    echo "    release exists, updating notes"
+    gh release edit "$tag" --repo "$REPO_SLUG" --notes-file "$NOTES_FILE"
+  else
+    gh release create "$tag" --repo "$REPO_SLUG" --target "$BRANCH" --title "$tag" --notes-file "$NOTES_FILE"
+  fi
+else
+  echo "    WARNING: gh CLI not found; create the release manually:"
+  echo "      gh release create $tag --repo $REPO_SLUG --target $BRANCH --title $tag --notes-file <changelog-section>"
+fi
+
 step "Deleting temp branch $temp_branch"
 git -C "$REPO_ROOT" branch -D "$temp_branch"
 
@@ -105,5 +132,5 @@ Release pushed.
   Tag:     $tag
   Remote:  $REMOTE/$BRANCH
 
-  https://github.com/lucidos-dev/lucidos/releases/tag/$tag
+  https://github.com/$REPO_SLUG/releases/tag/$tag
 EOF

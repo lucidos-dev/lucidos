@@ -2,10 +2,12 @@ Harden the code: review changed code for reuse, quality, and efficiency, then fi
 
 ## Phase 0: Check if Already Hardened
 
-The marker stores the HEAD commit SHA. A new commit changes HEAD, invalidating the marker. Run:
+`lucidos hardened query` prints `FRESH`, `STALE`, or `MISSING` for the branch
+in `$PWD`. `FRESH` means HEAD still matches the SHA recorded by the last
+`/harden`; `STALE` means CC has committed since then and a re-run is needed.
 
 ```bash
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) && HASH=$(echo -n "$REPO_ROOT" | shasum -a 256 | cut -d' ' -f1) && MARKER_DIR="$HOME/.cognos/harden-markers" && mkdir -p "$MARKER_DIR" && MARKER="$MARKER_DIR/cognos-harden-$HASH" && CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null) && [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$CURRENT_SHA" ] && echo "ALREADY_HARDENED" || echo "NOT_HARDENED"
+[ "$(lucidos hardened query 2>/dev/null)" = "FRESH" ] && echo "ALREADY_HARDENED" || echo "NOT_HARDENED"
 ```
 
 If the output is `ALREADY_HARDENED`, inform the user: "Already hardened — skipping." and stop. Do NOT re-run hardening.
@@ -68,12 +70,14 @@ Only issues confirmed by validation proceed to the report.
 
 ## Phase 5: Create Marker
 
-After all phases complete (and any bug fixes are applied), create the marker by running the helper script:
+After all phases complete (and any bug fixes are applied), record this branch's
+HEAD as hardened in the parent workspace's DB:
 
 ```bash
 .claude/hooks/mark-harden.sh
 ```
 
-The marker is stored in `~/.cognos/harden-markers/` outside the worktree — do not look for it or try to manage it.
+State lives in the `hardened_branches` DB table (keyed by repo root + branch),
+not on disk — do not look for or manage any marker files.
 
 Inform the user: "Hardening complete. Session can finish."

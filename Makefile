@@ -9,7 +9,7 @@ build:
 
 # Build locally (for development)
 build-local:
-	cargo build -p cognos-engine -p cognos-cli
+	cargo build -p lucidos-engine -p lucidos-cli
 
 # Run all checks
 check: lint
@@ -39,7 +39,7 @@ test-full:
 # Clean build artifacts (preserves workspace artifacts)
 clean:
 	cargo clean
-	rm -rf test-workspace/data test-workspace/.cognos
+	rm -rf test-workspace/data test-workspace/.lucidos
 
 # Clean everything including artifacts (use with caution)
 clean-all:
@@ -47,15 +47,15 @@ clean-all:
 	rm -rf test-workspace
 	docker-compose down --volumes --remove-orphans
 
-# Start CognOS in Docker (background)
+# Start Lucidos in Docker (background)
 start:
-	COGNOS_WORKSPACE=$(WORKSPACE) ./scripts/start.sh
+	LUCIDOS_WORKSPACE=$(WORKSPACE) ./scripts/start.sh
 
-# Stop CognOS Docker container
+# Stop Lucidos Docker container
 stop:
 	./scripts/stop.sh
 
-# Restart CognOS Docker container
+# Restart Lucidos Docker container
 restart:
 	./scripts/restart.sh
 
@@ -69,15 +69,15 @@ logs:
 
 # Run in foreground (for development)
 run:
-	COGNOS_WORKSPACE=$(WORKSPACE) ./scripts/start.sh -f
+	LUCIDOS_WORKSPACE=$(WORKSPACE) ./scripts/start.sh -f
 
 # Run locally without Docker (for development)
 run-local:
-	rm -rf test-workspace/data test-workspace/.cognos
-	COGNOS_WORKSPACE=./test-workspace cargo run -p cognos-engine
+	rm -rf test-workspace/data test-workspace/.lucidos
+	LUCIDOS_WORKSPACE=./test-workspace cargo run -p lucidos-engine
 
 # Build and run fresh
 fresh: build
 	./scripts/stop.sh || true
-	rm -rf $(WORKSPACE)/data $(WORKSPACE)/.cognos
-	COGNOS_WORKSPACE=$(WORKSPACE) ./scripts/start.sh
+	rm -rf $(WORKSPACE)/data $(WORKSPACE)/.lucidos
+	LUCIDOS_WORKSPACE=$(WORKSPACE) ./scripts/start.sh

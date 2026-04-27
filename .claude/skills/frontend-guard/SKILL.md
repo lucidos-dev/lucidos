@@ -1,9 +1,9 @@
 ---
 name: frontend-guard
-description: Use when modifying CognOS frontend code (CSS, TSX, components) — checks changes against design tokens, component classes, and conventions to prevent drift
+description: Use when modifying Lucidos frontend code (CSS, TSX, components) — checks changes against design tokens, component classes, and conventions to prevent drift
 ---
 
-When modifying CognOS frontend code (CSS, TSX, components), check every change against these rules. Flag any violation before committing.
+When modifying Lucidos frontend code (CSS, TSX, components), check every change against these rules. Flag any violation before committing.
 
 ## Design Tokens (`:root` in `global.css`)
 

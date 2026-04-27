@@ -38,7 +38,7 @@ make_pkg_dir() {
 write_pid_for_workspace() {
     local ws_name="$1"
     local pid="$2"
-    local dir="$HOME/workspaces/$ws_name/.cognos"
+    local dir="$HOME/workspaces/$ws_name/.lucidos"
     mkdir -p "$dir"
     echo "$pid" > "$dir/frontend.pid"
 }
@@ -176,10 +176,92 @@ test_no_install_needed_skips_check() {
     fi
 }
 
+# ── Test 5: resolve_workspace_path expands bare names like web-dev.sh ──
+test_resolves_bare_name_to_home_workspaces() {
+    echo "test: resolve_workspace_path expands bare name"
+
+    rm -rf "$HOME/workspaces"
+    mkdir -p "$HOME/workspaces/dev/.lucidos"
+    # Get canonical path for comparison (handles macOS /private/var symlinks)
+    local expected
+    expected="$(cd "$HOME/workspaces/dev" && pwd)"
+
+    WORKSPACE="dev"
+    if resolve_workspace_path; then
+        if [ "$WORKSPACE" = "$expected" ]; then
+            pass "bare name 'dev' resolved to $expected"
+        else
+            fail "expected $expected, got $WORKSPACE"
+        fi
+    else
+        fail "resolve_workspace_path returned non-zero for existing workspace"
+    fi
+}
+
+test_resolves_absolute_path_unchanged() {
+    echo "test: resolve_workspace_path accepts absolute paths"
+
+    rm -rf "$HOME/workspaces"
+    mkdir -p "$HOME/workspaces/dev/.lucidos"
+    local expected
+    expected="$(cd "$HOME/workspaces/dev" && pwd)"
+
+    WORKSPACE="$HOME/workspaces/dev"
+    if resolve_workspace_path && [ "$WORKSPACE" = "$expected" ]; then
+        pass "absolute path resolved to $expected"
+    else
+        fail "expected $expected, got $WORKSPACE"
+    fi
+}
+
+test_errors_on_missing_workspace() {
+    echo "test: resolve_workspace_path errors when workspace missing"
+
+    rm -rf "$HOME/workspaces"
+
+    WORKSPACE="ghost-ws"
+    local err
+    err="$(resolve_workspace_path 2>&1)"
+    local rc=$?
+
+    if [ $rc -eq 0 ]; then
+        fail "expected non-zero exit for missing workspace, got 0"
+    else
+        pass "errored on missing workspace (rc=$rc)"
+    fi
+    if echo "$err" | grep -q "Workspace not found"; then
+        pass "error message names the missing workspace"
+    else
+        fail "error message did not mention 'Workspace not found': $err"
+    fi
+}
+
+test_does_not_create_directories() {
+    echo "test: resolve_workspace_path is side-effect free (no mkdir)"
+
+    rm -rf "$HOME/workspaces"
+
+    WORKSPACE="never-existed"
+    resolve_workspace_path 2>/dev/null || true
+
+    # Critical: stop / status must NOT create the workspace dir as a
+    # side effect of resolving its name. resolve_workspace (the mutating
+    # variant) does that for start scripts.
+    if [ -d "$HOME/workspaces/never-existed" ]; then
+        fail "resolve_workspace_path created directory: $HOME/workspaces/never-existed"
+    else
+        pass "no directory created"
+    fi
+}
+
 test_refuses_install_when_other_frontend_running
 test_installs_when_no_frontend_running
 test_stale_pidfile_does_not_block
 test_no_install_needed_skips_check
+test_resolves_bare_name_to_home_workspaces
+test_resolves_absolute_path_unchanged
+test_errors_on_missing_workspace
+test_does_not_create_directories
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shared functions for CognOS dev scripts (web-dev.sh, tauri-dev.sh).
+# Shared functions for Lucidos dev scripts (web-dev.sh, tauri-dev.sh).
 # All functions operate on shared global variables set by earlier functions.
 #
 # Expected call order:
@@ -23,7 +23,7 @@
 # ── parse_dev_args ──────────────────────────────────────────────────────
 # Parse -w, -b, -r, -h flags. Sets WORKSPACE, BUILD, RELEASE.
 parse_dev_args() {
-    WORKSPACE="${COGNOS_WORKSPACE:-}"
+    WORKSPACE="${LUCIDOS_WORKSPACE:-}"
     BUILD=""
     RELEASE=""
     ENGINE_ONLY=""
@@ -69,9 +69,28 @@ parse_dev_args() {
     fi
 }
 
+# ── resolve_workspace_path ──────────────────────────────────────────────
+# Pure resolver: expand bare name → ~/workspaces/<name>, canonicalize.
+# Reads & writes $WORKSPACE. Returns 1 on missing workspace. No side effects.
+# Use from read-only scripts (stop, status, tail) so unresolvable names
+# error loudly instead of being silently treated as "nothing to do".
+resolve_workspace_path() {
+    if [[ "$WORKSPACE" != */* ]]; then
+        WORKSPACE="$HOME/workspaces/$WORKSPACE"
+    fi
+    if [ ! -d "$WORKSPACE" ]; then
+        echo "Error: Workspace not found: $WORKSPACE" >&2
+        return 1
+    fi
+    WORKSPACE="$(cd "$WORKSPACE" && pwd)"
+}
+
 # ── resolve_workspace ───────────────────────────────────────────────────
-# Expand bare names to ~/workspaces/<name>, create dirs, resolve to absolute.
-# Sets: WORKSPACE, ENGINE_PIDFILE, FRONTEND_PIDFILE, ENGINE_LOG, PG_NAME
+# Same name resolution as resolve_workspace_path, plus the side effects
+# needed to *start* a workspace: creates the workspace dir + subdirs if
+# missing, and sets ENGINE_PIDFILE / FRONTEND_PIDFILE / ENGINE_LOG / PG_NAME.
+# Use from start scripts (web-dev.sh, tauri-dev.sh, e2e). For stop / status
+# / tail, use resolve_workspace_path instead.
 resolve_workspace() {
     # Bare name (no /) → ~/workspaces/<name>
     if [[ "$WORKSPACE" != */* ]]; then
@@ -85,15 +104,57 @@ resolve_workspace() {
     fi
     WORKSPACE="$(cd "$WORKSPACE" && pwd)"
 
+    # One-time rebrand migration. Old name spelled via variable so this block
+    # survives future bulk renames.
+    local _old="cognos"
+    if [ -d "$WORKSPACE/.${_old}" ]; then
+        # If a prior broken run created an empty .lucidos/ stub (mkdir -p ran
+        # before the engine crashed on auth), it has only runtime files
+        # (engine.pid/log/ports) and no subdirectories. Real workspace state
+        # always contains subdirs (worktrees/, browser-profile/, exhaust/...).
+        # Stash the stub aside (never delete) so the real .cognos/ data wins.
+        if [ -d "$WORKSPACE/.lucidos" ]; then
+            local subdir_count
+            subdir_count=$(find "$WORKSPACE/.lucidos" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$subdir_count" = "0" ]; then
+                local stash="$WORKSPACE/.lucidos.stale-$(date +%Y%m%d%H%M%S)"
+                echo "Stashing stub $WORKSPACE/.lucidos → $(basename "$stash") so .${_old}/ migration can proceed"
+                mv "$WORKSPACE/.lucidos" "$stash"
+            else
+                echo "ERROR: both $WORKSPACE/.${_old}/ and $WORKSPACE/.lucidos/ contain real state — manual merge required" >&2
+                return 1
+            fi
+        fi
+        echo "Migrating $WORKSPACE/.${_old} → $WORKSPACE/.lucidos (one-time rebrand)"
+        mv "$WORKSPACE/.${_old}" "$WORKSPACE/.lucidos"
+        # Each CC worktree's .git file points at <repo>/.git/worktrees/<id>/, and
+        # that gitdir file points back at the worktree's path. The mv broke that
+        # back-pointer; `git worktree repair` rewrites the gitdir file to the
+        # new path. No-op if .lucidos/worktrees/ is empty.
+        if [ -d "$WORKSPACE/.lucidos/worktrees" ]; then
+            for wt in "$WORKSPACE/.lucidos/worktrees"/*/; do
+                [ -d "$wt" ] || continue
+                git -C "$wt" worktree repair >/dev/null 2>&1 || true
+            done
+        fi
+    fi
+    if [ -f "$WORKSPACE/.${_old}-workspace" ] && [ ! -f "$WORKSPACE/.lucidos-workspace" ]; then
+        mv "$WORKSPACE/.${_old}-workspace" "$WORKSPACE/.lucidos-workspace"
+    fi
+    # Repo-root marker (default-workspace pointer consumed by start.sh).
+    if [ -n "$PROJECT_DIR" ] && [ -f "$PROJECT_DIR/.${_old}-workspace" ] && [ ! -f "$PROJECT_DIR/.lucidos-workspace" ]; then
+        mv "$PROJECT_DIR/.${_old}-workspace" "$PROJECT_DIR/.lucidos-workspace"
+    fi
+
     # Ensure workspace directories exist
     mkdir -p "$WORKSPACE/artifacts"
     mkdir -p "$WORKSPACE/data/postgres"
-    mkdir -p "$WORKSPACE/.cognos"
+    mkdir -p "$WORKSPACE/.lucidos"
 
     # Workspace-scoped state files
-    ENGINE_PIDFILE="$WORKSPACE/.cognos/engine.pid"
-    FRONTEND_PIDFILE="$WORKSPACE/.cognos/frontend.pid"
-    ENGINE_LOG="$WORKSPACE/.cognos/engine.log"
+    ENGINE_PIDFILE="$WORKSPACE/.lucidos/engine.pid"
+    FRONTEND_PIDFILE="$WORKSPACE/.lucidos/frontend.pid"
+    ENGINE_LOG="$WORKSPACE/.lucidos/engine.log"
 
     # Compute a short name for the postgres container from workspace path
     PG_NAME=$(printf '%s' "$WORKSPACE" | cksum | awk '{print $1}')
@@ -101,15 +162,15 @@ resolve_workspace() {
 
 # ── detect_tls ──────────────────────────────────────────────────────────
 # Check for TLS certs. Checks .certs/ dir first, then falls back to
-# COGNOS_TLS_CERT/KEY env vars (needed in worktrees where .certs/ is gitignored).
-# Sets PROTO, exports COGNOS_TLS_CERT/KEY.
+# LUCIDOS_TLS_CERT/KEY env vars (needed in worktrees where .certs/ is gitignored).
+# Sets PROTO, exports LUCIDOS_TLS_CERT/KEY.
 detect_tls() {
     local cert_dir="$PROJECT_DIR/.certs"
     if [ -f "$cert_dir/cert.pem" ] && [ -f "$cert_dir/key.pem" ]; then
-        export COGNOS_TLS_CERT="$cert_dir/cert.pem"
-        export COGNOS_TLS_KEY="$cert_dir/key.pem"
+        export LUCIDOS_TLS_CERT="$cert_dir/cert.pem"
+        export LUCIDOS_TLS_KEY="$cert_dir/key.pem"
         PROTO="https"
-    elif [ -f "$COGNOS_TLS_CERT" ] && [ -f "$COGNOS_TLS_KEY" ]; then
+    elif [ -f "$LUCIDOS_TLS_CERT" ] && [ -f "$LUCIDOS_TLS_KEY" ]; then
         PROTO="https"
     else
         PROTO="http"
@@ -124,7 +185,7 @@ detect_vite_tls() {
     local vite_cert_dir="$FRONTEND_DIR/../../.certs"
     if [ -f "$vite_cert_dir/cert.pem" ] && [ -f "$vite_cert_dir/key.pem" ]; then
         VITE_PROTO="https"
-    elif [ -f "$COGNOS_TLS_CERT" ] && [ -f "$COGNOS_TLS_KEY" ]; then  # Vite's config also checks these env vars
+    elif [ -f "$LUCIDOS_TLS_CERT" ] && [ -f "$LUCIDOS_TLS_KEY" ]; then  # Vite's config also checks these env vars
         VITE_PROTO="https"
     else
         VITE_PROTO="http"
@@ -134,19 +195,21 @@ detect_vite_tls() {
 # ── setup_postgres ──────────────────────────────────────────────────────
 # Start or verify Docker postgres container for workspace.
 setup_postgres() {
-    export COGNOS_WORKSPACE="$WORKSPACE"
-    export COGNOS_PG_NAME="$PG_NAME"
-    export COGNOS_PG_PORT="$PG_PORT"
+    export LUCIDOS_WORKSPACE="$WORKSPACE"
+    export LUCIDOS_PG_NAME="$PG_NAME"
+    export LUCIDOS_PG_PORT="$PG_PORT"
+
+    _migrate_postgres_if_needed
 
     local need_restart=""
-    if docker inspect "cognos-pg-$PG_NAME" >/dev/null 2>&1; then
+    if docker inspect "lucidos-pg-$PG_NAME" >/dev/null 2>&1; then
         local container_status
-        container_status=$(docker inspect --format='{{.State.Status}}' "cognos-pg-$PG_NAME" 2>/dev/null || echo "")
+        container_status=$(docker inspect --format='{{.State.Status}}' "lucidos-pg-$PG_NAME" 2>/dev/null || echo "")
         if [ "$container_status" != "running" ]; then
             need_restart="container not running (status: $container_status)"
         else
             local actual_mount expected_mount
-            actual_mount=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Source}}{{end}}{{end}}' "cognos-pg-$PG_NAME" 2>/dev/null || echo "")
+            actual_mount=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Source}}{{end}}{{end}}' "lucidos-pg-$PG_NAME" 2>/dev/null || echo "")
             expected_mount="$WORKSPACE/data/postgres"
             if [ "$actual_mount" != "$expected_mount" ]; then
                 need_restart="mount mismatch (expected $expected_mount, got $actual_mount)"
@@ -162,26 +225,143 @@ setup_postgres() {
     else
         # Read the actual published port from the running container
         local actual_pg_port
-        actual_pg_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "cognos-pg-$PG_NAME" 2>/dev/null || echo "")
+        actual_pg_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "lucidos-pg-$PG_NAME" 2>/dev/null || echo "")
         if [ -n "$actual_pg_port" ] && [ "$actual_pg_port" != "$PG_PORT" ]; then
             PG_PORT="$actual_pg_port"
             export PG_PORT
-            export COGNOS_PG_PORT="$PG_PORT"
+            export LUCIDOS_PG_PORT="$PG_PORT"
         fi
         echo "PostgreSQL already running for this workspace (port $PG_PORT)"
     fi
 }
 
+# One-time rebrand migration: container named with the legacy prefix and
+# role/db `cognos` → container with role/db `lucidos`.
+#
+# Three independent renames (role, database, container) probed and applied
+# separately so any partial state from a prior failed run is recovered:
+#   1. Locate the container under either old or new name; start it if stopped.
+#   2. Probe via psql (pg_isready does not authenticate) to learn which login
+#      works (lucidos or cognos) and whether the lucidos database exists.
+#   3. Rename the role if needed, via a temporary superuser (postgres refuses
+#      ALTER USER on the session user). The role rename pair (RENAME + WITH
+#      PASSWORD) runs in a transaction so a partial failure cannot leave the
+#      role with an invalid password hash.
+#   4. Rename the database if needed (must be a separate, single statement —
+#      ALTER DATABASE ... RENAME cannot run inside a transaction).
+#   5. Ensure the container is named with the new prefix.
+_migrate_postgres_if_needed() {
+    local _old="cognos"
+    local old_container="${_old}-pg-$PG_NAME"
+    local new_container="lucidos-pg-$PG_NAME"
+    local tmp_role="_lucidos_migrate"
+    local tmp_pw="_tmp"
+    local container=""
+
+    if docker inspect "$new_container" >/dev/null 2>&1; then
+        container="$new_container"
+    elif docker inspect "$old_container" >/dev/null 2>&1; then
+        container="$old_container"
+    else
+        return 0
+    fi
+
+    if [ "$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null)" != "running" ]; then
+        docker start "$container" >/dev/null
+    fi
+
+    echo -n "Probing postgres in $container"
+    local probe_user=""
+    for _ in {1..30}; do
+        if docker exec "$container" psql -U lucidos -d postgres -tAc "SELECT 1" >/dev/null 2>&1; then
+            probe_user="lucidos"
+            break
+        fi
+        if docker exec "$container" psql -U "$_old" -d postgres -tAc "SELECT 1" >/dev/null 2>&1; then
+            probe_user="$_old"
+            break
+        fi
+        echo -n "."
+        sleep 1
+    done
+    if [ -z "$probe_user" ]; then
+        echo " ERROR" >&2
+        echo "ERROR: postgres in $container did not become ready" >&2
+        return 1
+    fi
+    echo " ready (login=$probe_user)"
+
+    local has_lucidos_db
+    has_lucidos_db=$(docker exec "$container" psql -U "$probe_user" -d postgres -tAc \
+        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname='lucidos')" 2>/dev/null | tr -d '[:space:]')
+
+    # Fully migrated: role + db done. Just complete the container rename if
+    # needed and clean up any temp role leaked from a prior failed run.
+    if [ "$probe_user" = "lucidos" ] && [ "$has_lucidos_db" = "t" ]; then
+        docker exec "$container" psql -U lucidos -d postgres -c \
+            "DROP ROLE IF EXISTS $tmp_role" >/dev/null 2>&1 || true
+        if [ "$container" = "$old_container" ]; then
+            echo "Renaming container $old_container → $new_container"
+            docker rename "$old_container" "$new_container"
+        fi
+        return 0
+    fi
+
+    echo "Migrating postgres role/db: ${_old} → lucidos (one-time rebrand)"
+
+    # Step 1: rename the role if not yet done.
+    if [ "$probe_user" = "$_old" ]; then
+        if ! docker exec "$container" psql -U "$_old" -d postgres -c \
+            "DROP ROLE IF EXISTS $tmp_role; CREATE ROLE $tmp_role WITH SUPERUSER LOGIN PASSWORD '$tmp_pw'" >/dev/null; then
+            echo "ERROR: failed to create temp migration role" >&2
+            return 1
+        fi
+        # RENAME invalidates any md5 password hash (it includes the username),
+        # so RENAME and WITH PASSWORD must be atomic.
+        if ! docker exec -e PGPASSWORD="$tmp_pw" "$container" psql -U "$tmp_role" -d postgres -v ON_ERROR_STOP=1 -c \
+            "BEGIN; ALTER USER ${_old} RENAME TO lucidos; ALTER USER lucidos WITH PASSWORD 'lucidos'; COMMIT;"; then
+            echo "ERROR: postgres role rename failed" >&2
+            docker exec "$container" psql -U "$_old" -d postgres -c \
+                "DROP ROLE IF EXISTS $tmp_role" >/dev/null 2>&1 || true
+            return 1
+        fi
+        docker exec "$container" psql -U lucidos -d postgres -c \
+            "DROP ROLE IF EXISTS $tmp_role" >/dev/null 2>&1 || \
+            echo "WARN: temp migration role left in place (cleaned up on next run)" >&2
+    fi
+
+    # Step 2: rename the database if not yet done. Cannot run in a transaction.
+    # web-dev.sh runs setup_postgres before kill_stale_processes, so a prior
+    # engine may still hold connections to the old database — terminate them
+    # first or the rename fails with "database is being accessed by other users".
+    if [ "$has_lucidos_db" != "t" ]; then
+        docker exec "$container" psql -U lucidos -d postgres -c \
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${_old}' AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
+        if ! docker exec "$container" psql -U lucidos -d postgres -c \
+            "ALTER DATABASE ${_old} RENAME TO lucidos"; then
+            echo "ERROR: postgres database rename failed" >&2
+            return 1
+        fi
+    fi
+
+    # Step 3: rename the container if not yet done.
+    if [ "$container" = "$old_container" ]; then
+        docker rename "$old_container" "$new_container"
+    fi
+
+    echo "Postgres role/db migrated: ${_old} → lucidos"
+}
+
 _start_postgres_container() {
-    echo "Starting PostgreSQL for workspace: $WORKSPACE (port $PG_PORT, container cognos-pg-$PG_NAME)"
+    echo "Starting PostgreSQL for workspace: $WORKSPACE (port $PG_PORT, container lucidos-pg-$PG_NAME)"
 
-    docker rm -f "cognos-pg-$PG_NAME" 2>/dev/null || true
+    docker rm -f "lucidos-pg-$PG_NAME" 2>/dev/null || true
 
-    docker compose -p "cognos-$PG_NAME" -f "$PROJECT_DIR/docker-compose.dev.yml" up -d
+    docker compose -p "lucidos-$PG_NAME" -f "$PROJECT_DIR/docker-compose.dev.yml" up -d
 
     echo -n "Waiting for PostgreSQL"
     for i in {1..30}; do
-        if docker exec "cognos-pg-$PG_NAME" pg_isready -U cognos > /dev/null 2>&1; then
+        if docker exec "lucidos-pg-$PG_NAME" pg_isready -U lucidos > /dev/null 2>&1; then
             echo " ready!"
             break
         fi
@@ -189,7 +369,7 @@ _start_postgres_container() {
         sleep 1
     done
 
-    docker exec "cognos-pg-$PG_NAME" psql -U cognos -d cognos -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1 || true
+    docker exec "lucidos-pg-$PG_NAME" psql -U lucidos -d lucidos -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1 || true
 }
 
 # ── kill_stale_processes ────────────────────────────────────────────────
@@ -233,7 +413,7 @@ kill_stale_processes() {
             occupant=$(lsof -ti :"$API_PORT" 2>/dev/null || true)
             if [ -n "$occupant" ]; then
                 occupant_cmd=$(ps -p "$occupant" -o comm= 2>/dev/null || true)
-                if [[ "$occupant_cmd" == *cognos-engine* ]]; then
+                if [[ "$occupant_cmd" == *lucidos-engine* ]]; then
                     echo "Killing orphaned engine on port $API_PORT (PID $occupant)..."
                     kill "$occupant" 2>/dev/null || true
                     killed=1
@@ -275,22 +455,22 @@ build_or_find_engine() {
 
         echo ""
         echo "Building engine..."
-        # cognos-cli is built alongside the engine so the `cognos` binary
-        # lands next to `cognos-engine`. The engine adds its directory to
+        # lucidos-cli is built alongside the engine so the `lucidos` binary
+        # lands next to `lucidos-engine`. The engine adds its directory to
         # PATH for spawned CC sessions; without the binary it skips that and
-        # the cognos-cli skill is not installed.
+        # the lucidos-cli skill is not installed.
         if [ -n "$RELEASE" ]; then
-            cargo build -p cognos-engine -p cognos-cli --release
-            ENGINE_BIN="$PROJECT_DIR/target/release/cognos-engine"
+            cargo build -p lucidos-engine -p lucidos-cli --release
+            ENGINE_BIN="$PROJECT_DIR/target/release/lucidos-engine"
         else
-            cargo build -p cognos-engine -p cognos-cli
-            ENGINE_BIN="$PROJECT_DIR/target/debug/cognos-engine"
+            cargo build -p lucidos-engine -p lucidos-cli
+            ENGINE_BIN="$PROJECT_DIR/target/debug/lucidos-engine"
         fi
     else
-        if [ -n "$RELEASE" ] && [ -f "$PROJECT_DIR/target/release/cognos-engine" ]; then
-            ENGINE_BIN="$PROJECT_DIR/target/release/cognos-engine"
-        elif [ -f "$PROJECT_DIR/target/debug/cognos-engine" ]; then
-            ENGINE_BIN="$PROJECT_DIR/target/debug/cognos-engine"
+        if [ -n "$RELEASE" ] && [ -f "$PROJECT_DIR/target/release/lucidos-engine" ]; then
+            ENGINE_BIN="$PROJECT_DIR/target/release/lucidos-engine"
+        elif [ -f "$PROJECT_DIR/target/debug/lucidos-engine" ]; then
+            ENGINE_BIN="$PROJECT_DIR/target/debug/lucidos-engine"
         else
             echo "No engine binary found. Run with -b to build."
             exit 1
@@ -300,23 +480,23 @@ build_or_find_engine() {
 
 # ── swap_ports ──────────────────────────────────────────────────────────
 # Engine takes VITE_PORT (user-facing), Vite runs on API_PORT (internal).
-# Sets ENGINE_PORT, INTERNAL_VITE_PORT. Writes .cognos/ports. Exports env vars.
+# Sets ENGINE_PORT, INTERNAL_VITE_PORT. Writes .lucidos/ports. Exports env vars.
 swap_ports() {
     INTERNAL_VITE_PORT="$API_PORT"
     ENGINE_PORT="$VITE_PORT"
 
     # Update ports file to reflect swapped assignments
-    cat > "$WORKSPACE/.cognos/ports" <<EOF
+    cat > "$WORKSPACE/.lucidos/ports" <<EOF
 API_PORT=$ENGINE_PORT
 VITE_PORT=$ENGINE_PORT
 EOF
 
     detect_vite_tls
 
-    export COGNOS_API_PORT="$ENGINE_PORT"
-    export DATABASE_URL="postgres://cognos:cognos@localhost:$PG_PORT/cognos"
+    export LUCIDOS_API_PORT="$ENGINE_PORT"
+    export DATABASE_URL="postgres://lucidos:lucidos@localhost:$PG_PORT/lucidos"
     export WORKSPACE_PATH="$WORKSPACE"
-    export COGNOS_DEV_PROXY="$VITE_PROTO://localhost:$INTERNAL_VITE_PORT"
+    export LUCIDOS_DEV_PROXY="$VITE_PROTO://localhost:$INTERNAL_VITE_PORT"
 }
 
 source "$(dirname "${BASH_SOURCE[0]}")/sleep.sh"
@@ -369,7 +549,7 @@ start_engine() {
     fi
 
     echo ""
-    echo "Starting CognOS engine..."
+    echo "Starting Lucidos engine..."
     # Rotate log if > 10 MB
     if [ -f "$ENGINE_LOG" ]; then
         local log_size
@@ -421,14 +601,14 @@ start_engine() {
 # Subshell so `nullglob` doesn't leak into the caller's shell options.
 running_frontend_workspaces() (
     shopt -s nullglob
-    for pidfile in "$HOME"/workspaces/*/.cognos/frontend.pid; do
+    for pidfile in "$HOME"/workspaces/*/.lucidos/frontend.pid; do
         local pid ws_dir
         # `cat … || true` keeps a transient unreadable file from killing the
         # subshell under the caller's `set -e`.
         pid="$(cat "$pidfile" 2>/dev/null || true)"
         [ -n "$pid" ] || continue
         if kill -0 "$pid" 2>/dev/null; then
-            ws_dir="${pidfile%/.cognos/frontend.pid}"
+            ws_dir="${pidfile%/.lucidos/frontend.pid}"
             echo "${ws_dir##*/}"
         fi
     done
@@ -485,13 +665,13 @@ ensure_frontend_deps() {
 }
 
 # ── build_sdk ──────────────────────────────────────────────────────────
-# Build the CognOS SDK bundle (packages/cognos-sdk → dist/sdk.js).
+# Build the Lucidos SDK bundle (packages/lucidos-sdk → dist/sdk.js).
 # The engine serves this at /api/v1/sdk.js for app UIs.
 build_sdk() {
     # SDK deps are hoisted to root node_modules by npm workspaces
     ensure_npm_deps "$PROJECT_DIR" "workspace dependencies"
-    echo "Building CognOS SDK..."
-    (cd "$PROJECT_DIR/packages/cognos-sdk" && npm run build)
+    echo "Building Lucidos SDK..."
+    (cd "$PROJECT_DIR/packages/lucidos-sdk" && npm run build)
 }
 
 # ── start_vite ──────────────────────────────────────────────────────────
@@ -578,11 +758,11 @@ show_banner() {
     echo ""
     echo "========================================"
     if [ "$mode" = "tauri" ]; then
-        echo "  CognOS Tauri dev ready"
+        echo "  Lucidos Tauri dev ready"
     elif [ "$mode" = "engine-only" ]; then
-        echo "  CognOS engine restarted"
+        echo "  Lucidos engine restarted"
     else
-        echo "  CognOS dev server ready"
+        echo "  Lucidos dev server ready"
     fi
     echo "  Workspace:   $WORKSPACE"
     echo "  Local:       $PROTO://localhost:$ENGINE_PORT"
@@ -611,6 +791,6 @@ cleanup_processes() {
     fi
     echo "Engine still running for workspace: $WORKSPACE (port $ENGINE_PORT)"
     echo "Stop with: ./scripts/stop.sh -w $WORKSPACE"
-    echo "PostgreSQL still running (container cognos-pg-$PG_NAME). Stop with:"
+    echo "PostgreSQL still running (container lucidos-pg-$PG_NAME). Stop with:"
     echo "  ./scripts/stop.sh -w $WORKSPACE --force"
 }

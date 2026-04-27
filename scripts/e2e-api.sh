@@ -50,11 +50,11 @@ cd "$PROJECT_DIR"
 
 export E2E_WORKSPACE
 
-# The CLI tests in api_e2e shell out to the `cognos` binary. Make sure it's
+# The CLI tests in api_e2e shell out to the `lucidos` binary. Make sure it's
 # built and at the expected target path before tests run.
-cargo build -p cognos-cli
+cargo build -p lucidos-cli
 
-CMD=(cargo test -p cognos-engine --test api_e2e)
+CMD=(cargo test -p lucidos-engine --test api_e2e)
 [ -n "$FILTER" ] && CMD+=("$FILTER")
 CMD+=("--" "--ignored")
 [ ${#CARGO_ARGS[@]} -gt 0 ] && CMD+=("${CARGO_ARGS[@]}")

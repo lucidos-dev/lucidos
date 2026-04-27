@@ -69,8 +69,8 @@ Before claiming a bug is fixed:
 - [ ] Test covers the full flow (not just the broken function)
 - [ ] Fix makes the test pass
 - [ ] All existing tests still pass
-- [ ] `cargo test -p cognos-engine` passes
-- [ ] `cd crates/cognos-app && npm test` passes
+- [ ] `cargo test -p lucidos-engine` passes
+- [ ] `cd crates/lucidos-app && npm test` passes
 - [ ] `npx tsc --noEmit` — zero errors
 - [ ] No new warnings
 

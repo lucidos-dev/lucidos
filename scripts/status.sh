@@ -1,11 +1,13 @@
 #!/bin/bash
-# Check CognOS engine status (supports multiple concurrent workspaces)
+# Check Lucidos engine status (supports multiple concurrent workspaces)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
+
+source "$SCRIPT_DIR/lib/workspace.sh"
 
 # Parse arguments
 WORKSPACE=""
@@ -22,7 +24,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --json                Output structured JSON (for API consumption)"
             echo "  -h, --help            Show this help"
             echo ""
-            echo "Without -w: scans for all running CognOS workspaces."
+            echo "Without -w: scans for all running Lucidos workspaces."
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -32,10 +34,10 @@ done
 # Show status for a single workspace
 show_workspace_status() {
     local ws="$1"
-    local engine_pid_file="$ws/.cognos/engine.pid"
-    local frontend_pid_file="$ws/.cognos/frontend.pid"
-    local ports_file="$ws/.cognos/ports"
-    local engine_log="$ws/.cognos/engine.log"
+    local engine_pid_file="$ws/.lucidos/engine.pid"
+    local frontend_pid_file="$ws/.lucidos/frontend.pid"
+    local ports_file="$ws/.lucidos/ports"
+    local engine_log="$ws/.lucidos/engine.log"
 
     echo "  Workspace: $ws"
 
@@ -50,7 +52,7 @@ show_workspace_status() {
     # Read PG port from container
     local pg_name
     pg_name=$(printf '%s' "$ws" | cksum | awk '{print $1}')
-    pg_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "cognos-pg-$pg_name" 2>/dev/null || echo "")
+    pg_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "lucidos-pg-$pg_name" 2>/dev/null || echo "")
 
     if [ -n "$api_port" ]; then
         echo "  Ports:     API=$api_port  Vite=$vite_port  PG=${pg_port:-?}"
@@ -106,17 +108,17 @@ show_workspace_status() {
                 tauri_found="1"
                 break
             fi
-        done < <(pgrep -x cognos-app 2>/dev/null || true)
+        done < <(pgrep -x lucidos-app 2>/dev/null || true)
     fi
     if [ -z "$tauri_found" ]; then
         echo "  Tauri:     STOPPED"
     fi
 
     # PostgreSQL status
-    if docker inspect "cognos-pg-$pg_name" >/dev/null 2>&1; then
+    if docker inspect "lucidos-pg-$pg_name" >/dev/null 2>&1; then
         local container_status
-        container_status=$(docker inspect --format='{{.State.Status}}' "cognos-pg-$pg_name" 2>/dev/null || echo "unknown")
-        echo "  PostgreSQL: $container_status (container cognos-pg-$pg_name, port ${pg_port:-?})"
+        container_status=$(docker inspect --format='{{.State.Status}}' "lucidos-pg-$pg_name" 2>/dev/null || echo "unknown")
+        echo "  PostgreSQL: $container_status (container lucidos-pg-$pg_name, port ${pg_port:-?})"
     else
         echo "  PostgreSQL: no container"
     fi
@@ -153,8 +155,8 @@ show_workspace_status() {
 # JSON output for a single workspace — prints a JSON object (no trailing comma)
 json_workspace_status() {
     local ws="$1"
-    local ports_file="$ws/.cognos/ports"
-    local engine_pid_file="$ws/.cognos/engine.pid"
+    local ports_file="$ws/.lucidos/ports"
+    local engine_pid_file="$ws/.lucidos/engine.pid"
 
     # Load ports
     local api_port="" vite_port="" pg_port=""
@@ -167,7 +169,7 @@ json_workspace_status() {
     # PG port from container
     local pg_name
     pg_name=$(printf '%s' "$ws" | cksum | awk '{print $1}')
-    pg_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "cognos-pg-$pg_name" 2>/dev/null || echo "")
+    pg_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "lucidos-pg-$pg_name" 2>/dev/null || echo "")
 
     # Engine running?
     local engine_running="false"
@@ -204,11 +206,11 @@ if [ -n "$JSON_MODE" ]; then
     ENTRIES=""
     EXCLUDE_WS=""
     if [ -n "$WORKSPACE" ]; then
-        if [ -d "$WORKSPACE" ]; then
-            EXCLUDE_WS="$(cd "$WORKSPACE" && pwd)"
-        else
-            EXCLUDE_WS="$WORKSPACE"
-        fi
+        # The exclude is opportunistic — engines pass an absolute workspace_path
+        # so it normally resolves; a missing shortname shouldn't be fatal in
+        # JSON mode (returns no exclude → may include the caller, harmless).
+        resolve_workspace_path 2>/dev/null || true
+        EXCLUDE_WS="$WORKSPACE"
     fi
 
     while IFS= read -r container; do
@@ -216,7 +218,7 @@ if [ -n "$JSON_MODE" ]; then
         ws_dir=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Source}}{{end}}{{end}}' "$container" 2>/dev/null || echo "")
         if [ -n "$ws_dir" ]; then
             ws_dir="$(dirname "$(dirname "$ws_dir")")"
-            if [ -d "$ws_dir/.cognos" ]; then
+            if [ -d "$ws_dir/.lucidos" ]; then
                 # Skip the requesting workspace
                 if [ -n "$EXCLUDE_WS" ] && [ "$ws_dir" = "$EXCLUDE_WS" ]; then
                     continue
@@ -227,23 +229,20 @@ if [ -n "$JSON_MODE" ]; then
                 ENTRIES="$ENTRIES$(json_workspace_status "$ws_dir")"
             fi
         fi
-    done < <(docker ps --filter "name=cognos-pg-" --format '{{.Names}}' 2>/dev/null || true)
+    done < <(docker ps --filter "name=lucidos-pg-" --format '{{.Names}}' 2>/dev/null || true)
 
     printf '{"workspaces":[%s]}\n' "$ENTRIES"
     exit 0
 fi
 
-echo "=== CognOS Engine Status ==="
+echo "=== Lucidos Engine Status ==="
 echo ""
 
 if [ -n "$WORKSPACE" ]; then
-    # Resolve to absolute path
-    if [ -d "$WORKSPACE" ]; then
-        WORKSPACE="$(cd "$WORKSPACE" && pwd)"
-    fi
+    resolve_workspace_path
     show_workspace_status "$WORKSPACE"
 else
-    # Find workspaces by inspecting running cognos PG containers
+    # Find workspaces by inspecting running lucidos PG containers
     FOUND=""
     while IFS= read -r container; do
         [ -z "$container" ] && continue
@@ -252,7 +251,7 @@ else
         # Mount points to <workspace>/data/postgres — go up two levels
         if [ -n "$ws_dir" ]; then
             ws_dir="$(dirname "$(dirname "$ws_dir")")"
-            if [ -d "$ws_dir/.cognos" ]; then
+            if [ -d "$ws_dir/.lucidos" ]; then
                 if [ -n "$FOUND" ]; then
                     echo "---"
                 fi
@@ -261,10 +260,10 @@ else
                 echo ""
             fi
         fi
-    done < <(docker ps --filter "name=cognos-pg-" --format '{{.Names}}' 2>/dev/null || true)
+    done < <(docker ps --filter "name=lucidos-pg-" --format '{{.Names}}' 2>/dev/null || true)
 
     if [ -z "$FOUND" ]; then
-        echo "No CognOS workspaces found."
+        echo "No Lucidos workspaces found."
         echo ""
         echo "Start one with: ./scripts/web-dev.sh -w <workspace>"
     fi

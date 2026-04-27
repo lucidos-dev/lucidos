@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Isolate test runs from any real e2e workspace lock
-TMPROOT="$(mktemp -d -t cognos-e2e-lock-test.XXXXXX)"
+TMPROOT="$(mktemp -d -t lucidos-e2e-lock-test.XXXXXX)"
 export E2E_LOCK_DIR_OVERRIDE="$TMPROOT/lock-dir"
 mkdir -p "$E2E_LOCK_DIR_OVERRIDE"
 OUT_DIR="$TMPROOT/out"

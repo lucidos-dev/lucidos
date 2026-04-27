@@ -5,9 +5,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Default to test-space-2 or use COGNOS_WORKSPACE
-WORKSPACE="${COGNOS_WORKSPACE:-$PROJECT_DIR/test-space-2}"
-MODELS_DIR="$WORKSPACE/.cognos/models/ocr"
+# Default to test-space-2 or use LUCIDOS_WORKSPACE
+WORKSPACE="${LUCIDOS_WORKSPACE:-$PROJECT_DIR/test-space-2}"
+MODELS_DIR="$WORKSPACE/.lucidos/models/ocr"
 
 echo "Downloading OCR models to: $MODELS_DIR"
 mkdir -p "$MODELS_DIR"

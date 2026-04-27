@@ -1,0 +1,529 @@
+.thread-drawer {
+    width: var(--thread-drawer-width, 18.75rem);
+    flex-shrink: 0;
+    background: var(--bg-primary);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+    transition: width var(--duration-slow) ease;
+}
+
+.thread-drawer-collapsed {
+    width: 0 !important;
+}
+
+/* --- Drawer resize divider --- */
+
+.drawer-divider {
+    width: var(--divider-width);
+    cursor: col-resize;
+    background: var(--border-color);
+    flex-shrink: 0;
+    position: relative;
+    z-index: 2;
+    transition: background-color var(--duration-fast), width var(--duration-slow) ease, opacity var(--duration-slow) ease;
+    touch-action: none;
+}
+
+.drawer-divider-collapsed {
+    width: 0;
+    opacity: 0;
+    cursor: default;
+}
+
+.thread-drawer-header {
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border-color);
+    flex-shrink: 0;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.thread-drawer-header-title {
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.thread-drawer-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.thread-drawer-close-btn {
+    display: none;
+}
+
+/* Filter active indicator — no color override; count badge shows state */
+
+/* Filter dropdown */
+.thread-filter-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    z-index: var(--z-dropdown);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    padding: 0.5rem;
+    min-width: 10rem;
+    box-shadow: var(--shadow-md);
+}
+
+.thread-filter-title {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+    padding: 0.125rem 0.375rem 0.375rem;
+}
+
+.thread-filter-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.375rem;
+    border-radius: 0.25rem;
+    font-size: 0.8125rem;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.thread-filter-option:hover {
+    background: var(--bg-hover);
+}
+
+.thread-drawer-list {
+    flex: 1;
+    overflow-y: auto;
+    padding-bottom: 0.25rem;
+}
+
+.thread-row {
+    cursor: pointer;
+    position: relative;
+    padding-left: 1.25rem;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.thread-row.thread-row-focused,
+.thread-row.thread-row-focused:hover {
+    background: var(--bg-selected);
+    border-left: 0.125rem solid var(--accent);
+}
+
+.thread-row.thread-row-highlighted {
+    background: var(--bg-hover);
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+}
+
+.thread-row.thread-row-highlighted.thread-row-focused {
+    background: var(--bg-selected);
+}
+
+.thread-row-left {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.thread-row-title-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    min-width: 0;
+    flex-wrap: wrap;
+}
+
+.thread-row-title {
+    font-size: 0.8125rem;
+    font-weight: 500;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.draft-indicator {
+    font-size: 0.625rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    padding: 0.0625rem 0.25rem;
+    border-radius: 0.1875rem;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.thread-row-meta {
+    font-size: 0.6875rem;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding-left: 0.25rem;
+}
+
+.thread-row-children-progress {
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+.thread-row-right {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.25rem;
+    flex-shrink: 0;
+}
+
+.thread-row-time {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+.thread-row-tag-line {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.thread-row-tag-line .icon-btn {
+    padding-right: 0;
+}
+
+.thread-row-tag-line .icon-btn svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+}
+
+.thread-status {
+    display: flex;
+    align-items: center;
+}
+
+.thread-row > .thread-status {
+    position: absolute;
+    left: 0.375rem;
+    top: 1.0625rem;
+    transform: translateY(-50%);
+}
+
+.thread-row > .thread-status .mini-spinner {
+    width: 0.5rem;
+    height: 0.5rem;
+    box-sizing: border-box;
+}
+
+.thread-status svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+/* --- Thread search bar (inline in threads-header) --- */
+/* Always in DOM so iOS can focus() synchronously within a user gesture.
+   No width/height constraints — composeHandlers focuses before toggling
+   .search-active, so the input must have natural dimensions for the caret
+   to render at the correct size. clip-path hides it visually. */
+.thread-search-bar {
+    position: absolute;
+    overflow: hidden;
+    clip-path: inset(50%);
+    pointer-events: none;
+}
+
+/* When search is active, show the search bar and hide title/buttons */
+.search-active > .thread-search-bar {
+    position: static;
+    overflow: visible;
+    clip-path: none;
+    pointer-events: auto;
+    display: flex;
+    align-items: center;
+    flex: 1;
+    gap: 0.25rem;
+    min-width: 0;
+}
+
+.threads-header.search-active > *:not(.thread-search-bar):not(.thread-toggle) {
+    display: none !important;
+}
+
+.thread-search-bar-icon {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    flex-shrink: 0;
+    color: var(--text-secondary);
+}
+
+.thread-search-input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    font-family: inherit;
+    padding: 0.125rem 0;
+}
+
+.thread-search-input::placeholder {
+    color: var(--text-muted);
+}
+
+.thread-search-close {
+    flex-shrink: 0;
+}
+
+.thread-drawer-load-more {
+    min-height: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.thread-drawer-loading {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    padding: 0.5rem;
+}
+
+/* --- FLIP animation portal: flying thread clones render here --- */
+.flip-portal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 0;
+    height: 0;
+    z-index: 9999;
+    pointer-events: none;
+    overflow: visible;
+}
+
+
+/* --- Drawer sections (Running / Pinned) --- */
+
+.drawer-section {
+    padding: 0;
+}
+
+.list-section-title-collapsible {
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.section-count {
+    margin-left: auto;
+    font-weight: 400;
+    color: var(--text-muted);
+}
+
+@media (hover: hover) {
+    .list-section-title-collapsible:hover {
+        color: var(--text-primary);
+        background: color-mix(in srgb, var(--bg-tertiary) 85%, var(--text-muted));
+    }
+}
+
+
+/* --- Thread focused view --- */
+
+.thread-view {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+}
+
+.thread-view-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 1rem;
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-primary));
+    -webkit-user-select: none;
+    user-select: none;
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border-color));
+    flex-shrink: 0;
+}
+
+.thread-view-header > .icon-btn,
+.mobile-thread-title-row > .icon-btn {
+    padding: 0;
+}
+
+.thread-view-header > .icon-btn svg,
+.mobile-thread-title-row > .icon-btn svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+}
+
+
+/* position:relative so the edit <input> can absolutely-position over the display textarea. */
+.thread-title-edit {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    position: relative;
+}
+
+.thread-title-input {
+    font-family: inherit;
+    font-weight: 600;
+    font-size: 0.875rem;
+    line-height: 1.3;
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--accent);
+    border-radius: 0.25rem;
+    padding: 0.125rem 0.25rem;
+    outline: none;
+    width: 100%;
+    min-width: 0;
+}
+
+.thread-title-input.thread-title-display {
+    background: transparent;
+    border-color: transparent;
+    cursor: pointer;
+    margin: -0.125rem -0.25rem;
+    transition: background var(--duration-fast) ease;
+    resize: none;
+    overflow: hidden;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.thread-title-input.thread-title-display:hover {
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+/* Overlaid (transparent) on top of the display textarea so taps reach the
+ * input directly — iOS opens the keyboard on native focus, no JS focus dance.
+ * user-select:text overrides the row's user-select:none so iOS PWA opens the
+ * keyboard on focus. */
+.thread-title-input.thread-title-edit-input {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+    -webkit-user-select: text;
+    user-select: text;
+}
+
+.thread-title-edit.is-editing .thread-title-display {
+    display: none;
+}
+
+.thread-title-edit.is-editing .thread-title-input.thread-title-edit-input {
+    position: static;
+    opacity: 1;
+    cursor: text;
+}
+
+/* Suggestion area below the input */
+.thread-title-suggestion {
+    min-height: 1.25rem;
+}
+
+.thread-title-suggestion-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    font-style: italic;
+    cursor: pointer;
+    padding: 0;
+    text-align: left;
+    transition: color var(--duration-fast) ease;
+}
+
+.thread-title-suggestion-btn:hover {
+    color: var(--accent);
+}
+
+/* Shimmer loading animation for suggestion */
+.thread-title-shimmer {
+    height: 0.75rem;
+    width: 60%;
+    border-radius: 0.25rem;
+    background: linear-gradient(
+        90deg,
+        var(--bg-tertiary) 25%,
+        color-mix(in srgb, var(--accent) 20%, var(--bg-tertiary)) 50%,
+        var(--bg-tertiary) 75%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+}
+
+@keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+.thread-view .thread-content-wrap {
+    flex: 1;
+    min-height: 0;
+}
+
+/* Mobile: overlay below app header with slide animation */
+@media (max-width: 768px) {
+    .thread-drawer {
+        position: fixed;
+        top: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+        left: 0;
+        bottom: 0;
+        width: 100% !important;
+        z-index: var(--z-drawer);
+        padding-top: 0;
+        transition: transform var(--duration-slow) ease;
+        transform: translateX(0);
+    }
+
+    .thread-drawer.thread-drawer-collapsed {
+        transform: translateX(-100%);
+        width: 100% !important;
+    }
+
+    .drawer-divider {
+        display: none;
+    }
+
+}
+
+/* Reduced motion: disable decorative animations */
+@media (prefers-reduced-motion: reduce) {
+    .thread-drawer,
+    .drawer-divider,
+    .thread-title-display {
+        transition: none;
+    }
+
+    .thread-title-shimmer {
+        animation: none;
+    }
+}
