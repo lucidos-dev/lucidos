@@ -1192,7 +1192,16 @@ impl EventBus {
             }
             ThreadEvent::TriggerStarted { trigger_id, trigger_name, .. } => {
                 let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("trigger");
-                let trigger_uuid = Uuid::parse_str(trigger_id).ok();
+                let trigger_uuid = match Uuid::parse_str(trigger_id) {
+                    Ok(uuid) => Some(uuid),
+                    Err(_) => {
+                        crate::log!(
+                            "[EventBus] TriggerStarted has non-UUID trigger_id={} for thread {} — projection trigger_id will be NULL (thread won't appear in per-trigger filter)",
+                            trigger_id, thread_id
+                        );
+                        None
+                    }
+                };
                 sqlx::query(
                     r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, trigger_id, created_at, last_activity, message_count, status, last_revived_at)
                        VALUES ($1, $2, $3, 'system', $4, NOW(), NOW(), 1, 'running', NOW())

@@ -1,12 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { ConnectionStatus } from './ConnectionStatus';
-import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView, recoveryProgress } from '../../store/store';
+import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView, recoveryProgress, threadFilterActive } from '../../store/store';
 import { useHideOnScroll } from '../../hooks/useHideOnScroll';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { ComposeIcon, SearchIcon, FilterIcon } from '../shared/icons';
 import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
-import { threadFilterActive } from '../../store/store';
 import { createComposeDraft } from '../../store/actions/drafts';
 import { openUrl } from '../../store/actions/artifacts';
 import { navigateToPane, resolveSwipePane } from '../../store/actions/pane';

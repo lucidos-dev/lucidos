@@ -235,6 +235,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
         ccIsExternalRepo: false,
         ccApplying: false,
         lastRevivedAt: created || new Date().toISOString(),
+        triggerId: isTriggerEvent ? (eventFields.trigger_id as string | undefined) : undefined,
       },
       events: new Map(),
       streamingBuffer: '',
@@ -256,6 +257,9 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   }
   if (isChannelDefiningEvent(event.type) && 'channel' in event && event.channel) {
     thread.meta.channel = event.channel as ThreadChannel;
+  }
+  if (event.type === 'TriggerStarted' && event.trigger_id) {
+    thread.meta.triggerId = event.trigger_id;
   }
   if (event.type === 'ChildrenCountChanged') {
     thread.meta.activeChildrenCount = event.active;

@@ -85,29 +85,20 @@ function persistExcludedTriggerIds(set: Set<string>) {
   localStorage.setItem('lucidos-excluded-trigger-ids', JSON.stringify([...set]));
 }
 
-/** Toggle whether a specific trigger's threads are visible. The default state
- *  is "shown" (excluded set is empty), so toggling moves the ID in/out of the
- *  exclusion set. */
 export function toggleTriggerId(triggerId: string) {
   const next = new Set(excludedTriggerIds.value);
-  if (next.has(triggerId)) {
-    next.delete(triggerId);
-  } else {
-    next.add(triggerId);
-  }
+  if (next.has(triggerId)) next.delete(triggerId);
+  else next.add(triggerId);
   persistExcludedTriggerIds(next);
 }
 
-/** Show every trigger by clearing the exclusion set. */
 export function showAllTriggers() {
   if (excludedTriggerIds.value.size === 0) return;
   persistExcludedTriggerIds(new Set());
 }
 
-/** Hide every known trigger by adding all current trigger IDs to the
- *  exclusion set. Triggers created later will appear by default — matching
- *  the channel filter's "everything is included unless explicitly hidden"
- *  semantics. */
+// Triggers created after this call appear by default — matches the channel
+// filter's "everything visible unless explicitly hidden" semantics.
 export function hideAllTriggers(triggerIds: readonly string[]) {
   if (triggerIds.length === 0) return;
   persistExcludedTriggerIds(new Set(triggerIds));

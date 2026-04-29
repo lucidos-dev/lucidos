@@ -184,18 +184,7 @@ export const threadChannelFilter = signal<Set<ThreadChannel>>(restoreThreadChann
 // (keeps the default exhaustive — any trigger newly created later is visible
 // without needing to opt it in). Only consulted when 'trigger' is in
 // threadChannelFilter; otherwise the channel filter already hides them all.
-function restoreExcludedTriggerIds(): Set<string> {
-  try {
-    const saved = localStorage.getItem('lucidos-excluded-trigger-ids');
-    if (saved) {
-      const parsed = JSON.parse(saved) as string[];
-      if (Array.isArray(parsed)) return new Set(parsed.filter(s => typeof s === 'string'));
-    }
-  } catch { /* ignore */ }
-  return new Set();
-}
-
-export const excludedTriggerIds = signal<Set<string>>(restoreExcludedTriggerIds());
+export const excludedTriggerIds = signal<Set<string>>(loadStringSet('lucidos-excluded-trigger-ids'));
 
 /** True when the user has narrowed the drawer below "everything visible". */
 export const threadFilterActive = computed(() =>

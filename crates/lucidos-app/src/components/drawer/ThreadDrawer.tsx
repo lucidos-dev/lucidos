@@ -1,5 +1,5 @@
 import type { ComponentChildren } from 'preact';
-import { useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { useRef, useEffect, useCallback } from 'preact/hooks';
 import { signal } from '@preact/signals';
 import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, focusedDraftId, threadChannelFilter, excludedTriggerIds, threadsLoaded, splitRatio, ThreadChannel, ALL_CHANNELS, effectiveThreadStatus, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, drafts, type DraftMeta } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
@@ -209,10 +209,7 @@ function ThreadList() {
         const allThreads = Array.from(threadMap.value.values()).filter(t => {
             const channel = t.meta.channel;
             if (!filter.has(channel as ThreadChannel) && VALID_CHANNELS.has(channel)) return false;
-            // Per-trigger filter only applies when the trigger channel is included
-            // and the thread has a known trigger ID. Trigger threads with unknown
-            // trigger_id (e.g. legacy rows pre-backfill) stay visible — there's no
-            // checkbox to control them, so hiding them would orphan them.
+            // Trigger threads without a known triggerId have no checkbox; hiding them would orphan them.
             if (channel === 'trigger' && t.meta.triggerId && excludedTriggers.has(t.meta.triggerId)) {
                 return false;
             }
@@ -270,13 +267,8 @@ function ThreadList() {
     const flatKey = flatIds.join(',');
     useEffect(() => { navigableIds.value = flatIds; }, [flatKey]);
 
-    // Both Set references change identity only when the underlying signal is
-    // reassigned, so memoizing on those refs avoids re-sorting on every render
-    // (and the resulting string still triggers the FLIP hook on real changes).
-    const filterResetKey = useMemo(
-        () => `${[...threadChannelFilter.value].sort().join(',')}|${[...excludedTriggerIds.value].sort().join(',')}`,
-        [threadChannelFilter.value, excludedTriggerIds.value],
-    );
+    // String resetKey lets the FLIP hook compare by value (Sets would compare by reference).
+    const filterResetKey = `${[...threadChannelFilter.value].sort().join(',')}|${[...excludedTriggerIds.value].sort().join(',')}`;
     useFlipTransitions(containerRef, portalRef, sectionDefs, filterResetKey);
 
     // Scroll focused thread into view (e.g. when opened via thread link)
