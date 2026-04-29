@@ -3,15 +3,14 @@ import { threadChannelFilter, excludedTriggerIds, triggers } from '../../store/s
 import { loadedOr } from '../../store/types';
 import { CHANNEL_OPTIONS, toggleChannel, toggleTriggerId, showAllTriggers, hideAllTriggers } from './headerHelpers';
 import { loadTriggers } from '../../store/actions/triggers';
+import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
 
 const VIEWPORT_MARGIN_PX = 8;
 
 export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => void; toggleRef: { current: HTMLButtonElement | null } }) {
   const ref = useRef<HTMLDivElement>(null);
   const [position] = useState(() => {
-    const el = toggleRef.current;
-    if (!el) return null;
-    const rect = el.getBoundingClientRect();
+    const rect = toggleRef.current!.getBoundingClientRect();
     const right = Math.max(VIEWPORT_MARGIN_PX, window.innerWidth - rect.right);
     return {
       top: rect.bottom,
@@ -21,16 +20,11 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
   });
   const filter = threadChannelFilter.value;
 
+  useDismissOnOutside(true, ref, toggleRef.current, onClose);
   useEffect(() => {
-    function handleClick(e: MouseEvent) {
-      if (toggleRef.current?.contains(e.target as Node)) return;
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
-    }
-    document.addEventListener('click', handleClick);
-    return () => document.removeEventListener('click', handleClick);
+    window.addEventListener('resize', onClose);
+    return () => window.removeEventListener('resize', onClose);
   }, [onClose]);
-
-  if (!position) return null;
 
   return (
     <div
