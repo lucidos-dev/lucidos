@@ -1,5 +1,5 @@
 import type { ComponentChildren } from 'preact';
-import { useRef, useEffect, useCallback } from 'preact/hooks';
+import { useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { signal } from '@preact/signals';
 import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, focusedDraftId, threadChannelFilter, excludedTriggerIds, threadsLoaded, splitRatio, ThreadChannel, ALL_CHANNELS, effectiveThreadStatus, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, drafts, type DraftMeta } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
@@ -270,10 +270,13 @@ function ThreadList() {
     const flatKey = flatIds.join(',');
     useEffect(() => { navigableIds.value = flatIds; }, [flatKey]);
 
-    // Stable string key — strings compare by value, so the FLIP hook only
-    // sees a "reset" when the channel filter or trigger exclusion set actually
-    // changes content (not on every render's fresh array literal).
-    const filterResetKey = `${[...threadChannelFilter.value].sort().join(',')}|${[...excludedTriggerIds.value].sort().join(',')}`;
+    // Both Set references change identity only when the underlying signal is
+    // reassigned, so memoizing on those refs avoids re-sorting on every render
+    // (and the resulting string still triggers the FLIP hook on real changes).
+    const filterResetKey = useMemo(
+        () => `${[...threadChannelFilter.value].sort().join(',')}|${[...excludedTriggerIds.value].sort().join(',')}`,
+        [threadChannelFilter.value, excludedTriggerIds.value],
+    );
     useFlipTransitions(containerRef, portalRef, sectionDefs, filterResetKey);
 
     // Scroll focused thread into view (e.g. when opened via thread link)

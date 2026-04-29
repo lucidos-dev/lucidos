@@ -20,7 +20,6 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
     return () => document.removeEventListener('click', handleClick);
   }, [onClose]);
 
-  // Load the trigger list lazily so the sub-list is populated when the dropdown opens.
   useEffect(() => {
     if (triggers.value.status === 'not-loaded') loadTriggers();
   }, []);
@@ -57,7 +56,7 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
               </button>
             )}
           </div>
-          {triggers.value.status === 'loading' && triggerList.length === 0 ? (
+          {triggers.value.status === 'loading' ? (
             <div class="thread-filter-hint">Loading…</div>
           ) : (
             <>

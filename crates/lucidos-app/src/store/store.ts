@@ -197,6 +197,12 @@ function restoreExcludedTriggerIds(): Set<string> {
 
 export const excludedTriggerIds = signal<Set<string>>(restoreExcludedTriggerIds());
 
+/** True when the user has narrowed the drawer below "everything visible". */
+export const threadFilterActive = computed(() =>
+  threadChannelFilter.value.size < ALL_CHANNELS.length
+  || excludedTriggerIds.value.size > 0,
+);
+
 // --- Thread search ---
 export const threadSearchQuery = signal('');
 export const threadSearchResults = signal<Loadable<import('../api/threads').ThreadSearchResult[]>>({ status: 'not-loaded' });
