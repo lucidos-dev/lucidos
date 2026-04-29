@@ -1,4 +1,4 @@
-import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, SETTINGS_NAV_ITEMS, triggers, appsList, threadChannelFilter, excludedTriggerIds, parseRepoPath, repoPending, selectedChange } from '../../store/store';
+import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, SETTINGS_NAV_ITEMS, triggers, appsList, threadChannelFilter, parseRepoPath, repoPending, selectedChange } from '../../store/store';
 import type { ThreadChannel, InlineForm } from '../../store/store';
 import { loadedOr } from '../../store/types';
 import { formatChannel } from '../../utils/formatChannel';
@@ -78,28 +78,4 @@ export function toggleChannel(channel: ThreadChannel) {
   }
   threadChannelFilter.value = next;
   localStorage.setItem('lucidos-thread-channel-filter', JSON.stringify([...next]));
-}
-
-function persistExcludedTriggerIds(set: Set<string>) {
-  excludedTriggerIds.value = set;
-  localStorage.setItem('lucidos-excluded-trigger-ids', JSON.stringify([...set]));
-}
-
-export function toggleTriggerId(triggerId: string) {
-  const next = new Set(excludedTriggerIds.value);
-  if (next.has(triggerId)) next.delete(triggerId);
-  else next.add(triggerId);
-  persistExcludedTriggerIds(next);
-}
-
-export function showAllTriggers() {
-  if (excludedTriggerIds.value.size === 0) return;
-  persistExcludedTriggerIds(new Set());
-}
-
-// Triggers created after this call appear by default — matches the channel
-// filter's "everything visible unless explicitly hidden" semantics.
-export function hideAllTriggers(triggerIds: readonly string[]) {
-  if (triggerIds.length === 0) return;
-  persistExcludedTriggerIds(new Set(triggerIds));
 }

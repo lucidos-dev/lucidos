@@ -92,9 +92,6 @@ pub struct ThreadInfo {
     /// Cached title of the parent thread — saves an extra round-trip when the
     /// route panel renders "Parent thread · <title>" links.
     pub parent_thread_title: Option<String>,
-    /// Trigger that started this thread (None for non-trigger threads, or for
-    /// trigger threads created before the projection started capturing it).
-    pub trigger_id: Option<String>,
 }
 
 /// Row type for thread summary queries — all columns selected from thread_summaries.
@@ -120,7 +117,6 @@ struct ThreadRow {
     last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
     parent_thread_id: Option<String>,
     parent_thread_title: Option<String>,
-    trigger_id: Option<String>,
 }
 
 /// SQL column list for thread summary queries. Callers MUST alias the outer
@@ -136,8 +132,7 @@ const THREAD_COLS: &str =
     t.message_count::bigint, t.section, t.active_children_count::bigint, t.total_children_count::bigint, \
     t.status, t.cc_has_changes, t.cc_requires_restart, t.cc_is_external_repo, t.cc_applying, t.last_revived_at, \
     t.parent_thread_id::text AS parent_thread_id, \
-    (SELECT p.title FROM thread_summaries p WHERE p.thread_id = t.parent_thread_id) AS parent_thread_title, \
-    t.trigger_id::text AS trigger_id";
+    (SELECT p.title FROM thread_summaries p WHERE p.thread_id = t.parent_thread_id) AS parent_thread_title";
 
 impl EventStore {
     /// Get pinned threads from the projection table.
@@ -273,7 +268,6 @@ impl EventStore {
                     last_revived_at: r.last_revived_at,
                     parent_thread_id: r.parent_thread_id,
                     parent_thread_title: r.parent_thread_title,
-                    trigger_id: r.trigger_id,
                 })
             })
             .collect()
@@ -530,8 +524,7 @@ impl EventStore {
             s.message_count::bigint, s.section, s.active_children_count::bigint, s.total_children_count::bigint, \
             s.status, s.cc_has_changes, s.cc_requires_restart, s.cc_is_external_repo, s.cc_applying, s.last_revived_at, \
             s.parent_thread_id::text AS parent_thread_id, \
-            (SELECT p.title FROM thread_summaries p WHERE p.thread_id = s.parent_thread_id) AS parent_thread_title, \
-            s.trigger_id::text AS trigger_id";
+            (SELECT p.title FROM thread_summaries p WHERE p.thread_id = s.parent_thread_id) AS parent_thread_title";
 
         let sql = format!(
             "WITH title_matches AS (\
@@ -601,7 +594,6 @@ impl EventStore {
             last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
             parent_thread_id: Option<String>,
             parent_thread_title: Option<String>,
-            trigger_id: Option<String>,
             score: f64,
         }
 
@@ -634,7 +626,6 @@ impl EventStore {
                         last_revived_at: r.last_revived_at,
                         parent_thread_id: r.parent_thread_id,
                         parent_thread_title: r.parent_thread_title,
-                        trigger_id: r.trigger_id,
                     },
                     score: r.score,
                 })

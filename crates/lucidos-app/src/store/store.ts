@@ -179,19 +179,6 @@ function restoreThreadChannelFilter(): Set<ThreadChannel> {
 
 export const threadChannelFilter = signal<Set<ThreadChannel>>(restoreThreadChannelFilter());
 
-// --- Per-trigger filter ---
-// Trigger IDs the user has explicitly hidden. Empty Set = "show all triggers"
-// (keeps the default exhaustive — any trigger newly created later is visible
-// without needing to opt it in). Only consulted when 'trigger' is in
-// threadChannelFilter; otherwise the channel filter already hides them all.
-export const excludedTriggerIds = signal<Set<string>>(loadStringSet('lucidos-excluded-trigger-ids'));
-
-/** True when the user has narrowed the drawer below "everything visible". */
-export const threadFilterActive = computed(() =>
-  threadChannelFilter.value.size < ALL_CHANNELS.length
-  || excludedTriggerIds.value.size > 0,
-);
-
 // --- Thread search ---
 export const threadSearchQuery = signal('');
 export const threadSearchResults = signal<Loadable<import('../api/threads').ThreadSearchResult[]>>({ status: 'not-loaded' });

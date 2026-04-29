@@ -61,9 +61,11 @@
 
 /* Filter active indicator — no color override; count badge shows state */
 
-/* position:fixed anchors to viewport; top/right/max-width set inline from JS so the dropdown can't overflow even when the toggle isn't at the screen edge. */
+/* Filter dropdown */
 .thread-filter-dropdown {
-    position: fixed;
+    position: absolute;
+    top: 100%;
+    right: 0;
     z-index: var(--z-dropdown);
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
@@ -95,54 +97,6 @@
 
 .thread-filter-option:hover {
     background: var(--bg-hover);
-}
-
-.thread-filter-subgroup {
-    margin: 0.25rem 0 0 0;
-    padding-top: 0.375rem;
-    border-top: 1px solid var(--border-color);
-    max-height: 14rem;
-    overflow-y: auto;
-}
-
-.thread-filter-subhead {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.125rem 0.375rem 0.25rem;
-    font-size: 0.6875rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-secondary);
-    border-radius: 0.25rem;
-}
-
-.thread-filter-subhead:has(input) {
-    cursor: pointer;
-}
-
-.thread-filter-subhead:has(input):hover {
-    background: var(--bg-hover);
-}
-
-.thread-filter-suboption {
-    padding-left: 1.25rem;
-}
-
-.thread-filter-trigger-name {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.thread-filter-hint {
-    padding: 0.375rem;
-    font-size: 0.75rem;
-    color: var(--text-secondary);
-    font-style: italic;
 }
 
 .thread-drawer-list {
