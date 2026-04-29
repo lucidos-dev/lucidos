@@ -1,10 +1,10 @@
 import { isMac } from './platform';
 
 const MOD = isMac ? '⌘' : 'Ctrl+';
-const SHIFT = isMac ? '⇧' : 'Shift+';
 
 const SHORTCUTS = {
-  newThread: `${MOD}${SHIFT}O or C`,
+  // Ctrl on Mac (not Cmd): Cmd+Shift+O is intercepted system-side, only Ctrl actually fires.
+  newThread: isMac ? '⌃⇧O' : 'Ctrl+Shift+O',
   toggleThreadDrawer: 'T',
   searchEverywhere: `${MOD}K`,
   zoomIn: `${MOD}+`,
