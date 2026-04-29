@@ -55,6 +55,8 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
 }
 
 function TriggerSubList() {
+  const allRef = useRef<HTMLInputElement>(null);
+
   useEffect(() => {
     if (triggers.value.status === 'not-loaded') loadTriggers();
   }, []);
@@ -63,28 +65,34 @@ function TriggerSubList() {
   const triggerList = loadedOr(loadable, []);
   const isLoading = loadable.status === 'loading';
   const isFailed = loadable.status === 'failed';
-  if (!isLoading && !isFailed && triggerList.length === 0) return null;
 
   const excluded = excludedTriggerIds.value;
   const allTriggerIds = triggerList.map(t => t.id);
   const visibleCount = allTriggerIds.filter(id => !excluded.has(id)).length;
   const allChecked = visibleCount === allTriggerIds.length && allTriggerIds.length > 0;
   const noneChecked = visibleCount === 0 && allTriggerIds.length > 0;
+  const someChecked = !allChecked && !noneChecked;
+
+  // `indeterminate` is a DOM property, not an HTML attribute — JSX can't set it.
+  useEffect(() => {
+    if (allRef.current) allRef.current.indeterminate = someChecked;
+  }, [someChecked]);
+
+  if (!isLoading && !isFailed && triggerList.length === 0) return null;
 
   return (
     <div class="thread-filter-subgroup">
-      <div class="thread-filter-subhead">
-        <span>Triggers</span>
+      <label class="thread-filter-subhead">
         {triggerList.length > 0 && (
-          <button
-            type="button"
-            class="thread-filter-toggle-all"
-            onClick={() => allChecked ? hideAllTriggers(allTriggerIds) : showAllTriggers()}
-          >
-            {allChecked ? 'None' : 'All'}
-          </button>
+          <input
+            ref={allRef}
+            type="checkbox"
+            checked={allChecked}
+            onChange={() => allChecked ? hideAllTriggers(allTriggerIds) : showAllTriggers()}
+          />
         )}
-      </div>
+        <span>Triggers</span>
+      </label>
       {isLoading && <div class="thread-filter-hint">Loading…</div>}
       {isFailed && (
         <div class="thread-filter-hint error-text">Failed to load triggers: {loadable.error}</div>

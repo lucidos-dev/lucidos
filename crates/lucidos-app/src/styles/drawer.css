@@ -108,29 +108,21 @@
 .thread-filter-subhead {
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    gap: 0.5rem;
     padding: 0.125rem 0.375rem 0.25rem;
     font-size: 0.6875rem;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--text-secondary);
+    border-radius: 0.25rem;
 }
 
-.thread-filter-toggle-all {
-    background: none;
-    border: none;
-    color: var(--text-secondary);
-    font-size: 0.6875rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+.thread-filter-subhead:has(input) {
     cursor: pointer;
-    padding: 0.125rem 0.25rem;
-    border-radius: 0.1875rem;
 }
 
-.thread-filter-toggle-all:hover {
-    color: var(--text-primary);
+.thread-filter-subhead:has(input):hover {
     background: var(--bg-hover);
 }
 
