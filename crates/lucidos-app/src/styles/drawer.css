@@ -72,6 +72,7 @@
     border-radius: 0.5rem;
     padding: 0.5rem;
     min-width: 10rem;
+    max-width: calc(100vw - 1rem);
     box-shadow: var(--shadow-md);
 }
 
@@ -141,6 +142,8 @@
 }
 
 .thread-filter-trigger-name {
+    flex: 1;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
