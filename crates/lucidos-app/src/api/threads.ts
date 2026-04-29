@@ -28,6 +28,8 @@ export interface ThreadInfo {
   parent_thread_id?: string | null;
   /** Cached title of the parent thread — null when no parent or no title yet. */
   parent_thread_title?: string | null;
+  /** Trigger that started this thread (null for non-trigger threads). */
+  trigger_id?: string | null;
 }
 
 export interface ThreadsResponse {

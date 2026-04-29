@@ -11,7 +11,7 @@ import { ContentHeaderActions } from './ContentHeaderActions';
 import { ControlPanel, controlPanelOpen, controlPanelBadgeCount, controlPanelBadgeTooltip } from './ControlPanel';
 import { ThreadFilterDropdown } from './ThreadFilterDropdown';
 import { getContentTitle, getDiffDescription } from './headerHelpers';
-import { attentionThreadCount, threadSearchQuery, mobileView, MOBILE_VIEWS, threadChannelFilter, ALL_CHANNELS, unreadCount, changes, focusedThreadId, threadMap, effectiveThreadStatus, type MobileView } from '../../store/store';
+import { attentionThreadCount, threadSearchQuery, mobileView, MOBILE_VIEWS, threadChannelFilter, excludedTriggerIds, ALL_CHANNELS, unreadCount, changes, focusedThreadId, threadMap, effectiveThreadStatus, type MobileView } from '../../store/store';
 import { navigateToPane, toggleThreads } from '../../store/actions/pane';
 import { useThreadSearch } from '../../hooks/useThreadSearch';
 import { ThreadTitleEditor } from '../chat/ThreadTitleEditor';
@@ -43,7 +43,7 @@ export function MobileThreadsHeader() {
   const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadSearch();
   const toggleRef = useRef<HTMLButtonElement>(null);
   const closeFilter = useCallback(() => setFilterOpen(false), []);
-  const filterActive = threadChannelFilter.value.size < ALL_CHANNELS.length;
+  const filterActive = threadChannelFilter.value.size < ALL_CHANNELS.length || excludedTriggerIds.value.size > 0;
 
   return (
     <div class={`mobile-threads-header${searchOpen ? ' search-active' : ''}`}>

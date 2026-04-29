@@ -6,7 +6,7 @@ import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { ComposeIcon, SearchIcon, FilterIcon } from '../shared/icons';
 import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
-import { threadChannelFilter, ALL_CHANNELS } from '../../store/store';
+import { threadChannelFilter, excludedTriggerIds, ALL_CHANNELS } from '../../store/store';
 import { createComposeDraft } from '../../store/actions/drafts';
 import { openUrl } from '../../store/actions/artifacts';
 import { navigateToPane, resolveSwipePane } from '../../store/actions/pane';
@@ -29,7 +29,7 @@ function ThreadsHeader() {
   const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadSearch();
   const toggleRef = useRef<HTMLButtonElement>(null);
   const closeFilter = useCallback(() => setFilterOpen(false), []);
-  const filterActive = threadChannelFilter.value.size < ALL_CHANNELS.length;
+  const filterActive = threadChannelFilter.value.size < ALL_CHANNELS.length || excludedTriggerIds.value.size > 0;
 
   return (
     <div class={`threads-header${searchOpen ? ' search-active' : ''}`}>

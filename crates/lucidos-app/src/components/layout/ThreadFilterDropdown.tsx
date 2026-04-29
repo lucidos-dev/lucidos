@@ -1,10 +1,15 @@
 import { useRef, useEffect } from 'preact/hooks';
-import { threadChannelFilter } from '../../store/store';
-import { CHANNEL_OPTIONS, toggleChannel } from './headerHelpers';
+import { threadChannelFilter, excludedTriggerIds, triggers } from '../../store/store';
+import { loadedOr } from '../../store/types';
+import { CHANNEL_OPTIONS, toggleChannel, toggleTriggerId, showAllTriggers, hideAllTriggers } from './headerHelpers';
+import { loadTriggers } from '../../store/actions/triggers';
 
 export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => void; toggleRef: { current: HTMLButtonElement | null } }) {
   const ref = useRef<HTMLDivElement>(null);
   const filter = threadChannelFilter.value;
+  const excluded = excludedTriggerIds.value;
+  const triggerList = loadedOr(triggers.value, []);
+  const triggerChannelOn = filter.has('trigger');
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -14,6 +19,16 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
     document.addEventListener('click', handleClick);
     return () => document.removeEventListener('click', handleClick);
   }, [onClose]);
+
+  // Load the trigger list lazily so the sub-list is populated when the dropdown opens.
+  useEffect(() => {
+    if (triggers.value.status === 'not-loaded') loadTriggers();
+  }, []);
+
+  const allTriggerIds = triggerList.map(t => t.id);
+  const visibleCount = allTriggerIds.filter(id => !excluded.has(id)).length;
+  const allChecked = visibleCount === allTriggerIds.length && allTriggerIds.length > 0;
+  const noneChecked = visibleCount === 0 && allTriggerIds.length > 0;
 
   return (
     <div class="thread-filter-dropdown" ref={ref}>
@@ -28,6 +43,41 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
           {opt.label}
         </label>
       ))}
+      {triggerChannelOn && (triggers.value.status === 'loading' || triggerList.length > 0) && (
+        <div class="thread-filter-subgroup">
+          <div class="thread-filter-subhead">
+            <span>Triggers</span>
+            {triggerList.length > 0 && (
+              <button
+                type="button"
+                class="thread-filter-toggle-all"
+                onClick={() => allChecked ? hideAllTriggers(allTriggerIds) : showAllTriggers()}
+              >
+                {allChecked ? 'None' : 'All'}
+              </button>
+            )}
+          </div>
+          {triggers.value.status === 'loading' && triggerList.length === 0 ? (
+            <div class="thread-filter-hint">Loading…</div>
+          ) : (
+            <>
+              {triggerList.map(t => (
+                <label class="thread-filter-option thread-filter-suboption" key={t.id}>
+                  <input
+                    type="checkbox"
+                    checked={!excluded.has(t.id)}
+                    onChange={() => toggleTriggerId(t.id)}
+                  />
+                  <span class="thread-filter-trigger-name">{t.name}</span>
+                </label>
+              ))}
+              {noneChecked && (
+                <div class="thread-filter-hint">No triggers selected — list will be empty.</div>
+              )}
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -27,6 +27,7 @@ function makeThreadState(info: ThreadInfo, pinned: boolean): ThreadState {
       lastRevivedAt: info.last_revived_at || '',
       parentThreadId: info.parent_thread_id || undefined,
       parentThreadTitle: info.parent_thread_title || undefined,
+      triggerId: info.trigger_id || undefined,
     },
     events: new Map(),
     streamingBuffer: '',
@@ -64,6 +65,7 @@ export function upsertThread(map: Map<string, ThreadState>, info: ThreadInfo, pi
     if (info.last_revived_at) existing.meta.lastRevivedAt = info.last_revived_at;
     if (info.parent_thread_id) existing.meta.parentThreadId = info.parent_thread_id;
     if (info.parent_thread_title) existing.meta.parentThreadTitle = info.parent_thread_title;
+    if (info.trigger_id) existing.meta.triggerId = info.trigger_id;
   }
 }
 
@@ -334,6 +336,9 @@ function applyEventRows(
     }
     if (isChannelDefiningEvent(row.event_type) && row.payload.channel) {
       thread.meta.channel = row.payload.channel as ThreadMeta['channel'];
+    }
+    if (row.event_type === 'TriggerStarted' && row.payload.trigger_id) {
+      thread.meta.triggerId = row.payload.trigger_id as string;
     }
   }
   // Restore API-authoritative fields on initial load only.

@@ -228,6 +228,8 @@ export type ThreadMeta = {
   /** Set when mode != 'human' on the initial MessageReceived. */
   parentThreadId?: string;
   parentThreadTitle?: string;
+  /** Trigger that started this thread (only set when channel === 'trigger'). */
+  triggerId?: string;
 };
 
 export type ThreadState = {

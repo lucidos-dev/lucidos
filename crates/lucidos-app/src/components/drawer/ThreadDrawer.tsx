@@ -1,7 +1,7 @@
 import type { ComponentChildren } from 'preact';
 import { useRef, useEffect, useCallback } from 'preact/hooks';
 import { signal } from '@preact/signals';
-import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, focusedDraftId, threadChannelFilter, threadsLoaded, splitRatio, ThreadChannel, ALL_CHANNELS, effectiveThreadStatus, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, drafts, type DraftMeta } from '../../store/store';
+import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, focusedDraftId, threadChannelFilter, excludedTriggerIds, threadsLoaded, splitRatio, ThreadChannel, ALL_CHANNELS, effectiveThreadStatus, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, drafts, type DraftMeta } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
 import { focusDraft } from '../../store/actions/drafts';
@@ -205,9 +205,19 @@ function ThreadList() {
     let categorized: ThreadSections;
     if (hydrated) {
         const filter = threadChannelFilter.value;
-        const allThreads = Array.from(threadMap.value.values()).filter(
-            t => filter.has(t.meta.channel as ThreadChannel) || !VALID_CHANNELS.has(t.meta.channel),
-        );
+        const excludedTriggers = excludedTriggerIds.value;
+        const allThreads = Array.from(threadMap.value.values()).filter(t => {
+            const channel = t.meta.channel;
+            if (!filter.has(channel as ThreadChannel) && VALID_CHANNELS.has(channel)) return false;
+            // Per-trigger filter only applies when the trigger channel is included
+            // and the thread has a known trigger ID. Trigger threads with unknown
+            // trigger_id (e.g. legacy rows pre-backfill) stay visible — there's no
+            // checkbox to control them, so hiding them would orphan them.
+            if (channel === 'trigger' && t.meta.triggerId && excludedTriggers.has(t.meta.triggerId)) {
+                return false;
+            }
+            return true;
+        });
         categorized = categorizeThreads(allThreads, draftMap, focused, mobile);
 
         const byRevived = (a: ThreadState, b: ThreadState) =>
@@ -260,7 +270,11 @@ function ThreadList() {
     const flatKey = flatIds.join(',');
     useEffect(() => { navigableIds.value = flatIds; }, [flatKey]);
 
-    useFlipTransitions(containerRef, portalRef, sectionDefs, threadChannelFilter.value);
+    // Stable string key — strings compare by value, so the FLIP hook only
+    // sees a "reset" when the channel filter or trigger exclusion set actually
+    // changes content (not on every render's fresh array literal).
+    const filterResetKey = `${[...threadChannelFilter.value].sort().join(',')}|${[...excludedTriggerIds.value].sort().join(',')}`;
+    useFlipTransitions(containerRef, portalRef, sectionDefs, filterResetKey);
 
     // Scroll focused thread into view (e.g. when opened via thread link)
     useEffect(() => {

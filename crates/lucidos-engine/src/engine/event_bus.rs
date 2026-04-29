@@ -1190,17 +1190,20 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
-            ThreadEvent::TriggerStarted { trigger_name, .. } => {
+            ThreadEvent::TriggerStarted { trigger_id, trigger_name, .. } => {
                 let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("trigger");
+                let trigger_uuid = Uuid::parse_str(trigger_id).ok();
                 sqlx::query(
-                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, status, last_revived_at)
-                       VALUES ($1, $2, $3, 'system', NOW(), NOW(), 1, 'running', NOW())
+                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, trigger_id, created_at, last_activity, message_count, status, last_revived_at)
+                       VALUES ($1, $2, $3, 'system', $4, NOW(), NOW(), 1, 'running', NOW())
                        ON CONFLICT (thread_id) DO UPDATE
-                       SET last_activity = NOW(), message_count = thread_summaries.message_count + 1, status = 'running', last_revived_at = NOW()"#,
+                       SET last_activity = NOW(), message_count = thread_summaries.message_count + 1, status = 'running', last_revived_at = NOW(),
+                           trigger_id = COALESCE(thread_summaries.trigger_id, EXCLUDED.trigger_id)"#,
                 )
                 .bind(thread_id)
                 .bind(trigger_name.as_deref())
                 .bind(source)
+                .bind(trigger_uuid)
                 .execute(&mut **tx)
                 .await?;
                 Vec::new()

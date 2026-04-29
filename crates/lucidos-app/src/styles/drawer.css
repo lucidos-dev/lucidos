@@ -99,6 +99,60 @@
     background: var(--bg-hover);
 }
 
+.thread-filter-subgroup {
+    margin: 0.25rem 0 0 0;
+    padding-top: 0.375rem;
+    border-top: 1px solid var(--border-color);
+    max-height: 14rem;
+    overflow-y: auto;
+}
+
+.thread-filter-subhead {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.125rem 0.375rem 0.25rem;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+}
+
+.thread-filter-toggle-all {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    cursor: pointer;
+    padding: 0.125rem 0.25rem;
+    border-radius: 0.1875rem;
+}
+
+.thread-filter-toggle-all:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+}
+
+.thread-filter-suboption {
+    padding-left: 1.25rem;
+}
+
+.thread-filter-trigger-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.thread-filter-hint {
+    padding: 0.375rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
 .thread-drawer-list {
     flex: 1;
     overflow-y: auto;

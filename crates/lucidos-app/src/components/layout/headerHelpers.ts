@@ -1,4 +1,4 @@
-import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, SETTINGS_NAV_ITEMS, triggers, appsList, threadChannelFilter, parseRepoPath, repoPending, selectedChange } from '../../store/store';
+import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, SETTINGS_NAV_ITEMS, triggers, appsList, threadChannelFilter, excludedTriggerIds, parseRepoPath, repoPending, selectedChange } from '../../store/store';
 import type { ThreadChannel, InlineForm } from '../../store/store';
 import { loadedOr } from '../../store/types';
 import { formatChannel } from '../../utils/formatChannel';
@@ -78,4 +78,37 @@ export function toggleChannel(channel: ThreadChannel) {
   }
   threadChannelFilter.value = next;
   localStorage.setItem('lucidos-thread-channel-filter', JSON.stringify([...next]));
+}
+
+function persistExcludedTriggerIds(set: Set<string>) {
+  excludedTriggerIds.value = set;
+  localStorage.setItem('lucidos-excluded-trigger-ids', JSON.stringify([...set]));
+}
+
+/** Toggle whether a specific trigger's threads are visible. The default state
+ *  is "shown" (excluded set is empty), so toggling moves the ID in/out of the
+ *  exclusion set. */
+export function toggleTriggerId(triggerId: string) {
+  const next = new Set(excludedTriggerIds.value);
+  if (next.has(triggerId)) {
+    next.delete(triggerId);
+  } else {
+    next.add(triggerId);
+  }
+  persistExcludedTriggerIds(next);
+}
+
+/** Show every trigger by clearing the exclusion set. */
+export function showAllTriggers() {
+  if (excludedTriggerIds.value.size === 0) return;
+  persistExcludedTriggerIds(new Set());
+}
+
+/** Hide every known trigger by adding all current trigger IDs to the
+ *  exclusion set. Triggers created later will appear by default — matching
+ *  the channel filter's "everything is included unless explicitly hidden"
+ *  semantics. */
+export function hideAllTriggers(triggerIds: readonly string[]) {
+  if (triggerIds.length === 0) return;
+  persistExcludedTriggerIds(new Set(triggerIds));
 }
