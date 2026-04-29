@@ -40,9 +40,11 @@ function TriggerSubList() {
     if (triggers.value.status === 'not-loaded') loadTriggers();
   }, []);
 
-  const triggerList = loadedOr(triggers.value, []);
-  const isLoading = triggers.value.status === 'loading';
-  if (!isLoading && triggerList.length === 0) return null;
+  const loadable = triggers.value;
+  const triggerList = loadedOr(loadable, []);
+  const isLoading = loadable.status === 'loading';
+  const isFailed = loadable.status === 'failed';
+  if (!isLoading && !isFailed && triggerList.length === 0) return null;
 
   const excluded = excludedTriggerIds.value;
   const allTriggerIds = triggerList.map(t => t.id);
@@ -64,9 +66,11 @@ function TriggerSubList() {
           </button>
         )}
       </div>
-      {isLoading ? (
-        <div class="thread-filter-hint">Loading…</div>
-      ) : (
+      {isLoading && <div class="thread-filter-hint">Loading…</div>}
+      {isFailed && (
+        <div class="thread-filter-hint error-text">Failed to load triggers: {loadable.error}</div>
+      )}
+      {!isLoading && !isFailed && (
         <>
           {triggerList.map(t => (
             <label class="thread-filter-option thread-filter-suboption" key={t.id}>
