@@ -1,4 +1,5 @@
 import { useRef, useEffect, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { threadChannelFilter, excludedTriggerIds, triggers } from '../../store/store';
 import { loadedOr } from '../../store/types';
 import { CHANNEL_OPTIONS, toggleChannel, toggleTriggerId, showAllTriggers, hideAllTriggers } from './headerHelpers';
@@ -26,7 +27,11 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
     return () => window.removeEventListener('resize', onClose);
   }, [onClose]);
 
-  return (
+  // Portaled to <body> so position:fixed anchors to the viewport — the mobile
+  // <header> ancestor has will-change:transform (and useHideOnScroll applies an
+  // inline translateY on scroll), which establishes a containing block that
+  // would otherwise clip/mis-anchor the dropdown.
+  return createPortal(
     <div
       class="thread-filter-dropdown"
       ref={ref}
@@ -44,7 +49,8 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
         </label>
       ))}
       {filter.has('trigger') && <TriggerSubList />}
-    </div>
+    </div>,
+    document.body,
   );
 }
 
