@@ -1,11 +1,9 @@
 import { isMac } from './platform';
 
 const MOD = isMac ? '⌘' : 'Ctrl+';
-const CTRL = isMac ? '⌃' : 'Ctrl+';
-const SHIFT = isMac ? '⇧' : 'Shift+';
 
 const SHORTCUTS = {
-  newThread: `${CTRL}${SHIFT}O`,
+  newThread: isMac ? '⌃⇧O' : 'Ctrl+Shift+O',
   toggleThreadDrawer: 'T',
   searchEverywhere: `${MOD}K`,
   zoomIn: `${MOD}+`,
