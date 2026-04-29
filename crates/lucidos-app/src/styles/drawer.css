@@ -61,18 +61,15 @@
 
 /* Filter active indicator — no color override; count badge shows state */
 
-/* Filter dropdown */
+/* position:fixed anchors to viewport; top/right/max-width set inline from JS so the dropdown can't overflow even when the toggle isn't at the screen edge. */
 .thread-filter-dropdown {
-    position: absolute;
-    top: 100%;
-    right: 0;
+    position: fixed;
     z-index: var(--z-dropdown);
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 0.5rem;
     padding: 0.5rem;
     min-width: 10rem;
-    max-width: calc(100vw - 1rem);
     box-shadow: var(--shadow-md);
 }
 

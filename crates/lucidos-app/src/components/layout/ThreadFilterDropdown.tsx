@@ -1,11 +1,24 @@
-import { useRef, useEffect } from 'preact/hooks';
+import { useRef, useEffect, useState } from 'preact/hooks';
 import { threadChannelFilter, excludedTriggerIds, triggers } from '../../store/store';
 import { loadedOr } from '../../store/types';
 import { CHANNEL_OPTIONS, toggleChannel, toggleTriggerId, showAllTriggers, hideAllTriggers } from './headerHelpers';
 import { loadTriggers } from '../../store/actions/triggers';
 
+const VIEWPORT_MARGIN_PX = 8;
+
 export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => void; toggleRef: { current: HTMLButtonElement | null } }) {
   const ref = useRef<HTMLDivElement>(null);
+  const [position] = useState(() => {
+    const el = toggleRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const right = Math.max(VIEWPORT_MARGIN_PX, window.innerWidth - rect.right);
+    return {
+      top: rect.bottom,
+      right,
+      maxWidth: window.innerWidth - right - VIEWPORT_MARGIN_PX,
+    };
+  });
   const filter = threadChannelFilter.value;
 
   useEffect(() => {
@@ -17,8 +30,14 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
     return () => document.removeEventListener('click', handleClick);
   }, [onClose]);
 
+  if (!position) return null;
+
   return (
-    <div class="thread-filter-dropdown" ref={ref}>
+    <div
+      class="thread-filter-dropdown"
+      ref={ref}
+      style={{ top: `${position.top}px`, right: `${position.right}px`, maxWidth: `${position.maxWidth}px` }}
+    >
       <div class="thread-filter-title">Show</div>
       {CHANNEL_OPTIONS.map(opt => (
         <label class="thread-filter-option" key={opt.value}>
