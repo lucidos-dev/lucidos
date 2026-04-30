@@ -293,9 +293,7 @@ function ThreadList() {
         const observer = new IntersectionObserver(
             (entries) => {
                 if (!entries[0]?.isIntersecting) return;
-                // Skip when history is collapsed: the sentinel comes into view
-                // because the list shrunk (layout shift), not user scroll. Loading
-                // here silently grows the collapsed count badge on every toggle.
+                // Collapsing history shrinks the list and pops the sentinel into view — would silently bloat the count badge.
                 if (collapsedSections.value.has('history')) return;
                 loadOlderThreads();
             },
