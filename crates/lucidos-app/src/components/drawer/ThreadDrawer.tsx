@@ -292,9 +292,10 @@ function ThreadList() {
 
         const observer = new IntersectionObserver(
             (entries) => {
-                if (entries[0]?.isIntersecting) {
-                    loadOlderThreads();
-                }
+                if (!entries[0]?.isIntersecting) return;
+                // Collapsing history shrinks the list and pops the sentinel into view — would silently bloat the count badge.
+                if (collapsedSections.value.has('history')) return;
+                loadOlderThreads();
             },
             { root: sentinel.closest('.thread-drawer-list'), threshold: 0 },
         );

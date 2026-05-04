@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.2 — 2026-05-04
+
+Bugfixes.
+
+### Fixed
+- **(#1, Akram)** History infinite-scroll no longer fires when the History section is collapsed. Previously, collapsing shrank the list and pulled the `IntersectionObserver` sentinel into view, silently appending ~15 threads (and inflating the count badge) on every toggle.
+- **(#1, Akram)** New-thread shortcut tooltip now shows `⌃⇧O` on Mac. The old `⌘⇧O or C` was misleading: Cmd+Shift+O is intercepted by the browser/OS on Mac (only Ctrl+Shift+O actually fires), and `or C` was easily misread as `or Cmd+Shift+C`. The standalone `C` shortcut still works in code, just no longer advertised.
 ## v0.7.1 — 2026-04-27
 
 ### Highlights
