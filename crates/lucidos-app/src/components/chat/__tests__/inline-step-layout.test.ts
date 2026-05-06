@@ -1,0 +1,41 @@
+import { describe, it, expect } from 'vitest';
+// @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error — same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error — same
+import { fileURLToPath } from 'node:url';
+
+const here: string = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Regression test: inline steps must render checkmark and description on the
+ * same line, with ellipsis truncation for long descriptions.
+ *
+ * Previous bug: `flex-wrap: wrap` on `.inline-step` caused the description to
+ * wrap below the checkmark icon when text was long. Combined with
+ * `white-space: nowrap` but no overflow handling, text was clipped without
+ * ellipsis.
+ */
+describe('inline step layout (CSS regression)', () => {
+  const css = readFileSync(resolve(here, '../../../styles/steps.css'), 'utf-8');
+
+  // Extract the CSS block for a selector
+  function getBlock(selector: string): string {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`, 'g');
+    return [...css.matchAll(re)].map(m => m[1]).join('\n');
+  }
+
+  it('inline-step must not flex-wrap (checkmark and text stay on same line)', () => {
+    const block = getBlock('.inline-step');
+    // flex-wrap: wrap causes the description to drop below the icon
+    expect(block).not.toContain('flex-wrap: wrap');
+  });
+
+  it('step-description must truncate with ellipsis', () => {
+    const block = getBlock('.inline-step .step-description');
+    expect(block).toContain('overflow: hidden');
+    expect(block).toContain('text-overflow: ellipsis');
+  });
+});
