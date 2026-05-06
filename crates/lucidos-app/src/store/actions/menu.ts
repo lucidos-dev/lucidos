@@ -55,6 +55,9 @@ export function switchMenuItem(item: MenuItem) {
 export function openSettingsSubview(key: Exclude<SettingsSubview, 'main'>) {
   settingsSubview.value = key;
   if (key === 'accounts') loadCredentials();
+  panelOverlay.value = null;
+  localStorage.removeItem('file-preview-open');
+  localStorage.removeItem('app-window-open');
   pushNavState();
 }
 
