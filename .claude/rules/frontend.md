@@ -11,6 +11,14 @@ globs:
 
 The frontend expresses **what** the user wants, not **how** the backend should do it. Don't make the frontend extract data from its local state just to pass it back.
 
+## Drafts Are Threads — Bind Global Selections at Promotion Time
+
+Compose drafts live in `threadMap` like any other thread (`meta.state === 'composing'`, `focusedThreadId` set). `sendCompose` (compose.ts) flips state to `'active'` BEFORE calling `sendMessage` — so `sendMessage` cannot tell first-send from follow-up by thread state alone. Every plausible signal (`threadMap.get` truthy, `focusedThreadId === null`, `meta.state === 'composing'`) gives a wrong answer for at least one of: optimistic insert, focused draft, or sendCompose's pre-flip.
+
+Bind global compose-view selections (e.g. `selectedRepoId.value`) onto `meta.*` at promotion time inside `sendCompose`. Follow-ups via `sendMessage` then just read `meta.*`. Raw-new sends straight to `sendMessage` (no thread) read `selectedRepoId.value` directly — there's no thread to carry the binding.
+
+Lifecycle states: `'composing' | 'active' | 'discarded' | 'archived'` (`ThreadComposeState`).
+
 ## Async Data Loading — `Loadable<T>`
 
 Every async-fetched value **must** use `Loadable<T>` from `store/types.ts`:

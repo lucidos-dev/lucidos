@@ -23,6 +23,33 @@ fn build_intent_tools() -> Vec<ToolDefinition> {
     tools
 }
 
+/// Derive the "target" key for the consecutive-tool-call circuit breaker.
+///
+/// Most tools have a meaningful target argument (`path`, `url`, `query`).
+/// `run_bash` is special: its argument is `command`, and bucketing by the
+/// bare tool name would mean three unrelated shell calls (e.g. `git status`
+/// → `git add` → `git commit`) trip the guard. Bucketing by the first
+/// whitespace-delimited token of `command` keeps the original "stop the LLM
+/// from spamming the exact same call" intent (same prefix still counts) while
+/// letting unrelated commands run in sequence.
+pub(super) fn derive_call_key(tool_name: &str, args: &serde_json::Value) -> String {
+    if tool_name == tn::RUN_BASH {
+        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+            if let Some(first_token) = cmd.split_whitespace().next() {
+                return first_token.to_string();
+            }
+        }
+        return tn::RUN_BASH.to_string();
+    }
+
+    args.get("path")
+        .or_else(|| args.get("url"))
+        .or_else(|| args.get("query"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Check if buffered text has reached a renderable boundary.
 pub(super) fn should_flush(text: &str) -> bool {
     // Paragraph break
@@ -701,13 +728,7 @@ impl LucidosEngine {
                 let current_args = &response.tool_calls[0].arguments;
 
                 // Track by tool name + target for dedup detection
-                let call_key = current_args
-                    .get("path")
-                    .or_else(|| current_args.get("url"))
-                    .or_else(|| current_args.get("query"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let call_key = derive_call_key(current_tool, current_args);
 
                 let current_call = (current_tool.clone(), call_key.clone());
                 if Some(&current_call) == last_tool_call.as_ref() {
@@ -1782,13 +1803,7 @@ impl LucidosEngine {
             // Circuit breaker for consecutive duplicate calls
             if response.tool_calls.len() == 1 {
                 let tc = &response.tool_calls[0];
-                let call_key = tc
-                    .arguments
-                    .get("path")
-                    .or_else(|| tc.arguments.get("url"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let call_key = derive_call_key(&tc.name, &tc.arguments);
                 let current_call = (tc.name.clone(), call_key);
                 if Some(&current_call) == last_tool_call.as_ref() {
                     consecutive_same_call += 1;
@@ -2104,6 +2119,91 @@ mod intent_loop_tools_tests {
             !names.contains(&tn::EXECUTE_INTENT),
             "Intent loop tools must NOT include execute_intent (no recursion)"
         );
+    }
+}
+
+#[cfg(test)]
+mod derive_call_key_tests {
+    use super::derive_call_key;
+    use crate::llm::tool_names as tn;
+    use serde_json::json;
+
+    #[test]
+    fn run_bash_buckets_by_first_token() {
+        let key = derive_call_key(tn::RUN_BASH, &json!({ "command": "git status" }));
+        assert_eq!(key, "git");
+    }
+
+    #[test]
+    fn run_bash_trims_leading_whitespace() {
+        let key = derive_call_key(tn::RUN_BASH, &json!({ "command": "  git  add ." }));
+        assert_eq!(key, "git");
+    }
+
+    #[test]
+    fn run_bash_empty_command_falls_back_to_tool_name() {
+        let key = derive_call_key(tn::RUN_BASH, &json!({ "command": "" }));
+        assert_eq!(key, tn::RUN_BASH);
+    }
+
+    #[test]
+    fn run_bash_whitespace_only_command_falls_back_to_tool_name() {
+        let key = derive_call_key(tn::RUN_BASH, &json!({ "command": "   " }));
+        assert_eq!(key, tn::RUN_BASH);
+    }
+
+    #[test]
+    fn run_bash_missing_command_falls_back_to_tool_name() {
+        let key = derive_call_key(tn::RUN_BASH, &json!({}));
+        assert_eq!(key, tn::RUN_BASH);
+    }
+
+    #[test]
+    fn run_bash_distinct_commands_bucket_separately() {
+        let git = derive_call_key(tn::RUN_BASH, &json!({ "command": "git status" }));
+        let cargo = derive_call_key(tn::RUN_BASH, &json!({ "command": "cargo test" }));
+        let ls = derive_call_key(tn::RUN_BASH, &json!({ "command": "ls -la" }));
+        assert_eq!(git, "git");
+        assert_eq!(cargo, "cargo");
+        assert_eq!(ls, "ls");
+        assert_ne!(git, cargo);
+        assert_ne!(cargo, ls);
+    }
+
+    #[test]
+    fn run_bash_same_prefix_buckets_together() {
+        let a = derive_call_key(tn::RUN_BASH, &json!({ "command": "git status" }));
+        let b = derive_call_key(tn::RUN_BASH, &json!({ "command": "git add ." }));
+        let c = derive_call_key(tn::RUN_BASH, &json!({ "command": "git commit -m x" }));
+        assert_eq!(a, "git");
+        assert_eq!(b, "git");
+        assert_eq!(c, "git");
+    }
+
+    #[test]
+    fn read_file_keys_by_path_unchanged() {
+        let key = derive_call_key(tn::READ_FILE, &json!({ "path": "src/main.rs" }));
+        assert_eq!(key, "src/main.rs");
+    }
+
+    #[test]
+    fn web_search_keys_by_query_unchanged() {
+        let key = derive_call_key(tn::WEB_SEARCH, &json!({ "query": "rust async" }));
+        assert_eq!(key, "rust async");
+    }
+
+    #[test]
+    fn non_run_bash_with_command_arg_does_not_bucket_by_command() {
+        // Sanity: only run_bash is special-cased. A different tool that happens
+        // to carry a `command` arg falls through to the path/url/query lookup.
+        let key = derive_call_key(tn::READ_FILE, &json!({ "command": "git status" }));
+        assert_eq!(key, "");
+    }
+
+    #[test]
+    fn non_run_bash_without_known_arg_returns_empty() {
+        let key = derive_call_key(tn::LIST_FILES, &json!({}));
+        assert_eq!(key, "");
     }
 }
 

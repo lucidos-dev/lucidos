@@ -337,6 +337,41 @@
     flex-shrink: 0;
 }
 
+/* --- Repo file preview split (changed-files sidebar + main pane) --- */
+
+/* container-type lets the sidebar respond to the split's own inline-size,
+ * not the viewport — so dragging the SplitLayout divider triggers the show/hide. */
+.repo-preview-split {
+    container-type: inline-size;
+    display: flex;
+    height: 100%;
+    min-height: 0;
+}
+
+.repo-preview-split-sidebar {
+    display: none;
+    flex: 0 0 16rem;
+    overflow-y: auto;
+    border-right: 1px solid var(--border-color);
+    background: var(--bg-secondary);
+}
+
+.repo-preview-split-main {
+    flex: 1;
+    min-width: 0;
+    overflow: auto;
+}
+
+@container (min-width: 50rem) {
+    .repo-preview-split-sidebar {
+        display: block;
+    }
+}
+
+.file-item.active {
+    background: var(--bg-tertiary);
+}
+
 /* --- Diff view --- */
 
 .diff-view {

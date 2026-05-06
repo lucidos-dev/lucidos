@@ -224,6 +224,11 @@ export async function sendMessage(
   setFocusedThread(threadId);
   if (isNewThread) pushThreadNavState({ type: 'thread', id: threadId });
 
+  // Snapshot the thread BEFORE the optimistic insert below — the insert
+  // creates a state='active' thread for raw new threads, which would
+  // otherwise be indistinguishable from an active follow-up further down.
+  const threadBeforeSend = threadMap.value.get(threadId);
+
   // Set optimistic pending message
   const map = threadMap.value;
   if (!map.has(threadId)) {
@@ -253,27 +258,19 @@ export async function sendMessage(
   if (ctx?.repo_file_context) body.repo_file_context = ctx.repo_file_context;
   if (images?.length) body.images = images.map(img => ({ base64: img.base64, mime_type: img.mimeType }));
 
-  // A thread is locked to its (mode, repo) at first message. Existing thread
-  // wins over `options?.useClaudeCode`, and its bound `meta.repoId` wins over
-  // the global compose-view signal — switching either mid-thread caused the
-  // executor card and commands menu to disagree (different repo's skills,
-  // sessions on different repos, branch can't follow). Backend 409s as a
-  // backstop in `validate_thread_continuity`.
-  const existingThread = threadMap.value.get(threadId);
-  const isCcThread = existingThread
-    ? existingThread.meta.channel === 'claude_code'
-    : !!options?.useClaudeCode;
+  // Drafts (state='composing') ARE threads in threadMap with focusedThreadId
+  // set, so neither `threadMap.get` truthiness nor `focusedThreadId === null`
+  // discriminates draft from established follow-up. Use the lifecycle marker
+  // against the pre-insert snapshot.
+  const isUnsent = !threadBeforeSend || threadBeforeSend.meta.state === 'composing';
+  const isCcThread = isUnsent
+    ? !!options?.useClaudeCode
+    : threadBeforeSend!.meta.channel === 'claude_code';
   if (isCcThread) {
     body.use_claude_code = true;
-    if (existingThread) {
-      // Existing thread: trust the bound repo (undefined `meta.repoId` means
-      // the thread runs on the default Lucidos repo). Never fall back to the
-      // global `selectedRepoId` signal — it reflects whatever the user last
-      // picked in compose view, which is unrelated to this thread.
-      if (existingThread.meta.repoId) {
-        body.repo_id = existingThread.meta.repoId;
-      }
-    } else if (selectedRepoId.value) {
+    if (!isUnsent && threadBeforeSend?.meta.repoId) {
+      body.repo_id = threadBeforeSend.meta.repoId;
+    } else if (isUnsent && selectedRepoId.value) {
       body.repo_id = selectedRepoId.value;
     }
     // Apply pending CC preferences (set from compose view before session start).

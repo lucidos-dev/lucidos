@@ -8,7 +8,7 @@ import { SettingsView } from '../settings/SettingsView';
 import { ChangesView } from '../changes/ChangesView';
 import { NotificationsView } from '../notifications/NotificationsView';
 import { FilePreviewInline } from '../files/FilePreviewInline';
-import { RepoFilePreview } from '../files/RepoFilePreview';
+import { RepoFilePreviewWithSidebar } from '../files/RepoFilePreview';
 import { UrlPreviewInline } from '../files/UrlPreviewInline';
 import { AppUiInline } from '../apps/AppUiInline';
 import { InlineForm } from './InlineForm';
@@ -48,7 +48,7 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
         {overlay?.type === 'file-preview' && (() => {
           const repo = parseRepoPath(overlay.path);
           return repo
-            ? <RepoFilePreview repoId={repo.repoId} mode={repo.mode} path={repo.path} changeId={repo.changeId} layout={layout} />
+            ? <RepoFilePreviewWithSidebar repoId={repo.repoId} mode={repo.mode} path={repo.path} changeId={repo.changeId} layout={layout} />
             : <FilePreviewInline path={overlay.path} layout={layout} />;
         })()}
         {overlay?.type === 'url-preview' && <UrlPreviewInline url={overlay.url} layout={layout} />}

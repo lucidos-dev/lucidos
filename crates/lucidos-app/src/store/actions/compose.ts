@@ -17,7 +17,7 @@
  * focused-textarea guards.
  */
 
-import { threadMap, focusedThreadId, inputMode, showToast, setFocusedThread } from '../store';
+import { threadMap, focusedThreadId, inputMode, showToast, setFocusedThread, selectedRepoId } from '../store';
 import { makeOptimisticThreadState, type ThreadMeta } from '../thread-events';
 import { clearDraft, composeDrafts, draftIsEmpty, getDraft, patchDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { ApiError, ensureThreadStarted, putComposeOnThread, deleteThread } from '../../api/client';
@@ -114,13 +114,11 @@ export function applyRemoteCompose(
 function mutateThreadMeta(threadId: string, patch: Partial<ThreadMeta>): void {
   const thread = threadMap.value.get(threadId);
   if (!thread) return;
-  const nextMeta = { ...thread.meta };
-  for (const k of Object.keys(patch) as Array<keyof ThreadMeta>) {
-    if (patch[k] === undefined) continue;
-    (nextMeta as Record<string, unknown>)[k] = patch[k];
-  }
+  // Spread (not iterate-skip-undefined) so passing `{ field: undefined }`
+  // explicitly clears the field — needed e.g. when sendCompose unbinds repoId
+  // because the user picked the default repo on retry after a failed send.
   const next = new Map(threadMap.value);
-  next.set(threadId, { ...thread, meta: nextMeta });
+  next.set(threadId, { ...thread, meta: { ...thread.meta, ...patch } });
   threadMap.value = next;
 }
 
@@ -284,7 +282,10 @@ export async function sendCompose(threadId: string, opts: { useClaudeCode?: bool
     : undefined;
 
   cancelPendingPush(threadId);
-  mutateThreadMeta(threadId, { state: 'active' });
+  // Bind here so sendMessage doesn't have to detect first-send vs follow-up
+  // (see frontend.md "Drafts Are Threads"). selectedRepoId may drift afterward.
+  const boundRepoId = opts.useClaudeCode && selectedRepoId.value ? selectedRepoId.value : undefined;
+  mutateThreadMeta(threadId, { state: 'active', repoId: boundRepoId });
   clearDraft(threadId);
   setFocusedThread(threadId);
   try {

@@ -6,7 +6,7 @@ Lucidos is an AI companion that shares your whole workspace. You talk, build, ru
 
 A local, event-driven, AI-native operating system. You own and store all the data yourself. The prompt is the primary interface, but Lucidos is a unified, integrated environment where configurable LLMs know all about your apps, triggers (scheduled or event-driven), and files. Describe an app and it's running in seconds - no build step, no deploy. Built to augment the *user*, it remembers everything you do. While it is not an "autonomous" role playing entity, you can automate anything. Nothing happens without a user intent, though - which is a central concept for Lucidos.
 
-The integrated environment makes for a smooth user experience, where researching a topic, storing the findings, spinning up an app around them, and scheduling regular syncs with external data sources can all be done in one simple flow. Local data lives in a Postgres event store or as git-versioned artifacts.
+The integrated environment makes for a smooth user experience, where researching a topic, storing the findings, spinning up an app around them, and pulling in data from external sources — whether through scheduled syncs or direct API calls — can all be done in one simple flow. Local data lives in a Postgres event store or as git-versioned artifacts.
 
 ---
 

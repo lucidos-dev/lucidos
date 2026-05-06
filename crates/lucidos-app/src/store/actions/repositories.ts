@@ -3,14 +3,14 @@ import {
   repoViewMode, repoExpandedFolders, selectedLines,
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
   activeMenuItem, repositories, showToast,
-  panelOverlay, parseRepoPath, SELECTED_CHANGE_KEY,
+  panelOverlay, parseRepoPath, encodeRepoPath, SELECTED_CHANGE_KEY,
 } from '../store';
 import { listRepoFiles, getChangeDiff, getChangeById, getRepoChanges, getThreadCcDiff } from '../../api/client';
 import type { Change, ThreadCcDiff } from '../../api/client';
 import { toFailed, loadedOr, setLoadingIfFresh } from '../types';
 import { revealContentPane } from './pane';
 import { loadRepositories } from './chat';
-import { pushNavState } from './navigation';
+import { pushNavState, replaceNavState } from './navigation';
 import { errorDetail } from '../../utils/errorDetail';
 
 export async function switchRepoSource(repoId: string | null): Promise<void> {
@@ -222,6 +222,28 @@ export async function restoreRepoSelectionFromStorage(): Promise<void> {
   } catch {
     localStorage.removeItem(SELECTED_CHANGE_KEY);
   }
+}
+
+/** Open the file-preview panel on a path in the current repo. The split-view
+ *  sidebar inside the panel reuses this — when called while the panel is
+ *  already on screen, overwrite the existing nav slot so the unified panel is
+ *  one history entry with the latest file selection winning, instead of
+ *  stacking one entry per file the user clicks through. */
+export function openRepoFilePreview(path: string, mode: 'file' | 'diff'): void {
+  const repoId = repoSource.value;
+  if (!repoId) return;
+  // Snapshot before mutating panelOverlay so the push-vs-replace decision
+  // sees the *previous* overlay type.
+  const replaceInPlace = panelOverlay.value?.type === 'file-preview';
+  const changeId = mode === 'diff' ? repoSelectedChangeId.value ?? undefined : undefined;
+  selectedLines.value = null;
+  panelOverlay.value = {
+    type: 'file-preview',
+    path: encodeRepoPath(repoId, mode, path, changeId),
+  };
+  revealContentPane();
+  if (replaceInPlace) replaceNavState();
+  else pushNavState();
 }
 
 /** Open the Files panel on the 3-dot diff of a CC worktree's branch — for

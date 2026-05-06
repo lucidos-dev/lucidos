@@ -1,18 +1,17 @@
 import {
   repoFiles, repoDiff, repoViewMode, repoExpandedFolders,
-  repoSource, repoPending, panelOverlay, selectedLines, encodeRepoPath,
-  repoSelectedChangeId,
+  repoPending, repoSelectedChangeId,
 } from '../../store/store';
 import type { DiffFile } from '../../store/store';
 import {
   toggleRepoFolder, expandAllRepoFolders, collapseAllRepoFolders,
+  openRepoFilePreview,
 } from '../../store/actions/repositories';
 import { buildFolderTree } from '../../store/actions/artifacts';
 import type { FolderNode } from '../../store/actions/artifacts';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { loadedOr } from '../../store/types';
 import { getEmojiForFile } from '../../utils/fileIcons';
-import { pushNavState } from '../../store/actions/navigation';
 import { TreeNode } from './FolderTree';
 import { changeBadgeLabel } from './changeBadge';
 import { diffStats } from './diffStats';
@@ -89,7 +88,7 @@ export function RepoFilesView() {
   );
 }
 
-function ChangesFileList({ files }: { files: DiffFile[] }) {
+export function ChangesFileList({ files, activePath }: { files: DiffFile[]; activePath?: string }) {
   let totalAdd = 0;
   let totalDel = 0;
   const fileStats = files.map(f => {
@@ -109,8 +108,8 @@ function ChangesFileList({ files }: { files: DiffFile[] }) {
       {files.map((f, i) => (
         <div
           key={f.path}
-          class="file-item repo-changed-file"
-          onClick={() => openRepoFilePreview(f.path, true)}
+          class={`file-item repo-changed-file${f.path === activePath ? ' active' : ''}`}
+          onClick={() => openRepoFilePreview(f.path, 'diff')}
         >
           <span class="file-icon">{getEmojiForFile(f.path)}</span>
           <span class="file-name">{f.path}</span>
@@ -148,7 +147,7 @@ function RepoFolderTree({ changedMap }: { changedMap: Map<string, DiffFile> }) {
         indent={0}
         isExpanded={(path) => repoExpandedFolders.value.has(path)}
         onToggle={toggleRepoFolder}
-        onFileClick={(path) => openRepoFilePreview(path, !!changedMap.get(path))}
+        onFileClick={(path) => openRepoFilePreview(path, changedMap.has(path) ? 'diff' : 'file')}
         folderExtra={(folder) =>
           folderHasChanges(folder, changedMap) ? <span class="folder-change-dot" /> : null
         }
@@ -164,13 +163,4 @@ function RepoFolderTree({ changedMap }: { changedMap: Map<string, DiffFile> }) {
       />
     </div>
   );
-}
-
-function openRepoFilePreview(path: string, isDiff: boolean) {
-  selectedLines.value = null;
-  panelOverlay.value = {
-    type: 'file-preview',
-    path: encodeRepoPath(repoSource.value!, isDiff ? 'diff' : 'file', path, isDiff ? repoSelectedChangeId.value ?? undefined : undefined),
-  };
-  pushNavState();
 }

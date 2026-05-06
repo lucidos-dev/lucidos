@@ -205,6 +205,19 @@ export function pushNavState(): void {
   }
 }
 
+/** Overwrite the entry at the cursor with the current state — used when a
+ *  panel already on screen mutates in place (e.g. switching files inside the
+ *  diff split-view) and we want a single history slot for the whole session. */
+export function replaceNavState(): void {
+  ensureInitialized();
+  if (_restoring) return;
+  if (navCursor.value < 0 || navCursor.value >= navStack.value.length) return;
+  const newStack = [...navStack.value];
+  newStack[navCursor.value] = captureState();
+  navStack.value = newStack;
+  saveNavState();
+}
+
 export function navBack(): void {
   ensureInitialized();
   if (!canGoBack.value) return;

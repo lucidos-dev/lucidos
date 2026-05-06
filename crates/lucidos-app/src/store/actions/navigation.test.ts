@@ -388,3 +388,48 @@ describe('overlay-only changes are accepted by pushEntry (regression guard)', ()
     expect(result!.stack).toHaveLength(5);
   });
 });
+
+// Mirrors the pure logic of `replaceNavState` in navigation.ts — used by the
+// diff split-view sidebar so switching files inside the open panel keeps a
+// single history slot with the latest selection winning.
+function replaceEntry(stack: NavEntry[], cursor: number, entry: NavEntry): NavEntry[] | null {
+  if (cursor < 0 || cursor >= stack.length) return null;
+  const next = [...stack];
+  next[cursor] = entry;
+  return next;
+}
+
+describe('replaceEntry (latest-file-wins for diff split-view)', () => {
+  it('overwrites the entry at the cursor without growing the stack', () => {
+    const stack = [
+      makeEntry(),
+      makeEntry({ overlay: { type: 'file-preview', path: 'a.md' } }),
+    ];
+    const result = replaceEntry(stack, 1, makeEntry({ overlay: { type: 'file-preview', path: 'b.md' } }));
+    expect(result).not.toBeNull();
+    expect(result!).toHaveLength(2);
+    expect((result![1].overlay as { path: string }).path).toBe('b.md');
+  });
+
+  it('chained replaces keep one slot — back goes to the entry before the panel opened', () => {
+    let stack = [
+      makeEntry(),
+      makeEntry({ overlay: { type: 'file-preview', path: 'a.md' } }),
+    ];
+    for (const path of ['b.md', 'c.md', 'd.md']) {
+      const next = replaceEntry(stack, 1, makeEntry({ overlay: { type: 'file-preview', path } }));
+      stack = next!;
+    }
+    expect(stack).toHaveLength(2);
+    expect((stack[1].overlay as { path: string }).path).toBe('d.md');
+    // back from cursor=1 lands on the original entry, not on a previously
+    // visited file inside the panel
+    expect(stack[0].overlay).toBeNull();
+  });
+
+  it('refuses to replace when cursor is out of bounds', () => {
+    const stack = [makeEntry()];
+    expect(replaceEntry(stack, -1, makeEntry())).toBeNull();
+    expect(replaceEntry(stack, 1, makeEntry())).toBeNull();
+  });
+});

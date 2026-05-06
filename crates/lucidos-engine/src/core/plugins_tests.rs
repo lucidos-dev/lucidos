@@ -47,6 +47,25 @@ fn parses_optional_engine() {
 }
 
 #[test]
+fn parses_optional_setup_field() {
+    let toml = format!(
+        "{}setup = \"Set up a daily reflection trigger using `knowhow/browser-learning/reflection.md`. Suggested cron: `0 0 4 * * *`.\"\n",
+        VALID_MANIFEST
+    );
+    let m = parse_manifest(&toml).unwrap();
+    assert_eq!(
+        m.setup.as_deref(),
+        Some("Set up a daily reflection trigger using `knowhow/browser-learning/reflection.md`. Suggested cron: `0 0 4 * * *`.")
+    );
+}
+
+#[test]
+fn setup_is_none_when_absent() {
+    let m = parse_manifest(VALID_MANIFEST).unwrap();
+    assert_eq!(m.setup, None);
+}
+
+#[test]
 fn rejects_missing_id() {
     let toml = r#"
 version = "0.1.0"

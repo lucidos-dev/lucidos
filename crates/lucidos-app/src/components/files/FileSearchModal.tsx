@@ -2,11 +2,9 @@ import { useState, useRef, useEffect } from 'preact/hooks';
 import {
   artifacts, fileSearchOpen, activeMenuItem,
   repoFiles, repoSource, repoDiff, changes,
-  encodeRepoPath, panelOverlay, selectedLines, repoSelectedChangeId,
 } from '../../store/store';
 import { openFilePreview } from '../../store/actions/artifacts';
-import { revealContentPane } from '../../store/actions/pane';
-import { pushNavState } from '../../store/actions/navigation';
+import { openRepoFilePreview } from '../../store/actions/repositories';
 import { getEmojiForFile } from '../../utils/fileIcons';
 import {
   collectSearchResults, filterSearchResults, type FileSearchResult,
@@ -92,16 +90,7 @@ export function FileSearchModal() {
     if (result.source === 'workspace') {
       openFilePreview(result.path);
     } else if (result.source === 'repo' || result.source === 'change') {
-      const repoId = repoSource.value;
-      if (repoId) {
-        selectedLines.value = null;
-        panelOverlay.value = {
-          type: 'file-preview',
-          path: encodeRepoPath(repoId, result.changeStatus ? 'diff' : 'file', result.path, result.changeStatus ? repoSelectedChangeId.value ?? undefined : undefined),
-        };
-        revealContentPane();
-        pushNavState();
-      }
+      openRepoFilePreview(result.path, result.changeStatus ? 'diff' : 'file');
     }
   };
 

@@ -16,6 +16,12 @@ pub struct PluginManifest {
     /// one, but install + uninstall work fine.
     pub source: Option<String>,
     pub engine: Option<String>,
+    /// Optional post-install instructions for the LLM to act on (e.g. "create a
+    /// daily reflection trigger using `knowhow/foo/run.md`"). Surfaced verbatim
+    /// in the `install_plugin` tool result so the agent can offer to wire it up
+    /// on the same turn as the install. Free-form markdown -- the author writes
+    /// it; the engine does not interpret it.
+    pub setup: Option<String>,
     /// Full manifest as JSON, so future additive fields land in the event.
     pub raw: serde_json::Value,
 }
@@ -122,6 +128,11 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ValidationError
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let setup = table
+        .get("setup")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let raw = serde_json::to_value(&value)
         .map_err(|e| ValidationError::ManifestParseError(e.to_string()))?;
 
@@ -132,6 +143,7 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ValidationError
         description,
         source,
         engine,
+        setup,
         raw,
     })
 }

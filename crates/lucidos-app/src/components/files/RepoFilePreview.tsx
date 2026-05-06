@@ -12,6 +12,7 @@ import { isMobile, viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { DiffView } from './DiffView';
 import { RenderedDiff } from './RenderedDiff';
+import { ChangesFileList } from './RepoFilesView';
 
 interface Props {
   repoId: string;
@@ -41,6 +42,34 @@ export function shouldRenderMarkdownDiff(opts: {
   if (opts.ext !== 'md') return false;
   if (opts.fileStatus === 'deleted') return false;
   return !!opts.activeChangeId || !!opts.branchRef;
+}
+
+/** Renders RepoFilePreview with a sidebar listing the changed files in the
+ *  current diff. The sidebar is hidden via container query when the content
+ *  pane is too narrow (see `.repo-preview-split-sidebar` in panels.css), so
+ *  mobile and a heavily-collapsed content pane fall back to today's behavior. */
+export function RepoFilePreviewWithSidebar(props: Props) {
+  const isActiveLayout = props.layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
+  if (!isActiveLayout) return null;
+
+  const diff = repoDiff.value;
+  const files = diff.status === 'loaded' ? diff.data.files : [];
+  const showSidebar = files.length > 0;
+
+  if (!showSidebar) {
+    return <RepoFilePreview {...props} />;
+  }
+
+  return (
+    <div class="repo-preview-split">
+      <aside class="repo-preview-split-sidebar">
+        <ChangesFileList files={files} activePath={props.path} />
+      </aside>
+      <div class="repo-preview-split-main">
+        <RepoFilePreview {...props} />
+      </div>
+    </div>
+  );
 }
 
 export function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {

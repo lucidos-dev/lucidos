@@ -1,25 +1,16 @@
 # Changelog
 
-## v0.9.1 — 2026-05-06
+## v0.9.2 — 2026-05-06
 
 ### Added
-- **Export thread** button next to "Copy reference" in the thread header.
-- Copy button on thread headers reveals on hover (desktop).
-- CC commands menu scopes compose-view skills to the selected repo.
+- **Plugin install setup hints**: `install_plugin` now surfaces optional `setup` text from the plugin manifest, so users see post-install instructions inline.
+- **Diff split-view single-step nav**: Clicking files in the diff split-view records a single history entry instead of stacking one per click.
 
 ### Fixed
-- **Compose**: textarea sync skipped while user is focused (cursor jump on remote draft updates); persisted draft text now reaches the focused textarea on reload; `focusedThreadId` persisted across reloads; `applyRemoteCompose` guarded against orphan + empty drafts; send routed via `composeMode` instead of the draft's frozen channel; draft state split cleanly between local + remote.
-- **Claude Code**: parallel tool calls with the same label no longer get misrouted (was causing UI spinning).
-- **Thread lifecycle**: stale-resume guard in `run_session.rs` so transient API errors no longer destroy user work via branch deletion; threads with pending changes pinned to Review before archiving; `ChangeProposed` moved to a CC-specific unread-marking arm; `pendingChanges` counter tracks `ChangeProposed`/`ChangeApplied`/`ChangeDiscarded` correctly.
-- **Memory module**: artifact-indexing gaps causing some artifacts to be missed in long-term memory.
-- **Settings**: `openSettingsSubview` clears `panelOverlay` and removes `file-preview-open` / `app-window-open` from localStorage.
-- **Release wrapper**: `scripts/release.sh` no-PR mode now bases the worktree off `main` instead of the previous tag, so local commits actually ship (this was the v0.9.0 regression).
-- localStorage v5 hash bug.
-- Merge cancellation bug (verified by 3 new tests in `dismiss-requesting.test.ts`).
-- CCSettingsChanged thread lifecycle violation on CC sessions started with non-default settings.
+- **Repo selector for new CC threads**: The repo dropdown was silently ignored for new CC sessions — they always landed on the default Lucidos repo. Drafts and freshly composed threads now correctly bind the selected repo at compose-promotion time.
 
-### Changed
-- Thread state machine clarified into `composing` / `active` / `discarded` / `archived` (engine/thread_state.rs).
+### Docs
+- README mentions direct API calls as an alternative to scheduled syncs.
 ## v0.7.1 — 2026-04-27
 
 ### Highlights
