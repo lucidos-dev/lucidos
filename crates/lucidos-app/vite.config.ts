@@ -118,7 +118,15 @@ export default defineConfig({
     },
   },
   test: {
-    include: ['src/**/*.test.ts'],
+    // Cover both .test.ts and .test.tsx — JSX-bearing tests live in .tsx.
+    // Without the explicit `.tsx` glob, files like
+    // `src/components/chat/__tests__/permission-card.test.tsx` silently never
+    // run (no error, just zero discovery — a vitest convention quirk).
+    include: [
+      'src/**/*.test.ts',
+      'src/**/*.test.tsx',
+      '../../packages/lucidos-sdk/src/**/*.test.ts',
+    ],
     setupFiles: ['src/test-setup.ts'],
   },
   resolve: {

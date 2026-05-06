@@ -54,12 +54,55 @@ impl LucidosEngine {
                 _ => {
                     drop(guard);
                     log!(
-                        "[ApplyNow] No live session for thread {} — falling back to stale handling",
+                        "[ApplyNow] No live session for thread {} — propose then chain user-initiated apply",
                         thread_id
                     );
-                    return self
-                        .end_stale_waiting_session(thread_id, true, false, actor)
-                        .await;
+                    // Stale fallback: propose any uncommitted/committed work as
+                    // a pending change, then explicitly apply it. The apply is
+                    // stamped with the clicking user's actor, so the resulting
+                    // ChangeApplied chip reads "You" — not the engine.
+                    self.end_stale_waiting_session(thread_id, false, actor.clone())
+                        .await?;
+                    let pending = self.changes().pending_for_thread(thread_id).await;
+                    // Guarantee a terminal event so the frontend's `applyingNow`
+                    // spinner always resolves. Without this, a stale fallback that
+                    // proposes nothing (branch had no real commits) would hang
+                    // the spinner indefinitely.
+                    if pending.is_empty() {
+                        self.event_bus
+                            .emit_or_log(
+                                crate::engine::event_bus::BusEvent::Thread {
+                                    thread_id,
+                                    event: crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
+                                        change_id: String::new(),
+                                        error: "No changes to apply — branch is already merged or has no commits".to_string(),
+                                        actor: actor.clone(),
+                                    },
+                                    meta: crate::engine::thread_events::EventMeta::NONE,
+                                },
+                                "[ApplyNow] ChangeApplyFailed (stale fallback, no pending)",
+                            )
+                            .await;
+                        return Ok(());
+                    }
+                    for change in pending {
+                        log!(
+                            "[ApplyNow] Applying user-requested change {} on stale-session thread {}",
+                            change.id,
+                            thread_id
+                        );
+                        if let Err(e) = self.apply_change(change.id, actor.clone()).await {
+                            log!("[ApplyNow] apply_change for {} failed: {}", change.id, e);
+                            self.emit_apply_failed(
+                                thread_id,
+                                change.id,
+                                &e.to_string(),
+                                actor.clone(),
+                            )
+                            .await;
+                        }
+                    }
+                    return Ok(());
                 }
             }
         };
@@ -307,7 +350,6 @@ impl LucidosEngine {
         }
 
         // Step 4: Propose change
-        let request_id = Uuid::new_v4();
         let changed_files = branch_changed_files(repo_root, branch_name).await;
         let requires_restart = files_require_restart(&changed_files);
         let base = default_local_branch(repo_root).await;
@@ -319,7 +361,6 @@ impl LucidosEngine {
         let repo_root_str = repo_root.to_string_lossy();
         let change_id = self
             .propose_change(crate::engine::change_ops::ProposeChangeInput {
-                request_id,
                 thread_id,
                 branch_name,
                 repo_root: &repo_root_str,
@@ -418,11 +459,17 @@ impl LucidosEngine {
 
         let prompt = build_merge_prompt("main", None, None);
 
-        let _ = msg_tx.send(AgentUserInput {
+        if let Err(e) = msg_tx.send(AgentUserInput {
             text: prompt,
             images: None,
             origin_event_id: None,
-        });
+        }) {
+            return Err(format!(
+                "Failed to send merge prompt to CC session — receiver gone: {}",
+                e
+            )
+            .into());
+        }
 
         if let Err(e) = self
             .wait_for_idle(

@@ -1,17 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { deriveTriggerType, type TriggerInfo } from '../types';
-
-function makeTrigger(overrides: Partial<TriggerInfo> = {}): TriggerInfo {
-  return {
-    id: '1',
-    name: 'Test',
-    cron_expressions: [],
-    timezone: 'UTC',
-    paused: false,
-    run: { type: 'intent', text: 'test', knowhow: [] },
-    ...overrides,
-  };
-}
+import { deriveTriggerType } from '../types';
+import { makeTrigger } from './fixtures';
 
 describe('deriveTriggerType', () => {
   it('returns schedule for cron-only trigger', () => {

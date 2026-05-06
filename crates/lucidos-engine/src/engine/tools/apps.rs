@@ -77,7 +77,7 @@ impl LucidosEngine {
 
                 // System knowhow: explicit `system-knowhow/<id>` prefix routes to the
                 // engine-shipped, read-only knowhow at <repo>/system-knowhow/.
-                if let Some(sys_id) = id.strip_prefix("system-knowhow/") {
+                if let Some(sys_id) = id.strip_prefix(crate::core::knowhow::SYSTEM_KNOWHOW_PREFIX) {
                     let dir = self
                         .system_knowhow_dir()
                         .ok_or("System knowhow not available")?;
@@ -144,8 +144,9 @@ impl LucidosEngine {
 
         // Load referenced know-how (general + app-specific if this is an app intent)
         let kh_dirs = self.knowhow_dirs();
+        let system_dir = self.system_knowhow_dir();
         let mut knowhow_context =
-            crate::core::knowhow::load_knowhow_sections_merged(&kh_dirs, &intent.knowhow);
+            crate::core::knowhow::load_knowhow_sections_merged(&kh_dirs, system_dir, &intent.knowhow);
 
         // If this is an app intent (id contains '/'), also load that app's knowhow
         if let Some((app_id, _)) = intent_id.split_once('/') {
@@ -183,7 +184,6 @@ If you catch yourself writing \"I'll do X\" without a tool call, STOP.
                 request_id,
                 extraction_ctx,
                 device_id,
-                intent_id,
                 cancel_token,
                 thread_id,
             )

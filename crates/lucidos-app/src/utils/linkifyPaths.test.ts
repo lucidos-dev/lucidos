@@ -55,10 +55,10 @@ describe('linkifyPaths', () => {
   });
 
   it('linkifies app IDs when different from app name', () => {
-    const html = '<p>Åpne FINN Jobber: finn-jobs</p>';
-    const result = linkifyPaths(html, [], [{ name: 'FINN Jobber', id: 'finn-jobs' }]);
-    expect(result).toContain('<a class="app-link" data-app-id="finn-jobs">finn-jobs</a>');
-    expect(result).toContain('<a class="app-link" data-app-id="finn-jobs">FINN Jobber</a>');
+    const html = '<p>Open Job Tracker: job-tracker</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Job Tracker', id: 'job-tracker' }]);
+    expect(result).toContain('<a class="app-link" data-app-id="job-tracker">job-tracker</a>');
+    expect(result).toContain('<a class="app-link" data-app-id="job-tracker">Job Tracker</a>');
   });
 
   it('does not duplicate app entries when name equals id', () => {
@@ -84,20 +84,20 @@ describe('linkifyPaths', () => {
   });
 
   it('preserves artifacts/ prefix in data-path for API compatibility', () => {
-    const html = '<p>See artifacts/projects/emil/notes.md for details</p>';
-    const result = linkifyPaths(html, ['artifacts/projects/emil/notes.md'], []);
+    const html = '<p>See artifacts/projects/sample/notes.md for details</p>';
+    const result = linkifyPaths(html, ['artifacts/projects/sample/notes.md'], []);
     // data-path must keep the artifacts/ prefix so the backend API validation passes
-    expect(result).toContain('data-path="artifacts/projects/emil/notes.md"');
-    expect(result).toContain('>artifacts/projects/emil/notes.md</a>');
+    expect(result).toContain('data-path="artifacts/projects/sample/notes.md"');
+    expect(result).toContain('>artifacts/projects/sample/notes.md</a>');
   });
 
   it('resolves bare path to full store path with artifacts/ prefix', () => {
-    const html = '<p>Check projects/emil/notes.md for updates</p>';
-    const result = linkifyPaths(html, ['artifacts/projects/emil/notes.md'], []);
+    const html = '<p>Check projects/sample/notes.md for updates</p>';
+    const result = linkifyPaths(html, ['artifacts/projects/sample/notes.md'], []);
     // Even though text omits the prefix, data-path must include it for the API
-    expect(result).toContain('data-path="artifacts/projects/emil/notes.md"');
+    expect(result).toContain('data-path="artifacts/projects/sample/notes.md"');
     // Display text should match what the user wrote (without prefix)
-    expect(result).toContain('>projects/emil/notes.md</a>');
+    expect(result).toContain('>projects/sample/notes.md</a>');
   });
 
   it('preserves non-artifacts prefixes as-is (knowhow/, apps/)', () => {
@@ -134,11 +134,11 @@ describe('linkifyPaths', () => {
     const shortPath = 'notes.md';
     // 999 filler paths to push the longer path into a later batch (batch size = 500)
     const filler = Array.from({ length: 999 }, (_, i) => `filler/file_${i}.md`);
-    const longPath = 'projects/emil/notes.md';
-    const html = '<p>See projects/emil/notes.md</p>';
+    const longPath = 'projects/sample/notes.md';
+    const html = '<p>See projects/sample/notes.md</p>';
     const result = linkifyPaths(html, [shortPath, ...filler, longPath], []);
-    expect(result).toContain('data-path="projects/emil/notes.md"');
-    expect(result).toContain('>projects/emil/notes.md</a>');
+    expect(result).toContain('data-path="projects/sample/notes.md"');
+    expect(result).toContain('>projects/sample/notes.md</a>');
     // Must NOT have a nested link of the short path inside the long-path anchor
     expect(result).not.toMatch(/<a[^>]*><a/);
   });

@@ -62,9 +62,11 @@ pub enum EngineReason {
     SessionRecovered,
     /// Generic orphan thread recovery (non-CC).
     OrphanRecovery,
-    /// Scheduled trigger fired.
+    /// Scheduled trigger fired. `trigger_id` is the trigger's user-facing
+    /// `config.id` (a string — typically a v4 UUID) so the route popover can
+    /// match it directly against `/api/v1/triggers`.
     Scheduler {
-        trigger_id: uuid::Uuid,
+        trigger_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger_name: Option<String>,
     },
@@ -176,6 +178,13 @@ pub enum MessageOrigin {
     Engine {
         reason: EngineReason,
     },
+    /// The host system killed the underlying process (engine shutdown, OS signal,
+    /// crash, safety net catch). The engine only marks the abort — it didn't
+    /// decide to abort. Distinct from `Engine` which represents engine-deliberate
+    /// actions (hardening retrigger, merge conflict, scheduler). Renders as
+    /// "System" in the UI. Implies `ActorMode::Engine` (deterministic, non-human,
+    /// non-agent), but the chip label differentiates from engine-deliberate work.
+    System,
 }
 
 fn default_workspace_mode() -> ActorMode {
@@ -206,7 +215,7 @@ impl MessageOrigin {
             Self::Device { .. } => ActorMode::Human,
             Self::Api { mode, .. } => *mode,
             Self::Workspace { mode, .. } | Self::ThreadLink { mode, .. } => *mode,
-            Self::Engine { .. } => ActorMode::Engine,
+            Self::Engine { .. } | Self::System => ActorMode::Engine,
         }
     }
 
@@ -214,6 +223,14 @@ impl MessageOrigin {
     /// like `Some(MessageOrigin::engine(EngineReason::SessionRecovered))`.
     pub fn engine(reason: EngineReason) -> Self {
         Self::Engine { reason }
+    }
+
+    /// Convenience constructor for system-killed-process aborts.
+    /// Use for `ResponseAborted` paths where the underlying process died
+    /// (engine shutdown, safety-net catch, recovery after restart, OS signal).
+    /// NOT for engine-deliberate actions like hardening retrigger or scheduler.
+    pub fn system() -> Self {
+        Self::System
     }
 
     /// Convenience constructor for child→parent callback origins. The
@@ -304,12 +321,18 @@ pub enum AnswerKind {
 
 /// Why a session ended — used by frontend for status/display logic.
 ///
-/// Terminal-only as of Phase 4 of the CC resume architecture: every CC turn now
-/// ends with `CodingAgentIdled` (turn boundary); `SessionEnded` only fires when
+/// Mostly terminal-only (Phase 4 of the CC resume architecture): every CC turn
+/// ends with `CodingAgentIdled` as a turn boundary; `SessionEnded` fires when
 /// the thread is truly done. Removed non-terminal reasons (`Completed`,
-/// `ChangesProposed`, `ChangesApplied`, `AutoEnded`, `UserEnded`, `StaleResume`,
-/// `Discarded`) survive in the DB on legacy rows — they deserialize as
-/// `LegacyNonTerminal` via `#[serde(other)]` so old data doesn't crash.
+/// `ChangesProposed`, `ChangesApplied`, `AutoEnded`, `UserEnded`, `Discarded`)
+/// survive in the DB on legacy rows — they deserialize as `LegacyNonTerminal`
+/// via `#[serde(other)]` so old data doesn't crash.
+///
+/// `StaleResume` is the one transient exception: emitted when CC returns an
+/// empty Result against a stale `--resume` token. The chat handler retries
+/// internally with a fresh session; `event_bus` skips the status flip and the
+/// frontend skips the AbortPanel so the user doesn't see a phantom "Aborted"
+/// during the retry window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEndReason {
@@ -321,11 +344,31 @@ pub enum SessionEndReason {
     /// site uses this yet, but the variant is reserved so the frontend can
     /// branch on it.)
     Closed,
+    /// CC's `--resume <sid>` returned an empty Result — the prior session is
+    /// gone. The engine emits this so restart-recovery's auto-detect resolver
+    /// (`resolve_resume_context`) sees SessionEnded as the latest lifecycle
+    /// event and does NOT try to resume the stale sid; the chat handler then
+    /// retries the user's message against a fresh session. Frontend treats
+    /// this as a transient lifecycle marker — no "Aborted" display, status
+    /// stays `running` until the retry's SessionStarted lands.
+    StaleResume,
     /// Catch-all for legacy DB rows persisted before this enum was reduced to
     /// terminal-only reasons. Treat as a harmless terminal end on read; never
     /// emit going forward.
     #[serde(other)]
     LegacyNonTerminal,
+}
+
+impl SessionEndReason {
+    /// True when the session-end is mid-flight — the engine is still working on
+    /// the current turn and a fresh `SessionStarted` is expected to follow.
+    /// Callers should NOT treat the SessionEnded as a turn boundary in this
+    /// case (don't flip status to terminal, don't decrement parent child
+    /// counters, don't fire completion callbacks). Defaults to `false` so any
+    /// future variant is treated as terminal unless explicitly opted in.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::StaleResume)
+    }
 }
 
 /// Persisted thread events — stored in the DB with thread_id + sequence.
@@ -482,6 +525,12 @@ pub enum ThreadEvent {
         description: String,
         #[serde(default = "default_agent_kind_claude_code")]
         agent: AgentKind,
+        /// Agent-issued identifier for this tool invocation, persisted so the
+        /// matching `CodingAgentToolResult` can be paired with the call even
+        /// when an `EXCHANGE_START_TYPES` event (e.g. permission prompt)
+        /// splits them across exchanges. Empty for legacy DB rows.
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        tool_use_id: String,
     },
     #[serde(alias = "ClaudeCodeToolResult")]
     CodingAgentToolResult {
@@ -489,6 +538,10 @@ pub enum ThreadEvent {
         result: String,
         #[serde(default = "default_agent_kind_claude_code")]
         agent: AgentKind,
+        /// Matches the originating `CodingAgentToolCalled.tool_use_id`.
+        /// Empty for legacy DB rows.
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        tool_use_id: String,
     },
     #[serde(alias = "ClaudeCodeUserMessageSent")]
     CodingAgentUserMessageSent {
@@ -583,11 +636,31 @@ pub enum ThreadEvent {
     ThreadTitleRenamed {
         title: String,
     },
-    ThreadPinned,
-    ThreadUnpinned,
-    ThreadMarkedRead,
-    ThreadMarkedUnread,
-    ThreadDismissed,
+    ThreadSaved,
+    ThreadUnsaved,
+    ThreadArchived,
+    /// A thread was created in `composing` state. Emitted by the first
+    /// successful POST /threads (debounced first user input — keystroke,
+    /// image attach, or mode toggle on a fresh compose). The thread can
+    /// be addressed by id immediately after this event lands.
+    ThreadStarted {
+        /// Initial mode the user opened compose with. Mutable while the
+        /// thread is `Composing`; locked on first `MessageReceived`.
+        mode: String,
+        /// Stamped by `api::actor::user_actor_resolved` so the timeline
+        /// shows which device started the draft thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A thread in `composing` state was explicitly discarded. Emitted by
+    /// DELETE /threads/:id. Terminal — the state-machine guard rejects
+    /// every subsequent compose PUT and message POST with 410 Gone, which
+    /// is the "make impossible states impossible" lever that replaces the
+    /// old LWW + tombstone machinery.
+    ThreadDiscarded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     TriggerStarted {
         #[serde(alias = "task_id")]
         trigger_id: String,
@@ -605,6 +678,12 @@ pub enum ThreadEvent {
         /// legacy DB rows persisted before this field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
+        /// Snapshot of the firing trigger's `go_to_review` flag. When true,
+        /// the section transition logic treats this trigger thread as
+        /// top-level so its terminal event surfaces it in REVIEW. Defaults
+        /// to false for backward compat with pre-flag DB rows.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        go_to_review: bool,
     },
     TriggerCompleted {
         #[serde(alias = "task_id")]
@@ -788,6 +867,10 @@ pub enum ThreadEvent {
         mode: ActorMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
+        // None for engine-driven injections (resume notes from chat/rerun.rs)
+        // and for legacy DB rows that pre-date this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        injected_message_id: Option<uuid::Uuid>,
     },
 
     // Interactive (persisted)
@@ -849,7 +932,7 @@ pub enum ThreadEvent {
     /// `tier=1` means build artifacts (`target/`, `node_modules/`,
     /// `.lucidos/cache/`) were stripped from a long-idle worktree; the
     /// worktree itself is still on disk. `tier=2` means the entire worktree
-    /// directory was removed (long-idle, clean, unpinned). `freed_bytes` is
+    /// directory was removed (long-idle, clean, unsaved). `freed_bytes` is
     /// a best-effort sum of file sizes reclaimed; on filesystems where
     /// metadata is partially unavailable it may be `0` even if real space was
     /// freed. `branch_deleted` is `true` when Tier 2 also dropped a
@@ -908,6 +991,18 @@ pub enum ThreadEvent {
 }
 
 impl ThreadEvent {
+    /// Names of every event variant that closes a chat-mode request.
+    /// Excludes CC-specific terminators (`CodingAgentIdled`, `SessionEnded`)
+    /// — `chat::recovery::recover_orphaned_threads` checks both sets and
+    /// keeps its own enumeration. Use this for code that operates on the
+    /// chat agentic loop only.
+    pub const TERMINATOR_EVENT_TYPES: &'static [&'static str] = &[
+        "ResponseGenerated",
+        "ResponseCanceled",
+        "ResponseAborted",
+        "ResponseFailed",
+    ];
+
     /// Convert a control request into a CodingAgentSettingsChanged event,
     /// if applicable. `agent` identifies which backend issued the change.
     pub fn from_control_request(
@@ -955,11 +1050,11 @@ impl ThreadEvent {
             Self::ContinueSignal { .. } => "ContinueSignal",
             Self::ThreadTitleGenerated { .. } => "ThreadTitleGenerated",
             Self::ThreadTitleRenamed { .. } => "ThreadTitleRenamed",
-            Self::ThreadPinned => "ThreadPinned",
-            Self::ThreadUnpinned => "ThreadUnpinned",
-            Self::ThreadMarkedRead => "ThreadMarkedRead",
-            Self::ThreadMarkedUnread => "ThreadMarkedUnread",
-            Self::ThreadDismissed => "ThreadDismissed",
+            Self::ThreadSaved => "ThreadSaved",
+            Self::ThreadUnsaved => "ThreadUnsaved",
+            Self::ThreadArchived => "ThreadArchived",
+            Self::ThreadStarted { .. } => "ThreadStarted",
+            Self::ThreadDiscarded { .. } => "ThreadDiscarded",
             Self::TriggerStarted { .. } => "TriggerStarted",
             Self::TriggerCompleted { .. } => "TriggerCompleted",
             Self::ChangeProposed { .. } => "ChangeProposed",
@@ -1110,18 +1205,46 @@ mod tests {
         assert_eq!(json["reason"]["kind"], "session_recovered");
     }
 
+    /// `MessageOrigin::System` serializes as `{"kind":"system"}` with NO
+    /// other fields. The frontend's MessageOrigin union has `{ kind: 'system' }`
+    /// (no reason / no metadata) — adding fields here would break that contract.
+    /// Distinct from Engine: System means the host killed the process; Engine
+    /// means the engine deliberately took an action.
+    #[test]
+    fn message_origin_system_serializes_with_kind_system_no_other_fields() {
+        let origin = MessageOrigin::System;
+        let json = serde_json::to_value(&origin).unwrap();
+        assert_eq!(json, serde_json::json!({"kind": "system"}));
+    }
+
+    /// System is intrinsically engine-mode (deterministic, non-human, non-agent).
+    /// Mirrors `MessageOrigin::Engine`'s mode — the chip differentiates via
+    /// label override (System vs Lucidos Engine), not via mode.
+    #[test]
+    fn message_origin_system_mode_is_engine() {
+        assert_eq!(MessageOrigin::System.mode(), ActorMode::Engine);
+    }
+
+    /// `MessageOrigin::system()` is the canonical constructor — emit sites use
+    /// it for the "host killed the process" attribution (orphan recovery,
+    /// shutdown, safety net, post-restart abort marker).
+    #[test]
+    fn message_origin_system_constructor() {
+        assert!(matches!(MessageOrigin::system(), MessageOrigin::System));
+    }
+
     #[test]
     fn message_origin_engine_scheduler_carries_trigger_metadata() {
-        let trigger_id = uuid::Uuid::new_v4();
+        let trigger_id = uuid::Uuid::new_v4().to_string();
         let origin = MessageOrigin::Engine {
             reason: EngineReason::Scheduler {
-                trigger_id,
+                trigger_id: trigger_id.clone(),
                 trigger_name: Some("nightly-backup".to_string()),
             },
         };
         let json = serde_json::to_value(&origin).unwrap();
         assert_eq!(json["reason"]["kind"], "scheduler");
-        assert_eq!(json["reason"]["trigger_id"], trigger_id.to_string());
+        assert_eq!(json["reason"]["trigger_id"], trigger_id);
         assert_eq!(json["reason"]["trigger_name"], "nightly-backup");
     }
 
@@ -1389,6 +1512,7 @@ mod tests {
                     args: json!({}),
                     description: String::new(),
                     agent: crate::runtime::AgentKind::ClaudeCode,
+                    tool_use_id: String::new(),
                 },
                 "CodingAgentToolCalled",
             ),
@@ -1397,6 +1521,7 @@ mod tests {
                     name: "n".into(),
                     result: "r".into(),
                     agent: crate::runtime::AgentKind::ClaudeCode,
+                    tool_use_id: String::new(),
                 },
                 "CodingAgentToolResult",
             ),
@@ -1434,11 +1559,9 @@ mod tests {
                 },
                 "ThreadTitleRenamed",
             ),
-            (ThreadEvent::ThreadPinned, "ThreadPinned"),
-            (ThreadEvent::ThreadUnpinned, "ThreadUnpinned"),
-            (ThreadEvent::ThreadMarkedRead, "ThreadMarkedRead"),
-            (ThreadEvent::ThreadMarkedUnread, "ThreadMarkedUnread"),
-            (ThreadEvent::ThreadDismissed, "ThreadDismissed"),
+            (ThreadEvent::ThreadSaved, "ThreadSaved"),
+            (ThreadEvent::ThreadUnsaved, "ThreadUnsaved"),
+            (ThreadEvent::ThreadArchived, "ThreadArchived"),
             (
                 ThreadEvent::TriggerStarted {
                     trigger_id: "id".into(),
@@ -1446,6 +1569,7 @@ mod tests {
                     prompt: None,
                     invocation: None,
                     origin: None,
+                    go_to_review: false,
                 },
                 "TriggerStarted",
             ),
@@ -1628,18 +1752,16 @@ mod tests {
             // Thread lifecycle
             r#"{"type":"ThreadTitleGenerated","title":"t"}"#,
             r#"{"type":"ThreadTitleRenamed","title":"new title"}"#,
-            r#"{"type":"ThreadPinned"}"#,
-            r#"{"type":"ThreadUnpinned"}"#,
-            r#"{"type":"ThreadMarkedRead"}"#,
-            r#"{"type":"ThreadMarkedUnread"}"#,
-            r#"{"type":"ThreadDismissed"}"#,
+            r#"{"type":"ThreadSaved"}"#,
+            r#"{"type":"ThreadUnsaved"}"#,
+            r#"{"type":"ThreadArchived"}"#,
             // EventMeta.actor merged into payload — must round-trip on unit and
             // struct variants alike. Internally-tagged enums tolerate extra
             // fields by default, but make it a regression test so a future
             // `#[serde(deny_unknown_fields)]` flip would fail loudly here.
-            r#"{"type":"ThreadPinned","actor":{"kind":"device","device_id":"d","label":"Chrome"}}"#,
-            r#"{"type":"ThreadUnpinned","actor":{"kind":"api","user_agent":"curl/8"}}"#,
-            r#"{"type":"ThreadDismissed","actor":{"kind":"workspace","workspace":"dev"}}"#,
+            r#"{"type":"ThreadSaved","actor":{"kind":"device","device_id":"d","label":"Chrome"}}"#,
+            r#"{"type":"ThreadUnsaved","actor":{"kind":"api","user_agent":"curl/8"}}"#,
+            r#"{"type":"ThreadArchived","actor":{"kind":"workspace","workspace":"dev"}}"#,
             r#"{"type":"ThreadTitleRenamed","title":"x","actor":{"kind":"device","device_id":"d","label":"l"}}"#,
             // Triggers — minimal + full + legacy task_id alias on the renamed variant
             r#"{"type":"TriggerStarted","trigger_id":"id"}"#,
@@ -1812,6 +1934,7 @@ mod tests {
             args: json!({"file_path": "/src/main.rs"}),
             description: "Read main.rs".into(),
             agent: crate::runtime::AgentKind::ClaudeCode,
+            tool_use_id: String::new(),
         };
         let serialized = serde_json::to_value(&event).unwrap();
         assert_eq!(serialized["description"], "Read main.rs");
@@ -1822,9 +1945,45 @@ mod tests {
             args: json!({}),
             description: String::new(),
             agent: crate::runtime::AgentKind::ClaudeCode,
+            tool_use_id: String::new(),
         };
         let serialized2 = serde_json::to_value(&event2).unwrap();
         assert!(serialized2.get("description").is_none());
+    }
+
+    #[test]
+    fn cc_tool_called_result_tool_use_id_round_trip() {
+        let call = ThreadEvent::CodingAgentToolCalled {
+            name: "Bash".into(),
+            args: json!({"command": "ls"}),
+            description: "ls".into(),
+            agent: crate::runtime::AgentKind::ClaudeCode,
+            tool_use_id: "toolu_42".into(),
+        };
+        let serialized = serde_json::to_value(&call).unwrap();
+        assert_eq!(serialized["tool_use_id"], "toolu_42");
+
+        // Empty id → skipped from the wire
+        let call_no_id = ThreadEvent::CodingAgentToolCalled {
+            name: "Bash".into(),
+            args: json!({}),
+            description: String::new(),
+            agent: crate::runtime::AgentKind::ClaudeCode,
+            tool_use_id: String::new(),
+        };
+        assert!(serde_json::to_value(&call_no_id).unwrap().get("tool_use_id").is_none());
+
+        // Legacy DB row without tool_use_id deserializes cleanly
+        let legacy: ThreadEvent = serde_json::from_str(
+            r#"{"type":"CodingAgentToolResult","name":"","result":"ok"}"#,
+        )
+        .unwrap();
+        match legacy {
+            ThreadEvent::CodingAgentToolResult { tool_use_id, .. } => {
+                assert!(tool_use_id.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
@@ -1849,7 +2008,7 @@ mod tests {
             text: "look at this".into(),
             images: vec![json!({"base64": "abc", "mime_type": "image/png"})],
             device_id: Some("phone-1".into()),
-            device: Some("Kenneth's iPhone".into()),
+            device: Some("Test iPhone".into()),
             image_description: Some("a cat".into()),
             parent_thread_id: None,
             spawning_event_id: None,
@@ -1901,6 +2060,7 @@ mod tests {
             prompt: Some("Run the daily report".into()),
             invocation: Some(TriggerInvocation::Schedule),
             origin: None,
+            go_to_review: false,
         };
         let payload = event.to_payload(&EventMeta::NONE);
         assert_eq!(payload["trigger_id"], "t-1");
@@ -1921,6 +2081,7 @@ mod tests {
                 event_id: Some(event_id),
             }),
             origin: None,
+            go_to_review: false,
         };
         let payload = event.to_payload(&EventMeta::NONE);
         assert_eq!(payload["invocation"]["kind"], "Event");
@@ -2025,8 +2186,8 @@ mod tests {
         // Auditability: every mutating endpoint stamps the event with who
         // initiated it. EventMeta carries that across all ThreadEvent variants
         // without per-variant struct churn or backward-compat churn for unit
-        // variants like ThreadPinned.
-        let event = ThreadEvent::ThreadPinned;
+        // variants like ThreadSaved.
+        let event = ThreadEvent::ThreadSaved;
         let meta = EventMeta {
             actor: Some(MessageOrigin::Device {
                 device_id: "dev-1".into(),
@@ -2042,7 +2203,7 @@ mod tests {
 
     #[test]
     fn event_meta_actor_none_omits_field() {
-        let event = ThreadEvent::ThreadPinned;
+        let event = ThreadEvent::ThreadSaved;
         let payload = event.to_payload(&EventMeta::NONE);
         assert!(payload.get("actor").is_none());
     }
@@ -2262,11 +2423,12 @@ mod tests {
 
     #[test]
     fn session_ended_reason_serialization() {
-        // Each terminal-only variant round-trips on the wire.
+        // Each emit-able variant round-trips on the wire.
         for (reason, expected) in [
             (SessionEndReason::Shutdown, "shutdown"),
             (SessionEndReason::Panic, "panic"),
             (SessionEndReason::Closed, "closed"),
+            (SessionEndReason::StaleResume, "stale_resume"),
         ] {
             let event = ThreadEvent::SessionEnded { reason };
             let serialized = serde_json::to_value(&event).unwrap();
@@ -2289,16 +2451,15 @@ mod tests {
         }
 
         // Backwards compat: removed reasons (completed, changes_proposed,
-        // changes_applied, auto_ended, user_ended, stale_resume, discarded) on
-        // legacy rows deserialize via `#[serde(other)]` to `LegacyNonTerminal`
-        // so old data doesn't crash the engine.
+        // changes_applied, auto_ended, user_ended, discarded) on legacy rows
+        // deserialize via `#[serde(other)]` to `LegacyNonTerminal` so old data
+        // doesn't crash the engine.
         for legacy in [
             "completed",
             "user_ended",
             "changes_proposed",
             "changes_applied",
             "auto_ended",
-            "stale_resume",
             "discarded",
         ] {
             let raw = format!(r#"{{"type":"SessionEnded","reason":"{}"}}"#, legacy);
@@ -2447,23 +2608,24 @@ mod tests {
 
     #[test]
     fn trigger_started_can_carry_scheduler_origin() {
-        let id = uuid::Uuid::new_v4();
+        let id = uuid::Uuid::new_v4().to_string();
         let event = ThreadEvent::TriggerStarted {
-            trigger_id: id.to_string(),
+            trigger_id: id.clone(),
             trigger_name: Some("nightly".into()),
             prompt: Some("run".into()),
             invocation: Some(TriggerInvocation::Schedule),
             origin: Some(MessageOrigin::Engine {
                 reason: EngineReason::Scheduler {
-                    trigger_id: id,
+                    trigger_id: id.clone(),
                     trigger_name: Some("nightly".into()),
                 },
             }),
+            go_to_review: false,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "TriggerStarted");
         assert_eq!(json["origin"]["reason"]["kind"], "scheduler");
-        assert_eq!(json["origin"]["reason"]["trigger_id"], id.to_string());
+        assert_eq!(json["origin"]["reason"]["trigger_id"], id);
         assert_eq!(json["origin"]["reason"]["trigger_name"], "nightly");
     }
 

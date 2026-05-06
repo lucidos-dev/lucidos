@@ -4,6 +4,7 @@ members = [
     "crates/lucidos-engine",
     "crates/lucidos-app",
     "crates/lucidos-cli",
+    "crates/lucidos-e2e",
 ]
 
 [workspace.package]

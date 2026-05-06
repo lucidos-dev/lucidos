@@ -7,7 +7,7 @@ pub mod cc_question_wait;
 pub(crate) mod cc_settings;
 mod change_ops;
 mod chat;
-mod claude_code;
+pub(crate) mod claude_code;
 mod context;
 mod document;
 pub mod event_bus;
@@ -18,11 +18,14 @@ pub mod memory_consumer;
 mod pending_apply_actors;
 pub mod thread_events;
 pub mod thread_lifecycle;
+pub mod thread_state;
 pub(crate) mod tools;
 pub mod types;
 pub mod worktree_cleanup;
 
 pub(crate) use chat::generate_thread_title;
+#[cfg(test)]
+pub(crate) use context::format_history_steps;
 pub use types::*;
 
 /// Public re-export so binaries (notably `main.rs`) can start the CC spawn
@@ -59,7 +62,13 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct InjectedPrompt {
     pub text: String,
-    /// Client-provided UUID so the frontend can match the SSE event back to its pending message.
+    /// Client-provided UUID for the injecting message. Carried through the
+    /// channel for callers that need correlation, but NOT reused as the
+    /// persisted `UserPromptInjected.id` — the chat fast-path emits a
+    /// `MessageReceived` row with this UUID first, so reusing it would
+    /// collide on `events_pkey`. Frontend reconciles pending messages via
+    /// `MessageReceived.id`; the UPI link back to the request is carried
+    /// by `EventMeta::request_event_id`.
     pub event_id: Option<Uuid>,
     /// Semantic mode of the actor that generated this injection — Human (user
     /// typed), Agent (parent thread's LLM), or Engine (recovery / scheduler).
@@ -96,9 +105,17 @@ pub struct LucidosEngine {
     embedder: Arc<FastEmbedProvider>,
     memory_index: Option<PgVectorIndex>,
     extractor: Option<MemoryExtractor>,
-    image_provider: Option<Arc<dyn crate::llm::ImageProvider>>,
+    /// Vertex project ID — used to build image providers on demand.
+    vertex_project_id: String,
+    /// Shared region handle, updated in place when `vertex_region` changes.
+    vertex_location: crate::llm::vertex::LocationHandle,
+    vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
+    openai_api_key: Option<String>,
     rebuilding_memory: AtomicBool,
     cancel_rebuild: AtomicBool,
+    /// Acquired via `scheduler::BackupGuard::try_acquire`. POST /api/backup
+    /// returns 409 when the guard is held; the scheduled cron skips its tick.
+    pub backup_in_progress: AtomicBool,
     /// Per-thread handles (cancellation token + injection channel). Key = thread_id.
     /// Uses std::sync::Mutex since operations are trivial (insert/remove),
     /// and this allows the ThreadGuard to clean up synchronously in Drop (even on panic).
@@ -230,8 +247,35 @@ thread_local! {
     static PARENT_CALLBACK_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<event_bus::ParentCallback>>> = const { std::cell::RefCell::new(None) };
 }
 
+fn spawn_vertex_region_subscriber(
+    mut rx: tokio::sync::broadcast::Receiver<event_bus::EmittedEvent>,
+    location: crate::llm::vertex::LocationHandle,
+) {
+    tokio::spawn(async move {
+        use event_bus::{BusEvent, SystemEvent};
+        while let Ok(emitted) = rx.recv().await {
+            let BusEvent::System(SystemEvent::PreferencesChanged { key, value, .. }) =
+                &emitted.typed
+            else {
+                continue;
+            };
+            if key != crate::core::PREF_VERTEX_REGION {
+                continue;
+            }
+            let Some(new_region) = value else { continue };
+            match location.write() {
+                Ok(mut guard) => {
+                    let old = std::mem::replace(&mut *guard, new_region.clone());
+                    log!("[Preferences] vertex_region updated live: {} → {}", old, new_region);
+                }
+                Err(e) => log!("[Preferences] vertex_region update skipped (lock poisoned): {}", e),
+            }
+        }
+    });
+}
+
 impl LucidosEngine {
-    const DEFAULT_REPO_NAME: &'static str = "Lucidos";
+    pub(crate) const DEFAULT_REPO_NAME: &'static str = "Lucidos";
 
     /// Start the parent callback listener. Must be called after Arc::new(engine).
     /// Takes the mpsc receiver that was stashed during construction and spawns
@@ -345,10 +389,90 @@ impl LucidosEngine {
                             event_id,
                         } => {
                             crate::log!(
-                                "[SpawnConsumer] Continue thread={} event={} — invoking run_direct_agent (no input, --resume)",
+                                "[SpawnConsumer] Continue thread={} event={} — invoking run_direct_agent (--resume + non-empty stdin placeholder)",
                                 thread_id,
                                 event_id
                             );
+
+                            // Load the originating ContinueSignal's actor +
+                            // reason. The actor stamps the resume boundary so
+                            // it reads "You restarted" rather than "⚙ System".
+                            // The reason gates the boundary itself: only the
+                            // user-clicked-continue path opens a "Resumed
+                            // after engine restart" exchange — an
+                            // `answered_after_idle` continuation belongs
+                            // inside the existing AskUserQuestion exchange.
+                            let (continue_actor, continue_reason): (
+                                Option<crate::engine::thread_events::MessageOrigin>,
+                                Option<String>,
+                            ) = match engine.event_store().get_event_by_id(event_id).await {
+                                Ok(Some(row)) => {
+                                    let actor = row.payload.get("actor").and_then(|v| {
+                                        match serde_json::from_value::<
+                                            crate::engine::thread_events::MessageOrigin,
+                                        >(v.clone())
+                                        {
+                                            Ok(o) => Some(o),
+                                            Err(e) => {
+                                                crate::log!(
+                                                    "[SpawnConsumer] Continue event {} has malformed actor payload: {} — chip will fall back to engine",
+                                                    event_id, e
+                                                );
+                                                None
+                                            }
+                                        }
+                                    });
+                                    let reason = row
+                                        .payload
+                                        .get("reason")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from);
+                                    (actor, reason)
+                                }
+                                Ok(None) => (None, None),
+                                Err(e) => {
+                                    crate::log!(
+                                        "[SpawnConsumer] Failed to load continue event {}: {} — chip will fall back to engine and the resume boundary will be skipped",
+                                        event_id, e
+                                    );
+                                    (None, None)
+                                }
+                            };
+
+                            // SessionRecovered opens the resume exchange in
+                            // the timeline before any CC text streams. CC's
+                            // own `--resume` system carries the prior context
+                            // to the model, so no engine note (unlike the
+                            // chat/rerun path). Skipped for non-recovery
+                            // continuations (answered_after_idle) so the
+                            // follow-up CC events fold into the existing
+                            // AskUserQuestion exchange instead of being
+                            // mislabeled "Resumed after engine restart".
+                            if crate::engine::agent_recovery::continue_should_open_resume_exchange(
+                                continue_reason.as_deref(),
+                            ) {
+                                engine
+                                    .event_bus
+                                    .emit_or_log(
+                                        crate::engine::event_bus::BusEvent::Thread {
+                                            thread_id,
+                                            event: crate::engine::thread_events::ThreadEvent::SessionRecovered {
+                                                branch: String::new(),
+                                                origin: None,
+                                            },
+                                            meta: crate::engine::thread_events::EventMeta {
+                                                channel: Some(
+                                                    crate::engine::thread_events::EventChannel::CodingAgent,
+                                                ),
+                                                actor: continue_actor,
+                                                ..crate::engine::thread_events::EventMeta::NONE
+                                            },
+                                        },
+                                        "[SpawnConsumer] SessionRecovered (continue)",
+                                    )
+                                    .await;
+                            }
+
                             // Resolve the latest CC session id from the events
                             // table so `--resume` lands on the prior conversation.
                             let resume_sid =
@@ -360,15 +484,13 @@ impl LucidosEngine {
                             let request_id = uuid::Uuid::new_v4();
                             let cancel_token =
                                 tokio_util::sync::CancellationToken::new();
-                            // Empty user_message — the caller's intent is "continue,
-                            // not start something new". Phase 5.3 will replace this
-                            // call site with the full recovery payload (system
-                            // prompt override, worktree path, etc.).
+                            // Must stay non-empty — see CONTINUE_RESUME_USER_MESSAGE
+                            // doc for the empty-stdin zombie write-up.
                             let result = engine
                                 .run_direct_agent(
                                     request_id,
                                     thread_id,
-                                    "",
+                                    crate::engine::agent_recovery::CONTINUE_RESUME_USER_MESSAGE,
                                     None,
                                     event_id,
                                     None,
@@ -404,9 +526,8 @@ impl LucidosEngine {
         database_url: &str,
         llm: Arc<dyn LlmProvider>,
         vertex_project_id: String,
-        vertex_location: String,
+        vertex_location: crate::llm::vertex::LocationHandle,
         vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
-        _image_provider: Option<Box<dyn crate::llm::ImageProvider>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let artifact_manager = ArtifactManager::new(workspace_path.clone())?;
 
@@ -444,6 +565,29 @@ impl LucidosEngine {
 
         let event_store = EventStore::new(pool.clone());
         event_store.init_schema().await?;
+
+        // One-shot, idempotent: the SQL backfill in migration
+        // 20260429214800 only read `payload->>'trigger_id'` and missed legacy
+        // `task_id` events, leaving `thread_summaries.trigger_id` NULL on every
+        // pre-rename trigger thread. Recover from the events table first…
+        let from_events = event_store.backfill_trigger_id_from_events().await?;
+        if from_events > 0 {
+            log!(
+                "[Engine] Backfilled {} thread_summaries rows: trigger_id NULL → first TriggerStarted event",
+                from_events
+            );
+        }
+
+        // …then translate any v5 hashes the pre-fix scheduler stamped into
+        // `trigger_id` back to the raw `config.id` so the dropdown filter matches.
+        // Subsequent runs update zero rows.
+        let backfilled = event_store.backfill_trigger_id_v5_to_config_id().await?;
+        if backfilled > 0 {
+            log!(
+                "[Engine] Backfilled {} thread_summaries rows: trigger_id v5-hash → config.id",
+                backfilled
+            );
+        }
         let python_runtime = PythonRuntime::new(workspace_path.clone());
         let app_manager = Arc::new(AppManager::new(&workspace_path)?);
 
@@ -462,89 +606,32 @@ impl LucidosEngine {
         HeadlessBlocklist::init_schema(&pool).await?;
         BrowserLogins::init_schema(&pool).await?;
 
-        // Initialize image provider based on preference or available credentials.
-        // Clone token cache before extractor consumes it.
-        let image_provider: Option<Arc<dyn crate::llm::ImageProvider>> = {
-            let image_model = PreferenceStore::get(&pool, "image_model")
-                .await
-                .ok()
-                .flatten();
-            let model = image_model.as_deref().unwrap_or("auto");
-
-            match model {
-                "gpt-image-1" => {
-                    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-                        log!("[Image] Using OpenAI gpt-image-1");
-                        Some(Arc::new(crate::llm::image::OpenAiImageProvider::new(key)))
-                    } else {
-                        log!("[Image] gpt-image-1 selected but OPENAI_API_KEY not set");
-                        None
-                    }
-                }
-                "imagen-4" => {
-                    if !vertex_project_id.is_empty() {
-                        log!("[Image] Using Vertex AI Imagen 4");
-                        let tc = vertex_token_cache
-                            .clone()
-                            .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None)));
-                        Some(Arc::new(crate::llm::image::VertexImagenProvider::new(
-                            vertex_project_id.clone(),
-                            vertex_location.clone(),
-                            tc,
-                        )))
-                    } else {
-                        log!("[Image] imagen-4 selected but VERTEX_PROJECT_ID not set");
-                        None
-                    }
-                }
-                _ => {
-                    // Auto: prefer Imagen if Vertex is configured, else OpenAI
-                    if !vertex_project_id.is_empty() {
-                        let tc = vertex_token_cache
-                            .clone()
-                            .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None)));
-                        log!("[Image] Auto-selected Vertex AI Imagen 4");
-                        Some(Arc::new(crate::llm::image::VertexImagenProvider::new(
-                            vertex_project_id.clone(),
-                            vertex_location.clone(),
-                            tc,
-                        )))
-                    } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-                        log!("[Image] Auto-selected OpenAI gpt-image-1");
-                        Some(Arc::new(crate::llm::image::OpenAiImageProvider::new(key)))
-                    } else {
-                        log!(
-                            "[Image] No image provider available (no Vertex or OpenAI credentials)"
-                        );
-                        None
-                    }
-                }
-            }
-        };
+        let openai_api_key = std::env::var("OPENAI_API_KEY").ok();
 
         let extractor = if vertex_project_id.is_empty() {
-            log!("No Vertex project configured — memory extraction disabled");
+            log!("[Memory] No Vertex project configured — memory extraction disabled");
             None
-        } else if let Some(cache) = vertex_token_cache {
-            Some(MemoryExtractor::with_token_cache(
-                vertex_project_id,
-                vertex_location,
+        } else {
+            let cache = vertex_token_cache
+                .clone()
+                .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None)));
+            Some(MemoryExtractor::with_location_handle(
+                vertex_project_id.clone(),
+                vertex_location.clone(),
                 cache,
             ))
-        } else {
-            Some(MemoryExtractor::new(vertex_project_id, vertex_location))
         };
 
         // Memory index uses PostgreSQL + pgvector for vector search
         let memory_index = match PgVectorIndex::new(pool.clone()).await {
             Ok(index) => {
                 let count = index.len().await.unwrap_or(0);
-                log!("Memory index initialized (pgvector, {} entries)", count);
+                log!("[Memory] Index initialized (pgvector, {} entries)", count);
                 Some(index)
             }
             Err(e) => {
                 log!(
-                    "Warning: Could not initialize memory index: {}. Memory search disabled.",
+                    "[Memory] Could not initialize index: {}. Memory search disabled.",
                     e
                 );
                 None
@@ -568,7 +655,7 @@ impl LucidosEngine {
             .join("user_profile.md");
         let user_profile = std::fs::read_to_string(&profile_path).unwrap_or_default();
         if !user_profile.is_empty() {
-            log!("Loaded user profile ({} chars)", user_profile.len());
+            log!("[Memory] Loaded user profile ({} chars)", user_profile.len());
         }
 
         // Load user timezone from database, environment, or leave empty (LLM will ask)
@@ -578,9 +665,9 @@ impl LucidosEngine {
         };
 
         if user_timezone.is_empty() {
-            log!("User timezone: not set (LLM will ask)");
+            log!("[Engine] User timezone: not set (LLM will ask)");
         } else {
-            log!("User timezone: {}", user_timezone);
+            log!("[Engine] User timezone: {}", user_timezone);
         }
 
         // Load user language preference from database
@@ -590,9 +677,9 @@ impl LucidosEngine {
         };
 
         if user_language.is_empty() {
-            log!("User language: not set (will detect from conversation)");
+            log!("[Engine] User language: not set (will detect from conversation)");
         } else {
-            log!("User language: {}", user_language);
+            log!("[Engine] User language: {}", user_language);
         }
 
         let repo_root = git_ops::main_worktree().await;
@@ -670,7 +757,11 @@ impl LucidosEngine {
             }
         }
 
-        // Reconcile: discard pending changes whose branches no longer exist
+        // Surface — but do NOT discard — pending changes whose branches no
+        // longer exist. The user resolves these from Review explicitly; the
+        // engine never auto-discards on the user's behalf. Apply on a
+        // missing-branch row will fail with a useful error and the user
+        // can then click Discard.
         let stale = event_bus.changes_projection().list_pending().await;
         for change in stale {
             let branch_ok = git_cmd(&["rev-parse", "--verify", &change.branch_name], &repo_root)
@@ -679,37 +770,10 @@ impl LucidosEngine {
                 .unwrap_or(false);
             if !branch_ok {
                 log!(
-                    "Discarding stale pending change {} — branch {} gone",
+                    "[Engine] Pending change {} references missing branch {} — left in Review for user to resolve",
                     change.id,
                     change.branch_name
                 );
-                if let Some(thread_id) = change.thread_id {
-                    event_bus
-                        .emit_or_log(
-                            event_bus::BusEvent::Thread {
-                                thread_id,
-                                event: thread_events::ThreadEvent::ChangeDiscarded {
-                                    change_id: change.id.to_string(),
-                                    actor: None,
-                                    path: String::new(),
-                                },
-                                meta: thread_events::EventMeta::NONE,
-                            },
-                            "[Startup] ChangeDiscarded",
-                        )
-                        .await;
-                } else {
-                    event_bus
-                        .emit_or_log(
-                            crate::engine::event_bus::BusEvent::System(
-                                crate::engine::event_bus::SystemEvent::ChangeDiscarded {
-                                    change_id: change.id.to_string(),
-                                },
-                            ),
-                            "[Startup] ChangeDiscarded",
-                        )
-                        .await;
-                }
             }
         }
 
@@ -723,6 +787,8 @@ impl LucidosEngine {
             crate::core::user_dir::ensure_git_init(ud);
         }
 
+        spawn_vertex_region_subscriber(event_bus.subscribe(), vertex_location.clone());
+
         Ok(Self {
             artifact_manager,
             event_store,
@@ -733,9 +799,13 @@ impl LucidosEngine {
             embedder,
             memory_index,
             extractor,
-            image_provider,
+            vertex_project_id,
+            vertex_location,
+            vertex_token_cache,
+            openai_api_key,
             rebuilding_memory: AtomicBool::new(false),
             cancel_rebuild: AtomicBool::new(false),
+            backup_in_progress: AtomicBool::new(false),
             active_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             thread_completion: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cc_commands_cache: tokio::sync::RwLock::new(Self::load_cc_commands_cache(
@@ -1134,6 +1204,18 @@ impl LucidosEngine {
                 "[Chat] Thread {} stuck for 60s — force-cancelling and evicting",
                 thread_id
             );
+            // Engine-initiated abort — emit ResponseAborted with actor=System
+            // BEFORE cancelling the token. Without this, the downstream cancel
+            // arms default to ResponseCanceled (because they read
+            // is_shutdown=false), which the frontend renders as user-initiated
+            // "Canceled" — misleading users into thinking they pressed Stop.
+            emit_stuck_thread_eviction_abort(
+                &self.event_bus,
+                &self.pool,
+                &self.agent_sessions,
+                thread_id,
+            )
+            .await;
             if let Some(handle) = self.active_threads.lock().unwrap().remove(&thread_id) {
                 handle.token.cancel();
             }
@@ -1145,10 +1227,16 @@ impl LucidosEngine {
         self.register_thread(thread_id)
     }
 
-    /// Cancel a specific thread.
-    pub fn cancel_thread(&self, thread_id: Uuid) {
+    /// Cancel a specific thread. Returns `true` if the thread had an active
+    /// `cancel_token` registered (the cancel landed and the per-thread loop
+    /// will observe it). Returns `false` when there is no active entry — the
+    /// caller can then fall back to settling the projection.
+    pub fn cancel_thread(&self, thread_id: Uuid) -> bool {
         if let Some(handle) = self.active_threads.lock().unwrap().get(&thread_id) {
             handle.token.cancel();
+            true
+        } else {
+            false
         }
     }
 
@@ -1194,11 +1282,6 @@ impl LucidosEngine {
             .keys()
             .copied()
             .collect()
-    }
-
-    /// Check if a thread is currently active (being processed).
-    pub fn is_thread_active(&self, thread_id: Uuid) -> bool {
-        self.active_threads.lock().unwrap().contains_key(&thread_id)
     }
 
     /// Drain any messages from an injection channel that were not consumed
@@ -1264,24 +1347,161 @@ impl LucidosEngine {
         }
     }
 
+    /// Pre-shutdown abort emission for `/api/restart`. Walks the in-flight
+    /// chat AND CC threads and emits the boundary events with a user-attributed
+    /// `actor` so the post-restart timeline reads "You restarted" instead of
+    /// "⚙ System restarted".
+    ///
+    /// For chat threads: emits `ResponseAborted { actor: <actor> }` with
+    /// `request_event_id` pointing to the originating MessageReceived/
+    /// TriggerStarted.
+    ///
+    /// For CC threads: emits both `ResponseAborted` AND the synthetic
+    /// `CodingAgentIdled { reason: engine_restart_interrupt }` so the spawn
+    /// dispatcher's classifier (which runs after restart on recovery) sees a
+    /// thread that's already terminated and skips re-emitting the same pair.
+    /// `actor` flows onto both events.
+    ///
+    /// Idempotent — reading the per-event guard inside the projection ensures
+    /// a duplicate restart click does not double-emit.
+    pub async fn abort_in_flight_for_restart(
+        self: &std::sync::Arc<Self>,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+    ) {
+        use crate::engine::event_bus::BusEvent;
+        use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
+
+        // `all_cc_thread_ids` covers idle CC sessions too — their run loop
+        // stays registered in `active_threads` between turns, so they show up
+        // in `processing_thread_ids()` and must be excluded from the chat
+        // bucket. `cc_thread_ids` (in-flight only) and `external_emitted_flags`
+        // drive the pre-emit; the flag tells `run_session`'s classify/safety
+        // paths to skip a duplicate emit (see `external_terminal_emitted`).
+        let (all_cc_thread_ids, cc_thread_ids, external_emitted_flags): (
+            std::collections::HashSet<uuid::Uuid>,
+            Vec<uuid::Uuid>,
+            Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        ) = {
+            let guard = self.agent_sessions.lock().await;
+            let all = guard.keys().copied().collect();
+            let (ids, flags) = guard
+                .iter()
+                .filter(|(_, s)| s.is_in_flight())
+                .map(|(tid, s)| (*tid, s.external_terminal_emitted.clone()))
+                .unzip();
+            (all, ids, flags)
+        };
+
+        let chat_thread_ids =
+            partition_chat_thread_ids(&self.processing_thread_ids(), &all_cc_thread_ids);
+
+        // ---- Chat threads ---------------------------------------------------
+        // Look up originating event ids in parallel — sequential awaits would
+        // serialize N round-trips on a busy restart.
+        let chat_originating_ids: Vec<Option<uuid::Uuid>> = futures::future::join_all(
+            chat_thread_ids.iter().map(|tid| {
+                crate::engine::agent_session::latest_originating_event_id(
+                    &self.pool,
+                    *tid,
+                    &["MessageReceived", "TriggerStarted"],
+                )
+            }),
+        )
+        .await;
+        for (thread_id, originating_event_id) in chat_thread_ids.iter().zip(chat_originating_ids) {
+            self.event_bus
+                .emit_or_log(
+                    BusEvent::Thread {
+                        thread_id: *thread_id,
+                        event: ThreadEvent::ResponseAborted {
+                            text: "This response was interrupted by an engine restart.".to_string(),
+                            images: vec![],
+                            model: None,
+                            reasoning_effort: None,
+                        },
+                        meta: EventMeta {
+                            request_event_id: originating_event_id,
+                            actor: actor.clone(),
+                            ..EventMeta::NONE
+                        },
+                    },
+                    "[Restart] ResponseAborted (chat)",
+                )
+                .await;
+        }
+
+        // ---- CC threads -----------------------------------------------------
+        // Pre-emit ONLY the boundary `ResponseAborted{actor: device}` so the
+        // post-restart timeline reads "You restarted" on the AbortPanel.
+        // The synthetic `CodingAgentIdled{engine_restart_interrupt}` that
+        // drives the spawn-dispatcher classifier is left to the post-restart
+        // recovery sweep — it owns the decision of whether to preserve the
+        // worktree (the worktree is `--resume`'d by the user's Continue click)
+        // or clean it up. Pre-emitting that idle event from here would push
+        // the branch into `idle_branches` on restart and trigger a worktree
+        // cleanup, breaking the Continue flow.
+        let cc_originating_ids: Vec<Option<uuid::Uuid>> = futures::future::join_all(
+            cc_thread_ids.iter().map(|tid| {
+                crate::engine::agent_session::latest_originating_event_id(
+                    &self.pool,
+                    *tid,
+                    &["MessageReceived", "CodingAgentUserMessageSent", "TriggerStarted"],
+                )
+            }),
+        )
+        .await;
+        for ((thread_id, originating_event_id), flag) in cc_thread_ids
+            .iter()
+            .zip(cc_originating_ids)
+            .zip(external_emitted_flags)
+        {
+            self.event_bus
+                .emit_or_log(
+                    BusEvent::Thread {
+                        thread_id: *thread_id,
+                        event: ThreadEvent::ResponseAborted {
+                            text: String::new(),
+                            images: vec![],
+                            model: None,
+                            reasoning_effort: None,
+                        },
+                        meta: EventMeta {
+                            channel: Some(EventChannel::CodingAgent),
+                            request_event_id: originating_event_id,
+                            actor: actor.clone(),
+                            ..EventMeta::NONE
+                        },
+                    },
+                    "[Restart] ResponseAborted (cc)",
+                )
+                .await;
+            // Set AFTER the emit lands so any Result arriving from this point
+            // on observes the flag and skips its own duplicate emit.
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// Emit ResponseAborted for all active non-CC threads during engine shutdown.
     /// CC threads are handled separately by `shutdown_agent_sessions`.
     ///
     /// After emitting, cancels all threads so their tasks can clean up. The
     /// agentic loop may also emit ResponseCanceled on cancellation — having both
     /// is harmless (ResponseAborted takes precedence in status derivation).
+    ///
+    /// Stamps `actor: System` so the AbortPanel renders ⚙ System — the host
+    /// system killed these in-flight responses (engine shutdown). The
+    /// user-driven `/api/restart` path pre-emits with `actor: Device {..}`
+    /// BEFORE shutdown for in-flight threads it knows about; this fallback
+    /// covers anything that started after that pre-emit.
     pub async fn shutdown_active_threads(&self) {
         let active_ids = self.processing_thread_ids();
         if active_ids.is_empty() {
             return;
         }
-        // Filter out CC threads (they're handled by shutdown_agent_sessions)
-        let cc_thread_ids: std::collections::HashSet<uuid::Uuid> =
-            { self.agent_sessions.lock().await.keys().copied().collect() };
-        for thread_id in active_ids {
-            if cc_thread_ids.contains(&thread_id) {
-                continue;
-            }
+        // CC threads (in-flight or idle) are handled by shutdown_agent_sessions.
+        let all_cc_thread_ids: std::collections::HashSet<uuid::Uuid> =
+            self.agent_sessions.lock().await.keys().copied().collect();
+        for thread_id in partition_chat_thread_ids(&active_ids, &all_cc_thread_ids) {
             log!(
                 "[Shutdown] Emitting ResponseAborted for active thread {}",
                 thread_id
@@ -1296,7 +1516,9 @@ impl LucidosEngine {
                         model: None,
                         reasoning_effort: None,
                     },
-                    meta: crate::engine::thread_events::EventMeta::NONE,
+                    meta: crate::engine::thread_events::EventMeta::with_actor(Some(
+                        crate::engine::thread_events::MessageOrigin::system(),
+                    )),
                 })
                 .await
             {
@@ -1312,7 +1534,7 @@ impl LucidosEngine {
 
     pub async fn shutdown_browser(&self) {
         if let Err(e) = self.browser_runtime.close_all().await {
-            log!("Error closing browsers on shutdown: {}", e);
+            log!("[Engine] Error closing browsers on shutdown: {}", e);
         }
     }
 
@@ -1394,7 +1616,7 @@ impl LucidosEngine {
     /// Script triggers have no thread — they use a system event.
     pub async fn record_trigger_completed(
         &self,
-        trigger_id: Uuid,
+        trigger_id: &str,
         trigger_name: &str,
         result_summary: &str,
         thread_id: Option<Uuid>,
@@ -1428,10 +1650,6 @@ impl LucidosEngine {
         Ok(())
     }
 
-    pub fn get_artifacts(&self) -> Result<Vec<String>, std::io::Error> {
-        self.artifact_manager.list_artifacts()
-    }
-
     /// Get a snapshot of the conversation at a specific event (thin wrapper)
     pub async fn get_conversation_at_event(
         &self,
@@ -1440,37 +1658,6 @@ impl LucidosEngine {
         self.event_store
             .get_conversation_at_event(event_id, &self.workspace_path)
             .await
-    }
-
-    /// Get all messages for a specific request (thin wrapper)
-    pub async fn get_request_messages(
-        &self,
-        request_id: &str,
-    ) -> Result<Vec<SessionMessage>, Box<dyn std::error::Error + Send + Sync>> {
-        self.event_store
-            .get_request_messages_by_id(request_id)
-            .await
-    }
-
-    /// Load saved API credentials for a service
-    pub async fn get_api_credentials(&self, service_name: &str) -> Option<serde_json::Value> {
-        match CredentialStore::get(&self.pool, service_name).await {
-            Ok(Some(cred)) => Some(serde_json::json!({
-                "base_url": cred.base_url,
-                "auth_type": cred.auth_type,
-                "auth_value": cred.auth_value,
-                "auth_header": cred.auth_header,
-            })),
-            _ => None,
-        }
-    }
-
-    /// List all configured API services
-    pub async fn list_api_services(&self) -> Vec<String> {
-        match CredentialStore::list(&self.pool).await {
-            Ok(creds) => creds.into_iter().map(|c| c.service_name).collect(),
-            Err(_) => Vec::new(),
-        }
     }
 
     /// Build CRED_*, OAUTH_*, LUCIDOS_WORKSPACE, and PATH environment variables
@@ -1646,20 +1833,93 @@ impl LucidosEngine {
         {
             Ok(Ok(Some(commit))) => {
                 log!(
-                    "Auto-committed dirty data files after {} ({})",
+                    "[Engine] Auto-committed dirty data files after {} ({})",
                     context,
                     &commit[..commit.floor_char_boundary(7)]
                 );
             }
             Ok(Err(e)) => {
-                log!("Failed to commit dirty data files after {}: {}", context, e);
+                log!("[Engine] Failed to commit dirty data files after {}: {}", context, e);
             }
             Err(_) => {
-                log!("commit_all_dirty timed out (30s) after {}", context);
+                log!("[Engine] commit_all_dirty timed out (30s) after {}", context);
             }
             Ok(Ok(None)) => {}
         }
     }
+}
+
+/// `processing_thread_ids - all_cc_thread_ids`. Idle CC sessions stay in
+/// `active_threads` between turns, so the exclusion set must cover them or
+/// they get misclassified as chat threads.
+fn partition_chat_thread_ids(
+    processing_thread_ids: &[Uuid],
+    all_cc_thread_ids: &std::collections::HashSet<Uuid>,
+) -> Vec<Uuid> {
+    processing_thread_ids
+        .iter()
+        .filter(|tid| !all_cc_thread_ids.contains(tid))
+        .copied()
+        .collect()
+}
+
+/// Emit a `ResponseAborted` (actor=System) for a thread the engine is
+/// force-evicting after the `register_thread_queued` 60s timeout. Without
+/// this pre-emit, the cancel arms would default to `ResponseCanceled`
+/// (`is_shutdown=false`) and the user would see a misleading "Canceled".
+/// CC sessions also get `external_terminal_emitted` set so the run-loop
+/// arm skips its duplicate emit; chat threads' `agentic_loop` may still
+/// emit a duplicate `ResponseCanceled`, which the frontend deflates
+/// because `Aborted` is checked before `Canceled` in `exchangeStatus`.
+pub(crate) async fn emit_stuck_thread_eviction_abort(
+    bus: &event_bus::EventBus,
+    pool: &sqlx::PgPool,
+    agent_sessions: &tokio::sync::Mutex<HashMap<Uuid, types::AgentSession>>,
+    thread_id: Uuid,
+) {
+    use thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
+
+    let channel = {
+        let guard = agent_sessions.lock().await;
+        if let Some(s) = guard.get(&thread_id) {
+            s.external_terminal_emitted
+                .store(true, std::sync::atomic::Ordering::Release);
+            Some(EventChannel::CodingAgent)
+        } else {
+            None
+        }
+    };
+
+    let request_event_id = crate::engine::agent_session::latest_originating_event_id(
+        pool,
+        thread_id,
+        &[
+            "MessageReceived",
+            "CodingAgentUserMessageSent",
+            "TriggerStarted",
+        ],
+    )
+    .await;
+
+    bus.emit_or_log(
+        event_bus::BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ResponseAborted {
+                text: String::new(),
+                images: vec![],
+                model: None,
+                reasoning_effort: None,
+            },
+            meta: EventMeta {
+                channel,
+                request_event_id,
+                actor: Some(MessageOrigin::system()),
+                ..EventMeta::NONE
+            },
+        },
+        "[Engine] ResponseAborted (stuck-thread eviction)",
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -2546,5 +2806,34 @@ mod tests {
         // 3. Follow-up can register without any cancel hack
         let (new_token, _new_rx, _new_guard) = register_queued(&threads, &completions, tid).await;
         assert!(!new_token.is_cancelled());
+    }
+
+    #[test]
+    fn partition_chat_thread_ids_excludes_idle_cc_session() {
+        use std::collections::HashSet;
+        let chat_only = Uuid::new_v4();
+        let cc_in_flight = Uuid::new_v4();
+        let cc_idle = Uuid::new_v4();
+        let processing = vec![chat_only, cc_in_flight, cc_idle];
+        let all_cc: HashSet<Uuid> = [cc_in_flight, cc_idle].into_iter().collect();
+
+        let chat = partition_chat_thread_ids(&processing, &all_cc);
+
+        assert_eq!(chat, vec![chat_only]);
+    }
+
+    #[test]
+    fn partition_chat_thread_ids_keeps_chat_threads() {
+        use std::collections::HashSet;
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let processing = vec![a, b];
+        let all_cc: HashSet<Uuid> = HashSet::new();
+
+        let chat = partition_chat_thread_ids(&processing, &all_cc);
+
+        assert_eq!(chat.len(), 2);
+        assert!(chat.contains(&a));
+        assert!(chat.contains(&b));
     }
 }

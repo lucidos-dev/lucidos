@@ -47,7 +47,7 @@ test.describe('Claude Code interaction', () => {
     const msg1 = uniqueMessage('cc-idle-1');
     await sendMessage(page, `Say exactly: "first ${msg1}" and nothing else. Do not create any files.`);
 
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
 
     const msg2 = uniqueMessage('cc-idle-2');
     await sendFollowUp(page, `Say exactly: "second ${msg2}" and nothing else. Do not create any files.`);
@@ -65,14 +65,14 @@ test.describe('Claude Code interaction', () => {
     const msg = uniqueMessage('cc-dismiss');
     await sendMessage(page, `Say exactly: "dismiss ${msg}" and nothing else. Do not create any files.`);
 
-    const panel = await waitForActionPanel(page, 'Done', 120_000);
+    const panel = await waitForActionPanel(page, 'Archive', 120_000);
 
-    const doneBtn = panel.locator('button.action-btn:has-text("Done")');
+    const doneBtn = panel.locator('button.action-btn:has-text("Archive")');
     await expect(doneBtn).toBeVisible();
     await doneBtn.click();
 
     // After dismiss, our thread should no longer be focused — verify our
-    // unique message is gone from the visible content (handleDismissThread
+    // unique message is gone from the visible content (handleArchiveThread
     // focuses the next review thread or unfocuses entirely).
     await page.waitForFunction(({ marker, sel }) => {
       return !Array.from(document.querySelectorAll(sel)).some(el => {
@@ -90,10 +90,10 @@ test.describe('Claude Code interaction', () => {
     const msg = uniqueMessage('cc-placeholder');
     await sendMessage(page, `Say exactly: "placeholder ${msg}" and nothing else. Do not create any files.`);
 
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
 
     const input = page.locator('[data-role="prompt-input"]:visible').first();
     const placeholder = await input.getAttribute('placeholder');
-    expect(placeholder).toBe('Reply...');
+    expect(placeholder).toBe('Post a follow up…');
   });
 });

@@ -2,6 +2,29 @@ use super::super::LucidosEngine;
 use crate::core::oauth;
 use crate::core::CredentialStore;
 
+/// Sentinel prefix on a tool result that the agentic loop strips off and
+/// re-emits as a `CredentialRequest` SSE event for the frontend modal.
+pub(crate) const CREDENTIAL_REQUEST_PREFIX: &str = "[CREDENTIAL_REQUEST]";
+
+/// Build a `[CREDENTIAL_REQUEST]<json>` tool result for the frontend to intercept.
+/// The JSON is built via `serde_json` so any characters (newlines, quotes,
+/// backslashes) in the inputs are escaped correctly — `format!`-based
+/// interpolation produces invalid JSON the moment a prompt has a newline.
+pub(crate) fn credential_request_payload(
+    service: &str,
+    prompt: &str,
+    base_url: &str,
+    auth_type: &str,
+) -> String {
+    let payload = serde_json::json!({
+        "service": service,
+        "prompt": prompt,
+        "base_url": base_url,
+        "auth_type": auth_type,
+    });
+    format!("{CREDENTIAL_REQUEST_PREFIX}{payload}")
+}
+
 impl LucidosEngine {
     pub(crate) async fn execute_credential_tool(
         &self,
@@ -27,14 +50,11 @@ impl LucidosEngine {
                     ));
                 }
 
-                // Return a special response that the frontend will intercept to show a modal
-                // The SSE handler in the frontend will parse this and show a credential input modal
-                Ok(format!(
-                    "[CREDENTIAL_REQUEST]{{\"service\":\"{}\",\"prompt\":\"{}\",\"base_url\":\"{}\",\"auth_type\":\"{}\"}}",
+                Ok(credential_request_payload(
                     service_name,
-                    prompt.replace('\"', "\\\""),
+                    prompt,
                     base_url,
-                    auth_type
+                    auth_type,
                 ))
             }
             "connect_oauth_account" => {
@@ -51,9 +71,11 @@ impl LucidosEngine {
                     .await?
                     .is_none()
                 {
-                    // Request client credentials via the credential modal
-                    return Ok(format!(
-                        "[CREDENTIAL_REQUEST]{{\"service\":\"oauth:{provider}\",\"prompt\":\"Enter your OAuth client credentials for {provider}.\",\"base_url\":\"https://{provider}.com\",\"auth_type\":\"oauth_client\"}}"
+                    return Ok(credential_request_payload(
+                        &cred_service,
+                        &format!("Enter your OAuth client credentials for {provider}."),
+                        &format!("https://{provider}.com"),
+                        "oauth_client",
                     ));
                 }
 
@@ -71,36 +93,52 @@ impl LucidosEngine {
     }
 }
 
-/// Wait for an OAuth callback on the given listener, extract the authorization code.
-pub(crate) async fn wait_for_oauth_callback(
-    listener: tokio::net::TcpListener,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let (stream, _) = listener.accept().await?;
-    let mut buf = vec![0u8; 4096];
-    stream.readable().await?;
-    let n = stream.try_read(&mut buf)?;
-    let request = String::from_utf8_lossy(&buf[..n]);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Parse the GET request line to extract the code parameter
-    let first_line = request.lines().next().unwrap_or("");
-    let path = first_line.split_whitespace().nth(1).unwrap_or("");
-    let code = path
-        .split('?')
-        .nth(1)
-        .and_then(|q| {
-            q.split('&')
-                .find(|p| p.starts_with("code="))
-                .map(|p| p.trim_start_matches("code=").to_string())
-        })
-        .ok_or("No authorization code in callback")?;
+    fn parse_payload(s: &str) -> serde_json::Value {
+        let json_part = s
+            .strip_prefix(CREDENTIAL_REQUEST_PREFIX)
+            .expect("missing CREDENTIAL_REQUEST_PREFIX");
+        serde_json::from_str(json_part).expect("payload must be valid JSON")
+    }
 
-    // Send a success response to the browser
-    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to Lucidos.</p></body></html>";
-    stream.writable().await?;
-    let _ = stream.try_write(response.as_bytes());
+    #[test]
+    fn payload_is_valid_json_with_multiline_prompt() {
+        let prompt = "1. Open dashboard\n2. Create API key\n3. Paste it below";
+        let result = credential_request_payload(
+            "binance",
+            prompt,
+            "https://api.binance.com",
+            "api_key",
+        );
+        let parsed = parse_payload(&result);
+        assert_eq!(parsed["service"], "binance");
+        assert_eq!(parsed["prompt"], prompt);
+        assert_eq!(parsed["base_url"], "https://api.binance.com");
+        assert_eq!(parsed["auth_type"], "api_key");
+    }
 
-    // URL-decode the code
-    let code = urlencoding::decode(&code)?.into_owned();
+    #[test]
+    fn payload_escapes_quotes_and_backslashes_in_prompt() {
+        let prompt = r#"Use the "API Key" field, escape backslashes like \n correctly"#;
+        let result =
+            credential_request_payload("svc", prompt, "https://api.example.com", "api_key");
+        let parsed = parse_payload(&result);
+        assert_eq!(parsed["prompt"], prompt);
+    }
 
-    Ok(code)
+    #[test]
+    fn payload_handles_special_chars_in_other_fields() {
+        let result = credential_request_payload(
+            r#"weird"service"#,
+            "prompt",
+            r#"https://example.com/path with "quotes""#,
+            "api_key",
+        );
+        let parsed = parse_payload(&result);
+        assert_eq!(parsed["service"], r#"weird"service"#);
+        assert_eq!(parsed["base_url"], r#"https://example.com/path with "quotes""#);
+    }
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { panelOverlay, activeInlineForm, connectionStatus } from '../store';
-import type { EmailConfirmRequest } from '../types';
+import type { CredentialRequest, EmailConfirmRequest } from '../types';
 
 // Mock all external dependencies so handleResume can run in isolation
 vi.mock('../../api/client', () => ({
@@ -63,6 +63,45 @@ describe('handleResume preserves email-confirm form', () => {
     if (form?.type === 'email-confirm') {
       expect(form.request.to).toEqual(['test@example.com']);
       expect(form.request.subject).toBe('Test');
+    }
+  });
+});
+
+const credentialRequestForm = {
+  type: 'credential' as const,
+  request: {
+    service: 'helius',
+    base_url: 'https://api.helius.xyz',
+    auth_type: 'api_key' as const,
+    prompt: 'Paste your Helius API key.\n1. Go to https://dev.helius.xyz/dashboard\n2. Copy API Key',
+  } as CredentialRequest,
+};
+
+describe('handleResume preserves credential request form', () => {
+  it('should NOT clear credential request form on resume/focus', async () => {
+    panelOverlay.value = { type: 'form', form: credentialRequestForm };
+
+    await handleResume();
+
+    // User often takes a screenshot, switches tabs, or alt-tabs while filling
+    // out credentials — the panel must survive every focus event. The data
+    // lives on panelOverlay (and is persisted in the nav stack), so resync
+    // does not need to "refetch" it from the original SSE event.
+    expect(activeInlineForm.value).not.toBeNull();
+    expect(activeInlineForm.value?.type).toBe('credential');
+  });
+
+  it('should preserve the full credential request prompt and instructions on resume', async () => {
+    panelOverlay.value = { type: 'form', form: credentialRequestForm };
+
+    await handleResume();
+
+    const form = activeInlineForm.value;
+    expect(form?.type).toBe('credential');
+    if (form?.type === 'credential') {
+      expect(form.request?.service).toBe('helius');
+      expect(form.request?.prompt).toContain('1. Go to https://dev.helius.xyz/dashboard');
+      expect(form.request?.prompt).toContain('2. Copy API Key');
     }
   });
 });

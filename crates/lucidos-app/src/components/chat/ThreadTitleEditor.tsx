@@ -26,9 +26,22 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
     if (!editing) setEditValue(title);
   }, [title, editing]);
 
-  // Deps are [title] only — autoresizing on editValue would churn the iOS
-  // textarea layout per keystroke and clobber cursor/selection.
-  useEffect(() => autoResizeTextarea(displayRef.current), [title]);
+  // Deps are [title, editing] — autoresizing on editValue would churn the iOS
+  // textarea layout per keystroke and clobber cursor/selection. The editing
+  // gate skips the call while the display textarea is display:none (its
+  // scrollHeight reads 0 → height collapses to ~2px and stays there once the
+  // editor closes). Re-running on the editing→false transition refits height
+  // to the latest title delivered by SSE during the save.
+  useEffect(() => {
+    if (!editing) autoResizeTextarea(displayRef.current);
+  }, [title, editing]);
+
+  // The overlay input keeps DOM focus after save/escape, so onFocus won't
+  // re-fire on the next click — blur explicitly so editing can be re-entered
+  // without clicking elsewhere first.
+  useEffect(() => {
+    if (!editing) inputRef.current?.blur();
+  }, [editing]);
 
   useEffect(() => () => { abortRef.current?.abort(); }, []);
 
@@ -98,7 +111,7 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
         ref={displayRef}
         class="thread-title-input thread-title-display"
         rows={1}
-        value={title || 'Untitled Thread'}
+        value={title}
         readOnly
         tabIndex={-1}
         onClick={startEditing}

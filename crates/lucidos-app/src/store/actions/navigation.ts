@@ -23,11 +23,25 @@ function inlineFormsEqual(a: InlineForm | null, b: InlineForm | null): boolean {
   if (!a || !b) return false;
   if (a.type !== b.type) return false;
   switch (a.type) {
-    case 'credential': return a.editing === (b as typeof a).editing;
+    case 'credential': {
+      // Two engine-prompted requests for different services are distinct
+      // overlays — without comparing `request.service`, pushNavState would
+      // dedupe the second and the user could never return to it.
+      const bb = b as typeof a;
+      return a.editing === bb.editing && a.request?.service === bb.request?.service;
+    }
     case 'app-edit': return a.appId === (b as typeof a).appId;
     case 'new-app': return true;
     case 'trigger': return a.taskId === (b as typeof a).taskId;
-    case 'email-confirm': return true;
+    case 'email-confirm': {
+      const ar = a.request;
+      const br = (b as typeof a).request;
+      return (
+        ar.subject === br.subject &&
+        ar.to.length === br.to.length &&
+        ar.to.every((addr, i) => addr === br.to[i])
+      );
+    }
   }
 }
 

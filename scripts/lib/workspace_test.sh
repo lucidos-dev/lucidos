@@ -43,14 +43,21 @@ write_pid_for_workspace() {
     echo "$pid" > "$dir/frontend.pid"
 }
 
-# ── Test 1: refuse npm install when another workspace's frontend is running ──
-test_refuses_install_when_other_frontend_running() {
-    echo "test: refuses install when other frontend running"
+# ── Test 1: refuse npm install when a frontend in THIS project is running ──
+test_refuses_install_when_same_project_frontend_running() {
+    echo "test: refuses install when a frontend in this project is running"
 
-    local pkg="$SANDBOX/pkg-needs-install"
+    # `local PROJECT_DIR` shadows the global that ensure_npm_deps reads —
+    # bash dynamic scoping makes the local visible to called functions.
+    local PROJECT_DIR="$SANDBOX/proj-conflict"
+    local pkg="$PROJECT_DIR"
     make_pkg_dir "$pkg" 0       # no node_modules → install IS needed
 
-    sleep 30 &
+    # Fake Vite running with cwd inside PROJECT_DIR, mirroring the real layout
+    # ($PROJECT_DIR/crates/lucidos-app). Backgrounded inline (NOT inside a
+    # helper called via $()) so the child stays alive until this test ends.
+    mkdir -p "$PROJECT_DIR/crates/lucidos-app"
+    ( cd "$PROJECT_DIR/crates/lucidos-app" && exec sleep 30 ) &
     local fake_pid=$!
     disown "$fake_pid" 2>/dev/null || true   # suppress "Terminated" noise on cleanup
     write_pid_for_workspace "other-ws" "$fake_pid"
@@ -80,6 +87,47 @@ test_refuses_install_when_other_frontend_running() {
         pass "error message names the running workspace"
     else
         fail "error message did not mention 'other-ws': $out"
+    fi
+}
+
+# ── Test 1b: allow install when running frontend is in a DIFFERENT checkout ──
+# Mirrors the CC-worktree case: a Vite running from main repo doesn't
+# share node_modules with a worktree, so installing in the worktree is safe.
+test_allows_install_when_other_checkout_frontend_running() {
+    echo "test: allows install when running frontend is in a different checkout"
+
+    local PROJECT_DIR="$SANDBOX/proj-worktree"
+    local pkg="$PROJECT_DIR"
+    make_pkg_dir "$pkg" 0       # no node_modules → install IS needed
+
+    # Fake Vite cwd in a DIFFERENT physical project (simulating main repo
+    # while we install in a worktree).
+    local other_project="$SANDBOX/proj-main"
+    mkdir -p "$other_project/crates/lucidos-app"
+    ( cd "$other_project/crates/lucidos-app" && exec sleep 30 ) &
+    local fake_pid=$!
+    disown "$fake_pid" 2>/dev/null || true
+    write_pid_for_workspace "main-ws" "$fake_pid"
+
+    npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
+    export -f npm
+
+    local out
+    out="$(ensure_npm_deps "$pkg" "test deps" 2>&1)"
+    local rc=$?
+
+    kill "$fake_pid" 2>/dev/null || true
+    unset -f npm
+
+    if [ $rc -ne 0 ]; then
+        fail "expected exit 0, got $rc; output: $out"
+    else
+        pass "exited 0"
+    fi
+    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
+        pass "npm install ran"
+    else
+        fail "npm install did not run; output: $out"
     fi
 }
 
@@ -254,10 +302,139 @@ test_does_not_create_directories() {
     fi
 }
 
-test_refuses_install_when_other_frontend_running
+# ── Test: workspace member with hoisted root deps does not need install ──
+# Reproduces the "fresh git worktree" failure: in npm-workspace setups, the
+# per-package node_modules dir only holds Vite cache. A fresh worktree has no
+# per-package node_modules but the root one is fully populated. The check
+# must not falsely report "missing" in that case.
+test_workspace_member_with_root_deps_skips_install() {
+    echo "test: workspace member skips install when root node_modules present"
+
+    rm -rf "$HOME/workspaces"
+
+    # Build the layout that npm workspaces produces:
+    #   $root/package.json   { "workspaces": ["pkg-member"] }
+    #   $root/node_modules/  (populated by `npm install` at root)
+    #   $root/pkg-member/package.json   ( workspace member )
+    #   $root/pkg-member/   ( NO node_modules — this is the fresh-worktree case )
+    local root="$SANDBOX/wsroot-$$"
+    mkdir -p "$root/node_modules" "$root/pkg-member"
+    cat > "$root/package.json" <<'EOF'
+{"private":true,"workspaces":["pkg-member"]}
+EOF
+    echo '{"name":"pkg-member"}' > "$root/pkg-member/package.json"
+    # Backdate package.json so node_modules mtime is newer (no install needed).
+    touch -t 202001010000 "$root/pkg-member/package.json"
+
+    # Pin a running frontend for another workspace — if the function decides
+    # install IS needed, this would make it exit 1.
+    sleep 30 &
+    local fake_pid=$!
+    disown "$fake_pid" 2>/dev/null || true
+    write_pid_for_workspace "other-ws" "$fake_pid"
+
+    npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
+    export -f npm
+
+    local out rc
+    out="$(ensure_npm_deps "$root/pkg-member" "frontend deps" 2>&1)"
+    rc=$?
+
+    kill "$fake_pid" 2>/dev/null || true
+    unset -f npm
+
+    if [ $rc -ne 0 ]; then
+        fail "fresh-worktree case errored (rc=$rc); output: $out"
+    else
+        pass "fresh-worktree case exited 0"
+    fi
+    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
+        fail "npm install ran when root deps already present"
+    else
+        pass "npm install did not run"
+    fi
+}
+
+# ── Test: workspace member install still triggers on package.json bump ──
+# When the workspace member's own package.json is newer than the root
+# node_modules (i.e. someone added a dep), install must still fire.
+test_workspace_member_install_when_package_json_bumped() {
+    echo "test: workspace member triggers install when its package.json bumped"
+
+    rm -rf "$HOME/workspaces"
+
+    local root="$SANDBOX/wsroot2-$$"
+    mkdir -p "$root/node_modules" "$root/pkg-member"
+    cat > "$root/package.json" <<'EOF'
+{"private":true,"workspaces":["pkg-member"]}
+EOF
+    # Backdate root node_modules, then write member package.json as "fresh"
+    # so it's newer than the install marker.
+    touch -t 202001010000 "$root/node_modules"
+    echo '{"name":"pkg-member","dependencies":{"new":"^1"}}' > "$root/pkg-member/package.json"
+
+    npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
+    export -f npm
+
+    local out rc
+    out="$(ensure_npm_deps "$root/pkg-member" "frontend deps" 2>&1)"
+    rc=$?
+    unset -f npm
+
+    if [ $rc -ne 0 ]; then
+        fail "expected exit 0, got $rc; output: $out"
+    else
+        pass "exited 0"
+    fi
+    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
+        pass "npm install ran on package.json bump"
+    else
+        fail "npm install did not run; output: $out"
+    fi
+}
+
+# ── Test: missing root node_modules in a workspace setup still triggers install ──
+test_workspace_member_install_when_root_node_modules_missing() {
+    echo "test: workspace member triggers install when root node_modules missing"
+
+    rm -rf "$HOME/workspaces"
+
+    local root="$SANDBOX/wsroot3-$$"
+    mkdir -p "$root/pkg-member"
+    cat > "$root/package.json" <<'EOF'
+{"private":true,"workspaces":["pkg-member"]}
+EOF
+    echo '{"name":"pkg-member"}' > "$root/pkg-member/package.json"
+    # No root/node_modules and no per-pkg node_modules → install needed.
+
+    npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
+    export -f npm
+
+    local out rc
+    out="$(ensure_npm_deps "$root/pkg-member" "frontend deps" 2>&1)"
+    rc=$?
+    unset -f npm
+
+    if [ $rc -ne 0 ]; then
+        fail "expected exit 0, got $rc; output: $out"
+    else
+        pass "exited 0"
+    fi
+    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
+        pass "npm install ran when root node_modules missing"
+    else
+        fail "npm install did not run; output: $out"
+    fi
+}
+
+test_refuses_install_when_same_project_frontend_running
+test_allows_install_when_other_checkout_frontend_running
 test_installs_when_no_frontend_running
 test_stale_pidfile_does_not_block
 test_no_install_needed_skips_check
+test_workspace_member_with_root_deps_skips_install
+test_workspace_member_install_when_package_json_bumped
+test_workspace_member_install_when_root_node_modules_missing
 test_resolves_bare_name_to_home_workspaces
 test_resolves_absolute_path_unchanged
 test_errors_on_missing_workspace

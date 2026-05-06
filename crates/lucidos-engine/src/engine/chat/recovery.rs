@@ -10,19 +10,27 @@ impl LucidosEngine {
     /// (e.g., lid close during tool execution after a prior ResponseGenerated).
     ///
     /// Emits ResponseAborted via EventBus with partial text so the thread is
-    /// marked UNREAD and the user notices.
+    /// marked UNREAD and the user notices. The actor is stamped as `System` so
+    /// the AbortPanel renders "⚙ System" — the host system killed the previous
+    /// response (engine crashed, OS killed the process, etc.); the engine on
+    /// restart is just marking it. `request_event_id` is the originating
+    /// MessageReceived/TriggerStarted id — the user-facing rerun path uses
+    /// this to find the prompt to re-run.
     ///
     /// `exclude_thread_ids` — threads being actively recovered by worktree recovery;
     /// they should not be aborted here since CC recovery will handle them.
     pub async fn recover_orphaned_threads(self: &Arc<Self>, exclude_thread_ids: &[uuid::Uuid]) {
         use crate::engine::event_bus::BusEvent;
-        use crate::engine::thread_events::{EventMeta, ThreadEvent};
+        use crate::engine::thread_events::{
+            EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+        };
 
         // Find threads where the LAST exchange boundary (MessageReceived or
         // TriggerStarted) has activity events after it but no terminal
-        // event. This correctly handles multi-exchange threads where earlier
-        // exchanges completed (has_response=true) but the latest was interrupted.
-        let rows: Vec<(uuid::Uuid, Option<String>)> = match sqlx::query_as(
+        // event. Returns the originating event id and the originating event's
+        // type so the emitted ResponseAborted can carry `request_event_id`
+        // linking back to it AND the right channel (chat vs trigger).
+        let rows: Vec<(uuid::Uuid, Option<String>, Option<uuid::Uuid>, Option<String>)> = match sqlx::query_as(
             r#"
             WITH candidate_threads AS (
                 SELECT thread_id::text AS aggregate_id
@@ -64,8 +72,17 @@ impl LucidosEngine {
                     FROM events e2
                     WHERE e2.aggregate_id = o.thread_id::text
                       AND e2.event_type IN ('TextStreamed', 'CodingAgentTextStreamed')
-                      AND e2.created > o.last_start) AS partial_text
+                      AND e2.created > o.last_start) AS partial_text,
+                   start_evt.id AS originating_event_id,
+                   start_evt.event_type AS originating_event_type
             FROM orphans o
+            LEFT JOIN LATERAL (
+                SELECT e3.id, e3.event_type FROM events e3
+                WHERE e3.aggregate_id = o.thread_id::text
+                  AND e3.event_type IN ('MessageReceived','TriggerStarted')
+                  AND e3.created = o.last_start
+                ORDER BY e3.sequence DESC LIMIT 1
+            ) start_evt ON true
             "#,
         )
         .bind(exclude_thread_ids)
@@ -85,10 +102,15 @@ impl LucidosEngine {
 
         log!("[Recovery] Found {} orphaned thread(s)", rows.len());
 
-        for (thread_id, partial_text) in rows {
+        for (thread_id, partial_text, originating_event_id, originating_event_type) in rows {
             let text = match partial_text {
                 Some(t) if !t.is_empty() => t,
                 _ => "This response was interrupted by an engine restart.".to_string(),
+            };
+            let channel = match originating_event_type.as_deref() {
+                Some("TriggerStarted") => Some(EventChannel::Trigger),
+                Some("MessageReceived") => Some(EventChannel::Chat),
+                _ => None,
             };
 
             if let Err(e) = self
@@ -101,7 +123,12 @@ impl LucidosEngine {
                         model: None,
                         reasoning_effort: None,
                     },
-                    meta: EventMeta::NONE,
+                    meta: EventMeta {
+                        channel,
+                        request_event_id: originating_event_id,
+                        actor: Some(MessageOrigin::system()),
+                        ..EventMeta::NONE
+                    },
                 })
                 .await
             {

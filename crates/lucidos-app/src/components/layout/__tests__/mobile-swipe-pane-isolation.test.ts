@@ -38,4 +38,15 @@ describe('.mobile-swipe-pane visual isolation', () => {
       /isolation\s*:\s*isolate|contain\s*:[^;]*\bpaint\b|transform\s*:\s*translateZ/,
     );
   });
+
+  it('forces its own compositor layer so iframe descendants clip during swipes', () => {
+    // `isolation: isolate` creates a stacking context but NOT a compositor
+    // layer. On iOS Safari, iframe descendants need an ancestor compositor
+    // layer to clip during transforms — without it, the iframe paints
+    // outside its pane during a swipe. `will-change: transform` is only a
+    // hint and doesn't guarantee promotion in WebKit, so it's not enough.
+    expect(paneRuleBody()).toMatch(
+      /transform\s*:\s*translate(Z|3d)|contain\s*:[^;]*\bpaint\b/,
+    );
+  });
 });

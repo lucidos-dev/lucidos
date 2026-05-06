@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { exchangeResponseEvents, exchangeStatus, type Exchange } from '../thread-events';
+import { exchangeResponseEvents, exchangeStatus, exchangeSteps, type Exchange } from '../thread-events';
 import type { StoredEvent } from '../thread-events';
 
 function step(seq: number, event: Partial<StoredEvent> & { type: string }): { seq: number; event: StoredEvent } {
@@ -14,69 +14,7 @@ function exchange(steps: Array<{ seq: number; event: StoredEvent }>): Exchange {
   };
 }
 
-describe('exchangeResponseEvents — UserQuestionAsked rendering', () => {
-  it('emits a question ResponseEvent for UserQuestionAsked', () => {
-    const ex = exchange([
-      step(1, {
-        type: 'UserQuestionAsked',
-        tool_use_id: 'tu_1',
-        cc_session_id: 'sess',
-        question: 'Pick one:',
-        options: [
-          { id: 'opt-0', label: 'Yes' },
-          { id: 'opt-1', label: 'No', description: 'Cancel build' },
-        ],
-      }),
-    ]);
-    const events = exchangeResponseEvents(ex);
-    const q = events.find(e => e.type === 'question');
-    expect(q).toBeDefined();
-    expect((q as { question: string }).question).toBe('Pick one:');
-    expect((q as { tool_use_id: string }).tool_use_id).toBe('tu_1');
-    expect((q as { options: { label: string }[] }).options).toHaveLength(2);
-    expect((q as { resolved?: unknown }).resolved).toBeUndefined();
-  });
-
-  it('marks question resolved when matching UserQuestionAnswered follows', () => {
-    const ex = exchange([
-      step(1, {
-        type: 'UserQuestionAsked',
-        tool_use_id: 'tu_1',
-        cc_session_id: 'sess',
-        question: 'Pick one:',
-        options: [{ id: 'opt-0', label: 'Yes' }],
-      }),
-      step(2, {
-        type: 'UserQuestionAnswered',
-        tool_use_id: 'tu_1',
-        answer: { kind: 'Selected', option_id: 'opt-0' },
-      }),
-    ]);
-    const events = exchangeResponseEvents(ex);
-    const q = events.find(e => e.type === 'question') as { resolved?: { kind: string; option_id?: string } };
-    expect(q.resolved).toEqual({ kind: 'Selected', option_id: 'opt-0' });
-  });
-
-  it('resolves with FreeText when user typed instead of clicked', () => {
-    const ex = exchange([
-      step(1, {
-        type: 'UserQuestionAsked',
-        tool_use_id: 'tu_2',
-        cc_session_id: 'sess',
-        question: 'What now?',
-        options: [],
-      }),
-      step(2, {
-        type: 'UserQuestionAnswered',
-        tool_use_id: 'tu_2',
-        answer: { kind: 'FreeText', text: 'skip the tests' },
-      }),
-    ]);
-    const events = exchangeResponseEvents(ex);
-    const q = events.find(e => e.type === 'question') as { resolved?: { kind: string; text?: string } };
-    expect(q.resolved).toEqual({ kind: 'FreeText', text: 'skip the tests' });
-  });
-
+describe('exchangeStatus + spinner behavior around UserQuestionAsked', () => {
   it('exchangeStatus reads as awaiting-answer while waiting for an answer (no spinner, no Done label)', () => {
     const ex = exchange([
       step(1, { type: 'SessionStarted', session_id: 'sess', branch: '' }),
@@ -89,7 +27,6 @@ describe('exchangeResponseEvents — UserQuestionAsked rendering', () => {
         options: [{ id: 'opt-0', label: 'A' }],
       }),
     ]);
-    // CC-mode thread; isLast=true; no streaming buffer.
     expect(exchangeStatus(ex, '', true, false, true)).toBe('awaiting-answer');
   });
 
@@ -113,23 +50,44 @@ describe('exchangeResponseEvents — UserQuestionAsked rendering', () => {
     expect(exchangeStatus(ex, '', true, false, true)).toBe('cc-working');
   });
 
-  it('ignores unrelated UserQuestionAnswered for a different tool_use_id', () => {
+  it('keeps resume-marker Thinking step spinning when AskUserQuestion ToolResult fires', () => {
+    // After UserQuestionAnswered, the engine emits a CodingAgentPromptSent
+    // resume marker (empty text → Thinking spinner). Then CC's PreToolUse
+    // hook unblocks and CC processes the synthetic tool_result for the
+    // AskUserQuestion, which surfaces as CodingAgentToolResult. That
+    // CodingAgentToolResult must NOT resolve the resume-marker Thinking
+    // spinner — the spinner should keep spinning until CC produces real
+    // output (text or a non-AskUserQuestion tool call).
     const ex = exchange([
-      step(1, {
+      step(1, { type: 'SessionStarted', session_id: 'sess', branch: '' }),
+      step(2, { type: 'CodingAgentTextStreamed', text: 'thinking…' }),
+      step(3, {
         type: 'UserQuestionAsked',
-        tool_use_id: 'tu_a',
+        tool_use_id: 'tu_resume',
         cc_session_id: 'sess',
-        question: 'A?',
-        options: [],
+        question: 'Pick:',
+        options: [{ id: 'opt-0', label: 'A' }],
       }),
-      step(2, {
+      step(4, {
         type: 'UserQuestionAnswered',
-        tool_use_id: 'tu_other',
-        answer: { kind: 'Canceled' },
+        tool_use_id: 'tu_resume',
+        answer: { kind: 'Selected', option_id: 'opt-0' },
       }),
+      step(5, { type: 'CodingAgentPromptSent', text: '' }),
+      step(6, { type: 'CodingAgentToolResult', name: '', result: 'opt-0' }),
     ]);
-    const events = exchangeResponseEvents(ex);
-    const q = events.find(e => e.type === 'question') as { resolved?: unknown };
-    expect(q.resolved).toBeUndefined();
+
+    // The resume-marker Thinking step must still be a spinner (success: null).
+    const events = exchangeResponseEvents(ex, 0, true);
+    const stepEvents = events.filter(e => e.type === 'step') as Array<{ description: string; success: boolean | null }>;
+    const trailingThinking = stepEvents[stepEvents.length - 1];
+    expect(trailingThinking.description).toBe('Thinking');
+    expect(trailingThinking.success).toBeNull();
+
+    // exchangeSteps (the parallel projection used by other UI surfaces) must agree.
+    const steps = exchangeSteps(ex, true, false);
+    const lastStep = steps[steps.length - 1];
+    expect(lastStep.description).toBe('Thinking');
+    expect(lastStep.success).toBeNull();
   });
 });

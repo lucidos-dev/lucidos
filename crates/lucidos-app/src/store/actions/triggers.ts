@@ -1,14 +1,18 @@
 import {
   triggers,
+  historicalTriggers,
+  selectedTriggerIds,
+  setSelectedTriggerIds,
   panelOverlay,
   closeInlineForm,
   showToast,
   showConfirm,
 } from '../store';
-import { toFailed } from '../types';
+import { toFailed, setLoadingIfFresh } from '../types';
 import type { TriggerRun } from '../types';
 import {
   listTriggers,
+  listHistoricalTriggers,
   createTrigger,
   updateTrigger,
   deleteTriggerApi,
@@ -19,16 +23,43 @@ import { navigateToPane } from './pane';
 import { isMobile } from '../../utils/viewport';
 import { errorDetail } from '../../utils/errorDetail';
 
-export async function loadTriggers(): Promise<void> {
-  if (triggers.value.status !== 'loaded') {
-    triggers.value = { status: 'loading' };
+/** Drop selectedTriggerIds entries that aren't in either registry. No-ops
+ *  until both registries are loaded so a still-fetching list doesn't drop
+ *  the user's selection. */
+export function pruneStaleSelectedTriggerIds(): void {
+  if (triggers.value.status !== 'loaded' || historicalTriggers.value.status !== 'loaded') return;
+  const valid = new Set<string>();
+  for (const t of triggers.value.data) valid.add(t.id);
+  for (const t of historicalTriggers.value.data) valid.add(t.id);
+  const current = selectedTriggerIds.value;
+  const next = new Set<string>();
+  let dropped = 0;
+  for (const id of current) {
+    if (valid.has(id)) next.add(id);
+    else dropped++;
   }
+  if (dropped > 0) setSelectedTriggerIds(next);
+}
+
+export async function loadTriggers(): Promise<void> {
+  setLoadingIfFresh(triggers);
   try {
     const data = await listTriggers();
     triggers.value = { status: 'loaded', data: data.triggers || [] };
+    pruneStaleSelectedTriggerIds();
   } catch (error) {
-    console.error('Failed to load triggers:', error);
     triggers.value = toFailed(error);
+  }
+}
+
+export async function loadHistoricalTriggers(): Promise<void> {
+  setLoadingIfFresh(historicalTriggers);
+  try {
+    const data = await listHistoricalTriggers();
+    historicalTriggers.value = { status: 'loaded', data: data.triggers || [] };
+    pruneStaleSelectedTriggerIds();
+  } catch (error) {
+    historicalTriggers.value = toFailed(error);
   }
 }
 
@@ -65,10 +96,12 @@ interface SubmitTriggerParams {
   condition?: Record<string, unknown>;
   /** Whether the form is showing event fields — controls whether on_event/condition are sent on update. */
   showEvent?: boolean;
+  /** When true, threads spawned by this trigger surface in REVIEW on completion. */
+  goToReview: boolean;
 }
 
 export async function submitTrigger(params: SubmitTriggerParams): Promise<boolean> {
-  const { name, run, cronExpressions, taskId, onEvent, condition, showEvent } = params;
+  const { name, run, cronExpressions, taskId, onEvent, condition, showEvent, goToReview } = params;
   if (!name.trim()) {
     showToast('Trigger name is required', 'error');
     return false;
@@ -85,6 +118,7 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         name: name.trim(),
         run,
         cron_expressions: trimmed,
+        go_to_review: goToReview,
       };
       if (showEvent) {
         body.on_event = onEvent || null;
@@ -106,6 +140,7 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         cron_expressions: trimmed,
         on_event: onEvent,
         condition,
+        go_to_review: goToReview,
       });
       if (!data.success) {
         showToast(data.error || 'Failed to create trigger', 'error');
@@ -117,7 +152,6 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
     await loadTriggers();
     return true;
   } catch (error) {
-    console.error('Failed to save trigger:', error);
     showToast('Failed to save trigger: ' + errorDetail(error), 'error');
     return false;
   }
@@ -135,7 +169,6 @@ export async function toggleTrigger(
       showToast(data.error || 'Failed to update trigger', 'error');
     }
   } catch (error) {
-    console.error('Failed to toggle trigger:', error);
     showToast('Failed to update trigger: ' + errorDetail(error), 'error');
   }
 }
@@ -156,7 +189,6 @@ export async function deleteTrigger(
       showToast(data.error || 'Failed to delete trigger', 'error');
     }
   } catch (error) {
-    console.error('Failed to delete trigger:', error);
     showToast('Failed to delete trigger: ' + errorDetail(error), 'error');
   }
 }

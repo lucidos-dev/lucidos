@@ -1,6 +1,6 @@
 import { useEffect } from 'preact/hooks';
 import { mobileView, panelOverlay } from '../store/store';
-import { opensSoftwareKeyboard } from '../utils/dom';
+import { opensSoftwareKeyboard, getRemPx } from '../utils/dom';
 import { getResizeMode, scrollToBottom, scrolledUp } from '../components/chat/scrollState';
 import { isMobile } from '../utils/viewport';
 
@@ -37,8 +37,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let disabled = false; // true when app UI iframe is active — header stays visible
     // Per-pane scroll state so each pane has independent header position
     const paneState: Record<string, { headerOffset: number; prevScrollTop: number }> = {};
-    // Actual px-per-rem — mobile uses 112.5% (18px) base font size by default
-    let cachedRemSize = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+    let cachedRemSize = getRemPx();
     // Change-detection guard (avoid needless style invalidation on every scroll)
     let lastOffsetRem = 0;
 
@@ -123,7 +122,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     }
 
     function refreshHeight() {
-      cachedRemSize = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+      cachedRemSize = getRemPx();
       const el = headerRef.current;
       if (!el) {
         if (cachedHeight !== 0) {

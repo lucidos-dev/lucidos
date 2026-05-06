@@ -1,5 +1,5 @@
-import { EVENT_CLASSIFICATION, LAST_ACTIVITY_EVENTS, SECTION_TRANSITIONS, SESSION_END_REASONS, STATUS_TRANSITIONS } from '../generated/thread-lifecycle';
-import type { EventChannel, SessionEndReason, StatusTransition } from '../generated/thread-lifecycle';
+import { EVENT_CLASSIFICATION, LAST_ACTIVITY_EVENTS, SESSION_END_REASONS } from '../generated/thread-lifecycle';
+import type { EventChannel, SessionEndReason } from '../generated/thread-lifecycle';
 import { MODELS, REASONING_LEVELS } from './models';
 
 /** Who started a thread: user-initiated or system-initiated (e.g. scheduled task). */
@@ -42,20 +42,34 @@ export type MessageOrigin =
       mode?: ActorMode;
       direction?: ThreadDirection;
     }
-  | { kind: 'engine'; reason: EngineReason };
+  | { kind: 'engine'; reason: EngineReason }
+  /** The host system killed the underlying process (engine shutdown, OS signal,
+   *  crash, safety-net catch). Distinct from `engine` which represents
+   *  engine-deliberate actions (hardening retrigger, scheduler, merge conflict). */
+  | { kind: 'system' };
 
-/** Display label for system-initiated work attributed to the engine. */
+/** Display label for engine-deliberate work (hardening, merging, scheduler). */
 export const ENGINE_LABEL = 'Lucidos Engine';
+
+/** Display label for process killed by the host system (engine shutdown,
+ *  safety-net catch, OS signal). Distinct from `ENGINE_LABEL`: the engine
+ *  acts deliberately; the system just kills processes. */
+export const SYSTEM_LABEL = 'System';
 
 /** Display label for work kicked off by a Lucidos LLM agent in another thread
  *  (parent_thread origin) — distinct from the engine, which only owns events
  *  it literally raises on its own (recovery, hardening, scheduler, …). */
 export const LUCIDOS_AGENT_LABEL = 'Lucidos Agent';
 
+/** Icon paired with `LUCIDOS_AGENT_LABEL` — used by both the initiator chip
+ *  (who started the work) and the executor chip (who produced the response).
+ *  Single source so the two panels stay in sync. */
+export const LUCIDOS_AGENT_ICON = '🤖';
+
 /** Derive the ActorMode from a MessageOrigin. Mirrors the Rust
- *  `MessageOrigin::mode()` impl: device is intrinsic Human, engine is intrinsic
- *  Engine, the others read from the carried `mode` field (defaulting to the
- *  same defaults the backend uses for old DB rows). */
+ *  `MessageOrigin::mode()` impl: device is intrinsic Human, engine and system
+ *  are intrinsic Engine, the others read from the carried `mode` field
+ *  (defaulting to the same defaults the backend uses for old DB rows). */
 export function originMode(origin: MessageOrigin | undefined): ActorMode {
   if (!origin) return 'engine'; // unknown origin → engine acted on its own
   switch (origin.kind) {
@@ -64,6 +78,7 @@ export function originMode(origin: MessageOrigin | undefined): ActorMode {
     case 'workspace':   return origin.mode ?? 'human';
     case 'thread_link': return origin.mode ?? 'agent';
     case 'engine':      return 'engine';
+    case 'system':      return 'engine';
   }
 }
 
@@ -71,13 +86,25 @@ export function originMode(origin: MessageOrigin | undefined): ActorMode {
  *  origin kind). The chip answers "who decided this": a human at the keyboard,
  *  an LLM acting on behalf of the user, or deterministic engine code. The
  *  origin variant (device / api / workspace / thread_link) is metadata for
- *  the popover and does not affect the chip. */
+ *  the popover and does not affect the chip.
+ *
+ *  Special case: the `system` origin renders as "System", distinct from the
+ *  generic engine label. The engine acts deliberately (hardening, scheduler);
+ *  the system just kills processes (shutdown, OS signal, crash). */
 export function actorInitiator(actor: MessageOrigin | undefined): { icon: string; label: string } {
+  if (actor?.kind === 'system') return { icon: '⚙', label: SYSTEM_LABEL };
   switch (originMode(actor)) {
     case 'human':  return { icon: '\u{1F464}', label: 'You' };
-    case 'agent':  return { icon: '💡', label: LUCIDOS_AGENT_LABEL };
+    case 'agent':  return { icon: LUCIDOS_AGENT_ICON, label: LUCIDOS_AGENT_LABEL };
     case 'engine': return { icon: '⚙', label: ENGINE_LABEL };
   }
+}
+
+/** Summary text for a `ResponseAborted` event, derived from its actor.
+ *  Device actor = `/api/restart` pre-emit ("You — Restarted"); anything else
+ *  is the host system killing the process ("System — Response interrupted"). */
+export function responseAbortedSummary(actor: MessageOrigin | undefined): string {
+  return actor?.kind === 'device' ? 'Restarted' : 'Response interrupted';
 }
 
 // Persisted thread events — stored in DB, appear in snapshots.
@@ -89,12 +116,12 @@ export type ThreadEvent =
   | { type: 'MemorySearched'; results?: number; queries?: string[] }
   | { type: 'ToolCalled'; name: string; args: unknown; description?: string }
   | { type: 'ToolResult'; name: string; result: string; images?: string[] }
-  | { type: 'ResponseGenerated'; text?: string; images?: string[]; model?: string; reasoning_effort?: string }
-  | { type: 'ResponseCanceled'; text?: string; images?: string[]; model?: string; reasoning_effort?: string }
-  | { type: 'ResponseAborted'; text?: string; images?: string[]; model?: string; reasoning_effort?: string }
-  | { type: 'ResponseFailed'; error: string }
+  | { type: 'ResponseGenerated'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; request_event_id?: string; channel?: EventChannel }
+  | { type: 'ResponseCanceled'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; channel?: EventChannel }
+  | { type: 'ResponseAborted'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; request_event_id?: string; actor?: MessageOrigin; channel?: EventChannel }
+  | { type: 'ResponseFailed'; error: string; request_event_id?: string; channel?: EventChannel }
   | { type: 'SessionStarted'; session_id: string; branch?: string; repo_id?: string }
-  | { type: 'SessionRecovered'; branch?: string; origin?: MessageOrigin }
+  | { type: 'SessionRecovered'; branch?: string; origin?: MessageOrigin; actor?: MessageOrigin }
   // SessionEnded.reason is loosely typed to tolerate legacy DB rows whose
   // payloads carry removed values like 'completed' / 'changes_proposed' /
   // 'auto_ended' / 'user_ended' / 'stale_resume' / 'discarded'. The current
@@ -103,19 +130,19 @@ export type ThreadEvent =
   // historical row and should be treated as a harmless terminal end.
   | { type: 'SessionEnded'; reason?: SessionEndReason | string }
   | { type: 'CodingAgentTextStreamed'; text: string }
-  | { type: 'CodingAgentToolCalled'; name: string; args: unknown; description?: string }
-  | { type: 'CodingAgentToolResult'; name: string; result: string }
+  | { type: 'CodingAgentToolCalled'; name: string; args: unknown; description?: string; tool_use_id?: string }
+  | { type: 'CodingAgentToolResult'; name: string; result: string; tool_use_id?: string }
   | { type: 'CodingAgentUserMessageSent'; text: string }
   | { type: 'CodingAgentPromptSent'; text: string; origin?: MessageOrigin }
   | { type: 'MissingHardeningDetected'; origin?: MessageOrigin }
   | { type: 'CodingAgentIdled'; has_changes?: boolean; requires_restart?: boolean; is_external_repo?: boolean; cc_session_id?: string }
   | { type: 'ThreadTitleGenerated'; title: string }
   | { type: 'ThreadTitleRenamed'; title: string; actor?: MessageOrigin }
-  | { type: 'ThreadPinned'; actor?: MessageOrigin }
-  | { type: 'ThreadUnpinned'; actor?: MessageOrigin }
-  | { type: 'ThreadMarkedRead' }
-  | { type: 'ThreadMarkedUnread' }
-  | { type: 'ThreadDismissed'; actor?: MessageOrigin }
+  | { type: 'ThreadSaved'; actor?: MessageOrigin }
+  | { type: 'ThreadUnsaved'; actor?: MessageOrigin }
+  | { type: 'ThreadArchived'; actor?: MessageOrigin }
+  | { type: 'ThreadStarted'; mode: string; actor?: MessageOrigin }
+  | { type: 'ThreadDiscarded'; actor?: MessageOrigin; discarded_at?: string }
   | { type: 'TriggerStarted'; trigger_id: string; trigger_name?: string; prompt?: string; invocation?: TriggerInvocation; origin?: MessageOrigin }
   | { type: 'TriggerCompleted'; trigger_id: string; trigger_name?: string; result_summary?: string }
   | { type: 'ChangeProposed'; change_id?: string; description?: string; files?: string[]; requires_restart?: boolean; path?: string; diff?: string; origin?: MessageOrigin; commit_sha?: string }
@@ -124,14 +151,14 @@ export type ThreadEvent =
   | { type: 'ChangeReverted'; change_id?: string; actor?: MessageOrigin; path?: string }
   | { type: 'ChangeApplyFailed'; change_id?: string; error?: string; actor?: MessageOrigin }
   | { type: 'MergeConflictDetected'; change_id?: string; files?: string[]; origin?: MessageOrigin }
-  | { type: 'UserPromptInjected'; text: string; mode?: ActorMode; origin?: MessageOrigin }
+  | { type: 'UserPromptInjected'; text: string; mode?: ActorMode; origin?: MessageOrigin; injected_message_id?: string }
   | { type: 'CredentialRequested'; provider: string }
   | { type: 'McpConsentRequested'; tool: string; args: unknown }
   | { type: 'CodingAgentSettingsChanged'; model?: string; reasoning_effort?: string; permission_mode?: string }
   | { type: 'UserQuestionAsked'; tool_use_id: string; cc_session_id: string; question: string; options?: QuestionOption[] }
-  | { type: 'UserQuestionAnswered'; tool_use_id: string; answer: AnswerKind }
+  | { type: 'UserQuestionAnswered'; tool_use_id: string; answer: AnswerKind; actor?: MessageOrigin }
   | { type: 'CodingAgentPermissionRequest'; request_id: string; tool_use_id: string; tool_name: string; input: Record<string, unknown>; summary: string }
-  | { type: 'CodingAgentPermissionResolved'; request_id: string; allowed: boolean; reason?: string };
+  | { type: 'CodingAgentPermissionResolved'; request_id: string; allowed: boolean; reason?: string; actor?: MessageOrigin };
 
 /** Mirrors the Rust `QuestionOption` in thread_events.rs. */
 export interface QuestionOption {
@@ -172,7 +199,7 @@ export type TransientEvent =
   | { type: 'CodingAgentThreadSpawned'; cc_thread_id: string; title: string }
   | { type: 'ChildrenCountChanged'; active: number; total: number };
 
-export type StoredEvent = ThreadEvent & { created?: string; _displayCreated?: string };
+export type StoredEvent = ThreadEvent & { created?: string; _displayCreated?: string; _eventId?: string };
 
 /** Events that define (or redefine) a thread's channel/source. */
 export function isChannelDefiningEvent(eventType: string): boolean {
@@ -186,9 +213,71 @@ export type SequencedEvent = {
   event: StoredEvent;
 };
 
-/** Thread section as stored in the DB projection (thread_summaries.section).
- *  'default' = history/pinned, 'unread' = needs user attention (both chat and CC). */
-export type ThreadSection = 'default' | 'unread';
+/** Thread section as stored in the DB projection (thread_summaries.archive_state).
+ *  'archived' = history/saved, 'inbox' = needs user attention (both chat and CC).
+ *  Wire JSON field name stays `section` for backwards-compat. */
+export type ThreadSection = 'archived' | 'inbox';
+
+/** Post-event projection snapshot carried on persisted SSE thread events
+ *  (`data.aggregate`) and on `fetchThreadEvents` HTTP responses
+ *  (`currentAggregate`). Mirrors the backend `ThreadAggregate` struct.
+ *  Compose fields are intentionally excluded — they have their own
+ *  broadcast cadence and including them would clobber local typing.
+ *  Frontend overlays this onto `thread.meta` so it never has to derive
+ *  thread state from event-type lookups (SECTION_TRANSITIONS / STATUS_TRANSITIONS). */
+export type ThreadAggregate = {
+  threadId: string;
+  title: string;
+  channel: string;
+  initiator: ThreadInitiator;
+  createdAt: string;
+  lastActivity: string;
+  messageCount: number;
+  section: ThreadSection;
+  status: ThreadStatus;
+  activeChildrenCount: number;
+  totalChildrenCount: number;
+  ccHasChanges: boolean;
+  ccRequiresRestart: boolean;
+  ccIsExternalRepo: boolean;
+  ccApplying: boolean;
+  isSaved: boolean;
+  hasResponse: boolean;
+  lastRevivedAt: string | null;
+  parentThreadId: string | null;
+  parentThreadTitle: string | null;
+  triggerId?: string;
+  triggerName?: string;
+  ccRepoId?: string;
+  ccRepoName?: string;
+  state: ThreadComposeState;
+};
+
+/** Apply an aggregate snapshot to a thread's meta. Used by live SSE (per-event
+ *  aggregate) and historical replay (fetchThreadEvents.currentAggregate).
+ *  Nullable fields propagate cleared values; trigger/repo fields are omitted
+ *  by the backend when not applicable, so absence preserves prior values. */
+export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): void {
+  meta.section = agg.section;
+  meta.status = agg.status;
+  meta.activeChildrenCount = agg.activeChildrenCount;
+  meta.totalChildrenCount = agg.totalChildrenCount;
+  meta.ccHasChanges = agg.ccHasChanges;
+  meta.ccRequiresRestart = agg.ccRequiresRestart;
+  meta.ccIsExternalRepo = agg.ccIsExternalRepo;
+  meta.ccApplying = agg.ccApplying;
+  meta.saved = agg.isSaved;
+  meta.messageCount = agg.messageCount;
+  meta.updatedAt = agg.lastActivity;
+  meta.lastRevivedAt = agg.lastRevivedAt ?? '';
+  meta.state = agg.state;
+  meta.parentThreadId = agg.parentThreadId ?? undefined;
+  meta.parentThreadTitle = agg.parentThreadTitle ?? undefined;
+  if (agg.triggerId) meta.triggerId = agg.triggerId;
+  if (agg.triggerName) meta.triggerName = agg.triggerName;
+  if (agg.ccRepoId) meta.repoId = agg.ccRepoId;
+  if (agg.ccRepoName) meta.repoName = agg.ccRepoName;
+}
 
 /** Placeholder shown in the drawer while a thread waits for its first
  *  LLM-generated title. Treated as "no title" by anything that displays it. */
@@ -199,10 +288,9 @@ export type ThreadMeta = {
   title: string;
   channel: EventChannel | 'error_unknown_channel';
   initiator: ThreadInitiator;
-  pinned: boolean;
+  saved: boolean;
   createdAt: string;
   updatedAt: string;
-  unread: boolean;
   /** Thread status computed by the backend: 'idle', 'running', or 'waiting'. */
   status: ThreadStatus;
   /** Exchange count from the API (message_count). Used for drawer display
@@ -228,7 +316,27 @@ export type ThreadMeta = {
   /** Set when mode != 'human' on the initial MessageReceived. */
   parentThreadId?: string;
   parentThreadTitle?: string;
+  /** Trigger that fired this thread (only for `channel === 'trigger'`). */
+  triggerId?: string;
+  /** Trigger name at fire-time (snapshot — falls back when the trigger is renamed/deleted). */
+  triggerName?: string;
+  /** Repository the CC session bound to (only for `channel === 'claude_code'`). */
+  repoId?: string;
+  /** Current repo name from the registry — undefined when the repo was deleted. */
+  repoName?: string;
+  /** Compose state machine. Server is the source of truth; events flow via
+   *  ThreadStarted, MessageReceived, ThreadDiscarded, ThreadArchived.
+   *
+   *  Draft text / images / mode pick live in the sibling `composeDrafts`
+   *  signal (see `store/composeDrafts.ts`). They are NOT on ThreadMeta:
+   *  per-keystroke draft writes would otherwise re-render every component
+   *  subscribed to threadMap (most expensively ChatExchange, which calls
+   *  marked.parse per render). */
+  state: ThreadComposeState;
 };
+
+export type ThreadComposeState = 'composing' | 'active' | 'discarded' | 'archived';
+export type ComposeChannelMode = 'lucidos' | 'claude_code' | null;
 
 export type ThreadState = {
   meta: ThreadMeta;
@@ -250,15 +358,90 @@ export type ThreadState = {
 
 export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'failed';
 
+/** Build a fresh `ThreadState` for optimistic / SSE-bootstrapped threads.
+ *  All CC/changes flags default to false and counts to 0; callers override
+ *  what they actually know. Centralised so adding a `ThreadMeta` field is a
+ *  one-line change instead of a four-place audit.
+ *
+ *  Compose draft (text/images/mode) lives in the sibling `composeDrafts`
+ *  signal — callers that bootstrap a `composing` thread (compose.ts,
+ *  thread-sync.ts ThreadStarted skeleton) seed the draft entry separately
+ *  via `setDraft`. Keeps this builder free of signal side effects. */
+export function makeOptimisticThreadState(opts: {
+  id: string;
+  title: string;
+  channel: ThreadMeta['channel'];
+  initiator: ThreadInitiator;
+  eventsLoaded: boolean;
+  timestamp?: string;
+  pendingUserMessages?: ThreadState['pendingUserMessages'];
+  triggerId?: string;
+  triggerName?: string;
+  repoId?: string;
+  repoName?: string;
+  /** Override compose state — defaults to 'active'. Set 'composing' for
+   *  optimistic draft creation (compose.ts, ThreadStarted SSE). */
+  state?: ThreadComposeState;
+  /** Override status — defaults to 'running'. Composing rows want 'idle'. */
+  status?: ThreadStatus;
+}): ThreadState {
+  const ts = opts.timestamp ?? new Date().toISOString();
+  return {
+    meta: {
+      id: opts.id,
+      title: opts.title,
+      channel: opts.channel,
+      initiator: opts.initiator,
+      saved: false,
+      createdAt: ts,
+      updatedAt: ts,
+      status: opts.status ?? 'running',
+      messageCount: 0,
+      section: 'archived',
+      activeChildrenCount: 0,
+      totalChildrenCount: 0,
+      ccHasChanges: false,
+      ccRequiresRestart: false,
+      ccIsExternalRepo: false,
+      ccApplying: false,
+      lastRevivedAt: ts,
+      triggerId: opts.triggerId,
+      triggerName: opts.triggerName,
+      repoId: opts.repoId,
+      repoName: opts.repoName,
+      state: opts.state ?? 'active',
+    },
+    events: new Map(),
+    streamingBuffer: '',
+    eventsLoaded: opts.eventsLoaded,
+    eventsLoadFailed: false,
+    lastDbSeq: 0,
+    pendingUserMessages: opts.pendingUserMessages ?? [],
+  };
+}
+
 /** Sort threads by updatedAt descending (most recent first). */
 export const byRecent = (a: ThreadState, b: ThreadState): number =>
   b.meta.updatedAt.localeCompare(a.meta.updatedAt);
 
-/** Sort review threads: ccHasChanges first, then most recent. */
+/** Sort review threads in two tiers, then by recency within each tier:
+ *
+ *   Tier 1 (system has identified a CTA): ccHasChanges, WaitingForUserAnswer,
+ *   or Failed.
+ *   Tier 2: everything else (idle threads in the inbox).
+ *
+ *   Within each tier: most-recently-updated first.
+ */
 export const byReviewOrder = (a: ThreadState, b: ThreadState): number => {
-  const aHas = a.meta.ccHasChanges ? 1 : 0;
-  const bHas = b.meta.ccHasChanges ? 1 : 0;
-  if (bHas !== aHas) return bHas - aHas;
+  const tier = (t: ThreadState) =>
+    t.meta.ccHasChanges
+      || t.meta.status === 'waiting_for_user_answer'
+      || t.meta.status === 'failed'
+        ? 0
+        : 1;
+  const ta = tier(a);
+  const tb = tier(b);
+  if (ta !== tb) return ta - tb;
   return byRecent(a, b);
 };
 
@@ -266,72 +449,6 @@ export const byReviewOrder = (a: ThreadState, b: ThreadState): number => {
  *  projection (event_bus.rs). Generated from thread_lifecycle.rs. */
 function updatesLastActivity(type: string): boolean {
   return LAST_ACTIVITY_EVENTS.has(type);
-}
-
-/** Update thread meta.status and CC fields from a persisted SSE event.
- *  Generated transitions from thread_lifecycle.rs — matches event_bus.rs. */
-function updateStatusFromEvent(thread: ThreadState, event: ThreadEvent | TransientEvent): void {
-  // Stale resume is an internal retry — the user's message is still being
-  // processed in a fresh session, so keep status as-is (running).
-  // Must match event_bus.rs:1006 which skips the DB status update.
-  if (event.type === 'SessionEnded' && event.reason === 'stale_resume') return;
-
-  const transition: StatusTransition | undefined = STATUS_TRANSITIONS[event.type];
-  if (!transition) return;
-
-  const meta = thread.meta;
-
-  // Apply CC flag rule FIRST — conditional_cc status checks depend on updated flags.
-  // The SQL backend SETs cc_has_changes from the payload and uses the same $2 param
-  // in the status CASE. We must update flags before the status check to match.
-  if (transition.ccFlags) {
-    switch (transition.ccFlags.kind) {
-      case 'clear_all':
-        meta.ccHasChanges = false;
-        meta.ccRequiresRestart = false;
-        meta.ccIsExternalRepo = false;
-        meta.ccApplying = false;
-        break;
-      case 'set_changes':
-        meta.ccHasChanges = true;
-        break;
-      case 'set_applying':
-        meta.ccApplying = true;
-        break;
-      case 'clear_applying':
-        meta.ccApplying = false;
-        break;
-      case 'from_payload':
-        // SET (not OR) — CodingAgentIdled is the authoritative snapshot.
-        // After apply/discard, has_changes=false clears the flag.
-        meta.ccHasChanges = !!(event as { has_changes?: boolean }).has_changes;
-        meta.ccRequiresRestart = !!(event as { requires_restart?: boolean }).requires_restart;
-        meta.ccIsExternalRepo = !!(event as { is_external_repo?: boolean }).is_external_repo;
-        break;
-    }
-  }
-
-  // Apply status rule (after CC flags so conditional_cc sees the correct state)
-  switch (transition.status.kind) {
-    case 'set':
-      meta.status = transition.status.status;
-      break;
-    case 'conditional_cc':
-      meta.status = meta.ccHasChanges ? transition.status.withChanges : transition.status.withoutChanges;
-      break;
-    case 'no_change':
-      break;
-  }
-
-  // Special case: SessionEnded with reason='discarded' clears all CC flags.
-  // This depends on payload content, not just event type, so it can't be in the generated data.
-  if (event.type === 'SessionEnded' && event.reason === 'discarded') {
-    meta.ccHasChanges = false;
-    meta.ccRequiresRestart = false;
-    meta.ccIsExternalRepo = false;
-    meta.ccApplying = false;
-    meta.status = 'idle';
-  }
 }
 
 /** CC activity event types — tool calls, text streaming, and tool results.
@@ -369,6 +486,35 @@ export type Exchange = {
   steps: SequencedEvent[];
 };
 
+/** The narrowed `UserQuestionAnswered` variant — exposed so call sites that
+ *  walk an Exchange's steps can read the question's resolution (answer + actor)
+ *  without redeclaring the shape. */
+export type AnsweredQuestion = Extract<ThreadEvent, { type: 'UserQuestionAnswered' }>;
+
+/** The narrowed `CodingAgentPermissionResolved` variant — same purpose as
+ *  `AnsweredQuestion`, for permission-prompt resolutions. */
+export type ResolvedPermission = Extract<ThreadEvent, { type: 'CodingAgentPermissionResolved' }>;
+
+/** Find the matching `UserQuestionAnswered` step in a divider exchange.
+ *  Returns the typed event (with `answer` narrowed and the optional `actor`
+ *  stamped by `EventMeta`) or undefined when the question is still pending. */
+export function findQuestionAnswer(exchange: Exchange, toolUseId: string): AnsweredQuestion | undefined {
+  for (const { event } of exchange.steps) {
+    if (event.type === 'UserQuestionAnswered' && event.tool_use_id === toolUseId) return event;
+  }
+  return undefined;
+}
+
+/** Find the matching `CodingAgentPermissionResolved` step in a permission
+ *  divider exchange. Returns the typed event or undefined when the request
+ *  is still pending. */
+export function findPermissionResolution(exchange: Exchange, requestId: string): ResolvedPermission | undefined {
+  for (const { event } of exchange.steps) {
+    if (event.type === 'CodingAgentPermissionResolved' && event.request_id === requestId) return event;
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Exchange-level derived data — standalone functions on Exchange.
 // These extract rendering data from an Exchange's events.
@@ -376,7 +522,7 @@ export type Exchange = {
 // ---------------------------------------------------------------------------
 
 import type { ExchangeStatus } from './exchange-status';
-import { mergeAdjacentTextEvents } from './event-rendering';
+import { mergeAdjacentTextEvents, isMeaningfulText } from './event-rendering';
 import type { Step, ResponseEvent } from './types';
 
 /** Derive the user message text from an exchange. */
@@ -386,7 +532,10 @@ export function exchangeUserMessage(exchange: Exchange): string {
     return ev.prompt || ev.trigger_name || '';
   }
   if (ev.type === 'SessionRecovered') {
-    return 'Thread auto-resumed after engine restart';
+    return 'Resumed after engine restart';
+  }
+  if (ev.type === 'ResponseAborted') {
+    return responseAbortedSummary(ev.actor);
   }
   if (ev.type === 'MissingHardeningDetected') {
     return `${ENGINE_LABEL} — Hardening`;
@@ -408,6 +557,11 @@ export function exchangeUserChannel(exchange: Exchange): string | undefined {
   if (t === 'TriggerStarted') return 'trigger';
   if (t === 'SessionRecovered' || t === 'MissingHardeningDetected' || t === 'MergeConflictDetected') {
     return 'claude_code';
+  }
+  if (t === 'ResponseAborted') {
+    // Boundary event — channel is the original thread's channel; leaving it
+    // undefined lets the caller fall back to thread meta when needed.
+    return undefined;
   }
   if (exchange.userEvent.type === 'MessageReceived') return exchange.userEvent.channel;
   return undefined;
@@ -443,11 +597,13 @@ export function modeToInitiator(mode: ActorMode | undefined): ThreadInitiator {
 }
 
 /** Whether this exchange was system-initiated (auto-recovery, auto-hardening,
- *  auto-merge, scheduled trigger, change lifecycle) rather than user-initiated. */
+ *  auto-merge, scheduled trigger, change lifecycle, abort/resume boundary)
+ *  rather than user-initiated. */
 function isSystemExchange(exchange: Exchange): boolean {
   const ev = exchange.userEvent;
   return ev.type === 'SessionRecovered' || ev.type === 'TriggerStarted'
     || ev.type === 'MissingHardeningDetected' || ev.type === 'MergeConflictDetected'
+    || ev.type === 'ResponseAborted'
     || isChangeLifecycleEvent(ev);
 }
 
@@ -565,6 +721,40 @@ function describeRun(text: string): string {
     if (trimmed) return trimmed.length > 60 ? `Run ${trimmed.slice(0, 57)}...` : `Run ${trimmed}`;
   }
   return 'Run command';
+}
+
+/** Full primary-arg value for an engine tool call — used as a hover tooltip when
+ *  the rendered description elides it (Rust `describe_tool()` truncates commands,
+ *  paths, prompts, and URLs to ~60 chars). Returns whichever single arg the
+ *  description actually clips so the tooltip mirrors the un-elided form.
+ *  Undefined when nothing useful would differ from the description. */
+export function fullCommandForEngineTool(name: string, args: unknown): string | undefined {
+  const a = args as Record<string, unknown> | null | undefined;
+  if (!a) return undefined;
+  const s = (k: string) => (typeof a[k] === 'string' ? (a[k] as string) : undefined);
+
+  switch (name) {
+    case 'run_bash': return s('command');
+    case 'run_python': return s('code');
+    case 'read_file':
+    case 'write_file':
+    case 'edit_file':
+    case 'delete_file':
+    case 'refresh_file': return s('path');
+    case 'copy_file': return s('destination');
+    case 'import_file': return s('source_path');
+    case 'browser_open':
+    case 'http_request': return s('url');
+    case 'web_search': return s('query');
+    case 'execute_intent': return s('intent_id');
+    case 'emit_event':
+    case 'query_events': return s('event_type');
+    case 'send_notification': return s('title');
+    case 'send_email': return s('subject');
+    case 'generate_image':
+    case 'run_thread': return s('prompt');
+    default: return undefined;
+  }
 }
 
 /** @deprecated Fallback for old events without a stored description. New descriptions come from Rust `describe_tool()`. */
@@ -687,21 +877,24 @@ function resolvePendingSteps(steps: { success: boolean | null }[]): void {
 }
 
 const isThinking = (s: { description?: string }) => s.description === 'Thinking';
+const isNotThinking = (s: { description?: string }) => !isThinking(s);
 
 /** Build Step[] from exchange events (tool calls with success tracking).
- *  @param isLast — true if this is the last (newest) exchange. Non-last exchanges
- *  resolve pending spinners even without a completion event, since they were
- *  implicitly interrupted by the next user message.
- *  @param threadIdle — true if the thread's DB status is 'idle'. Forces resolution
- *  of pending steps since the exchange is no longer actively processing. */
-export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = false): Step[] {
+ *  @param _isLast — kept for caller compatibility; spinners are no longer resolved
+ *  on `!isLast` alone. A non-last exchange can still be the one the agentic loop
+ *  is actively processing (chat mid-flight injection — the parent's
+ *  request_event_id keeps attracting events even after the follow-up MR lands),
+ *  so resolution waits for either an in-exchange completion event or `threadIdle`.
+ *  @param threadIdle — true if the thread's DB status is 'idle'. Combined with
+ *  the in-exchange completion flag to finalize pending steps. */
+export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = false): Step[] {
   const steps: Step[] = [];
   let isComplete = false;
   for (const { event } of exchange.steps) {
     switch (event.type) {
       case 'MemorySearched': {
         const results = (event as { results?: number }).results ?? 0;
-        steps.push({ description: results > 0 ? `Memory: ${results} results` : 'Memory: no results', success: true });
+        steps.push({ description: results > 0 ? 'Memory searched' : 'Memory: no results', success: true });
         break;
       }
       case 'Thinking': {
@@ -729,13 +922,31 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
       case 'CodingAgentToolCalled': {
         resolveLastPendingStep(steps, isThinking);
         const e = event as { name: string; args: unknown; description?: string };
-        steps.push({ description: e.description || describeCCTool(e.name, e.args), success: null });
+        steps.push({ description: e.description || describeCCTool(e.name, e.args), success: null, tool_use_id: toolUseIdOf(event) });
         isComplete = false; // CC resumed — not finished yet
         break;
       }
-      case 'CodingAgentToolResult':
-        resolveLastPendingStep(steps);
+      case 'CodingAgentToolResult': {
+        // tool_use_id is unique per call; description is ambiguous for parallel
+        // calls (two `Read SKILL.md` of different files share a row label).
+        // Fallback handles AskUserQuestion: its CodingAgentToolCalled is
+        // suppressed (run_session.rs) so no step carries its id, and the
+        // ToolResult must not resolve the resume-marker Thinking spinner
+        // queued by agent_question.rs — hence isNotThinking on the walker.
+        const id = toolUseIdOf(event);
+        let resolved = false;
+        if (id) {
+          for (const step of steps) {
+            if (step.success === null && step.tool_use_id === id) {
+              step.success = true;
+              resolved = true;
+              break;
+            }
+          }
+        }
+        if (!resolved) resolveLastPendingStep(steps, isNotThinking);
         break;
+      }
       case 'ResponseGenerated': case 'ResponseCanceled': case 'ResponseAborted': case 'ResponseFailed':
       case 'CodingAgentIdled':
         isComplete = true;
@@ -746,7 +957,7 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
         break;
     }
   }
-  if (isComplete || !isLast || threadIdle) resolvePendingSteps(steps);
+  if (isComplete || threadIdle) resolvePendingSteps(steps);
   return steps;
 }
 
@@ -779,9 +990,13 @@ function resolveLastPendingResponseStep(
 
 /** Build ResponseEvent[] from exchange events (interleaved text + steps for rendering).
  *  `imageOffset` is the number of images in all previous exchanges (for thread:N numbering).
- *  @param isLast — true if this is the last (newest) exchange. Non-last exchanges
- *  resolve pending spinners even without a completion event. */
-export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, isLast = true): ResponseEvent[] {
+ *  @param _isLast — kept for caller compatibility; no longer drives spinner resolution
+ *  on its own. See `threadIdle`.
+ *  @param threadIdle — true if the thread's DB status is 'idle'. Combined with
+ *  the in-exchange completion flag to finalize pending steps. A non-last
+ *  exchange can still be the one the engine is actively processing (chat
+ *  mid-flight injection), so resolution must not trigger purely on `!isLast`. */
+export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isLast = true, threadIdle = false): ResponseEvent[] {
   const events: ResponseEvent[] = [];
   const hasCCContent = exchangeHasCCContent(exchange);
   // Count images across the thread for thread:N numbering — starts after user images in this exchange
@@ -794,7 +1009,7 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, isLa
         const ms = event as { results?: number; queries?: string[] };
         const results = ms.results ?? 0;
         const detail = ms.queries?.length ? ms.queries.join(', ') : undefined;
-        events.push({ type: 'step', description: results > 0 ? `Memory: ${results} results` : 'Memory: no results', success: true, detail });
+        events.push({ type: 'step', description: results > 0 ? 'Memory searched' : 'Memory: no results', success: true, detail });
         break;
       }
       case 'Thinking': {
@@ -811,7 +1026,9 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, isLa
       }
       case 'ToolCalled': {
         const e = event as { name: string; args: unknown; description?: string };
-        events.push({ type: 'step', description: e.description || describeEngineTool(e.name, e.args), tool_name: e.name, success: null });
+        const description = e.description || describeEngineTool(e.name, e.args);
+        const full = fullCommandForEngineTool(e.name, e.args);
+        events.push({ type: 'step', description, tool_name: e.name, success: null, full });
         break;
       }
       case 'ToolResult': {
@@ -838,13 +1055,26 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, isLa
       case 'CodingAgentToolCalled': {
         resolveLastPendingResponseStep(events, isThinking);
         const e = event as { name: string; args: unknown; description?: string };
-        events.push({ type: 'step', description: e.description || describeCCTool(e.name, e.args), tool_name: e.name, success: null });
+        events.push({ type: 'step', description: e.description || describeCCTool(e.name, e.args), tool_name: e.name, success: null, tool_use_id: toolUseIdOf(event) });
         isComplete = false; // CC resumed — not finished yet
         break;
       }
-      case 'CodingAgentToolResult':
-        resolveLastPendingResponseStep(events);
+      case 'CodingAgentToolResult': {
+        // See exchangeSteps for the pairing rationale.
+        const id = toolUseIdOf(event);
+        let resolved = false;
+        if (id) {
+          for (const e of events) {
+            if (e.type === 'step' && e.success === null && e.tool_use_id === id) {
+              e.success = true;
+              resolved = true;
+              break;
+            }
+          }
+        }
+        if (!resolved) resolveLastPendingResponseStep(events, isNotThinking);
         break;
+      }
       case 'CodingAgentTextStreamed':
         resolveLastPendingResponseStep(events, isThinking);
         events.push({ type: 'text', md: (event as { text: string }).text });
@@ -857,69 +1087,24 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, isLa
       case 'CodingAgentIdled':
         isComplete = true;
         break;
-      // ChangeApplied/Discarded/Reverted/ApplyFailed are exchange-STARTERS
-      // (see EXCHANGE_START_TYPES) — they render as their own initiator panels
-      // and never reach this loop as steps.
-      case 'UserQuestionAsked': {
-        const e = event as { tool_use_id: string; question: string; options?: QuestionOption[] };
-        events.push({
-          type: 'question',
-          tool_use_id: e.tool_use_id,
-          question: e.question,
-          options: e.options ?? [],
-        });
-        // CC was killed waiting for the answer — exchange is not "done" yet.
-        isComplete = false;
-        break;
-      }
-      case 'UserQuestionAnswered': {
-        // Find the matching question card in this exchange and mark it resolved.
-        const e = event as { tool_use_id: string; answer: AnswerKind };
-        for (let i = events.length - 1; i >= 0; i--) {
-          const ev = events[i];
-          if (ev.type === 'question' && ev.tool_use_id === e.tool_use_id) {
-            (ev as { resolved?: AnswerKind }).resolved = e.answer;
-            break;
-          }
-        }
-        break;
-      }
-      case 'CodingAgentPermissionRequest': {
-        const e = event as { request_id: string; tool_use_id: string; tool_name: string; input: Record<string, unknown>; summary: string };
-        events.push({
-          type: 'permission',
-          request_id: e.request_id,
-          tool_use_id: e.tool_use_id,
-          tool_name: e.tool_name,
-          input: e.input,
-          summary: e.summary,
-        });
-        // CC's tool call is blocking on the engine — exchange isn't done yet.
-        isComplete = false;
-        break;
-      }
-      case 'CodingAgentPermissionResolved': {
-        const e = event as { request_id: string; allowed: boolean; reason?: string };
-        for (let i = events.length - 1; i >= 0; i--) {
-          const ev = events[i];
-          if (ev.type === 'permission' && ev.request_id === e.request_id) {
-            (ev as { resolved?: { allowed: boolean; reason?: string } }).resolved = {
-              allowed: e.allowed,
-              reason: e.reason,
-            };
-            break;
-          }
-        }
-        break;
-      }
+      // ChangeApplied/Discarded/Reverted/ApplyFailed and UserQuestionAsked/
+      // CodingAgentPermissionRequest/CredentialRequested/McpConsentRequested
+      // are exchange-STARTERS (see EXCHANGE_START_TYPES) — they render as their
+      // own initiator panels and never reach this loop as steps. The matching
+      // resolution events (UserQuestionAnswered, CodingAgentPermissionResolved)
+      // become steps of the divider exchange and are handled by describeInitiator
+      // from the userEvent's exchange — no per-step ResponseEvent synthesis here.
       case 'SessionEnded':
         break;
     }
   }
   // Resolve pending spinners on finished exchanges (missing ToolResult from
   // killed sessions, parallel tool calls with lost results, or non-last
-  // exchanges where the user sent a new message mid-tool-call).
-  if (isComplete || !isLast) {
+  // exchanges that were genuinely abandoned). Mid-flight chat injection means
+  // a non-last exchange can still be the one the agentic loop is actively
+  // processing, so we DON'T resolve purely on `!isLast` — wait for the
+  // exchange's terminator OR for the thread to go idle.
+  if (isComplete || threadIdle) {
     const stepEvents = events.filter(e => e.type === 'step') as { success: boolean | null }[];
     resolvePendingSteps(stepEvents);
     // Strip trailing Thinking steps — noise from CC processing notifications
@@ -937,6 +1122,31 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, isLa
   return mergeAdjacentTextEvents(events);
 }
 
+/** Whether a non-last exchange's response panel should be hidden as visual
+ *  noise. The next exchange's user message implies the chronological flow,
+ *  so a panel that produced no real output isn't worth a "Continued below ↳"
+ *  placeholder.
+ *
+ *  An exchange counts as empty if it has no response text and every event is
+ *  either a bare 'Thinking' step or a text event that contributes no visible
+ *  output. CC follow-ups race the user: the loop emits a Thinking marker
+ *  (and sometimes a whitespace-only text header) before producing any tool
+ *  call or text, leaving an interrupted exchange with stray steps that say
+ *  nothing the status indicator doesn't already. */
+export function isEmptyContinuedExchange(
+  status: ExchangeStatus,
+  hasResponse: boolean,
+  events: ResponseEvent[],
+  isLast: boolean,
+): boolean {
+  if (isLast) return false;
+  if (status !== 'done' && status !== 'interrupted') return false;
+  if (hasResponse) return false;
+  return events.every(e =>
+    (e.type === 'step' && isThinking(e)) || (e.type === 'text' && !isMeaningfulText(e))
+  );
+}
+
 /** Get the error message from a failed exchange. */
 export function exchangeError(exchange: Exchange): string {
   for (const { event } of exchange.steps) {
@@ -945,17 +1155,40 @@ export function exchangeError(exchange: Exchange): string {
   return '';
 }
 
-/** Check whether an aborted exchange was caused by an engine restart/shutdown.
- *  Only returns true when SessionEnded with reason 'shutdown' is present.
- *  ResponseAborted alone (CC process crash, stdin write failure, EOF race)
- *  is NOT an engine restart — it's a CC session interruption. */
-export function isAbortedByRestart(exchange: Exchange): boolean {
+/** Index of the last (newest) ResponseAborted exchange that has NO later
+ *  SessionRecovered exchange anywhere in the thread. Used by AbortPanel to
+ *  decide whether to render the Continue button — only the unresumed abort
+ *  shows it; older aborts that the user already continued past are inert. */
+export function unresumedAbortIndex(exchanges: Exchange[]): number | null {
+  // Scan once from the end: the first ResponseAborted we hit before any
+  // SessionRecovered is the unresumed one.
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const t = exchanges[i].userEvent.type;
+    if (t === 'SessionRecovered') return null;
+    if (t === 'ResponseAborted') return i;
+  }
+  return null;
+}
+
+/** Read the engine note (UserPromptInjected step) from a SessionRecovered
+ *  exchange. Returns the full text and a coarse count of bullet entries for
+ *  the subline ("Reminded the model about N prior tool calls"). Returns null
+ *  when no engine note is present (e.g., CC resume path). */
+export function resumeEngineNote(exchange: Exchange): { text: string; toolCount: number } | null {
   for (const { event } of exchange.steps) {
-    if (event.type === 'SessionEnded' && event.reason === 'shutdown') {
-      return true;
+    if (event.type === 'UserPromptInjected' && (event as { mode?: ActorMode }).mode === 'engine') {
+      const text = (event as { text: string }).text || '';
+      // Count bullet lines that look like "- name(args) → result" — the engine
+      // note format from chat/rerun.rs::build_side_effect_summary.
+      let toolCount = 0;
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('- ') && trimmed.includes(' → ')) toolCount++;
+      }
+      return { text, toolCount };
     }
   }
-  return false;
+  return null;
 }
 
 /** SessionEnded reasons that represent deliberate lifecycle events, NOT system
@@ -976,6 +1209,34 @@ const NORMAL_SESSION_END_REASONS: ReadonlySet<string> = new Set<string>([
   'stale_resume',
   'discarded',
 ]);
+
+/** Identify ResponseAborted events that have been superseded by a later
+ *  same-request_event_id terminal (ResponseGenerated / ResponseFailed). This
+ *  models the engine-restart-then-recovered turn: recovery emits an abort,
+ *  the rerun re-uses the original request_event_id, and the eventual success
+ *  or definitive failure should win the exchange's verdict.
+ *
+ *  Strict matching: only events with the SAME non-null request_event_id are
+ *  paired. Two different ids in the same exchange (or one event missing the
+ *  field) do NOT merge — preserving the no-recovery case unchanged. */
+function supersededAbortIndices(steps: SequencedEvent[]): Set<number> {
+  const superseded = new Set<number>();
+  for (let i = 0; i < steps.length; i++) {
+    const aborted = steps[i].event;
+    if (aborted.type !== 'ResponseAborted') continue;
+    const abortReqId = aborted.request_event_id;
+    if (!abortReqId) continue;
+    for (let j = i + 1; j < steps.length; j++) {
+      const later = steps[j].event;
+      if (later.type !== 'ResponseGenerated' && later.type !== 'ResponseFailed') continue;
+      if (later.request_event_id === abortReqId) {
+        superseded.add(i);
+        break;
+      }
+    }
+  }
+  return superseded;
+}
 
 /** Derive ExchangeStatus for an exchange.
  *  @param isLast — true if this is the last (newest) exchange in the thread
@@ -1011,11 +1272,24 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   let wasCompleted = false;
   let completedBeforeAbort = false;
 
-  for (const { event } of exchange.steps) {
+  const supersededAborts = supersededAbortIndices(exchange.steps);
+
+  // Divider exchanges (UserQuestionAsked / CodingAgentPermissionRequest as
+  // userEvent) start in awaiting-answer until a matching resolution lands as
+  // a step. Without seeding here, the steps loop sees only the resolution and
+  // never the request, so isWaitingForAnswer stays false for pending dividers.
+  const userEventType = exchange.userEvent.type;
+  if (userEventType === 'UserQuestionAsked' || userEventType === 'CodingAgentPermissionRequest') {
+    isWaitingForAnswer = true;
+  }
+
+  for (let i = 0; i < exchange.steps.length; i++) {
+    const event = exchange.steps[i].event;
     switch (event.type) {
       case 'ResponseGenerated': isComplete = true; wasCompleted = true; break;
       case 'ResponseCanceled': isCanceled = true; isComplete = true; break;
       case 'ResponseAborted':
+        if (supersededAborts.has(i)) break; // superseded by a later same-id terminal
         if (wasCompleted) completedBeforeAbort = true;
         isAborted = true; isComplete = true; break;
       case 'ResponseFailed': isFailed = true; isComplete = true; break;
@@ -1066,6 +1340,13 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   if (threadIsCC) isCC = true;
 
   const hasSteps = exchange.steps.length > 0;
+  // Absorbed-UPI placeholder: the engine emitted a UPI carrying this
+  // exchange's MR via injected_message_id, so the response actually lives in
+  // the prior exchange (req_id-routed there). The placeholder reads as 'done'
+  // and is excluded from the 'interrupted' carve-out below ("Continued below"
+  // is wrong — the answer is above, not below).
+  const onlyStep = exchange.steps.length === 1 ? exchange.steps[0].event : undefined;
+  const isAbsorbedUpiPlaceholder = onlyStep?.type === 'UserPromptInjected' && !!onlyStep.injected_message_id;
 
   if (isFailed) return 'error';
   // Abort/shutdown AFTER the exchange was already completed (e.g., auto-harden
@@ -1085,7 +1366,8 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // !isLast→done fallthrough to avoid showing "No response generated".
   // CC threads don't queue — messages go to CC's stdin, not engine queue.
   // Only the LAST queued exchange shows "Queued" — earlier ones were superseded
-  // by a newer message and should fall through to 'done' (→ "Continued below ↳").
+  // by a newer message and are handled by the empty-non-last rule below
+  // (→ 'done', renders as "Continued below ↳").
   if (hasPriorActive && !hasSteps && !isCC && isLast) return 'queued';
   // CC idle → done. WaitingBanner handles the "can interact" state separately.
   if (isCCWaiting) return 'done';
@@ -1097,12 +1379,33 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // "Awaiting answer" (not the misleading "Done ✓"). The QuestionCard /
   // PermissionCard inside the exchange shows the action surface.
   if (isWaitingForAnswer) return 'awaiting-answer';
-  // Non-last CC exchange: interrupted only if mid-work (not completed).
-  if (!isLast && isCC && !isComplete && hasSteps) return 'interrupted';
-  if (isComplete || !isLast) return 'done';
+  // Non-last with steps but no terminator: the user moved past this exchange
+  // (chat fast-path injects the follow-up via UPI under the parent's
+  // request_event_id and redirects later events to the new exchange; CC
+  // shares one session across exchanges). Render as 'interrupted' so only
+  // the last panel reads "Working".
+  if (!isLast && !isComplete && hasSteps && !isAbsorbedUpiPlaceholder) return 'interrupted';
+  if (isComplete) return 'done';
+  // Non-last CC exchange without a terminator was skipped by CC's msg_tx queue
+  // — safely 'done'.
+  if (!isLast && (isCC || threadIdle)) return 'done';
+  // Empty non-last chat exchange — engine never produced events for it
+  // (superseded by a later message, or skipped). Render as 'done' rather
+  // than letting it fall through to 'pending', which is in ACTIVE_STATUSES
+  // and would lock the next exchange's gate into 'queued' indefinitely.
+  // Relies on chat's request_event_id serialization invariant: by the time an
+  // exchange is non-last, the loop has already moved past it (mid-flight
+  // injection routes new events back to the parent's request_event_id, so a
+  // non-last exchange the loop is still actively processing has steps).
+  if (!isLast && !hasSteps && !isCC) return 'done';
   // CC exchanges are 'cc-working' once they have steps, 'pending' before.
   if (isCC) return hasSteps ? 'cc-working' : 'pending';
   if (streamingBuffer) return 'streaming';
+
+  // Absorbed-UPI placeholder: handled here for the isLast case (the
+  // !isLast branch above bypasses 'interrupted' for it). Must run before
+  // the threadIdle stale-detector to avoid a false 'aborted'.
+  if (isAbsorbedUpiPlaceholder) return 'done';
 
   // Stale exchange: thread DB says idle but exchange has no terminal event and
   // no live streaming buffer. This happens when the engine crashed or lid closed
@@ -1118,8 +1421,8 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   const responseText = exchangeResponseText(exchange);
   if (responseText) return 'streaming';
 
-  const steps = exchangeSteps(exchange, isLast);
-  const events = exchangeResponseEvents(exchange, 0, isLast);
+  const steps = exchangeSteps(exchange, isLast, threadIdle);
+  const events = exchangeResponseEvents(exchange, 0, isLast, threadIdle);
   if (steps.length > 0 || events.length > 0) return 'streaming';
 
   return 'pending';
@@ -1164,11 +1467,15 @@ export function computeExchanges(thread: ThreadState): Exchange[] {
 /** Event types that begin a new exchange in the timeline. Includes user-initiated
  *  events (MessageReceived, UserPromptInjected), system-initiated events that
  *  spawn a fresh round of work (engine restart, auto-hardening, auto-merge),
- *  and change lifecycle events (apply/discard/revert/fail) — each is its own
- *  auditable system action with an actor, not a step inside a CC response. */
+ *  the abort/resume boundary pair, change lifecycle events
+ *  (apply/discard/revert/fail), and the ActionRequired family
+ *  (UserQuestionAsked, CodingAgentPermissionRequest, CredentialRequested,
+ *  McpConsentRequested) — each agent pause is its own auditable boundary with
+ *  an actor, not a step inside the prior agent response. */
 const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'MessageReceived',
   'TriggerStarted',
+  'ResponseAborted',
   'SessionRecovered',
   'UserPromptInjected',
   'MissingHardeningDetected',
@@ -1177,10 +1484,134 @@ const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'ChangeDiscarded',
   'ChangeReverted',
   'ChangeApplyFailed',
+  'UserQuestionAsked',
+  'CodingAgentPermissionRequest',
+  'CredentialRequested',
+  'McpConsentRequested',
 ]);
 
 function isExchangeStartEvent(type: string): boolean {
   return EXCHANGE_START_TYPES.has(type);
+}
+
+/** Pure thread-level metadata events that don't belong to any exchange.
+ *  Without this filter, an event arriving after a follow-up MR has started a
+ *  new (still-empty) exchange leaks into that exchange's steps via the
+ *  `current.steps.push` fallthrough — breaking the absorbed-UPI single-step
+ *  shape that exchangeStatus relies on to short-circuit to 'done'.
+ *  ThreadArchived is excluded automatically: it's classified terminal in the
+ *  generated contract, not metadata. Derived from EVENT_CLASSIFICATION so a
+ *  new Thread* metadata event added in Rust is picked up without an edit. */
+const THREAD_LEVEL_METADATA_EVENTS: ReadonlySet<string> = new Set(
+  Object.entries(EVENT_CLASSIFICATION)
+    .filter(([evt, cls]) => cls === 'metadata' && evt.startsWith('Thread'))
+    .map(([evt]) => evt)
+);
+
+/** True if the thread contains at least one event that could contribute to
+ *  rendered content. Used to distinguish a legitimately empty thread (only
+ *  lifecycle metadata) from a thread with content events that failed to form
+ *  exchanges (true corruption). Sourced from the Rust-generated
+ *  `EVENT_CLASSIFICATION`: anything not classified as 'metadata' (or unknown
+ *  to the contract) counts as content. */
+export function hasContentEvents(events: Map<number, StoredEvent>): boolean {
+  for (const event of events.values()) {
+    if (EVENT_CLASSIFICATION[event.type] !== 'metadata') return true;
+  }
+  return false;
+}
+
+/** Find an existing exchange to absorb `event` into instead of starting a new one.
+ *
+ *  Two convergent paths:
+ *  1. Engine resume note — UPI emitted by chat/rerun.rs right after SessionRecovered
+ *     belongs as a step under the resume initiator. A Human-mode UPI in the same
+ *     position is a real correction and stays its own exchange.
+ *  2. Mid-flight injection — chat fast-path emits MessageReceived first (with the
+ *     client UUID) then sends the injection; the agentic loop later emits UPI
+ *     carrying that UUID in `injected_message_id`. Without absorption the user
+ *     sees a duplicate "Auto-prompt sent" panel below their own message.
+ *
+ *  Returns null when the event is not absorbable, or when an injection's partner
+ *  is missing — the caller falls back to starting a new exchange so the UPI still
+ *  renders rather than vanishing. */
+function findAbsorbTarget(
+  current: Exchange | null,
+  exchanges: Exchange[],
+  event: StoredEvent,
+): Exchange | null {
+  if (event.type !== 'UserPromptInjected') return null;
+  if (event.mode === 'engine'
+      && current
+      && current.userEvent.type === 'SessionRecovered') {
+    return current;
+  }
+  if (event.injected_message_id) {
+    return exchanges.find(ex =>
+      ex.userEvent.type === 'MessageReceived' && ex.userEvent._eventId === event.injected_message_id,
+    ) ?? null;
+  }
+  return null;
+}
+
+/** Chat-loop events whose `request_event_id` should route them to their
+ *  originating exchange. Excludes `CodingAgent*` because CC reuses one session
+ *  across many follow-ups and never re-anchors the field — routing CC events
+ *  by request id would push every follow-up's work back into the first MR.
+ *
+ *  Response* events are dual-purpose (chat AND CC emit them). For CC they
+ *  carry the session's persistent req_id (same reason CodingAgent* events do),
+ *  so they're filtered out by `shouldRouteByRequestId` when channel is CC. */
+const REQUEST_ID_ROUTED_TYPES: ReadonlySet<string> = new Set([
+  'Thinking',
+  'MemorySearched',
+  'ToolCalled',
+  'ToolResult',
+  'TextStreamed',
+  'ResponseGenerated',
+  'ResponseCanceled',
+  'ResponseAborted',
+  'ResponseFailed',
+]);
+
+/** Skip req_id routing for Response* terminals when their channel is CC: the
+ *  session's persistent meta carries the original MR's req_id for the entire
+ *  session, so routing back by id would push a mid-flight cancel/abort to the
+ *  original exchange instead of terminating the active follow-up. */
+function shouldRouteByRequestId(event: StoredEvent): boolean {
+  if (!REQUEST_ID_ROUTED_TYPES.has(event.type)) return false;
+  switch (event.type) {
+    case 'ResponseGenerated':
+    case 'ResponseCanceled':
+    case 'ResponseAborted':
+    case 'ResponseFailed':
+      return event.channel !== 'claude_code';
+    default:
+      return true;
+  }
+}
+
+/** Read `request_event_id` from any event payload. The field is added to the
+ *  wire payload by Rust's `EventMeta::apply()` regardless of the event type,
+ *  so the cast is honest about what arrives at runtime. */
+function requestEventIdOf(event: { type: string }): string | undefined {
+  return (event as { request_event_id?: string }).request_event_id;
+}
+
+/** Read `tool_use_id` from a CodingAgentTool* event payload. Empty string in
+ *  legacy DB rows from before the field existed — normalize to `undefined`. */
+function toolUseIdOf(event: { type: string }): string | undefined {
+  const id = (event as { tool_use_id?: string }).tool_use_id;
+  return id ? id : undefined;
+}
+
+/** Find an exchange by its anchor `_eventId`. Backward walk so an id collision
+ *  resolves to the most recent owner. */
+function findExchangeByAnchorId(exchanges: Exchange[], anchorId: string): Exchange | null {
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    if (exchanges[i].userEvent._eventId === anchorId) return exchanges[i];
+  }
+  return null;
 }
 
 /** Sort events chronologically by `created` timestamp, falling back to seq for events
@@ -1203,11 +1634,91 @@ export function sortEventsChronologically(
 export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[] {
   const sorted = sortEventsChronologically(events);
 
+  // Legacy rerun-in-place: when a ResponseAborted shares request_event_id
+  // with a later ResponseGenerated/ResponseFailed in the same thread, the
+  // rerun re-used the original exchange (pre-Phase-5.3 behavior). Don't split
+  // at those aborts — supersededAbortIndices in exchangeStatus deflates the
+  // verdict to the later success.
+  //
+  // Single forward pass: record request_event_ids of every later resolving
+  // terminal first, then mark aborts that match. O(N) instead of O(N²).
+  const resolvedReqIds = new Set<string>();
+  for (const { event } of sorted) {
+    if (event.type !== 'ResponseGenerated' && event.type !== 'ResponseFailed') continue;
+    const reqId = requestEventIdOf(event);
+    if (reqId) resolvedReqIds.add(reqId);
+  }
+  const legacySupersededAbortSeqs = new Set<number>();
+  for (const { seq, event } of sorted) {
+    if (event.type !== 'ResponseAborted') continue;
+    const reqId = requestEventIdOf(event);
+    if (reqId && resolvedReqIds.has(reqId)) legacySupersededAbortSeqs.add(seq);
+  }
+
   const exchanges: Exchange[] = [];
   let current: Exchange | null = null;
+  // tool_use_id → exchange that owns the matching CodingAgentToolCalled step.
+  // Populated as calls are appended (always via the default `current.steps.push`
+  // branch — CodingAgent* events aren't absorbed or request-id routed) and
+  // queried when a CodingAgentToolResult lands so we can re-route it to the
+  // call's exchange even if a permission request boundary intervened.
+  const toolCallOwners = new Map<string, Exchange>();
+  // request_event_id → redirect target exchange. Set when a UPI is absorbed
+  // mid-flight: the loop emits the UPI when it actually ingests the queued
+  // follow-up, so every event after that point is part of the answer to the
+  // absorbed prompt — not the original request. Without redirecting, the
+  // post-injection tools and the final ResponseGenerated all stay in the
+  // original exchange and the follow-up panel renders as an empty stub.
+  const reqIdRedirect = new Map<string, Exchange>();
 
   for (const { seq, event } of sorted) {
-    if (isExchangeStartEvent(event.type)) {
+    if (THREAD_LEVEL_METADATA_EVENTS.has(event.type)) continue;
+
+    // Legacy rerun-in-place aborts stay in the originating exchange as a
+    // step so supersededAbortIndices in exchangeStatus can deflate the
+    // verdict and the rerun's TextStreamed/ResponseGenerated render in
+    // the same response panel — never split, never start a fresh boundary.
+    const isLegacySupersededAbort =
+      event.type === 'ResponseAborted' && legacySupersededAbortSeqs.has(seq);
+
+    const reqId = shouldRouteByRequestId(event) ? requestEventIdOf(event) : undefined;
+    const owner = reqId
+      ? (reqIdRedirect.get(reqId) ?? findExchangeByAnchorId(exchanges, reqId))
+      : null;
+
+    // ResponseAborted is dual-purpose: it terminates the originating exchange
+    // (so the partial-response panel reads 'Aborted ⚠') AND opens a new
+    // boundary exchange whose userEvent is the abort itself, rendered as the
+    // AbortPanel. The boundary always sits chronologically last so the panel
+    // appears below any newer MessageReceived in the timeline.
+    if (event.type === 'ResponseAborted' && !isLegacySupersededAbort) {
+      const target = owner ?? current;
+      if (target && target.userEvent.type !== 'ResponseAborted') {
+        target.steps.push({ seq, event });
+        current = { userEvent: event, userSeq: seq, steps: [] };
+        exchanges.push(current);
+        continue;
+      }
+    }
+    // Re-route ToolResult by tool_use_id when a permission boundary stranded
+    // it from its call's exchange. Legacy events (no id) fall through.
+    if (event.type === 'CodingAgentToolResult') {
+      const id = toolUseIdOf(event);
+      const callOwner = id ? toolCallOwners.get(id) : undefined;
+      if (callOwner && callOwner !== current) {
+        callOwner.steps.push({ seq, event });
+        continue;
+      }
+    }
+    const absorbTarget = findAbsorbTarget(current, exchanges, event);
+    if (absorbTarget) {
+      absorbTarget.steps.push({ seq, event });
+      current = absorbTarget;
+      if (event.type === 'UserPromptInjected') {
+        const absorbedReqId = requestEventIdOf(event);
+        if (absorbedReqId) reqIdRedirect.set(absorbedReqId, absorbTarget);
+      }
+    } else if (isExchangeStartEvent(event.type) && !isLegacySupersededAbort) {
       current = { userEvent: event, userSeq: seq, steps: [] };
       exchanges.push(current);
     } else if (event.type === 'CodingAgentUserMessageSent') {
@@ -1221,8 +1732,25 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
       const text = (event as { text: string }).text;
       current = { userEvent: { type: 'MessageReceived', text } as StoredEvent, userSeq: seq, steps: [] };
       exchanges.push(current);
+    } else if (event.type === 'CodingAgentPromptSent' && !current) {
+      // Legacy engine-spawned CC threads (merge-conflict, hardening) created
+      // before MergeConflictDetected/MissingHardeningDetected boundary events
+      // existed emit a bare CodingAgentPromptSent as the first content event.
+      // Promote it to a synthetic boundary so the panel renders — without this
+      // every following step is dropped and the thread shows the "Messages
+      // could not be displayed" empty state. Modern threads always have a
+      // proper boundary first, so `current` is non-null and we fall through
+      // to the step branch below.
+      current = { userEvent: event, userSeq: seq, steps: [] };
+      exchanges.push(current);
+    } else if (owner) {
+      owner.steps.push({ seq, event });
     } else if (current) {
       current.steps.push({ seq, event });
+      if (event.type === 'CodingAgentToolCalled') {
+        const id = toolUseIdOf(event);
+        if (id) toolCallOwners.set(id, current);
+      }
     }
   }
   return exchanges;
@@ -1235,16 +1763,31 @@ export function handleEvent(
   event: ThreadEvent | TransientEvent,
   created?: string,
   eventId?: string,
+  aggregate?: ThreadAggregate,
 ): boolean {
   const thread = threadMap.get(threadId);
   if (!thread) return false;
+
+  // Backend-computed snapshot is the source of truth for thread.meta. Live
+  // SSE attaches a per-event aggregate on persisted events; transient events
+  // (e.g. ChildrenCountChanged from fanout) may also carry one when the
+  // backend updated other projection fields out-of-band. fetchThreadEvents
+  // replay applies a single currentAggregate after the loop (in
+  // applyEventRows), so per-row calls here legitimately have no aggregate.
+  if (aggregate) {
+    const prevStatus = thread.meta.status;
+    applyAggregateToMeta(thread.meta, aggregate);
+    if (thread.meta.status === 'running' && prevStatus !== 'running' && created) {
+      thread.meta.lastRevivedAt = created;
+    }
+  }
 
   if (seq !== null) {
     if (thread.events.has(seq)) return false;
     if (!created) {
       console.warn(`[handleEvent] persisted event ${event.type} (seq=${seq}) missing created timestamp — this indicates a backend bug`);
     }
-    const stored: StoredEvent = { ...(event as ThreadEvent), created };
+    const stored: StoredEvent = { ...(event as ThreadEvent), created, ...(eventId ? { _eventId: eventId } : {}) };
     thread.events.set(seq, stored);
     thread.streamingBuffer = '';
     // Update updatedAt only for events that the backend updates last_activity for.
@@ -1252,19 +1795,6 @@ export function handleEvent(
     if (created && updatesLastActivity(event.type)) thread.meta.updatedAt = created;
     // When a real MessageReceived event arrives from the backend,
     // remove the matching optimistic pending message by event_id (UUID).
-    // Update section from SSE events
-    const newSection = SECTION_TRANSITIONS[event.type];
-    if (newSection) {
-      thread.meta.section = newSection;
-    }
-    // Mirror backend status transitions from SSE events.
-    // These must match the status updates in event_bus.rs update_thread_projection().
-    const prevStatus = thread.meta.status;
-    updateStatusFromEvent(thread, event);
-    // Track when thread last entered 'running' — used for IN PROGRESS sort order.
-    if (thread.meta.status === 'running' && prevStatus !== 'running' && created) {
-      thread.meta.lastRevivedAt = created;
-    }
 
     if ((event.type === 'MessageReceived' || event.type === 'UserPromptInjected') && thread.pendingUserMessages.length > 0) {
       if (eventId) {
@@ -1275,6 +1805,16 @@ export function handleEvent(
         // remove the oldest pending message (FIFO order)
         thread.pendingUserMessages.shift();
       }
+    }
+    // FreeText answers don't emit a MessageReceived (the backend routes typed
+    // text straight to UserQuestionAnswered), so the optimistic pending message
+    // added by sendMessage() must be cleared here too. Match by text — the
+    // backend forwards user input verbatim. A non-match indicates drift; let
+    // the safety timer clean it up rather than silently shifting the wrong one.
+    if (event.type === 'UserQuestionAnswered' && event.answer.kind === 'FreeText' && thread.pendingUserMessages.length > 0) {
+      const text = event.answer.text;
+      const idx = thread.pendingUserMessages.findIndex(p => p.text === text);
+      if (idx !== -1) thread.pendingUserMessages.splice(idx, 1);
     }
   } else {
     if ('text' in event) {

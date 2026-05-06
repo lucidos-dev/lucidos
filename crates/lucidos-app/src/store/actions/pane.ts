@@ -1,5 +1,6 @@
-import { mobileView, setMobileView, threadDrawerOpen, MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, type MobileView } from '../store';
+import { mobileView, setMobileView, splitRatio, threadDrawerOpen, MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, type MobileView } from '../store';
 import { forceCloseDrawer } from '../../components/layout/Drawer';
+import { setSplitRatio, DEFAULT_SPLIT_RATIO } from '../../components/layout/splitHelpers';
 import { isMobile } from '../../utils/viewport';
 
 /** Clamp a pane index + delta to valid bounds and return the target MobileView.
@@ -27,6 +28,18 @@ export function navigateToPane(view: MobileView) {
   // user lands on the compose view with the drawer still visible.
   if (view !== 'thread') threadDrawerOpen.value = false;
   setMobileView(view);
+}
+
+/** Make the content pane visible after opening something into it.
+ *  Mobile: swipe to the content pane. Desktop: expand the split if collapsed.
+ *  Always call this after setting `panelOverlay.value` so a click on a content
+ *  link is never silently absorbed when the pane is closed. */
+export function revealContentPane() {
+  if (isMobile()) {
+    navigateToPane('content');
+  } else if (splitRatio.value >= 1) {
+    setSplitRatio(DEFAULT_SPLIT_RATIO);
+  }
 }
 
 /** Toggle the thread list visibility.

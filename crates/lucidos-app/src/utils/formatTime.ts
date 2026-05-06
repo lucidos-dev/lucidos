@@ -51,6 +51,17 @@ export function formatShortDate(date: Date): string {
   });
 }
 
+/** "Feb 28" for current year, "Feb 28, 2025" for past years. */
+export function formatShortDateWithYear(date: Date): string {
+  const tz = getUserTimezone();
+  const sameYear = date.getFullYear() === new Date().getFullYear();
+  return date.toLocaleDateString([], {
+    month: 'short', day: 'numeric',
+    ...(sameYear ? {} : { year: 'numeric' }),
+    ...(tz ? { timeZone: tz } : {}),
+  });
+}
+
 /** "Today 14:30", "Yesterday 14:30", or "Feb 28 14:30" */
 export function formatNotificationDate(date: Date): string {
   const now = new Date();

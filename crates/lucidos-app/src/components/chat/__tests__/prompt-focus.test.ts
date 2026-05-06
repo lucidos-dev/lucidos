@@ -4,7 +4,7 @@ if (typeof globalThis.requestAnimationFrame === 'undefined') {
   (globalThis as any).requestAnimationFrame = (cb: any) => { cb(); return 0; };
 }
 
-import { focusIfNeeded, focusPromptNow, composeHandlers } from '../promptFocus';
+import { focusIfNeeded, focusPromptNow, composeHandlers, isComposeFocusedHere, blurPromptInputIfFocused } from '../promptFocus';
 
 describe('focusIfNeeded', () => {
   it('calls focus({ preventScroll: true }) when element is not the active element', () => {
@@ -84,6 +84,61 @@ describe('focusPromptNow', () => {
   });
 });
 
+describe('isComposeFocusedHere', () => {
+  function focusOn(threadId: string | null): { dataset: Record<string, string> } {
+    const el = threadId === null ? null : { dataset: { role: 'prompt-input', threadId } };
+    (globalThis as any).document = { ...document, activeElement: el };
+    return el as any;
+  }
+
+  it('returns true when activeElement is a prompt-input bound to the threadId', () => {
+    focusOn('t-1');
+    expect(isComposeFocusedHere('t-1')).toBe(true);
+  });
+
+  it('returns false when activeElement is bound to a DIFFERENT threadId', () => {
+    focusOn('t-2');
+    expect(isComposeFocusedHere('t-1')).toBe(false);
+  });
+
+  it('returns false when activeElement is not a prompt-input', () => {
+    (globalThis as any).document = {
+      ...document,
+      activeElement: { dataset: { role: 'some-button' } },
+    };
+    expect(isComposeFocusedHere('t-1')).toBe(false);
+  });
+
+  it('returns false when activeElement is null', () => {
+    focusOn(null);
+    expect(isComposeFocusedHere('t-1')).toBe(false);
+  });
+
+  // The bug this guards against: SplitLayout (desktop) and MobileSwipeContainer
+  // (mobile) both render a PromptInput, so two `[data-role="prompt-input"]`
+  // textareas exist in the DOM. During viewport transitions both can be
+  // briefly visible. The previous `getVisiblePromptInput()`-then-compare
+  // implementation picked the FIRST visible one and returned false when the
+  // user was actually focused on the second — at which point an SSE
+  // ThreadComposeChanged would slip through and bounce the cursor to the end.
+  // Checking `document.activeElement` directly avoids the race entirely.
+  it('returns true even when there are multiple prompt-input elements (only activeElement matters)', () => {
+    const focused = { dataset: { role: 'prompt-input', threadId: 't-1' } };
+    (globalThis as any).document = {
+      ...document,
+      // Plant additional unfocused prompt-input elements that querySelectorAll
+      // would have returned alongside the focused one. Only activeElement
+      // determines focus — the rest are noise.
+      querySelectorAll: vi.fn().mockReturnValue([
+        { dataset: { role: 'prompt-input', threadId: 't-1' } },
+        focused,
+      ]),
+      activeElement: focused,
+    };
+    expect(isComposeFocusedHere('t-1')).toBe(true);
+  });
+});
+
 describe('composeHandlers', () => {
   function mockDoc() {
     const visibleEl = {
@@ -160,5 +215,65 @@ describe('composeHandlers', () => {
     handlers.onClick(); // should work
     expect(action).toHaveBeenCalledOnce();
     expect(el.focus).toHaveBeenCalledOnce();
+  });
+});
+
+describe('blurPromptInputIfFocused', () => {
+  it('blurs the active element when it is the prompt textarea', () => {
+    const el = { dataset: { role: 'prompt-input', threadId: 't-1' }, blur: vi.fn() } as any;
+    (globalThis as any).document = { ...document, activeElement: el };
+
+    blurPromptInputIfFocused();
+
+    expect(el.blur).toHaveBeenCalledOnce();
+  });
+
+  it('does not blur when active element is not the prompt textarea', () => {
+    const el = { dataset: { role: 'some-button' }, blur: vi.fn() } as any;
+    (globalThis as any).document = { ...document, activeElement: el };
+
+    blurPromptInputIfFocused();
+
+    expect(el.blur).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op when activeElement is null', () => {
+    (globalThis as any).document = { ...document, activeElement: null };
+
+    // Should not throw
+    blurPromptInputIfFocused();
+  });
+});
+
+describe('installActionBtnBlurListener', () => {
+  it('blurs prompt on .action-btn pointerdown, ignores other targets', async () => {
+    // Re-import a fresh module so the module-scoped install flag is reset —
+    // this test exercises the install plumbing, not just the captured closure.
+    vi.resetModules();
+    const { installActionBtnBlurListener: install } = await import('../promptFocus');
+
+    const promptEl = { dataset: { role: 'prompt-input', threadId: 't-1' }, blur: vi.fn() } as any;
+    let captured: ((e: any) => void) | null = null;
+    (globalThis as any).document = {
+      ...document,
+      activeElement: promptEl,
+      addEventListener: vi.fn((evt: string, handler: (e: any) => void) => {
+        if (evt === 'pointerdown') captured = handler;
+      }),
+    };
+
+    install();
+
+    expect(captured).not.toBeNull();
+    const actionBtn = { closest: vi.fn().mockReturnValue({}) } as any;
+    captured!({ target: actionBtn });
+    expect(actionBtn.closest).toHaveBeenCalledWith('.action-btn');
+    expect(promptEl.blur).toHaveBeenCalledOnce();
+
+    promptEl.blur.mockClear();
+    const other = { closest: vi.fn().mockReturnValue(null) } as any;
+    captured!({ target: other });
+    expect(other.closest).toHaveBeenCalledWith('.action-btn');
+    expect(promptEl.blur).not.toHaveBeenCalled();
   });
 });

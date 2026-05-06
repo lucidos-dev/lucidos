@@ -13,7 +13,21 @@ export interface UploadResult {
 }
 
 export interface EditOperation {
-  /** JSON path edit */
+  /**
+   * JSON path edit. Accepts dot-bracket notation with quoted keys for
+   * non-identifier names. All resolve to RFC 6901 JSON Pointers:
+   *
+   *   `metadata.author.name`              → `/metadata/author/name`
+   *   `sections[1].slides[0].title`       → `/sections/1/slides/0/title`
+   *   `dailyLog["2026-05-04"]`            → `/dailyLog/2026-05-04`
+   *   `dailyLog['2026-05-04']`            → `/dailyLog/2026-05-04`
+   *   `$.streak` (JSONPath root marker)   → `/streak`
+   *   `/sections/1/title` (raw pointer)   → `/sections/1/title`
+   *
+   * Use quoted keys for any key that isn't a bare identifier (dates,
+   * slugs with dots, keys containing spaces, etc.). RFC 6901 escaping
+   * (`~` → `~0`, `/` → `~1`) is applied automatically inside quoted keys.
+   */
   json_path?: string;
   json_value?: unknown;
   /** Text find-replace edit */
@@ -46,6 +60,12 @@ export const data = {
   },
 
   url(path: string): string {
+    // system-knowhow lives in the engine repo, not the workspace, so it isn't
+    // served by the static `/data` mount. Route it through the API endpoint
+    // which dispatches to the engine's system_knowhow_dir.
+    if (path.startsWith('system-knowhow/')) {
+      return `${getBaseUrl()}/api/v1/data/${encodePathSegments(path)}`;
+    }
     return `${getBaseUrl()}/data/${encodePathSegments(path)}`;
   },
 

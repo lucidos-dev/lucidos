@@ -24,6 +24,16 @@ export function toFailed<T>(error: unknown): Loadable<T> {
   return { status: 'failed', error: error instanceof Error ? error.message : String(error) };
 }
 
+/** Flip a signal to `loading` only if it isn't already `loaded`. Used by
+ *  refetchers (filter change, SSE refresh, post-mutation reload) so the
+ *  visible list stays through the network round-trip and swaps atomically
+ *  when fresh data lands — without this, every refetch flashes a spinner. */
+export function setLoadingIfFresh<T>(signal: { value: Loadable<T> }): void {
+  if (signal.value.status !== 'loaded') {
+    signal.value = { status: 'loading' };
+  }
+}
+
 // Menu item names (drawer navigation)
 export const MENU_ITEMS = ['files', 'apps', 'triggers', 'settings', 'changes', 'notifications'] as const;
 export type MenuItem = typeof MENU_ITEMS[number];
@@ -35,6 +45,10 @@ export type ConnectionStatus = 'connected' | 'disconnected';
 export interface Step {
   description: string;
   success: boolean | null; // null = pending/in-progress
+  /** Pairs the step with its CodingAgentToolResult by id; description is
+   *  ambiguous for parallel calls like two `Read SKILL.md`. Absent for
+   *  engine tools and legacy DB rows. */
+  tool_use_id?: string;
   context_tokens?: number;
   context_messages?: number;
   trimmed?: boolean;
@@ -43,7 +57,7 @@ export interface Step {
 // A response event — interleaved text blocks and steps (from backend ResponseEvent).
 export type ResponseEvent =
   | { type: 'text'; md: string }
-  | { type: 'step'; description: string; tool_name?: string; success: boolean | null; detail?: string; context_tokens?: number; context_messages?: number; trimmed?: boolean }
+  | { type: 'step'; description: string; tool_name?: string; success: boolean | null; tool_use_id?: string; detail?: string; context_tokens?: number; context_messages?: number; trimmed?: boolean; full?: string }
   | { type: 'section_break'; channel: string }
   | { type: 'image'; base64: string; mime_type: string; index: number }
   | {
@@ -67,38 +81,6 @@ export type ResponseEvent =
       resolved?: { allowed: boolean; reason?: string };
     };
 
-// A section of the context sent to the LLM
-export interface ContextSection {
-  name: string;
-  content: string;
-  char_count: number;
-}
-
-// A condensed message from the agentic loop context inspector
-export interface ContextMessage {
-  role: string;
-  text: string;
-  tool_calls: Array<{ name: string; input_summary: string }>;
-  tool_results: Array<{ tool_name: string; content_preview: string; success: boolean }>;
-}
-
-// An iteration snapshot from the agentic loop
-export interface ContextIteration {
-  iteration: number;
-  new_messages: ContextMessage[];
-  total_messages: number;
-  total_chars: number;
-  trimmed: boolean;
-}
-
-// A timeline event rendered inline in a thread view
-export interface ThreadTimelineEvent {
-  event_type: 'session_started' | 'session_ended' | 'change_applied' | 'change_discarded' | 'change_reverted';
-  timestamp: string;
-  description?: string;
-  change_id?: string;
-}
-
 // A notification
 export interface Notification {
   id: string;
@@ -111,7 +93,7 @@ export interface Notification {
 }
 
 export type TriggerRun =
-  | { type: 'intent'; text: string; knowhow: string[] }
+  | { type: 'intent'; intent: string; knowhow: string[] }
   | { type: 'script'; path: string };
 
 // A trigger config (event-sourced).
@@ -129,12 +111,25 @@ export interface TriggerInfo {
   run: TriggerRun;
   on?: string;
   condition?: Record<string, unknown>;
+  app_id?: string;
+  /** When true, threads spawned by this trigger surface in REVIEW on completion
+   *  instead of going straight to HISTORY. Absent or false = HISTORY (default). */
+  go_to_review?: boolean;
 }
 
 /** An active (non-paused) trigger has no more runs when it has no next_run and no event trigger.
  *  Paused triggers are "Paused", not "No more runs". */
 export function hasNoMoreRuns(trigger: TriggerInfo): boolean {
   return !trigger.paused && !trigger.next_run && !trigger.on;
+}
+
+/** A trigger that has ever spawned a thread. `name` and `last_activity` are
+ *  taken from the most-recent thread; `name` is null when no thread captured
+ *  one. `last_activity` lets the UI disambiguate same-named entries. */
+export interface HistoricalTriggerInfo {
+  id: string;
+  name: string | null;
+  last_activity: string;
 }
 
 export type TriggerType = 'schedule' | 'event' | 'hybrid';

@@ -200,11 +200,21 @@
         border-radius: 1.5rem;
     }
 
-    /* List rows — stack vertically so actions don't cramp text */
+    /* List rows — stack vertically so actions don't cramp text. */
     .list-row {
         flex-direction: column;
         align-items: flex-start;
         gap: 0.5rem;
+    }
+
+    /* Force the info column to the row width so a nowrap label
+       (.list-row-label) ellipsizes instead of growing the column to its
+       intrinsic content width — which would drag .list-row-actions off-screen
+       to the right. flex-shrink alone won't do it: align-items: flex-start
+       sizes children by intrinsic cross-axis content, and `overflow: hidden`
+       only clips visually. */
+    .list-row-info {
+        width: 100%;
     }
 
     .list-row-name {
@@ -268,11 +278,6 @@
 
     .action-btn {
         position: relative;
-    }
-
-    .exchange-stop-btn {
-        width: 1.25rem;
-        height: 1.25rem;
     }
 
     /* Notifications — touch-friendly */
@@ -400,15 +405,26 @@
         overflow: visible;
     }
 
-    /* Threads view: pad title to align with hamburger-indented titles in other views */
-    .mobile-threads-header .mobile-header-title {
-        padding-left: 1.75rem;
-    }
-
-    /* Tighter icon spacing on mobile — smaller tap targets to pack icons closer */
+    /* Mobile header slot — square so hamburger/nav/search line up. Drawer
+     * rows are sized separately in drawer.css. */
     .mobile-header-row .icon-btn.header-icon {
         width: 1.75rem;
         height: 1.75rem;
+    }
+
+    /* Title-bar copy/pin: height matches the title text (~1.14rem) so the
+     * buttons sit flush with the title baseline. Width keeps the slot. */
+    .mobile-thread-title-row .icon-btn.header-icon {
+        width: 1.75rem;
+        height: 1.25rem;
+    }
+
+    /* Title-bar copy/pin glyphs use the compact md size; .mobile-header-row
+     * keeps --icon-size-lg. (Drawer-row glyphs are sized unconditionally in
+     * drawer.css.) */
+    .mobile-thread-title-row .icon-btn.header-icon svg {
+        width: var(--icon-size-md);
+        height: var(--icon-size-md);
     }
 
     /* Badge position reset for smaller mobile icons */
@@ -494,7 +510,9 @@
         display: flex;
         align-items: center;
         gap: 0.75rem;
-        padding: 0.5rem 1rem;
+        /* Right padding matches `.pane-header`'s `--header-padding-x` so the
+         * action icons land in the same slot as the mobile header above. */
+        padding: 0.5rem 0.625rem 0.5rem 1rem;
         background: color-mix(in srgb, var(--accent) 12%, var(--bg-primary));
         -webkit-user-select: none;
         user-select: none;
@@ -704,6 +722,22 @@
            pane (sticky title bar, prompt area, edge-swipe zones) cannot
            paint above a sibling pane during transition. */
         isolation: isolate;
+        /* Force each pane onto its own compositor layer so the iframe
+           inside the content pane is composited as a child of THIS layer
+           and clips at the pane's bounds. Without this, on iOS Safari
+           the iframe layer is composited as a child of the swipe-track's
+           layer and can paint outside its pane during the swipe — the
+           user sees the iframe's pixels in the wrong place and reads it
+           as "different app". The header refresh button then re-mounts
+           the iframe and the correct pixels return.
+           translateZ(0) chosen over `contain: paint` because Safari's
+           contain support is newer; translateZ has worked reliably on
+           iOS Safari for compositor-layer promotion since iOS 9.
+           History: an unmeasured perf-only version was added (5979772eb)
+           and reverted (a48524016) the same day in 2026-04. This re-add
+           is bug-driven (observed iframe paint corruption), not perf. */
+        -webkit-transform: translateZ(0);
+        transform: translateZ(0);
     }
 
     /* Panes inside swipe container need full height */
@@ -747,11 +781,6 @@
         min-height: 0;
         z-index: auto;
         padding-top: 0;
-    }
-
-    /* Hide ThreadDrawer's own header on mobile — MobileAppHeader handles it */
-    .mobile-threads-pane .thread-drawer-header {
-        display: none;
     }
 
     /* thread-pane-body needs to be a real element on mobile (not display:contents) */
@@ -834,6 +863,14 @@
         transform: none !important;
         transition: none !important;
     }
+
+    /* .mobile-swipe-pane's translateZ(0) (added for iframe compositor clipping)
+       also creates a containing block. Drop it during pseudo-fullscreen so the
+       app iframe's position:fixed escapes to the real viewport. */
+    :root[data-pseudo-fullscreen] .mobile-swipe-pane {
+        -webkit-transform: none !important;
+        transform: none !important;
+    }
 }
 
 /* Reduced motion: disable slide/fade animations, keep instant state changes */
@@ -846,5 +883,46 @@
 
     .mobile-swipe-track {
         transition: none;
+    }
+}
+
+/* ─── Landscape lock ─── */
+/* Hidden by default; shown only on phones in landscape orientation.
+   Detection: orientation:landscape + max-height:500px catches all phones
+   (height in landscape is ~300-450px) without triggering on tablets
+   (height ≥768px in landscape) or short desktop windows (orientation
+   is normally portrait or square at typical desktop heights). */
+.landscape-lock {
+    display: none;
+}
+
+@media (orientation: landscape) and (max-height: 500px) and (hover: none) and (pointer: coarse) {
+    .landscape-lock {
+        display: flex;
+        position: fixed;
+        inset: 0;
+        z-index: var(--z-tooltip);
+        background: var(--bg-primary);
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        padding: 1rem;
+        color: var(--text-primary);
+        text-align: center;
+        -webkit-user-select: none;
+        user-select: none;
+    }
+
+    .landscape-lock svg {
+        width: 3rem;
+        height: 3rem;
+        color: var(--accent);
+    }
+
+    .landscape-lock p {
+        margin: 0;
+        font-size: 1rem;
+        color: var(--text-secondary);
     }
 }

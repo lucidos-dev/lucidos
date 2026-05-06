@@ -2,7 +2,7 @@ mod actor;
 mod app_ui;
 mod apps;
 mod artifacts;
-mod backup;
+pub(crate) mod backup;
 mod changes;
 mod chat;
 mod claude_code;
@@ -15,12 +15,15 @@ mod mcp;
 mod memory;
 mod notifications;
 mod presence;
+pub(crate) mod proxy;
 mod repositories;
 mod saved_contexts;
 mod sdk;
+mod sdk_prefs;
 mod search;
 mod settings;
 mod threads;
+mod threads_compose;
 mod triggers;
 
 use axum::{
@@ -31,7 +34,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post, put},
+    routing::{any, delete, get, post, put},
     Json, Router,
 };
 use futures::stream::Stream;
@@ -64,16 +67,26 @@ pub type SharedEngine = Arc<LucidosEngine>;
 type PendingOAuthFlows =
     Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Receiver<OAuthFlowResult>>>>;
 
-/// Check for path traversal attempts (`..", leading `/` or `\`)
+/// Check for path traversal attempts (`..`, leading `/` or `\`)
 pub(crate) fn is_path_traversal(path: &str) -> bool {
     path.contains("..") || path.starts_with('/') || path.starts_with('\\')
+}
+
+/// Parse an optional UUID query/body string, mapping malformed input to `BAD_REQUEST`.
+///
+/// Without this, handlers fall back to silently treating malformed ids as `None`
+/// (e.g. "cancel one" becomes "cancel all") — see CLAUDE.md "no silent defaults".
+pub(super) fn parse_optional_uuid(opt: Option<&str>) -> Result<Option<Uuid>, StatusCode> {
+    opt.map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 /// Reject refs/commits that git would parse as a flag, traverse with `..`, or contain
 /// shell metacharacters. The git invocations themselves use argv (no shell), so these
 /// checks defend against ref-as-flag injection and against passing the value through
 /// any future shell-quoting layer.
-pub(crate) fn is_dangerous_git_ref(s: &str) -> bool {
+pub(super) fn is_dangerous_git_ref(s: &str) -> bool {
     s.is_empty() || s.starts_with('-') || s.contains("..") || s.contains(';') || s.contains('|')
 }
 
@@ -761,6 +774,10 @@ pub fn create_router(
         .route("/changes/:id/revert", post(changes::revert_change))
         .route("/changes/:id/diff", get(repositories::get_change_diff))
         .route("/changes/:id/file", get(repositories::get_change_file))
+        .route(
+            "/threads/:thread_id/cc-diff",
+            get(repositories::get_thread_cc_diff),
+        )
         .route("/changes/:id", get(changes::get_change))
         .route("/notifications", get(notifications::get_notifications))
         .route(
@@ -809,12 +826,21 @@ pub fn create_router(
                 .put(triggers::update_trigger)
                 .delete(triggers::delete_trigger),
         )
+        .route(
+            "/triggers/historical",
+            get(triggers::list_historical_triggers),
+        )
         // Preferences endpoints
         .route(
             "/preferences",
             get(settings::get_preferences)
                 .put(settings::set_preference)
                 .delete(settings::delete_preference),
+        )
+        // CC tool-permission allowlist (~/.lucidos/cc-allowed-tools)
+        .route(
+            "/cc-allowed-tools",
+            get(settings::get_cc_allowed_tools).put(settings::put_cc_allowed_tools),
         )
         // Push notification endpoints
         .route("/push/vapid-key", get(notifications::get_vapid_key))
@@ -827,6 +853,10 @@ pub fn create_router(
         .route(
             "/notification-pushed",
             post(notifications::notification_pushed).get(notifications::get_notification_pushed),
+        )
+        .route(
+            "/notification-dismissed",
+            post(notifications::notification_dismissed),
         )
         // Thread presence (focus tracking → notification suppression)
         .route("/thread-presence", post(presence::update_presence))
@@ -873,13 +903,6 @@ pub fn create_router(
         .route("/app/:app_id/*path", get(apps::serve_app_file))
         .route("/app/versions", get(apps::get_app_versions))
         .route("/app/restore", post(apps::restore_app_version))
-        // Legacy pinned-apps endpoint (backward compat)
-        .route(
-            "/pinned-skills",
-            get(settings::get_pinned_apps)
-                .post(settings::pin_app)
-                .delete(settings::unpin_app),
-        )
         // Email endpoints
         .route("/email/send", post(settings::send_email_confirmed))
         // MCP endpoints
@@ -897,6 +920,11 @@ pub fn create_router(
         .route("/internal/mark-hardened", post(internal::mark_hardened))
         .route("/internal/hardened-state", get(internal::query_hardened))
         .route("/internal/commit-made", post(internal::commit_made))
+        .route("/internal/client-log", post(internal::client_log))
+        .route(
+            "/internal/seed-change-for-test",
+            post(internal::seed_change_for_test),
+        )
         // App capture endpoints
         .route("/app-capture", post(apps::submit_app_capture))
         .route("/static/html2canvas.min.js", get(apps::serve_html2canvas))
@@ -931,10 +959,10 @@ pub fn create_router(
         // Thread endpoints
         .route("/threads", get(threads::list_threads))
         .route("/threads/search", get(threads::search_threads))
-        .route("/threads/pin", post(threads::pin_thread))
-        .route("/threads/unpin", post(threads::unpin_thread))
+        .route("/threads/save", post(threads::save_thread))
+        .route("/threads/unsave", post(threads::unsave_thread))
         .route("/threads/rename", post(threads::rename_thread))
-        .route("/threads/dismiss", post(threads::dismiss_thread))
+        .route("/threads/archive", post(threads::archive_thread))
         .route("/threads/suggest-title", post(threads::suggest_title))
         .route(
             "/threads/:thread_id/messages",
@@ -990,10 +1018,20 @@ pub fn create_router(
         .route("/sdk.js", get(sdk::serve_sdk_js))
         .route("/sdk-iframe.css", get(sdk::serve_sdk_iframe_css))
         .route("/sdk-iframe-audio.js", get(sdk::serve_sdk_iframe_audio_js))
+        .route("/sdk-prefs.js", get(sdk_prefs::serve_sdk_prefs_js))
         .route("/ui/navigate", post(sdk::ui_navigate))
         .route("/data", get(data_api::list_data))
         .route("/data/edit", post(data_api::edit_data))
         .route("/data/upload", post(data_api::upload_data))
+        .route("/threads", post(threads_compose::post_thread))
+        .route("/threads/:id", delete(threads_compose::delete_thread))
+        .route("/threads/:id/compose", put(threads_compose::put_compose))
+        // Generic API proxy — forwards to a backend configured in
+        // `data/config/apis.json`. Two routes so callers can hit
+        // `/proxy/sonos` (no trailing path) as well as `/proxy/sonos/play/2`.
+        .route("/proxy/:name", any(proxy::proxy_handler_root))
+        .route("/proxy/:name/", any(proxy::proxy_handler_root))
+        .route("/proxy/:name/*path", any(proxy::proxy_handler))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .route(
             "/data/*path",

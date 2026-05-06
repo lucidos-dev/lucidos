@@ -1,5 +1,6 @@
 use super::memory::jaccard_similarity;
 use super::LucidosEngine;
+use crate::core::store::types::Step;
 use crate::llm::{ContentBlock, Message, MessageContent};
 use crate::memory::{EmbeddingProvider, MemoryEntry, QueryClassification};
 use uuid::Uuid;
@@ -62,7 +63,7 @@ pub(super) fn sanitize_file_content_for_llm(content: String, path: &str, offset:
     if sanitized.len() != original_len {
         let stripped_kb = (original_len - sanitized.len()) / 1024;
         log!(
-            "read_file '{}': stripped {}KB of base64 image data ({} → {} bytes)",
+            "[Context] read_file '{}': stripped {}KB of base64 image data ({} → {} bytes)",
             path,
             stripped_kb,
             original_len,
@@ -93,7 +94,7 @@ pub(super) fn sanitize_file_content_for_llm(content: String, path: &str, offset:
     let chunk = &remaining[..chunk_end_rel];
 
     log!(
-        "read_file '{}': returning bytes {}–{} of {}",
+        "[Context] read_file '{}': returning bytes {}–{} of {}",
         path,
         start,
         next_offset,
@@ -162,7 +163,7 @@ pub(super) fn trim_context_if_needed(messages: &mut Vec<Message>, budget: usize)
     }
     if image_bytes_stripped > 0 {
         log!(
-            "Context trimming: stripped {}KB of image data from older messages",
+            "[Context] Context trimming: stripped {}KB of image data from older messages",
             image_bytes_stripped / 1024
         );
     }
@@ -208,7 +209,7 @@ pub(super) fn trim_context_if_needed(messages: &mut Vec<Message>, budget: usize)
 
     let total_after_pass1: usize = messages.iter().map(estimate_message_chars).sum();
     if total_after_pass1 <= budget {
-        log!("Context trimming: pass 1 reduced ~{}k -> ~{}k tokens ({} -> {} chars, {} msgs, budget ~{}k tokens)",
+        log!("[Context] Context trimming: pass 1 reduced ~{}k -> ~{}k tokens ({} -> {} chars, {} msgs, budget ~{}k tokens)",
             total / 3500, total_after_pass1 / 3500,
             total, total_after_pass1, messages.len(), budget / 3500
         );
@@ -248,13 +249,13 @@ pub(super) fn trim_context_if_needed(messages: &mut Vec<Message>, budget: usize)
         }
     }
 
-    log!("Context trimming: ~{}k -> ~{}k tokens ({} -> {} chars), removed {} messages, {} remaining (budget ~{}k tokens)",
+    log!("[Context] Context trimming: ~{}k -> ~{}k tokens ({} -> {} chars), removed {} messages, {} remaining (budget ~{}k tokens)",
         total / 3500, current_total / 3500,
         total, current_total, removed, messages.len(), budget / 3500
     );
     if current_total > budget {
         log!(
-            "Warning: context still over budget after trimming (~{}k tokens, {} chars > {} budget)",
+            "[Context] Warning: context still over budget after trimming (~{}k tokens, {} chars > {} budget)",
             current_total / 3500,
             current_total,
             budget
@@ -319,7 +320,7 @@ pub(super) fn validate_tool_use_pairing(messages: &mut Vec<Message>) -> usize {
 
             if !missing.is_empty() {
                 log!(
-                    "WARNING: {} tool_use IDs missing tool_result in messages[{}]: {:?}",
+                    "[Context] WARNING: {} tool_use IDs missing tool_result in messages[{}]: {:?}",
                     missing.len(),
                     i + 1,
                     missing
@@ -341,7 +342,7 @@ pub(super) fn validate_tool_use_pairing(messages: &mut Vec<Message>) -> usize {
         } else {
             // No following user message at all — the assistant message with tool_use
             // is the last message. This shouldn't happen but inject a user message.
-            log!("WARNING: assistant message at index {} has tool_use blocks but no following user message", i);
+            log!("[Context] WARNING: assistant message at index {} has tool_use blocks but no following user message", i);
             let result_blocks: Vec<ContentBlock> = tool_use_ids
                 .iter()
                 .map(|id| {
@@ -427,6 +428,32 @@ pub(super) fn format_history_content(content: &str, role: &str, is_verbatim: boo
     }
 }
 
+/// Bounds runaway tool-loop turns; ~6 typical tool calls fit in well under this.
+const HISTORY_STEPS_MAX_BYTES: usize = 2_000;
+
+/// Compact summary of an assistant turn's tool calls for the LLM's history
+/// string. Returns `None` when there's nothing tool-shaped to report
+/// (synthetic Thinking/MemorySearched steps lack `tool_name` and are
+/// skipped). Output is capped at [`HISTORY_STEPS_MAX_BYTES`].
+pub(crate) fn format_history_steps(steps: &[Step]) -> Option<String> {
+    let descs: Vec<String> = steps
+        .iter()
+        .filter(|s| s.tool_name.is_some())
+        .map(|s| {
+            let mark = if s.success { "ok" } else { "FAIL" };
+            // describe_tool's trailing "..." is for live progress, not history.
+            let desc = s.description.trim_end_matches("...");
+            format!("{} [{}]", desc, mark)
+        })
+        .collect();
+    if descs.is_empty() {
+        return None;
+    }
+    let joined = descs.join(" | ");
+    let capped = truncate_head_tail(&joined, HISTORY_STEPS_MAX_BYTES);
+    Some(format!(" [tools: {}]", capped))
+}
+
 /// Trim history context from the START (oldest messages) when over budget.
 /// This preserves the most recent messages, which are most relevant for follow-ups.
 pub(super) fn trim_history_from_oldest(history: &mut String, bytes_to_trim: usize) {
@@ -452,7 +479,7 @@ impl LucidosEngine {
         const MAX_CONTEXT_CHARS: usize = 50_000;
         use crate::memory::{RETRIEVAL_MIN_IMPORTANCE as MIN_IMPORTANCE, RETRIEVAL_MIN_SIMILARITY as MIN_SIMILARITY};
         const RESULTS_PER_QUERY: usize = 50;
-        const MAX_FACTS: usize = 60;
+        const MAX_FACTS: usize = 25;
         const KEYWORD_SIMILARITY_PROXY: f64 = 0.6;
         const KEYWORD_BOOST: f64 = 1.2;
         const JACCARD_DEDUP_THRESHOLD: f32 = 0.8;
@@ -529,7 +556,7 @@ impl LucidosEngine {
         for sub_query in &sub_queries {
             for word in sub_query.split_whitespace() {
                 let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric());
-                // No uppercase filter: Norwegian common nouns like "pappa"/"øye"
+                // No uppercase filter: Norwegian common nouns like "bil"/"hund"
                 // are valid entity tags but never capitalize.
                 if trimmed.len() >= 3 {
                     keywords.push(trimmed.to_string());

@@ -1,49 +1,28 @@
 import { useRef, useEffect, useState } from 'preact/hooks';
 import { signal } from '@preact/signals';
-import { pendingChatMessage, showToast, inputMode, popupImageSrc, focusedThreadId, focusedDraftId, threadMap, repositories, selectedRepoId, panelUrl, panelTitle } from '../../store/store';
+import { pendingChatMessage, showToast, inputMode, popupImageSrc, focusedThreadId, threadMap, repositories, selectedRepoId, panelUrl, panelTitle, showConfirm, cancelingThreadIds, effectiveThreadStatus } from '../../store/store';
 import { sendMessage, loadRepositories } from '../../store/actions/chat';
-import { syncDraftEntry } from '../../store/actions/drafts';
-import {
-  loadDraftText as loadDraftTextStorage,
-  saveDraftText as saveDraftTextStorage,
-} from '../../utils/draftStorage';
+import { handleSaveThread, handleUnsaveThread } from '../../store/actions/threads';
+import { updateCompose, discardCompose, sendCompose, sendFollowup, ensureFocusedComposeThread, type ComposeMode } from '../../store/actions/compose';
+import { getDraft } from '../../store/composeDrafts';
 import { scrollToBottom, scrolledUp } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon } from '../shared/icons';
 import { Dropdown } from '../shared/Dropdown';
 import { CCControlMenu, ccMenuOpenRequest } from './CCControlMenu';
 import { WaitingBanner, getWaitingState } from './WaitingBanner';
-import { focusIfNeeded, composeHandlers } from './promptFocus';
+import { focusIfNeeded, composeHandlers, isComposeFocusedHere } from './promptFocus';
+import { syncTextareaValue, shouldSkipSyncWhileEditing } from './promptValueSync';
+import { effectiveSendMode } from './promptToggleMode';
 import { resizeTextarea, useFontMetricsResize } from './promptResize';
 import { isMobile } from '../../utils/viewport';
 import { errorDetail } from '../../utils/errorDetail';
-import {
-  pastedImagesForCurrentThread,
-  getPastedImages,
-  removePastedImage,
-  clearPastedImages,
-  hydratePastedImages,
-  migrateLegacyPastedImages,
-} from './pastedImages';
+import { extractPasteUrl, escapeMarkdownLinkText } from '../../utils/extractPasteUrl';
+import { pastedImagesForCurrentThread, getPastedImages, removePastedImage } from './pastedImages';
 import { attachImageToActiveDraft } from './attachToDraft';
 import { computeCaptureGeometry, readDeviceAngle } from './cameraGeometry';
 
 const attachMenuOpen = signal(false);
 const cameraOpen = signal(false);
-
-function currentDraftId(): string {
-  return focusedThreadId.value ?? focusedDraftId.value;
-}
-
-function saveDraftText(id: string, text: string) {
-  saveDraftTextStorage(id, text);
-  syncDraftEntry(id);
-}
-
-/** Clear text + images for the draft. */
-function clearDraft(id: string) {
-  clearPastedImages(id);
-  saveDraftText(id, '');
-}
 
 function addImageFile(file: File) {
   attachImageToActiveDraft(file).catch((err) => {
@@ -114,11 +93,39 @@ function CameraCapture() {
   );
 }
 
+// Saved threads must always offer Unsave — once a saved thread auto-archives,
+// canArchive flips to false, which would otherwise strand the user in the
+// saved section with no exit. Save (the unsaved → save action) stays gated
+// on canArchive so it doesn't appear in non-actionable states.
+export function shouldShowSaveButton(isSaved: boolean, canArchive: boolean): boolean {
+  return isSaved || canArchive;
+}
+
+function SaveThreadButton({ threadId }: { threadId: string }) {
+  const saved = threadMap.value.get(threadId)?.meta.saved ?? false;
+  const onClick = async () => {
+    if (saved) {
+      // Unsave is a deliberate gesture — confirm so a stray click doesn't
+      // drop a saved thread out of its parking spot.
+      if (await showConfirm('Remove this thread from the Saved section?', 'Remove')) {
+        handleUnsaveThread(threadId);
+      }
+    } else {
+      handleSaveThread(threadId);
+    }
+  };
+  const cls = `action-btn save-thread-btn${saved ? '' : ' action-btn-confirm'}`;
+  return (
+    <button class={cls} onClick={onClick} aria-label={saved ? 'Unsave thread' : 'Save thread'}>
+      {saved ? '✓ Saved' : 'Save'}
+    </button>
+  );
+}
+
 export function PromptInput() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const [hasText, setHasText] = useState(false);
   // Watch for pending messages from other modules (e.g. new app modal)
   useEffect(() => {
     const msg = pendingChatMessage.value;
@@ -130,48 +137,31 @@ export function PromptInput() {
     }
   });
 
-  // Save/restore per-draft text and focus input when the active draft id changes.
-  // Tracks whichever id (thread or compose draft) the prompt is currently bound to.
-  const did = currentDraftId();
-  const prevDidRef = useRef<string | undefined>(undefined);
+  const tid = focusedThreadId.value;
+  // Subscribe via composeDrafts, NOT threadMap: ChatExchange subscribes to
+  // threadMap and runs marked.parse per render, so per-keystroke writes there
+  // would re-parse every exchange in the thread.
+  const composeText = getDraft(tid).text;
+  const hasText = composeText.length > 0;
+
+  // Preserve cursor on same-thread re-syncs; let it end-snap on thread switch.
+  // shouldSkipSyncWhileEditing protects in-flight keystrokes — see its docstring.
+  const prevTidRef = useRef<string | null | undefined>(undefined);
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
-
-    const prev = prevDidRef.current;
-
-    // Migrate from old global draft key (one-time, on first mount)
-    if (prev === undefined) {
-      const oldDraft = localStorage.getItem('lucidos-draft');
-      if (oldDraft) {
-        saveDraftTextStorage(did, oldDraft);
-        localStorage.removeItem('lucidos-draft');
-        syncDraftEntry(did);
-      }
-      migrateLegacyPastedImages(did);
+    const sameThread = prevTidRef.current === tid;
+    const focusedHere = isComposeFocusedHere(tid ?? '');
+    if (!shouldSkipSyncWhileEditing(el, sameThread, focusedHere)
+        && syncTextareaValue(el, composeText, sameThread)) {
+      autoResize();
+      requestAnimationFrame(() => requestAnimationFrame(() => autoResize()));
     }
-
-    // offsetParent (not offsetWidth) — both SplitLayout and MobileSwipeContainer
-    // render PromptInput, and on mobile the desktop copy uses display:none but
-    // can briefly report non-zero offsetWidth during transitions.
-    if (prev !== undefined && prev !== did && el.offsetParent !== null) {
-      saveDraftText(prev, el.value);
-    }
-
-    const draftText = loadDraftTextStorage(did);
-    el.value = draftText;
-    setHasText(draftText.length > 0);
-    hydratePastedImages(did);
-
-    autoResize();
-    requestAnimationFrame(() => requestAnimationFrame(() => autoResize()));
-
-    prevDidRef.current = did;
-
-    if (!isMobile()) {
+    if (!sameThread && !isMobile()) {
       requestAnimationFrame(() => focusIfNeeded(el));
     }
-  }, [did]);
+    prevTidRef.current = tid;
+  }, [tid, composeText]);
 
   useFontMetricsResize(() => autoResize());
 
@@ -209,37 +199,58 @@ export function PromptInput() {
   async function submit() {
     const el = inputRef.current;
     if (!el) return;
-    let msg = el.value.trim();
-    const tid = focusedThreadId.value;
-    const draftId = currentDraftId();
-    const currentImages = getPastedImages(draftId);
+    const msg = el.value.trim();
+    const threadId = focusedThreadId.value;
+    const currentImages = threadId ? getPastedImages(threadId) : [];
     if (!msg && currentImages.length === 0) return;
     el.value = '';
     el.style.height = 'auto';
-    setHasText(false);
     scrollToBottom();
     if (isMobile()) el.blur();
 
+    const thread = threadId ? threadMap.value.get(threadId) : undefined;
+    const useClaudeCode = effectiveSendMode(thread) === 'claude_code';
+
+    if (threadId && thread?.meta.state === 'composing') {
+      // Composing thread: send through compose so server transitions
+      // state→active and clears compose fields atomically.
+      sendCompose(threadId, { useClaudeCode }).catch((error) => {
+        showToast('Failed to send message: ' + errorDetail(error), 'error');
+      });
+      return;
+    }
+
+    // Active thread follow-up (or no thread at all → backend will create one).
     const images = currentImages.length > 0 ? [...currentImages] : undefined;
-    clearDraft(draftId);
-
-    // Always send via sendMessage — the backend auto-injects into active
-    // threads or starts a new exchange as appropriate. This avoids the
-    // frontend needing to know thread state (which can be stale).
-    const thread = tid ? threadMap.value.get(tid) : undefined;
-    const isCCThread = thread?.meta.channel === 'claude_code';
-
-    const useClaudeCode = isCCThread || (!tid && inputMode.value.type === 'claude_code');
-    // Compose-mode sends carry the originating draft id so chat.ts can
-    // promote it (clear storage + assign a fresh focusedDraftId) once the
-    // server accepts the request. Thread follow-ups don't need this.
-    const sendOpts = {
-      useClaudeCode: useClaudeCode || undefined,
-      composeDraftId: tid ? undefined : draftId,
-    };
-    sendMessage(msg, images, sendOpts).catch((error) => {
+    const sendPromise = threadId
+      ? sendFollowup(threadId, msg, images, { useClaudeCode: useClaudeCode || undefined })
+      : sendMessage(msg, images, { useClaudeCode: useClaudeCode || undefined });
+    sendPromise.catch((error) => {
       showToast('Failed to send message: ' + errorDetail(error), 'error');
     });
+  }
+
+  function handleDiscard() {
+    const el = inputRef.current;
+    if (!el) return;
+    const id = focusedThreadId.value;
+    if (!id) return;
+    el.value = '';
+    el.style.height = 'auto';
+    const thread = threadMap.value.get(id);
+    if (thread?.meta.state === 'active') {
+      // Active thread: clear the in-progress follow-up text + images, but
+      // keep the user in the thread. Deleting it would 409 ("thread is
+      // active — use archive instead"). Compose fields are persisted
+      // server-side for active threads too (cross-device draft sync), so
+      // emptying them flows through updateCompose.
+      updateCompose(id, { text: '', images: [] });
+    } else {
+      void discardCompose(id);
+    }
+    // Discard is an exit from compose — always drop focus so the mobile
+    // keyboard goes down, regardless of which branch we took.
+    el.blur();
   }
 
   function handleInput() {
@@ -247,21 +258,19 @@ export function PromptInput() {
     const el = inputRef.current;
     if (!el) return;
     const val = el.value;
-    setHasText(val.length > 0);
     // "/" prefix in CC mode opens command menu with filter
     const tid = focusedThreadId.value;
-    const draftId = currentDraftId();
     const thread = tid ? threadMap.value.get(tid) : undefined;
-    const isCCMode = thread?.meta.channel === 'claude_code' || (!tid && inputMode.value.type === 'claude_code');
+    const isCCMode = effectiveSendMode(thread) === 'claude_code';
     if (isCCMode && val.startsWith('/')) {
       el.value = '';
-      saveDraftText(draftId, '');
       autoResize();
-      setHasText(false);
       ccMenuOpenRequest.value = val.slice(1);
+      if (tid) updateCompose(tid, { text: '' });
       return;
     }
-    saveDraftText(draftId, val);
+    const threadId = ensureFocusedComposeThread();
+    updateCompose(threadId, { text: val });
   }
 
   function handlePaste(e: ClipboardEvent) {
@@ -278,6 +287,20 @@ export function PromptInput() {
         return; // Only process first image item
       }
     }
+
+    const el = inputRef.current;
+    if (!el) return;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    if (start === end) return;
+    const text = e.clipboardData?.getData('text/plain') ?? '';
+    const url = extractPasteUrl(text);
+    if (!url) return;
+    e.preventDefault();
+    const selection = escapeMarkdownLinkText(el.value.slice(start, end));
+    // setRangeText keeps the change in the textarea's native undo stack.
+    el.setRangeText(`[${selection}](${url})`, start, end, 'end');
+    handleInput();
   }
 
   function handleFileSelect(e: Event) {
@@ -290,15 +313,30 @@ export function PromptInput() {
   }
 
   function removeImage(index: number) {
-    const id = currentDraftId();
+    const id = focusedThreadId.value;
+    if (!id) return;
     removePastedImage(id, index);
-    syncDraftEntry(id);
   }
 
-  // Toggle visibility: always visible in compose view, fades out when a thread
-  // is focused. Derived from showToggles so toggles mount immediately when
-  // returning to compose — no useEffect sync needed.
-  const showToggles = !focusedThreadId.value;
+  /** Mode toggle. For a focused composing thread, persist the choice on the
+   *  thread row so peers see it. Otherwise (no thread or active thread) just
+   *  set the inputMode signal — there's nothing server-side to update. */
+  function setMode(mode: ComposeMode) {
+    inputMode.value = mode === 'claude_code' ? { type: 'claude_code' } : { type: 'do' };
+    const id = focusedThreadId.value;
+    if (!id) return;
+    const thread = threadMap.value.get(id);
+    if (thread?.meta.state !== 'composing') return;
+    updateCompose(id, { mode });
+  }
+
+  const focusedThread = focusedThreadId.value ? threadMap.value.get(focusedThreadId.value) : undefined;
+
+  // Toggle visibility: visible whenever the channel choice is mutable — the
+  // compose view (no focused thread) AND a focused composing draft (state
+  // hasn't locked to active yet). Derived inline so toggles mount immediately
+  // on a state change — no useEffect sync needed.
+  const showToggles = !focusedThreadId.value || focusedThread?.meta.state === 'composing';
   const [fading, setFading] = useState(false);
 
   useEffect(() => {
@@ -314,15 +352,36 @@ export function PromptInput() {
 
   const isNarrow = typeof window !== 'undefined' && window.innerWidth <= 600;
   const images = pastedImagesForCurrentThread.value;
+  const hasContent = hasText || images.length > 0;
   // CC doesn't use browser context — hide the pill when it won't be sent
-  const focusedThread = focusedThreadId.value ? threadMap.value.get(focusedThreadId.value) : undefined;
-  const willUseClaudeCode = focusedThreadId.value
-    ? focusedThread?.meta.channel === 'claude_code'
-    : inputMode.value.type === 'claude_code';
+  const toggleMode = effectiveSendMode(focusedThread);
+  const willUseClaudeCode = toggleMode === 'claude_code';
   const hasUrlContext = !!panelUrl.value && !willUseClaudeCode;
   const showCCCommands = willUseClaudeCode;
 
-  const mode = inputMode.value;
+  const waitingState = getWaitingState();
+  const canArchive = waitingState?.type === 'actions' && waitingState.actions.includes('archive');
+
+  // Clear the optimistic canceling flag once the thread leaves the cancellable
+  // states ('running' or 'waiting_for_user_answer'). The set survives component
+  // re-renders by design (button lives in the always-visible prompt area) —
+  // without explicit release the flag would stick across the next stream and
+  // disable the button before it's pressed. Both states must be included or
+  // the flag would be cleared on the optimistic update before the cancel-side
+  // events even land (waiting_for_user_answer briefly transitions through
+  // 'running' via UserQuestionAnswered).
+  useEffect(() => {
+    const focused = focusedThreadId.value;
+    if (!focused || !cancelingThreadIds.value.has(focused)) return;
+    const thread = threadMap.value.get(focused);
+    if (!thread) return;
+    const status = effectiveThreadStatus(thread);
+    if (status !== 'running' && status !== 'waiting_for_user_answer') {
+      const next = new Set(cancelingThreadIds.value);
+      next.delete(focused);
+      cancelingThreadIds.value = next;
+    }
+  }, [focusedThreadId.value, threadMap.value, cancelingThreadIds.value]);
 
   return (
     <div class="prompt-input-container">
@@ -343,19 +402,19 @@ export function PromptInput() {
       {togglesMounted && <div key="toggles" class={`input-toggles-wrapper${togglesFading ? ' fading-out' : ''}`}>
       <div class="input-target-tabs segmented-control">
         <button
-          class={`segmented-btn ${mode.type === 'do' ? 'active' : ''}`}
-          {...composeHandlers(() => { inputMode.value = { type: 'do' }; })}
+          class={`segmented-btn ${toggleMode === 'lucidos' ? 'active' : ''}`}
+          {...composeHandlers(() => setMode('lucidos'))}
         >
-          Manifest
+          Lucidos
         </button>
         <button
-          class={`segmented-btn ${mode.type === 'claude_code' ? 'active' : ''}`}
-          {...composeHandlers(() => { inputMode.value = { type: 'claude_code' }; })}
+          class={`segmented-btn ${toggleMode === 'claude_code' ? 'active' : ''}`}
+          {...composeHandlers(() => setMode('claude_code'))}
         >
           Claude
         </button>
       </div>
-        {!togglesFading && mode.type === 'claude_code' && (() => {
+        {!togglesFading && toggleMode === 'claude_code' && (() => {
           const reposLoadable = repositories.value;
           if (reposLoadable.status === 'not-loaded') loadRepositories();
           if (reposLoadable.status === 'failed') {
@@ -398,7 +457,8 @@ export function PromptInput() {
             ref={inputRef}
             class="prompt-textarea"
             data-role="prompt-input"
-            placeholder="Go ahead…"
+            data-thread-id={tid ?? ''}
+            placeholder={focusedThreadId.value ? 'Post a follow up…' : 'Go ahead…'}
             rows={1}
             onInput={handleInput}
             onKeyDown={handleKeyDown}
@@ -411,8 +471,8 @@ export function PromptInput() {
               const el = inputRef.current;
               if (!el) return;
               el.value = '';
-              setHasText(false);
-              saveDraftText(currentDraftId(), '');
+              const id = focusedThreadId.value;
+              if (id) updateCompose(id, { text: '' });
               autoResize();
               el.focus();
             }}
@@ -420,60 +480,82 @@ export function PromptInput() {
             <ClearIcon />
           </button>
         </div>
+        {/* Single hidden file input lives at the top of prompt-box so the menu
+            open/close re-render never unmounts it mid-tap. Photo buttons below
+            trigger via `.click()` (the proven pattern from 0.7.2). Hidden via
+            `.visually-hidden` (off-screen, in layout) — `display:none` is what
+            HiddenFileInput's docs blame for dropping the iOS PWA change event,
+            so we match that even though .click() is a synthetic dispatch. */}
         <input
           ref={fileInputRef}
           type="file"
           accept="image/*"
           multiple
-          style={{ display: 'none' }}
+          class="visually-hidden"
+          tabIndex={-1}
+          aria-hidden="true"
           onChange={handleFileSelect}
         />
         <div class="prompt-actions-row">
           {showCCCommands && <CCControlMenu threadId={focusedThreadId.value ?? undefined} />}
-          <div class="image-attach-anchor" ref={menuRef}>
+          {isNarrow ? (
             <button
               class="icon-btn header-icon"
-              onClick={() => {
-                if (isNarrow) {
-                  fileInputRef.current?.click();
-                } else {
-                  attachMenuOpen.value = !attachMenuOpen.value;
-                }
-              }}
-              data-tooltip={isNarrow ? undefined : 'Attach image'}
+              onClick={() => fileInputRef.current?.click()}
               aria-label="Attach image"
             >
               <ImageIcon />
             </button>
-            {attachMenuOpen.value && (
-              <div class="image-attach-menu">
-                <button onClick={() => { attachMenuOpen.value = false; cameraOpen.value = true; }}>
-                  <CameraIcon />
-                  Camera
-                </button>
-                <button onClick={() => { attachMenuOpen.value = false; fileInputRef.current?.click(); }}>
-                  <FileIcon />
-                  File
-                </button>
-              </div>
-            )}
-          </div>
-          {(() => {
-            const hasContent = hasText || images.length > 0;
-            if (!hasContent) {
-              const waitingState = getWaitingState();
-              if (waitingState) return <WaitingBanner state={waitingState} />;
-            }
-            return (
+          ) : (
+            <div class="image-attach-anchor" ref={menuRef}>
+              {/* composeHandlers keeps the prompt textarea focused (iPad PWA
+                  keyboard stays open) so the menu anchors to the right spot —
+                  see 5ca953fd7. */}
               <button
-                class={`action-btn prompt-submit-btn${hasContent ? '' : ' invisible'}`}
-                {...composeHandlers(submit)}
-                aria-label="Send message"
+                class="icon-btn header-icon"
+                {...composeHandlers(() => { attachMenuOpen.value = !attachMenuOpen.value; })}
+                data-tooltip="Attach image"
+                aria-label="Attach image"
               >
-                Send
+                <ImageIcon />
               </button>
-            );
-          })()}
+              {attachMenuOpen.value && (
+                <div class="image-attach-menu">
+                  <button onClick={() => { attachMenuOpen.value = false; cameraOpen.value = true; }}>
+                    <CameraIcon />
+                    Camera
+                  </button>
+                  <button onClick={() => { attachMenuOpen.value = false; fileInputRef.current?.click(); }}>
+                    <FileIcon />
+                    File
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+          <div class="prompt-actions-right">
+            {hasContent && (
+              <button
+                class="action-btn action-btn-danger"
+                onClick={handleDiscard}
+                aria-label="Discard draft"
+              >
+                Discard draft
+              </button>
+            )}
+            {focusedThreadId.value && !hasContent && shouldShowSaveButton(focusedThread?.meta.saved ?? false, canArchive) && <SaveThreadButton threadId={focusedThreadId.value} />}
+            {!hasContent && waitingState
+              ? <WaitingBanner state={waitingState} />
+              : (
+                <button
+                  class={`action-btn${hasContent ? '' : ' invisible'}`}
+                  onClick={submit}
+                  aria-label="Send message"
+                >
+                  Send
+                </button>
+              )}
+          </div>
         </div>
       </div>
       {cameraOpen.value && <CameraCapture />}

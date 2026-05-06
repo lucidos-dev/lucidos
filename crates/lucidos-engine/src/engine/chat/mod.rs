@@ -3,6 +3,7 @@ mod images;
 mod process;
 mod recovery;
 mod recursion_guard;
+mod rerun;
 mod spawn;
 mod title;
 

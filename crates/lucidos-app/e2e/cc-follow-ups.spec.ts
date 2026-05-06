@@ -66,7 +66,7 @@ test.describe('Claude Code follow-ups during and after working', () => {
 
     const msg1 = uniqueMessage('cc-after-idle-1');
     await sendMessage(page, `Say exactly: "first ${msg1}" and nothing else. Do not create any files.`);
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
 
     // CC is now idle — send follow-up
     const msg2 = uniqueMessage('cc-after-idle-2');
@@ -87,7 +87,7 @@ test.describe('Claude Code follow-ups during and after working', () => {
 
     const msg1 = uniqueMessage('cc-seq-1');
     await sendMessage(page, `Say exactly: "one ${msg1}". Do not create any files.`);
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
 
     const msg2 = uniqueMessage('cc-seq-2');
     await sendFollowUp(page, `Say exactly: "two ${msg2}". Do not create any files.`);

@@ -3483,8 +3483,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./test-workspace"));
 
-    log!("=== History Population Tool (with backdated timestamps) ===\n");
-    log!("Workspace: {}\n", workspace_path.display());
+    log!("[Populate] === History Population Tool (with backdated timestamps) ===\n");
+    log!("[Populate] Workspace: {}\n", workspace_path.display());
 
     // Create workspace structure
     std::fs::create_dir_all(workspace_path.join("data"))?;
@@ -3492,7 +3492,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Connect to PostgreSQL (use DATABASE_URL env var)
     let database_url = lucidos_engine::core::database_url();
-    log!("Connecting to PostgreSQL at {}", database_url);
+    log!("[Populate] Connecting to PostgreSQL at {}", database_url);
 
     // Create shared connection pool
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -3503,17 +3503,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize event store schema
     let event_store = EventStore::new(pool.clone());
     event_store.init_schema().await?;
-    log!("Event store initialized");
+    log!("[Populate] Event store initialized");
 
     // Initialize scheduler schemas (notifications)
     NotificationStore::init_schema(&pool).await?;
-    log!("Scheduler schemas initialized");
+    log!("[Populate] Scheduler schemas initialized");
 
     // Initialize embedder and memory index
-    log!("Initializing embedder (first run downloads model ~30MB)...");
+    log!("[Populate] Initializing embedder (first run downloads model ~30MB)...");
     let embedder = FastEmbedProvider::new()?;
 
-    log!("Creating memory index...");
+    log!("[Populate] Creating memory index...");
     let memory_index = PgVectorIndex::new(pool.clone()).await?;
 
     let working_days: i64 = 730; // Full 2 years
@@ -3525,7 +3525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let total_events = working_days * (conversations_per_day * 2 + artifacts_per_day);
     log!(
-        "\nPopulating {} events ({} days of history)...\n",
+        "\n[Populate] Populating {} events ({} days of history)...\n",
         total_events,
         working_days
     );
@@ -3569,6 +3569,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &embedding,
                     embedder.model_id(),
                     msg_time,
+                    lucidos_engine::memory::EXTRACTOR_VERSION,
                 )
                 .await?;
             event_count += 1;
@@ -3594,6 +3595,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &embedding,
                     embedder.model_id(),
                     response_time,
+                    lucidos_engine::memory::EXTRACTOR_VERSION,
                 )
                 .await?;
             event_count += 1;
@@ -3640,6 +3642,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &embedding,
                     embedder.model_id(),
                     artifact_time,
+                    lucidos_engine::memory::EXTRACTOR_VERSION,
                 )
                 .await?;
             event_count += 1;
@@ -3686,6 +3689,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 &embedding,
                 embedder.model_id(),
                 morning_time,
+                lucidos_engine::memory::EXTRACTOR_VERSION,
             )
             .await?;
 
@@ -3694,7 +3698,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if day % 100 == 0 {
             let pct = (day as f64 / working_days as f64) * 100.0;
             log!(
-                "  Day {}/{} ({:.0}%) - {} events, {} artifacts, {} notifications...",
+                "[Populate]   Day {}/{} ({:.0}%) - {} events, {} artifacts, {} notifications...",
                 day,
                 working_days,
                 pct,
@@ -3706,7 +3710,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Mark older notifications as read (keep last 10 as unread)
-    log!("\nMarking older notifications as read (keeping 10 unread)...");
+    log!("\n[Populate] Marking older notifications as read (keeping 10 unread)...");
     sqlx::query(
         r#"
         UPDATE notifications
@@ -3722,7 +3726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await?;
 
     // Create personal tracking files (always present)
-    log!("Creating personal tracking files...");
+    log!("[Populate] Creating personal tracking files...");
     std::fs::write(
         artifacts_path.join("todo.md"),
         "# Todo\n\n- [ ] Review API migration PR\n- [ ] Call dentist\n- [ ] Finish quarterly report\n- [x] Order new laptop charger\n- [ ] Update project documentation\n- [ ] Schedule team retrospective\n",
@@ -3746,23 +3750,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .fetch_all(&pool)
         .await?;
 
-    log!("\n=== Done ===");
-    log!("  PostgreSQL events: {}", db_events[0].0);
-    log!("  PostgreSQL notifications: {}", db_notifications[0].0);
+    log!("\n[Populate] === Done ===");
+    log!("[Populate]   PostgreSQL events: {}", db_events[0].0);
+    log!("[Populate]   PostgreSQL notifications: {}", db_notifications[0].0);
     log!(
-        "  Memory index entries: {}",
+        "[Populate]   Memory index entries: {}",
         memory_index.len().await.unwrap_or(0)
     );
-    log!("  Artifact files created: {}", artifact_count);
-    log!("  Time: {:.1}s", elapsed.as_secs_f64());
-    log!("  Workspace: {}", workspace_path.display());
-    log!("\nTo test, run:");
+    log!("[Populate]   Artifact files created: {}", artifact_count);
+    log!("[Populate]   Time: {:.1}s", elapsed.as_secs_f64());
+    log!("[Populate]   Workspace: {}", workspace_path.display());
+    log!("\n[Populate] To test, run:");
     log!(
-        "  LUCIDOS_WORKSPACE={} cargo run -p lucidos-engine",
+        "[Populate]   LUCIDOS_WORKSPACE={} cargo run -p lucidos-engine",
         workspace_path.display()
     );
-    log!("\nThen open http://localhost:3000 in your browser.");
-    log!("Click the bell icon to see notifications!");
+    log!("\n[Populate] Then open http://localhost:3000 in your browser.");
+    log!("[Populate] Click the bell icon to see notifications!");
 
     Ok(())
 }

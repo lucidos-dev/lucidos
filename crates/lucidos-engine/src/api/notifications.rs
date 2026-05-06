@@ -9,7 +9,9 @@ pub(super) async fn get_notifications(
     Query(query): Query<NotificationsListQuery>,
 ) -> Result<Json<NotificationsResponse>, (StatusCode, String)> {
     let filter = query.filter.as_deref().unwrap_or("all");
-    let limit = query.limit.max(0);
+    // Clamp upper bound so a misconfigured client can't ask for an unbounded
+    // page; sibling list endpoints (changes, applied changes) cap at 100 too.
+    let limit = query.limit.clamp(0, 100);
 
     let before_ts = query.before.map(super::parse_unix_ts);
 
@@ -257,4 +259,67 @@ pub(super) async fn get_notification_pushed(
         }
     });
     Json(serde_json::json!({ "notification_id": id }))
+}
+
+/// Clear the pending push if it matches the dismissed notification id.
+fn clear_pending_push_if_matches(
+    pending: &std::sync::Arc<std::sync::Mutex<Option<(String, std::time::Instant)>>>,
+    dismissed_id: &str,
+) {
+    let mut guard = pending.lock().unwrap();
+    if guard.as_ref().is_some_and(|(stored, _)| stored == dismissed_id) {
+        *guard = None;
+    }
+}
+
+/// POST /api/notification-dismissed — SW notificationclose clears the pending push
+/// when the user dismisses the OS notification (close button or notification-center
+/// swipe). Without this, the push fallback (/api/notification-pushed, 60s window)
+/// fires the next time the app gains focus, auto-opening the modal for a
+/// notification the user explicitly dismissed.
+pub(super) async fn notification_dismissed(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> StatusCode {
+    if let Some(id) = body.get("notification_id").and_then(|v| v.as_str()) {
+        clear_pending_push_if_matches(&state.pending_notification_push, id);
+    }
+    StatusCode::NO_CONTENT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    fn pending_with(id: &str) -> Arc<Mutex<Option<(String, Instant)>>> {
+        Arc::new(Mutex::new(Some((id.to_string(), Instant::now()))))
+    }
+
+    #[test]
+    fn dismiss_clears_pending_when_id_matches() {
+        let pending = pending_with("notif-abc");
+        clear_pending_push_if_matches(&pending, "notif-abc");
+        assert!(pending.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn dismiss_keeps_pending_when_id_differs() {
+        // Push for notif-A is stored, but the user dismisses notif-B (e.g. an
+        // earlier push that was overwritten before the user touched it). The
+        // newer pending entry must survive.
+        let pending = pending_with("notif-A");
+        clear_pending_push_if_matches(&pending, "notif-B");
+        let guard = pending.lock().unwrap();
+        let (kept, _) = guard.as_ref().expect("pending should still be set");
+        assert_eq!(kept, "notif-A");
+    }
+
+    #[test]
+    fn dismiss_is_noop_when_no_pending() {
+        let pending: Arc<Mutex<Option<(String, Instant)>>> = Arc::new(Mutex::new(None));
+        clear_pending_push_if_matches(&pending, "notif-abc");
+        assert!(pending.lock().unwrap().is_none());
+    }
 }

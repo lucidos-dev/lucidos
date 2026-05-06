@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { backupProgress, showToast } from '../../store/store';
+import { backupProgress, backupListVersion, showToast } from '../../store/store';
 import { grantOAuthScope } from '../../store/actions/oauth';
 import { formatDateTime } from '../../utils/formatTime';
+import { formatBytes } from '../../utils/formatBytes';
 import { Dropdown } from '../shared/Dropdown';
 import {
   getBackupProviders,
@@ -15,12 +16,16 @@ import {
   restoreBackup,
   validateWorkspaceName,
   startWorkspace,
+  ApiError,
   type BackupEntry,
   type BackupProviderInfo,
   type BackupKeyResponse,
   type RestoredWorkspace,
   type ValidateNameResult,
 } from '../../api/client';
+import type { Loadable } from '../../store/types';
+import { toFailed } from '../../store/types';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { errorDetail } from '../../utils/errorDetail';
 
 const PHASE_LABELS: Record<string, string> = {
@@ -53,10 +58,6 @@ const RETENTION_OPTIONS: { label: string; value: string }[] = [
   { label: 'Keep 50', value: '50' },
 ];
 
-function formatSize(bytes: number): string {
-  return (bytes / 1024 / 1024).toFixed(1) + ' MB';
-}
-
 /** Extract workspace name from backup filename: lucidos-backup-{name}-{YYYYMMDD}-{HHMMSS}.enc */
 function extractWorkspaceName(filename: string): string {
   const match = filename.match(/^lucidos-backup-(.+)-\d{8}-\d{6}\.enc$/);
@@ -78,14 +79,14 @@ const PROVIDER_SCOPES: Record<string, string> = {
 };
 
 export function BackupSection() {
-  const [providers, setProviders] = useState<BackupProviderInfo[]>([]);
+  const [providersLoadable, setProvidersLoadable] = useState<Loadable<BackupProviderInfo[]>>({ status: 'not-loaded' });
+  const showProvidersLoading = useDelayedLoading(providersLoadable);
   const [selectedProvider, setSelectedProvider] = useState<string>('');
-  const [backingUp, setBackingUp] = useState(false);
+  const [submittingBackup, setSubmittingBackup] = useState(false);
   const [keyInfo, setKeyInfo] = useState<BackupKeyResponse | null>(null);
   const [showKey, setShowKey] = useState(false);
-  const [backups, setBackups] = useState<BackupEntry[] | null>(null);
-  const [backupsLoading, setBackupsLoading] = useState(false);
-  const [backupsError, setBackupsError] = useState<string | null>(null);
+  const [backupsLoadable, setBackupsLoadable] = useState<Loadable<BackupEntry[]>>({ status: 'not-loaded' });
+  const showBackupsLoading = useDelayedLoading(backupsLoadable);
   const [selectedBackupId, setSelectedBackupId] = useState<string | null>(null);
   const [restoreKey, setRestoreKey] = useState('');
   const [restoring, setRestoring] = useState(false);
@@ -105,11 +106,12 @@ export function BackupSection() {
   const nameSeqRef = useRef(0);
 
   useEffect(() => {
+    setProvidersLoadable({ status: 'loading' });
     getBackupProviders().then((p) => {
-      setProviders(p);
+      setProvidersLoadable({ status: 'loaded', data: p });
       if (p.length > 0) setSelectedProvider(p[0].id);
-    }).catch((err) => {
-      showToast(`Failed to load backup providers: ${errorDetail(err)}`, 'error');
+    }).catch((err: unknown) => {
+      setProvidersLoadable(toFailed(err));
     });
 
     getBackupSchedule().then((s) => {
@@ -129,13 +131,14 @@ export function BackupSection() {
     });
   }, []);
 
-  // Auto-load backups when provider changes and is ready
+  const providers = providersLoadable.status === 'loaded' ? providersLoadable.data : [];
+
   const selectedReady = providers.find((p) => p.id === selectedProvider)?.ready ?? false;
   useEffect(() => {
     if (selectedProvider && selectedReady) {
       loadBackups();
     }
-  }, [selectedProvider, selectedReady]);
+  }, [selectedProvider, selectedReady, backupListVersion.value]);
 
   function selectedProviderInfo(): BackupProviderInfo | undefined {
     return providers.find((p) => p.id === selectedProvider);
@@ -153,7 +156,7 @@ export function BackupSection() {
       // Refresh providers to update ready state
       try {
         const p = await getBackupProviders();
-        setProviders(p);
+        setProvidersLoadable({ status: 'loaded', data: p });
       } catch (err) {
         showToast(`Failed to refresh providers: ${errorDetail(err)}`, 'error');
       }
@@ -168,16 +171,18 @@ export function BackupSection() {
       showToast(`${info.name} is not ready — grant access first`, 'error');
       return;
     }
-    setBackingUp(true);
+    setSubmittingBackup(true);
     try {
-      const entry = await createBackup(selectedProvider);
-      showToast(`Backup created: ${entry.filename} (${formatSize(entry.size_bytes)})`, 'success');
-      loadBackups();
+      await createBackup(selectedProvider);
     } catch (err) {
-      showToast(`Backup failed: ${errorDetail(err)}`, 'error');
-    } finally {
-      setBackingUp(false);
       backupProgress.value = null;
+      if (err instanceof ApiError && err.httpCode === 409) {
+        showToast('Another backup is already running', 'warning');
+      } else {
+        showToast(`Backup failed: ${errorDetail(err)}`, 'error');
+      }
+    } finally {
+      setSubmittingBackup(false);
     }
   }
 
@@ -210,16 +215,12 @@ export function BackupSection() {
 
   async function loadBackups() {
     if (!selectedProvider) return;
-    setBackupsLoading(true);
-    setBackupsError(null);
+    setBackupsLoadable({ status: 'loading' });
     try {
       const list = await listBackups(selectedProvider);
-      setBackups(list);
+      setBackupsLoadable({ status: 'loaded', data: list });
     } catch (err) {
-      setBackupsError(errorDetail(err));
-      setBackups(null);
-    } finally {
-      setBackupsLoading(false);
+      setBackupsLoadable(toFailed(err));
     }
   }
 
@@ -315,6 +316,8 @@ export function BackupSection() {
   const providerInfo = selectedProviderInfo();
   const progress = backupProgress.value;
   const progressLabel = progress ? (PHASE_LABELS[progress.phase] || progress.phase) : null;
+  // `submittingBackup` covers the POST-to-first-progress gap; SSE owns the rest.
+  const backingUp = submittingBackup || progress !== null;
 
   return (
     <>
@@ -328,10 +331,16 @@ export function BackupSection() {
             value={selectedProvider}
             onChange={(v) => {
               setSelectedProvider(v);
-              setBackups(null);
+              setBackupsLoadable({ status: 'not-loaded' });
               setSelectedBackupId(null);
             }}
           />
+          {providersLoadable.status === 'failed' && (
+            <span class="error-text">Failed to load providers: {providersLoadable.error}</span>
+          )}
+          {providersLoadable.status === 'loading' && showProvidersLoading && (
+            <span class="form-hint">Loading providers...</span>
+          )}
         </div>
 
         {providerInfo && !providerInfo.connected && (
@@ -419,21 +428,21 @@ export function BackupSection() {
       <div class="settings-section">
         <div class="settings-section-title" data-search-anchor="backup:restore">Restore from backup</div>
 
-        {backupsLoading && (
+        {backupsLoadable.status === 'loading' && showBackupsLoading && (
           <div class="loading-spinner" />
         )}
 
-        {backupsError && (
-          <div class="error-text" style="padding: 0.5rem 0;">Failed to load backups: {backupsError}</div>
+        {backupsLoadable.status === 'failed' && (
+          <div class="error-text" style="padding: 0.5rem 0;">Failed to load backups: {backupsLoadable.error}</div>
         )}
 
-        {!backupsLoading && backups !== null && backups.length === 0 && (
+        {backupsLoadable.status === 'loaded' && backupsLoadable.data.length === 0 && (
           <div class="empty-state">No backups found</div>
         )}
 
-        {backups !== null && backups.length > 0 && (
+        {backupsLoadable.status === 'loaded' && backupsLoadable.data.length > 0 && (
           <div class="list-rows">
-            {backups.map((b) => (
+            {backupsLoadable.data.map((b) => (
               <div
                 class={`list-row ${selectedBackupId === b.id ? 'backup-selected' : ''}`}
                 key={b.id}
@@ -458,7 +467,7 @@ export function BackupSection() {
                   <div class="list-row-details">
                     <span>{formatDate(b.created_at)}</span>
                     {' \u00b7 '}
-                    <span>{formatSize(b.size_bytes)}</span>
+                    <span>{formatBytes(b.size_bytes)}</span>
                   </div>
                 </div>
               </div>

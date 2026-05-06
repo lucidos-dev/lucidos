@@ -102,7 +102,8 @@ async fn fetch_relevant_events(
                 'CodingAgentToolCalled', \
                 'CodingAgentToolResult', \
                 'CodingAgentUserMessageSent', \
-                'ResponseGenerated' \
+                'ResponseGenerated', \
+                'ResponseFailed' \
            ) \
          ORDER BY sequence ASC",
     )
@@ -132,6 +133,13 @@ fn project_event(event_type: &str, payload: &serde_json::Value) -> Option<String
         "CodingAgentTextStreamed" | "ResponseGenerated" => {
             let text = text_field("text")?;
             Some(format!("You (assistant): {}", text))
+        }
+        // Surface failures (incl. empty completions) so an orchestrator
+        // re-reading its own history sees that it once produced no response —
+        // otherwise the gap is invisible and looks like the turn succeeded.
+        "ResponseFailed" => {
+            let reason = text_field("error").unwrap_or_else(|| "no response".to_string());
+            Some(format!("You (assistant): (failed: {})", reason))
         }
         "CodingAgentToolCalled" => {
             let name = payload
@@ -298,6 +306,7 @@ mod tests {
             args: json!({}),
             description: description.into(),
             agent: crate::runtime::AgentKind::ClaudeCode,
+            tool_use_id: String::new(),
         }
     }
 
@@ -306,6 +315,7 @@ mod tests {
             name: String::new(),
             result: result.into(),
             agent: crate::runtime::AgentKind::ClaudeCode,
+            tool_use_id: String::new(),
         }
     }
 

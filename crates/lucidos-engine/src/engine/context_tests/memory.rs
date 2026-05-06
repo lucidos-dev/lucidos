@@ -5,7 +5,7 @@ use chrono::{Duration, Utc};
 use uuid::Uuid;
 
 const JACCARD_DEDUP_THRESHOLD: f32 = 0.8;
-const MAX_FACTS: usize = 60;
+const MAX_FACTS: usize = 25;
 
 fn make_entry(summary: &str, topic: &str, importance: f32, age_days: i64) -> MemoryEntry {
     MemoryEntry {
@@ -82,7 +82,6 @@ fn run_pipeline(entries: Vec<(MemoryEntry, f64)>) -> Vec<(String, Vec<(MemoryEnt
 
 #[test]
 fn higher_similarity_ranks_higher() {
-    let _now = Utc::now();
     let e1 = make_entry("Fact A", "Topic", 0.8, 10);
     let e2 = make_entry("Fact B", "Topic", 0.8, 10);
     let age = 10.0;
@@ -96,8 +95,6 @@ fn higher_similarity_ranks_higher() {
 
 #[test]
 fn higher_importance_ranks_higher_same_similarity() {
-    let _e1 = make_entry("Critical fact", "Work", 0.95, 5);
-    let _e2 = make_entry("Minor detail", "Work", 0.3, 5);
     let s1 = relevance_score(0.7, 0.95, 5.0);
     let s2 = relevance_score(0.7, 0.3, 5.0);
     assert!(
@@ -110,8 +107,6 @@ fn higher_importance_ranks_higher_same_similarity() {
 
 #[test]
 fn recent_fact_ranks_higher_all_else_equal() {
-    let _e1 = make_entry("Recent fact", "Topic", 0.7, 1);
-    let _e2 = make_entry("Old fact", "Topic", 0.7, 300);
     let s1 = relevance_score(0.8, 0.7, 1.0);
     let s2 = relevance_score(0.8, 0.7, 300.0);
     assert!(s1 > s2, "recent should rank higher: {} vs {}", s1, s2);
@@ -193,18 +188,18 @@ fn distinct_facts_same_topic_both_survive_dedup() {
 #[test]
 fn near_duplicate_gets_deduped_keeps_higher_scored() {
     // Single word substitution in a 6-word fact: 5/7 = 0.714... wait, let's be precise.
-    // "Works at Finn as a software engineer" (7 words) vs
-    // "Works at Finn as a software developer" (7 words)
-    // Shared: {Works, at, Finn, as, a, software} = 6, Union: + {engineer, developer} = 8
+    // "Works at Acme as a software engineer" (7 words) vs
+    // "Works at Acme as a software developer" (7 words)
+    // Shared: {Works, at, Acme, as, a, software} = 6, Union: + {engineer, developer} = 8
     // Jaccard = 6/8 = 0.75 — below 0.8. Need higher overlap.
     // Use verbatim duplicate:
     let entries = vec![
         (
-            make_entry("Works at Finn as a software engineer", "Work", 0.8, 5),
+            make_entry("Works at Acme as a software engineer", "Work", 0.8, 5),
             0.9,
         ),
         (
-            make_entry("Works at Finn as a software engineer", "Work", 0.8, 3),
+            make_entry("Works at Acme as a software engineer", "Work", 0.8, 3),
             0.7,
         ),
     ];
@@ -229,12 +224,12 @@ fn slightly_different_wording_not_deduped() {
     // 0.8 threshold is strict — adding 2+ words to a 7-word fact drops below it
     let entries = vec![
         (
-            make_entry("Works at Finn as a software engineer", "Work", 0.8, 5),
+            make_entry("Works at Acme as a software engineer", "Work", 0.8, 5),
             0.9,
         ),
         (
             make_entry(
-                "Works at Finn as a software engineer in Oslo",
+                "Works at Acme as a software engineer in Oslo",
                 "Work",
                 0.8,
                 3,
@@ -263,11 +258,11 @@ fn dedup_works_across_topics() {
     // Same fact accidentally tagged under different topics — should still dedup
     let entries = vec![
         (
-            make_entry("Kenneth works at Finn as an engineer", "Work", 0.8, 5),
+            make_entry("Alex works at Acme as an engineer", "Work", 0.8, 5),
             0.9,
         ),
         (
-            make_entry("Kenneth works at Finn as an engineer", "Career", 0.8, 5),
+            make_entry("Alex works at Acme as an engineer", "Career", 0.8, 5),
             0.7,
         ),
     ];
@@ -319,7 +314,7 @@ fn top_n_keeps_highest_scored() {
         .flat_map(|(_, entries)| entries.iter().map(|(e, _)| e.summary.clone()))
         .collect();
 
-    // The last 60 (highest-scored) should survive
+    // The top MAX_FACTS (highest-scored) should survive
     assert!(
         facts.contains(&"Fact 99".to_string()),
         "highest-scored fact should survive"

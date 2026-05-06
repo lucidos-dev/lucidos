@@ -4,7 +4,8 @@ import { panelOverlay } from '../store';
 // Mock all side-effect imports that handleNavigationRequest calls
 const switchMenuItem = vi.fn();
 const openSettingsSubview = vi.fn();
-vi.mock('./menu', () => ({ switchMenuItem, openSettingsSubview }));
+const setActiveMenu = vi.fn();
+vi.mock('./menu', () => ({ switchMenuItem, openSettingsSubview, setActiveMenu }));
 
 const openAppById = vi.fn();
 vi.mock('./apps', () => ({
@@ -90,9 +91,24 @@ describe('handleNavigationRequest', () => {
     expect(openSettingsSubview).toHaveBeenCalledWith('accounts');
   });
 
-  it('opens new-trigger form', () => {
+  it('opens new-trigger form atomically (single nav push)', () => {
     handleNavigationRequest({ target: 'new-trigger' });
-    expect(switchMenuItem).toHaveBeenCalledWith('triggers');
-    expect(panelOverlay.value).toEqual({ type: 'form', form: { type: 'trigger' } });
+    expect(setActiveMenu).toHaveBeenCalledWith(
+      'triggers',
+      { type: 'form', form: { type: 'trigger' } },
+    );
+    // switchMenuItem would push an extra (triggers, no overlay) entry first.
+    expect(switchMenuItem).not.toHaveBeenCalled();
+    expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens new-app form atomically (single nav push)', () => {
+    handleNavigationRequest({ target: 'new-app' });
+    expect(setActiveMenu).toHaveBeenCalledWith(
+      'apps',
+      { type: 'form', form: { type: 'new-app' } },
+    );
+    expect(switchMenuItem).not.toHaveBeenCalled();
+    expect(pushNavState).toHaveBeenCalledTimes(1);
   });
 });

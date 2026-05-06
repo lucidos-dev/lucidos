@@ -1,9 +1,9 @@
-import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, SETTINGS_NAV_ITEMS, triggers, appsList, threadChannelFilter, parseRepoPath, repoPending, selectedChange } from '../../store/store';
+import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, SETTINGS_NAV_ITEMS, triggers, appsList, parseRepoPath, repoPending, selectedChange } from '../../store/store';
 import type { ThreadChannel, InlineForm } from '../../store/store';
 import { loadedOr } from '../../store/types';
 import { formatChannel } from '../../utils/formatChannel';
 
-export const menuLabels: Record<string, string> = {
+const menuLabels: Record<string, string> = {
   files: 'Files', apps: 'Apps', triggers: 'Triggers',
   changes: 'Changes', notifications: 'Notifications',
   settings: 'Settings',
@@ -15,7 +15,7 @@ export const CHANNEL_OPTIONS: { value: ThreadChannel; label: string }[] = [
   { value: 'trigger', label: formatChannel('trigger') },
 ];
 
-export function getFormTitle(form: InlineForm): string {
+function getFormTitle(form: InlineForm): string {
   switch (form.type) {
     case 'trigger': {
       if (!form.taskId) return 'New Trigger';
@@ -32,7 +32,7 @@ export function getFormTitle(form: InlineForm): string {
   }
 }
 
-export function getHostname(url: string): string {
+function getHostname(url: string): string {
   try { return new URL(url).hostname; } catch { return url; }
 }
 
@@ -66,16 +66,4 @@ export function getDiffDescription(): string | null {
   const desc = repoPending.value?.description
     ?? selectedChange.value?.description;
   return desc || null;
-}
-
-export function toggleChannel(channel: ThreadChannel) {
-  const current = threadChannelFilter.value;
-  const next = new Set(current);
-  if (next.has(channel)) {
-    if (next.size > 1) next.delete(channel);
-  } else {
-    next.add(channel);
-  }
-  threadChannelFilter.value = next;
-  localStorage.setItem('lucidos-thread-channel-filter', JSON.stringify([...next]));
 }

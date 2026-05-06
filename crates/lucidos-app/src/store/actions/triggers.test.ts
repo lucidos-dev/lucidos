@@ -1,0 +1,127 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { triggers, historicalTriggers, selectedTriggerIds, panelOverlay } from '../store';
+import { pruneStaleSelectedTriggerIds, submitTrigger } from './triggers';
+import { makeTrigger } from '../__tests__/fixtures';
+
+const STORAGE_KEY = 'lucidos-selected-trigger-ids';
+const SCROLL_KEY = 'lucidos-scroll-content-triggers';
+
+const mockCreateTrigger = vi.fn();
+const mockUpdateTrigger = vi.fn();
+const mockListTriggers = vi.fn();
+vi.mock('../../api/client', () => ({
+  createTrigger: (...args: unknown[]) => mockCreateTrigger(...args),
+  updateTrigger: (...args: unknown[]) => mockUpdateTrigger(...args),
+  listTriggers: (...args: unknown[]) => mockListTriggers(...args),
+  listHistoricalTriggers: vi.fn().mockResolvedValue({ triggers: [] }),
+  deleteTriggerApi: vi.fn(),
+}));
+
+describe('pruneStaleSelectedTriggerIds', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    triggers.value = { status: 'not-loaded' };
+    historicalTriggers.value = { status: 'not-loaded' };
+    selectedTriggerIds.value = new Set();
+  });
+
+  it('does nothing while either registry is still loading', () => {
+    selectedTriggerIds.value = new Set(['stale-id']);
+    triggers.value = { status: 'loaded', data: [] };
+    historicalTriggers.value = { status: 'loading' };
+
+    pruneStaleSelectedTriggerIds();
+
+    expect([...selectedTriggerIds.value]).toEqual(['stale-id']);
+  });
+
+  it('drops selected ids that match neither live nor historical, persists to localStorage', () => {
+    selectedTriggerIds.value = new Set(['live-keep', 'hist-keep', 'stale-v5-hash']);
+    triggers.value = { status: 'loaded', data: [makeTrigger({ id: 'live-keep', name: 'Live' })] };
+    historicalTriggers.value = {
+      status: 'loaded',
+      data: [{ id: 'hist-keep', name: 'Hist', last_activity: '2026-04-30T00:00:00Z' }],
+    };
+
+    pruneStaleSelectedTriggerIds();
+
+    expect([...selectedTriggerIds.value].sort()).toEqual(['hist-keep', 'live-keep']);
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]').sort()).toEqual(['hist-keep', 'live-keep']);
+  });
+
+  it('leaves selection untouched when every selected id is still valid', () => {
+    selectedTriggerIds.value = new Set(['live-1']);
+    triggers.value = { status: 'loaded', data: [makeTrigger({ id: 'live-1', name: 'Live' })] };
+    historicalTriggers.value = { status: 'loaded', data: [] };
+
+    pruneStaleSelectedTriggerIds();
+
+    expect([...selectedTriggerIds.value]).toEqual(['live-1']);
+    // No write — `setSelectedTriggerIds` only fires when something dropped.
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+});
+
+describe('submitTrigger scroll reset', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    panelOverlay.value = { type: 'form', form: { type: 'trigger', taskId: 't1' } };
+    triggers.value = { status: 'loaded', data: [] };
+    historicalTriggers.value = { status: 'loaded', data: [] };
+    mockCreateTrigger.mockReset();
+    mockUpdateTrigger.mockReset();
+    mockListTriggers.mockReset().mockResolvedValue({ triggers: [] });
+  });
+
+  it('drops the saved trigger list scroll on update so the list returns to top', async () => {
+    // Bug: editing a trigger far down a long list, saving, returning landed
+    // back at the row instead of the top — useScrollMemory restored the
+    // pre-edit scroll position.
+    localStorage.setItem(SCROLL_KEY, '500');
+    mockUpdateTrigger.mockResolvedValue({ success: true });
+
+    const ok = await submitTrigger({
+      name: 'Nightly Build',
+      run: { type: 'intent', intent: 'build', knowhow: [] },
+      cronExpressions: ['0 0 0 * * *'],
+      taskId: 't1',
+      goToReview: false,
+    });
+
+    expect(ok).toBe(true);
+    expect(localStorage.getItem(SCROLL_KEY)).toBeNull();
+  });
+
+  it('drops the saved trigger list scroll on create as well', async () => {
+    localStorage.setItem(SCROLL_KEY, '300');
+    mockCreateTrigger.mockResolvedValue({ success: true });
+
+    const ok = await submitTrigger({
+      name: 'New Trigger',
+      run: { type: 'intent', intent: 'do thing', knowhow: [] },
+      cronExpressions: ['0 0 0 * * *'],
+      goToReview: false,
+    });
+
+    expect(ok).toBe(true);
+    expect(localStorage.getItem(SCROLL_KEY)).toBeNull();
+  });
+
+  it('leaves the saved scroll alone when save fails (user stays on form)', async () => {
+    localStorage.setItem(SCROLL_KEY, '500');
+    mockUpdateTrigger.mockResolvedValue({ success: false, error: 'nope' });
+
+    const ok = await submitTrigger({
+      name: 'X',
+      run: { type: 'intent', intent: 'x', knowhow: [] },
+      cronExpressions: ['0 0 0 * * *'],
+      taskId: 't1',
+      goToReview: false,
+    });
+
+    expect(ok).toBe(false);
+    // Form is still open; the user hasn't navigated, so the saved position
+    // must be preserved for the eventual successful save (or cancel).
+    expect(localStorage.getItem(SCROLL_KEY)).toBe('500');
+  });
+});

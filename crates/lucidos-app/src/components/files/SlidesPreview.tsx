@@ -29,11 +29,9 @@ interface ContentNode {
   content?: string;
   emoji?: string;
   label?: string;
-  sub?: string;
   num?: number;
   body?: string;
   highlight?: string;
-  style?: string;
   items?: string[];
   events?: string[];
   chips?: string[];
@@ -199,7 +197,7 @@ export function SlidesPreview({ content }: Props) {
   try {
     deck = JSON.parse(content);
   } catch {
-    return <div class="empty-state" style="color:var(--accent-red)">Invalid .slides JSON</div>;
+    return <div class="empty-state error-text">Invalid .slides JSON</div>;
   }
 
   const slides = flattenSlides(deck);

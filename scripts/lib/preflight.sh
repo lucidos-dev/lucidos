@@ -63,7 +63,7 @@ _check_or_install() {
 check_prereqs() {
     if [[ "$OSTYPE" != "darwin"* ]]; then
         # Linux/Windows: no auto-install, but warn on missing required tools.
-        for t in cargo sccache docker node; do
+        for t in cargo sccache cmake docker node; do
             command -v "$t" >/dev/null 2>&1 || echo "Warning: '$t' not found in PATH." >&2
         done
         return 0
@@ -78,6 +78,8 @@ check_prereqs() {
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" required
     _check_or_install sccache "Rust compile cache" \
         "brew install sccache" required
+    _check_or_install cmake   "Required to build native Rust dependencies" \
+        "brew install cmake" required
     _check_or_install docker  "PostgreSQL+pgvector container runtime" \
         "brew install --cask docker && open -a Docker" required
     _check_or_install node    "Frontend / Vite dev server" \

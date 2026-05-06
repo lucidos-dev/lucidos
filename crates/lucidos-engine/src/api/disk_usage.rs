@@ -36,9 +36,9 @@ use crate::engine::event_bus::BusEvent;
 use crate::engine::git_ops::worktrees_dir;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::worktree_cleanup::{
-    available_disk_bytes, deterministic_worktree_for, inventory_worktrees, is_worktree_dirty,
-    prune_build_artifacts, remove_worktree_and_optionally_delete_branch, FREE_DISK_HARD_BYTES,
-    FREE_DISK_SOFT_BYTES,
+    available_disk_bytes, deterministic_worktree_for, directory_size_bytes, inventory_worktrees,
+    is_worktree_dirty, prune_build_artifacts, remove_worktree_and_optionally_delete_branch,
+    FREE_DISK_HARD_BYTES, FREE_DISK_SOFT_BYTES,
 };
 
 /// GET /api/disk-usage/worktrees — inventory of all known per-thread worktrees.
@@ -153,6 +153,10 @@ pub(super) async fn cleanup_worktree(
 /// (rare; typically only when the workspace volume is unreadable). Frontend
 /// computes per-worktree-total locally from the `/disk-usage/worktrees` rows —
 /// we don't duplicate that walk here.
+///
+/// `workspace_data_bytes` walks `<workspace>/data/` (artifacts, postgres,
+/// apps, knowhow, …) so the chart can show it as a distinct segment instead
+/// of letting it disappear into "Other apps".
 pub(super) async fn summary(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -160,10 +164,22 @@ pub(super) async fn summary(
     let dir = worktrees_dir(workspace);
     let free_bytes = available_disk_bytes(&dir).or_else(|| available_disk_bytes(workspace));
     let total_bytes = fs2::total_space(&dir).ok().or_else(|| fs2::total_space(workspace).ok());
+    // The walk can hit a multi-GB postgres data dir with many files — keep it
+    // off the tokio worker thread so other requests aren't stalled.
+    let data_dir = workspace.join(crate::core::DATA_DIR);
+    let workspace_data_bytes =
+        match tokio::task::spawn_blocking(move || directory_size_bytes(&data_dir)).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                crate::log!("[DiskUsage] data dir walk task failed: {}", e);
+                0
+            }
+        };
 
     Ok(Json(serde_json::json!({
         "free_bytes": free_bytes,
         "total_bytes": total_bytes,
+        "workspace_data_bytes": workspace_data_bytes,
         "soft_threshold_bytes": FREE_DISK_SOFT_BYTES,
         "hard_threshold_bytes": FREE_DISK_HARD_BYTES,
     })))

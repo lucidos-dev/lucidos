@@ -1,17 +1,18 @@
 import { API_BASE, postMcpConsent } from '../../api/client';
 import type { Change } from '../../api/client';
-import { threadMap, focusedThreadId, changes, appliedChanges, changesHasMore, updateAvailable, applyingChangeIds, applyingNowThreadIds, generatedTitleIds, ccSessionVersion } from '../store';
-import { memoryRebuildProgress, backupProgress, recoveryProgress, panelOverlay, showConfirm, showToast, dismissToast, repoSource } from '../store';
-import { handleEvent, isChannelDefiningEvent, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadState, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
+import { threadMap, focusedThreadId, changes, appliedChanges, changesHasMore, updateAvailable, applyingChangeIds, applyingNowThreadIds, generatedTitleIds, ccSessionVersion, setFocusedThread } from '../store';
+import { memoryRebuildProgress, backupProgress, backupListVersion, recoveryProgress, showConfirm, showToast, repoSource } from '../store';
+import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadState, type ThreadEvent, type TransientEvent } from '../thread-events';
 import type { ThreadChannel } from '../store';
 import type { MenuItem } from '../types';
 import { handleNotificationSSE } from './notifications';
-import { addRestartGroup } from './chat-changes';
+import { addRestartGroup, appliedToastRefreshAction } from './chat-changes';
 import { loadPreferences } from './preferences';
 import { loadArtifacts, openFilePreview, openUrl, normalizeDataPath } from './artifacts';
 import { navigateToTrigger } from './triggers';
-import { refreshAppUI, captureAppUI, openCredentialRequest, openAppById } from './apps';
-import { navigateToAccounts, switchMenuItem, openSettingsSubview } from './menu';
+import { refreshAppUI, captureAppUI, openAppById } from './apps';
+import { openCredentialRequest } from './credentials';
+import { setActiveMenu, switchMenuItem, openSettingsSubview, landOnAccountsWithOverlay } from './menu';
 import { pushNavState } from './navigation';
 import { initPushSubscription } from './push';
 import { getDeviceId, toggleDevicePush } from './devices';
@@ -19,10 +20,25 @@ import { scrollToBottom } from '../../components/chat/scrollState';
 import { focusThread } from './threads';
 import { refreshRepoView } from './repositories';
 import { processSSEForReferences } from './entityReferences';
+import { loadAllThreads, refreshThreadEvents } from './thread-loading';
+import { applyRemoteCompose, pendingComposePuts } from './compose';
+import { clearDraft, setDraft } from '../composeDrafts';
+import { removeThreadNavEntries } from './thread-navigation';
+import { isComposeFocusedHere } from '../../components/chat/promptFocus';
+import { formatBytes } from '../../utils/formatBytes';
 
 let eventSource: EventSource | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let repoChangesDebounce: ReturnType<typeof setTimeout> | null = null;
+
+/** Set when `onerror` fires; consumed by the next `onopen` so we resync only
+ *  on RECONNECT, not on the initial connect (where loadAllThreads() is already
+ *  driving state via useStartup.ts). */
+let needsResyncOnOpen = false;
+
+/** In-flight resync coalescer — multiple Lagged events or back-to-back
+ *  reconnects collapse into one network round-trip. */
+let resyncInFlight: Promise<void> | null = null;
 
 // Events that clear optimistic Apply Now state — the apply completed, failed,
 // backend took over (merge conflict), or CC resumed work (not actually ending).
@@ -150,6 +166,22 @@ export function connectThreadEvents(): void {
     processSSEForReferences(type, data);
   };
 
+  es.onopen = () => {
+    if (gen !== sseGeneration) return;
+    // Only resync after a reconnect — on the initial connect, useStartup.ts
+    // already loads thread state. Without the flag we'd double-fetch on every
+    // page load.
+    if (needsResyncOnOpen) {
+      needsResyncOnOpen = false;
+      // Terminal BackupCompleted/BackupFailed are ephemeral: if they fired during
+      // the SSE gap, the UI would stay "Backing up..." forever. Clear the signal
+      // so the user can retry; an in-flight backup will repopulate on the next
+      // BackupProgress event, and a duplicate POST returns 409 with a clear toast.
+      backupProgress.value = null;
+      resyncLoadedThreads();
+    }
+  };
+
   es.onerror = () => {
     // Stale handler — disconnectThreadEvents() already closed this
     // EventSource and connectThreadEvents() created a replacement.
@@ -157,6 +189,10 @@ export function connectThreadEvents(): void {
     // (via the module-scoped `eventSource` variable), causing a 3s
     // SSE gap on every iOS Safari PWA resume.
     if (gen !== sseGeneration) return;
+
+    // Mark for resync — events emitted during the gap won't reach this tab,
+    // so the next successful connect must refetch persisted state.
+    needsResyncOnOpen = true;
 
     es.close();
     eventSource = null;
@@ -168,10 +204,37 @@ export function connectThreadEvents(): void {
   };
 }
 
+/** Refetch thread metadata + missed events for every loaded thread.
+ *  Called when SSE drops + reconnects, or when the backend signals `Lagged`
+ *  (its broadcast subscriber fell behind the buffer and dropped events).
+ *  Without this, a tab that misses `ResponseGenerated` shows the "Thinking"
+ *  spinner indefinitely while the backend has long since gone idle. */
+export function resyncLoadedThreads(): Promise<void> {
+  if (resyncInFlight) return resyncInFlight;
+  resyncInFlight = (async () => {
+    try {
+      // Refresh thread-level metadata (status, section, message_count) first
+      // so any per-thread refresh sees the authoritative state.
+      await loadAllThreads();
+      const ids = [...threadMap.value.values()]
+        .filter((t) => t.eventsLoaded)
+        .map((t) => t.meta.id);
+      await Promise.all(ids.map((id) => refreshThreadEvents(id)));
+    } finally {
+      resyncInFlight = null;
+    }
+  })();
+  return resyncInFlight;
+}
+
 export function disconnectThreadEvents(): void {
   // Bump generation BEFORE closing — any onerror handler queued by the
   // close() call will see a stale generation and bail out.
   sseGeneration++;
+  // Explicit disconnect means the caller (runResumeSync, unmount) is taking
+  // ownership of state recovery — don't let the next onopen also resync, or
+  // every real reconnect doubles the per-thread refreshThreadEvents fan-out.
+  needsResyncOnOpen = false;
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -190,7 +253,18 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   const event = data.event as ThreadEvent | TransientEvent;
   const created = typeof data.created === 'string' ? data.created : undefined;
   const eventId = typeof data.event_id === 'string' ? data.event_id : undefined;
+  // Backend-computed projection snapshot. Present on every persisted thread
+  // event, absent on transient events. handleEvent overlays it onto thread.meta.
+  const aggregate = (data.aggregate && typeof data.aggregate === 'object')
+    ? (data.aggregate as ThreadAggregate)
+    : undefined;
   if (!threadId || !event || typeof event !== 'object' || !('type' in event)) return;
+  // Live persisted events MUST carry an aggregate — its absence here (vs.
+  // historical-replay where applyEventRows applies one snapshot at the end)
+  // means the backend missed populating EmittedEvent.aggregate.
+  if (seq !== null && !aggregate) {
+    console.warn(`[SSE] persisted event ${event.type} (seq=${seq}) missing aggregate — backend bug`);
+  }
 
   const map = threadMap.value;
 
@@ -213,37 +287,37 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       || event.type === 'SessionRecovered'
       || event.type.startsWith('CodingAgent');
     const isTriggerEvent = event.type === 'TriggerStarted';
+    const isThreadStarted = event.type === 'ThreadStarted';
     const eventFields = event as Record<string, unknown>;
     const senderIsSystem = modeToInitiator(eventFields.mode as ActorMode | undefined) === 'system';
-    const skeleton: ThreadState = {
-      meta: {
-        id: threadId,
-        title: PENDING_TITLE_PLACEHOLDER,
-        channel: (isCcEvent ? 'claude_code' : isTriggerEvent ? 'trigger' : 'chat') as ThreadMeta['channel'],
-        initiator: isTriggerEvent || senderIsSystem ? 'system' : 'user',
-        pinned: false,
-        createdAt: created || new Date().toISOString(),
-        updatedAt: created || new Date().toISOString(),
-        unread: true,
-        status: 'running',
-        messageCount: 0,
-        section: 'default',
-        activeChildrenCount: 0,
-        totalChildrenCount: 0,
-        ccHasChanges: false,
-        ccRequiresRestart: false,
-        ccIsExternalRepo: false,
-        ccApplying: false,
-        lastRevivedAt: created || new Date().toISOString(),
-      },
-      events: new Map(),
-      streamingBuffer: '',
-      eventsLoaded: false,
-      eventsLoadFailed: false,
-      lastDbSeq: 0,
-      pendingUserMessages: [],
-    };
-    map.set(threadId, skeleton);
+    const startedMode = isThreadStarted ? (eventFields.mode as string | undefined) : undefined;
+    map.set(threadId, makeOptimisticThreadState({
+      id: threadId,
+      title: PENDING_TITLE_PLACEHOLDER,
+      channel: (isCcEvent || startedMode === 'claude_code'
+        ? 'claude_code'
+        : isTriggerEvent
+          ? 'trigger'
+          : 'chat') as ThreadMeta['channel'],
+      initiator: isTriggerEvent || senderIsSystem ? 'system' : 'user',
+      eventsLoaded: isThreadStarted, // composing has no events to load
+      timestamp: created,
+      triggerId: isTriggerEvent ? (eventFields.trigger_id as string | undefined) : undefined,
+      triggerName: isTriggerEvent ? (eventFields.trigger_name as string | undefined) : undefined,
+      ...(isThreadStarted ? {
+        state: 'composing' as const,
+        status: 'idle' as const,
+      } : {}),
+    }));
+    if (isThreadStarted) {
+      // Seed the draft entry with the user's mode pick from ThreadStarted's
+      // payload — ThreadComposeChanged will follow with text/images shortly.
+      setDraft(threadId, {
+        text: '',
+        images: [],
+        mode: startedMode === 'claude_code' ? 'claude_code' : 'lucidos',
+      });
+    }
   }
 
   // Thread is guaranteed to exist after the skeleton block above.
@@ -261,6 +335,10 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     thread.meta.activeChildrenCount = event.active;
     thread.meta.totalChildrenCount = event.total;
   }
+  if (event.type === 'TriggerStarted') {
+    if (!thread.meta.triggerId) thread.meta.triggerId = event.trigger_id;
+    if (!thread.meta.triggerName && event.trigger_name) thread.meta.triggerName = event.trigger_name;
+  }
 
   // If a prior loadThreadEvents failed but SSE is now delivering persisted
   // events, clear the failure flag so the UI recovers from error → content.
@@ -271,8 +349,37 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // seq from SSE: present (number > 0) for persisted events, absent for transient
   const effectiveSeq = seq ?? null;
 
-  handleEvent(map, threadId, effectiveSeq, event, created, eventId);
+  handleEvent(map, threadId, effectiveSeq, event, created, eventId, aggregate);
   scheduleThreadMapFlush();
+
+  // Compose-clear must yield to a user actively typing here. Two layers:
+  //   1. Origin-device echo: when the send/discard came from this device,
+  //      sendCompose/discardCompose already mutated local compose state
+  //      synchronously. The SSE echo arrives later and would blank any text
+  //      the user has started typing for the next message — drop it.
+  //   2. Focused textarea (cross-device fallback): when a peer device sends
+  //      and this user is mid-keystroke, dropping the inbound clear preserves
+  //      the local PUT that may not have round-tripped yet.
+  if (event.type === 'MessageReceived') {
+    thread.meta.state = 'active';
+    if (!isFromThisDevice(event)) clearComposeIfUnfocused(thread, threadId);
+  }
+  if (event.type === 'ThreadDiscarded') {
+    thread.meta.state = 'discarded';
+    if (!isFromThisDevice(event)) {
+      // Without releasing focus + nav, ThreadPane keeps routing to ThreadView
+      // (state ≠ 'composing') and shows the empty-state instead of the fresh
+      // compose layout. Skipped while typing here so keystrokes aren't yanked.
+      if (!isComposeFocusedHere(threadId)) {
+        if (focusedThreadId.value === threadId) setFocusedThread(null);
+        removeThreadNavEntries(threadId);
+      }
+      clearComposeIfUnfocused(thread, threadId);
+    }
+  }
+  if (event.type === 'ThreadArchived') {
+    thread.meta.state = 'archived';
+  }
 
   // Bump CC session version so CCControlMenu re-fetches commands.
   // CodingAgentUserMessageSent covers follow-ups to idle CC sessions
@@ -285,7 +392,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     ccSessionVersion.value++;
   }
 
-  // No auto-read on focus — user must explicitly click Done, Apply, or Discard.
+  // No auto-read on focus — user must explicitly click Archive, Apply, or Discard.
 
   // Dispatch side effects for transient events
   handleTransientSideEffects(event);
@@ -324,25 +431,36 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   if (event.type === 'ChangeApplied') {
     const changeId = (event as { change_id?: string }).change_id;
     const desc = changeId ? findChangeDescription(threadId, changeId) : undefined;
+    const requiresRestart = !!(event as { requires_restart?: boolean }).requires_restart;
+    const clientUpdate = !!(event as { client_update?: boolean }).client_update;
     const applyKey = `applying-${threadId}`;
-    showToast(changeToastMessage('Applied', threadId, desc), 'success', { key: applyKey, onClick: () => focusThread(threadId) });
-    setTimeout(() => dismissToast(applyKey), 5000);
+    const refreshAction = appliedToastRefreshAction(requiresRestart, clientUpdate);
+    showToast(changeToastMessage('Applied', threadId, desc), 'success', {
+      key: applyKey,
+      onClick: () => focusThread(threadId),
+      action: refreshAction,
+      autoDismissMs: 4000,
+    });
     // Set restart toast immediately from the thread event — don't wait for
     // the separate ChangesUpdated system event. If ChangesUpdated is missed
     // (SSE drop, Vite reload race), this ensures the toast appears.
-    if ((event as { requires_restart?: boolean }).requires_restart) {
+    if (requiresRestart) {
       const commits = (event as { commits?: string[] }).commits ?? [];
       const eventTitle = (event as { thread_title?: string }).thread_title;
       const threadTitle = eventTitle ?? threadMap.value.get(threadId)?.meta.title ?? 'Untitled thread';
       addRestartGroup({ threadId, threadTitle, commits });
     }
-    if ((event as { client_update?: boolean }).client_update) {
+    if (clientUpdate) {
       updateAvailable.value = true;
     }
   } else if (event.type === 'ChangeDiscarded') {
     const changeId = (event as { change_id?: string }).change_id;
     const desc = changeId ? findChangeDescription(threadId, changeId) : undefined;
-    showToast(changeToastMessage('Discarded', threadId, desc), 'success');
+    showToast(changeToastMessage('Discarded', threadId, desc), 'success', {
+      key: `discarding-${threadId}`,
+      onClick: () => focusThread(threadId),
+      autoDismissMs: 4000,
+    });
   } else if (event.type === 'ChangeReverted') {
     const changeId = (event as { change_id?: string }).change_id;
     const desc = changeId ? findChangeDescription(threadId, changeId) : undefined;
@@ -380,7 +498,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   }
 }
 
-function handleGlobalEvent(type: string, data: Record<string, unknown>): void {
+export function handleGlobalEvent(type: string, data: Record<string, unknown>): void {
   switch (type) {
     case 'NotificationCreated':
     case 'NotificationRead':
@@ -426,9 +544,23 @@ function handleGlobalEvent(type: string, data: Record<string, unknown>): void {
       const progress = (data.progress as number) ?? 0;
       const total = (data.total as number) ?? 0;
       backupProgress.value = { phase, progress, total };
-      if (progress >= total && total > 0) {
-        setTimeout(() => { backupProgress.value = null; }, 2000);
-      }
+      // BackupCompleted/BackupFailed clear progress; auto-clearing on 100%
+      // would null a follow-up backup started <2s later.
+      break;
+    }
+
+    case 'BackupCompleted': {
+      backupProgress.value = null;
+      const filename = String(data.filename ?? '');
+      const size = formatBytes(Number(data.size_bytes ?? 0));
+      showToast(`Backup created: ${filename} (${size})`, 'success');
+      backupListVersion.value++;
+      break;
+    }
+
+    case 'BackupFailed': {
+      backupProgress.value = null;
+      showToast(`Backup failed: ${String(data.error ?? 'Unknown error')}`, 'error');
       break;
     }
 
@@ -448,7 +580,66 @@ function handleGlobalEvent(type: string, data: Record<string, unknown>): void {
       if (message) showToast(message, level as 'success' | 'info' | 'error' | 'warning');
       break;
     }
+
+    case 'Lagged': {
+      // Backend signals our broadcast subscriber fell behind the buffer and
+      // dropped events. Refetch state so any "in-flight" UI (Thinking spinner,
+      // streaming exchange) reconciles with the now-completed backend state.
+      const count = (data.count as number) ?? 0;
+      console.warn(`[SSE] Stream lagged by ${count} events — resyncing loaded threads`);
+      resyncLoadedThreads();
+      break;
+    }
+
+    // ThreadComposeChanged is the SSE-only ephemeral notification emitted on
+    // every compose PUT. Routed to compose.ts which writes the threadMap
+    // entry's compose fields. Three guards layered together:
+    //   1. origin_device_id — server rebroadcasts to all devices including
+    //      the originator; ignore our own echo.
+    //   2. pendingComposePuts — a debounced PUT may already be in flight
+    //      with newer text; the SSE event for our previous PUT could clobber
+    //      it on arrival otherwise.
+    //   3. focused-textarea — if the user is mid-keystroke on this thread's
+    //      input, dropping the inbound update is safer than blanking what
+    //      they just typed.
+    case 'ThreadComposeChanged': {
+      const originDeviceId = data.origin_device_id as string | undefined;
+      if (originDeviceId && originDeviceId === getDeviceId()) break;
+      const id = data.id as string;
+      if (pendingComposePuts.has(id)) break;
+      if (isComposeFocusedHere(id)) break;
+      const modeRaw = data.mode as string | undefined;
+      applyRemoteCompose(id, {
+        text: (data.text as string) ?? '',
+        images: Array.isArray(data.images) ? data.images as string[] : [],
+        mode: modeRaw === 'claude_code' ? 'claude_code' : modeRaw === 'lucidos' ? 'lucidos' : null,
+      });
+      break;
+    }
   }
+}
+
+/** True when an inbound thread event was emitted by this browser. Per-event
+ *  field: `MessageReceived.device_id` (HTTP-boundary legacy field) or
+ *  `ThreadDiscarded.actor.device_id` (structured MessageOrigin). Matching
+ *  means the local mutating action already updated state synchronously —
+ *  applying the SSE echo would clobber any keystrokes the user has typed
+ *  since the local mutation. */
+function isFromThisDevice(event: ThreadEvent | TransientEvent): boolean {
+  const me = getDeviceId();
+  switch (event.type) {
+    case 'MessageReceived':
+      return event.device_id === me;
+    case 'ThreadDiscarded':
+      return event.actor?.kind === 'device' && event.actor.device_id === me;
+    default:
+      return false;
+  }
+}
+
+function clearComposeIfUnfocused(_thread: ThreadState, threadId: string): void {
+  if (isComposeFocusedHere(threadId)) return;
+  clearDraft(threadId);
 }
 
 /** Handle transient ThreadEvent types that trigger side effects (modals, refreshes). */
@@ -459,17 +650,18 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent): void {
         openCredentialRequest(JSON.parse((event as { payload: string }).payload));
       } catch (e) {
         console.error('Failed to parse credential request:', e);
+        showToast('Failed to handle credential request from engine', 'error');
       }
       break;
 
     case 'EmailConfirmRequest':
       try {
         const request = JSON.parse((event as { payload: string }).payload);
-        navigateToAccounts();
-        panelOverlay.value = { type: 'form', form: { type: 'email-confirm', request } };
+        landOnAccountsWithOverlay({ type: 'form', form: { type: 'email-confirm', request } });
         pushNavState();
       } catch (e) {
         console.error('Failed to parse email confirm request:', e);
+        showToast('Failed to handle email confirm request from engine', 'error');
       }
       break;
 
@@ -529,6 +721,7 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent): void {
         handleNavigationRequest(nav);
       } catch (e) {
         console.error('[SSE] Failed to parse navigation request:', e);
+        showToast('Failed to handle navigation request from engine', 'error');
       }
       break;
 
@@ -547,34 +740,14 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent): void {
       // Create the CC thread with proper title and source
       // Inherit initiator from parent — if parent is system-initiated, CC sub-thread is too
       if (!map.has(e.cc_thread_id)) {
-        map.set(e.cc_thread_id, {
-          meta: {
-            id: e.cc_thread_id,
-            title: e.title,
-            channel: 'claude_code',
-            initiator: currentThread?.meta.initiator ?? 'user',
-            pinned: false,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            unread: false,
-            status: 'running',
-            messageCount: 0,
-            section: 'default',
-            activeChildrenCount: 0,
-            totalChildrenCount: 0,
-            ccHasChanges: false,
-            ccRequiresRestart: false,
-            ccIsExternalRepo: false,
-            ccApplying: false,
-            lastRevivedAt: new Date().toISOString(),
-          },
-          events: new Map(),
-          streamingBuffer: '',
+        map.set(e.cc_thread_id, makeOptimisticThreadState({
+          id: e.cc_thread_id,
+          title: e.title,
+          channel: 'claude_code',
+          initiator: currentThread?.meta.initiator ?? 'user',
           eventsLoaded: false,
-          eventsLoadFailed: false,
-          lastDbSeq: 0,
           pendingUserMessages: userMessages,
-        });
+        }));
       }
       flushThreadMap();  // Immediate — user needs to see the new thread now
       break;
@@ -622,13 +795,13 @@ export function handleNavigationRequest(nav: {
       if (nav.id) focusThread(nav.id);
       break;
     case 'new-app':
-      switchMenuItem('apps');
-      panelOverlay.value = { type: 'form', form: { type: 'new-app' } };
+      // Single nav push — switchMenuItem would push (apps, no overlay) first,
+      // stranding Back on an empty Apps list.
+      setActiveMenu('apps', { type: 'form', form: { type: 'new-app' } });
       pushNavState();
       break;
     case 'new-trigger':
-      switchMenuItem('triggers');
-      panelOverlay.value = { type: 'form', form: { type: 'trigger' } };
+      setActiveMenu('triggers', { type: 'form', form: { type: 'trigger' } });
       pushNavState();
       break;
     case 'url':

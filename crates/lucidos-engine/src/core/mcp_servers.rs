@@ -25,6 +25,21 @@ type McpServerRow = (
 
 pub struct McpServerStore;
 
+fn row_to_server(
+    row: McpServerRow,
+) -> Result<McpServer, Box<dyn std::error::Error + Send + Sync>> {
+    let (id, name, command, args, env, auto_approve, created_at) = row;
+    Ok(McpServer {
+        id,
+        name,
+        command,
+        args: serde_json::from_value(args)?,
+        env: serde_json::from_value(env)?,
+        auto_approve,
+        created_at,
+    })
+}
+
 impl McpServerStore {
     pub async fn list(
         pool: &PgPool,
@@ -36,20 +51,7 @@ impl McpServerStore {
             .fetch_all(pool)
             .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, name, command, args, env, auto_approve, created_at)| McpServer {
-                    id,
-                    name,
-                    command,
-                    args: serde_json::from_value(args).unwrap_or_default(),
-                    env: serde_json::from_value(env).unwrap_or_default(),
-                    auto_approve,
-                    created_at,
-                },
-            )
-            .collect())
+        rows.into_iter().map(row_to_server).collect()
     }
 
     pub async fn get(
@@ -64,17 +66,7 @@ impl McpServerStore {
             .fetch_optional(pool)
             .await?;
 
-        Ok(row.map(
-            |(id, name, command, args, env, auto_approve, created_at)| McpServer {
-                id,
-                name,
-                command,
-                args: serde_json::from_value(args).unwrap_or_default(),
-                env: serde_json::from_value(env).unwrap_or_default(),
-                auto_approve,
-                created_at,
-            },
-        ))
+        row.map(row_to_server).transpose()
     }
 
     pub async fn insert(

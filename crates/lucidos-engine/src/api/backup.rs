@@ -72,7 +72,7 @@ pub struct ScheduleResponse {
 
 /// JSON error response so the frontend can parse the actual error message.
 #[derive(Serialize)]
-pub(super) struct ErrorResponse {
+pub(crate) struct ErrorResponse {
     error: String,
 }
 
@@ -80,7 +80,7 @@ fn json_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<E
     (status, Json(ErrorResponse { error: msg.into() }))
 }
 
-fn progress_sender(
+pub(crate) fn progress_sender(
     sender: tokio::sync::broadcast::Sender<crate::engine::event_bus::EmittedEvent>,
 ) -> impl Fn(&str, usize, usize) + Send + Sync + 'static {
     move |phase: &str, current: usize, total: usize| {
@@ -95,6 +95,7 @@ fn progress_sender(
                     total,
                 },
             ),
+            aggregate: None,
         });
     }
 }
@@ -106,14 +107,25 @@ fn resolve_provider(
     backup::get_provider(provider_id, pool).map_err(|e| json_error(StatusCode::BAD_REQUEST, e))
 }
 
-pub async fn list_providers(State(state): State<AppState>) -> Json<Vec<ProviderInfo>> {
+pub async fn list_providers(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ProviderInfo>>, (StatusCode, Json<ErrorResponse>)> {
     let metas = backup::list_providers();
     let mut result = Vec::with_capacity(metas.len());
     for meta in metas {
+        // Surface DB errors instead of silently treating them as "not connected" —
+        // a transient DB failure must not be reported as "no OAuth account".
         let account = OAuthStore::get_by_provider(&state.pool, meta.oauth_provider)
             .await
-            .ok()
-            .flatten();
+            .map_err(|e| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Failed to query OAuth account for {}: {e}",
+                        meta.oauth_provider
+                    ),
+                )
+            })?;
         let connected = account.is_some();
         let ready = connected
             && (meta.required_scope.is_empty()
@@ -128,7 +140,7 @@ pub async fn list_providers(State(state): State<AppState>) -> Json<Vec<ProviderI
             required_scope: meta.required_scope,
         });
     }
-    Json(result)
+    Ok(Json(result))
 }
 
 pub async fn get_backup_key(
@@ -146,12 +158,19 @@ pub async fn get_backup_key(
     }))
 }
 
+/// Queues a backup and returns 202 immediately; terminal state arrives via
+/// the `BackupCompleted` / `BackupFailed` SSE events. The backup pipeline can
+/// run for many minutes, so a synchronous handler would race the frontend's
+/// AbortController and discard the result.
 pub async fn create_backup(
     State(state): State<AppState>,
     Json(req): Json<BackupRequest>,
-) -> Result<Json<backup::BackupEntry>, (StatusCode, Json<ErrorResponse>)> {
-    let provider = resolve_provider(&req.provider, &state.pool)?;
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
+    let guard = crate::scheduler::BackupGuard::try_acquire(&state.engine)
+        .ok_or_else(|| json_error(StatusCode::CONFLICT, "Backup already in progress"))?;
 
+    // Validate sync — guard drops on early return so the flag is released.
+    let provider = resolve_provider(&req.provider, &state.pool)?;
     let (key, _) = crypto::ensure_key(&state.workspace_path).map_err(|e| {
         json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -159,35 +178,28 @@ pub async fn create_backup(
         )
     })?;
 
+    let engine = state.engine.clone();
+    let pool = state.pool.clone();
+    let workspace = state.workspace_path.clone();
     let database_url = crate::core::database_url();
 
-    let progress = progress_sender(state.engine.event_bus.sender());
-
-    let entry = backup::create_backup(
-        &state.workspace_path,
-        &database_url,
-        &key,
-        provider.as_ref(),
-        progress,
-    )
-    .await
-    .map_err(|e| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Backup failed: {e}"),
-        )
-    })?;
-
-    // Prune old backups in the background — don't block the response
-    let pool_clone = state.pool.clone();
     tokio::spawn(async move {
-        let keep = backup::get_retention_count(&pool_clone).await;
-        if let Err(e) = backup::prune_old_backups(provider.as_ref(), keep).await {
-            crate::log!("[Backup] Pruning failed (non-fatal): {}", e);
-        }
+        let _guard = guard;
+        crate::scheduler::run_backup(
+            &engine,
+            &pool,
+            &workspace,
+            &database_url,
+            &key,
+            provider.as_ref(),
+        )
+        .await;
     });
 
-    Ok(Json(entry))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "status": "started" })),
+    ))
 }
 
 pub async fn list_backups(

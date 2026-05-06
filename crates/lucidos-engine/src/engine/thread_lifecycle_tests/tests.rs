@@ -1,9 +1,7 @@
 use super::*;
 
 const SECTION_TRANSITION_EVENTS: &[(&str, &str)] = &[
-    ("ThreadMarkedRead", "default"),
-    ("ThreadMarkedUnread", "unread"),
-    ("ThreadDismissed", "default"),
+    ("ThreadArchived", "archived"),
 ];
 
 const CC_ONLY_EVENTS: &[&str] = &[
@@ -39,8 +37,8 @@ fn generate_cross_validation_fixture() -> String {
         ("failed", ThreadStatus::Failed),
     ];
     let sections = [
-        ("default", StoredSection::Default),
-        ("unread", StoredSection::Unread),
+        ("archived", ArchiveState::Archived),
+        ("inbox", ArchiveState::Inbox),
     ];
     let bools = [false, true];
 
@@ -54,7 +52,7 @@ fn generate_cross_validation_fixture() -> String {
                     let actions: Vec<&str> = resolve_actions(*tt, *st, *sec, pending)
                         .iter()
                         .map(|a| match a {
-                            Action::Done => "done",
+                            Action::Archive => "archive",
                             Action::Apply => "apply",
                             Action::Discard => "discard",
                         })
@@ -69,23 +67,24 @@ fn generate_cross_validation_fixture() -> String {
         }
     }
 
-    // displaySection: 2 sections × 3 statuses × 2 pinned × 2 activeChildren = 24 cases
+    // displaySection: 2 sections × 3 statuses × 2 saved × 2 activeChildren × 2 pending = 48 cases
     for (sec_str, sec) in &sections {
         for (st_str, st) in &statuses {
-            for &pinned in &bools {
+            for &saved in &bools {
                 for &active_children in &bools {
-                    let result = display_section(*sec, *st, pinned, active_children);
-                    let result_str = match result {
-                        DisplaySection::Running => "running",
-                        DisplaySection::Waiting => "waiting",
-                        DisplaySection::Review => "review",
-                        DisplaySection::Pinned => "pinned",
-                        DisplaySection::History => "history",
-                    };
-                    cases.push(format!(
-                            r#"    {{ "fn": "displaySection", "args": [{:?}, {:?}, {}, {}], "expected": {:?} }}"#,
-                            sec_str, st_str, pinned, active_children, result_str
-                        ));
+                    for &pending in &bools {
+                        let result = display_section(*sec, *st, saved, active_children, pending);
+                        let result_str = match result {
+                            DisplaySection::Active => "active",
+                            DisplaySection::Review => "review",
+                            DisplaySection::Saved => "saved",
+                            DisplaySection::Archive => "archive",
+                        };
+                        cases.push(format!(
+                                r#"    {{ "fn": "displaySection", "args": [{:?}, {:?}, {}, {}, {}], "expected": {:?} }}"#,
+                                sec_str, st_str, saved, active_children, pending, result_str
+                            ));
+                    }
                 }
             }
         }
@@ -106,24 +105,24 @@ fn generate_typescript() -> String {
     // Type aliases
     out.push_str("export type EventChannel = 'chat' | 'claude_code' | 'trigger';\n");
     out.push_str("export const EVENT_CHANNELS: readonly EventChannel[] = ['chat', 'claude_code', 'trigger'] as const;\n");
-    out.push_str("export type SessionEndReason = 'shutdown' | 'panic' | 'closed' | 'legacy_non_terminal';\n");
-    out.push_str("export const SESSION_END_REASONS: readonly SessionEndReason[] = ['shutdown', 'panic', 'closed', 'legacy_non_terminal'] as const;\n");
+    out.push_str("export type SessionEndReason = 'shutdown' | 'panic' | 'closed' | 'stale_resume' | 'legacy_non_terminal';\n");
+    out.push_str("export const SESSION_END_REASONS: readonly SessionEndReason[] = ['shutdown', 'panic', 'closed', 'stale_resume', 'legacy_non_terminal'] as const;\n");
     out.push_str("export type ThreadType = 'chat' | 'claude_code';\n");
-    out.push_str("export type StoredSection = 'default' | 'unread';\n");
+    out.push_str("export type ArchiveState = 'archived' | 'inbox';\n");
     out.push_str(
-        "export type DisplaySection = 'running' | 'waiting' | 'review' | 'pinned' | 'history';\n",
+        "export type DisplaySection = 'active' | 'saved' | 'review' | 'archive';\n",
     );
     out.push_str("export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'failed';\n");
     out.push_str("export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';\n");
-    out.push_str("export type Action = 'done' | 'apply' | 'discard';\n");
+    out.push_str("export type Action = 'archive' | 'apply' | 'discard';\n");
     out.push_str("export type MessageLabel = 'Requesting' | 'Working' | 'Waiting' | 'Canceled' | 'Aborted';\n\n");
 
     // LEGAL_SECTIONS
     out.push_str(
-        "export const LEGAL_SECTIONS: Readonly<Record<ThreadType, readonly StoredSection[]>> = {\n",
+        "export const LEGAL_SECTIONS: Readonly<Record<ThreadType, readonly ArchiveState[]>> = {\n",
     );
-    out.push_str("  chat: ['default', 'unread'],\n");
-    out.push_str("  claude_code: ['default', 'unread'],\n");
+    out.push_str("  chat: ['archived', 'inbox'],\n");
+    out.push_str("  claude_code: ['archived', 'inbox'],\n");
     out.push_str("} as const;\n\n");
 
     // EVENT_CLASSIFICATION
@@ -157,22 +156,23 @@ fn generate_typescript() -> String {
     out.push_str("]);\n\n");
 
     // isSectionLegal
-    out.push_str("export function isSectionLegal(threadType: ThreadType, section: StoredSection): boolean {\n");
+    out.push_str("export function isSectionLegal(threadType: ThreadType, section: ArchiveState): boolean {\n");
     out.push_str("  return (LEGAL_SECTIONS[threadType] as readonly string[]).includes(section);\n");
     out.push_str("}\n\n");
 
     // displaySection
     out.push_str("export function displaySection(\n");
-    out.push_str("  stored: StoredSection,\n");
+    out.push_str("  stored: ArchiveState,\n");
     out.push_str("  status: ThreadStatus,\n");
-    out.push_str("  isPinned: boolean,\n");
+    out.push_str("  isSaved: boolean,\n");
     out.push_str("  hasActiveChildren: boolean,\n");
+    out.push_str("  hasPendingChanges: boolean,\n");
     out.push_str("): DisplaySection {\n");
-    out.push_str("  if (status === 'running') return 'running';\n");
-    out.push_str("  if (status === 'waiting_for_user_answer') return 'review';\n");
-    out.push_str("  if (hasActiveChildren) return 'waiting';\n");
-    out.push_str("  if (stored === 'unread') return 'review';\n");
-    out.push_str("  return isPinned ? 'pinned' : 'history';\n");
+    out.push_str("  if (isSaved) return 'saved';\n");
+    out.push_str("  if (status === 'running' || hasActiveChildren) return 'active';\n");
+    out.push_str("  if (hasPendingChanges) return 'review';\n");
+    out.push_str("  if (stored === 'archived') return 'archive';\n");
+    out.push_str("  return 'review';\n");
     out.push_str("}\n\n");
 
     // isCcOnlyEvent
@@ -184,74 +184,20 @@ fn generate_typescript() -> String {
     out.push_str("\nexport function resolveActions(\n");
     out.push_str("  threadType: ThreadType,\n");
     out.push_str("  status: ThreadStatus,\n");
-    out.push_str("  storedSection: StoredSection,\n");
+    out.push_str("  storedSection: ArchiveState,\n");
     out.push_str("  hasPendingChanges: boolean,\n");
     out.push_str("): Action[] {\n");
-    out.push_str("  if (storedSection !== 'unread') return [];\n");
-    out.push_str("  if (status === 'running') return [];\n");
-    out.push_str("  if (status === 'waiting_for_user_answer') return ['done'];\n");
-    out.push_str("  if (threadType === 'chat') return ['done'];\n");
-    out.push_str("  return hasPendingChanges ? ['discard', 'apply'] : ['done'];\n");
+    out.push_str("  if (status === 'running' || status === 'waiting_for_user_answer') return [];\n");
+    out.push_str("  if (hasPendingChanges && threadType === 'claude_code') return ['discard', 'apply'];\n");
+    out.push_str("  if (storedSection !== 'inbox') return [];\n");
+    out.push_str("  return ['archive'];\n");
     out.push_str("}\n");
 
-    // Status transition types
-    out.push_str("\nexport type StatusRule =\n");
-    out.push_str("  | { kind: 'set'; status: ThreadStatus }\n");
-    out.push_str(
-        "  | { kind: 'conditional_cc'; withChanges: ThreadStatus; withoutChanges: ThreadStatus }\n",
-    );
-    out.push_str("  | { kind: 'no_change' };\n\n");
-
-    out.push_str("export type CcFlagRule =\n");
-    out.push_str("  | { kind: 'clear_all' }\n");
-    out.push_str("  | { kind: 'set_changes' }\n");
-    out.push_str("  | { kind: 'set_applying' }\n");
-    out.push_str("  | { kind: 'clear_applying' }\n");
-    out.push_str("  | { kind: 'from_payload' }\n");
-    out.push_str("  | null;\n\n");
-
-    out.push_str("export type StatusTransition = {\n");
-    out.push_str("  status: StatusRule;\n");
-    out.push_str("  ccFlags: CcFlagRule;\n");
-    out.push_str("};\n\n");
-
-    out.push_str(
-        "export const STATUS_TRANSITIONS: Readonly<Record<string, StatusTransition>> = {\n",
-    );
-    for (event, transition) in status_transitions() {
-        let status_str = match &transition.status {
-            StatusRule::Set(s) => {
-                format!("{{ kind: 'set', status: '{}' }}", s.as_str())
-            }
-            StatusRule::ConditionalCc(with, without) => {
-                format!(
-                    "{{ kind: 'conditional_cc', withChanges: '{}', withoutChanges: '{}' }}",
-                    with.as_str(),
-                    without.as_str()
-                )
-            }
-            StatusRule::NoChange => "{ kind: 'no_change' }".to_string(),
-        };
-        let cc_str = match &transition.cc_flags {
-            CcFlagRule::ClearAll => "{ kind: 'clear_all' }",
-            CcFlagRule::SetChanges => "{ kind: 'set_changes' }",
-            CcFlagRule::SetApplying => "{ kind: 'set_applying' }",
-            CcFlagRule::ClearApplying => "{ kind: 'clear_applying' }",
-            CcFlagRule::FromPayload => "{ kind: 'from_payload' }",
-            CcFlagRule::None => "null",
-        };
-        out.push_str(&format!(
-            "  {}: {{ status: {}, ccFlags: {} }},\n",
-            event, status_str, cc_str
-        ));
-    }
-    out.push_str("} as const;\n\n");
-
-    out.push_str("export const SECTION_TRANSITIONS: Readonly<Record<string, StoredSection>> = {\n");
-    for (event, section) in SECTION_TRANSITION_EVENTS {
-        out.push_str(&format!("  {}: '{}',\n", event, section));
-    }
-    out.push_str("} as const;\n\n");
+    // STATUS_TRANSITIONS / SECTION_TRANSITIONS removed in Phase 5: the
+    // frontend now sources thread.meta.status and thread.meta.section
+    // exclusively from the per-event ThreadAggregate snapshot, so the
+    // generated lookup tables and their supporting types (StatusRule,
+    // CcFlagRule, StatusTransition) are no longer consumed.
 
     out.push_str("export const MESSAGE_COUNT_EVENTS: ReadonlySet<string> = new Set([\n");
     for event in MESSAGE_COUNT_EVENTS {
@@ -280,10 +226,8 @@ fn metadata_events_are_correct() {
     let metadata_events = [
         "ThreadTitleGenerated",
         "ThreadTitleRenamed",
-        "ThreadPinned",
-        "ThreadUnpinned",
-        "ThreadMarkedRead",
-        "ThreadMarkedUnread",
+        "ThreadSaved",
+        "ThreadUnsaved",
     ];
     for event_type in &metadata_events {
         assert_eq!(
@@ -319,65 +263,54 @@ fn cc_events_never_classified_as_start() {
 // 4. both_thread_types_share_same_legal_sections
 #[test]
 fn both_thread_types_share_same_legal_sections() {
-    assert!(is_section_legal(ThreadType::Chat, StoredSection::Default));
-    assert!(is_section_legal(ThreadType::Chat, StoredSection::Unread));
+    assert!(is_section_legal(ThreadType::Chat, ArchiveState::Archived));
+    assert!(is_section_legal(ThreadType::Chat, ArchiveState::Inbox));
     assert!(is_section_legal(
         ThreadType::CodingAgent,
-        StoredSection::Default
+        ArchiveState::Archived
     ));
     assert!(is_section_legal(
         ThreadType::CodingAgent,
-        StoredSection::Unread
+        ArchiveState::Inbox
     ));
 }
 
-// 5. response_generated_marks_chat_unread
+// 5. response_generated_surfaces_chat_to_inbox
 #[test]
-fn response_generated_marks_chat_unread() {
+fn response_generated_surfaces_chat_to_inbox() {
     let result = resolve_transition(
         "ResponseGenerated",
         ThreadType::Chat,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(StoredSection::Unread));
-    assert_eq!(
-        result.side_effects,
-        vec![SideEffect::EmitThreadMarkedUnread]
-    );
-}
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));}
 
-// 6. response_generated_does_not_mark_cc_unread
+// 6. response_generated_does_not_surface_cc
 #[test]
-fn response_generated_does_not_mark_cc_unread() {
+fn response_generated_does_not_surface_cc() {
     let result = resolve_transition(
         "ResponseGenerated",
         ThreadType::CodingAgent,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     )
     .unwrap();
     assert_eq!(result.new_section, None);
-    assert!(result.side_effects.is_empty());
 }
 
-// 7. claude_code_idled_marks_cc_unread
+// 7. claude_code_idled_surfaces_cc_to_inbox
 #[test]
-fn claude_code_idled_marks_cc_unread() {
+fn claude_code_idled_surfaces_cc_to_inbox() {
     let result = resolve_transition(
         "CodingAgentIdled",
         ThreadType::CodingAgent,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(StoredSection::Unread));
-    assert_eq!(
-        result.side_effects,
-        vec![SideEffect::EmitThreadMarkedUnread]
-    );
-}
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));}
 
 // 8. claude_code_idled_rejected_for_chat
 #[test]
@@ -385,146 +318,108 @@ fn claude_code_idled_rejected_for_chat() {
     let result = resolve_transition(
         "CodingAgentIdled",
         ThreadType::Chat,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     );
     assert!(result.is_err());
 }
 
-// 9. change_applied_stays_unread — thread stays in REVIEW so Done button appears
+// 9. change_applied_keeps_inbox — thread stays in REVIEW so Archive button appears
 #[test]
-fn change_applied_stays_unread() {
+fn change_applied_keeps_inbox() {
     let result = resolve_transition(
         "ChangeApplied",
         ThreadType::CodingAgent,
-        StoredSection::Unread,
+        ArchiveState::Inbox,
         true,
     )
     .unwrap();
     assert_eq!(
         result.new_section, None,
-        "ChangeApplied must NOT change section — Done button needs to appear"
+        "ChangeApplied must NOT change section — Archive button needs to appear"
     );
-    assert!(result.side_effects.is_empty());
 }
 
-// 10. change_applied_no_op_if_not_unread
+// 10. change_applied_no_op_if_not_in_inbox
 #[test]
-fn change_applied_no_op_if_not_unread() {
+fn change_applied_no_op_if_not_in_inbox() {
     let result = resolve_transition(
         "ChangeApplied",
         ThreadType::CodingAgent,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     )
     .unwrap();
     assert_eq!(result.new_section, None);
-    assert!(result.side_effects.is_empty());
 }
 
-// 11. thread_marked_unread_works_for_both_types
+// 12. thread_archived_clears_inbox_both_types
 #[test]
-fn thread_marked_unread_works_for_both_types() {
+fn thread_archived_clears_inbox_both_types() {
     let chat = resolve_transition(
-        "ThreadMarkedUnread",
+        "ThreadArchived",
         ThreadType::Chat,
-        StoredSection::Default,
+        ArchiveState::Inbox,
         true,
     )
     .unwrap();
-    assert_eq!(chat.new_section, Some(StoredSection::Unread));
+    assert_eq!(chat.new_section, Some(ArchiveState::Archived));
 
     let cc = resolve_transition(
-        "ThreadMarkedUnread",
+        "ThreadArchived",
         ThreadType::CodingAgent,
-        StoredSection::Default,
+        ArchiveState::Inbox,
         true,
     )
     .unwrap();
-    assert_eq!(cc.new_section, Some(StoredSection::Unread));
+    assert_eq!(cc.new_section, Some(ArchiveState::Archived));
 }
 
-// 12. thread_dismissed_clears_unread_both_types
+// 13. thread_archived_is_terminal
 #[test]
-fn thread_dismissed_clears_unread_both_types() {
-    let chat = resolve_transition(
-        "ThreadDismissed",
-        ThreadType::Chat,
-        StoredSection::Unread,
-        true,
-    )
-    .unwrap();
-    assert_eq!(chat.new_section, Some(StoredSection::Default));
-
-    let cc = resolve_transition(
-        "ThreadDismissed",
-        ThreadType::CodingAgent,
-        StoredSection::Unread,
-        true,
-    )
-    .unwrap();
-    assert_eq!(cc.new_section, Some(StoredSection::Default));
-}
-
-// 13. thread_dismissed_is_terminal
-#[test]
-fn thread_dismissed_is_terminal() {
+fn thread_archived_is_terminal() {
     assert_eq!(
-        classify_event("ThreadDismissed"),
+        classify_event("ThreadArchived"),
         Some(EventClass::Terminal)
     );
 }
 
-// 14. chat_sub_threads_never_go_to_unread
+// 14. chat_sub_threads_never_go_to_inbox
 #[test]
-fn chat_sub_threads_never_go_to_unread() {
-    // ResponseGenerated for sub-thread chat → stays default
+fn chat_sub_threads_never_go_to_inbox() {
+    // ResponseGenerated for sub-thread chat → stays archived
     let result = resolve_transition(
         "ResponseGenerated",
         ThreadType::Chat,
-        StoredSection::Default,
+        ArchiveState::Archived,
         false,
     )
     .unwrap();
     assert_eq!(result.new_section, None);
-    assert!(result.side_effects.is_empty());
-
-    // ThreadMarkedUnread for sub-thread chat → stays default
-    let result = resolve_transition(
-        "ThreadMarkedUnread",
-        ThreadType::Chat,
-        StoredSection::Default,
-        false,
-    )
-    .unwrap();
-    assert_eq!(result.new_section, None);
-    assert!(result.side_effects.is_empty());
 }
 
-// 14b. response_aborted_marks_both_thread_types_unread
+// 14b. response_aborted_surfaces_both_thread_types_to_inbox
 #[test]
-fn response_aborted_marks_both_thread_types_unread() {
-    // Chat thread: ResponseAborted → unread
+fn response_aborted_surfaces_both_thread_types_to_inbox() {
+    // Chat thread: ResponseAborted → inbox
     let chat = resolve_transition(
         "ResponseAborted",
         ThreadType::Chat,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     )
     .unwrap();
-    assert_eq!(chat.new_section, Some(StoredSection::Unread));
-    assert_eq!(chat.side_effects, vec![SideEffect::EmitThreadMarkedUnread]);
+    assert_eq!(chat.new_section, Some(ArchiveState::Inbox));
 
-    // CC thread: ResponseAborted → unread (aborted CC needs user attention in REVIEW)
+    // CC thread: ResponseAborted → inbox (aborted CC needs user attention in REVIEW)
     let cc = resolve_transition(
         "ResponseAborted",
         ThreadType::CodingAgent,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     )
     .unwrap();
-    assert_eq!(cc.new_section, Some(StoredSection::Unread));
-    assert_eq!(cc.side_effects, vec![SideEffect::EmitThreadMarkedUnread]);
+    assert_eq!(cc.new_section, Some(ArchiveState::Inbox));
 }
 
 // 14c. response_aborted_chat_sub_thread_stays_default
@@ -533,65 +428,83 @@ fn response_aborted_chat_sub_thread_stays_default() {
     let result = resolve_transition(
         "ResponseAborted",
         ThreadType::Chat,
-        StoredSection::Default,
+        ArchiveState::Archived,
         false,
     )
     .unwrap();
     assert_eq!(result.new_section, None);
-    assert!(result.side_effects.is_empty());
 }
 
-// 14d. cc_sub_threads_always_go_to_unread
+// CC threads also receive a CodingAgentIdled after ResponseCanceled in the
+// normal path, but the no-session settle fallback (claude_code.rs) emits
+// ResponseCanceled alone — so the inbox transition must hold for both.
 #[test]
-fn cc_sub_threads_always_go_to_unread() {
-    // CodingAgentIdled for sub-thread CC → unread (CC always needs user action)
+fn response_canceled_surfaces_both_thread_types_to_inbox() {
+    let chat = resolve_transition(
+        "ResponseCanceled",
+        ThreadType::Chat,
+        ArchiveState::Archived,
+        true,
+    )
+    .unwrap();
+    assert_eq!(chat.new_section, Some(ArchiveState::Inbox));
+
+    let cc = resolve_transition(
+        "ResponseCanceled",
+        ThreadType::CodingAgent,
+        ArchiveState::Archived,
+        true,
+    )
+    .unwrap();
+    assert_eq!(cc.new_section, Some(ArchiveState::Inbox));
+}
+
+#[test]
+fn response_canceled_chat_sub_thread_stays_default() {
+    let result = resolve_transition(
+        "ResponseCanceled",
+        ThreadType::Chat,
+        ArchiveState::Archived,
+        false,
+    )
+    .unwrap();
+    assert_eq!(result.new_section, None);
+}
+
+// 14d. cc_sub_threads_always_go_to_inbox
+#[test]
+fn cc_sub_threads_always_go_to_inbox() {
+    // CodingAgentIdled for sub-thread CC → inbox (CC always needs user action)
     let result = resolve_transition(
         "CodingAgentIdled",
         ThreadType::CodingAgent,
-        StoredSection::Default,
+        ArchiveState::Archived,
         false,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(StoredSection::Unread));
-    assert_eq!(
-        result.side_effects,
-        vec![SideEffect::EmitThreadMarkedUnread]
-    );
-
-    // ResponseAborted for sub-thread CC → unread
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));    // ResponseAborted for sub-thread CC → inbox
     let result = resolve_transition(
         "ResponseAborted",
         ThreadType::CodingAgent,
-        StoredSection::Default,
+        ArchiveState::Archived,
         false,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(StoredSection::Unread));
-    assert_eq!(
-        result.side_effects,
-        vec![SideEffect::EmitThreadMarkedUnread]
-    );
-
-    // ChangeProposed for sub-thread CC → unread
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));    // ChangeProposed for sub-thread CC → inbox
     let result = resolve_transition(
         "ChangeProposed",
         ThreadType::CodingAgent,
-        StoredSection::Default,
+        ArchiveState::Archived,
         false,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(StoredSection::Unread));
-    assert_eq!(
-        result.side_effects,
-        vec![SideEffect::EmitThreadMarkedUnread]
-    );
-}
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));}
 
 // 15. no_transition_produces_illegal_section
 #[test]
 fn no_transition_produces_illegal_section() {
     let thread_types = [ThreadType::Chat, ThreadType::CodingAgent];
-    let sections = [StoredSection::Default, StoredSection::Unread];
+    let sections = [ArchiveState::Archived, ArchiveState::Inbox];
 
     for event_type in all_persisted_event_types() {
         for &thread_type in &thread_types {
@@ -620,94 +533,136 @@ fn no_transition_produces_illegal_section() {
 #[test]
 fn running_status_maps_to_running() {
     assert_eq!(
-        display_section(StoredSection::Default, ThreadStatus::Running, false, false),
-        DisplaySection::Running
+        display_section(ArchiveState::Archived, ThreadStatus::Running, false, false, false),
+        DisplaySection::Active
     );
 }
 
-// 17. unread_maps_to_review
+// 17. inbox_maps_to_review
 #[test]
-fn unread_maps_to_review() {
+fn inbox_maps_to_review() {
     assert_eq!(
-        display_section(StoredSection::Unread, ThreadStatus::Idle, false, false),
+        display_section(ArchiveState::Inbox, ThreadStatus::Idle, false, false, false),
         DisplaySection::Review
     );
 }
 
-// 18. pinned_default_idle_maps_to_pinned
+// 18. saved_default_idle_maps_to_saved
 #[test]
-fn pinned_default_idle_maps_to_pinned() {
+fn saved_default_idle_maps_to_saved() {
     assert_eq!(
-        display_section(StoredSection::Default, ThreadStatus::Idle, true, false),
-        DisplaySection::Pinned
+        display_section(ArchiveState::Archived, ThreadStatus::Idle, true, false, false),
+        DisplaySection::Saved
     );
 }
 
-// 19. running_overrides_pinned_to_running
+// 19. saved_overrides_running — under the new routing saved wins everything
 #[test]
-fn running_overrides_pinned_to_running() {
+fn saved_overrides_running_to_saved() {
     assert_eq!(
-        display_section(StoredSection::Default, ThreadStatus::Running, true, false),
-        DisplaySection::Running
+        display_section(ArchiveState::Archived, ThreadStatus::Running, true, false, false),
+        DisplaySection::Saved
     );
 }
 
-// 20. default_idle_not_pinned_maps_to_history
+// 20. archived_idle_not_saved_maps_to_archive
 #[test]
-fn default_idle_not_pinned_maps_to_history() {
+fn archived_idle_not_saved_maps_to_archive() {
     assert_eq!(
-        display_section(StoredSection::Default, ThreadStatus::Idle, false, false),
-        DisplaySection::History
+        display_section(ArchiveState::Archived, ThreadStatus::Idle, false, false, false),
+        DisplaySection::Archive
     );
 }
 
-// 21. active_children_idle_maps_to_waiting
+// 21. active_children_idle_maps_to_active — Waiting was folded into Active
 #[test]
-fn active_children_idle_maps_to_waiting() {
+fn active_children_idle_maps_to_active() {
     assert_eq!(
-        display_section(StoredSection::Default, ThreadStatus::Idle, false, true),
-        DisplaySection::Waiting
+        display_section(ArchiveState::Archived, ThreadStatus::Idle, false, true, false),
+        DisplaySection::Active
     );
 }
 
-// 22. active_children_overrides_pinned_to_waiting
+// 22. active_children_saved_still_saved — save overrides delegated work
 #[test]
-fn active_children_overrides_pinned_to_waiting() {
+fn active_children_saved_still_saved() {
     assert_eq!(
-        display_section(StoredSection::Default, ThreadStatus::Idle, true, true),
-        DisplaySection::Waiting
+        display_section(ArchiveState::Archived, ThreadStatus::Idle, true, true, false),
+        DisplaySection::Saved
     );
 }
 
-// 22a. running_with_active_children_stays_running
+// 22a. running_with_active_children_stays_active
 #[test]
-fn running_with_active_children_stays_running() {
+fn running_with_active_children_stays_active() {
     assert_eq!(
-        display_section(StoredSection::Default, ThreadStatus::Running, false, true),
-        DisplaySection::Running
+        display_section(ArchiveState::Archived, ThreadStatus::Running, false, true, false),
+        DisplaySection::Active
     );
 }
 
-// 22b (display). unread_with_active_children_maps_to_waiting
+// 22b. inbox_with_active_children_maps_to_active
 #[test]
-fn unread_with_active_children_maps_to_waiting() {
+fn inbox_with_active_children_maps_to_active() {
     assert_eq!(
-        display_section(StoredSection::Unread, ThreadStatus::Idle, false, true),
-        DisplaySection::Waiting
+        display_section(ArchiveState::Inbox, ThreadStatus::Idle, false, true, false),
+        DisplaySection::Active
+    );
+}
+
+// 22c. inbox_idle_no_children_maps_to_review
+#[test]
+fn inbox_idle_no_children_maps_to_review() {
+    assert_eq!(
+        display_section(ArchiveState::Inbox, ThreadStatus::Idle, false, false, false),
+        DisplaySection::Review
+    );
+}
+
+// 22d. archived_with_pending_changes_routes_to_review — pending changes
+//      outrank archive so users can never lose unresolved work behind the
+//      archive curtain. Once the user resolves all pending changes, the
+//      thread settles into Archive (covered by 20).
+#[test]
+fn archived_with_pending_changes_routes_to_review() {
+    assert_eq!(
+        display_section(ArchiveState::Archived, ThreadStatus::Idle, false, false, true),
+        DisplaySection::Review
+    );
+}
+
+// 22e. saved_overrides_pending — saving is still the strongest claim;
+//      a pending change on a saved thread surfaces via the Saved section's
+//      CTA badge, not by overriding routing.
+#[test]
+fn saved_overrides_pending() {
+    assert_eq!(
+        display_section(ArchiveState::Archived, ThreadStatus::Idle, true, false, true),
+        DisplaySection::Saved
+    );
+}
+
+// 22f. running_overrides_pending — Active wins so live work isn't masked
+//      by a pending change row carried in from a previous turn.
+#[test]
+fn running_overrides_pending() {
+    assert_eq!(
+        display_section(ArchiveState::Archived, ThreadStatus::Running, false, false, true),
+        DisplaySection::Active
     );
 }
 
 // ── resolve_actions tests ──
 
 #[test]
-fn chat_unread_idle_shows_done() {
+fn chat_inbox_idle_shows_archive() {
     let actions = resolve_actions(
         ThreadType::Chat,
         ThreadStatus::Idle,
-        StoredSection::Unread,
+        ArchiveState::Inbox,
         false,
     );
-    assert_eq!(actions, vec![Action::Done]);
+    assert_eq!(actions, vec![Action::Archive]);
 }
 
 #[test]
@@ -715,7 +670,7 @@ fn chat_default_shows_no_actions() {
     let actions = resolve_actions(
         ThreadType::Chat,
         ThreadStatus::Idle,
-        StoredSection::Default,
+        ArchiveState::Archived,
         false,
     );
     assert!(actions.is_empty());
@@ -726,99 +681,109 @@ fn chat_running_shows_no_actions() {
     let actions = resolve_actions(
         ThreadType::Chat,
         ThreadStatus::Running,
-        StoredSection::Unread,
+        ArchiveState::Inbox,
         false,
     );
     assert!(actions.is_empty());
 }
 
 #[test]
-fn cc_unread_with_changes_shows_apply_discard() {
+fn cc_inbox_with_changes_shows_apply_discard() {
     let actions = resolve_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,
-        StoredSection::Unread,
+        ArchiveState::Inbox,
         true,
     );
     assert_eq!(actions, vec![Action::Discard, Action::Apply]);
 }
 
 #[test]
-fn cc_unread_no_changes_shows_done() {
+fn cc_inbox_no_changes_shows_archive() {
     let actions = resolve_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,
-        StoredSection::Unread,
+        ArchiveState::Inbox,
         false,
     );
-    assert_eq!(actions, vec![Action::Done]);
+    assert_eq!(actions, vec![Action::Archive]);
 }
 
 #[test]
-fn external_repo_cc_no_pending_change_shows_done() {
+fn external_repo_cc_no_pending_change_shows_archive() {
     // External repo threads: cc_has_changes=true in thread_summaries but no
     // pending row in the changes table (runtime skips propose_change).
-    // has_pending_changes=false → Done, not Apply/Discard.
+    // has_pending_changes=false → Archive, not Apply/Discard.
     let actions = resolve_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,
-        StoredSection::Unread,
+        ArchiveState::Inbox,
         false,
     );
     assert_eq!(
         actions,
-        vec![Action::Done],
+        vec![Action::Archive],
         "External repo threads without pending changes must show Done, not Apply/Discard"
     );
 }
 
 #[test]
-fn cc_default_shows_no_actions() {
+fn cc_archived_no_changes_shows_no_actions() {
     let actions = resolve_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Idle,
-        StoredSection::Default,
-        true,
+        ArchiveState::Archived,
+        false,
     );
     assert!(actions.is_empty());
+}
+
+#[test]
+fn cc_archived_with_pending_changes_shows_apply_discard() {
+    // display_section surfaces archived+pending threads in Review specifically
+    // so the user can never lose unresolved work behind the archive curtain.
+    // resolve_actions must keep the action set in sync — otherwise the user
+    // sees the thread in Review with dots but has no buttons to resolve it.
+    let actions = resolve_actions(
+        ThreadType::CodingAgent,
+        ThreadStatus::Waiting,
+        ArchiveState::Archived,
+        true,
+    );
+    assert_eq!(actions, vec![Action::Discard, Action::Apply]);
 }
 
 // ── ChangeProposed must surface CC threads in REVIEW ──
 
 #[test]
-fn change_proposed_marks_cc_unread() {
+fn change_proposed_surfaces_cc_to_inbox() {
     // Bug: ChangeProposed was in the no_change bucket, so CC threads with
     // proposed changes went to HISTORY instead of REVIEW when there was no
     // prior CodingAgentIdled (or user had already read the thread).
     let result = resolve_transition(
         "ChangeProposed",
         ThreadType::CodingAgent,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     )
     .unwrap();
     assert_eq!(
         result.new_section,
-        Some(StoredSection::Unread),
-        "ChangeProposed must mark CC thread as unread to surface Apply panel"
-    );
-    assert_eq!(
-        result.side_effects,
-        vec![SideEffect::EmitThreadMarkedUnread],
-        "ChangeProposed must emit ThreadMarkedUnread side effect"
+        Some(ArchiveState::Inbox),
+        "ChangeProposed must surface CC thread to inbox so the Apply panel appears"
     );
 }
 
 #[test]
-fn change_proposed_keeps_cc_unread_if_already_unread() {
+fn change_proposed_keeps_cc_in_inbox_if_already_in_inbox() {
     let result = resolve_transition(
         "ChangeProposed",
         ThreadType::CodingAgent,
-        StoredSection::Unread,
+        ArchiveState::Inbox,
         true,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(StoredSection::Unread));
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));
 }
 
 #[test]
@@ -826,7 +791,7 @@ fn cc_running_shows_no_actions() {
     let actions = resolve_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Running,
-        StoredSection::Unread,
+        ArchiveState::Inbox,
         true,
     );
     assert!(actions.is_empty());
@@ -835,27 +800,22 @@ fn cc_running_shows_no_actions() {
 // ── UserQuestionAsked / UserQuestionAnswered tests ──
 
 #[test]
-fn user_question_asked_marks_cc_unread() {
+fn user_question_asked_surfaces_cc_to_inbox() {
     let result = resolve_transition(
         "UserQuestionAsked",
         ThreadType::CodingAgent,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(StoredSection::Unread));
-    assert_eq!(
-        result.side_effects,
-        vec![SideEffect::EmitThreadMarkedUnread]
-    );
-}
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));}
 
 #[test]
 fn user_question_asked_rejected_for_chat() {
     let result = resolve_transition(
         "UserQuestionAsked",
         ThreadType::Chat,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     );
     assert!(result.is_err(), "UserQuestionAsked must be CC-only");
@@ -866,7 +826,7 @@ fn user_question_answered_no_section_change() {
     let result = resolve_transition(
         "UserQuestionAnswered",
         ThreadType::CodingAgent,
-        StoredSection::Unread,
+        ArchiveState::Inbox,
         true,
     )
     .unwrap();
@@ -874,7 +834,6 @@ fn user_question_answered_no_section_change() {
         result.new_section, None,
         "answer event keeps thread in REVIEW until next terminal"
     );
-    assert!(result.side_effects.is_empty());
 }
 
 #[test]
@@ -910,71 +869,76 @@ fn user_question_answered_status_transition_resumes_running() {
 }
 
 #[test]
-fn waiting_for_user_answer_routes_to_review() {
-    // Both stored sections route to REVIEW so the question card is reachable.
+fn waiting_for_user_answer_routes_to_review_when_inbox() {
+    // The transition contract guarantees `UserQuestionAsked` stamps
+    // archive_state = Inbox, so the typical WFUA thread routes to Review.
     assert_eq!(
         display_section(
-            StoredSection::Default,
+            ArchiveState::Inbox,
             ThreadStatus::WaitingForUserAnswer,
+            false,
             false,
             false
         ),
         DisplaySection::Review
     );
+    // An archived legacy WFUA row routes to Archive (no special case anymore).
+    // The transition contract enforces Inbox so this state shouldn't occur
+    // in practice; the assertion documents the new behavior.
     assert_eq!(
         display_section(
-            StoredSection::Unread,
+            ArchiveState::Archived,
             ThreadStatus::WaitingForUserAnswer,
+            false,
             false,
             false
         ),
-        DisplaySection::Review
+        DisplaySection::Archive
     );
-    // Even with active children the question takes precedence — the user must answer.
+    // Saved beats WFUA — the saved-section badge surfaces the question.
     assert_eq!(
         display_section(
-            StoredSection::Default,
+            ArchiveState::Inbox,
+            ThreadStatus::WaitingForUserAnswer,
+            true,
+            false,
+            false
+        ),
+        DisplaySection::Saved
+    );
+    // Active children turn it Active (which already reads as work-in-progress).
+    assert_eq!(
+        display_section(
+            ArchiveState::Inbox,
             ThreadStatus::WaitingForUserAnswer,
             false,
-            true
+            true,
+            false
         ),
-        DisplaySection::Review
+        DisplaySection::Active
     );
 }
 
 #[test]
-fn waiting_for_user_answer_shows_done_only() {
-    // QuestionCard owns answer/free-text, but the user must still be able to
-    // abandon the question. Show Done (which auto-cancels the question on the
-    // backend); never Apply/Discard since the mid-turn work is incomplete.
-    let actions = resolve_actions(
-        ThreadType::CodingAgent,
-        ThreadStatus::WaitingForUserAnswer,
-        StoredSection::Unread,
-        true,
-    );
-    assert_eq!(
-        actions,
-        vec![Action::Done],
-        "Done must be available so the user can dismiss the thread"
-    );
-
-    let no_changes = resolve_actions(
-        ThreadType::CodingAgent,
-        ThreadStatus::WaitingForUserAnswer,
-        StoredSection::Unread,
-        false,
-    );
-    assert_eq!(no_changes, vec![Action::Done]);
-
-    // Default section (already dismissed/read) → no actions.
-    let default = resolve_actions(
-        ThreadType::CodingAgent,
-        ThreadStatus::WaitingForUserAnswer,
-        StoredSection::Default,
-        true,
-    );
-    assert!(default.is_empty(), "no actions when not in REVIEW");
+fn waiting_for_user_answer_returns_no_actions() {
+    // Mid-turn: Apply/Discard must never appear (incomplete work) and Archive
+    // is replaced by a separately-rendered Cancel.
+    for section in [ArchiveState::Inbox, ArchiveState::Archived] {
+        for has_changes in [true, false] {
+            let actions = resolve_actions(
+                ThreadType::CodingAgent,
+                ThreadStatus::WaitingForUserAnswer,
+                section,
+                has_changes,
+            );
+            assert!(
+                actions.is_empty(),
+                "WaitingForUserAnswer must yield no actions (section={:?}, has_changes={}); Cancel is rendered separately",
+                section,
+                has_changes,
+            );
+        }
+    }
 }
 
 #[test]
@@ -989,7 +953,7 @@ fn cc_settings_changed_accepted_for_cc_threads() {
     let result = resolve_transition(
         "CodingAgentSettingsChanged",
         ThreadType::CodingAgent,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     );
     assert!(
@@ -1000,19 +964,14 @@ fn cc_settings_changed_accepted_for_cc_threads() {
     assert_eq!(
         result.new_section, None,
         "CodingAgentSettingsChanged must not change section"
-    );
-    assert!(
-        result.side_effects.is_empty(),
-        "CodingAgentSettingsChanged must have no side effects"
-    );
-}
+    );}
 
 #[test]
 fn cc_settings_changed_rejected_for_chat_threads() {
     let result = resolve_transition(
         "CodingAgentSettingsChanged",
         ThreadType::Chat,
-        StoredSection::Default,
+        ArchiveState::Archived,
         true,
     );
     assert!(
@@ -1284,11 +1243,11 @@ fn status_transition_classification_consistency() {
 }
 
 /// Cross-validate: CcFlagRule != None should only appear on CC-relevant events
-/// (Change*, ClaudeCode*, MergeConflict*, ThreadDismissed). This catches accidental
+/// (Change*, ClaudeCode*, MergeConflict*, ThreadArchived). This catches accidental
 /// cc_has_changes/cc_applying mutations on chat-only events.
 #[test]
 fn cc_flag_rules_only_on_cc_relevant_events() {
-    let cc_relevant_prefixes = ["Change", "CodingAgent", "MergeConflict", "ThreadDismissed"];
+    let cc_relevant_prefixes = ["Change", "CodingAgent", "MergeConflict", "ThreadArchived"];
     for (event, transition) in status_transitions() {
         if transition.cc_flags != CcFlagRule::None {
             let is_cc_relevant = cc_relevant_prefixes

@@ -35,7 +35,10 @@ function postPresence(threadId: string, focused: boolean): void {
     }),
     keepalive: true,
   }).catch((e) => {
-    console.error('[Presence] Failed to post presence update:', e);
+    // Presence is a hint for notification suppression — failure here is
+    // non-blocking. The next focus/blur/heartbeat will retry; if the backend
+    // never hears from us, the user just sees redundant push notifications.
+    console.warn('[Presence] Failed to post presence update:', e);
   });
 }
 

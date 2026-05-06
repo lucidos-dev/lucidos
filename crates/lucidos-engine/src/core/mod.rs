@@ -12,6 +12,7 @@ pub mod knowhow;
 pub mod mcp_servers;
 pub mod oauth;
 pub mod pinned_apps;
+pub mod plugins;
 pub mod preferences;
 pub mod repositories;
 pub mod store;
@@ -30,19 +31,17 @@ pub const DATA_DIR: &str = "data";
 pub const ARTIFACTS_DIR: &str = "data/artifacts";
 pub const APPS_DIR: &str = "data/apps";
 pub const KNOWHOW_DIR: &str = "data/knowhow";
-pub const TRIGGERS_DIR: &str = "data/triggers";
-pub const POSTGRES_DIR: &str = "data/postgres";
 
 pub use apps::{App, AppManager, AppManifest};
-pub use artifacts::{ArtifactChange, ArtifactManager};
+pub use artifacts::{list_searchable_data_files, ArtifactChange, ArtifactManager};
 pub use credentials::{AuthType, Credential, CredentialInfo, CredentialStore};
 pub use devices::DeviceStore;
 pub use email::{EmailAccount, EmailAccountInfo, EmailStore};
 pub use intents::{Intent, IntentStore};
 pub use knowhow::{Knowhow, KnowhowDirs, KnowhowStore, KnowhowSummary};
-pub use system_knowhow::{is_system_knowhow_path, SystemKnowhowStore};
 pub use oauth::{OAuthAccount, OAuthAccountInfo, OAuthStore};
 pub use pinned_apps::{PinnedAppStore, PinnedAppUi};
+pub use system_knowhow::{is_system_knowhow_path, SystemKnowhowStore};
 
 /// Migrate legacy `prompts/` directories to `intents/` across the workspace.
 ///
@@ -132,7 +131,8 @@ pub use events::EventRow;
 pub use mcp_servers::{McpServer, McpServerStore};
 pub use preferences::{
     PreferenceStore, DEFAULT_CHAT_MODEL, PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT,
-    PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE, PREF_VERTEX_REGION,
+    PREF_IMAGE_MODEL, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE,
+    PREF_VERTEX_REGION,
 };
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, ResponseEvent, SessionMessage, Step,
@@ -289,6 +289,23 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Summarize a `glob_files` / `grep_files` JSON result as "N items[, truncated]".
+/// Falls back to a char count if the JSON can't be parsed (e.g. the handler
+/// returned an "Error: ..." string).
+fn describe_search_result(result: &str, items_key: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(result).ok()?;
+    let count = parsed.get(items_key)?.as_array()?.len();
+    let truncated = parsed
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some(if truncated {
+        format!("{} {}, truncated", count, items_key)
+    } else {
+        format!("{} {}", count, items_key)
+    })
+}
+
 pub fn describe_tool_result(tool_name: &str, result: &str, success: bool) -> Option<String> {
     if !success {
         let msg = result.lines().next().unwrap_or(result);
@@ -297,12 +314,14 @@ pub fn describe_tool_result(tool_name: &str, result: &str, success: bool) -> Opt
     match tool_name {
         "read_file" => Some(format!("{} chars", result.len())),
         "list_files" => Some(format!("{} items", result.lines().count())),
+        "glob_files" => describe_search_result(result, "paths"),
+        "grep_files" => describe_search_result(result, "matches"),
         "search_artifacts" => Some(format!("{} results", result.lines().count())),
         "run_python" | "run_bash" => result.lines().next().map(|l| truncate(l, 100)),
         "write_file" | "edit_file" | "create_app" | "execute_intent" => Some("Done".to_string()),
         "git_commit" => result.lines().next().map(|l| truncate(l, 80)),
         "git_diff" | "git_log" => Some(format!("{} lines", result.lines().count())),
-        "http_request" => result.lines().next().map(|l| truncate(l, 80)),
+        "http_request" | "proxy_request" => result.lines().next().map(|l| truncate(l, 80)),
         _ => {
             if result.len() <= 80 {
                 Some(result.to_string())
@@ -318,6 +337,18 @@ pub fn describe_tool_result(tool_name: &str, result: &str, success: bool) -> Opt
 pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
     match name {
         "list_files" => "Listing files in workspace...".to_string(),
+        "glob_files" => format!(
+            "Globbing {}...",
+            args["pattern"].as_str().unwrap_or("pattern")
+        ),
+        "grep_files" => {
+            let pat = args["pattern"].as_str().unwrap_or("pattern");
+            if let Some(path_glob) = args.get("path_glob").and_then(|v| v.as_str()) {
+                format!("Grepping {} in {}...", pat, path_glob)
+            } else {
+                format!("Grepping {}...", pat)
+            }
+        }
         "read_file" => format!("Reading {}...", args["path"].as_str().unwrap_or("file")),
         "write_file" => format!("Writing {}...", args["path"].as_str().unwrap_or("file")),
         "edit_file" => format!("Editing {}...", args["path"].as_str().unwrap_or("file")),
@@ -347,6 +378,12 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             } else {
                 format!("Fetching {}...", url)
             }
+        }
+        "proxy_request" => {
+            let name = args["name"].as_str().unwrap_or("proxy");
+            let method = args["method"].as_str().unwrap_or("GET");
+            let path = args["path"].as_str().unwrap_or("");
+            format!("{} via {} proxy: {}...", method, name, path)
         }
         "import_file" => format!(
             "Importing {}...",
@@ -548,6 +585,22 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             args["domain"].as_str().unwrap_or("site")
         ),
         "browser_clear_data" => "Clearing browser data...".to_string(),
+        "install_plugin" => format!(
+            "Installing plugin from {}...",
+            args["source"].as_str().unwrap_or("source")
+        ),
+        "check_plugin_updates" => match args.get("id").and_then(|v| v.as_str()) {
+            Some(id) => format!("Checking plugin '{}' for updates...", id),
+            None => "Checking installed plugins for updates...".to_string(),
+        },
+        "update_plugin" => format!(
+            "Updating plugin '{}'...",
+            args["id"].as_str().unwrap_or("plugin")
+        ),
+        "uninstall_plugin" => format!(
+            "Uninstalling plugin '{}'...",
+            args["id"].as_str().unwrap_or("plugin")
+        ),
         "enable_push_notifications" => "Enabling push notifications...".to_string(),
         _ if name.starts_with("mcp__") => {
             let rest = &name[5..];

@@ -9,6 +9,22 @@ export function focusIfNeeded(el: HTMLElement | null | undefined): void {
   }
 }
 
+/** The currently focused prompt textarea, or null if focus is elsewhere.
+ *  Reads document.activeElement directly — querying for the visible
+ *  prompt-input then comparing races during viewport transitions when both
+ *  SplitLayout and MobileSwipeContainer copies are briefly mounted. */
+function activePromptInput(): HTMLElement | null {
+  const el = document.activeElement as HTMLElement | null;
+  return el?.dataset?.role === 'prompt-input' ? el : null;
+}
+
+/** True when the focused element is a prompt-input textarea bound to threadId.
+ *  Gate any SSE / API refresh that would overwrite compose state on this —
+ *  otherwise in-flight keystrokes get blanked and the cursor jumps to end. */
+export function isComposeFocusedHere(threadId: string): boolean {
+  return activePromptInput()?.dataset.threadId === threadId;
+}
+
 /**
  * Find the visible prompt textarea. Both desktop (SplitLayout) and mobile
  * (MobileSwipeContainer) render PromptInput, creating two elements with
@@ -16,7 +32,7 @@ export function focusIfNeeded(el: HTMLElement | null | undefined): void {
  * `.content-row { display: none }` and has a 0x0 rect. We query all and
  * pick the one with non-zero dimensions.
  */
-function getVisiblePromptInput(): HTMLElement | null {
+export function getVisiblePromptInput(): HTMLElement | null {
   const els = document.querySelectorAll<HTMLElement>('[data-role="prompt-input"]');
   for (const el of els) {
     if (isElementVisible(el)) return el;
@@ -40,6 +56,29 @@ function getVisiblePromptInput(): HTMLElement | null {
 export function focusPromptNow(): void {
   const el = getVisiblePromptInput();
   if (el) el.focus({ preventScroll: true });
+}
+
+/** Blur the prompt textarea iff it is the active element. No-op otherwise.
+ *  Action buttons exit the compose state, so the mobile keyboard the user
+ *  raised while composing should drop with the tap. */
+export function blurPromptInputIfFocused(): void {
+  activePromptInput()?.blur();
+}
+
+/** Install a document-level listener that blurs the prompt textarea on any
+ *  `.action-btn` tap. Idempotent — safe to call from module init. Action
+ *  buttons (Send / Discard draft / Apply / Archive / Cancel / Discard / Diff
+ *  / Continue / Revert) never want the mobile keyboard to remain up or to
+ *  surface via implicit focus retention. */
+let actionBtnBlurInstalled = false;
+export function installActionBtnBlurListener(): void {
+  if (actionBtnBlurInstalled) return;
+  actionBtnBlurInstalled = true;
+  document.addEventListener('pointerdown', (e) => {
+    const target = e.target as HTMLElement | null;
+    if (!target?.closest('.action-btn')) return;
+    blurPromptInputIfFocused();
+  });
 }
 
 /**

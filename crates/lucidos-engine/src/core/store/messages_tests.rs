@@ -1184,7 +1184,7 @@ fn events_include_memory_searched_step() {
         2,
         "Should have MemorySearched + Thinking steps"
     );
-    assert_eq!(steps[0], ("Memory: 7 results", true));
+    assert_eq!(steps[0], ("Memory searched", true));
     assert_eq!(steps[1], ("Requesting", true));
 }
 
@@ -2080,3 +2080,87 @@ fn cc_tool_calls_with_text_still_works() {
     assert!(has_text, "Text events expected");
     assert!(has_step, "Step events expected");
 }
+
+/// Regression: orchestrator turns whose entire output was tool calls had
+/// `steps` on the SessionMessage but no surviving content for the LLM to
+/// see on resume. End-to-end check: events → build_session_messages →
+/// format_history_steps surfaces the tool names.
+#[test]
+fn orchestrator_resume_history_preserves_tool_calls() {
+    let events = vec![
+        make_event(
+            "TriggerStarted",
+            json!({"prompt": "Run nightly CI pipeline"}),
+            0,
+        ),
+        make_event(
+            "ToolCalled",
+            json!({"name": "load_knowhow", "args": {"id": "ops/nightly-pipeline"}}),
+            1,
+        ),
+        make_event(
+            "ToolResult",
+            json!({"name": "load_knowhow", "success": true, "result": "<knowhow body>"}),
+            2,
+        ),
+        make_event(
+            "ToolCalled",
+            json!({"name": "emit_event", "args": {"event_type": "BuildClean", "payload": {}}}),
+            3,
+        ),
+        make_event(
+            "ToolResult",
+            json!({"name": "emit_event", "success": true, "result": "Event BuildClean emitted"}),
+            4,
+        ),
+        make_event(
+            "ToolCalled",
+            json!({"name": "run_claude", "args": {"prompt": "/harden-project"}}),
+            5,
+        ),
+        make_event(
+            "ToolResult",
+            json!({"name": "run_claude", "success": true, "result": "Claude Code session started"}),
+            6,
+        ),
+        make_event("TextStreamed", json!({"text": "Step 2 started."}), 7),
+        make_event("ResponseGenerated", json!({"text": "Step 2 started."}), 8),
+        make_event(
+            "MessageReceived",
+            json!({"text": "[Child completed] Hardening complete. Session can finish."}),
+            9,
+        ),
+    ];
+    let msgs = build_session_messages(&events);
+    // user (trigger), assistant (step 2 reply with 3 tool steps), user (callback)
+    assert_eq!(msgs.len(), 3);
+    let assistant = &msgs[1];
+    assert_eq!(assistant.role, "assistant");
+    assert_eq!(
+        assistant.steps.len(),
+        3,
+        "all three tool calls should be attached as steps"
+    );
+
+    // The fix: format_history_steps must surface a non-empty summary for an
+    // assistant turn whose entire output was tool calls.
+    let summary = crate::engine::format_history_steps(&assistant.steps)
+        .expect("orchestrator turn with tool calls must produce a history summary");
+    assert!(
+        summary.contains("load_knowhow") || summary.contains("know-how"),
+        "summary should mention load_knowhow, got: {}",
+        summary
+    );
+    assert!(
+        summary.contains("BuildClean"),
+        "summary should mention the emitted event type, got: {}",
+        summary
+    );
+    assert!(
+        summary.contains("run_claude") || summary.contains("Claude Code"),
+        "summary should mention run_claude, got: {}",
+        summary
+    );
+}
+
+

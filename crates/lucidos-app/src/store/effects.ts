@@ -1,5 +1,5 @@
 import { effect } from '@preact/signals';
-import { pageTitle, unreadCount, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, inputMode, threadDrawerOpen, selectedRepoId, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource } from './store';
+import { pageTitle, unreadCount, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, inputMode, threadDrawerOpen, selectedRepoId, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, repoSelectedChangeId, SELECTED_CHANGE_KEY } from './store';
 
 // Sync page title with unread count
 effect(() => {
@@ -66,4 +66,16 @@ effect(() => {
 // Persist source-vs-rendered preview toggle (md/html/csv/svg + diff view)
 effect(() => {
   localStorage.setItem('lucidos-file-preview-source', String(filePreviewSource.value));
+});
+
+// Persist selected change so the Diff view survives reload — without this,
+// reloading on the Changes tab silently drops the selection and the toggle
+// snaps back to All Files. Restored at startup via restoreRepoSelectionFromStorage.
+effect(() => {
+  const id = repoSelectedChangeId.value;
+  if (id) {
+    localStorage.setItem(SELECTED_CHANGE_KEY, id);
+  } else {
+    localStorage.removeItem(SELECTED_CHANGE_KEY);
+  }
 });

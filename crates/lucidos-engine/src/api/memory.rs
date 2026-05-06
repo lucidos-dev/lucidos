@@ -189,7 +189,11 @@ pub(super) async fn get_memory_source(
 }
 
 /// Trigger a memory rebuild in the background.
-/// Query params: `force=true` clears all entries first (full rebuild); default is resume/incremental.
+/// Query params:
+///   `force=true` clears all entries first (full rebuild); default is resume/incremental.
+///   `re_extract_stale=true` (incremental only) deletes entries written by an older
+///   `EXTRACTOR_VERSION` so the incremental walk re-extracts them with the current
+///   extractor — without paying for a full rebuild.
 pub(super) async fn rebuild_memory(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -201,13 +205,23 @@ pub(super) async fn rebuild_memory(
         );
     }
     let force = params.get("force").map(|v| v == "true").unwrap_or(false);
+    let re_extract_stale = params
+        .get("re_extract_stale")
+        .map(|v| v == "true")
+        .unwrap_or(false);
     let engine = state.engine.clone();
     let bus = state.engine.event_bus.clone();
 
     tokio::spawn(async move {
-        engine.rebuild_memory(force, Some(bus)).await;
+        engine.rebuild_memory(force, re_extract_stale, Some(bus)).await;
     });
-    let mode = if force { "full_rebuild" } else { "incremental" };
+    let mode = if force {
+        "full_rebuild"
+    } else if re_extract_stale {
+        "incremental_re_extract_stale"
+    } else {
+        "incremental"
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({ "status": "started", "mode": mode })),

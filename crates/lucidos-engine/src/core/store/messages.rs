@@ -202,12 +202,11 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                 });
             }
             "MemorySearched" => {
-                let results = event
+                let has_results = event
                     .payload
                     .get("results")
                     .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(0);
+                    .is_some_and(|n| n > 0);
                 let queries: Vec<String> = event
                     .payload
                     .get("queries")
@@ -218,18 +217,14 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                             .collect()
                     })
                     .unwrap_or_default();
-                let desc = if results > 0 {
-                    format!("Memory: {} results", results)
-                } else {
-                    "Memory: no results".to_string()
-                };
+                let desc = if has_results { "Memory searched" } else { "Memory: no results" };
                 let detail = if queries.is_empty() {
                     None
                 } else {
                     Some(queries.join(", "))
                 };
                 pending_steps.push(Step {
-                    description: desc.clone(),
+                    description: desc.to_string(),
                     tool_name: None,
                     success: true,
                     context_tokens: None,
@@ -237,7 +232,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     trimmed: None,
                 });
                 pending_events.push(ResponseEvent::Step {
-                    description: desc,
+                    description: desc.to_string(),
                     tool_name: None,
                     success: true,
                     detail,

@@ -131,13 +131,14 @@ fn parse_assistant_mixed_content() {
 
 #[test]
 fn parse_legacy_tool_result() {
-    let line = r#"{"type":"tool_result","content":"file contents here","is_error":false}"#;
+    let line = r#"{"type":"tool_result","content":"file contents here","is_error":false,"tool_use_id":"toolu_legacy"}"#;
     let events = parse_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::ToolResult { output, status } => {
+        AgentEvent::ToolResult { output, status, id } => {
             assert_eq!(output, "file contents here");
             assert_eq!(status, "success");
+            assert_eq!(id, "toolu_legacy");
         }
         other => panic!("Expected ToolResult, got {:?}", other),
     }
@@ -149,9 +150,11 @@ fn parse_legacy_tool_result_error() {
     let events = parse_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::ToolResult { output, status } => {
+        AgentEvent::ToolResult { output, status, id } => {
             assert_eq!(output, "not found");
             assert_eq!(status, "error");
+            // Missing tool_use_id in payload → empty (legacy frame).
+            assert!(id.is_empty());
         }
         other => panic!("Expected ToolResult, got {:?}", other),
     }
@@ -164,9 +167,10 @@ fn parse_user_tool_result() {
     let events = parse_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::ToolResult { output, status } => {
+        AgentEvent::ToolResult { output, status, id } => {
             assert_eq!(output, "result text");
             assert_eq!(status, "success");
+            assert_eq!(id, "tu_1");
         }
         other => panic!("Expected ToolResult, got {:?}", other),
     }
@@ -178,9 +182,10 @@ fn parse_user_tool_result_error() {
     let events = parse_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::ToolResult { output, status } => {
+        AgentEvent::ToolResult { output, status, id } => {
             assert_eq!(output, "permission denied");
             assert_eq!(status, "error");
+            assert_eq!(id, "tu_1");
         }
         other => panic!("Expected ToolResult, got {:?}", other),
     }
@@ -227,9 +232,89 @@ fn parse_result() {
     let events = parse_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::Result { text, duration_ms } => {
+        AgentEvent::Result {
+            text,
+            duration_ms,
+            error,
+        } => {
             assert_eq!(text, "Done.");
             assert_eq!(*duration_ms, 1234);
+            assert!(error.is_none(), "success result has no error field");
+        }
+        other => panic!("Expected Result, got {:?}", other),
+    }
+}
+
+/// CC mid-stream API failure (network drop, upstream 5xx) terminates the turn
+/// with `subtype: "error_during_execution"`. The previous parser dropped the
+/// signal, leaving `ResponseGenerated` to render the partial response as a
+/// complete answer.
+#[test]
+fn parse_result_error_during_execution_carries_error() {
+    let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","duration_ms":2300,"errors":["Stream interrupted: connection reset"]}"#;
+    let events = parse_line(line);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        AgentEvent::Result {
+            text,
+            duration_ms,
+            error,
+        } => {
+            assert_eq!(text, "");
+            assert_eq!(*duration_ms, 2300);
+            assert_eq!(
+                error.as_deref(),
+                Some("Stream interrupted: connection reset")
+            );
+        }
+        other => panic!("Expected Result, got {:?}", other),
+    }
+}
+
+/// `error_max_turns` and other non-success subtypes also carry `is_error: true`
+/// but may omit `errors`. Use the subtype as the fallback error message so the
+/// `ResponseFailed` event has something user-readable instead of an empty string.
+#[test]
+fn parse_result_error_max_turns_falls_back_to_subtype() {
+    let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","duration_ms":42000}"#;
+    let events = parse_line(line);
+    match &events[0] {
+        AgentEvent::Result { error, .. } => {
+            assert_eq!(
+                error.as_deref(),
+                Some("error_max_turns"),
+                "no errors[] present — subtype is the user-facing reason"
+            );
+        }
+        other => panic!("Expected Result, got {:?}", other),
+    }
+}
+
+/// Multiple errors join with `; ` so a single `ResponseFailed.error` string
+/// captures every line CC reported, not just the first.
+#[test]
+fn parse_result_joins_multiple_errors() {
+    let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","duration_ms":100,"errors":["upstream 503","retry exhausted"]}"#;
+    let events = parse_line(line);
+    match &events[0] {
+        AgentEvent::Result { error, .. } => {
+            assert_eq!(error.as_deref(), Some("upstream 503; retry exhausted"));
+        }
+        other => panic!("Expected Result, got {:?}", other),
+    }
+}
+
+/// `is_error: false` (or absent) with a `success` subtype: the legacy success
+/// path. `error` MUST stay `None` so `classify_result` doesn't flip the turn
+/// to `Failed`.
+#[test]
+fn parse_result_success_with_subtype_has_no_error() {
+    let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"All good.","duration_ms":1500}"#;
+    let events = parse_line(line);
+    match &events[0] {
+        AgentEvent::Result { text, error, .. } => {
+            assert_eq!(text, "All good.");
+            assert!(error.is_none());
         }
         other => panic!("Expected Result, got {:?}", other),
     }
@@ -278,7 +363,7 @@ fn parse_full_cc_session() {
     assert!(matches!(&all_events[2], AgentEvent::ToolUse { name, .. } if name == "Read"));
     // user tool_result
     assert!(
-        matches!(&all_events[3], AgentEvent::ToolResult { output, status } if output == "file contents" && status == "success")
+        matches!(&all_events[3], AgentEvent::ToolResult { output, status, .. } if output == "file contents" && status == "success")
     );
     // second assistant text
     assert!(
@@ -289,6 +374,7 @@ fn parse_full_cc_session() {
         &all_events[5],
         AgentEvent::Result {
             duration_ms: 5000,
+            error: None,
             ..
         }
     ));
@@ -882,9 +968,14 @@ async fn driver_task_parses_stdout_into_typed_events() {
         .expect("driver should emit Result")
         .expect("events channel should be open");
     match result {
-        AgentEvent::Result { text, duration_ms } => {
+        AgentEvent::Result {
+            text,
+            duration_ms,
+            error,
+        } => {
             assert_eq!(text, "done");
             assert_eq!(duration_ms, 42);
+            assert!(error.is_none());
         }
         other => panic!("expected Result, got {:?}", other),
     }

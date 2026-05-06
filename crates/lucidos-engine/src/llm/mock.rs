@@ -56,6 +56,9 @@ impl LlmProvider for MockProvider {
         Ok(LlmResponse {
             content: Some(MOCK_RESPONSE.to_string()),
             tool_calls: vec![],
+            stop_reason: Some("end_turn".to_string()),
+            output_tokens: None,
+            thinking_chars: None,
         })
     }
 

@@ -1,7 +1,7 @@
 import {
   showToast,
   applyingNowThreadIds,
-  dismissingThreadIds,
+  archivingThreadIds,
   discardingCCThreadIds,
   changes,
 } from '../store';
@@ -27,7 +27,7 @@ function clearApplyingNow(threadId: string): void {
  *  Sets optimistic "applying" state immediately so the UI responds before SSE arrives. */
 export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
   if (applyingNowThreadIds.value.has(threadId)) return; // Already in progress
-  if (dismissingThreadIds.value.has(threadId)) return; // Can't apply while dismissing
+  if (archivingThreadIds.value.has(threadId)) return; // Can't apply while archiving
   if (discardingCCThreadIds.value.has(threadId)) return; // Can't apply while discarding
   // Pin to bottom before banner re-renders (height change would set scrolledUp=true)
   scrollToBottom();
@@ -83,15 +83,19 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
 export async function handleDiscardCCChanges(threadId: string): Promise<void> {
   if (discardingCCThreadIds.value.has(threadId)) return;
   if (applyingNowThreadIds.value.has(threadId)) return;
-  if (dismissingThreadIds.value.has(threadId)) return;
+  if (archivingThreadIds.value.has(threadId)) return;
   // Pin to bottom before banner re-renders (height change would set scrolledUp=true)
   scrollToBottom();
   discardingCCThreadIds.value = new Set([...discardingCCThreadIds.value, threadId]);
+  // autoDismissMs is a safety net for the rare zero-pending-changes case
+  // where the engine emits no ChangeDiscarded event and the spinner has no
+  // SSE handler to replace it. Successful discards re-key with 4s.
+  showToast(changeToastMessage('Discarding changes', threadId), 'info', { key: `discarding-${threadId}`, onClick: () => focusThread(threadId), spinning: true, autoDismissMs: 30_000 });
   try {
     await discardCCChanges(threadId);
-    showToast('Changes discarded', 'success');
+    // Success toast fires from the SSE ChangeDiscarded handler — same key replaces the spinner.
   } catch (e) {
-    showToast(`Failed to discard changes: ${errorDetail(e)}`, 'error');
+    showToast(`Failed to discard changes: ${errorDetail(e)}`, 'error', { key: `discarding-${threadId}` });
   } finally {
     const next = new Set(discardingCCThreadIds.value);
     next.delete(threadId);
@@ -116,14 +120,22 @@ export async function answerCCQuestion(
 }
 
 /** Send a control request to a running Claude Code session.
- *  Generic — works with any CC control subtype (set_model, set_permission_mode, etc.). */
-export async function sendCCControl(threadId: string, request: Record<string, string>): Promise<boolean> {
+ *  Generic — works with any CC control subtype (set_model, set_permission_mode, etc.).
+ *  Returns:
+ *    'ok'      — applied to the live session
+ *    'pending' — 404 (no live session, caller falls back to pending preference);
+ *                no toast shown so a benign race doesn't look like a UX error
+ *    'error'   — hard failure (toast already shown) */
+export async function sendCCControl(threadId: string, request: Record<string, string>): Promise<'ok' | 'pending' | 'error'> {
   try {
     await sendControlRequest(threadId, request);
-    return true;
+    return 'ok';
   } catch (err) {
+    if (err instanceof ApiError && err.httpCode === 404) {
+      return 'pending';
+    }
     const detail = err instanceof ApiError ? err.reason : 'session may have ended';
     showToast(`Failed to send control request — ${detail}`, 'error');
-    return false;
+    return 'error';
   }
 }

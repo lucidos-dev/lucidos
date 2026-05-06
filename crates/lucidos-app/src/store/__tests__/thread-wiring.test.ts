@@ -12,9 +12,11 @@ import {
   type ThreadState,
   type StoredEvent,
 } from '../thread-events';
+import { handleEventWithAgg } from './aggregate-test-helper';
 import { focusedThreadId, threadMap } from '../store';
 import { flushThreadMap } from '../actions/thread-sync';
 import { upsertThread } from '../actions/thread-loading';
+import { getDraft, setDraft } from '../composeDrafts';
 
 const TS = '2026-04-17T00:00:00Z';
 
@@ -29,10 +31,9 @@ function makeThread(overrides: Partial<ThreadState> = {}): ThreadState {
       title: '...',
       channel: 'chat',
       initiator: 'user',
-      pinned: false,
+      saved: false,
       createdAt: '',
       updatedAt: '',
-      unread: false,
       status: 'idle',
       ccHasChanges: false,
       ccRequiresRestart: false,
@@ -40,9 +41,10 @@ function makeThread(overrides: Partial<ThreadState> = {}): ThreadState {
       ccApplying: false,
       lastRevivedAt: '',
       messageCount: 0,
-      section: 'default',
+      section: 'archived',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
+      state: 'active',
     },
     events: new Map(),
     streamingBuffer: '',
@@ -75,7 +77,7 @@ describe('SSE routing: skeleton thread creation', () => {
     const thread = makeThread();
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'SessionStarted', session_id: 'cc-1' }, TS);
+    handleEventWithAgg(map, 't1', 1, { type: 'SessionStarted', session_id: 'cc-1' }, TS);
     // Source should be updated by thread-sync.ts, not handleEvent
     // handleEvent just inserts the event
     expect(thread.events.size).toBe(1);
@@ -91,7 +93,7 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     // Frontend connects to SSE late, misses MessageReceived, gets later CC events.
     // SSE creates skeleton with eventsLoaded=true, so loadThreadEvents skips DB load.
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', pinned: false, createdAt: '', updatedAt: '', unread: true, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'default', activeChildrenCount: 0, totalChildrenCount: 0 },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, state: 'active' },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: true, // Old CodingAgentThreadSpawned behavior — now fixed to false
@@ -102,8 +104,8 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     const map = new Map([['recovery-1', skeleton]]);
 
     // SSE delivers only later events (frontend missed MessageReceived)
-    handleEvent(map, 'recovery-1', 5, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }, TS);
-    handleEvent(map, 'recovery-1', 6, { type: 'CodingAgentToolResult', name: 'Read', result: 'ok' }, TS);
+    handleEventWithAgg(map, 'recovery-1', 5, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }, TS);
+    handleEventWithAgg(map, 'recovery-1', 6, { type: 'CodingAgentToolResult', name: 'Read', result: 'ok' }, TS);
 
     // Thread has CC events but no MessageReceived — no exchange can be formed
     const events = [...skeleton.events.values()];
@@ -117,7 +119,7 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     // After the fix: skeleton.eventsLoaded=false, so loadThreadEvents runs,
     // loads MessageReceived from DB, and the thread shows its messages.
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', pinned: false, createdAt: '', updatedAt: '', unread: true, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'default', activeChildrenCount: 0, totalChildrenCount: 0 },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, state: 'active' },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: false, // Fix: allows DB backfill
@@ -128,13 +130,13 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     const map = new Map([['recovery-1', skeleton]]);
 
     // SSE delivers later events
-    handleEvent(map, 'recovery-1', 5, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }, TS);
-    handleEvent(map, 'recovery-1', 6, { type: 'CodingAgentToolResult', name: 'Read', result: 'ok' }, TS);
+    handleEventWithAgg(map, 'recovery-1', 5, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }, TS);
+    handleEventWithAgg(map, 'recovery-1', 6, { type: 'CodingAgentToolResult', name: 'Read', result: 'ok' }, TS);
 
     // Simulate DB backfill (loadThreadEvents would do this)
     // DB has the MessageReceived at seq 1 that SSE missed
-    handleEvent(map, 'recovery-1', 1, { type: 'MessageReceived', text: 'Recovering interrupted session...' }, TS);
-    handleEvent(map, 'recovery-1', 2, { type: 'SessionStarted', session_id: 'cc-recovery' }, TS);
+    handleEventWithAgg(map, 'recovery-1', 1, { type: 'MessageReceived', text: 'Recovering interrupted session...' }, TS);
+    handleEventWithAgg(map, 'recovery-1', 2, { type: 'SessionStarted', session_id: 'cc-recovery' }, TS);
 
     // Dedup: re-inserting seq 5 and 6 is safely rejected
     const r5 = handleEvent(map, 'recovery-1', 5, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }, TS);
@@ -157,7 +159,7 @@ describe('SSE routing: title updates', () => {
     const thread = makeThread();
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'ThreadTitleGenerated', title: 'My Thread' }, TS);
+    handleEventWithAgg(map, 't1', 1, { type: 'ThreadTitleGenerated', title: 'My Thread' }, TS);
     expect(thread.events.size).toBe(1);
     const evt = [...thread.events.values()][0];
     expect(evt.type).toBe('ThreadTitleGenerated');
@@ -187,8 +189,8 @@ describe('Deduplication', () => {
     const thread = makeThread();
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 100, { type: 'TextStreamed', text: 'chunk 1' }, TS);
-    handleEvent(map, 't1', 101, { type: 'TextStreamed', text: 'chunk 2' }, TS);
+    handleEventWithAgg(map, 't1', 100, { type: 'TextStreamed', text: 'chunk 1' }, TS);
+    handleEventWithAgg(map, 't1', 101, { type: 'TextStreamed', text: 'chunk 2' }, TS);
 
     expect(thread.events.size).toBe(2);
   });
@@ -202,8 +204,8 @@ describe('Streaming buffer', () => {
     const thread = makeThread();
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', null, { type: 'TextStreaming', text: 'hello ' });
-    handleEvent(map, 't1', null, { type: 'TextStreaming', text: 'world' });
+    handleEventWithAgg(map, 't1', null, { type: 'TextStreaming', text: 'hello ' });
+    handleEventWithAgg(map, 't1', null, { type: 'TextStreaming', text: 'world' });
 
     expect(thread.streamingBuffer).toBe('hello world');
     expect(thread.events.size).toBe(0);
@@ -213,10 +215,10 @@ describe('Streaming buffer', () => {
     const thread = makeThread();
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', null, { type: 'TextStreaming', text: 'partial' });
+    handleEventWithAgg(map, 't1', null, { type: 'TextStreaming', text: 'partial' });
     expect(thread.streamingBuffer).toBe('partial');
 
-    handleEvent(map, 't1', 1, { type: 'TextStreamed', text: 'full text' }, TS);
+    handleEventWithAgg(map, 't1', 1, { type: 'TextStreamed', text: 'full text' }, TS);
     expect(thread.streamingBuffer).toBe('');
   });
 
@@ -224,8 +226,8 @@ describe('Streaming buffer', () => {
     const thread = makeThread();
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', null, { type: 'TextStreaming', text: 'some text' });
-    handleEvent(map, 't1', null, { type: 'PreambleCompleting' });
+    handleEventWithAgg(map, 't1', null, { type: 'TextStreaming', text: 'some text' });
+    handleEventWithAgg(map, 't1', null, { type: 'PreambleCompleting' });
 
     expect(thread.streamingBuffer).toBe('some text');
   });
@@ -241,7 +243,7 @@ describe('pendingUserMessages lifecycle', () => {
 
     expect(thread.pendingUserMessages).toHaveLength(1);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'my question' }, TS, 'msg-1');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'my question' }, TS, 'msg-1');
     expect(thread.pendingUserMessages).toEqual([]);
   });
 
@@ -249,7 +251,7 @@ describe('pendingUserMessages lifecycle', () => {
     const thread = makeThread({ pendingUserMessages: [{ text: 'my question', eventId: 'msg-1', created: '2026-01-01T00:00:00Z' }] });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 100, { type: 'ToolCalled', name: 'x', args: {} }, TS);
+    handleEventWithAgg(map, 't1', 100, { type: 'ToolCalled', name: 'x', args: {} }, TS);
 
     // Only the ToolCalled event — pending message still there
     expect(thread.events.size).toBe(1);
@@ -260,7 +262,7 @@ describe('pendingUserMessages lifecycle', () => {
     const thread = makeThread({ pendingUserMessages: [{ text: 'my question', eventId: 'msg-1', created: '2026-01-01T00:00:00Z' }] });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', null, { type: 'TextStreaming', text: 'chunk' });
+    handleEventWithAgg(map, 't1', null, { type: 'TextStreaming', text: 'chunk' });
     expect(thread.pendingUserMessages).toHaveLength(1);
     expect(thread.events.size).toBe(0);
   });
@@ -272,11 +274,11 @@ describe('pendingUserMessages lifecycle', () => {
     ] });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 100, { type: 'MessageReceived', text: 'first' }, TS, 'msg-1');
+    handleEventWithAgg(map, 't1', 100, { type: 'MessageReceived', text: 'first' }, TS, 'msg-1');
     expect(thread.pendingUserMessages).toHaveLength(1);
     expect(thread.pendingUserMessages[0].eventId).toBe('msg-2');
 
-    handleEvent(map, 't1', 101, { type: 'MessageReceived', text: 'second' }, TS, 'msg-2');
+    handleEventWithAgg(map, 't1', 101, { type: 'MessageReceived', text: 'second' }, TS, 'msg-2');
     expect(thread.pendingUserMessages).toEqual([]);
 
     const msgEvents = [...thread.events.values()].filter(e => e.type === 'MessageReceived');
@@ -297,7 +299,7 @@ describe('Thread status from meta', () => {
     const thread = makeThread({ eventsLoaded: true });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 100, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 100, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
     expect(thread.meta.status).toBe('running');
   });
 
@@ -305,8 +307,8 @@ describe('Thread status from meta', () => {
     const thread = makeThread({ eventsLoaded: true });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 100, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 101, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 100, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 101, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
 
     expect(thread.meta.status).toBe('idle');
   });
@@ -315,7 +317,7 @@ describe('Thread status from meta', () => {
     const thread = makeThread({ eventsLoaded: true });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:00Z');
     // SessionStarted is a technical lifecycle event — status stays at whatever it was.
     // Actual processing is signaled by MessageReceived, CodingAgentPromptSent, etc.
     expect(thread.meta.status).toBe('idle');
@@ -332,7 +334,7 @@ describe('updatedAt tracking', () => {
     const map = new Map([['t1', thread]]);
 
     const serverTime = '2026-03-15T18:30:00Z';
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, serverTime);
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, serverTime);
     expect(thread.meta.updatedAt).toBe(serverTime);
   });
 
@@ -341,7 +343,7 @@ describe('updatedAt tracking', () => {
     const map = new Map([['t1', thread]]);
 
     const serverTime = '2026-03-15T10:00:00Z';
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, serverTime);
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, serverTime);
     // Must use server time, not new Date() — ensures consistent ordering with API
     expect(thread.meta.updatedAt).toBe(serverTime);
     // Should NOT be close to current client time
@@ -354,7 +356,7 @@ describe('updatedAt tracking', () => {
     thread.meta.updatedAt = '2020-01-01T00:00:00Z';
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', null, { type: 'CodingAgentTextStreamed', text: 'chunk' } as any, '2026-03-15T15:24:59Z');
+    handleEventWithAgg(map, 't1', null, { type: 'CodingAgentTextStreamed', text: 'chunk' } as any, '2026-03-15T15:24:59Z');
     expect(thread.meta.updatedAt).toBe('2026-03-15T15:24:59Z');
   });
 
@@ -363,7 +365,7 @@ describe('updatedAt tracking', () => {
     thread.meta.updatedAt = '2020-01-01T00:00:00Z';
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', null, { type: 'CodingAgentTextStreamed', text: 'chunk' } as any);
+    handleEventWithAgg(map, 't1', null, { type: 'CodingAgentTextStreamed', text: 'chunk' } as any);
     expect(thread.meta.updatedAt).toBe('2020-01-01T00:00:00Z');
   });
 });
@@ -376,7 +378,7 @@ describe('Created timestamp storage', () => {
     const thread = makeThread();
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 100, { type: 'MessageReceived', text: 'hi' }, '2026-03-14T12:00:00Z');
+    handleEventWithAgg(map, 't1', 100, { type: 'MessageReceived', text: 'hi' }, '2026-03-14T12:00:00Z');
 
     const stored = thread.events.get(100) as StoredEvent;
     expect(stored.created).toBe('2026-03-14T12:00:00Z');
@@ -387,7 +389,7 @@ describe('Created timestamp storage', () => {
     const map = new Map([['t1', thread]]);
     const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    handleEvent(map, 't1', 100, { type: 'MessageReceived', text: 'hi' });
+    handleEventWithAgg(map, 't1', 100, { type: 'MessageReceived', text: 'hi' });
 
     const stored = thread.events.get(100) as StoredEvent;
     expect(stored.created).toBeUndefined();
@@ -430,9 +432,9 @@ describe('getCCWaitingInfo', () => {
   it('CodingAgentIdled with has_changes=true updates meta', () => {
     const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
 
     expect(thread.meta.status).toBe('waiting');
     expect(thread.meta.ccHasChanges).toBe(true);
@@ -443,8 +445,8 @@ describe('getCCWaitingInfo', () => {
   it('CodingAgentIdled with requires_restart=true updates meta', () => {
     const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'CodingAgentIdled', has_changes: true, requires_restart: true } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'CodingAgentIdled', has_changes: true, requires_restart: true } as any, '2026-01-01T00:00:02Z');
 
     expect(thread.meta.ccRequiresRestart).toBe(true);
     const info = getCCWaitingInfo(thread.meta);
@@ -454,9 +456,9 @@ describe('getCCWaitingInfo', () => {
   it('SessionEnded after ResponseGenerated (no changes) → idle, no waiting info', () => {
     const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'SessionEnded' }, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'SessionEnded' }, '2026-01-01T00:00:02Z');
 
     // ResponseGenerated without ccHasChanges → idle
     expect(thread.meta.status).toBe('idle');
@@ -466,9 +468,9 @@ describe('getCCWaitingInfo', () => {
   it('MessageReceived after CodingAgentIdled resumes work → status=running', () => {
     const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
-    handleEvent(map, 't1', 3, { type: 'MessageReceived', text: 'also fix linting' }, '2026-01-01T00:00:03Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'MessageReceived', text: 'also fix linting' }, '2026-01-01T00:00:03Z');
 
     expect(thread.meta.status).toBe('running');
     expect(getCCWaitingInfo(thread.meta)).toBeNull();
@@ -477,9 +479,9 @@ describe('getCCWaitingInfo', () => {
   it('MergeConflictDetected sets ccApplying=true', () => {
     const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
-    handleEvent(map, 't1', 3, { type: 'MergeConflictDetected', change_id: 'c-1', files: ['a.rs'] } as any, '2026-01-01T00:00:03Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'MergeConflictDetected', change_id: 'c-1', files: ['a.rs'] } as any, '2026-01-01T00:00:03Z');
 
     expect(thread.meta.ccApplying).toBe(true);
   });
@@ -487,10 +489,10 @@ describe('getCCWaitingInfo', () => {
   it('ChangeApplied clears all CC flags and sets status to idle', () => {
     const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
-    handleEvent(map, 't1', 3, { type: 'MergeConflictDetected', change_id: 'c-1', files: ['a.rs'] } as any, '2026-01-01T00:00:03Z');
-    handleEvent(map, 't1', 4, { type: 'ChangeApplied', change_id: 'c-1' } as any, '2026-01-01T00:00:04Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'MergeConflictDetected', change_id: 'c-1', files: ['a.rs'] } as any, '2026-01-01T00:00:03Z');
+    handleEventWithAgg(map, 't1', 4, { type: 'ChangeApplied', change_id: 'c-1' } as any, '2026-01-01T00:00:04Z');
 
     expect(thread.meta.status).toBe('idle');
     expect(thread.meta.ccHasChanges).toBe(false);
@@ -501,8 +503,8 @@ describe('getCCWaitingInfo', () => {
   it('ChangeProposed sets ccHasChanges=true but does not change status', () => {
     const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'implement feature' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'ChangeProposed', change_id: 'c-1', description: 'Add feature', files: ['a.rs'] } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'implement feature' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'ChangeProposed', change_id: 'c-1', description: 'Add feature', files: ['a.rs'] } as any, '2026-01-01T00:00:02Z');
 
     // ChangeProposed only sets CC flags — status stays 'running' from MessageReceived.
     // This prevents Apply/Discard buttons from appearing while CC is still active
@@ -561,7 +563,7 @@ describe('Focused thread preserved across reload', () => {
       created_at: '2026-03-20T10:00:00Z',
       last_activity: '2026-03-20T11:00:00Z',
       message_count: 5,
-      section: 'default',
+      section: 'archived',
       active_children_count: 0,
       total_children_count: 0,
       status: 'idle',
@@ -570,12 +572,63 @@ describe('Focused thread preserved across reload', () => {
       cc_is_external_repo: false,
       cc_applying: false,
       last_revived_at: null,
+      state: 'active',
+      compose_text: '',
+      compose_images: [],
     }, false);
 
     expect(map.has(focusedId)).toBe(true);
     expect(map.get(focusedId)!.meta.title).toBe('Thread Blocking Bug Investigation');
     expect(map.get(focusedId)!.meta.channel).toBe('claude_code');
     expect(map.get(focusedId)!.eventsLoaded).toBe(false);
+  });
+
+  it('upsertThread refreshes compose state from API for existing threads', () => {
+    // Bug: SSE skeleton creation lands `state='composing'` on the thread before
+    // MessageReceived arrives. If MessageReceived is dropped (SSE drop, broadcast
+    // backpressure), the thread is stuck at 'composing' on the frontend even
+    // though the projection has 'active'. categorizeThreads then skips it from
+    // every section — the thread is invisible everywhere except Search.
+    // Fix: upsertThread must refresh `state` and the compose tuple from API
+    // responses, not just the initial create.
+    const map = new Map<string, ThreadState>();
+    const id = 'stuck-composing';
+
+    // SSE skeleton landed first with state='composing'
+    map.set(id, makeThread({
+      meta: { ...makeThread().meta, id, state: 'composing' },
+    }));
+    setDraft(id, { text: 'half-typed', images: [], mode: 'claude_code' });
+
+    // Subsequent loadAllThreads / resync brings authoritative state from API
+    upsertThread(map, {
+      thread_id: id,
+      title: 'Fix Expired GitHub Enterprise Token',
+      channel: 'claude_code',
+      initiator: 'user',
+      created_at: '2026-05-04T10:56:14Z',
+      last_activity: '2026-05-04T10:56:44Z',
+      message_count: 1,
+      section: 'inbox',
+      active_children_count: 0,
+      total_children_count: 0,
+      status: 'waiting',
+      cc_has_changes: true,
+      cc_requires_restart: false,
+      cc_is_external_repo: false,
+      cc_applying: false,
+      last_revived_at: null,
+      state: 'active',
+      compose_text: '',
+      compose_images: [],
+      compose_mode: null,
+    }, false);
+
+    const meta = map.get(id)!.meta;
+    expect(meta.state).toBe('active');
+    const draft = getDraft(id);
+    expect(draft.mode).toBeNull();
+    expect(draft.text).toBe('');
   });
 });
 
@@ -588,15 +641,15 @@ describe('CC follow-up in same thread', () => {
     const map = new Map([['cc-1', thread]]);
 
     // First CC exchange
-    handleEvent(map, 'cc-1', 1, { type: 'MessageReceived', text: 'fix the bug' }, '2026-03-15T10:00:00Z', undefined);
-    handleEvent(map, 'cc-1', 2, { type: 'SessionStarted', session_id: 'claude-code/20260315' }, TS);
-    handleEvent(map, 'cc-1', 3, { type: 'CodingAgentTextStreamed', text: 'Fixed.' }, TS);
-    handleEvent(map, 'cc-1', 4, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-03-15T10:01:00Z');
+    handleEventWithAgg(map, 'cc-1', 1, { type: 'MessageReceived', text: 'fix the bug' }, '2026-03-15T10:00:00Z', undefined);
+    handleEventWithAgg(map, 'cc-1', 2, { type: 'SessionStarted', session_id: 'claude-code/20260315' }, TS);
+    handleEventWithAgg(map, 'cc-1', 3, { type: 'CodingAgentTextStreamed', text: 'Fixed.' }, TS);
+    handleEventWithAgg(map, 'cc-1', 4, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-03-15T10:01:00Z');
 
     // Follow-up — should be in SAME thread, not a new one
-    handleEvent(map, 'cc-1', 5, { type: 'MessageReceived', text: 'also fix linting' }, '2026-03-15T10:02:00Z', undefined);
-    handleEvent(map, 'cc-1', 6, { type: 'CodingAgentTextStreamed', text: 'Done.' }, TS);
-    handleEvent(map, 'cc-1', 7, { type: 'CodingAgentIdled' } as any, '2026-03-15T10:03:00Z');
+    handleEventWithAgg(map, 'cc-1', 5, { type: 'MessageReceived', text: 'also fix linting' }, '2026-03-15T10:02:00Z', undefined);
+    handleEventWithAgg(map, 'cc-1', 6, { type: 'CodingAgentTextStreamed', text: 'Done.' }, TS);
+    handleEventWithAgg(map, 'cc-1', 7, { type: 'CodingAgentIdled' } as any, '2026-03-15T10:03:00Z');
 
     // All events in ONE thread
     expect(map.size).toBe(1);
@@ -622,12 +675,12 @@ describe('Exchange count for drawer', () => {
     const thread = makeThread();
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 100, { type: 'MessageReceived', text: 'q1' }, TS);
-    handleEvent(map, 't1', 101, { type: 'ResponseGenerated' }, TS);
-    handleEvent(map, 't1', 102, { type: 'MessageReceived', text: 'q2' }, TS);
-    handleEvent(map, 't1', 103, { type: 'ResponseGenerated' }, TS);
-    handleEvent(map, 't1', 104, { type: 'TriggerStarted', trigger_id: 't1' }, TS);
-    handleEvent(map, 't1', 105, { type: 'ResponseGenerated' }, TS);
+    handleEventWithAgg(map, 't1', 100, { type: 'MessageReceived', text: 'q1' }, TS);
+    handleEventWithAgg(map, 't1', 101, { type: 'ResponseGenerated' }, TS);
+    handleEventWithAgg(map, 't1', 102, { type: 'MessageReceived', text: 'q2' }, TS);
+    handleEventWithAgg(map, 't1', 103, { type: 'ResponseGenerated' }, TS);
+    handleEventWithAgg(map, 't1', 104, { type: 'TriggerStarted', trigger_id: 't1' }, TS);
+    handleEventWithAgg(map, 't1', 105, { type: 'ResponseGenerated' }, TS);
 
     const count = [...thread.events.values()].filter(
       e => e.type === 'MessageReceived' || e.type === 'TriggerStarted'
@@ -639,9 +692,9 @@ describe('Exchange count for drawer', () => {
     const thread = makeThread();
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 100, { type: 'SessionRecovered', branch: 'claude-code/20260318' }, TS);
-    handleEvent(map, 't1', 101, { type: 'SessionStarted', session_id: 'cc-1' }, TS);
-    handleEvent(map, 't1', 102, { type: 'ResponseGenerated' }, TS);
+    handleEventWithAgg(map, 't1', 100, { type: 'SessionRecovered', branch: 'claude-code/20260318' }, TS);
+    handleEventWithAgg(map, 't1', 101, { type: 'SessionStarted', session_id: 'cc-1' }, TS);
+    handleEventWithAgg(map, 't1', 102, { type: 'ResponseGenerated' }, TS);
 
     const exchanges = groupIntoExchanges(thread.events);
     expect(exchanges).toHaveLength(1);
@@ -659,22 +712,22 @@ describe('Apply Now: Scenario A3 — clean merge (happy path)', () => {
     const map = new Map([['t1', thread]]);
 
     // 1. CC session works and goes idle with changes
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix the bug' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} }, TS);
-    handleEvent(map, 't1', 4, { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok' }, TS);
-    handleEvent(map, 't1', 5, { type: 'CodingAgentTextStreamed', text: 'Fixed.' }, TS);
-    handleEvent(map, 't1', 6, { type: 'ResponseGenerated' }, '2026-01-01T00:00:10Z');
-    handleEvent(map, 't1', 7, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:11Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix the bug' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} }, TS);
+    handleEventWithAgg(map, 't1', 4, { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok' }, TS);
+    handleEventWithAgg(map, 't1', 5, { type: 'CodingAgentTextStreamed', text: 'Fixed.' }, TS);
+    handleEventWithAgg(map, 't1', 6, { type: 'ResponseGenerated' }, '2026-01-01T00:00:10Z');
+    handleEventWithAgg(map, 't1', 7, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:11Z');
 
     // Thread status: waiting (idle with changes)
     expect(thread.meta.status).toBe('waiting');
     expect(getCCWaitingInfo(thread.meta)).toEqual({ hasChanges: true, isExternalRepo: false, requiresRestart: false, applying: false });
 
     // 3. Backend proposes change, merges, emits ChangeApplied → ChangeProposed + ChangeApplied + SessionEnded
-    handleEvent(map, 't1', 8, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['lib.rs'] } as any, '2026-01-01T00:00:12Z');
-    handleEvent(map, 't1', 9, { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, path: '' } as any, '2026-01-01T00:00:13Z');
-    handleEvent(map, 't1', 10, { type: 'SessionEnded' }, '2026-01-01T00:00:14Z');
+    handleEventWithAgg(map, 't1', 8, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['lib.rs'] } as any, '2026-01-01T00:00:12Z');
+    handleEventWithAgg(map, 't1', 9, { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, path: '' } as any, '2026-01-01T00:00:13Z');
+    handleEventWithAgg(map, 't1', 10, { type: 'SessionEnded' }, '2026-01-01T00:00:14Z');
 
     // Thread status: idle (change resolved, session ended)
     expect(thread.meta.status).toBe('idle');
@@ -696,32 +749,32 @@ describe('Apply Now: Scenario A1 — hardening not done', () => {
     const map = new Map([['t1', thread]]);
 
     // 1. CC session works and goes idle
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'CodingAgentTextStreamed', text: 'Done.' }, TS);
-    handleEvent(map, 't1', 4, { type: 'ResponseGenerated' }, '2026-01-01T00:00:05Z');
-    handleEvent(map, 't1', 5, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:06Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentTextStreamed', text: 'Done.' }, TS);
+    handleEventWithAgg(map, 't1', 4, { type: 'ResponseGenerated' }, '2026-01-01T00:00:05Z');
+    handleEventWithAgg(map, 't1', 5, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:06Z');
     expect(thread.meta.status).toBe('waiting');
 
     // 3. Backend sends review follow-up — CC works
     // First need a MessageReceived or CodingAgentUserMessageSent to resume
-    handleEvent(map, 't1', 6, { type: 'CodingAgentUserMessageSent', text: 'Review changes' }, '2026-01-01T00:00:07Z');
-    handleEvent(map, 't1', 7, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }, TS);
-    handleEvent(map, 't1', 8, { type: 'CodingAgentToolResult', name: 'Read', result: 'code...' }, TS);
+    handleEventWithAgg(map, 't1', 6, { type: 'CodingAgentUserMessageSent', text: 'Review changes' }, '2026-01-01T00:00:07Z');
+    handleEventWithAgg(map, 't1', 7, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }, TS);
+    handleEventWithAgg(map, 't1', 8, { type: 'CodingAgentToolResult', name: 'Read', result: 'code...' }, TS);
 
     // CC resumed work — status=running (from CodingAgentUserMessageSent), no longer waiting
     expect(thread.meta.status).toBe('running');
     expect(getCCWaitingInfo(thread.meta)).toBeNull();
 
     // 4. Review finishes, CC idles again
-    handleEvent(map, 't1', 9, { type: 'ResponseGenerated' }, '2026-01-01T00:00:10Z');
-    handleEvent(map, 't1', 10, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:11Z');
+    handleEventWithAgg(map, 't1', 9, { type: 'ResponseGenerated' }, '2026-01-01T00:00:10Z');
+    handleEventWithAgg(map, 't1', 10, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:11Z');
     expect(thread.meta.ccHasChanges).toBe(true);
 
     // 5. Backend proposes change, merges, emits ChangeApplied + kills CC + SessionEnded
-    handleEvent(map, 't1', 11, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['a.rs'] } as any, '2026-01-01T00:00:12Z');
-    handleEvent(map, 't1', 12, { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, path: '' } as any, '2026-01-01T00:00:13Z');
-    handleEvent(map, 't1', 13, { type: 'SessionEnded' }, '2026-01-01T00:00:14Z');
+    handleEventWithAgg(map, 't1', 11, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['a.rs'] } as any, '2026-01-01T00:00:12Z');
+    handleEventWithAgg(map, 't1', 12, { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, path: '' } as any, '2026-01-01T00:00:13Z');
+    handleEventWithAgg(map, 't1', 13, { type: 'SessionEnded' }, '2026-01-01T00:00:14Z');
 
     // Thread goes idle
     expect(thread.meta.status).toBe('idle');
@@ -732,14 +785,14 @@ describe('Apply Now: Scenario A1 — hardening not done', () => {
     const thread = makeThread({ eventsLoaded: true, meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['a.rs'] } as any, '2026-01-01T00:00:02Z');
-    handleEvent(map, 't1', 4, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:03Z');
-    handleEvent(map, 't1', 5, { type: 'SessionEnded' }, '2026-01-01T00:00:04Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['a.rs'] } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 4, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:03Z');
+    handleEventWithAgg(map, 't1', 5, { type: 'SessionEnded' }, '2026-01-01T00:00:04Z');
 
     // ChangeApplyFailed arrives (e.g., repo has uncommitted changes)
-    handleEvent(map, 't1', 6, { type: 'ChangeApplyFailed', change_id: 'c-1', error: 'uncommitted changes' } as any, '2026-01-01T00:00:05Z');
+    handleEventWithAgg(map, 't1', 6, { type: 'ChangeApplyFailed', change_id: 'c-1', error: 'uncommitted changes' } as any, '2026-01-01T00:00:05Z');
 
     // Thread stays waiting — change is still pending, user can retry
     expect(thread.meta.status).toBe('waiting');
@@ -760,17 +813,17 @@ describe('Apply Now: Scenario A4 — no commits to apply (branch already merged)
     const map = new Map([['t1', thread]]);
 
     // 1. CC session works and goes idle with changes
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'CodingAgentTextStreamed', text: 'Done.' }, TS);
-    handleEvent(map, 't1', 4, { type: 'ResponseGenerated' }, '2026-01-01T00:00:05Z');
-    handleEvent(map, 't1', 5, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:06Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentTextStreamed', text: 'Done.' }, TS);
+    handleEventWithAgg(map, 't1', 4, { type: 'ResponseGenerated' }, '2026-01-01T00:00:05Z');
+    handleEventWithAgg(map, 't1', 5, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:06Z');
 
     expect(thread.meta.ccHasChanges).toBe(true);
     expect(thread.meta.status).toBe('waiting');
 
     // 3. ChangeApplied clears CC flags and sets status to idle
-    handleEvent(map, 't1', 6, { type: 'ChangeApplied', change_id: 'c-1' } as any, '2026-01-01T00:00:07Z');
+    handleEventWithAgg(map, 't1', 6, { type: 'ChangeApplied', change_id: 'c-1' } as any, '2026-01-01T00:00:07Z');
 
     // Status becomes idle, CC flags cleared
     expect(thread.meta.status).toBe('idle');
@@ -787,38 +840,38 @@ describe('Apply Now: Scenario A2 — merge conflict', () => {
     const t = (offsetMs: number) => new Date(now.getTime() + offsetMs).toISOString();
 
     // 1. CC done, idle with changes (fresh timestamps — real-time flow)
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, t(-20000));
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, t(-19000));
-    handleEvent(map, 't1', 3, { type: 'CodingAgentTextStreamed', text: 'Done.' }, TS);
-    handleEvent(map, 't1', 4, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['main.rs'] } as any, t(-17000));
-    handleEvent(map, 't1', 5, { type: 'CodingAgentIdled', has_changes: true } as any, t(-16000));
-    handleEvent(map, 't1', 6, { type: 'SessionEnded' }, t(-15000));
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, t(-20000));
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, t(-19000));
+    handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentTextStreamed', text: 'Done.' }, TS);
+    handleEventWithAgg(map, 't1', 4, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['main.rs'] } as any, t(-17000));
+    handleEventWithAgg(map, 't1', 5, { type: 'CodingAgentIdled', has_changes: true } as any, t(-16000));
+    handleEventWithAgg(map, 't1', 6, { type: 'SessionEnded' }, t(-15000));
 
     expect(thread.meta.status).toBe('waiting');
 
     // 2. Apply triggered → backend detects merge conflict
-    handleEvent(map, 't1', 7, { type: 'MergeConflictDetected', change_id: 'c-1', files: ['main.rs'] } as any, t(-5000));
+    handleEventWithAgg(map, 't1', 7, { type: 'MergeConflictDetected', change_id: 'c-1', files: ['main.rs'] } as any, t(-5000));
 
     // MergeConflictDetected sets ccApplying=true, status stays waiting
     expect(thread.meta.ccApplying).toBe(true);
 
     // 3. Conflict resolution CC session works
-    handleEvent(map, 't1', 8, { type: 'SessionStarted', session_id: 's2' }, t(-4000));
+    handleEventWithAgg(map, 't1', 8, { type: 'SessionStarted', session_id: 's2' }, t(-4000));
     // SessionStarted doesn't change status — still waiting
     expect(thread.meta.status).toBe('waiting');
     // CodingAgentPromptSent sets running
-    handleEvent(map, 't1', 8.5, { type: 'CodingAgentPromptSent', text: 'Resolve merge conflict' } as any, t(-3500));
+    handleEventWithAgg(map, 't1', 8.5, { type: 'CodingAgentPromptSent', text: 'Resolve merge conflict' } as any, t(-3500));
     expect(thread.meta.status).toBe('running');
 
-    handleEvent(map, 't1', 9, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }, TS);
-    handleEvent(map, 't1', 10, { type: 'CodingAgentToolResult', name: 'Read', result: 'conflict markers...' }, TS);
-    handleEvent(map, 't1', 11, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} }, TS);
-    handleEvent(map, 't1', 12, { type: 'CodingAgentToolResult', name: 'Edit', result: 'resolved' }, TS);
+    handleEventWithAgg(map, 't1', 9, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }, TS);
+    handleEventWithAgg(map, 't1', 10, { type: 'CodingAgentToolResult', name: 'Read', result: 'conflict markers...' }, TS);
+    handleEventWithAgg(map, 't1', 11, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} }, TS);
+    handleEventWithAgg(map, 't1', 12, { type: 'CodingAgentToolResult', name: 'Edit', result: 'resolved' }, TS);
     expect(thread.meta.status).toBe('running');
 
     // 4. Conflict resolved → ChangeApplied + SessionEnded
-    handleEvent(map, 't1', 13, { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, path: '' } as any, t(-2000));
-    handleEvent(map, 't1', 14, { type: 'SessionEnded' }, t(-1000));
+    handleEventWithAgg(map, 't1', 13, { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, path: '' } as any, t(-2000));
+    handleEventWithAgg(map, 't1', 14, { type: 'SessionEnded' }, t(-1000));
 
     expect(thread.meta.status).toBe('idle');
     expect(getCCWaitingInfo(thread.meta)).toBeNull();
@@ -836,15 +889,15 @@ describe('Apply Now: Scenario A2 — merge conflict', () => {
     const thread = makeThread({ eventsLoaded: true, meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['a.rs'] } as any, '2026-01-01T00:00:02Z');
-    handleEvent(map, 't1', 4, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:03Z');
-    handleEvent(map, 't1', 5, { type: 'SessionEnded' }, '2026-01-01T00:00:04Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['a.rs'] } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 4, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:03Z');
+    handleEventWithAgg(map, 't1', 5, { type: 'SessionEnded' }, '2026-01-01T00:00:04Z');
 
     // Merge conflict, CC tries to resolve but fails
-    handleEvent(map, 't1', 6, { type: 'MergeConflictDetected', change_id: 'c-1', files: ['a.rs'] } as any, '2026-01-01T00:00:05Z');
-    handleEvent(map, 't1', 7, { type: 'ChangeApplyFailed', change_id: 'c-1', error: 'could not resolve conflicts' } as any, '2026-01-01T00:00:06Z');
+    handleEventWithAgg(map, 't1', 6, { type: 'MergeConflictDetected', change_id: 'c-1', files: ['a.rs'] } as any, '2026-01-01T00:00:05Z');
+    handleEventWithAgg(map, 't1', 7, { type: 'ChangeApplyFailed', change_id: 'c-1', error: 'could not resolve conflicts' } as any, '2026-01-01T00:00:06Z');
 
     // Thread stays waiting — change still pending, user can retry
     expect(thread.meta.status).toBe('waiting');
@@ -856,18 +909,18 @@ describe('Apply Now: edge cases', () => {
     const thread = makeThread({ eventsLoaded: true, meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix 1', files: ['a.rs'] } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix 1', files: ['a.rs'] } as any, '2026-01-01T00:00:02Z');
     // Second round of work
-    handleEvent(map, 't1', 4, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} }, TS);
-    handleEvent(map, 't1', 5, { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok' }, TS);
-    handleEvent(map, 't1', 6, { type: 'ChangeProposed', change_id: 'c-2', description: 'Fix 2', files: ['b.rs'] } as any, '2026-01-01T00:00:05Z');
-    handleEvent(map, 't1', 7, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:06Z');
-    handleEvent(map, 't1', 8, { type: 'SessionEnded' }, '2026-01-01T00:00:07Z');
+    handleEventWithAgg(map, 't1', 4, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} }, TS);
+    handleEventWithAgg(map, 't1', 5, { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok' }, TS);
+    handleEventWithAgg(map, 't1', 6, { type: 'ChangeProposed', change_id: 'c-2', description: 'Fix 2', files: ['b.rs'] } as any, '2026-01-01T00:00:05Z');
+    handleEventWithAgg(map, 't1', 7, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:06Z');
+    handleEventWithAgg(map, 't1', 8, { type: 'SessionEnded' }, '2026-01-01T00:00:07Z');
 
     // Apply changes
-    handleEvent(map, 't1', 9, { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, path: '' } as any, '2026-01-01T00:00:08Z');
+    handleEventWithAgg(map, 't1', 9, { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, path: '' } as any, '2026-01-01T00:00:08Z');
 
     // ChangeApplied clears all CC flags → idle
     expect(thread.meta.status).toBe('idle');
@@ -878,12 +931,12 @@ describe('Apply Now: edge cases', () => {
     const thread = makeThread({ eventsLoaded: true, meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'ChangeProposed', change_id: 'c-1', description: 'Engine fix', files: ['engine.rs'], requires_restart: true } as any, '2026-01-01T00:00:02Z');
-    handleEvent(map, 't1', 4, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:03Z');
-    handleEvent(map, 't1', 5, { type: 'SessionEnded' }, '2026-01-01T00:00:04Z');
-    handleEvent(map, 't1', 6, { type: 'ChangeApplied', change_id: 'c-1', requires_restart: true, path: '' } as any, '2026-01-01T00:00:05Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'ChangeProposed', change_id: 'c-1', description: 'Engine fix', files: ['engine.rs'], requires_restart: true } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 4, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:03Z');
+    handleEventWithAgg(map, 't1', 5, { type: 'SessionEnded' }, '2026-01-01T00:00:04Z');
+    handleEventWithAgg(map, 't1', 6, { type: 'ChangeApplied', change_id: 'c-1', requires_restart: true, path: '' } as any, '2026-01-01T00:00:05Z');
 
     expect(thread.meta.status).toBe('idle');
 
@@ -903,11 +956,11 @@ describe('ThreadTitleRenamed event handling', () => {
     const map = new Map([['t1', thread]]);
 
     // Auto-generated title arrives first
-    handleEvent(map, 't1', 1, { type: 'ThreadTitleGenerated', title: 'Auto Title' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'ThreadTitleGenerated', title: 'Auto Title' }, '2026-01-01T00:00:00Z');
     expect(thread.events.get(1)!.type).toBe('ThreadTitleGenerated');
 
     // User renames the thread
-    handleEvent(map, 't1', 2, { type: 'ThreadTitleRenamed', title: 'My Custom Title' }, '2026-01-01T00:01:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'ThreadTitleRenamed', title: 'My Custom Title' }, '2026-01-01T00:01:00Z');
     expect(thread.events.get(2)!.type).toBe('ThreadTitleRenamed');
   });
 
@@ -915,7 +968,7 @@ describe('ThreadTitleRenamed event handling', () => {
     const thread = makeThread();
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 42, { type: 'ThreadTitleRenamed', title: 'Renamed' }, '2026-03-18T12:00:00Z');
+    handleEventWithAgg(map, 't1', 42, { type: 'ThreadTitleRenamed', title: 'Renamed' }, '2026-03-18T12:00:00Z');
 
     expect(thread.events.has(42)).toBe(true);
     const stored = thread.events.get(42)!;
@@ -928,41 +981,41 @@ describe('ThreadTitleRenamed event handling', () => {
     const thread = makeThread({ eventsLoaded: true });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
     expect(thread.meta.status).toBe('idle');
 
     // Renaming doesn't change status
-    handleEvent(map, 't1', 3, { type: 'ThreadTitleRenamed', title: 'New Name' }, '2026-01-01T00:01:00Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'ThreadTitleRenamed', title: 'New Name' }, '2026-01-01T00:01:00Z');
     expect(thread.meta.status).toBe('idle');
   });
 
-  it('ThreadPinned does not change waiting CC session to running', () => {
+  it('ThreadSaved does not change waiting CC session to running', () => {
     const thread = makeThread({ eventsLoaded: true, meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
 
     expect(thread.meta.status).toBe('waiting');
 
-    // Pinning the thread should NOT change status from waiting to running
-    handleEvent(map, 't1', 4, { type: 'ThreadPinned' }, '2026-01-01T00:00:03Z');
+    // Saving the thread should NOT change status from waiting to running
+    handleEventWithAgg(map, 't1', 4, { type: 'ThreadSaved' }, '2026-01-01T00:00:03Z');
     expect(thread.meta.status).toBe('waiting');
   });
 
-  it('ThreadUnpinned does not change waiting CC session to running', () => {
+  it('ThreadUnsaved does not change waiting CC session to running', () => {
     const thread = makeThread({ eventsLoaded: true, meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
 
     expect(thread.meta.status).toBe('waiting');
 
-    handleEvent(map, 't1', 4, { type: 'ThreadUnpinned' }, '2026-01-01T00:00:03Z');
+    handleEventWithAgg(map, 't1', 4, { type: 'ThreadUnsaved' }, '2026-01-01T00:00:03Z');
     expect(thread.meta.status).toBe('waiting');
   });
 
@@ -970,11 +1023,11 @@ describe('ThreadTitleRenamed event handling', () => {
     const thread = makeThread({ eventsLoaded: true });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
     expect(thread.meta.status).toBe('idle');
 
-    handleEvent(map, 't1', 3, { type: 'ThreadPinned' }, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'ThreadSaved' }, '2026-01-01T00:00:02Z');
     expect(thread.meta.status).toBe('idle');
   });
 
@@ -982,10 +1035,10 @@ describe('ThreadTitleRenamed event handling', () => {
     const thread = makeThread({ eventsLoaded: true });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't1', 3, { type: 'ThreadTitleRenamed', title: 'New Name' }, '2026-01-01T00:01:00Z');
-    handleEvent(map, 't1', 4, { type: 'MessageReceived', text: 'follow up' }, '2026-01-01T00:02:00Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'ThreadTitleRenamed', title: 'New Name' }, '2026-01-01T00:01:00Z');
+    handleEventWithAgg(map, 't1', 4, { type: 'MessageReceived', text: 'follow up' }, '2026-01-01T00:02:00Z');
 
     const exchanges = groupIntoExchanges(thread.events);
     expect(exchanges).toHaveLength(2); // Two MessageReceived = 2 exchanges
@@ -1028,9 +1081,9 @@ describe('SSE batching: flushThreadMap coalesces signal updates', () => {
     map.set('t2', t2);
 
     // Simulate rapid SSE events mutating threads in-place
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'q1' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
-    handleEvent(map, 't2', 1, { type: 'MessageReceived', text: 'q2' }, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'q1' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't2', 1, { type: 'MessageReceived', text: 'q2' }, '2026-01-01T00:00:02Z');
 
     // No flush yet — signal still points to same reference
     const beforeFlush = threadMap.value;
@@ -1065,19 +1118,19 @@ describe('Backend-authoritative liveness: meta.status from backend', () => {
     const staleTime = new Date(Date.now() - 120_000).toISOString();
 
     // CC session started, user sent message, CC is working
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix the bug' }, staleTime);
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, staleTime);
-    handleEvent(map, 't1', 3, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }, TS);
-    handleEvent(map, 't1', 4, { type: 'CodingAgentTextStreamed', text: 'Looking...' }, TS);
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix the bug' }, staleTime);
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, staleTime);
+    handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }, TS);
+    handleEventWithAgg(map, 't1', 4, { type: 'CodingAgentTextStreamed', text: 'Looking...' }, TS);
 
     // Backend reports status=running — that's the truth, regardless of timestamps
     expect(thread.meta.status).toBe('running');
 
     // User sent follow-up while CC was working
-    handleEvent(map, 't1', 5, { type: 'CodingAgentUserMessageSent', text: 'check ChangeApplied' }, staleTime);
+    handleEventWithAgg(map, 't1', 5, { type: 'CodingAgentUserMessageSent', text: 'check ChangeApplied' }, staleTime);
 
     // CC resumed work — status stays running
-    handleEvent(map, 't1', 6, { type: 'CodingAgentToolCalled', name: 'Search', args: {} }, staleTime);
+    handleEventWithAgg(map, 't1', 6, { type: 'CodingAgentToolCalled', name: 'Search', args: {} }, staleTime);
     expect(thread.meta.status).toBe('running');
   });
 
@@ -1088,10 +1141,10 @@ describe('Backend-authoritative liveness: meta.status from backend', () => {
     });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'hi' }, '2026-01-01T00:00:00Z');
     expect(thread.meta.status).toBe('running');
 
-    handleEvent(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
     expect(thread.meta.status).toBe('idle');
   });
 
@@ -1102,11 +1155,11 @@ describe('Backend-authoritative liveness: meta.status from backend', () => {
     });
     const map = new Map([['t1', thread]]);
 
-    handleEvent(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEvent(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
     expect(thread.meta.status).toBe('running');
 
-    handleEvent(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
     expect(thread.meta.status).toBe('waiting');
     expect(thread.meta.ccHasChanges).toBe(true);
   });
@@ -1134,7 +1187,7 @@ describe('No auto-focus on SSE-created threads', () => {
   it('SSE skeleton creation does not change focusedThreadId', () => {
     const map = threadMap.value;
     map.set('spawned-1', threadWithId('spawned-1'));
-    handleEvent(map, 'spawned-1', 1, { type: 'MessageReceived', text: 'task from another workspace' }, '2026-04-13T12:00:00Z');
+    handleEventWithAgg(map, 'spawned-1', 1, { type: 'MessageReceived', text: 'task from another workspace' }, '2026-04-13T12:00:00Z');
     threadMap.value = new Map(map);
 
     expect(focusedThreadId.value).toBeNull();
@@ -1146,8 +1199,8 @@ describe('No auto-focus on SSE-created threads', () => {
     focusedThreadId.value = 'focused-thread';
 
     map.set('spawned-2', threadWithId('spawned-2'));
-    handleEvent(map, 'spawned-2', 1, { type: 'MessageReceived', text: 'spawned task' }, '2026-04-13T12:00:00Z');
-    handleEvent(map, 'spawned-2', 2, { type: 'SessionStarted', session_id: 'cc-spawned' }, '2026-04-13T12:00:01Z');
+    handleEventWithAgg(map, 'spawned-2', 1, { type: 'MessageReceived', text: 'spawned task' }, '2026-04-13T12:00:00Z');
+    handleEventWithAgg(map, 'spawned-2', 2, { type: 'SessionStarted', session_id: 'cc-spawned' }, '2026-04-13T12:00:01Z');
     threadMap.value = new Map(map);
 
     expect(focusedThreadId.value).toBe('focused-thread');
@@ -1160,7 +1213,7 @@ describe('No auto-focus on SSE-created threads', () => {
     map.set('parent-thread', threadWithId('parent-thread'));
     focusedThreadId.value = 'parent-thread';
 
-    handleEvent(map, 'parent-thread', null, {
+    handleEventWithAgg(map, 'parent-thread', null, {
       type: 'CodingAgentThreadSpawned',
       cc_thread_id: 'cc-child-1',
       title: 'Fix the bug',
@@ -1177,13 +1230,13 @@ describe('No auto-focus on SSE-created threads', () => {
     focusedThreadId.value = 'my-thread';
 
     map.set('remote-thread', threadWithId('remote-thread', { channel: 'claude_code' }));
-    handleEvent(map, 'remote-thread', 1, { type: 'MessageReceived', text: 'remote task' }, '2026-04-13T12:00:00Z');
-    handleEvent(map, 'remote-thread', 2, { type: 'SessionStarted', session_id: 'cc-remote' }, '2026-04-13T12:00:01Z');
-    handleEvent(map, 'remote-thread', null, { type: 'CodingAgentTextStreamed', text: 'Working...' } as any);
-    handleEvent(map, 'remote-thread', 3, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} }, TS);
-    handleEvent(map, 'remote-thread', 4, { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok' }, TS);
-    handleEvent(map, 'remote-thread', 5, { type: 'ResponseGenerated' }, '2026-04-13T12:01:00Z');
-    handleEvent(map, 'remote-thread', 6, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-04-13T12:01:01Z');
+    handleEventWithAgg(map, 'remote-thread', 1, { type: 'MessageReceived', text: 'remote task' }, '2026-04-13T12:00:00Z');
+    handleEventWithAgg(map, 'remote-thread', 2, { type: 'SessionStarted', session_id: 'cc-remote' }, '2026-04-13T12:00:01Z');
+    handleEventWithAgg(map, 'remote-thread', null, { type: 'CodingAgentTextStreamed', text: 'Working...' } as any);
+    handleEventWithAgg(map, 'remote-thread', 3, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} }, TS);
+    handleEventWithAgg(map, 'remote-thread', 4, { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok' }, TS);
+    handleEventWithAgg(map, 'remote-thread', 5, { type: 'ResponseGenerated' }, '2026-04-13T12:01:00Z');
+    handleEventWithAgg(map, 'remote-thread', 6, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-04-13T12:01:01Z');
     threadMap.value = new Map(map);
 
     expect(focusedThreadId.value).toBe('my-thread');

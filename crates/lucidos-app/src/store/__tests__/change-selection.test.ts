@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
   repoSource, repoDiff, repoPending, repoViewMode, repositories,
-  activeMenuItem, panelOverlay,
+  activeMenuItem, panelOverlay, SELECTED_CHANGE_KEY,
 } from '../store';
+import '../effects';
 import type { Change, RepoChangesState } from '../../api/client';
 
 // Mock the API client
@@ -12,13 +13,17 @@ vi.mock('../../api/client', async () => {
   return {
     ...actual,
     getChangeDiff: vi.fn(),
+    getChangeById: vi.fn(),
     getRepoChanges: vi.fn(),
     listRepoFiles: vi.fn(),
   };
 });
 
-import { getChangeDiff, getRepoChanges } from '../../api/client';
-import { selectRepoChange, loadRepoChanges, viewChangeDiff } from '../actions/repositories';
+import { getChangeById, getChangeDiff, getRepoChanges } from '../../api/client';
+import {
+  selectRepoChange, loadRepoChanges, viewChangeDiff,
+  restoreRepoSelectionFromStorage,
+} from '../actions/repositories';
 
 const mockChange: Change = {
   id: 'change-1',
@@ -60,6 +65,7 @@ beforeEach(() => {
   repositories.value = { status: 'not-loaded' };
   activeMenuItem.value = 'files';
   panelOverlay.value = null;
+  localStorage.removeItem(SELECTED_CHANGE_KEY);
   vi.clearAllMocks();
 });
 
@@ -183,5 +189,76 @@ describe('viewChangeDiff', () => {
     await viewChangeDiff(mockChange);
 
     expect(repoSelectedChangeId.value).toBeNull();
+  });
+});
+
+describe('selected change persistence', () => {
+  it('writes selected change ID to localStorage', async () => {
+    repoSource.value = 'repo-1';
+    (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({ files: [] });
+
+    await selectRepoChange(mockChange);
+
+    expect(localStorage.getItem(SELECTED_CHANGE_KEY)).toBe('change-1');
+  });
+
+  it('removes localStorage entry when selection is cleared', async () => {
+    repoSource.value = 'repo-1';
+    repoSelectedChangeId.value = 'change-1';
+    localStorage.setItem(SELECTED_CHANGE_KEY, 'change-1');
+
+    await selectRepoChange(null);
+
+    expect(localStorage.getItem(SELECTED_CHANGE_KEY)).toBeNull();
+  });
+});
+
+describe('restoreRepoSelectionFromStorage', () => {
+  it('re-selects change saved in localStorage on reload', async () => {
+    repositories.value = {
+      status: 'loaded',
+      data: [{ id: 'repo-1', name: 'Test', path: '/test/repo' }],
+    };
+    localStorage.setItem(SELECTED_CHANGE_KEY, 'change-1');
+    (getChangeById as ReturnType<typeof vi.fn>).mockResolvedValue(mockChange);
+    (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({ files: [] });
+    (getRepoChanges as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [], applied: [], has_more: false });
+
+    await restoreRepoSelectionFromStorage();
+
+    expect(repoSelectedChangeId.value).toBe('change-1');
+    expect(repoViewMode.value).toBe('changes');
+    expect(repoSource.value).toBe('repo-1');
+  });
+
+  it('does nothing when no saved ID', async () => {
+    await restoreRepoSelectionFromStorage();
+
+    expect(repoSelectedChangeId.value).toBeNull();
+    expect(getChangeById).not.toHaveBeenCalled();
+  });
+
+  it('clears stale ID when change no longer exists', async () => {
+    localStorage.setItem(SELECTED_CHANGE_KEY, 'change-gone');
+    (getChangeById as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Not found'));
+
+    await restoreRepoSelectionFromStorage();
+
+    expect(localStorage.getItem(SELECTED_CHANGE_KEY)).toBeNull();
+    expect(repoSelectedChangeId.value).toBeNull();
+  });
+
+  it('skips when a file-preview overlay already encodes the same change', async () => {
+    // RepoFilePreview's useEffect handles this case — duplicating the fetch
+    // here doubles the round-trip on every reload of a diff file preview.
+    localStorage.setItem(SELECTED_CHANGE_KEY, 'change-1');
+    panelOverlay.value = {
+      type: 'file-preview',
+      path: 'repo:repo-1:diff#change-1:src/main.rs',
+    };
+
+    await restoreRepoSelectionFromStorage();
+
+    expect(getChangeById).not.toHaveBeenCalled();
   });
 });

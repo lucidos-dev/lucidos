@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { activeInlineForm, appsList, showToast } from '../../store/store';
 import { closeAppForm, saveAppMetadata, refreshAppUI } from '../../store/actions/apps';
-import type { App } from '../../store/types';
+import type { App, Loadable } from '../../store/types';
 import { readAppSourceApi, writeAppSourceApi } from '../../api/client';
 import type { UiSourceFile } from '../../api/client';
 import { AutoTextarea } from '../shared/AutoTextarea';
 import { autoResizeTextarea } from '../../utils/dom';
+import { useLoadableFetch } from '../../hooks/useLoadableFetch';
+import { errorDetail } from '../../utils/errorDetail';
 
 export function AppUiEditModal() {
   const form = activeInlineForm.value;
@@ -14,7 +16,7 @@ export function AppUiEditModal() {
   const { appId } = form;
 
   if (appsList.value.status !== 'loaded') {
-    return <div class="inline-form"><div class="empty">Loading...</div></div>;
+    return <div class="inline-form"><div class="loading-spinner" /></div>;
   }
 
   const app = appsList.value.data.find((s) => s.id === appId);
@@ -29,24 +31,16 @@ export function AppUiEditModal() {
 function AppUiEditModalInner({ app }: { app: App }) {
   const [name, setName] = useState(app.name);
   const [description, setDescription] = useState(app.description);
-  const [files, setFiles] = useState<UiSourceFile[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    readAppSourceApi(app.id)
-      .then((res) => {
-        setFiles(res.files);
-        setLoading(false);
-      })
-      .catch((err) => {
-        setError(String(err));
-        setLoading(false);
-      });
-  }, [app.id]);
+  const { loadable: filesLoadable, setLoadable: setFilesLoadable, showLoading } = useLoadableFetch<UiSourceFile[]>(
+    () => readAppSourceApi(app.id).then((res) => res.files),
+    [app.id],
+  );
 
   function updateFileContent(index: number, content: string) {
-    setFiles((prev) => prev.map((f, i) => i === index ? { ...f, content } : f));
+    setFilesLoadable((prev) => {
+      if (prev.status !== 'loaded') return prev;
+      return { status: 'loaded', data: prev.data.map((f, i) => i === index ? { ...f, content } : f) };
+    });
   }
 
   async function handleSave(e: Event) {
@@ -56,12 +50,13 @@ function AppUiEditModalInner({ app }: { app: App }) {
     const metaOk = await saveAppMetadata(app.id, name.trim(), description.trim());
     if (!metaOk) return;
 
+    const files = filesLoadable.status === 'loaded' ? filesLoadable.data : [];
     if (files.length > 0) {
       try {
         await writeAppSourceApi(app.id, files);
         refreshAppUI(app.id);
       } catch (err) {
-        showToast('Failed to save files: ' + String(err), 'error');
+        showToast('Failed to save files: ' + errorDetail(err), 'error');
         return;
       }
     }
@@ -86,23 +81,39 @@ function AppUiEditModalInner({ app }: { app: App }) {
             <label>Description</label>
             <AutoTextarea value={description} onInput={setDescription} />
           </div>
-          {loading && <div class="empty">Loading files...</div>}
-          {error && <div class="error-text">Failed to load files: {error}</div>}
-          {files.map((file, i) => (
-            <div class="form-group" key={file.name}>
-              <label>{file.name}</label>
-              <CodeTextarea value={file.content} onInput={(v) => updateFileContent(i, v)} />
-            </div>
-          ))}
+          <FilesEditor loadable={filesLoadable} showLoading={showLoading} updateFileContent={updateFileContent} />
           <div class="form-actions">
             <button type="button" class="btn-cancel" onClick={closeAppForm}>
               Cancel
             </button>
-            <button type="submit" class="btn-save" disabled={loading}>Save</button>
+            <button type="submit" class="btn-save" disabled={filesLoadable.status !== 'loaded'}>Save</button>
           </div>
         </div>
       </form>
     </div>
+  );
+}
+
+function FilesEditor({
+  loadable,
+  showLoading,
+  updateFileContent,
+}: {
+  loadable: Loadable<UiSourceFile[]>;
+  showLoading: boolean;
+  updateFileContent: (index: number, content: string) => void;
+}) {
+  if (loadable.status === 'failed') return <div class="error-text">Failed to load files: {loadable.error}</div>;
+  if (loadable.status !== 'loaded') return showLoading ? <div class="loading-spinner" /> : null;
+  return (
+    <>
+      {loadable.data.map((file, i) => (
+        <div class="form-group" key={file.name}>
+          <label>{file.name}</label>
+          <CodeTextarea value={file.content} onInput={(v) => updateFileContent(i, v)} />
+        </div>
+      ))}
+    </>
   );
 }
 

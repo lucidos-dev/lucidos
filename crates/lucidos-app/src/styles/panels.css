@@ -1069,7 +1069,10 @@
         z-index: calc(var(--z-control-panel) + 1);
     }
 
-    /* Threads header — icon left, title centered, actions right, positioned in drawer width */
+    /* Threads header — icon left, title centered, actions right, positioned in drawer width.
+       z-index 3 keeps the filter dropdown above .drawer-divider / .split-divider (both
+       z-index 2) — transform creates a stacking context, so the dropdown's own z-index
+       is trapped inside this one. */
     .threads-header {
         position: absolute;
         left: 0;
@@ -1080,7 +1083,7 @@
         align-items: center;
         gap: 0.25rem;
         padding: 0 0.5rem; /* toggle is a flex child, no magic offset needed */
-        z-index: 1;
+        z-index: 3;
         transition: width var(--duration-slow) ease;
     }
 
@@ -1225,10 +1228,26 @@
     overflow: hidden;
     text-overflow: ellipsis;
     min-width: 0;
-    /* Truncate workspace fully before Lucidos starts shrinking — high factor
-       (vs Lucidos' default 1) absorbs essentially all negative space until
-       this label hits min-width: 0, then Lucidos takes the rest. */
-    flex-shrink: 99;
+    flex-shrink: 1;
+}
+
+/* Truncation priority: while a workspace label is rendered AND not hidden,
+   pin "lucidos" at its natural width so the workspace absorbs all flex shrink
+   first (instead of both labels truncating in parallel — "lucid... ● wo..."). */
+.pane-header-brand-label:has(> .workspace-name-label:not(.is-hidden)) .pane-header-title {
+    flex-shrink: 0;
+}
+
+/* Set by ConnectionStatus when even workspace shrunk to 0 plus its margin
+   gap doesn't fit. Stays in the DOM so scrollWidth keeps reporting the
+   natural text width — the JS measurement loop reads it to decide when to
+   un-hide. The :has() rule above flips lucidos back to flex-shrink: 1 once
+   this class is set, so brand can truncate with text-overflow: ellipsis. */
+.workspace-name-label.is-hidden {
+    flex: 0 0 0;
+    width: 0;
+    margin: 0;
+    visibility: hidden;
 }
 
 /* --- Connection status inline --- */

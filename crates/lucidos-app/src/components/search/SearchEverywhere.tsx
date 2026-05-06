@@ -9,6 +9,7 @@ import { viewChangeDiffById } from '../../store/actions/repositories';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { SearchIcon, CloseIcon, ClearIcon } from '../shared/icons';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
+import { errorDetail } from '../../utils/errorDetail';
 import './SearchEverywhere.css';
 
 const CATEGORIES: { id: SearchCategory; label: string }[] = [
@@ -134,6 +135,7 @@ function ResultRow({ item, index, selected, onSelect, onHover }: {
   onSelect: (item: SearchResultItem) => void;
   onHover: (index: number) => void;
 }) {
+  const display = { title: item.title, subtitle: item.subtitle };
   return (
     <button
       key={`${item.category}:${item.id}`}
@@ -146,8 +148,8 @@ function ResultRow({ item, index, selected, onSelect, onHover }: {
         <CategoryIcon category={item.category} />
       </span>
       <span class="search-everywhere-result-info">
-        <span class="search-everywhere-result-title">{item.title}</span>
-        {item.subtitle && <span class="search-everywhere-result-subtitle">{item.subtitle}</span>}
+        <span class="search-everywhere-result-title">{display.title}</span>
+        {display.subtitle && <span class="search-everywhere-result-subtitle">{display.subtitle}</span>}
       </span>
     </button>
   );
@@ -232,7 +234,7 @@ export function SearchEverywhere() {
         if (err instanceof DOMException && err.name === 'AbortError') return;
         if (!controller.signal.aborted) {
           setResults({});
-          showToast('Search failed', 'error');
+          showToast(`Search failed: ${errorDetail(err)}`, 'error');
         }
       } finally {
         if (!controller.signal.aborted) {

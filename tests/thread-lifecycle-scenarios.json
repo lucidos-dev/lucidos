@@ -5,29 +5,19 @@
       "thread_type": "chat",
       "description": "Chat thread: message → stream → response marks unread",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "TextStreamed" },
-        { "emit": "ResponseGenerated", "expected": { "stored_section": "unread", "expected_actions": ["done"] } }
-      ]
-    },
-    {
-      "name": "chat_user_reads_thread",
-      "thread_type": "chat",
-      "description": "Chat thread: response marks unread, then user reads it back to default",
-      "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "ResponseGenerated" },
-        { "emit": "ThreadMarkedRead", "expected": { "stored_section": "default", "expected_actions": [] } }
+        {"emit": "MessageReceived"},
+        {"emit": "TextStreamed"},
+        {"emit": "ResponseGenerated", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}}
       ]
     },
     {
       "name": "chat_response_canceled",
       "thread_type": "chat",
-      "description": "Chat thread: canceled response does not mark unread",
+      "description": "Chat thread: canceled response surfaces in REVIEW so the user can save or archive",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "TextStreamed" },
-        { "emit": "ResponseCanceled", "expected": { "stored_section": "default" } }
+        {"emit": "MessageReceived"},
+        {"emit": "TextStreamed"},
+        {"emit": "ResponseCanceled", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}}
       ]
     },
     {
@@ -35,9 +25,8 @@
       "thread_type": "chat",
       "description": "Chat thread: failed response surfaces in REVIEW so the user notices the error",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "ResponseFailed", "expected": { "stored_section": "unread" },
-          "assert_side_effect": "ThreadMarkedUnread" }
+        {"emit": "MessageReceived"},
+        {"emit": "ResponseFailed", "expected": {"stored_section": "inbox"}}
       ]
     },
     {
@@ -45,8 +34,8 @@
       "thread_type": "chat",
       "description": "Chat thread: aborted response marks thread as unread so user notices",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "ResponseAborted", "expected": { "stored_section": "unread", "expected_actions": ["done"] }, "assert_side_effect": "ThreadMarkedUnread" }
+        {"emit": "MessageReceived"},
+        {"emit": "ResponseAborted", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}}
       ]
     },
     {
@@ -54,38 +43,19 @@
       "thread_type": "chat",
       "description": "Chat thread: response marks unread, new message keeps it unread",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "ResponseGenerated", "expected": { "stored_section": "unread" } },
-        { "emit": "MessageReceived", "expected": { "stored_section": "unread" } }
+        {"emit": "MessageReceived"},
+        {"emit": "ResponseGenerated", "expected": {"stored_section": "inbox"}},
+        {"emit": "MessageReceived", "expected": {"stored_section": "inbox"}}
       ]
     },
     {
-      "name": "chat_focus_clears_unread",
+      "name": "chat_archived",
       "thread_type": "chat",
-      "description": "Chat thread: focusing clears unread via ThreadMarkedRead",
+      "description": "Chat thread: ThreadArchived clears unread to default",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "ResponseGenerated" },
-        { "emit": "ThreadMarkedRead", "expected": { "stored_section": "default" } }
-      ]
-    },
-    {
-      "name": "chat_response_generated_marks_unread",
-      "thread_type": "chat",
-      "description": "Chat thread: ResponseGenerated emits EmitThreadMarkedUnread side effect",
-      "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "ResponseGenerated", "assert_side_effect": "ThreadMarkedUnread" }
-      ]
-    },
-    {
-      "name": "chat_dismissed",
-      "thread_type": "chat",
-      "description": "Chat thread: ThreadDismissed clears unread to default",
-      "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "ResponseGenerated", "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "ThreadDismissed", "expected": { "stored_section": "default", "expected_actions": [] } }
+        {"emit": "MessageReceived"},
+        {"emit": "ResponseGenerated", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "ThreadArchived", "expected": {"stored_section": "archived", "expected_actions": []}}
       ]
     },
     {
@@ -93,11 +63,11 @@
       "thread_type": "claude_code",
       "description": "CC thread: idle marks unread (needs user attention)",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "CodingAgentToolCalled" },
-        { "emit": "ResponseGenerated" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["done"] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "CodingAgentToolCalled"},
+        {"emit": "ResponseGenerated"},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}}
       ]
     },
     {
@@ -105,25 +75,25 @@
       "thread_type": "claude_code",
       "description": "CC thread: idle with changes, apply clears unread",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "CodingAgentToolCalled" },
-        { "emit": "ResponseGenerated" },
-        { "emit": "ChangeProposed", "set_pending_changes": true },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] } },
-        { "emit": "ChangeApplied", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "CodingAgentToolCalled"},
+        {"emit": "ResponseGenerated"},
+        {"emit": "ChangeProposed", "set_pending_changes": true},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}},
+        {"emit": "ChangeApplied", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}}
       ]
     },
     {
       "name": "cc_idle_with_changes_discard",
       "thread_type": "claude_code",
-      "description": "CC thread: idle with changes, discard stays unread with Done button",
+      "description": "CC thread: idle with changes, discard stays unread with Archive button",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ChangeProposed", "set_pending_changes": true },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] } },
-        { "emit": "ChangeDiscarded", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ChangeProposed", "set_pending_changes": true},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}},
+        {"emit": "ChangeDiscarded", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}}
       ]
     },
     {
@@ -131,10 +101,10 @@
       "thread_type": "claude_code",
       "description": "CC thread: idle without changes marks unread",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ResponseGenerated" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["done"] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ResponseGenerated"},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}}
       ]
     },
     {
@@ -142,12 +112,12 @@
       "thread_type": "claude_code",
       "description": "CC thread: follow-up message then re-idle stays unread",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "CodingAgentUserMessageSent" },
-        { "emit": "CodingAgentToolCalled" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["done"] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "CodingAgentUserMessageSent"},
+        {"emit": "CodingAgentToolCalled"},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}}
       ]
     },
     {
@@ -155,9 +125,9 @@
       "thread_type": "claude_code",
       "description": "CC thread: ResponseGenerated does NOT mark unread (only CodingAgentIdled does)",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ResponseGenerated", "expected": { "stored_section": "default" }, "assert_no_side_effect": "ThreadMarkedUnread" }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ResponseGenerated", "expected": {"stored_section": "archived"}}
       ]
     },
     {
@@ -165,13 +135,13 @@
       "thread_type": "claude_code",
       "description": "CC thread: multiple changes, apply clears CC flags (ClearAll), thread stays in REVIEW with Done",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ChangeProposed" },
-        { "emit": "ChangeProposed", "set_pending_changes": true },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] } },
-        { "emit": "ChangeApplied", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "ChangeDiscarded", "expected": { "stored_section": "unread", "expected_actions": ["done"] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ChangeProposed"},
+        {"emit": "ChangeProposed", "set_pending_changes": true},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}},
+        {"emit": "ChangeApplied", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "ChangeDiscarded", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}}
       ]
     },
     {
@@ -179,10 +149,10 @@
       "thread_type": "claude_code",
       "description": "CC thread: abort from engine restart marks unread (shows in REVIEW)",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "CodingAgentToolCalled" },
-        { "emit": "ResponseAborted", "expected": { "stored_section": "unread" } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "CodingAgentToolCalled"},
+        {"emit": "ResponseAborted", "expected": {"stored_section": "inbox"}}
       ]
     },
     {
@@ -190,22 +160,22 @@
       "thread_type": "claude_code",
       "description": "CC thread: merge conflict does not change section from unread",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ChangeProposed" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread" } },
-        { "emit": "MergeConflictDetected", "expected": { "stored_section": "unread" } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ChangeProposed"},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox"}},
+        {"emit": "MergeConflictDetected", "expected": {"stored_section": "inbox"}}
       ]
     },
     {
-      "name": "cc_dismissed",
+      "name": "cc_archived",
       "thread_type": "claude_code",
-      "description": "CC thread: ThreadDismissed clears unread to default",
+      "description": "CC thread: ThreadArchived clears unread to default",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "ThreadDismissed", "expected": { "stored_section": "default", "expected_actions": [] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "ThreadArchived", "expected": {"stored_section": "archived", "expected_actions": []}}
       ]
     },
     {
@@ -213,10 +183,10 @@
       "thread_type": "claude_code",
       "description": "CC thread: idle then session ended stays unread (session is process-level)",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread" } },
-        { "emit": "SessionEnded", "expected": { "stored_section": "unread" } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox"}},
+        {"emit": "SessionEnded", "expected": {"stored_section": "inbox"}}
       ]
     },
     {
@@ -224,11 +194,11 @@
       "thread_type": "claude_code",
       "description": "CC thread: changes proposed, idle, session ended stays unread",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ChangeProposed" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread" } },
-        { "emit": "SessionEnded", "expected": { "stored_section": "unread" } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ChangeProposed"},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox"}},
+        {"emit": "SessionEnded", "expected": {"stored_section": "inbox"}}
       ]
     },
     {
@@ -236,34 +206,33 @@
       "thread_type": "claude_code",
       "description": "CC thread: missing hardening detected after apply stays unread",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ChangeProposed" },
-        { "emit": "CodingAgentIdled" },
-        { "emit": "ChangeApplied", "set_pending_changes": false, "expected": { "stored_section": "unread" } },
-        { "emit": "MissingHardeningDetected", "expected": { "stored_section": "unread" } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ChangeProposed"},
+        {"emit": "CodingAgentIdled"},
+        {"emit": "ChangeApplied", "set_pending_changes": false, "expected": {"stored_section": "inbox"}},
+        {"emit": "MissingHardeningDetected", "expected": {"stored_section": "inbox"}}
       ]
     },
     {
-      "name": "pinned_chat_thread",
+      "name": "saved_chat_thread",
       "thread_type": "chat",
-      "description": "Chat thread: pinning does not affect stored section",
+      "description": "Chat thread: saving does not affect stored section (stays inbox after response)",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "ResponseGenerated" },
-        { "emit": "ThreadMarkedRead" },
-        { "emit": "ThreadPinned", "expected": { "stored_section": "default" } }
+        {"emit": "MessageReceived"},
+        {"emit": "ResponseGenerated"},
+        {"emit": "ThreadSaved", "expected": {"stored_section": "inbox"}}
       ]
     },
     {
-      "name": "pinned_cc_thread",
+      "name": "saved_cc_thread",
       "thread_type": "claude_code",
       "description": "CC thread: pinning does not prevent idle from setting unread",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ThreadPinned" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread" } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ThreadSaved"},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox"}}
       ]
     },
     {
@@ -271,8 +240,8 @@
       "thread_type": "chat",
       "description": "Chat thread: CodingAgentIdled is rejected",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "CodingAgentIdled", "expect_error": "CodingAgentIdled is CC-only" }
+        {"emit": "MessageReceived"},
+        {"emit": "CodingAgentIdled", "expect_error": "CodingAgentIdled is CC-only"}
       ]
     },
     {
@@ -280,25 +249,21 @@
       "thread_type": "chat",
       "description": "Chat thread: SessionStarted is rejected",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted", "expect_error": "CC-specific event on Chat thread" }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted", "expect_error": "CC-specific event on Chat thread"}
       ]
     },
     {
       "name": "cc_change_reverted_after_apply_stays_unread",
       "thread_type": "claude_code",
-      "description": "ChangeReverted after ChangeApplied stays unread (Done button still visible)",
+      "description": "ChangeReverted after ChangeApplied stays unread (Archive button still visible)",
       "steps": [
-        { "emit": "MessageReceived", "payload": { "text": "Fix", "channel": "claude_code" } },
-        { "emit": "SessionStarted", "payload": { "session_id": "s1", "branch": "fix" } },
-        { "emit": "ChangeProposed", "payload": { "change_id": "c1", "description": "Fix", "files": ["a.rs"] } },
-        { "emit": "CodingAgentIdled", "payload": { "has_changes": true } },
-        { "emit": "ChangeApplied", "payload": { "change_id": "c1" },
-          "expected": { "stored_section": "unread" }
-        },
-        { "emit": "ChangeReverted", "payload": { "change_id": "c1" },
-          "expected": { "stored_section": "unread" }
-        }
+        {"emit": "MessageReceived", "payload": {"text": "Fix", "channel": "claude_code"}},
+        {"emit": "SessionStarted", "payload": {"session_id": "s1", "branch": "fix"}},
+        {"emit": "ChangeProposed", "payload": {"change_id": "c1", "description": "Fix", "files": ["a.rs"]}},
+        {"emit": "CodingAgentIdled", "payload": {"has_changes": true}},
+        {"emit": "ChangeApplied", "payload": {"change_id": "c1"}, "expected": {"stored_section": "inbox"}},
+        {"emit": "ChangeReverted", "payload": {"change_id": "c1"}, "expected": {"stored_section": "inbox"}}
       ]
     },
     {
@@ -306,34 +271,21 @@
       "thread_type": "chat",
       "description": "Trigger thread follows chat rules — response goes to unread",
       "steps": [
-        { "emit": "TriggerStarted", "payload": { "trigger_id": "t1", "trigger_name": "Daily check", "invocation": { "kind": "Schedule" } } },
-        { "emit": "ToolCalled", "payload": { "name": "web_search", "args": {} } },
-        { "emit": "ToolResult", "payload": { "name": "web_search", "result": "results" } },
-        { "emit": "ResponseGenerated", "payload": { "text": "Here are the results" },
-          "expected": { "stored_section": "unread" },
-          "assert_side_effect": "ThreadMarkedUnread"
-        }
+        {"emit": "TriggerStarted", "payload": {"trigger_id": "t1", "trigger_name": "Daily check", "invocation": {"kind": "Schedule"}}},
+        {"emit": "ToolCalled", "payload": {"name": "web_search", "args": {}}},
+        {"emit": "ToolResult", "payload": {"name": "web_search", "result": "results"}},
+        {"emit": "ResponseGenerated", "payload": {"text": "Here are the results"}, "expected": {"stored_section": "inbox"}}
       ]
     },
     {
       "name": "trigger_followup",
       "thread_type": "chat",
-      "description": "Trigger thread: user followup response goes to unread (review), not history",
+      "description": "Trigger thread: user followup response stays in inbox (review)",
       "steps": [
-        { "emit": "TriggerStarted", "payload": { "trigger_id": "t1", "trigger_name": "Daily check", "invocation": { "kind": "Schedule" } } },
-        { "emit": "ResponseGenerated", "payload": { "text": "Here are the results" },
-          "expected": { "stored_section": "unread" }
-        },
-        { "emit": "ThreadMarkedRead",
-          "expected": { "stored_section": "default" }
-        },
-        { "emit": "MessageReceived", "payload": { "text": "Can you elaborate?" },
-          "expected": { "stored_section": "default" }
-        },
-        { "emit": "ResponseGenerated", "payload": { "text": "Sure, here are the details..." },
-          "expected": { "stored_section": "unread" },
-          "assert_side_effect": "ThreadMarkedUnread"
-        }
+        {"emit": "TriggerStarted", "payload": {"trigger_id": "t1", "trigger_name": "Daily check", "invocation": {"kind": "Schedule"}}},
+        {"emit": "ResponseGenerated", "payload": {"text": "Here are the results"}, "expected": {"stored_section": "inbox"}},
+        {"emit": "MessageReceived", "payload": {"text": "Can you elaborate?"}, "expected": {"stored_section": "inbox"}},
+        {"emit": "ResponseGenerated", "payload": {"text": "Sure, here are the details..."}, "expected": {"stored_section": "inbox"}}
       ]
     },
     {
@@ -341,12 +293,9 @@
       "thread_type": "claude_code",
       "description": "ResponseFailed surfaces the thread in REVIEW so the user sees the error",
       "steps": [
-        { "emit": "MessageReceived", "payload": { "text": "Fix", "channel": "claude_code" } },
-        { "emit": "SessionStarted", "payload": { "session_id": "s1", "branch": "fix" } },
-        { "emit": "ResponseFailed", "payload": { "error": "Rate limited" },
-          "expected": { "stored_section": "unread", "status": "failed" },
-          "assert_side_effect": "ThreadMarkedUnread"
-        }
+        {"emit": "MessageReceived", "payload": {"text": "Fix", "channel": "claude_code"}},
+        {"emit": "SessionStarted", "payload": {"session_id": "s1", "branch": "fix"}},
+        {"emit": "ResponseFailed", "payload": {"error": "Rate limited"}, "expected": {"stored_section": "inbox", "status": "failed"}}
       ]
     },
     {
@@ -354,14 +303,10 @@
       "thread_type": "claude_code",
       "description": "Multiple CodingAgentIdled events are idempotent — stays unread",
       "steps": [
-        { "emit": "MessageReceived", "payload": { "text": "Fix", "channel": "claude_code" } },
-        { "emit": "SessionStarted", "payload": { "session_id": "s1", "branch": "fix" } },
-        { "emit": "CodingAgentIdled", "payload": { "has_changes": true },
-          "expected": { "stored_section": "unread" }
-        },
-        { "emit": "CodingAgentIdled", "payload": { "has_changes": true },
-          "expected": { "stored_section": "unread" }
-        }
+        {"emit": "MessageReceived", "payload": {"text": "Fix", "channel": "claude_code"}},
+        {"emit": "SessionStarted", "payload": {"session_id": "s1", "branch": "fix"}},
+        {"emit": "CodingAgentIdled", "payload": {"has_changes": true}, "expected": {"stored_section": "inbox"}},
+        {"emit": "CodingAgentIdled", "payload": {"has_changes": true}, "expected": {"stored_section": "inbox"}}
       ]
     },
     {
@@ -369,15 +314,9 @@
       "thread_type": "chat",
       "description": "Chat parent shows as Ongoing while any child is not in History",
       "steps": [
-        { "emit": "MessageReceived", "payload": { "text": "Hello", "channel": "chat" } },
-        { "emit": "ResponseGenerated", "payload": { "text": "Hi!" } },
-        { "emit": "ThreadMarkedRead", "payload": {} },
-        {
-          "emit": "MessageReceived",
-          "payload": { "text": "Spawn child", "channel": "chat", "parent_thread_id": "00000000-0000-0000-0000-000000000001" },
-          "expected_comment": "This spawns a child — parent's active_children_count increments. Display section tested via has_active_children=true in display_section, not via stored_section.",
-          "expected": { "stored_section": "default" }
-        }
+        {"emit": "MessageReceived", "payload": {"text": "Hello", "channel": "chat"}},
+        {"emit": "ResponseGenerated", "payload": {"text": "Hi!"}},
+        {"emit": "MessageReceived", "payload": {"text": "Spawn child", "channel": "chat", "parent_thread_id": "00000000-0000-0000-0000-000000000001"}, "expected_comment": "This spawns a child — parent's active_children_count increments. Display section tested via has_active_children=true in display_section, not via stored_section.", "expected": {"stored_section": "inbox"}}
       ]
     },
     {
@@ -386,8 +325,8 @@
       "is_top_level": false,
       "description": "Sub-thread chat: ResponseGenerated does NOT mark unread — goes directly to history",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "ResponseGenerated", "expected": { "stored_section": "default" }, "assert_no_side_effect": "ThreadMarkedUnread" }
+        {"emit": "MessageReceived"},
+        {"emit": "ResponseGenerated", "expected": {"stored_section": "archived"}}
       ]
     },
     {
@@ -396,20 +335,20 @@
       "is_top_level": false,
       "description": "Sub-thread CC: CodingAgentIdled marks unread — every CC session needs user action (Apply/Discard/Done)",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread" }, "assert_side_effect": "ThreadMarkedUnread" }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox"}}
       ]
     },
     {
-      "name": "cc_apply_keeps_session_alive_shows_done",
+      "name": "cc_apply_keeps_session_alive_shows_archive",
       "thread_type": "claude_code",
-      "description": "CC thread: after apply, thread stays unread with Done button — no need for CodingAgentIdled to re-mark",
+      "description": "CC thread: after apply, thread stays unread with Archive button — no need for CodingAgentIdled to re-mark",
       "steps": [
-        { "emit": "SessionStarted" },
-        { "emit": "CodingAgentIdled", "set_pending_changes": true, "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] } },
-        { "emit": "ChangeApplied", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "CodingAgentIdled", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } }
+        {"emit": "SessionStarted"},
+        {"emit": "CodingAgentIdled", "set_pending_changes": true, "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}},
+        {"emit": "ChangeApplied", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "CodingAgentIdled", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}}
       ]
     },
     {
@@ -417,24 +356,12 @@
       "thread_type": "claude_code",
       "description": "CC thread: ChangeProposed without prior CodingAgentIdled still marks unread — session finished without idle detection",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "CodingAgentToolCalled" },
-        { "emit": "ResponseGenerated", "expected": { "stored_section": "default" } },
-        { "emit": "ChangeProposed", "set_pending_changes": true, "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] }, "assert_side_effect": "ThreadMarkedUnread" },
-        { "emit": "SessionEnded", "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] } }
-      ]
-    },
-    {
-      "name": "cc_change_proposed_re_marks_after_read",
-      "thread_type": "claude_code",
-      "description": "CC thread: user reads thread (marks read), then ChangeProposed re-marks unread to surface Apply panel",
-      "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread" } },
-        { "emit": "ThreadMarkedRead", "expected": { "stored_section": "default" } },
-        { "emit": "ChangeProposed", "set_pending_changes": true, "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] }, "assert_side_effect": "ThreadMarkedUnread" }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "CodingAgentToolCalled"},
+        {"emit": "ResponseGenerated", "expected": {"stored_section": "archived"}},
+        {"emit": "ChangeProposed", "set_pending_changes": true, "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}},
+        {"emit": "SessionEnded", "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}}
       ]
     },
     {
@@ -442,19 +369,19 @@
       "thread_type": "chat",
       "description": "Chat thread: ChangeProposed is rejected (CC-only event)",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "ChangeProposed", "expect_error": "ChangeProposed is CC-only" }
+        {"emit": "MessageReceived"},
+        {"emit": "ChangeProposed", "expect_error": "ChangeProposed is CC-only"}
       ]
     },
     {
-      "name": "cc_discard_keeps_session_alive_shows_done",
+      "name": "cc_discard_keeps_session_alive_shows_archive",
       "thread_type": "claude_code",
-      "description": "CC thread: after discard, thread stays unread with Done button — no need for CodingAgentIdled to re-mark",
+      "description": "CC thread: after discard, thread stays unread with Archive button — no need for CodingAgentIdled to re-mark",
       "steps": [
-        { "emit": "SessionStarted" },
-        { "emit": "CodingAgentIdled", "set_pending_changes": true, "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] } },
-        { "emit": "ChangeDiscarded", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "CodingAgentIdled", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } }
+        {"emit": "SessionStarted"},
+        {"emit": "CodingAgentIdled", "set_pending_changes": true, "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}},
+        {"emit": "ChangeDiscarded", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "CodingAgentIdled", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}}
       ]
     },
     {
@@ -462,52 +389,42 @@
       "thread_type": "claude_code",
       "description": "CC thread: follow-up after CC process exited — empty ResponseGenerated + CodingAgentIdled still marks unread",
       "steps": [
-        { "emit": "MessageReceived", "payload": { "text": "Initial request", "channel": "claude_code" } },
-        { "emit": "SessionStarted", "payload": { "session_id": "s1", "branch": "claude-code/initial" } },
-        { "emit": "CodingAgentToolCalled" },
-        { "emit": "ResponseGenerated", "payload": { "text": "Done with initial work" } },
-        { "emit": "CodingAgentIdled", "payload": { "has_changes": false },
-          "expected": { "stored_section": "unread", "expected_actions": ["done"] }
-        },
-        { "emit": "ThreadDismissed",
-          "expected": { "stored_section": "default", "expected_actions": [] }
-        },
-        { "emit": "MessageReceived", "payload": { "text": "Follow-up after process died", "channel": "claude_code" },
-          "expected": { "status": "running" }
-        },
-        { "emit": "SessionStarted", "payload": { "session_id": "", "branch": "claude-code/resume" },
-          "expected": { "status": "running" }
-        },
-        { "emit": "ResponseGenerated", "payload": {} },
-        { "emit": "CodingAgentIdled", "payload": { "has_changes": false },
-          "expected": { "stored_section": "unread", "expected_actions": ["done"], "status": "idle" }
-        }
+        {"emit": "MessageReceived", "payload": {"text": "Initial request", "channel": "claude_code"}},
+        {"emit": "SessionStarted", "payload": {"session_id": "s1", "branch": "claude-code/initial"}},
+        {"emit": "CodingAgentToolCalled"},
+        {"emit": "ResponseGenerated", "payload": {"text": "Done with initial work"}},
+        {"emit": "CodingAgentIdled", "payload": {"has_changes": false}, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "ThreadArchived", "expected": {"stored_section": "archived", "expected_actions": []}},
+        {"emit": "MessageReceived", "payload": {"text": "Follow-up after process died", "channel": "claude_code"}, "expected": {"status": "running"}},
+        {"emit": "SessionStarted", "payload": {"session_id": "", "branch": "claude-code/resume"}, "expected": {"status": "running"}},
+        {"emit": "ResponseGenerated", "payload": {}},
+        {"emit": "CodingAgentIdled", "payload": {"has_changes": false}, "expected": {"stored_section": "inbox", "expected_actions": ["archive"], "status": "idle"}}
       ]
     },
     {
-      "name": "cc_apply_then_done_full_flow",
+      "name": "cc_apply_then_archive_full_flow",
       "thread_type": "claude_code",
-      "description": "CC thread: full flow — idle with changes → Apply → Done button → Dismiss → HISTORY",
+      "description": "CC thread: full flow — idle with changes → Apply → Archive button → Dismiss → HISTORY",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ChangeProposed", "set_pending_changes": true },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] } },
-        { "emit": "ChangeApplied", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "ThreadDismissed", "expected": { "stored_section": "default", "expected_actions": [] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ChangeProposed", "set_pending_changes": true},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}},
+        {"emit": "ChangeApplied", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "ThreadArchived", "expected": {"stored_section": "archived", "expected_actions": []}}
       ]
     },
     {
-      "name": "cc_discard_then_done_full_flow",
+      "name": "cc_discard_then_archive_full_flow",
       "thread_type": "claude_code",
-      "description": "CC thread: full flow — idle with changes → Discard → Done button → Dismiss → HISTORY",
+      "description": "CC thread: full flow — idle with changes → Discard → Archive button → Dismiss → HISTORY",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ChangeProposed", "set_pending_changes": true },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] } },
-        { "emit": "ChangeDiscarded", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "ThreadDismissed", "expected": { "stored_section": "default", "expected_actions": [] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ChangeProposed", "set_pending_changes": true},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}},
+        {"emit": "ChangeDiscarded", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "ThreadArchived", "expected": {"stored_section": "archived", "expected_actions": []}}
       ]
     },
     {
@@ -515,12 +432,12 @@
       "thread_type": "claude_code",
       "description": "CC thread: ChangeProposed → SessionEnded → ChangeApplied without CodingAgentIdled — thread stays unread with Done",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ChangeProposed", "set_pending_changes": true, "expected": { "stored_section": "unread" } },
-        { "emit": "SessionEnded", "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] } },
-        { "emit": "ChangeApplied", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "ThreadDismissed", "expected": { "stored_section": "default", "expected_actions": [] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ChangeProposed", "set_pending_changes": true, "expected": {"stored_section": "inbox"}},
+        {"emit": "SessionEnded", "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}},
+        {"emit": "ChangeApplied", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "ThreadArchived", "expected": {"stored_section": "archived", "expected_actions": []}}
       ]
     },
     {
@@ -528,28 +445,28 @@
       "thread_type": "claude_code",
       "description": "CC thread: multiple changes proposed, apply all, then Done — each step stays unread",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ChangeProposed", "set_pending_changes": true },
-        { "emit": "ChangeProposed" },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] } },
-        { "emit": "ChangeApplied", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "ChangeApplied", "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "ThreadDismissed", "expected": { "stored_section": "default", "expected_actions": [] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ChangeProposed", "set_pending_changes": true},
+        {"emit": "ChangeProposed"},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}},
+        {"emit": "ChangeApplied", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "ChangeApplied", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "ThreadArchived", "expected": {"stored_section": "archived", "expected_actions": []}}
       ]
     },
     {
       "name": "cc_apply_revert_stays_unread",
       "thread_type": "claude_code",
-      "description": "CC thread: apply then revert — thread stays unread throughout, Done button available",
+      "description": "CC thread: apply then revert — thread stays unread throughout, Archive button available",
       "steps": [
-        { "emit": "MessageReceived" },
-        { "emit": "SessionStarted" },
-        { "emit": "ChangeProposed", "set_pending_changes": true },
-        { "emit": "CodingAgentIdled", "expected": { "stored_section": "unread", "expected_actions": ["discard", "apply"] } },
-        { "emit": "ChangeApplied", "set_pending_changes": false, "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "ChangeReverted", "expected": { "stored_section": "unread", "expected_actions": ["done"] } },
-        { "emit": "ThreadDismissed", "expected": { "stored_section": "default", "expected_actions": [] } }
+        {"emit": "MessageReceived"},
+        {"emit": "SessionStarted"},
+        {"emit": "ChangeProposed", "set_pending_changes": true},
+        {"emit": "CodingAgentIdled", "expected": {"stored_section": "inbox", "expected_actions": ["discard", "apply"]}},
+        {"emit": "ChangeApplied", "set_pending_changes": false, "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "ChangeReverted", "expected": {"stored_section": "inbox", "expected_actions": ["archive"]}},
+        {"emit": "ThreadArchived", "expected": {"stored_section": "archived", "expected_actions": []}}
       ]
     }
   ]

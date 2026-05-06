@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, openThreadDrawer, waitForVisibleInput, ensureOnThreadPane, userMessageBody, USER_MSG_SELECTOR } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, openThreadDrawer, waitForVisibleInput, ensureOnThreadPane, userMessageBody, USER_MSG_SELECTOR, REAL_THREAD_NAV } from './helpers';
 
 test.describe('Page reload preserves state', () => {
   test.beforeEach(async ({ page }) => {
@@ -15,7 +15,7 @@ test.describe('Page reload preserves state', () => {
 
     // Open drawer and get the thread ID before reload
     await openThreadDrawer(page);
-    const threadNav = page.locator('[data-thread-nav]:visible').first();
+    const threadNav = page.locator(`${REAL_THREAD_NAV}:visible`).first();
     await expect(threadNav).toBeVisible({ timeout: 15_000 });
     const threadId = await threadNav.getAttribute('data-thread-nav');
 
@@ -71,7 +71,7 @@ test.describe('Page reload preserves state', () => {
 
     // Capture thread ID before reload
     await openThreadDrawer(page);
-    const threadNav = page.locator('[data-thread-nav]:visible').first();
+    const threadNav = page.locator(`${REAL_THREAD_NAV}:visible`).first();
     await expect(threadNav).toBeVisible({ timeout: 15_000 });
     const threadId = await threadNav.getAttribute('data-thread-nav');
 

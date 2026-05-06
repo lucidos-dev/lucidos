@@ -7,7 +7,8 @@
 # Options:
 #   -h, --headed     Run with visible browser
 #   -f <file>        Run specific test file (e.g., chat.spec.ts)
-#   --no-reset       Skip database reset
+#   --no-reset       Skip DB reset AND leave the workspace running for the next
+#                    invocation. Use for fast iteration on a single spec.
 #   --webkit         Run mobile tests on WebKit (iOS Safari engine)
 #   --ios            Launch iOS Simulator with Safari (requires Xcode)
 #   --               Everything after this is passed to Playwright
@@ -53,17 +54,7 @@ if [ -n "$USE_IOS" ]; then
     exec "$SCRIPT_DIR/e2e-ios.sh" "${IOS_ARGS[@]}"
 fi
 
-acquire_e2e_lock e2e-browser || exit 1
-ensure_workspace_running
-teardown_e2e() {
-    [ -z "$NO_RESET" ] && cleanup_e2e_worktrees
-    stop_e2e_workspace
-    release_e2e_lock
-}
-trap teardown_e2e EXIT
-trap 'exit 130' INT TERM
-[ -z "$NO_RESET" ] && cleanup_e2e_worktrees
-[ -z "$NO_RESET" ] && reset_e2e_database
+setup_e2e_session e2e-browser --cleanup-worktrees-on-teardown
 
 echo "Running browser e2e tests (port $VITE_PORT)"
 
@@ -92,17 +83,33 @@ if [ -n "$USER_PINNED_PROJECT" ]; then
     [ -n "$USE_WEBKIT" ] && CMD+=(--project=mobile-webkit)
     "${CMD[@]}"
 else
+    # Run every project even if an earlier one failed, so the user sees all
+    # results in one run. Aggregate exit status so the script still exits
+    # non-zero when any project failed. macOS ships bash 3.x — no associative
+    # arrays, so use parallel indexed arrays.
     PROJECTS=(chromium mobile mobile-webkit)
+    PROJECT_RCS=()
+    overall_rc=0
     for i in "${!PROJECTS[@]}"; do
         project="${PROJECTS[$i]}"
         if [ "$i" -gt 0 ] && [ -z "$NO_RESET" ]; then
             echo ""
-            echo "── Resetting workspace state before project: $project ──"
-            cleanup_e2e_worktrees
+            echo "── Resetting DB before project: $project ──"
+            # Event-store state (not worktree state) is what causes WebKit to
+            # time out as projects accumulate.
             reset_e2e_database
         fi
         echo ""
         echo "── Running project: $project ──"
-        "${CMD[@]}" --project="$project"
+        rc=0
+        "${CMD[@]}" --project="$project" || rc=$?
+        PROJECT_RCS[$i]=$rc
+        [ "$rc" -ne 0 ] && overall_rc=$rc
     done
+    echo ""
+    echo "── Per-project exit codes ──"
+    for i in "${!PROJECTS[@]}"; do
+        echo "  ${PROJECTS[$i]}: ${PROJECT_RCS[$i]}"
+    done
+    exit "$overall_rc"
 fi

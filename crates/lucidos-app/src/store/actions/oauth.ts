@@ -1,26 +1,23 @@
 import { oauthAccounts, showToast, showConfirm } from '../store';
-import { toFailed } from '../types';
+import { toFailed, setLoadingIfFresh } from '../types';
 import { listOAuthAccounts, deleteOAuthAccountApi, reauthorizeOAuth, completeOAuth } from '../../api/client';
 import { openCredentialRequest } from './credentials';
 import { isIOSPwa } from '../../utils/platform';
 import { errorDetail } from '../../utils/errorDetail';
 
 export async function loadOAuthAccounts(): Promise<void> {
-  if (oauthAccounts.value.status !== 'loaded') {
-    oauthAccounts.value = { status: 'loading' };
-  }
+  setLoadingIfFresh(oauthAccounts);
   try {
     const data = await listOAuthAccounts();
     oauthAccounts.value = { status: 'loaded', data: data.accounts || [] };
   } catch (error) {
-    console.error('Failed to load OAuth accounts:', error);
     oauthAccounts.value = toFailed(error);
   }
 }
 
 export async function grantOAuthScope(provider: string, scopes: string): Promise<boolean> {
   if (isIOSPwa()) {
-    showToast('OAuth-tilkobling fungerer ikke i iOS-appen. Bruk desktop-nettleseren i stedet.', 'error');
+    showToast('OAuth connection is not available in the iOS app. Use the desktop browser instead.', 'error');
     return false;
   }
   try {
@@ -67,7 +64,6 @@ export async function disconnectOAuthAccount(id: string, provider: string): Prom
       showToast(data.error || 'Failed to disconnect account', 'error');
     }
   } catch (error) {
-    console.error('Failed to disconnect OAuth account:', error);
     showToast(`Failed to disconnect account: ${errorDetail(error)}`, 'error');
   }
 }

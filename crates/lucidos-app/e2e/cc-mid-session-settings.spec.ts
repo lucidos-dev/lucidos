@@ -47,22 +47,18 @@ test.describe('CC mid-session model/effort persistence', () => {
     await waitForActiveSession(page, sentThreadId!);
 
     // Wait for response to complete (CC goes idle)
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
 
-    // === Change reasoning effort mid-session ===
+    // === Change reasoning effort after CC went idle ===
+    // Session is removed from agent_sessions when process exits, so the click
+    // stores 'max' as a pending preference (ccPendingReasoningEffort). The
+    // follow-up sendMessage carries it as `reasoning_effort` in the request
+    // body, which the next CC spawn picks up.
     await waitAndClick(page, '.cc-commands-btn-active', undefined, 15_000);
     await waitAndClick(page, '.cc-control-item', 'Reasoning');
     await waitAndClick(page, '.cc-control-option', 'Max');
 
-    // Verify the control request was accepted — commands API should reflect 'max'
-    await expect(async () => {
-      const cmdResp = await page.request.get(`/api/claude-code/commands?thread_id=${sentThreadId}`);
-      expect(cmdResp.ok()).toBeTruthy();
-      const cmdData = await cmdResp.json();
-      expect(cmdData.current_reasoning_effort).toBe('max');
-    }).toPass({ timeout: 10_000 });
-
-    // Send follow-up to trigger respawn (CC exited idle, session removed from map)
+    // Send follow-up to trigger respawn with pending effort applied
     await sendMessage(page, 'Say exactly: "effort-still-max". Do not create any files.');
     await waitForCCToStart(page, 60_000);
 
@@ -74,7 +70,7 @@ test.describe('CC mid-session model/effort persistence', () => {
       expect(cmdData.current_reasoning_effort).toBe('max');
     }).toPass({ timeout: 30_000 });
 
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
 
     // Verify UI also shows 'Max' in the control menu
     await waitAndClick(page, '.cc-commands-btn-active', undefined, 15_000);
@@ -111,22 +107,18 @@ test.describe('CC mid-session model/effort persistence', () => {
     expect(sentThreadId).toBeTruthy();
 
     await waitForActiveSession(page, sentThreadId!);
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
 
-    // === Change model mid-session to Haiku ===
+    // === Change model after CC went idle ===
+    // Session is removed from agent_sessions when process exits, so the click
+    // stores 'haiku' as a pending preference (ccPendingModel). The follow-up
+    // sendMessage carries it as `cc_model` in the request body, which the
+    // next CC spawn picks up.
     await waitAndClick(page, '.cc-commands-btn-active', undefined, 15_000);
     await waitAndClick(page, '.cc-control-item', 'Model');
     await waitAndClick(page, '.cc-control-option', 'Haiku');
 
-    // Verify the control request updated the model
-    await expect(async () => {
-      const cmdResp = await page.request.get(`/api/claude-code/commands?thread_id=${sentThreadId}`);
-      expect(cmdResp.ok()).toBeTruthy();
-      const cmdData = await cmdResp.json();
-      expect(cmdData.current_model).toBe('haiku');
-    }).toPass({ timeout: 10_000 });
-
-    // Send follow-up — triggers respawn after idle exit
+    // Send follow-up — triggers respawn with pending model applied
     await sendMessage(page, 'Say exactly: "model-still-haiku". Do not create any files.');
     await waitForCCToStart(page, 60_000);
 
@@ -138,7 +130,7 @@ test.describe('CC mid-session model/effort persistence', () => {
       expect(cmdData.current_model).toBe('haiku');
     }).toPass({ timeout: 30_000 });
 
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
 
     // Verify UI shows Haiku in the control menu
     await waitAndClick(page, '.cc-commands-btn-active', undefined, 15_000);

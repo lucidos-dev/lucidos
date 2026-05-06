@@ -1,7 +1,25 @@
+/// Replace markdown thread references — `[Title text](thread:UUID)` or
+/// `[Title text](thread:workspace/UUID)` — with a neutral placeholder before
+/// titling. The link's visible text is the *referenced* thread's title; left
+/// in, the LLM happily reuses it as the new thread's title.
+fn strip_thread_reference_links(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("thread:") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\[[^\]]*\]\(thread:[^)]+\)")
+            .expect("thread-reference regex must compile")
+    });
+    RE.replace_all(text, "[referenced thread]")
+}
+
 /// Build the LLM prompt for thread title generation.
 /// Truncates message to 1000 chars and image description to 300 chars.
 fn build_title_prompt(message: &str, image_description: Option<&str>) -> String {
-    let truncated: String = message.chars().take(1000).collect();
+    let truncated: String = strip_thread_reference_links(message)
+        .chars()
+        .take(1000)
+        .collect();
     let image_context = if let Some(desc) = image_description {
         let desc_truncated: String = desc.chars().take(300).collect();
         format!("\n\nAttached image description: {}", desc_truncated)
@@ -10,7 +28,10 @@ fn build_title_prompt(message: &str, image_description: Option<&str>) -> String 
     };
     format!(
         "Generate a very short title (3-6 words) for this conversation. \
-         Focus on the most specific/important topic — names, places, events, titles. \
+         Title by what the user wants to do or know IN THIS THREAD — the action, \
+         question, or topic of their request. If the message references another \
+         thread, document, or example only as context (e.g. to fix a bug found there), \
+         do not title by that referenced material's subject. \
          Return ONLY the title text, nothing else. No quotes.\n\n\
          Conversation:\n{}{}",
         truncated, image_context
@@ -127,5 +148,40 @@ mod tests {
         assert!(prompt.contains("Super Mario Galaxy Filmen"));
         assert!(prompt.contains("familiekalenderen"));
         assert!(prompt.contains("Kino med Emil"));
+    }
+
+    /// A thread reference pasted via the copy-ref button arrives as
+    /// `[Title text](thread:UUID)` or `[Title text](thread:workspace/UUID)`.
+    /// The link's *visible* text is the referenced thread's title — exactly
+    /// what biases the LLM into reusing it. Strip both forms before titling.
+    #[test]
+    fn title_prompt_strips_thread_reference_link_text() {
+        let msg = "Fix this bug from [Misplaced section: AI Memory and Context Redundancy](thread:1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff)";
+        let prompt = build_title_prompt(msg, None);
+        assert!(
+            !prompt.contains("Misplaced section"),
+            "referenced thread title must not leak into the LLM prompt:\n{}",
+            prompt
+        );
+        assert!(prompt.contains("Fix this bug"));
+        assert!(prompt.contains("[referenced thread]"));
+    }
+
+    #[test]
+    fn title_prompt_strips_workspace_qualified_thread_reference() {
+        let msg = "Apply the pattern from [Some Other Thread Title](thread:dev/1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff) here";
+        let prompt = build_title_prompt(msg, None);
+        assert!(!prompt.contains("Some Other Thread Title"));
+        assert!(prompt.contains("Apply the pattern"));
+        assert!(prompt.contains("[referenced thread]"));
+    }
+
+    #[test]
+    fn title_prompt_emphasizes_intent_over_referenced_topic() {
+        // The prompt itself must instruct the LLM to title by the user's
+        // intent in this thread, not by referenced material's subject.
+        let prompt = build_title_prompt("anything", None);
+        assert!(prompt.to_lowercase().contains("this thread"));
+        assert!(prompt.to_lowercase().contains("referenc"));
     }
 }

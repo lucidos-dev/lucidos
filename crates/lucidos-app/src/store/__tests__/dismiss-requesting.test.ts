@@ -1,30 +1,31 @@
 /**
  * Tests for the dismiss flow and mutual exclusivity of applying/dismissing states.
  *
- * Regression: clicking "Done" on an idle CC thread must not flash through a gap
- * where the WaitingBanner disappears. getWaitingState() checks dismissingThreadIds
- * before resolveActions, keeping the "Done..." button visible throughout dismiss.
+ * Regression: clicking "Archive" on an idle CC thread must not flash through a gap
+ * where the WaitingBanner disappears. getWaitingState() checks archivingThreadIds
+ * before resolveActions, keeping the "Archive..." button visible throughout dismiss.
  *
- * Invariant: applyingNowThreadIds, dismissingThreadIds, and discardingCCThreadIds
+ * Invariant: applyingNowThreadIds, archivingThreadIds, and discardingCCThreadIds
  * must never contain the same thread. Each action guards against the others.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   threadMap,
   focusedThreadId,
-  dismissingThreadIds,
+  archivingThreadIds,
   applyingNowThreadIds,
   discardingCCThreadIds,
+  cancelingThreadIds,
   changes,
 } from '../store';
 import type { ThreadState } from '../thread-events';
 import { getWaitingState } from '../../components/chat/WaitingBanner';
 
-// Mocks for handleDismissThread dependencies
+// Mocks for handleArchiveThread dependencies
 vi.mock('../../api/threads', () => ({
-  dismissThread: vi.fn().mockResolvedValue(undefined),
-  pinThread: vi.fn(),
-  unpinThread: vi.fn(),
+  archiveThread: vi.fn().mockResolvedValue(undefined),
+  saveThread: vi.fn(),
+  unsaveThread: vi.fn(),
 }));
 
 vi.mock('../actions/thread-loading', () => ({
@@ -41,19 +42,18 @@ vi.mock('../../components/chat/promptFocus', () => ({
   focusIfNeeded: vi.fn(),
 }));
 
-import { handleDismissThread } from '../actions/threads';
+import { handleArchiveThread } from '../actions/threads';
 
-function makeCCThread(id: string, status: 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer', section: 'default' | 'unread'): ThreadState {
+function makeCCThread(id: string, status: 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer', section: 'archived' | 'inbox'): ThreadState {
   return {
     meta: {
       id,
       title: 'test',
       channel: 'claude_code',
       initiator: 'user',
-      pinned: false,
+      saved: false,
       createdAt: '',
       updatedAt: '',
-      unread: section === 'unread',
       status,
       messageCount: 0,
       section,
@@ -64,6 +64,7 @@ function makeCCThread(id: string, status: 'idle' | 'running' | 'waiting' | 'wait
       ccIsExternalRepo: false,
       ccApplying: false,
       lastRevivedAt: '',
+      state: 'active',
     },
     events: new Map(),
     streamingBuffer: '',
@@ -77,20 +78,21 @@ function makeCCThread(id: string, status: 'idle' | 'running' | 'waiting' | 'wait
 beforeEach(() => {
   threadMap.value = new Map();
   focusedThreadId.value = null;
-  dismissingThreadIds.value = new Set();
+  archivingThreadIds.value = new Set();
   applyingNowThreadIds.value = new Map();
   discardingCCThreadIds.value = new Set();
+  cancelingThreadIds.value = new Set();
   changes.value = [];
 });
 
 describe('Done dismiss does not flash Requesting state', () => {
   it('returns dismiss-in-progress state even after SSE changes status to idle', () => {
     // Setup: CC thread is idle (ThreadDismissed SSE already arrived) but dismiss API
-    // hasn't returned yet — dismissingThreadIds still has the thread.
-    const thread = makeCCThread('t1', 'idle', 'default');
+    // hasn't returned yet — archivingThreadIds still has the thread.
+    const thread = makeCCThread('t1', 'idle', 'archived');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
-    dismissingThreadIds.value = new Set(['t1']);
+    archivingThreadIds.value = new Set(['t1']);
 
     const state = getWaitingState();
 
@@ -98,14 +100,14 @@ describe('Done dismiss does not flash Requesting state', () => {
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
-      expect(state!.isDismissing).toBe(true);
-      expect(state!.actions).toContain('done');
+      expect(state!.isArchiving).toBe(true);
+      expect(state!.actions).toContain('archive');
     }
   });
 
   it('returns null when thread is idle+default and NOT dismissing', () => {
     // Normal case: thread is in history (idle + default), no dismiss in progress
-    const thread = makeCCThread('t1', 'idle', 'default');
+    const thread = makeCCThread('t1', 'idle', 'archived');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
@@ -113,9 +115,9 @@ describe('Done dismiss does not flash Requesting state', () => {
     expect(state).toBeNull();
   });
 
-  it('returns actions when thread is waiting+unread and NOT dismissing', () => {
+  it('returns actions when thread is waiting+inbox and NOT dismissing', () => {
     // Normal case: CC idle thread waiting for user action
-    const thread = makeCCThread('t1', 'waiting', 'unread');
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
@@ -123,32 +125,32 @@ describe('Done dismiss does not flash Requesting state', () => {
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
-      expect(state!.actions).toContain('done');
-      expect(state!.isDismissing).toBe(false);
+      expect(state!.actions).toContain('archive');
+      expect(state!.isArchiving).toBe(false);
     }
   });
 
   it('dismiss clears stale applying state — states are mutually exclusive', async () => {
     // Scenario: applyingNowThreadIds has thread (e.g., from a stale apply attempt)
-    // and user clicks Done. handleDismissThread must clear applying state before
+    // and user clicks Done. handleArchiveThread must clear applying state before
     // setting dismissing state — the two must never coexist for the same thread.
-    const thread = makeCCThread('t1', 'waiting', 'unread');
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
     applyingNowThreadIds.value = new Map([['t1', 'requesting']]);
 
-    await handleDismissThread('t1');
+    await handleArchiveThread('t1');
 
     // Applying state must have been cleared — states are mutually exclusive
     expect(applyingNowThreadIds.value.has('t1')).toBe(false);
     // Dismiss completed and cleaned up
-    expect(dismissingThreadIds.value.has('t1')).toBe(false);
+    expect(archivingThreadIds.value.has('t1')).toBe(false);
   });
 });
 
 describe('Apply button never shows Requesting label', () => {
   it('returns applying state (always renders "Apply...")', () => {
-    const thread = makeCCThread('t1', 'waiting', 'unread');
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
     applyingNowThreadIds.value = new Map([['t1', 'requesting']]);
@@ -161,7 +163,7 @@ describe('Apply button never shows Requesting label', () => {
 
 describe('Discard hides Apply and shows "Discard..."', () => {
   it('returns discarding state when discardingCCThreadIds is set', () => {
-    const thread = makeCCThread('t1', 'waiting', 'unread');
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
     thread.meta.ccHasChanges = true;
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -175,7 +177,7 @@ describe('Discard hides Apply and shows "Discard..."', () => {
   it('discarding takes priority over action buttons', () => {
     // Even though resolveActions would return ['discard', 'apply'],
     // the discarding state should preempt them.
-    const thread = makeCCThread('t1', 'waiting', 'unread');
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
     discardingCCThreadIds.value = new Set(['t1']);
@@ -186,7 +188,7 @@ describe('Discard hides Apply and shows "Discard..."', () => {
   });
 
   it('applying takes priority over discarding (should not coexist)', () => {
-    const thread = makeCCThread('t1', 'waiting', 'unread');
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
     applyingNowThreadIds.value = new Map([['t1', 'requesting']]);
@@ -198,22 +200,40 @@ describe('Discard hides Apply and shows "Discard..."', () => {
   });
 });
 
-describe('WaitingForUserAnswer surfaces Done so the user can abandon the question', () => {
-  it('shows Done (only) when CC is paused on AskUserQuestion', () => {
-    // Bug regression: WaitingBanner returned null for waiting_for_user_answer,
-    // leaving the user with no way to dismiss the thread when they wanted to
-    // abandon the question. Done must be available; Apply/Discard must NOT
-    // (the mid-turn work is incomplete).
-    const thread = makeCCThread('t1', 'waiting_for_user_answer', 'unread');
+describe('WaitingForUserAnswer surfaces Cancel so the user can abandon the question', () => {
+  it('shows Cancel (only) when CC is paused on AskUserQuestion', () => {
+    // Save/Archive must NOT show while the question is still pending —
+    // mid-turn work hasn't terminated yet.
+    const thread = makeCCThread('t1', 'waiting_for_user_answer', 'inbox');
     thread.meta.ccHasChanges = true; // even with mid-turn work staged
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
     const state = getWaitingState();
     expect(state).not.toBeNull();
-    expect(state!.type).toBe('actions');
-    if (state!.type === 'actions') {
-      expect(state!.actions).toEqual(['done']);
+    expect(state!.type).toBe('canceling');
+    if (state!.type === 'canceling') {
+      expect(state!.threadId).toBe('t1');
+      expect(state!.isCanceling).toBe(false);
+    }
+  });
+
+  it('reflects optimistic isCanceling=true while still in waiting_for_user_answer', () => {
+    // After the user clicks Cancel, handleCancelExchange adds the thread to
+    // cancelingThreadIds before any SSE arrives. Status is still
+    // waiting_for_user_answer. The banner must show "Cancel..." (disabled) so
+    // the user can't double-fire — and the PromptInput cleanup effect must NOT
+    // clear the flag while we're still in this status.
+    const thread = makeCCThread('t1', 'waiting_for_user_answer', 'inbox');
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+    cancelingThreadIds.value = new Set(['t1']);
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('canceling');
+    if (state!.type === 'canceling') {
+      expect(state!.isCanceling).toBe(true);
     }
   });
 });
@@ -222,7 +242,7 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
   it('shows Done when isExternalRepo and hasChanges (Apply not available)', () => {
     // External repo: can't Apply (changes are in a different repo).
     // Must show Done, not a lone Discard button.
-    const thread = makeCCThread('t1', 'waiting', 'unread');
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
     thread.meta.ccHasChanges = true;
     thread.meta.ccIsExternalRepo = true;
     threadMap.value = new Map([['t1', thread]]);
@@ -232,7 +252,7 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
-      expect(state!.actions).toContain('done');
+      expect(state!.actions).toContain('archive');
       expect(state!.actions).not.toContain('discard');
       expect(state!.actions).not.toContain('apply');
     }
@@ -246,8 +266,8 @@ describe('Pending change with file_count=0 must not show Apply/Discard', () => {
     // lockfile rename). The phantom change row had file_count=0 — Apply/Discard
     // would render but do nothing useful. Backend now refuses to create such
     // rows; this guards against any that already exist or sneak in via SSE.
-    // Mirrors the real "Resolving iOS E2E Timeouts" state: idle + unread.
-    const thread = makeCCThread('t1', 'idle', 'unread');
+    // Mirrors the real "Resolving iOS E2E Timeouts" state: idle + inbox.
+    const thread = makeCCThread('t1', 'idle', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
     changes.value = [{
@@ -276,13 +296,13 @@ describe('Pending change with file_count=0 must not show Apply/Discard', () => {
     if (state!.type === 'actions') {
       expect(state!.actions).not.toContain('apply');
       expect(state!.actions).not.toContain('discard');
-      expect(state!.actions).toContain('done');
+      expect(state!.actions).toContain('archive');
       expect(state!.pendingChange).toBeNull();
     }
   });
 
   it('still shows Apply/Discard for a real pending change with files', () => {
-    const thread = makeCCThread('t1', 'waiting', 'unread');
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
     changes.value = [{
@@ -324,7 +344,7 @@ describe('Apply & Restart label sources requires_restart from pending change', (
   // transition), the button incorrectly showed "Apply" instead of "Apply & Restart".
   // The change row's own requires_restart is the authoritative file-derived value.
   it('shows requiresRestart when pending change has requires_restart=true even if meta says false', () => {
-    const thread = makeCCThread('t1', 'waiting', 'unread');
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
     thread.meta.ccHasChanges = true;
     thread.meta.ccRequiresRestart = false; // stale meta
     threadMap.value = new Map([['t1', thread]]);
@@ -360,7 +380,7 @@ describe('Apply & Restart label sources requires_restart from pending change', (
   it('shows requiresRestart when meta says true even if no pending change row yet', () => {
     // Symmetric: meta-only signal still works (e.g. before SSE delivers the
     // changes-updated broadcast).
-    const thread = makeCCThread('t1', 'waiting', 'unread');
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
     thread.meta.ccHasChanges = true;
     thread.meta.ccRequiresRestart = true;
     threadMap.value = new Map([['t1', thread]]);
@@ -380,7 +400,7 @@ describe('Apply Now — SessionEnded must not clear applying state', () => {
     // Scenario: during Apply Now, backend kills CC session (SessionEnded → status=waiting)
     // THEN proposes the change (ChangeProposed). Between those two events,
     // applyingNowThreadIds must stay set so the banner keeps showing "Applying...".
-    const thread = makeCCThread('t1', 'waiting', 'unread');
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
     thread.meta.ccHasChanges = true;
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -392,4 +412,54 @@ describe('Apply Now — SessionEnded must not clear applying state', () => {
     // Must NOT fall through to resolveActions which would return ['discard', 'apply']
   });
 
+});
+
+describe('ccApplying suppresses Cancel button during merge-via-CC apply', () => {
+  it('returns applying (not canceling) when status=running and ccApplying=true', () => {
+    // Scenario: user clicked Apply on the Changes panel for a thread with a
+    // live CC session. Tier 1 slow-path emits MergeConflictDetected (sets
+    // ccApplying=true), then sends a merge prompt to CC. CC processes the
+    // prompt → CodingAgentPromptSent flips status to 'running'.
+    //
+    // Without this guard, the WaitingBanner would show the Cancel button.
+    // Clicking Cancel only interrupts the CC subprocess — the apply task in
+    // apply_change keeps running, sees CC went idle, checks if main is now
+    // an ancestor of the branch, and emits ChangeApplied anyway. The user
+    // thinks they cancelled but the merge lands. Hide Cancel during apply
+    // so the user can't trigger a no-op cancel.
+    const thread = makeCCThread('t1', 'running', 'inbox');
+    thread.meta.ccApplying = true;
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('applying');
+  });
+
+  it('returns applying when status=waiting_for_user_answer and ccApplying=true', () => {
+    // Symmetric: even if CC pauses on a question mid-merge, suppress Cancel.
+    // The apply task is still in flight in the engine.
+    const thread = makeCCThread('t1', 'waiting_for_user_answer', 'inbox');
+    thread.meta.ccApplying = true;
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('applying');
+  });
+
+  it('still shows Cancel for normal CC running with ccApplying=false', () => {
+    // Regression guard: don't suppress Cancel for ordinary CC turns where no
+    // apply is in flight. ccApplying must be the sole gate.
+    const thread = makeCCThread('t1', 'running', 'inbox');
+    thread.meta.ccApplying = false;
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('canceling');
+  });
 });

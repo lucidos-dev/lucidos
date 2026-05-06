@@ -93,7 +93,7 @@ impl LucidosEngine {
                     if let Err(e) =
                         crate::core::DeviceStore::set_push_enabled(&self.pool, did, enabled).await
                     {
-                        log!("Warning: failed to set devices.push_enabled: {}", e);
+                        log!("[Preferences] Failed to set devices.push_enabled: {}", e);
                     }
                 }
 

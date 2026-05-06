@@ -11,6 +11,7 @@ import { MODELS, availableReasoningLevels } from '../../store/models';
 import { Dropdown } from '../shared/Dropdown';
 import { MemoryInspector } from './MemoryInspector';
 import { BackupSection } from './BackupSection';
+import { CcAllowedToolsSection } from './CcAllowedToolsSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { ChevronRightIcon } from '../shared/icons';
 import { CredentialItem } from '../credentials/CredentialItem';
@@ -70,7 +71,9 @@ const FONT_OPTIONS: Array<{ value: FontFamily; label: string }> = [
 const IMAGE_MODELS = [
   { value: 'auto', label: 'Auto' },
   { value: 'imagen-4', label: 'Imagen 4' },
-  { value: 'gpt-image-1', label: 'GPT Image' },
+  { value: 'gpt-image-1', label: 'GPT Image 1' },
+  { value: 'gpt-image-1.5', label: 'GPT Image 1.5' },
+  { value: 'gpt-image-2', label: 'GPT Image 2' },
 ];
 
 const BACKGROUND_MODELS = [
@@ -683,6 +686,7 @@ export function SettingsView() {
       case 'accounts': return accountsSection();
       case 'backup': return <BackupSection />;
       case 'repositories': return repositoriesSection();
+      case 'tool-permissions': return <CcAllowedToolsSection />;
       case 'disk-usage': return <DiskUsagePage />;
       default: return null;
     }

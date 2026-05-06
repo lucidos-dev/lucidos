@@ -45,6 +45,20 @@ describe('exchangeStatus — full branch coverage', () => {
     expect(exchangeStatus(exchange, '', false)).toBe('canceled');
   });
 
+  // Regression: cancel during CC startup. The backend's interrupt fallback
+  // used to emit a spurious `ResponseAborted` (no actor), which split the
+  // exchange and rendered as "⚙ System — Response interrupted" with a
+  // misleading Continue panel. Now it emits `ResponseCanceled` (with the
+  // user actor) so the exchange stays whole and reads "Canceled" — even
+  // when the cancel landed before the CC subprocess produced any output.
+  it('returns "canceled" for CC exchange canceled during startup (no SessionStarted yet)', () => {
+    const exchange = makeExchange(msg(), [
+      step(1, { type: 'ResponseCanceled' }),
+    ]);
+    expect(exchangeStatus(exchange, '', true)).toBe('canceled');
+    expect(exchangeStatus(exchange, '', false)).toBe('canceled');
+  });
+
   it('returns "done" when CC is idle (WaitingBanner handles session state)', () => {
     const exchange = makeExchange(msg(), [
       step(1, { type: 'SessionStarted', session_id: 's1' }),
@@ -136,12 +150,20 @@ describe('exchangeStatus — full branch coverage', () => {
     expect(exchangeStatus(exchange, '', false)).toBe('aborted');
   });
 
-  it('returns "done" for non-last non-CC exchange (even without completion event)', () => {
+  it('returns "interrupted" for non-last non-CC exchange with steps (user moved on with follow-up)', () => {
+    // A non-last chat exchange with steps but no completion is one the user
+    // moved past — the response continues in the panel below (mid-flight
+    // injection redirects post-UPI events to the follow-up). Render as
+    // 'interrupted' ("Continued below ↳") so only the last panel shows
+    // "Working" — same treatment as CC follow-ups. Holds whether the engine
+    // has gone idle or is still processing.
     const exchange = makeExchange(msg(), [
       step(1, { type: 'TextStreamed', text: 'partial' }),
     ]);
-    // !isLast && !isCC => 'done' (line: if (isComplete || !isLast) return 'done')
-    expect(exchangeStatus(exchange, '', false)).toBe('done');
+    // threadIdle=true
+    expect(exchangeStatus(exchange, '', /* isLast */ false, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ true)).toBe('interrupted');
+    // threadIdle=false (loop still running)
+    expect(exchangeStatus(exchange, '', /* isLast */ false, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ false)).toBe('interrupted');
   });
 
   it('returns "cc-working" for last CC exchange without completion or idle', () => {
@@ -248,6 +270,32 @@ describe('exchangeStatus — full branch coverage', () => {
     ]);
     expect(exchangeStatus(exchange, '', true)).toBe('aborted');
     expect(exchangeStatus(exchange, '', false)).toBe('aborted');
+  });
+
+  it('returns "done" for follow-up exchange whose content was injected into prior request', () => {
+    // When the user posts a follow-up while the agentic loop is still working
+    // on a prior message, the engine emits UserPromptInjected (with
+    // injected_message_id matching the new MessageReceived) — the new text is
+    // folded into the running prompt. The agent's response carries the ORIGINAL
+    // request_event_id, so it routes back to the prior exchange. The follow-up
+    // exchange ends up with only the absorbed UPI as its sole step.
+    //
+    // Without this special case, the threadIdle fallback at the bottom of
+    // exchangeStatus reads "isLast + hasSteps + !isComplete + threadIdle" as a
+    // stale crashed exchange and returns 'aborted' — surfacing a misleading
+    // "Aborted ⚠" panel even though the user's request was answered (above).
+    const exchange = makeExchange(msg('men kan ikke ha dette hele tiden'), [
+      step(1, {
+        type: 'UserPromptInjected',
+        text: 'men kan ikke ha dette hele tiden',
+        injected_message_id: 'msg-followup',
+      } as StoredEvent),
+    ]);
+    // threadIdle=true: the response went into the prior exchange and the
+    // thread's DB status flipped to idle. isLast=true: no further messages yet.
+    expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('done');
+    // Same verdict when no longer last (next MR arrived).
+    expect(exchangeStatus(exchange, '', false, false, false, true)).toBe('done');
   });
 
   it('ResponseAborted after CodingAgentIdled = done (abort is from system prompt crash)', () => {
@@ -370,5 +418,53 @@ describe('exchangeStatus — full branch coverage', () => {
     // Frontend correctly derives status from the event type — "canceled" is
     // technically correct given the events. The fix is to emit the right event.
     expect(exchangeStatus(exchange, '', true, false, true)).toBe('canceled');
+  });
+
+  // ── Engine-restart-then-recovered turns ──
+  // When the engine restarts mid-turn, recovery emits ResponseAborted, then
+  // re-runs the SAME request_event_id. On success the rerun emits a second
+  // terminal (ResponseGenerated / ResponseFailed) with the same request_event_id.
+  // The LAST terminal for a request_event_id wins — an earlier abort is
+  // superseded by the later success or definitive failure.
+
+  it('engine-restart recovery: ResponseAborted then ResponseGenerated (same request_event_id) → done', () => {
+    const exchange = makeExchange(msg(), [
+      step(1, { type: 'TextStreamed', text: 'partial' }),
+      step(2, { type: 'ResponseAborted', request_event_id: 'req-1', text: 'restart interrupted' } as StoredEvent),
+      step(3, { type: 'TextStreamed', text: 'rerun result' }),
+      step(4, { type: 'ResponseGenerated', request_event_id: 'req-1', text: 'final response' } as StoredEvent),
+    ]);
+    expect(exchangeStatus(exchange, '', true)).toBe('done');
+    expect(exchangeStatus(exchange, '', false)).toBe('done');
+  });
+
+  it('engine-restart recovery: ResponseAborted then ResponseFailed (same request_event_id) → error', () => {
+    const exchange = makeExchange(msg(), [
+      step(1, { type: 'TextStreamed', text: 'partial' }),
+      step(2, { type: 'ResponseAborted', request_event_id: 'req-1', text: 'restart interrupted' } as StoredEvent),
+      step(3, { type: 'ResponseFailed', request_event_id: 'req-1', error: 'boom on rerun' } as StoredEvent),
+    ]);
+    expect(exchangeStatus(exchange, '', true)).toBe('error');
+    expect(exchangeStatus(exchange, '', false)).toBe('error');
+  });
+
+  it('lone ResponseAborted (no later terminal for same request_event_id) → aborted', () => {
+    // Sanity: the no-recovery case is unchanged. A ResponseAborted with no
+    // following same-id success still renders as "aborted".
+    const exchange = makeExchange(msg(), [
+      step(1, { type: 'TextStreamed', text: 'partial' }),
+      step(2, { type: 'ResponseAborted', request_event_id: 'req-1', text: 'crashed' } as StoredEvent),
+    ]);
+    expect(exchangeStatus(exchange, '', true)).toBe('aborted');
+  });
+
+  it('two unrelated request_event_ids in one exchange aren\'t merged (sanity)', () => {
+    // Aborted (req-A) followed by Generated (req-B) — different requests, so
+    // the abort is NOT superseded. The exchange still reads as aborted.
+    const exchange = makeExchange(msg(), [
+      step(1, { type: 'ResponseAborted', request_event_id: 'req-A', text: 'crash' } as StoredEvent),
+      step(2, { type: 'ResponseGenerated', request_event_id: 'req-B', text: 'unrelated' } as StoredEvent),
+    ]);
+    expect(exchangeStatus(exchange, '', true)).toBe('aborted');
   });
 });

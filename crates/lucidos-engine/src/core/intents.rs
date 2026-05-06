@@ -147,7 +147,10 @@ impl IntentStore {
     fn load_from_path(path: &Path, id: &str) -> Option<Intent> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
-            Err(_) => return None,
+            Err(e) => {
+                log!("[Intents] Failed to read {}: {}", path.display(), e);
+                return None;
+            }
         };
 
         let (name, knowhow, content) = match parse_frontmatter(&text) {
@@ -176,10 +179,10 @@ mod tests {
 
     #[test]
     fn parse_intent_with_single_knowhow() {
-        let text = "---\nname: FINN Job Scoring\nknowhow: finn-no\n---\nCheck FINN.no for jobs.";
+        let text = "---\nname: Job Scoring\nknowhow: job-board\n---\nCheck the job board.";
         let (name, knowhow, _) = parse_frontmatter(text).unwrap();
-        assert_eq!(name, "FINN Job Scoring");
-        assert_eq!(knowhow, vec!["finn-no"]);
+        assert_eq!(name, "Job Scoring");
+        assert_eq!(knowhow, vec!["job-board"]);
     }
 
     #[test]

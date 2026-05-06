@@ -17,6 +17,7 @@ vi.mock('../../api/client', () => ({
 }));
 
 const { handleNotificationSSE } = await import('./notifications');
+const { getNotifications } = await import('../../api/client');
 
 function makeNotification(id: string, read: boolean): Notification {
   return {
@@ -62,11 +63,13 @@ describe('handleNotificationSSE', () => {
 
   it('reloads notifications when modal is closed and panel is active', () => {
     notificationsModalOpen.value = false;
+    (getNotifications as ReturnType<typeof vi.fn>).mockClear();
 
     handleNotificationSSE();
 
-    // loadNotifications sets status to 'loading' as its first action
-    expect(notifications.value.status).toBe('loading');
+    // Existing data stays visible through the refetch round-trip.
+    expect(notifications.value.status).toBe('loaded');
+    expect(getNotifications).toHaveBeenCalled();
   });
 
   it('does NOT reload when notifications panel is not active', () => {

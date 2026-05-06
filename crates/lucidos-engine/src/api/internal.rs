@@ -1,5 +1,8 @@
 use super::*;
-use crate::engine::cc_permission::{CcPermissionEntry, CcPermissionState, DedupKey, DENIAL_REASON};
+use crate::engine::cc_permission::{
+    CcPermissionEntry, CcPermissionState, DedupKey, DENIAL_REASON, SESSION_ALLOW_REASON,
+};
+use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
 use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 
@@ -59,6 +62,28 @@ pub(super) async fn permission_prompt(
         .into_response();
     }
 
+    // Pre-prompt session-allow check: if the user previously clicked "Allow
+    // for this thread" on a request whose `Session` pattern matches this one,
+    // skip the prompt entirely and answer the MCP call immediately. The
+    // matching pattern is derived from this prompt's input, so it works for
+    // tools/paths CC's `--allowedTools` doesn't reach (notably `.claude/`
+    // and `.git/` writes, which CC always routes through the prompt).
+    let session_pattern = derive_allow_pattern(&body.tool_name, &body.input, AllowScope::Session);
+    let is_session_allowed = match session_pattern.as_deref() {
+        Some(p) => {
+            let pending = state.engine.pending_cc_permission.lock().unwrap();
+            pending.matches_session_allow(thread_id, p)
+        }
+        None => false,
+    };
+    if is_session_allowed {
+        return Json(PermissionPromptResponse {
+            allowed: true,
+            reason: Some(SESSION_ALLOW_REASON.to_string()),
+        })
+        .into_response();
+    }
+
     let canonical_input =
         serde_json::to_string(&body.input).unwrap_or_else(|_| "{}".to_string());
     let dedup_key: DedupKey = (thread_id, body.tool_name.clone(), canonical_input);
@@ -66,7 +91,13 @@ pub(super) async fn permission_prompt(
 
     let (request_id, mut rx, is_canonical) = {
         let mut pending = state.engine.pending_cc_permission.lock().unwrap();
-        register_or_attach(&mut pending, dedup_key, thread_id)
+        register_or_attach(
+            &mut pending,
+            dedup_key,
+            thread_id,
+            body.tool_name.clone(),
+            body.input.clone(),
+        )
     };
 
     if is_canonical {
@@ -113,6 +144,8 @@ fn register_or_attach(
     state: &mut CcPermissionState,
     dedup_key: DedupKey,
     thread_id: Uuid,
+    tool_name: String,
+    input: serde_json::Value,
 ) -> (String, tokio::sync::broadcast::Receiver<bool>, bool) {
     // Opportunistic sweep: each new prompt is a chance to evict orphans
     // whose HTTP handlers were canceled (CC died, MCP request aborted) and
@@ -128,11 +161,52 @@ fn register_or_attach(
         CcPermissionEntry {
             thread_id,
             request_id: request_id.clone(),
+            tool_name,
+            input,
             tx,
         },
     );
     state.by_request_id.insert(request_id.clone(), dedup_key);
     (request_id, rx, true)
+}
+
+#[derive(Deserialize)]
+pub(super) struct ClientLogRequest {
+    pub category: String,
+    pub message: String,
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
+/// POST /api/internal/client-log — fire-and-forget breadcrumb channel for
+/// browser-side telemetry that needs engine-log persistence. Body capped at
+/// 4KB so the engine.log tail isn't drowned by a misbehaving client.
+pub(super) async fn client_log(
+    headers: HeaderMap,
+    Json(body): Json<ClientLogRequest>,
+) -> impl IntoResponse {
+    const MAX_FIELD_LEN: usize = 256;
+    const MAX_DATA_LEN: usize = 4096;
+    if body.category.len() > MAX_FIELD_LEN || body.message.len() > MAX_FIELD_LEN {
+        return (StatusCode::BAD_REQUEST, "category/message too long").into_response();
+    }
+    // Value's Display is infallible — it serializes through a String buffer.
+    let data_str = body.data.to_string();
+    if data_str.len() > MAX_DATA_LEN {
+        return (StatusCode::BAD_REQUEST, "data too large").into_response();
+    }
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    crate::log!(
+        "[Client/{}] {} {} ua={}",
+        body.category,
+        body.message,
+        data_str,
+        ua
+    );
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Deserialize)]
@@ -317,7 +391,7 @@ pub(super) async fn commit_made(
 }
 
 #[derive(Debug)]
-pub(crate) enum CommitEmitError {
+enum CommitEmitError {
     GitShowFailed(String),
     GitError(String),
 }
@@ -327,7 +401,7 @@ pub(crate) enum CommitEmitError {
 /// Reads the commit's subject + changed-file list via `git show`, then
 /// emits a `ChangeProposed` event keyed by `commit_sha`. The HTTP handler
 /// is a thin wrapper that resolves thread/worktree, then calls this.
-pub(crate) async fn emit_change_proposed_for_commit(
+async fn emit_change_proposed_for_commit(
     event_bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
     worktree_path: &std::path::Path,
@@ -393,6 +467,130 @@ pub(crate) async fn emit_change_proposed_for_commit(
         branch
     );
     Ok(())
+}
+
+#[derive(Deserialize)]
+pub(super) struct SeedChangeForTestRequest {
+    pub change_id: String,
+    pub thread_id: String,
+    pub branch_name: String,
+    pub repo_root: String,
+    pub description: String,
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub requires_restart: bool,
+    #[serde(default)]
+    pub hardened: bool,
+}
+
+/// POST /api/internal/seed-change-for-test — emit an aggregate `ChangeProposed`
+/// directly via the live EventBus, populating the `ChangesProjection` (and the
+/// `changes` table row inside the same commit tx) without going through the
+/// per-commit hook flow. The hook flow requires a live `agent_sessions` entry,
+/// which integration tests can't set up from outside the engine process.
+///
+/// Used only by the api e2e tests in `crates/lucidos-e2e/tests/api_support/changes_test.rs`.
+/// Production code emits ChangeProposed via `commit_made` (per-commit) or via
+/// the agent session's end-of-turn aggregation. This endpoint exists so those
+/// tests can exercise the apply endpoint against a real projection-resident
+/// change without recreating the entire CC commit flow.
+///
+/// Hardened so it can't be abused on a production instance:
+/// 1. Refuses outright in release builds (`cfg!(debug_assertions)` is false).
+///    The route is mounted unconditionally so `cargo build --release` doesn't
+///    silently miss it; the guard returns 404 instead.
+/// 2. Path-validates `repo_root`, `branch_name`, and every entry of `files`
+///    against `..`, leading `/`, and leading `\` per the rust.md path-validation
+///    rule, so even a dev-build instance reachable from the network can't be
+///    coaxed into running git ops outside a sane path.
+pub(super) async fn seed_change_for_test(
+    State(state): State<AppState>,
+    Json(body): Json<SeedChangeForTestRequest>,
+) -> impl IntoResponse {
+    if !cfg!(debug_assertions) {
+        return (StatusCode::NOT_FOUND, "test-only endpoint").into_response();
+    }
+
+    let thread_id = match Uuid::parse_str(&body.thread_id) {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid thread_id").into_response(),
+    };
+    if Uuid::parse_str(&body.change_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "Invalid change_id").into_response();
+    }
+    // repo_root may be absolute (it's a filesystem path to a git repo), but
+    // must not contain `..` segments. branch_name and per-file paths are
+    // relative-ish — reject absolute and traversal both.
+    if body.repo_root.is_empty()
+        || body.repo_root.split(['/', '\\']).any(|seg| seg == "..")
+    {
+        return (StatusCode::BAD_REQUEST, "repo_root: empty or contains '..'").into_response();
+    }
+    if let Some(bad) = reject_unsafe_relative(&body.branch_name) {
+        return (StatusCode::BAD_REQUEST, format!("branch_name: {bad}")).into_response();
+    }
+    for f in &body.files {
+        if let Some(bad) = reject_unsafe_relative(f) {
+            return (StatusCode::BAD_REQUEST, format!("files entry: {bad}")).into_response();
+        }
+    }
+
+    let result = state
+        .engine
+        .event_bus
+        .emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ChangeProposed {
+                change_id: body.change_id.clone(),
+                description: Some(body.description),
+                files: body.files,
+                requires_restart: body.requires_restart,
+                origin: None,
+                commit_sha: None,
+                branch_name: body.branch_name,
+                repo_root: body.repo_root,
+                hardened: body.hardened,
+                path: String::new(),
+                diff: String::new(),
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::CodingAgent),
+                ..EventMeta::NONE
+            },
+        })
+        .await;
+
+    match result {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "change_id": body.change_id })),
+        )
+            .into_response(),
+        Err(e) => {
+            crate::log!("[Internal] seed-change-for-test emit failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("emit failed: {e}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Reject relative paths that escape their parent (`..`), are absolute
+/// (leading `/` or `\`), or are empty. For values like branch names and
+/// per-file paths inside a repo. Returns the rejection reason or `None`.
+fn reject_unsafe_relative(path: &str) -> Option<&'static str> {
+    if path.is_empty() {
+        return Some("empty");
+    }
+    if path.starts_with('/') || path.starts_with('\\') {
+        return Some("must not be absolute");
+    }
+    if path.split(['/', '\\']).any(|seg| seg == "..") {
+        return Some("must not contain '..' segment");
+    }
+    None
 }
 
 /// Parse `git show --stat --format=%s --name-only -z <sha>` output into
@@ -846,11 +1044,22 @@ mod tests {
         assert_eq!(s, "WebFetch https://example.com");
     }
 
+    fn register(state: &mut CcPermissionState, key: DedupKey) -> (String, tokio::sync::broadcast::Receiver<bool>, bool) {
+        let tool_name = key.1.clone();
+        register_or_attach(
+            state,
+            key,
+            Uuid::nil(),
+            tool_name,
+            serde_json::json!({}),
+        )
+    }
+
     #[test]
     fn register_or_attach_creates_canonical_entry_first_time() {
         let mut state = CcPermissionState::default();
         let key: DedupKey = (Uuid::nil(), "Edit".into(), "{}".into());
-        let (request_id, _rx, is_canonical) = register_or_attach(&mut state, key.clone(), Uuid::nil());
+        let (request_id, _rx, is_canonical) = register(&mut state, key.clone());
         assert!(is_canonical, "first request must be canonical");
         assert!(state.by_dedup_key.contains_key(&key));
         assert!(state.by_request_id.contains_key(&request_id));
@@ -860,10 +1069,8 @@ mod tests {
     fn register_or_attach_returns_existing_request_id_for_duplicate() {
         let mut state = CcPermissionState::default();
         let key: DedupKey = (Uuid::nil(), "Edit".into(), "{}".into());
-        let (first_id, _rx1, first_canonical) =
-            register_or_attach(&mut state, key.clone(), Uuid::nil());
-        let (second_id, _rx2, second_canonical) =
-            register_or_attach(&mut state, key.clone(), Uuid::nil());
+        let (first_id, _rx1, first_canonical) = register(&mut state, key.clone());
+        let (second_id, _rx2, second_canonical) = register(&mut state, key.clone());
         assert!(first_canonical);
         assert!(!second_canonical, "duplicate must not be canonical");
         assert_eq!(
@@ -872,12 +1079,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn register_or_attach_stores_tool_name_and_input_on_canonical_entry() {
+        let mut state = CcPermissionState::default();
+        let key: DedupKey = (Uuid::nil(), "Skill".into(), "{\"skill\":\"x:y\"}".into());
+        let (request_id, _rx, _) = register_or_attach(
+            &mut state,
+            key,
+            Uuid::nil(),
+            "Skill".into(),
+            serde_json::json!({"skill": "x:y"}),
+        );
+        let entry = state.take(&request_id).unwrap();
+        assert_eq!(entry.tool_name, "Skill");
+        assert_eq!(entry.input, serde_json::json!({"skill": "x:y"}));
+    }
+
     #[tokio::test]
     async fn duplicate_subscribers_both_receive_the_answer() {
         let mut state = CcPermissionState::default();
         let key: DedupKey = (Uuid::nil(), "Edit".into(), "{}".into());
-        let (id, mut rx1, _) = register_or_attach(&mut state, key.clone(), Uuid::nil());
-        let (_, mut rx2, _) = register_or_attach(&mut state, key.clone(), Uuid::nil());
+        let (id, mut rx1, _) = register(&mut state, key.clone());
+        let (_, mut rx2, _) = register(&mut state, key.clone());
 
         // Resolve via the same path the consent endpoint uses.
         let entry = state.take(&id).expect("entry must be present");

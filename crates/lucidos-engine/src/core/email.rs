@@ -761,7 +761,7 @@ async fn imap_connect(
     };
 
     let mut client = async_imap::Client::new(stream);
-    let _greeting = client
+    client
         .read_response()
         .await
         .ok_or("No greeting from IMAP server")??;

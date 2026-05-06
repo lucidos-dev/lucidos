@@ -5,7 +5,6 @@ import { getCredentialValue } from '../../api/client';
 import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
 
-
 interface Props {
   credential: CredentialInfo;
 }

@@ -57,24 +57,38 @@ impl DeviceStore {
     }
 
     /// Get the display name for a device (falls back to truncated ID if no name set).
+    /// DB errors are logged and treated as "device not found" — caller falls back to None.
     pub async fn display_name(pool: &PgPool, id: &str) -> Option<String> {
         let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT name FROM devices WHERE id = $1")
+            match sqlx::query_as("SELECT name FROM devices WHERE id = $1")
                 .bind(id)
                 .fetch_optional(pool)
                 .await
-                .ok()?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    log!("[Devices] display_name({}) failed: {}", id, e);
+                    return None;
+                }
+            };
         let (name,) = row?;
         Some(resolve_device_name(name.as_deref(), id))
     }
 
     /// Build a rich tooltip string for a device: name + user agent summary.
+    /// DB errors are logged and treated as "device not found" — caller falls back to None.
     pub async fn tooltip_info(pool: &PgPool, id: &str) -> Option<String> {
-        let device: Option<Device> = sqlx::query_as("SELECT * FROM devices WHERE id = $1")
+        let device: Option<Device> = match sqlx::query_as("SELECT * FROM devices WHERE id = $1")
             .bind(id)
             .fetch_optional(pool)
             .await
-            .ok()?;
+        {
+            Ok(d) => d,
+            Err(e) => {
+                log!("[Devices] tooltip_info({}) failed: {}", id, e);
+                return None;
+            }
+        };
         let device = device?;
         let name = resolve_device_name(device.name.as_deref(), id);
         let ua = device.user_agent.as_deref().map(parse_user_agent);

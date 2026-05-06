@@ -1,11 +1,11 @@
-import { useState, useEffect } from 'preact/hooks';
 import { artifactRevision, filePreviewSource, popupImageSrc } from '../../store/store';
 import { lucidos } from '@lucidos/sdk';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { syntaxHighlightJson, syntaxHighlightCode, CODE_EXTS } from '../../utils/syntaxHighlight';
 import { renderCsvTable } from '../../utils/csv';
 import { SlidesPreview } from './SlidesPreview';
-import { isMobile } from '../../utils/viewport';
+import { isMobile, viewportIsMobile } from '../../utils/viewport';
+import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 
 const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp'];
 // .ogg is treated as audio (Vorbis/Opus is by far the most common modern usage);
@@ -25,14 +25,20 @@ export const RENDERABLE_EXTS = ['md', 'html', 'htm', 'csv', 'svg', 'slides'];
 
 interface Props {
   path: string;
+  /** Skip mounting in the inactive dual-rendered layout — otherwise both
+   *  SplitLayout and MobileSwipeContainer copies fetch and decode the file. */
+  layout: 'desktop' | 'mobile';
 }
 
-export function FilePreviewInline({ path }: Props) {
+export function FilePreviewInline({ path, layout }: Props) {
   const ext = path.split('.').pop()?.toLowerCase() || '';
   const rev = artifactRevision.value;
   const base = lucidos.data.url(path);
   const url = rev ? `${base}?v=${rev}` : base;
   const sourceMode = filePreviewSource.value && RENDERABLE_EXTS.includes(ext);
+  const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
+
+  if (!isActiveLayout) return null;
 
   return (
     <div class="file-preview-inline">
@@ -54,20 +60,17 @@ export function FilePreviewInline({ path }: Props) {
 }
 
 function TextContent({ ext, url, sourceMode }: { ext: string; url: string; sourceMode: boolean }) {
-  const [content, setContent] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setContent(null);
-    setError(null);
-    fetch(url).then(r => {
+  const { loadable, showLoading } = useLoadableFetch<string>(
+    () => fetch(url).then(r => {
       if (!r.ok) throw new Error(`${r.status}`);
       return r.text();
-    }).then(setContent).catch(e => setError(e.message));
-  }, [url]);
+    }),
+    [url],
+  );
 
-  if (error) return <div class="empty-state" style="color:var(--accent-red)">Failed to load: {error}</div>;
-  if (content === null) return <div class="loading-spinner" />;
+  if (loadable.status === 'failed') return <div class="empty-state error-text">Failed to load: {loadable.error}</div>;
+  if (loadable.status !== 'loaded') return showLoading ? <div class="loading-spinner" /> : null;
+  const content = loadable.data;
 
   if (sourceMode) {
     const lang = ext === 'md' ? 'markdown' : ext === 'csv' ? 'text' : ext === 'svg' ? 'xml' : 'html';

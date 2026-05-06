@@ -50,6 +50,12 @@ mail-parser = "0.9"
 aes-gcm = "0.10"
 tar = "0.4"
 zstd = "0.13"
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+toml = "0.8"
+semver = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# Enables `#[tokio::test(start_paused = true)]` for time-mocked tests.
+tokio = { version = "1", features = ["test-util"] }

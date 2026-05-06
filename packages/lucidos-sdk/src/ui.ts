@@ -58,7 +58,12 @@ export const ui = {
     if (theme === 'system') {
       theme = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
     }
+    const bg = theme === 'light' ? '#ffffff' : '#0d1117';
     document.documentElement.setAttribute('data-theme', theme);
+    document.documentElement.style.setProperty('--bg-primary', bg);
+    // Mirrors sdk-prefs.js — keeps <html> covered before/after the iframe's
+    // stylesheet applies its bg rule (iOS WKWebView underlying white).
+    document.documentElement.style.background = bg;
 
     // Font — load Google Fonts on demand, map to CSS value
     const fontKey = prefs['font-family'] || 'monospace';

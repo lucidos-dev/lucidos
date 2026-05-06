@@ -4,8 +4,9 @@ import { showToast } from '../../store/store';
 import { answerCCQuestion } from '../../store/actions/chat-claude-code';
 import { createTapGate } from '../../utils/tapGesture';
 
-export interface QuestionEvent {
-  tool_use_id: string;
+export interface QuestionBodyProps {
+  threadId: string;
+  toolUseId: string;
   question: string;
   options: Array<{ id: string; label: string; description?: string }>;
   resolved?:
@@ -14,29 +15,23 @@ export interface QuestionEvent {
     | { kind: 'Canceled' };
 }
 
-interface Props {
-  threadId: string;
-  event: QuestionEvent;
-}
-
-/** Interactive `AskUserQuestion` card. The `pending` signal is an optimistic
- *  override — replaced by `event.resolved` once the SSE roundtrip lands. */
-export function QuestionCard({ threadId, event }: Props) {
+/** Body of an `AskUserQuestion` divider exchange — rendered inside the
+ *  initiator panel which provides the chrome (border, header, timestamp).
+ *  The `pending` signal is an optimistic override — replaced by `resolved`
+ *  once the SSE roundtrip lands. */
+export function QuestionBody({ threadId, toolUseId, question, options, resolved }: QuestionBodyProps) {
   const pending = useSignal<string | null>(null);
 
-  const resolved = event.resolved;
+  const effective: QuestionBodyProps['resolved'] = resolved
+    ?? (pending.value !== null ? { kind: 'Selected', option_id: pending.value } : undefined);
 
-  if (resolved) {
-    return <AnsweredCard event={event} resolved={resolved} />;
-  }
-
-  if (pending.value !== null) {
-    return <AnsweredCard event={event} resolved={{ kind: 'Selected', option_id: pending.value }} optimistic />;
+  if (effective) {
+    return <AnsweredBody question={question} options={options} resolved={effective} />;
   }
 
   const onPick = async (optionId: string) => {
     pending.value = optionId;
-    const ok = await answerCCQuestion(threadId, event.tool_use_id, { kind: 'Selected', option_id: optionId });
+    const ok = await answerCCQuestion(threadId, toolUseId, { kind: 'Selected', option_id: optionId });
     if (!ok) {
       pending.value = null;
       showToast('Could not send answer — please try again.', 'error');
@@ -44,16 +39,16 @@ export function QuestionCard({ threadId, event }: Props) {
   };
 
   return (
-    <div class="cc-question-card" data-tool-use-id={event.tool_use_id}>
-      <div class="cc-question-text">{event.question}</div>
-      {event.options.length > 0 && (
+    <div class="cc-question-body" data-tool-use-id={toolUseId}>
+      <div class="cc-question-text">{question}</div>
+      {options.length > 0 && (
         <div class="cc-question-options">
-          {event.options.map(opt => (
+          {options.map(opt => (
             <OptionButton key={opt.id} option={opt} onPick={onPick} />
           ))}
         </div>
       )}
-      {event.options.length === 0 && (
+      {options.length === 0 && (
         <div class="cc-question-hint">Type your answer in the prompt below.</div>
       )}
     </div>
@@ -90,33 +85,44 @@ function OptionButton({
   );
 }
 
-function AnsweredCard({
-  event,
+/** Resolved-state rendering: options dim, the picked one (Selected) is
+ *  highlighted; FreeText answers show all options dimmed and a highlighted
+ *  "Custom answer: …" block; Canceled shows dimmed options + a "Canceled" badge. */
+function AnsweredBody({
+  question,
+  options,
   resolved,
-  optimistic = false,
 }: {
-  event: QuestionEvent;
-  resolved: NonNullable<QuestionEvent['resolved']>;
-  optimistic?: boolean;
+  question: string;
+  options: QuestionBodyProps['options'];
+  resolved: NonNullable<QuestionBodyProps['resolved']>;
 }) {
-  const summary = resolvedSummary(event, resolved);
+  const isSelected = (id: string) => resolved.kind === 'Selected' && resolved.option_id === id;
   return (
-    <div class={`cc-question-card cc-question-card-answered${optimistic ? ' cc-question-card-pending' : ''}`}>
-      <div class="cc-question-text">{event.question}</div>
-      <div class="cc-question-answer">{summary}</div>
+    <div class="cc-question-body cc-question-body-answered">
+      <div class="cc-question-text">{question}</div>
+      {options.length > 0 && (
+        <div class="cc-question-options">
+          {options.map(opt => (
+            <div
+              key={opt.id}
+              class={`cc-question-option-static${isSelected(opt.id) ? ' cc-question-option-selected' : ' cc-question-option-dimmed'}`}
+            >
+              <span class="cc-question-option-label">{opt.label}</span>
+              {opt.description && <span class="cc-question-option-desc">{opt.description}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+      {resolved.kind === 'FreeText' && (
+        <div class="cc-question-freetext">
+          <span class="cc-question-freetext-label">Custom answer</span>
+          <span class="cc-question-freetext-text">{resolved.text}</span>
+        </div>
+      )}
+      {resolved.kind === 'Canceled' && (
+        <div class="cc-question-canceled-badge">Canceled</div>
+      )}
     </div>
   );
-}
-
-function resolvedSummary(event: QuestionEvent, resolved: NonNullable<QuestionEvent['resolved']>): string {
-  switch (resolved.kind) {
-    case 'Selected': {
-      const opt = event.options.find(o => o.id === resolved.option_id);
-      return `Answered: ${opt?.label ?? resolved.option_id}`;
-    }
-    case 'FreeText':
-      return `Answered: ${resolved.text}`;
-    case 'Canceled':
-      return 'Canceled';
-  }
 }

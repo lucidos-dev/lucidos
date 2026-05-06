@@ -1,5 +1,5 @@
 import { useRef, useLayoutEffect } from 'preact/hooks';
-import { focusedThreadId, activeExchanges, promptAnimating } from '../../store/store';
+import { focusedThreadId, activeExchanges, promptAnimating, activeThreadIsComposing } from '../../store/store';
 import { PromptInput } from '../chat/PromptInput';
 import { CreateThreadView } from '../chat/CreateThreadView';
 import { ThreadView } from '../chat/ThreadView';
@@ -10,7 +10,9 @@ import { isMobile } from '../../utils/viewport';
 export function ThreadPane() {
   const tid = focusedThreadId.value;
   const isEmpty = activeExchanges.value.length === 0;
-  const isComposeEmpty = !tid && isEmpty;
+  // Composing drafts share the brand-new compose layout — prompt re-docks only after Send.
+  const isComposingDraft = activeThreadIsComposing.value;
+  const isComposeEmpty = (!tid && isEmpty) || isComposingDraft;
 
   const promptRef = useRef<HTMLDivElement>(null);
   const promptYRef = useRef<number | null>(null);
@@ -82,7 +84,7 @@ export function ThreadPane() {
     <div class={`thread-pane${isComposeEmpty ? ' compose-empty' : ''}`} data-drop-zone="attach">
       <ThreadToggleButton class="thread-pane-toggle" />
       <div class="thread-pane-body">
-        {tid ? <div class="thread-view-clip"><ThreadView /></div> : <CreateThreadView />}
+        {tid && !isComposingDraft ? <div class="thread-view-clip"><ThreadView /></div> : <CreateThreadView />}
         <div class="prompt-area" ref={promptRef}>
           <PromptInput />
         </div>

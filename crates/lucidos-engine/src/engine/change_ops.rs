@@ -3,7 +3,8 @@ use super::git_ops::{
     commits_in_range, ff_main_to, files_have_client_update, find_branch_merge_in_main,
     find_worktree_for_branch, git_cmd, harden_marker_state, has_branch_commits,
     is_harden_marker_present, is_merge_of_branch_into_main, push_main_in_background,
-    recover_no_commits_branch, worktrees_dir, HardenMarkerState, NoCommitsRecovery, MERGE_MUTEX,
+    recover_no_commits_branch, worktree_add, worktrees_dir, HardenMarkerState, NoCommitsRecovery,
+    MERGE_MUTEX,
 };
 use super::thread_events::MessageOrigin;
 use super::{ApplyResult, ApplyStatus, LucidosEngine};
@@ -20,14 +21,12 @@ pub(crate) struct LiveSessionInfo {
 
 /// Inputs for proposing (or updating) a pending change.
 ///
-/// `request_id` is a chat-request UUID, not a persisted event id.
 /// `hardened` is set atomically — callers declare hardening status up front.
 /// `origin` flows onto the emitted `ChangeProposed` event so engine-internal
 /// recovery paths (stale-session, orphan-recovery) can stamp themselves; live
 /// agent callers pass `None` (the surrounding `MessageReceived` carries the
 /// user/agent origin).
 pub(crate) struct ProposeChangeInput<'a> {
-    pub request_id: Uuid,
     pub thread_id: Uuid,
     pub branch_name: &'a str,
     pub repo_root: &'a str,
@@ -393,7 +392,6 @@ impl LucidosEngine {
         input: ProposeChangeInput<'_>,
     ) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
         let ProposeChangeInput {
-            request_id,
             thread_id,
             branch_name,
             repo_root,
@@ -404,8 +402,6 @@ impl LucidosEngine {
             hardened,
             origin,
         } = input;
-
-        let _ = request_id; // legacy auto-apply correlation; not on event today
 
         // If a pending change already exists for this branch, reuse its
         // change_id and re-emit `ChangeProposed`. The `needs_emit` guard
@@ -594,42 +590,6 @@ impl LucidosEngine {
             return Err(format!("Change is already {}", change.status).into());
         }
 
-        // External repo fast path: no hardening, no merge. Just mark applied,
-        // delete worktree, keep branch. The dev handles push/PR inside the session.
-        if let Some(thread_id) = change.thread_id {
-            let is_external = self.is_external_repo_thread(thread_id).await?;
-
-            if is_external {
-                // Phase 6.2: keep both worktree and branch on disk. The dev
-                // continues working in the same thread (push/PR follow-ups),
-                // and the next user message resumes CC at the same worktree.
-                // No reset to main here — the external repo's main is not
-                // ours to advance.
-
-                self.emit_change_applied(
-                    thread_id,
-                    change_id,
-                    false,
-                    false,
-                    Vec::new(),
-                    change.thread_title.clone(),
-                    actor.clone(),
-                    None,
-                    None,
-                )
-                .await;
-                self.broadcast_changes_updated().await;
-                return Ok(ApplyResult {
-                    status: ApplyStatus::Applied,
-                    change_id,
-                    thread_id: Some(thread_id),
-                    message: format!("Done. Branch '{}' kept in repo.", change.branch_name),
-                    files_changed: change.files.len(),
-                    ..ApplyResult::default()
-                });
-            }
-        }
-
         // Idempotency fast-path: when the branch ref is gone, check if it was
         // already merged into main out-of-band (e.g. by an agentic loop calling
         // `git merge` directly). Only kicks in when the live branch is missing,
@@ -788,23 +748,7 @@ impl LucidosEngine {
                     .join(format!("harden-{}", change_id.as_simple()));
                 let wt_str = wt_path.to_str().unwrap().to_string();
                 let _ = git_cmd(&["worktree", "remove", "--force", &wt_str], &repo_root).await;
-                match git_cmd(
-                    &[
-                        "-c",
-                        "filter.git-crypt.smudge=",
-                        "-c",
-                        "filter.git-crypt.clean=",
-                        "-c",
-                        "filter.git-crypt.required=false",
-                        "worktree",
-                        "add",
-                        &wt_str,
-                        &change.branch_name,
-                    ],
-                    &repo_root,
-                )
-                .await
-                {
+                match worktree_add(&repo_root, &wt_path, &[&change.branch_name]).await {
                     Ok(o) if o.status.success() => {}
                     Ok(o) => {
                         let msg = format!(
@@ -1248,7 +1192,7 @@ impl LucidosEngine {
             let _ = git_cmd(&["worktree", "remove", "--force", &temp_wt_str], &repo_root).await;
 
             let add_ok = matches!(
-                git_cmd(&["worktree", "add", &temp_wt_str, &change.branch_name], &repo_root).await,
+                worktree_add(&repo_root, &temp_wt, &[&change.branch_name]).await,
                 Ok(o) if o.status.success()
             );
 
@@ -1301,24 +1245,7 @@ impl LucidosEngine {
         let _ = git_cmd(&["worktree", "remove", "--force", &wt_path_str], &repo_root).await;
         let _ = git_cmd(&["branch", "-D", &temp_branch], &repo_root).await;
 
-        match git_cmd(
-            &[
-                "-c",
-                "filter.git-crypt.smudge=",
-                "-c",
-                "filter.git-crypt.clean=",
-                "-c",
-                "filter.git-crypt.required=false",
-                "worktree",
-                "add",
-                &wt_path_str,
-                "-b",
-                &temp_branch,
-            ],
-            &repo_root,
-        )
-        .await
-        {
+        match worktree_add(&repo_root, &wt_path, &["-b", &temp_branch]).await {
             Ok(o) if o.status.success() => {}
             Ok(o) => {
                 let msg = format!(
@@ -1390,12 +1317,17 @@ impl LucidosEngine {
         .map(|opt| opt.unwrap_or(false))
     }
 
-    /// Discard all pending changes for a thread. Reuses `discard_change` for each,
-    /// which handles event emission, DB update, and safe branch deletion.
-    pub async fn discard_pending_for_thread(&self, thread_id: Uuid) {
+    /// Discard all pending changes for a thread. `actor` flows into the
+    /// resulting `ChangeDiscarded` events so the chip reads "You" rather than
+    /// the engine fallback.
+    pub async fn discard_pending_for_thread(
+        &self,
+        thread_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) {
         let pending = self.changes().pending_for_thread(thread_id).await;
         for change in &pending {
-            if let Err(e) = self.discard_change(change.id, None).await {
+            if let Err(e) = self.discard_change(change.id, actor.clone()).await {
                 log!(
                     "[Changes] Failed to discard change {} for thread {}: {}",
                     change.id,
@@ -1463,7 +1395,7 @@ impl LucidosEngine {
             .await;
         if others {
             log!(
-                "Discarded change {} but kept branch {} and worktree — other pending changes reference it",
+                "[Changes] Discarded change {} but kept branch {} and worktree — other pending changes reference it",
                 change_id,
                 change.branch_name
             );
@@ -1558,7 +1490,7 @@ impl LucidosEngine {
         match result {
             Ok(()) => {
                 log!(
-                    "Reverted change {} (branch {})",
+                    "[Changes] Reverted change {} (branch {})",
                     change_id,
                     change.branch_name
                 );

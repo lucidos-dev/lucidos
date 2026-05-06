@@ -21,6 +21,7 @@ The standard Lucidos app boilerplate:
   <head>
     <meta charset="utf-8">
     <title>My App</title>
+    <script src="/api/v1/sdk-prefs.js"></script>
     <link rel="stylesheet" href="/api/v1/sdk-iframe.css">
     <script src="/api/v1/sdk-iframe-audio.js"></script>
     <script src="/api/v1/sdk.js"></script>
@@ -40,11 +41,14 @@ What each piece does — include only what you need:
 | Tag | Provides | Skip if |
 |---|---|---|
 | `<title>` | Tab title | (always include — browsers require it) |
+| `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script — reads the user's theme/font/scale from `localStorage` (shared with the parent shell via same-origin sandboxing) and sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible — before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
 | `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs an iframe-friendly link interceptor: `target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.navigate()` | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | Skip (app keeps default dark palette) |
 | `lucidos.ui.watchPreferences()` | Re-applies preferences whenever the user changes them (SSE-driven) | Static apps that don't need live preference updates |
+
+**Theme integration is opt-in.** An app that omits both `<script src="/api/v1/sdk-prefs.js">` and `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` gets no `data-theme` attribute, no CSS variables, and no Lucidos default styling — the engine never auto-injects either tag. This is the right choice for apps that ship their own complete visual identity (charts, games, embedded third-party UIs).
 
 Apps using `lucidos._capture()` don't need to include `html2canvas` — the SDK loads it on demand from `/api/static/html2canvas.min.js`.
 
@@ -85,12 +89,27 @@ lucidos.data.upload(file: File): Promise<UploadResult>  // 120s timeout
 interface WriteResult { success: boolean; commit?: string }
 interface UploadResult { success: boolean; filename?: string; error?: string }
 interface EditOperation {
-  json_path?: string;   // JSON path edit
+  json_path?: string;   // JSON path edit (see syntax below)
   json_value?: unknown;
   find?: string;        // Text find-replace edit
   replace?: string;
 }
 ```
+
+#### `json_path` syntax
+
+Mix any of these forms in a single path:
+
+| Form                              | Example                            | Resolves to                  |
+|-----------------------------------|------------------------------------|------------------------------|
+| Dot notation                      | `metadata.author.name`             | `/metadata/author/name`      |
+| Array index                       | `sections[1]`                      | `/sections/1`                |
+| Quoted key (double or single)     | `dailyLog["2026-05-04"]`           | `/dailyLog/2026-05-04`       |
+| JSONPath root marker              | `$.streak`                         | `/streak`                    |
+| Raw JSON Pointer (RFC 6901)       | `/sections/1/title`                | `/sections/1/title`          |
+| Mixed                             | `habits[0].dailyLog["2026-05-04"]` | `/habits/0/dailyLog/2026-05-04` |
+
+Use **quoted keys** whenever a key contains characters that aren't a bare identifier — dates (`"2026-05-04"`), slugs with dots (`"foo.bar"`), or anything with spaces. Inside a quoted key, `\` escapes the next character. RFC 6901 escaping (`~` → `~0`, `/` → `~1`) is applied automatically.
 
 ### Examples
 
@@ -108,6 +127,11 @@ const csvFiles = await lucidos.data.list('artifacts/imported/**/*.csv');
 // Edit JSON in-place
 await lucidos.data.edit('artifacts/habits/data.json', [
   { json_path: '$.streak', json_value: 5 }
+]);
+
+// Edit a key whose name isn't a bare identifier (here: an ISO date)
+await lucidos.data.edit('artifacts/habits/data.json', [
+  { json_path: 'habits[0].dailyLog["2026-05-04"]', json_value: 3 }
 ]);
 
 // Get a URL for embedding in HTML
@@ -174,6 +198,70 @@ const events = await lucidos.events.query({
 });
 ```
 
+## lucidos.proxy — Call External APIs
+
+Call backends configured in `data/config/apis.json` through the engine. The engine injects the configured auth header from the credential store and strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request — **the credential never enters the iframe**.
+
+This is the preferred way for app UIs to talk to external HTTP APIs. Direct `fetch` from the iframe runs into two walls:
+
+- **Mixed content** — apps load over HTTPS, so `fetch('http://localhost:5005/...')` is blocked by the browser.
+- **CORS** — the upstream rarely whitelists the engine's origin, so cross-origin XHR fails.
+
+`lucidos.proxy` sidesteps both: the request goes to the same-origin engine, which forwards server-side.
+
+```ts
+lucidos.proxy(name: string): ProxyClient
+
+interface ProxyClient {
+  fetch(path: string, init?: RequestInit): Promise<Response>;
+}
+```
+
+`fetch` returns the raw `Response` so the caller picks how to read the body (`.json()`, `.text()`, `.blob()`, …). The auth header is added server-side; do not set `Authorization` from the iframe.
+
+### Configure the backend (one-time)
+
+`data/config/apis.json`:
+
+```json
+{
+  "sonos":   { "base_url": "http://localhost:5005" },
+  "comfort": {
+    "base_url": "https://accsmart.panasonic.com",
+    "auth": { "type": "bearer", "credential": "comfort-cloud" }
+  }
+}
+```
+
+`auth.type` is `bearer`, `api_key`, or `basic`. `auth.credential` is the `service_name` already in the engine credential store. Omit `auth` for unauthenticated backends (e.g. local services).
+
+### Examples
+
+```js
+// GET — unauthenticated local backend
+const res = await lucidos.proxy('sonos').fetch('/Spisestua/play');
+if (!res.ok) throw new Error(`Sonos: HTTP ${res.status}`);
+
+// POST JSON — auth header injected by engine
+const res = await lucidos.proxy('comfort').fetch('/api/v1/devices', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ deviceGuid: 'abc' }),
+});
+const data = await res.json();
+```
+
+### When to use which
+
+| Want to … | Use |
+|---|---|
+| Read/write workspace files | `lucidos.data.*` |
+| Emit/query domain events | `lucidos.events.*` |
+| Call an external HTTP API | `lucidos.proxy(name).fetch(path, init)` |
+| Hit the engine's own `/api/v1/*` | Plain `fetch` (same origin, no proxy needed) |
+
+If the iframe needs an external API the workspace doesn't have a proxy entry for, add one to `data/config/apis.json` rather than embedding the credential in the app.
+
 ## lucidos.triggers — Scheduled Tasks
 
 CRUD operations for cron-based and event-based triggers.
@@ -188,11 +276,9 @@ lucidos.triggers.delete(id: string): Promise<void>
 ### Types
 
 ```ts
-interface TriggerRun {
-  type: 'prompt' | 'script';
-  value: string;
-  model?: string;
-}
+type TriggerRun =
+  | { type: 'intent'; intent: string; knowhow: string[] }
+  | { type: 'script'; path: string };
 
 interface Trigger {
   id: string;
@@ -320,7 +406,7 @@ interface Thread {
   source: string;
   last_activity: string;
   message_count: number;
-  is_pinned: boolean;
+  is_saved: boolean;
   has_response: boolean;
 }
 ```

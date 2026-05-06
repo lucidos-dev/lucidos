@@ -5,7 +5,7 @@ Decisions and tradeoffs made while building the end-to-end test suite.
 ## Architecture: Three Layers
 
 1. **Browser E2E tests** (Playwright, `crates/lucidos-app/e2e/`) — drive a real browser against the running Lucidos UI. Three projects run by default: `chromium` (desktop), `mobile` (mobile Chromium), and `mobile-webkit` (iOS Safari emulation via WebKit).
-2. **HTTP API tests** (Rust, `crates/lucidos-engine/tests/api_e2e*`) — hit the API directly without a browser
+2. **HTTP API tests** (Rust, `crates/lucidos-e2e/tests/api_support/`, workspace member crate `lucidos-e2e`) — hit the API directly without a browser
 
 All layers require a running Lucidos workspace (`~/workspaces/e2e-test` by default).
 
@@ -45,7 +45,10 @@ Several tests send messages to the LLM and assert on responses. These tests use 
 The streaming test captures text at two points during response generation. It asserts both snapshots are truthy (content appeared) rather than asserting the second is longer than the first, which is flaky with fast models that complete before the 1.5s delay.
 
 ### Rust API test module structure
-Rust's module system doesn't allow both `tests/api_e2e.rs` and `tests/api_e2e/mod.rs`. The solution uses `#[path]` attributes in `api_e2e.rs` to include submodules from an `api_e2e_support/` directory.
+Rust's module system doesn't allow both `tests/api.rs` and `tests/api/mod.rs`. The solution uses `#[path]` attributes in `tests/api.rs` (in the `lucidos-e2e` crate) to include submodules from a `tests/api_support/` directory.
+
+### Separate `lucidos-e2e` crate
+API tests live in their own workspace member crate, not in `lucidos-engine`'s `tests/`. This keeps `cargo test -p lucidos-engine` from compiling them (so it stays fast and infra-free) and removes the need for `#[ignore]` on tests that require a running workspace. Run via `./scripts/e2e-api.sh` or the umbrella `./scripts/e2e.sh`.
 
 ### Single-writer lock on the e2e workspace
 Both `e2e-browser.sh` and `e2e-api.sh` acquire `~/workspaces/e2e-test/.lucidos/e2e.lock` (PID + `$LUCIDOS_THREAD_ID` + worktree path + start time) before starting the workspace. A second invocation while the lock is held exits 1 with a message naming the holder; stale locks (dead PID) are reclaimed automatically. The lock exists because two CC sessions running Playwright concurrently against the shared workspace race on browser processes — on 2026-04-19 a WebKit GPU child leaked to 28 GB and OOM-rebooted a 32 GB Mac. Lock logic in `scripts/lib/e2e_lock.sh`; covered by `tests/e2e_lock_test.sh` (run directly, no harness).
@@ -74,11 +77,14 @@ Both `e2e-browser.sh` and `e2e-api.sh` acquire `~/workspaces/e2e-test/.lucidos/e
 ./scripts/web-dev.sh -w ~/workspaces/e2e-test -b
 
 # Browser E2E tests
-cd crates/lucidos-app && npx playwright test
+./scripts/e2e-browser.sh
 
-# HTTP API tests (also boots the e2e workspace and passes --ignored)
+# HTTP API tests (also boots the e2e workspace)
 ./scripts/e2e-api.sh
 
+# Both back-to-back (what the nightly pipeline runs)
+./scripts/e2e.sh
+
 # With visible browser (debugging)
-HEADED=1 npx playwright test --headed
+./scripts/e2e-browser.sh -h
 ```

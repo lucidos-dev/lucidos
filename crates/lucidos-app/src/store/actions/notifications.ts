@@ -9,7 +9,7 @@ import {
   notificationModalDetail,
   activeMenuItem,
 } from '../store';
-import { toFailed } from '../types';
+import { toFailed, setLoadingIfFresh } from '../types';
 import { savePreference } from './preferences';
 import {
   getNotifications,
@@ -23,7 +23,7 @@ const PAGE_SIZE = 15;
 
 /** Load the first page of notifications using the current filter. */
 export async function loadNotifications(): Promise<void> {
-  notifications.value = { status: 'loading' };
+  setLoadingIfFresh(notifications);
   try {
     const data = await getNotifications({
       limit: PAGE_SIZE,
@@ -33,7 +33,6 @@ export async function loadNotifications(): Promise<void> {
     unreadCount.value = data.unread_count;
     notificationsHasMore.value = data.has_more;
   } catch (error) {
-    console.error('Failed to load notifications:', error);
     notifications.value = toFailed(error);
   }
 }
@@ -62,7 +61,6 @@ export async function loadMoreNotifications(): Promise<void> {
     unreadCount.value = data.unread_count;
     notificationsHasMore.value = data.has_more;
   } catch (error) {
-    console.error('Failed to load more notifications:', error);
     showToast(`Failed to load more notifications: ${errorDetail(error)}`, 'error');
   } finally {
     notificationsLoadingMore.value = false;
@@ -122,9 +120,13 @@ export async function viewNotification(id: string): Promise<void> {
       notificationModalDetail.value = notification;
       notificationsModalOpen.value = true;
 
-      // Optimistic update: mark item read in the current list
+      // Read pre-mark state from the cached list — the parallel getNotification
+      // fetch may already reflect the post-mark state, racing with markNotificationRead.
       const current = notifications.value;
+      let wasUnread = !notification.read;
       if (current.status === 'loaded') {
+        const cached = current.data.find((n) => n.id === id);
+        if (cached) wasUnread = !cached.read;
         notifications.value = {
           status: 'loaded',
           data: current.data.map((n) =>
@@ -132,12 +134,11 @@ export async function viewNotification(id: string): Promise<void> {
           ),
         };
       }
-      if (unreadCount.value > 0) {
+      if (wasUnread && unreadCount.value > 0) {
         unreadCount.value = unreadCount.value - 1;
       }
     }
   } catch (error) {
-    console.error('Failed to view notification:', error);
     showToast('Failed to load notification: ' + errorDetail(error), 'error');
   }
 }
@@ -156,7 +157,6 @@ export async function markAllRead(): Promise<void> {
     }
     unreadCount.value = 0;
   } catch (error) {
-    console.error('Failed to mark all as read:', error);
     showToast('Failed to mark all as read: ' + errorDetail(error), 'error');
   }
 }

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { browseDirectories, type BrowseResult } from '../../api/client';
-import type { Loadable } from '../../store/types';
+import { toFailed, type Loadable } from '../../store/types';
 
 interface DirectoryPickerProps {
   onSelect: (path: string) => void;
@@ -13,7 +13,6 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [manualPath, setManualPath] = useState('');
   const [editingPath, setEditingPath] = useState(false);
-  const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -24,7 +23,7 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
         setData({ status: 'loaded', data: result });
         setManualPath(result.path);
       })
-      .catch(e => setData({ status: 'failed', error: String(e) }));
+      .catch(e => setData(toFailed(e)));
   }, [browsePath]);
 
   useEffect(() => {
@@ -92,7 +91,7 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
           )}
         </div>
 
-        <div class="dir-picker-list" ref={listRef} onKeyDown={(e) => {
+        <div class="dir-picker-list" onKeyDown={(e) => {
           const maxIdx = dirs.length - 1 + (currentPath !== '/' ? 1 : 0);
           if (e.key === 'ArrowDown') { e.preventDefault(); setSelectedIndex(i => Math.min(i + 1, maxIdx)); }
           if (e.key === 'ArrowUp') { e.preventDefault(); setSelectedIndex(i => Math.max(i - 1, -1)); }

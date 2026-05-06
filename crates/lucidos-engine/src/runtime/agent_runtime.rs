@@ -45,10 +45,25 @@ pub enum AgentEvent {
         input: serde_json::Value,
         id: String,
     },
-    /// Tool result returned to the agent.
-    ToolResult { output: String, status: String },
+    /// Tool result returned to the agent. `id` matches the originating
+    /// `ToolUse.id` so the engine can pair calls and results across event
+    /// boundaries (e.g. a permission prompt that lands between them).
+    /// Empty when the underlying CLI omits the id (legacy tool_result frames).
+    ToolResult {
+        output: String,
+        status: String,
+        id: String,
+    },
     /// Turn-complete marker. The agent is now idle.
-    Result { text: String, duration_ms: u64 },
+    /// `error` is `Some` when the agent reported the turn ended in failure
+    /// (CC's `subtype: "error_during_execution"` etc., `is_error: true`) —
+    /// the consumer emits `ResponseFailed` instead of `ResponseGenerated` so
+    /// the partial response renders as a failed exchange, not a complete one.
+    Result {
+        text: String,
+        duration_ms: u64,
+        error: Option<String>,
+    },
     /// Process exited. Always the last event before `events_rx` closes.
     /// Stderr is logged inside the runtime — consumers don't need to handle it.
     Exited,

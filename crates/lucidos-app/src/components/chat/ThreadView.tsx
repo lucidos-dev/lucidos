@@ -1,19 +1,18 @@
-import type { VNode } from 'preact';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, promptAnimating, effectiveThreadStatus, revealOnFocus } from '../../store/store';
 import { unfocusThread } from '../../store/actions/threads';
 import { loadThreadEvents, forceRetryThreadEvents } from '../../store/actions/thread-loading';
-import { ChatExchange } from './ChatExchange';
-import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
-import { useAutoScroll } from './CreateThreadView';
+import { useAutoScroll, renderExchanges, ScrollControls } from './CreateThreadView';
 import { ThreadStatusIcon, resolveVisualStatus } from '../shared/ThreadStatusIcon';
 import { ThreadTitleEditor } from './ThreadTitleEditor';
-import { PinButton } from '../shared/PinButton';
+import { CopyThreadRefButton } from '../shared/CopyThreadRefButton';
+import { ExportThreadButton } from '../shared/ExportThreadButton';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
-import { exchangeStatus as getExchangeStatus, exchangeImageCount, exchangeResponseModel, exchangeReasoningEffort, computeExchanges } from '../../store/thread-events';
-import { isActive as isStatusActive } from '../../store/exchange-status';
-import { awayFromBottom, notAtTop, scrollToBottom } from './scrollState';
+import { computeExchanges, hasContentEvents } from '../../store/thread-events';
+import { awayFromBottom, notAtTop, scrollToBottom, scrolledUp } from './scrollState';
+import { useScrollMemory, hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
 import { isIOS } from '../../utils/platform';
+import { threadDisplayTitle } from '../../utils/threadTitle';
 
 // Module-level tracking survives component unmount/remount (e.g. Thread A → CreateThread → Thread B).
 // Using a ref would reset on remount, causing the fade-in to be skipped.
@@ -70,24 +69,31 @@ export type EmptyReason =
 /** Derive the empty reason from thread state. During animation, returns
  *  'loading' — the spinner is the correct visual for a transition, and this
  *  prevents the error state from flashing when events arrive via SSE before
- *  the animation gate lifts. */
+ *  the animation gate lifts.
+ *
+ *  `hasContent` is true iff the thread has at least one event that should
+ *  contribute to a rendered exchange (see hasContentEvents). A composing draft
+ *  carrying only ThreadStarted is empty, not corrupt — the corrupt branch is
+ *  reserved for actual content events failing to form exchanges. Composing
+ *  drafts never reach this code path — ThreadPane routes them to
+ *  CreateThreadView. */
 export function emptyReason(
     animating: boolean,
     eventsLoaded: boolean,
     eventsLoadFailed: boolean,
-    eventCount: number,
+    hasContent: boolean,
     threadId: string,
 ): EmptyReason {
     if (animating) return { kind: 'loading', threadId };
     if (eventsLoadFailed) return { kind: 'failed', threadId };
-    if (eventsLoaded && eventCount > 0) return { kind: 'corrupt', threadId };
+    if (eventsLoaded && hasContent) return { kind: 'corrupt', threadId };
     if (eventsLoaded) return { kind: 'empty' };
     return { kind: 'loading', threadId };
 }
 
 function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
     const [showReload, setShowReload] = useState(false);
-    const threadId = reason.kind !== 'empty' ? reason.threadId : '';
+    const threadId = 'threadId' in reason ? reason.threadId : '';
 
     useEffect(() => {
         setShowReload(false);
@@ -176,7 +182,7 @@ export function ThreadView() {
     useLayoutEffect(() => {
         if (!shouldReveal || !threadId) return;
         commitReveal(threadId);
-        // Only animate on dismiss→next (Done button), not regular thread selection.
+        // Only animate on dismiss→next (Archive button), not regular thread selection.
         // peek() reads without subscribing so the effect doesn't re-run on flag changes.
         if (!revealOnFocus.peek()) return;
         revealOnFocus.value = false;
@@ -279,9 +285,27 @@ export function ThreadView() {
     // SSE-delivered events, the compositor layer may still hold a blank
     // texture. This dep ensures a repaint fires on the 0→N transition.
     const hasExchanges = exchanges.length > 0;
+    const savedScrollKey = threadId ? threadScrollKey(threadId) : null;
+
+    // Mark the user as scrolled-up synchronously when a saved scroll exists.
+    // Several auto-scroll callers (visualViewport.resize in MobileSwipeContainer,
+    // useHideOnScroll's focusin/focusout) gate on `wasAtBottom = !scrolledUp.value`
+    // and call scrollToBottom() if true. On iOS PWA those fire repeatedly during
+    // initial load and would override useScrollMemory's restore. Setting
+    // scrolledUp early makes wasAtBottom=false so they skip.
+    useLayoutEffect(() => {
+        if (savedScrollKey && hasSavedScroll(savedScrollKey)) {
+            scrolledUp.value = true;
+        }
+    }, [savedScrollKey]);
+
     useEffect(() => {
         if (threadId) {
-            if (eventsLoaded) scrollToBottom();
+            // Skip auto-scroll when a saved scroll position exists — its 500ms
+            // loop would otherwise overwrite the restore set by useScrollMemory.
+            // The saved key only holds a value when the user was scrolled up
+            // (shouldSave: () => scrolledUp.value), so at-bottom defers here.
+            if (eventsLoaded && !hasSavedScroll(savedScrollKey)) scrollToBottom();
             return forceIOSRepaint();
         }
     }, [threadId, eventsLoaded, hasExchanges]);
@@ -302,14 +326,17 @@ export function ThreadView() {
         return () => document.removeEventListener('visibilitychange', onVisibilityChange);
     }, []);
 
-    // Self-healing watchdog: if a thread has events but exchanges are empty,
-    // rebuild the events Map and re-fetch from the API. iOS Safari can
+    // Self-healing watchdog: if a thread has CONTENT events but exchanges are
+    // empty, rebuild the events Map and re-fetch from the API. iOS Safari can
     // corrupt long-lived Map internals under memory pressure, causing
-    // has()/get() to return wrong results. Capped at 2 attempts.
+    // has()/get() to return wrong results. Capped at 2 attempts. The
+    // hasContentEvents gate covers both empty-Map and metadata-only threads
+    // (e.g. a composing draft carrying only ThreadStarted) — both are
+    // legitimately empty and don't need self-healing.
     const watchdogRef = useRef<ThreadRetryRef>(null);
     useEffect(() => {
-        if (!threadId || !eventsLoaded || exchanges.length > 0) return;
-        if (eventCount === 0) return; // Legitimately empty
+        if (!threadId || !eventsLoaded || !eventThread || exchanges.length > 0) return;
+        if (!hasContentEvents(eventThread.events)) return;
         if (hasExhaustedRetries(watchdogRef, threadId, 2)) return;
         const timer = setTimeout(() => {
             incrementRetry(watchdogRef, threadId);
@@ -326,6 +353,18 @@ export function ThreadView() {
     }, [threadId, eventsLoaded, exchanges.length, eventCount]);
 
     useAutoScroll(areaRef, [eventCount, streamingBuffer, pendingCount], true);
+
+    // Restoring sets scrolledUp so useAutoScroll defers to the saved offset
+    // rather than snapping to bottom on the next render.
+    useScrollMemory(
+        areaRef,
+        savedScrollKey,
+        {
+            paused: !eventsLoaded,
+            shouldSave: () => scrolledUp.value,
+            onRestored: () => { scrolledUp.value = true; },
+        },
+    );
 
     // Re-scroll after render: addPendingMessage's scrollToBottom() can race with
     // ResizeObserver re-setting scrolledUp before Preact commits the DOM update.
@@ -360,7 +399,7 @@ export function ThreadView() {
         );
     }
 
-    const threadTitle = eventThread.meta.title || '';
+    const threadTitle = threadDisplayTitle(eventThread);
     const visualStatus = resolveVisualStatus(
       effectiveThreadStatus(eventThread),
       eventThread.meta.activeChildrenCount > 0,
@@ -369,58 +408,32 @@ export function ThreadView() {
     return (
         <div class="thread-view">
             <div class="thread-view-header">
-                <PinButton threadId={threadId} pinned={eventThread.meta.pinned} />
-                <ThreadTitleEditor threadId={threadId} title={threadTitle} />
                 <ThreadStatusIcon status={visualStatus} />
+                <ThreadTitleEditor threadId={threadId} title={threadTitle} />
+                <span class="thread-view-header-actions">
+                    <CopyThreadRefButton threadId={threadId} title={threadTitle} />
+                    <ExportThreadButton threadId={threadId} title={threadTitle} />
+                </span>
             </div>
             <div class="thread-content-wrap">
                 <div class="thread-content visible" ref={areaRef}>
                     <MobileThreadTitleBar />
 
                     {exchanges.length === 0 ? (
-                        <ThreadEmptyState reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, eventCount, threadId!)} />
+                        <ThreadEmptyState reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!)} />
                     ) : (
-                        exchanges.reduce<{ nodes: VNode[]; imgOffset: number; lastModel?: string; lastEffort?: string }>((acc, ex, i) => {
-                            const isLast = i === exchanges.length - 1;
-                            const priorActive = i > 0 && isStatusActive(getExchangeStatus(exchanges[i - 1], '', true));
-                            acc.nodes.push(
-                                <ChatExchange
-                                    key={'ex-' + ex.userSeq}
-                                    exchange={ex}
-                                    streamingBuffer={isLast ? streamingBuffer : ''}
-                                    isLast={isLast}
-                                    threadId={threadId!}
-                                    hasPriorActive={priorActive}
-                                    imageOffset={acc.imgOffset}
-                                    priorModel={acc.lastModel}
-                                    priorEffort={acc.lastEffort}
-                                />
-                            );
-                            acc.imgOffset += exchangeImageCount(ex);
-                            acc.lastModel = exchangeResponseModel(ex) ?? acc.lastModel;
-                            acc.lastEffort = exchangeReasoningEffort(ex) ?? acc.lastEffort;
-                            return acc;
-                        }, { nodes: [], imgOffset: 0 }).nodes
+                        renderExchanges(exchanges, threadId!, streamingBuffer)
                     )}
                 </div>
-                <button
-                    class={`scroll-to-top${isNotAtTop ? ' visible' : ''}`}
-                    onClick={() => {
-                        const el = areaRef.current;
-                        if (el) el.scrollTo({ top: 0, behavior: 'smooth' });
-                    }}
-                >
-                    <ChevronUpIcon />
-                </button>
-                <button
-                    class={`scroll-to-bottom${isUp ? ' visible' : ''}`}
-                    onClick={() => {
+                <ScrollControls
+                    showUp={isNotAtTop}
+                    showDown={isUp}
+                    onScrollUp={() => areaRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
+                    onScrollDown={() => {
                         const el = areaRef.current;
                         if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
                     }}
-                >
-                    <ChevronDownIcon />
-                </button>
+                />
             </div>
         </div>
     );

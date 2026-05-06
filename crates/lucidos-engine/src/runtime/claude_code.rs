@@ -172,10 +172,16 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let id = val
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let status = if is_error { "error" } else { "success" };
             vec![AgentEvent::ToolResult {
                 output: content,
                 status: status.to_string(),
+                id,
             }]
         }
         // CC 2.1.76+ sends tool results as "type": "user" with tool_result content blocks
@@ -197,10 +203,16 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                             .get("is_error")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
+                        let id = block
+                            .get("tool_use_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         let status = if is_error { "error" } else { "success" };
                         events.push(AgentEvent::ToolResult {
                             output,
                             status: status.to_string(),
+                            id,
                         });
                     }
                 }
@@ -214,9 +226,37 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 .unwrap_or("")
                 .to_string();
             let duration = val.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            let is_error = val
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let error = if is_error {
+                let joined = val
+                    .get("errors")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .filter(|s| !s.is_empty());
+                // Fall back to the subtype label (e.g. "error_max_turns") when
+                // CC omits `errors` so ResponseFailed still has a non-empty
+                // user-facing reason string.
+                Some(joined.unwrap_or_else(|| {
+                    val.get("subtype")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error")
+                        .to_string()
+                }))
+            } else {
+                None
+            };
             vec![AgentEvent::Result {
                 text,
                 duration_ms: duration,
+                error,
             }]
         }
         // CC 2.1.76+ sends streaming deltas as "type": "stream_event" wrappers.
@@ -683,7 +723,7 @@ async fn driver_task(
 
     let stderr_tail = drain_stderr(&mut stderr_reader).await;
     if !stderr_tail.is_empty() {
-        log!("Claude Code stderr: {}", stderr_tail.trim());
+        log!("[ClaudeCode] Claude Code stderr: {}", stderr_tail.trim());
     }
     let _ = events_tx.send(AgentEvent::Exited);
     // events_tx drops here — channel closes, consumer sees None.

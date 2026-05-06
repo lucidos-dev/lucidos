@@ -28,10 +28,6 @@ struct Step {
     #[serde(default)]
     expect_error: Option<String>,
     #[serde(default)]
-    assert_no_side_effect: Option<String>,
-    #[serde(default)]
-    assert_side_effect: Option<String>,
-    #[serde(default)]
     set_pending_changes: Option<bool>,
 }
 
@@ -78,7 +74,7 @@ fn all_scenarios_pass() {
         }
         let thread_type = parse_thread_type(&scenario.thread_type);
         let is_top_level = scenario.is_top_level.unwrap_or(true);
-        let mut current_section = StoredSection::Default;
+        let mut current_section = ArchiveState::Archived;
         let mut has_pending_changes = false;
 
         for (i, step) in scenario.steps.iter().enumerate() {
@@ -125,43 +121,13 @@ fn all_scenarios_pass() {
                 }
             }
 
-            if let Some(forbidden) = &step.assert_no_side_effect {
-                let has = result.side_effects.iter().any(|se| {
-                    matches!(
-                        (se, forbidden.as_str()),
-                        (SideEffect::EmitThreadMarkedUnread, "ThreadMarkedUnread")
-                            | (SideEffect::EmitThreadMarkedRead, "ThreadMarkedRead")
-                    )
-                });
-                assert!(
-                    !has,
-                    "Scenario '{}' step {} ({}): forbidden side-effect '{}'",
-                    scenario.name, i, step.emit, forbidden
-                );
-            }
-
-            if let Some(required) = &step.assert_side_effect {
-                let has = result.side_effects.iter().any(|se| {
-                    matches!(
-                        (se, required.as_str()),
-                        (SideEffect::EmitThreadMarkedUnread, "ThreadMarkedUnread")
-                            | (SideEffect::EmitThreadMarkedRead, "ThreadMarkedRead")
-                    )
-                });
-                assert!(
-                    has,
-                    "Scenario '{}' step {} ({}): expected side-effect '{}' not found",
-                    scenario.name, i, step.emit, required
-                );
-            }
-
             if let Some(ea) = step
                 .expected
                 .as_ref()
                 .and_then(|e| e.expected_actions.as_ref())
             {
                 // Derive a reasonable status from thread state
-                let status = if current_section == StoredSection::Unread {
+                let status = if current_section == ArchiveState::Inbox {
                     match thread_type {
                         ThreadType::CodingAgent => ThreadStatus::Waiting,
                         ThreadType::Chat => ThreadStatus::Idle,
@@ -174,7 +140,7 @@ fn all_scenarios_pass() {
                 let action_strs: Vec<String> = actions
                     .iter()
                     .map(|a| match a {
-                        Action::Done => "done".to_string(),
+                        Action::Archive => "archive".to_string(),
                         Action::Apply => "apply".to_string(),
                         Action::Discard => "discard".to_string(),
                     })
@@ -195,7 +161,7 @@ fn all_invariants_hold() {
     for scenario in &file.scenarios {
         if let Some(inv) = &scenario.assert_invariant {
             let tt = parse_thread_type(&inv.thread_type);
-            let forbidden = StoredSection::parse(&inv.forbidden_section);
+            let forbidden = ArchiveState::parse(&inv.forbidden_section);
             // "waiting" no longer exists as a section — parse maps it to Default.
             // Only check invariants for sections that still exist.
             if inv.forbidden_section == "waiting" {

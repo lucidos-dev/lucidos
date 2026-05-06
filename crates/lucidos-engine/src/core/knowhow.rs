@@ -2,7 +2,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::core::system_knowhow::SystemKnowhowStore;
 use crate::memory::{cosine_similarity, EmbeddingProvider};
+
+/// Prefix that routes a knowhow ID to engine-shipped reference knowhow at
+/// `<repo>/system-knowhow/`. IDs without this prefix come from the
+/// workspace-local or shared user-curated knowhow dirs.
+pub const SYSTEM_KNOWHOW_PREFIX: &str = "system-knowhow/";
 
 /// Bundles the user-curated knowhow search directories.
 /// Priority (highest wins): local > shared.
@@ -279,15 +285,35 @@ impl KnowhowStore {
     }
 }
 
-/// Load referenced know-how from shared and local directories, with local taking priority.
-/// Returns formatted sections for LLM context, or empty string if none found.
-pub fn load_knowhow_sections_merged(dirs: &KnowhowDirs, ids: &[String]) -> String {
+/// Load referenced know-how for LLM context.
+///
+/// IDs prefixed with `system-knowhow/` resolve against the engine-shipped
+/// reference dir (`<repo>/system-knowhow/`) and are tagged `[SYSTEM-KNOWHOW: ...]`.
+/// Bare IDs resolve via shared+local user knowhow with local taking priority and
+/// are tagged `[KNOW-HOW: ...]`. Returns formatted sections joined for prompt
+/// injection, or empty string if nothing matched.
+pub fn load_knowhow_sections_merged(
+    dirs: &KnowhowDirs,
+    system_dir: Option<&Path>,
+    ids: &[String],
+) -> String {
     if ids.is_empty() {
         return String::new();
     }
     let mut sections = Vec::new();
     for id in ids {
-        if let Some(kh) = KnowhowStore::load_with_fallback(dirs, id) {
+        if let Some(sys_id) = id.strip_prefix(SYSTEM_KNOWHOW_PREFIX) {
+            let Some(dir) = system_dir else {
+                log!(
+                    "[Knowhow] system-knowhow id '{}' requested but system_knowhow_dir is unavailable",
+                    id
+                );
+                continue;
+            };
+            if let Some(kh) = SystemKnowhowStore::load(dir, sys_id) {
+                sections.push(SystemKnowhowStore::format_section(&kh));
+            }
+        } else if let Some(kh) = KnowhowStore::load_with_fallback(dirs, id) {
             sections.push(kh.format_section());
         }
     }
@@ -836,7 +862,7 @@ mod tests {
         );
 
         let ids = vec!["shared-ref".to_string(), "local-ref".to_string()];
-        let sections = load_knowhow_sections_merged(&dirs(Some(&shared), &local), &ids);
+        let sections = load_knowhow_sections_merged(&dirs(Some(&shared), &local), None, &ids);
         assert!(
             sections.contains("Shared Ref"),
             "should include shared knowhow"
@@ -861,7 +887,7 @@ mod tests {
         write_knowhow_file(&local.join("overlap.md"), "Local Version", "Local content.");
 
         let ids = vec!["overlap".to_string()];
-        let sections = load_knowhow_sections_merged(&dirs(Some(&shared), &local), &ids);
+        let sections = load_knowhow_sections_merged(&dirs(Some(&shared), &local), None, &ids);
         assert!(
             sections.contains("Local Version"),
             "local should win over shared"
@@ -870,5 +896,58 @@ mod tests {
             !sections.contains("Shared Version"),
             "shared should not appear when local exists"
         );
+    }
+
+    #[test]
+    fn load_knowhow_sections_merged_loads_system_knowhow_with_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let system = tmp.path().join("system");
+
+        write_knowhow_file(
+            &system.join("best-practices.md"),
+            "Best Practices",
+            "System body content.",
+        );
+
+        let ids = vec!["system-knowhow/best-practices".to_string()];
+        let sections =
+            load_knowhow_sections_merged(&dirs(None, &local), Some(&system), &ids);
+        assert!(
+            sections.contains("[SYSTEM-KNOWHOW: Best Practices]"),
+            "should tag with SYSTEM-KNOWHOW, got: {}",
+            sections
+        );
+        assert!(sections.contains("System body content."));
+    }
+
+    #[test]
+    fn load_knowhow_sections_merged_mixes_system_and_user_knowhow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        let system = tmp.path().join("system");
+
+        write_knowhow_file(&local.join("user-doc.md"), "User Doc", "User body.");
+        write_knowhow_file(&system.join("sys-doc.md"), "Sys Doc", "Sys body.");
+
+        let ids = vec![
+            "system-knowhow/sys-doc".to_string(),
+            "user-doc".to_string(),
+        ];
+        let sections = load_knowhow_sections_merged(&dirs(None, &local), Some(&system), &ids);
+        assert!(sections.contains("[SYSTEM-KNOWHOW: Sys Doc]"));
+        assert!(sections.contains("[KNOW-HOW: User Doc]"));
+    }
+
+    #[test]
+    fn load_knowhow_sections_merged_handles_missing_system_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+
+        let ids = vec!["system-knowhow/anything".to_string()];
+        let sections = load_knowhow_sections_merged(&dirs(None, &local), None, &ids);
+        assert_eq!(sections, "", "missing system_dir should drop system ids silently");
     }
 }

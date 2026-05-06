@@ -4,13 +4,12 @@
 //! ## Workspace resolution
 //!
 //! Subcommands need to know which workspace they belong to. Order:
-//!   1. Walk up from `$PWD` looking for the first `.lucidos/ports` file.
-//!      That ancestor directory is the parent workspace.
-//!   2. Fall back to `$LUCIDOS_WORKSPACE` env var (engine sets this on the
-//!      spawned subprocess).
+//!   1. `$LUCIDOS_WORKSPACE` env var (engine sets this on every spawned
+//!      subprocess and it is authoritative).
+//!   2. Walk up from `$PWD` looking for the first `.lucidos/ports` file —
+//!      fallback for terminal users who run the CLI without the env var.
 //!
-//! The walk naturally skips `<parent>/.lucidos/worktrees/<id>/` because that
-//! directory does not itself contain a `.lucidos/ports` file.
+//! See `workspace::resolve` for why the order matters.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -18,12 +17,14 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod ask_user_question_hook;
+mod cc_stop_reminder;
 mod data;
 mod data_store;
 mod events;
 mod hardened;
 mod http;
 mod mcp_permission_server;
+mod proxy;
 mod send_thread;
 mod workspace;
 
@@ -35,8 +36,8 @@ use workspace::resolve_from_env;
     name = "lucidos",
     version,
     about = "Talk back to the parent Lucidos workspace from a Claude Code subprocess.",
-    long_about = "Resolves the parent workspace by walking up from $PWD for the first \
-                  .lucidos/ports file, falling back to $LUCIDOS_WORKSPACE."
+    long_about = "Resolves the parent workspace from $LUCIDOS_WORKSPACE if set, \
+                  else walks up from $PWD for the first .lucidos/ports file."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -80,12 +81,50 @@ enum Command {
     /// updatedInput JSON to stdout. Hidden; not for direct invocation.
     #[command(name = "ask-user-question-hook", hide = true)]
     AskUserQuestionHook,
+    /// Stop hook subcommand invoked by Claude Code via .lucidos/cc-settings.json
+    /// when CC tries to idle. If the branch has commits but no harden marker,
+    /// prints a permissive reminder JSON so CC nudges the model to run /harden.
+    /// Hidden; not for direct invocation.
+    #[command(name = "cc-stop-reminder", hide = true)]
+    CcStopReminder,
     /// POST a new chat or Claude Code thread to another (or this same) Lucidos
     /// workspace. Defaults caller_* fields from $LUCIDOS_WORKSPACE,
     /// $LUCIDOS_THREAD_ID, $LUCIDOS_EVENT_ID. With `--parent`, emits
     /// parent_thread_id/spawning_event_id instead (same-workspace callback).
     #[command(name = "send-thread")]
     SendThread(SendThreadArgs),
+    /// Call a backend configured in `data/config/apis.json` through the
+    /// engine's proxy (engine injects the configured auth header). Body to
+    /// stdout; exit 0 by default even on 4xx/5xx. Use `--fail` to mirror
+    /// `curl --fail`, `--include` to mirror `curl -i`.
+    Proxy(ProxyCliArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ProxyCliArgs {
+    /// Name of the proxy entry in `data/config/apis.json`.
+    pub(crate) name: String,
+    /// Request path (e.g. `/Spisestua/play`). Empty / missing = root.
+    #[arg(default_value = "")]
+    pub(crate) path: String,
+    /// HTTP method (GET, POST, PUT, DELETE, PATCH, …).
+    #[arg(short = 'X', long = "request", default_value = "GET")]
+    pub(crate) method: String,
+    /// Repeated header (e.g. `-H "Content-Type: application/json"`).
+    #[arg(short = 'H', long = "header", value_name = "HEADER")]
+    pub(crate) headers: Vec<String>,
+    /// Request body (inline string).
+    #[arg(short = 'd', long = "data", value_name = "BODY")]
+    pub(crate) data: Option<String>,
+    /// Read request body from stdin.
+    #[arg(long = "data-stdin", conflicts_with = "data")]
+    pub(crate) data_stdin: bool,
+    /// Prepend status line + response headers to stdout (`curl -i`).
+    #[arg(short = 'i', long = "include")]
+    pub(crate) include: bool,
+    /// Exit non-zero on HTTP 4xx/5xx and suppress the body (`curl --fail`).
+    #[arg(long = "fail")]
+    pub(crate) fail: bool,
 }
 
 /// Wire-format actor mode accepted by `--mode`. Typed enum so clap rejects
@@ -222,6 +261,15 @@ enum EventsCmd {
         /// ISO 8601 upper bound (exclusive).
         #[arg(long)]
         until: Option<String>,
+        /// Page backward: return only events strictly older than this event id
+        /// under (created, id) lexicographic ordering. Mutually exclusive with
+        /// --after-event-id.
+        #[arg(long, value_name = "UUID", conflicts_with = "after_event_id")]
+        before_event_id: Option<String>,
+        /// Tail-follow: return only events strictly newer than this event id.
+        /// Mutually exclusive with --before-event-id.
+        #[arg(long, value_name = "UUID")]
+        after_event_id: Option<String>,
         /// Max events to return (server clamps to 1..=1000).
         #[arg(long)]
         limit: Option<u32>,
@@ -231,7 +279,7 @@ enum EventsCmd {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("lucidos: {}", e);
             ExitCode::from(1)
@@ -239,23 +287,27 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), workspace::BoxError> {
+fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
     match cli.command {
         Command::Data { action } => {
             let ws = resolve_from_env()?;
             match action {
-                DataCmd::Path { relative, mkdir } => data::cmd_path(&ws, &relative, mkdir),
+                DataCmd::Path { relative, mkdir } => data::cmd_path(&ws, &relative, mkdir)?,
                 DataCmd::Write(args) => {
                     let source = match args.from.as_deref() {
                         None | Some("-") => WriteSource::Stdin,
                         Some(p) => WriteSource::File(PathBuf::from(p)),
                     };
-                    data::cmd_write(&ws, &args.relative, source)
+                    data::cmd_write(&ws, &args.relative, source)?;
                 }
             }
+            Ok(0)
         }
         Command::DataStore { action } => match action {
-            DataStoreCmd::Add { name, source_dir } => data_store::cmd_add(&name, &source_dir),
+            DataStoreCmd::Add { name, source_dir } => {
+                data_store::cmd_add(&name, &source_dir)?;
+                Ok(0)
+            }
         },
         Command::Events { action } => {
             let ws = resolve_from_env()?;
@@ -264,30 +316,73 @@ fn run(cli: Cli) -> Result<(), workspace::BoxError> {
                     event_type,
                     payload,
                     summary,
-                } => events::cmd_emit(&ws, &event_type, &payload, summary.as_deref()),
+                } => events::cmd_emit(&ws, &event_type, &payload, summary.as_deref())?,
                 EventsCmd::Query {
                     event_type,
                     since,
                     until,
+                    before_event_id,
+                    after_event_id,
                     limit,
                 } => events::cmd_query(
                     &ws,
-                    event_type.as_deref(),
-                    since.as_deref(),
-                    until.as_deref(),
-                    limit,
-                ),
+                    events::QueryFilters {
+                        event_type: event_type.as_deref(),
+                        since: since.as_deref(),
+                        until: until.as_deref(),
+                        before_event_id: before_event_id.as_deref(),
+                        after_event_id: after_event_id.as_deref(),
+                        limit,
+                    },
+                )?,
             }
+            Ok(0)
         }
         Command::Hardened { action } => {
             let ws = resolve_from_env()?;
             match action {
-                HardenedCmd::Mark => hardened::cmd_mark(&ws),
-                HardenedCmd::Query => hardened::cmd_query(&ws),
+                HardenedCmd::Mark => hardened::cmd_mark(&ws)?,
+                HardenedCmd::Query => hardened::cmd_query(&ws)?,
             }
+            Ok(0)
         }
-        Command::McpPermissionServer => mcp_permission_server::run(),
-        Command::AskUserQuestionHook => ask_user_question_hook::run(),
-        Command::SendThread(args) => send_thread::run(args),
+        Command::McpPermissionServer => {
+            mcp_permission_server::run()?;
+            Ok(0)
+        }
+        Command::AskUserQuestionHook => {
+            ask_user_question_hook::run()?;
+            Ok(0)
+        }
+        Command::CcStopReminder => {
+            cc_stop_reminder::run()?;
+            Ok(0)
+        }
+        Command::SendThread(args) => {
+            send_thread::run(args)?;
+            Ok(0)
+        }
+        Command::Proxy(args) => {
+            let ws = resolve_from_env()?;
+            let body = if args.data_stdin {
+                proxy::BodySource::Stdin
+            } else if let Some(d) = args.data {
+                proxy::BodySource::Inline(d)
+            } else {
+                proxy::BodySource::None
+            };
+            proxy::run(
+                &ws,
+                proxy::ProxyArgs {
+                    name: args.name,
+                    path: args.path,
+                    method: args.method,
+                    headers: args.headers,
+                    body,
+                    include: args.include,
+                    fail: args.fail,
+                },
+            )
+        }
     }
 }

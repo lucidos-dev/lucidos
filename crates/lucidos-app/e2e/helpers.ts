@@ -8,6 +8,13 @@ const WORKSPACE = resolve(process.env.E2E_WORKSPACE ?? `${process.env.HOME}/work
  *  Centralized so a UI rename only requires changing this one constant. */
 export const USER_MSG_SELECTOR = '.initiator-panel-user .initiator-body';
 
+/** Drawer rows for compose drafts share the `.thread-row` class and a
+ *  `data-thread-nav` attr with real thread rows. Tests that want a real
+ *  thread (e.g. to click and load messages) must filter drafts out — the
+ *  draft variants additionally carry `compose-draft-row` / `data-draft-id`. */
+export const REAL_THREAD_ROW = '.thread-row:not(.compose-draft-row)';
+export const REAL_THREAD_NAV = '[data-thread-nav]:not([data-draft-id])';
+
 /** Locator for the first physically visible user-message body (dual-layout safe). */
 export function userMessageBody(page: Page): Locator {
   return page.locator(`${USER_MSG_SELECTOR}:visible`).first();
@@ -376,17 +383,12 @@ export async function countVisibleThreadRows(page: Page): Promise<number> {
   });
 }
 
-/** Wait for stop button, click it, wait for Canceled status */
+/** Wait for the prompt-area Cancel button, click it, wait for Canceled status.
+ *  Works for both chat and Claude Code threads (single hard-cancel path). */
 export async function cancelStreamingResponse(page: Page): Promise<void> {
-  await page.waitForFunction(() => {
-    const btns = document.querySelectorAll('.exchange-stop-btn');
-    return Array.from(btns).some(el => {
-      const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    });
-  }, undefined, { timeout: 30_000 });
-
-  await clickVisibleElement(page, '.exchange-stop-btn');
+  // :not(:disabled) excludes the post-click 'Cancel...' state — substring
+  // match on 'Cancel' would otherwise also target it (and silently no-op).
+  await waitAndClick(page, '.thread-action-buttons button.action-btn-danger:not(:disabled)', 'Cancel', 30_000);
 
   await page.waitForFunction(() => {
     const labels = document.querySelectorAll('.exchange-status-label');
@@ -395,51 +397,7 @@ export async function cancelStreamingResponse(page: Page): Promise<void> {
       if (rect.width === 0 || rect.height === 0) return false;
       return (el.textContent ?? '').includes('Canceled');
     });
-  }, undefined, { timeout: 15_000 });
-}
-
-/** Wait for stop button, click it (no confirm dialog for CC), wait for status change.
- *  Falls back to full cancel if interrupt doesn't take effect within 15s. */
-export async function cancelCCResponse(page: Page): Promise<void> {
-  await page.waitForFunction(() => {
-    const btns = document.querySelectorAll('.exchange-stop-btn');
-    return Array.from(btns).some(el => {
-      const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    });
   }, undefined, { timeout: 30_000 });
-
-  await clickVisibleElement(page, '.exchange-stop-btn');
-
-  // Wait up to 15s for interrupt to take effect
-  const interruptWorked = await page.waitForFunction(() => {
-    const labels = document.querySelectorAll('.exchange-status-label');
-    const hasWorking = Array.from(labels).some(el => {
-      const rect = el.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return false;
-      const text = el.textContent ?? '';
-      return text.includes('Working') || text.includes('Requesting');
-    });
-    return !hasWorking;
-  }, undefined, { timeout: 15_000 }).then(() => true).catch(() => false);
-
-  if (!interruptWorked) {
-    // CC didn't respond to interrupt (may be stuck in a tool call).
-    // Escalate: hit the cancel endpoint to kill the CC process.
-    await page.request.post('/api/claude-code/cancel?discard=true').catch(() => {});
-
-    // Wait for status to clear after cancel
-    await page.waitForFunction(() => {
-      const labels = document.querySelectorAll('.exchange-status-label');
-      const hasWorking = Array.from(labels).some(el => {
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) return false;
-        const text = el.textContent ?? '';
-        return text.includes('Working') || text.includes('Requesting');
-      });
-      return !hasWorking;
-    }, undefined, { timeout: 30_000 });
-  }
 }
 
 /** Navigate to the Files panel — handles mobile pane navigation */
@@ -476,7 +434,7 @@ export async function openFilesPanel(page: Page): Promise<void> {
 export async function dismissCCSession(page: Page): Promise<void> {
   try {
     await ensureOnThreadPane(page);
-    await clickVisibleElement(page, '.thread-action-buttons button.action-btn', 'Done');
+    await clickVisibleElement(page, '.thread-action-buttons button.action-btn', 'Archive');
   } catch {
     // CC session may have already ended — not an error
   }

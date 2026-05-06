@@ -274,9 +274,8 @@ impl AppManager {
                 continue;
             }
             let file_path = app_dir.join(&name);
-            if let Ok(content) = std::fs::read_to_string(&file_path) {
-                result.push((name, content));
-            }
+            let content = std::fs::read_to_string(&file_path)?;
+            result.push((name, content));
         }
         result.sort_by(|a, b| {
             if a.0 == "index.html" {

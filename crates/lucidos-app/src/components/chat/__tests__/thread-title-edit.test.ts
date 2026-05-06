@@ -35,6 +35,21 @@ describe('ThreadTitleEditor — dual-element split', () => {
     }
   });
 
+  it('autoresize is gated on !editing (display:none scrollHeight=0 collapses height to ~2px)', () => {
+    // The display textarea has display:none while editing. Calling
+    // autoResizeTextarea on a display:none element pins style.height to the
+    // border-only height (~2px), and the next render reuses that value once
+    // the editor closes — title appears to disappear after a mobile rename.
+    // The race fires when SSE delivers ThreadTitleRenamed before the rename
+    // HTTP response resolves.
+    const effect = source.match(
+      /useEffect\(\(\)\s*=>\s*\{[\s\S]*?autoResizeTextarea\(displayRef\.current\)[\s\S]*?\},\s*\[([^\]]*)\]\)/,
+    );
+    expect(effect, 'autoResizeTextarea must run inside a guarded useEffect').not.toBeNull();
+    expect(effect![0]).toMatch(/if\s*\(\s*!\s*editing\s*\)/);
+    expect(effect![1]).toContain('editing');
+  });
+
   it('uses .select() for the input', () => {
     expect(source).toMatch(/inputRef\.current\??\.select\(\)/);
   });

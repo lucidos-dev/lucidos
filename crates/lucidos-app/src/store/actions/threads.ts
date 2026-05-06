@@ -1,28 +1,36 @@
-import { focusedThreadId, focusedDraftId, showToast, threadMap, dismissingThreadIds, applyingNowThreadIds, discardingCCThreadIds, getReviewThreads, revealOnFocus, resetCCPendingPreferences } from '../store';
+import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, getReviewThreads, revealOnFocus, resetCCPendingPreferences, setFocusedThread } from '../store';
 import { navigateToPane } from './pane';
 import { isMobile } from '../../utils/viewport';
 import { byReviewOrder } from '../thread-events';
-import { pinThread, unpinThread, dismissThread } from '../../api/threads';
-import { loadThreadEvents } from './thread-loading';
+import { saveThread, unsaveThread, archiveThread } from '../../api/threads';
+import { loadThreadEvents, ensureThreadByIdInMap } from './thread-loading';
 import { scrollToBottom } from '../../components/chat/scrollState';
 import { pushThreadNavState } from './thread-navigation';
-import { FOCUSED_THREAD_KEY } from '../../utils/draftStorage';
+import { hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
 import { errorDetail } from '../../utils/errorDetail';
 
-// Minimum time "Done..." is visible — long enough to register as feedback
-const DISMISS_MIN_MS = 250;
+// Minimum time the in-flight Archive feedback is visible — long enough to register
+const ARCHIVE_MIN_MS = 250;
 
 // ---------------------------------------------------------------------------
 // Thread CRUD
 // ---------------------------------------------------------------------------
 
-export function focusThread(threadId: string): void {
-  focusedThreadId.value = threadId;
-  localStorage.setItem(FOCUSED_THREAD_KEY, threadId);
+export interface FocusThreadOptions {
+  /** Skip mobile pane navigation. Used by history chevrons in the threads
+   *  list header so the user can preview prior threads without leaving the
+   *  list view. */
+  skipPaneNav?: boolean;
+}
+
+export function focusThread(threadId: string, options?: FocusThreadOptions): void {
+  setFocusedThread(threadId);
   resetCCPendingPreferences();
   // Scroll to bottom and suppress ResizeObserver so content rendering
-  // doesn't set scrolledUp=true before useAutoScroll can scroll down
-  scrollToBottom();
+  // doesn't set scrolledUp=true before useAutoScroll can scroll down.
+  // Skip when the target has a saved scroll — the 500ms pinning loop
+  // would override useScrollMemory's restore.
+  if (!hasSavedScroll(threadScrollKey(threadId))) scrollToBottom();
   // notAtTop is NOT reset here — syncNotAtTop() in the scroll listener owns
   // it exclusively. Manual resets cause the chevron to vanish when no scroll
   // event fires (e.g. re-focusing the same thread where scrollTop is unchanged).
@@ -35,26 +43,40 @@ export function focusThread(threadId: string): void {
   // On mobile, navigate to the thread pane so the focused thread is visible.
   // Without this, callers like toast onClick and search would set the focused
   // thread but leave the user on whichever pane they were on.
-  if (isMobile()) {
+  if (isMobile() && !options?.skipPaneNav) {
     navigateToPane('thread');
   }
 
-  // No auto-read — user must explicitly click Done, Apply, or Discard.
+  // No auto-read — user must explicitly click Archive, Apply, or Discard.
+}
+
+/** Focus a thread by id, fetching its metadata first if it's not already in
+ *  the loaded list (e.g. an old archived thread beyond the History per-source
+ *  window, or a thread reached via cross-workspace deep link). */
+export function focusThreadOrBootstrap(threadId: string): void {
+  if (threadMap.value.has(threadId)) {
+    focusThread(threadId);
+    return;
+  }
+  ensureThreadByIdInMap(threadId).then(found => {
+    if (found) focusThread(threadId);
+    else showToast('Thread not found', 'error');
+  }).catch(err => {
+    showToast(`Failed to open thread: ${errorDetail(err)}`, 'error');
+  });
 }
 
 export function unfocusThread(): void {
-  focusedThreadId.value = null;
+  setFocusedThread(null);
   revealOnFocus.value = false;
   resetCCPendingPreferences();
-  localStorage.removeItem(FOCUSED_THREAD_KEY);
-  pushThreadNavState({ type: 'draft', id: focusedDraftId.value });
 }
 
 // ---------------------------------------------------------------------------
-// Pin/unpin
+// Save/unsave
 // ---------------------------------------------------------------------------
 
-function updateThreadMeta(threadId: string, patch: Partial<{ pinned: boolean }>): void {
+function updateThreadMeta(threadId: string, patch: Partial<{ saved: boolean }>): void {
   const map = new Map(threadMap.value);
   const thread = map.get(threadId);
   if (thread) {
@@ -63,29 +85,29 @@ function updateThreadMeta(threadId: string, patch: Partial<{ pinned: boolean }>)
   }
 }
 
-async function togglePin(threadId: string, pinned: boolean): Promise<void> {
+async function toggleSave(threadId: string, saved: boolean): Promise<void> {
   const thread = threadMap.value.get(threadId);
-  if (!thread || thread.meta.pinned === pinned) return;
+  if (!thread || thread.meta.saved === saved) return;
 
-  updateThreadMeta(threadId, { pinned });
+  updateThreadMeta(threadId, { saved });
   try {
-    await (pinned ? pinThread : unpinThread)(threadId);
+    await (saved ? saveThread : unsaveThread)(threadId);
   } catch (e) {
-    updateThreadMeta(threadId, { pinned: !pinned });
-    showToast(`Failed to ${pinned ? 'pin' : 'unpin'} thread: ${errorDetail(e)}`, 'error');
+    updateThreadMeta(threadId, { saved: !saved });
+    showToast(`Failed to ${saved ? 'save' : 'unsave'} thread: ${errorDetail(e)}`, 'error');
   }
 }
 
-export function handlePinThread(threadId: string): Promise<void> {
-  return togglePin(threadId, true);
+export function handleSaveThread(threadId: string): Promise<void> {
+  return toggleSave(threadId, true);
 }
 
-export function handleUnpinThread(threadId: string): Promise<void> {
-  return togglePin(threadId, false);
+export function handleUnsaveThread(threadId: string): Promise<void> {
+  return toggleSave(threadId, false);
 }
 
 // ---------------------------------------------------------------------------
-// Dismiss (move waiting thread to history)
+// Archive (move waiting thread to history)
 // ---------------------------------------------------------------------------
 
 /** Find the next review thread below `excludeId` in the drawer sort order. */
@@ -99,29 +121,49 @@ function findNextReviewThread(excludeId: string): string | null {
   return null;
 }
 
-export async function handleDismissThread(threadId: string): Promise<void> {
-  if (dismissingThreadIds.value.has(threadId)) return;
-  if (discardingCCThreadIds.value.has(threadId)) return; // Can't dismiss while discarding
+export async function handleArchiveThread(threadId: string): Promise<void> {
+  if (archivingThreadIds.value.has(threadId)) return;
+  if (discardingCCThreadIds.value.has(threadId)) return; // Can't archive while discarding
+
+  // Archiving a saved thread is destructive of intent: it both unsaves (the
+  // user's "I'll manage this manually" gesture) and sends the thread to
+  // long-term storage. Confirm before doing both at once.
+  const thread = threadMap.value.get(threadId);
+  if (thread?.meta.saved) {
+    if (!await showConfirm(
+      'Remove this thread from the Saved section and archive it?',
+      'Archive',
+    )) {
+      return;
+    }
+    try {
+      await unsaveThread(threadId);
+    } catch (e) {
+      showToast(`Failed to unsave thread: ${errorDetail(e)}`, 'error');
+      return;
+    }
+  }
+
   // Pin to bottom and show header before banner re-renders
   scrollToBottom();
 
-  // Clear stale apply state — applying and dismissing are mutually exclusive.
-  // If the user is dismissing, any in-progress or stale apply is abandoned.
+  // Clear stale apply state — applying and archiving are mutually exclusive.
+  // If the user is archiving, any in-progress or stale apply is abandoned.
   if (applyingNowThreadIds.value.has(threadId)) {
     const next = new Map(applyingNowThreadIds.value);
     next.delete(threadId);
     applyingNowThreadIds.value = next;
   }
 
-  // Pre-compute the next review thread for post-dismiss navigation.
+  // Pre-compute the next review thread for post-archive navigation.
   const nextId = findNextReviewThread(threadId);
 
-  dismissingThreadIds.value = new Set([...dismissingThreadIds.value, threadId]);
+  archivingThreadIds.value = new Set([...archivingThreadIds.value, threadId]);
   try {
-    // Run API call alongside a minimum delay so "Done..." is visible
+    // Run API call alongside a minimum delay so "Archive..." is visible
     await Promise.all([
-      dismissThread(threadId),
-      new Promise(r => setTimeout(r, DISMISS_MIN_MS)),
+      archiveThread(threadId),
+      new Promise(r => setTimeout(r, ARCHIVE_MIN_MS)),
     ]);
 
     if (nextId) {
@@ -132,10 +174,10 @@ export async function handleDismissThread(threadId: string): Promise<void> {
       navigateToPane('thread');
     }
   } catch (e) {
-    showToast(`Failed to dismiss thread: ${errorDetail(e)}`, 'error');
+    showToast(`Failed to archive thread: ${errorDetail(e)}`, 'error');
   } finally {
-    const next = new Set(dismissingThreadIds.value);
+    const next = new Set(archivingThreadIds.value);
     next.delete(threadId);
-    dismissingThreadIds.value = next;
+    archivingThreadIds.value = next;
   }
 }

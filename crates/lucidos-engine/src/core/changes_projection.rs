@@ -1880,4 +1880,75 @@ mod tests {
 
         teardown_test_db(&db).await;
     }
+
+    /// External repo CC threads must not have rows in the changes table — the
+    /// runtime gates (`should_propose_change_at_idle`, the SessionEnded
+    /// cleanup path) all skip propose_change for external repos, and the
+    /// cleanup migration removes any rows that survived from before those
+    /// gates were added. This test pins the SQL pattern itself: run the same
+    /// DELETE the migration runs, and verify external-repo rows are removed
+    /// while internal-repo rows are preserved.
+    #[tokio::test]
+    async fn cleanup_sql_drops_external_repo_changes_keeps_internal() {
+        let (pool, db) = setup_test_db().await;
+
+        let internal_thread = Uuid::new_v4();
+        let external_thread = Uuid::new_v4();
+        let internal_change = Uuid::new_v4();
+        let external_change = Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO thread_summaries \
+                (thread_id, source, is_cc, created_at, last_activity, message_count, status, cc_is_external_repo) \
+             VALUES \
+                ($1, 'claude_code', TRUE, NOW(), NOW(), 0, 'idle', FALSE), \
+                ($2, 'claude_code', TRUE, NOW(), NOW(), 0, 'idle', TRUE)",
+        )
+        .bind(internal_thread)
+        .bind(external_thread)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (cid, tid, branch) in [
+            (internal_change, internal_thread, "claude-code/internal"),
+            (external_change, external_thread, "feature/UA-1764"),
+        ] {
+            sqlx::query(
+                "INSERT INTO changes \
+                    (id, request_id, thread_id, branch_name, repo_root, description, file_count, files, requires_restart, status, created_at) \
+                 VALUES ($1, $2, $3, $4, '/r', '', 0, '{}'::text[], FALSE, 'pending', NOW())",
+            )
+            .bind(cid)
+            .bind(Uuid::nil())
+            .bind(tid)
+            .bind(branch)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Mirrors the cleanup migration: keep both in sync if either changes.
+        sqlx::query(
+            "DELETE FROM changes WHERE thread_id IN \
+                (SELECT thread_id FROM thread_summaries WHERE cc_is_external_repo = true)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let remaining: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM changes ORDER BY branch_name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            remaining,
+            vec![internal_change],
+            "external-repo change must be deleted; internal-repo change must survive"
+        );
+
+        teardown_test_db(&db).await;
+    }
 }

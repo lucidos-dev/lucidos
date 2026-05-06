@@ -7,13 +7,54 @@ import {
   artifacts,
   mobileView,
   focusedThreadId,
+  threadMap,
 } from '../../store/store';
 import { scrolledUp, awayFromBottom, notAtTop, getResizeMode, extendSuppression, setActiveScrollElement, getActiveScrollElement, isElementVisible } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
-import { exchangeStatus as getExchangeStatus, exchangeImageCount, exchangeResponseModel, exchangeReasoningEffort } from '../../store/thread-events';
+import type { Exchange } from '../../store/thread-events';
+import { exchangeStatus as getExchangeStatus, exchangeImageCount, exchangeResponseModel, exchangeReasoningEffort, unresumedAbortIndex } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
+
+/** Threads imageOffset + last model/effort across exchanges so each child sees its predecessors' state. */
+export function renderExchanges(
+  exchanges: Exchange[],
+  threadId: string,
+  streamingBuffer: string,
+): VNode[] {
+  // Compute once which abort exchange (if any) gets the Continue button —
+  // the most recent ResponseAborted that has no later SessionRecovered.
+  const unresumedIdx = unresumedAbortIndex(exchanges);
+  const threadMeta = threadMap.value.get(threadId)?.meta;
+  const threadIsCC = threadMeta?.channel === 'claude_code';
+  const threadIdle = threadMeta?.status === 'idle';
+  return exchanges.reduce<{ nodes: VNode[]; imgOffset: number; lastModel?: string; lastEffort?: string }>((acc, ex, i) => {
+    const isLast = i === exchanges.length - 1;
+    // Pass isLast=false for the prior exchange (it's at i-1, never the last
+    // here): a mid-flight chat parent must read as 'streaming' so this
+    // exchange's gate flips to 'queued', not slip through to 'done'.
+    const priorActive = i > 0 && isStatusActive(getExchangeStatus(exchanges[i - 1], '', /* isLast */ false, /* hasPriorActive */ false, threadIsCC, threadIdle));
+    acc.nodes.push(
+      <ChatExchange
+        key={'ex-' + ex.userSeq}
+        exchange={ex}
+        streamingBuffer={isLast ? streamingBuffer : ''}
+        isLast={isLast}
+        threadId={threadId}
+        hasPriorActive={priorActive}
+        imageOffset={acc.imgOffset}
+        priorModel={acc.lastModel}
+        priorEffort={acc.lastEffort}
+        isUnresumedAbort={i === unresumedIdx}
+      />
+    );
+    acc.imgOffset += exchangeImageCount(ex);
+    acc.lastModel = exchangeResponseModel(ex) ?? acc.lastModel;
+    acc.lastEffort = exchangeReasoningEffort(ex) ?? acc.lastEffort;
+    return acc;
+  }, { nodes: [], imgOffset: 0 }).nodes;
+}
 
 // --- Scroll anchoring for toggle changes (More/Less, Show/Hide Steps) ---
 //
@@ -258,53 +299,41 @@ export function CreateThreadView() {
             {showWelcome ? (
               <WelcomeMessage />
             ) : (
-              exchanges.reduce<{ nodes: VNode[]; imgOffset: number; lastModel?: string; lastEffort?: string }>((acc, ex, i) => {
-                const isLast = i === exchanges.length - 1;
-                const priorActive = i > 0 && isStatusActive(getExchangeStatus(exchanges[i - 1], '', true));
-                acc.nodes.push(
-                  <ChatExchange
-                    key={'ex-' + ex.userSeq}
-                    exchange={ex}
-                    streamingBuffer={isLast ? streamingBuffer : ''}
-                    isLast={isLast}
-                    threadId={threadId}
-                    hasPriorActive={priorActive}
-                    imageOffset={acc.imgOffset}
-                    priorModel={acc.lastModel}
-                    priorEffort={acc.lastEffort}
-                  />
-                );
-                acc.imgOffset += exchangeImageCount(ex);
-                acc.lastModel = exchangeResponseModel(ex) ?? acc.lastModel;
-                acc.lastEffort = exchangeReasoningEffort(ex) ?? acc.lastEffort;
-                return acc;
-              }, { nodes: [], imgOffset: 0 }).nodes
+              renderExchanges(exchanges, threadId, streamingBuffer)
             )}
           </div>
           {!isEmpty && (
-            <>
-              <button
-                class={`scroll-to-top${isNotAtTop ? ' visible' : ''}`}
-                onClick={() => {
-                  const el = areaRef.current;
-                  if (el) el.scrollTo({ top: 0, behavior: 'smooth' });
-                }}
-              >
-                <ChevronUpIcon />
-              </button>
-              <button
-                class={`scroll-to-bottom${isUp ? ' visible' : ''}`}
-                onClick={() => {
-                  const el = areaRef.current;
-                  if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-                }}
-              >
-                <ChevronDownIcon />
-              </button>
-            </>
+            <ScrollControls
+              showUp={isNotAtTop}
+              showDown={isUp}
+              onScrollUp={() => areaRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
+              onScrollDown={() => {
+                const el = areaRef.current;
+                if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+              }}
+            />
           )}
         </>
       )}
     </div>
+  );
+}
+
+// Buttons stay mounted so the CSS `.visible` class can drive the fade transition.
+export function ScrollControls({ showUp, showDown, onScrollUp, onScrollDown }: {
+  showUp: boolean;
+  showDown: boolean;
+  onScrollUp: () => void;
+  onScrollDown: () => void;
+}) {
+  return (
+    <>
+      <button class={`scroll-to-top${showUp ? ' visible' : ''}`} onClick={onScrollUp}>
+        <ChevronUpIcon />
+      </button>
+      <button class={`scroll-to-bottom${showDown ? ' visible' : ''}`} onClick={onScrollDown}>
+        <ChevronDownIcon />
+      </button>
+    </>
   );
 }

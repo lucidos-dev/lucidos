@@ -142,6 +142,10 @@
     overflow-wrap: break-word;
     word-break: break-word;
     min-width: 0;
+    /* basis 0 + grow 1 — detail absorbs flex shrinkage first, so a short
+       description (e.g. "Memory searched") next to a long detail isn't
+       proportionally squeezed and ellipsized. */
+    flex: 1 1 0;
 }
 
 .inline-step .step-detail::before {

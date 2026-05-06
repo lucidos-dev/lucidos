@@ -13,35 +13,26 @@ pub enum ThreadType {
     CodingAgent,
 }
 
-impl ThreadType {
-    pub fn from_source(source: &str) -> Self {
-        match source {
-            "claude_code" => Self::CodingAgent,
-            _ => Self::Chat,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StoredSection {
-    Default,
-    Unread,
+pub enum ArchiveState {
+    Archived,
+    Inbox,
 }
 
-impl StoredSection {
+impl ArchiveState {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Default => "default",
-            Self::Unread => "unread",
+            Self::Archived => "archived",
+            Self::Inbox => "inbox",
         }
     }
 
     pub fn parse(s: &str) -> Self {
         match s {
-            "unread" => Self::Unread,
-            // "waiting" was removed — treat legacy DB values as default
-            _ => Self::Default,
+            "inbox" => Self::Inbox,
+            // Legacy values from before the rename also map to Archived.
+            _ => Self::Archived,
         }
     }
 }
@@ -49,11 +40,19 @@ impl StoredSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisplaySection {
-    Running,
-    Waiting,
+    /// Local work in progress OR waiting on active children. Combines what was
+    /// previously `Running` and `Waiting` — the user doesn't care whether the
+    /// thread is doing the work itself or waiting on a delegated child.
+    Active,
+    /// Saved threads stay here regardless of any other state. Highest-priority
+    /// route. The saved-section header carries a CTA badge so unaddressed
+    /// changes/questions/errors aren't lost.
+    Saved,
+    /// Anything that needs the user's attention to progress and isn't saved
+    /// or archived.
     Review,
-    Pinned,
-    History,
+    /// User-archived threads — long-term storage.
+    Archive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -100,7 +99,7 @@ pub enum EventClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
-    Done,
+    Archive,
     Apply,
     Discard,
 }
@@ -125,8 +124,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
     Some(match event_type {
         // Metadata
         "ThreadTitleGenerated" | "ThreadTitleRenamed" => EventClass::Metadata,
-        "ThreadPinned" | "ThreadUnpinned" => EventClass::Metadata,
-        "ThreadMarkedRead" | "ThreadMarkedUnread" => EventClass::Metadata,
+        "ThreadSaved" | "ThreadUnsaved" => EventClass::Metadata,
+        // Compose lifecycle — orthogonal to the section/status machinery.
+        "ThreadStarted" | "ThreadDiscarded" => EventClass::Metadata,
         // Start
         "MessageReceived" | "TriggerStarted" => EventClass::Start,
         "CodingAgentUserMessageSent" | "UserPromptInjected" => EventClass::Start,
@@ -144,8 +144,10 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "CodingAgentPromptSent" => EventClass::Activity,
         "CredentialRequested" | "McpConsentRequested" => EventClass::Activity,
         // Terminal
-        "ResponseGenerated" | "ResponseCanceled" | "ResponseAborted" => EventClass::Terminal,
-        "SessionEnded" | "ThreadDismissed" | "TriggerCompleted" => EventClass::Terminal,
+        "ResponseGenerated" | "ResponseCanceled" | "ResponseAborted" => {
+            EventClass::Terminal
+        }
+        "SessionEnded" | "ThreadArchived" | "TriggerCompleted" => EventClass::Terminal,
         "ChangeApplied" | "ChangeDiscarded" | "ChangeReverted" | "ChangeApplyFailed" => {
             EventClass::Terminal
         }
@@ -204,11 +206,11 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "MissingHardeningDetected",
         "ThreadTitleGenerated",
         "ThreadTitleRenamed",
-        "ThreadPinned",
-        "ThreadUnpinned",
-        "ThreadMarkedRead",
-        "ThreadMarkedUnread",
-        "ThreadDismissed",
+        "ThreadSaved",
+        "ThreadUnsaved",
+        "ThreadArchived",
+        "ThreadStarted",
+        "ThreadDiscarded",
         "TriggerStarted",
         "TriggerCompleted",
         "ChangeProposed",
@@ -234,10 +236,10 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
 
 // ── Legal Sections & Transitions ────────────────────────────────────
 
-pub const CHAT_LEGAL_SECTIONS: &[StoredSection] = &[StoredSection::Default, StoredSection::Unread];
-pub const CC_LEGAL_SECTIONS: &[StoredSection] = &[StoredSection::Default, StoredSection::Unread];
+pub const CHAT_LEGAL_SECTIONS: &[ArchiveState] = &[ArchiveState::Archived, ArchiveState::Inbox];
+pub const CC_LEGAL_SECTIONS: &[ArchiveState] = &[ArchiveState::Archived, ArchiveState::Inbox];
 
-pub fn is_section_legal(thread_type: ThreadType, section: StoredSection) -> bool {
+pub fn is_section_legal(thread_type: ThreadType, section: ArchiveState) -> bool {
     match thread_type {
         ThreadType::Chat => CHAT_LEGAL_SECTIONS.contains(&section),
         ThreadType::CodingAgent => CC_LEGAL_SECTIONS.contains(&section),
@@ -251,7 +253,7 @@ pub fn is_section_legal(thread_type: ThreadType, section: StoredSection) -> bool
 pub struct LifecycleViolation {
     pub event_type: String,
     pub thread_type: ThreadType,
-    pub current_section: StoredSection,
+    pub current_section: ArchiveState,
     pub reason: String,
 }
 
@@ -269,25 +271,21 @@ impl std::error::Error for LifecycleViolation {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionResult {
-    pub new_section: Option<StoredSection>,
-    pub side_effects: Vec<SideEffect>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SideEffect {
-    EmitThreadMarkedUnread,
-    EmitThreadMarkedRead,
+    pub new_section: Option<ArchiveState>,
 }
 
 pub fn resolve_transition(
     event_type: &str,
     thread_type: ThreadType,
-    current_section: StoredSection,
+    current_section: ArchiveState,
     is_top_level: bool,
 ) -> Result<TransitionResult, LifecycleViolation> {
-    let no_change = Ok(TransitionResult {
-        new_section: None,
-        side_effects: vec![],
+    let no_change = Ok(TransitionResult { new_section: None });
+    let to_inbox = Ok(TransitionResult {
+        new_section: Some(ArchiveState::Inbox),
+    });
+    let to_archived = Ok(TransitionResult {
+        new_section: Some(ArchiveState::Archived),
     });
     let violation = |reason: &str| {
         Err(LifecycleViolation {
@@ -299,39 +297,20 @@ pub fn resolve_transition(
     };
 
     let result = match event_type {
-        // ResponseGenerated marks chat threads as unread (top-level only)
+        // ResponseGenerated surfaces chat threads to inbox (top-level only)
         "ResponseGenerated" => match thread_type {
-            ThreadType::Chat => Ok(TransitionResult {
-                new_section: Some(StoredSection::Unread),
-                side_effects: vec![SideEffect::EmitThreadMarkedUnread],
-            }),
+            ThreadType::Chat => to_inbox,
             ThreadType::CodingAgent => no_change,
         },
-        // CodingAgentIdled marks CC threads as unread (top-level only)
+        // CodingAgentIdled surfaces CC threads to inbox (top-level only)
         "CodingAgentIdled" => match thread_type {
-            ThreadType::CodingAgent => Ok(TransitionResult {
-                new_section: Some(StoredSection::Unread),
-                side_effects: vec![SideEffect::EmitThreadMarkedUnread],
-            }),
+            ThreadType::CodingAgent => to_inbox,
             ThreadType::Chat => violation("CodingAgentIdled is CC-only"),
         },
-        // ChangeApplied/ChangeDiscarded: no transition — thread stays unread so Done button appears
+        // ChangeApplied/ChangeDiscarded: no transition — thread stays in inbox so Archive button appears
         "ChangeApplied" | "ChangeDiscarded" => no_change,
-        // ThreadMarkedRead always resets to default
-        "ThreadMarkedRead" => Ok(TransitionResult {
-            new_section: Some(StoredSection::Default),
-            side_effects: vec![],
-        }),
-        // ThreadMarkedUnread sets unread (top-level only, both thread types)
-        "ThreadMarkedUnread" => Ok(TransitionResult {
-            new_section: Some(StoredSection::Unread),
-            side_effects: vec![],
-        }),
-        // ThreadDismissed clears unread → default (both thread types)
-        "ThreadDismissed" => Ok(TransitionResult {
-            new_section: Some(StoredSection::Default),
-            side_effects: vec![],
-        }),
+        // ThreadArchived moves thread to archived (both thread types)
+        "ThreadArchived" => to_archived,
         // CC-only events illegal for Chat
         "SessionStarted"
         | "SessionRecovered"
@@ -347,32 +326,23 @@ pub fn resolve_transition(
             ThreadType::CodingAgent => no_change,
             ThreadType::Chat => violation("CC-specific event on Chat thread"),
         },
-        // ResponseAborted/ResponseFailed mark threads as unread — the user
-        // needs to know their request was interrupted (system kill / engine
-        // restart) or failed (model error / quota), so the thread surfaces in
-        // REVIEW with its error indicator instead of disappearing into HISTORY.
-        "ResponseAborted" | "ResponseFailed" => Ok(TransitionResult {
-            new_section: Some(StoredSection::Unread),
-            side_effects: vec![SideEffect::EmitThreadMarkedUnread],
-        }),
-        // ChangeProposed marks CC threads as unread — proposed changes require
+        // User-attended terminals surface the thread in REVIEW so the user can
+        // save or archive it. Without this, a cancel/abort on an already-
+        // archived thread leaves it actionless: `resolve_actions` returns []
+        // when stored_section != Inbox.
+        "ResponseAborted" | "ResponseFailed" | "ResponseCanceled" => to_inbox,
+        // ChangeProposed surfaces CC threads to inbox — proposed changes require
         // user action (apply/discard) and must surface in REVIEW. Without this,
         // CC sessions that finish without an intermediate CodingAgentIdled (or where
-        // the user already read the thread) would go straight to HISTORY.
+        // the thread is already archived) would go straight to HISTORY.
         "ChangeProposed" => match thread_type {
-            ThreadType::CodingAgent => Ok(TransitionResult {
-                new_section: Some(StoredSection::Unread),
-                side_effects: vec![SideEffect::EmitThreadMarkedUnread],
-            }),
+            ThreadType::CodingAgent => to_inbox,
             ThreadType::Chat => violation("ChangeProposed is CC-only"),
         },
         // UserQuestionAsked surfaces the thread in REVIEW so the user sees the
         // question card and the action buttons. CC-only.
         "UserQuestionAsked" => match thread_type {
-            ThreadType::CodingAgent => Ok(TransitionResult {
-                new_section: Some(StoredSection::Unread),
-                side_effects: vec![SideEffect::EmitThreadMarkedUnread],
-            }),
+            ThreadType::CodingAgent => to_inbox,
             ThreadType::Chat => violation("UserQuestionAsked is CC-only"),
         },
         // UserQuestionAnswered does not change section — CC will resume and the
@@ -384,10 +354,7 @@ pub fn resolve_transition(
         // CC permission request — surfaces the thread in REVIEW so the user
         // sees the PermissionCard. CC-only.
         "CodingAgentPermissionRequest" => match thread_type {
-            ThreadType::CodingAgent => Ok(TransitionResult {
-                new_section: Some(StoredSection::Unread),
-                side_effects: vec![SideEffect::EmitThreadMarkedUnread],
-            }),
+            ThreadType::CodingAgent => to_inbox,
             ThreadType::Chat => violation("CodingAgentPermissionRequest is CC-only"),
         },
         // CodingAgentPermissionResolved is a step inside the same exchange —
@@ -403,11 +370,10 @@ pub fn resolve_transition(
         | "MemorySearched"
         | "ToolCalled"
         | "ToolResult"
-        | "ResponseCanceled"
         | "ThreadTitleGenerated"
         | "ThreadTitleRenamed"
-        | "ThreadPinned"
-        | "ThreadUnpinned"
+        | "ThreadSaved"
+        | "ThreadUnsaved"
         | "TriggerStarted"
         | "TriggerCompleted"
         | "ChangeReverted"
@@ -419,6 +385,9 @@ pub fn resolve_transition(
         | "UserPromptInjected"
         | "CredentialRequested"
         | "McpConsentRequested"
+        // Compose lifecycle — orthogonal to section/status machinery.
+        | "ThreadStarted"
+        | "ThreadDiscarded"
         // WorktreeCleaned is a passive bookkeeping event emitted by the
         // background cleanup worker (Phase 10.2). It must NOT bump the thread
         // out of HISTORY or change status — that's the whole point of cleanup
@@ -427,17 +396,14 @@ pub fn resolve_transition(
         _ => violation("Unknown event type"),
     }?;
 
-    // Chat sub-threads never go to Unread — agentic loop children shouldn't
-    // surface in REVIEW. CC threads always go to Unread regardless of depth,
-    // because every CC session needs user action (Apply/Discard/Done).
+    // Chat sub-threads never go to Inbox — agentic loop children shouldn't
+    // surface in REVIEW. CC threads always go to Inbox regardless of depth,
+    // because every CC session needs user action (Apply/Discard/Archive).
     if !is_top_level
         && thread_type != ThreadType::CodingAgent
-        && result.new_section == Some(StoredSection::Unread)
+        && result.new_section == Some(ArchiveState::Inbox)
     {
-        return Ok(TransitionResult {
-            new_section: None,
-            side_effects: vec![],
-        });
+        return Ok(TransitionResult { new_section: None });
     }
 
     Ok(result)
@@ -445,33 +411,39 @@ pub fn resolve_transition(
 
 // ── Display Section Mapping ─────────────────────────────────────────
 
+/// Resolution order:
+///   1. is_saved                                        → Saved
+///   2. status == Running OR has_active_children        → Active
+///   3. has_pending_changes                             → Review
+///   4. archive_state == Archived                       → Archive
+///   5. otherwise                                       → Review
+///
+/// Saved is the strongest claim — saving is the user's "I'll manage this
+/// manually" gesture and overrides every other route. Pending changes
+/// outrank Archive so the user can never lose unresolved work behind the
+/// archive curtain: a thread the user archived while changes are still
+/// pending stays surfaced in Review until they explicitly Apply or
+/// Discard each one.
 pub fn display_section(
-    stored: StoredSection,
+    stored: ArchiveState,
     status: ThreadStatus,
-    is_pinned: bool,
+    is_saved: bool,
     has_active_children: bool,
+    has_pending_changes: bool,
 ) -> DisplaySection {
-    if status == ThreadStatus::Running {
-        return DisplaySection::Running;
+    if is_saved {
+        return DisplaySection::Saved;
     }
-    // CC paused on a user question — always surface in REVIEW so the question
-    // card is reachable, even if stored=default (e.g. legacy DB rows).
-    if status == ThreadStatus::WaitingForUserAnswer {
+    if status == ThreadStatus::Running || has_active_children {
+        return DisplaySection::Active;
+    }
+    if has_pending_changes {
         return DisplaySection::Review;
     }
-    if has_active_children {
-        return DisplaySection::Waiting;
+    if stored == ArchiveState::Archived {
+        return DisplaySection::Archive;
     }
-    match stored {
-        StoredSection::Unread => DisplaySection::Review,
-        StoredSection::Default => {
-            if is_pinned {
-                DisplaySection::Pinned
-            } else {
-                DisplaySection::History
-            }
-        }
-    }
+    DisplaySection::Review
 }
 
 /// Resolve which actions are available for a thread in its current state.
@@ -479,34 +451,28 @@ pub fn display_section(
 pub fn resolve_actions(
     thread_type: ThreadType,
     status: ThreadStatus,
-    stored_section: StoredSection,
+    stored_section: ArchiveState,
     has_pending_changes: bool,
 ) -> Vec<Action> {
-    // Only idle/waiting threads in Unread get actions
-    if stored_section != StoredSection::Unread {
+    // Mid-turn: nothing to dismiss; QuestionCard owns the input. Apply/Discard
+    // would commit incomplete work, so this branch must run BEFORE the
+    // pending-changes check below — even when archived + pending puts the
+    // thread in Review, mid-turn safety wins and the action bar stays empty.
+    // WaitingForUserAnswer is also mid-turn — the WaitingBanner renders a
+    // Cancel button (not an Action) for that state instead.
+    if status == ThreadStatus::Running || status == ThreadStatus::WaitingForUserAnswer {
         return vec![];
     }
-    // No bottom-bar actions while CC is mid-turn — there's nothing to dismiss yet.
-    if status == ThreadStatus::Running {
+    // Pending changes always win — display_section surfaces archived+pending
+    // in Review, so the action set must follow or the user sees dots with no
+    // buttons.
+    if has_pending_changes && thread_type == ThreadType::CodingAgent {
+        return vec![Action::Discard, Action::Apply];
+    }
+    if stored_section != ArchiveState::Inbox {
         return vec![];
     }
-    // While waiting for an answer the QuestionCard owns answer/free-text input,
-    // but the user must still be able to abandon the question and dismiss the
-    // thread. Show only Done — Apply/Discard would commit incomplete mid-turn work.
-    if status == ThreadStatus::WaitingForUserAnswer {
-        return vec![Action::Done];
-    }
-
-    match thread_type {
-        ThreadType::Chat => vec![Action::Done],
-        ThreadType::CodingAgent => {
-            if has_pending_changes {
-                vec![Action::Discard, Action::Apply]
-            } else {
-                vec![Action::Done]
-            }
-        }
-    }
+    vec![Action::Archive]
 }
 
 // ── TypeScript Codegen ──────────────────────────────────────────────
@@ -773,12 +739,71 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
-        // Dismiss → idle, clear CC flags
+        // Archive → idle, clear CC flags
         (
-            "ThreadDismissed",
+            "ThreadArchived",
             StatusTransition {
                 status: StatusRule::Set(ThreadStatus::Idle),
                 cc_flags: CcFlagRule::ClearAll,
+            },
+        ),
+        // Activity events: defense in depth against premature-Idled drift.
+        // `classify_result` always emits `CodingAgentIdled` after a CC Result,
+        // so any subsequent activity event (the model invokes a Skill tool
+        // that triggers another model turn, or back-to-back inputs CC merged
+        // into one Result haven't actually finished) must re-bump status to
+        // Running. This is a no-op on the common streaming path where status
+        // is already Running. Must list exactly the same events as the
+        // activity-event arm in `event_bus.rs::update_thread_projection`
+        // (`MemorySearched` is classified Activity but stays a projection
+        // no-op there, so it's also absent here).
+        (
+            "TextStreamed",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        (
+            "Thinking",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        (
+            "ToolCalled",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        (
+            "ToolResult",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        (
+            "CodingAgentTextStreamed",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        (
+            "CodingAgentToolCalled",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        (
+            "CodingAgentToolResult",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
             },
         ),
     ]

@@ -186,3 +186,109 @@ async fn verify_branch_ok_when_worktree_missing() {
     // Nothing to verify → no error (let downstream handle the missing dir).
     assert!(verify_branch(&missing, "main").await.is_ok());
 }
+
+#[tokio::test]
+async fn adopt_returns_none_when_no_last_sha() {
+    let (_tmp, repo) = make_repo().await;
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
+    assert!(
+        try_adopt_renegade_branch(&repo, None).await.is_none(),
+        "without a last-known SHA there's no ancestry check to make"
+    );
+}
+
+#[tokio::test]
+async fn adopt_returns_some_when_branch_descends_from_last_sha() {
+    let (_tmp, repo) = make_repo().await;
+    let initial = current_head(&repo).await;
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
+    tokio::fs::write(repo.join("b.txt"), "x").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "feature commit"], &repo).await;
+
+    let (new_branch, note) = try_adopt_renegade_branch(&repo, Some(&initial))
+        .await
+        .expect("feature contains the initial commit → safe to adopt");
+    assert_eq!(new_branch, "feature");
+    // Note mentions the new branch in two places (first to introduce the
+    // rename, then to confirm the new tracked branch). Lock both in so a
+    // regression that drops one substitution would be caught.
+    assert_eq!(
+        note.matches("'feature'").count(),
+        2,
+        "note must name the branch at both substitution sites: {}",
+        note
+    );
+    assert!(note.starts_with("[Note from engine"));
+    assert!(note.ends_with(']'));
+}
+
+#[tokio::test]
+async fn adopt_returns_none_when_branch_does_not_descend() {
+    let (_tmp, repo) = make_repo().await;
+    let initial = current_head(&repo).await;
+    // Move main forward; renegade branches off the OLD initial commit.
+    tokio::fs::write(repo.join("main_only.txt"), "main").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "main moves on"], &repo).await;
+    let main_after = current_head(&repo).await;
+
+    let _ = git_cmd(&["checkout", "-b", "renegade", &initial], &repo).await;
+    tokio::fs::write(repo.join("b.txt"), "f").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "renegade off old initial"], &repo).await;
+
+    assert!(
+        try_adopt_renegade_branch(&repo, Some(&main_after))
+            .await
+            .is_none(),
+        "renegade does not contain main_after → unsafe to adopt"
+    );
+}
+
+#[tokio::test]
+async fn is_ancestor_true_when_sha_reachable_from_ref() {
+    let (_tmp, repo) = make_repo().await;
+    let initial = current_head(&repo).await;
+    // Create a feature branch off main with one extra commit.
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
+    tokio::fs::write(repo.join("b.txt"), "more").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "feature commit"], &repo).await;
+
+    assert!(
+        is_ancestor(&repo, &initial, "feature").await,
+        "main's tip should be an ancestor of feature"
+    );
+}
+
+#[tokio::test]
+async fn is_ancestor_false_when_sha_unreachable_from_ref() {
+    let (_tmp, repo) = make_repo().await;
+    let initial = current_head(&repo).await;
+    // Move main forward; feature branches from the OLD initial commit.
+    tokio::fs::write(repo.join("main_only.txt"), "main").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "main moves on"], &repo).await;
+    let main_after = current_head(&repo).await;
+
+    // Branch the feature from the original initial commit, not main_after.
+    let _ = git_cmd(&["checkout", "-b", "feature", &initial], &repo).await;
+    tokio::fs::write(repo.join("b.txt"), "f").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "feature off old initial"], &repo).await;
+
+    assert!(
+        !is_ancestor(&repo, &main_after, "feature").await,
+        "main's newer commit is NOT reachable from feature"
+    );
+}
+
+#[tokio::test]
+async fn is_ancestor_false_for_unknown_sha() {
+    let (_tmp, repo) = make_repo().await;
+    assert!(
+        !is_ancestor(&repo, "0000000000000000000000000000000000000000", "main").await,
+        "unknown SHA must not be reported as ancestor"
+    );
+}

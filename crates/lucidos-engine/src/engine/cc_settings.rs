@@ -28,6 +28,12 @@ pub(crate) fn build_cc_settings_json() -> String {
                     "command": "lucidos ask-user-question-hook",
                     "timeout": HOOK_TIMEOUT_SECONDS
                 }]
+            }],
+            "Stop": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "lucidos cc-stop-reminder"
+                }]
             }]
         }
     })
@@ -68,6 +74,23 @@ mod tests {
             entries[0]["hooks"][0]["timeout"],
             serde_json::json!(HOOK_TIMEOUT_SECONDS),
             "must override CC's 60s default so long-running user thinking doesn't kill the hook"
+        );
+    }
+
+    #[test]
+    fn json_registers_stop_hook_for_harden_reminder() {
+        let json = build_cc_settings_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries = &parsed["hooks"]["Stop"];
+        assert!(
+            entries.is_array(),
+            "Stop must be an array — needed so CC checks for harden state when it tries to idle"
+        );
+        let hook = &entries[0]["hooks"][0];
+        assert_eq!(hook["type"], "command");
+        assert_eq!(
+            hook["command"], "lucidos cc-stop-reminder",
+            "must invoke the reminder subcommand the engine ships",
         );
     }
 

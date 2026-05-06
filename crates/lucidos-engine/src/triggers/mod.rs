@@ -51,6 +51,8 @@ mod tests {
             condition,
             paused: false,
             last_run: None,
+            app_id: None,
+            go_to_review: false,
         }
     }
 
@@ -133,13 +135,15 @@ mod tests {
             schedule: vec!["0 0 8 * * *".to_string()],
             timezone: "UTC".to_string(),
             run: TriggerRun::Intent {
-                text: "do something".to_string(),
+                intent: "do something".to_string(),
                 knowhow: vec![],
             },
             on: None,
             condition: None,
             paused: false,
             last_run: None,
+            app_id: None,
+            go_to_review: false,
         };
         configs.insert("cron-only".into(), cron_trigger);
 

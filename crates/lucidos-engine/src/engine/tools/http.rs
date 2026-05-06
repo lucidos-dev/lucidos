@@ -149,7 +149,7 @@ impl LucidosEngine {
                     // honest server tells us the size and the LLM asked us to
                     // persist it under data/artifacts/.
                     if (200..300).contains(&status) {
-                        if let (Some(ref data_path), Some(len)) =
+                        if let (Some(data_path), Some(len)) =
                             (resolved_output.as_ref(), response.content_length())
                         {
                             if len > MAX_BULK_BYTES {
@@ -228,6 +228,11 @@ impl LucidosEngine {
         // Handle temp_path - save to .lucidos/tmp/ (not git-tracked)
         let saved_temp = if let Some(path) = temp_path {
             if (200..300).contains(&status) {
+                if crate::api::is_path_traversal(path) {
+                    return Ok(
+                        "Error: temp_path must be relative with no '..' components".to_string(),
+                    );
+                }
                 let tmp_dir = self.workspace_path.join(".lucidos").join("tmp");
                 if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
                     return Ok(format!(

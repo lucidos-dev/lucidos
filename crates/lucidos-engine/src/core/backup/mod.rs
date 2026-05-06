@@ -151,36 +151,6 @@ pub struct RestoredWorkspace {
     pub workspace_name: String,
 }
 
-/// Parse the workspace name from a backup filename.
-///
-/// Expected format: `lucidos-backup-{name}-{YYYYMMDD}-{HHMMSS}.enc`
-/// The name may contain hyphens, so we match the timestamp suffix pattern.
-pub fn parse_workspace_name(filename: &str) -> Option<String> {
-    let stem = filename.strip_suffix(".enc")?;
-    let prefix = "lucidos-backup-";
-    let rest = stem.strip_prefix(prefix)?;
-    // Find the timestamp suffix: -{YYYYMMDD}-{HHMMSS} (16 chars: -XXXXXXXX-XXXXXX)
-    if rest.len() < 16 {
-        return None;
-    }
-    let (name, suffix) = rest.split_at(rest.len() - 16);
-    // Validate suffix is -{digits8}-{digits6}
-    let parts: Vec<&str> = suffix.split('-').collect();
-    if parts.len() != 3
-        || !parts[0].is_empty()
-        || parts[1].len() != 8
-        || !parts[1].chars().all(|c| c.is_ascii_digit())
-        || parts[2].len() != 6
-        || !parts[2].chars().all(|c| c.is_ascii_digit())
-    {
-        return None;
-    }
-    if name.is_empty() {
-        return None;
-    }
-    Some(name.to_string())
-}
-
 /// Validate a workspace name for use as a directory name.
 ///
 /// Rules: non-empty, no path traversal, filesystem-safe characters only
@@ -557,12 +527,14 @@ fn init_workspace(workspace_name: &str) -> Result<String, BoxError> {
 ///   encrypt  ~5 MB/s  (AES-256-GCM, 1 MB chunks)
 ///   upload   ~10 MB/s (network dependent)
 fn estimate_weights(workspace: &Path) -> (usize, usize, usize) {
-    let lucidos_dir = workspace.join(".lucidos");
-    let postgres_dir = workspace.join(crate::core::POSTGRES_DIR);
     let ws_bytes = walkdir(workspace)
         .unwrap_or_default()
         .iter()
-        .filter(|p| !p.starts_with(&lucidos_dir) && !p.starts_with(&postgres_dir))
+        .filter(|p| {
+            p.strip_prefix(workspace)
+                .map(|rel| !is_excluded_workspace_path(rel))
+                .unwrap_or(true)
+        })
         .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
         .sum::<u64>();
 
@@ -758,6 +730,33 @@ fn terminate_other_connections(database_url: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// True if a workspace-relative path must be omitted from the backup tar
+/// and from the size estimate.
+///
+/// Excludes:
+/// - `.lucidos/` — ephemeral runtime/cache
+/// - `data/postgres/` — live PGDATA, captured via pg_dump
+/// - `data/postgres.*/` — archived PGDATA siblings (e.g.
+///   `postgres.migrated-<ts>/` left by `scripts/lib/workspace.sh` after the
+///   one-time bind-mount → Docker-volume migration). These can be many GB
+///   and are redundant with pg_dump.
+fn is_excluded_workspace_path(rel: &Path) -> bool {
+    if rel.starts_with(".lucidos") {
+        return true;
+    }
+    let mut comps = rel.components();
+    let (Some(std::path::Component::Normal(d)), Some(std::path::Component::Normal(p))) =
+        (comps.next(), comps.next())
+    else {
+        return false;
+    };
+    if d != "data" {
+        return false;
+    }
+    let p = p.to_string_lossy();
+    p == "postgres" || p.starts_with("postgres.")
+}
+
 /// Tar workspace files (excluding .lucidos/) and SQL dump, then zstd compress.
 ///
 /// Streams tar entries directly through zstd to a file — never holds the full
@@ -772,12 +771,12 @@ fn tar_and_compress(
     let encoder = zstd::Encoder::new(file, 3)?;
     let mut builder = tar::Builder::new(encoder);
 
-    // Add workspace files, excluding .lucidos/ and data/postgres/ (live DB — backed up via pg_dump)
-    let postgres_rel = std::path::Path::new(crate::core::POSTGRES_DIR);
+    // Add workspace files, excluding .lucidos/, data/postgres/, and any
+    // data/postgres.*/ siblings (see is_excluded_workspace_path).
     for path in walkdir(workspace)? {
         let rel = path.strip_prefix(workspace)?;
 
-        if rel.starts_with(".lucidos") || rel.starts_with(postgres_rel) {
+        if is_excluded_workspace_path(rel) {
             continue;
         }
 
@@ -882,26 +881,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_workspace_name_from_filename() {
-        assert_eq!(
-            parse_workspace_name("lucidos-backup-personal-20260415-191605.enc"),
-            Some("personal".to_string())
-        );
-        assert_eq!(
-            parse_workspace_name("lucidos-backup-my-workspace-20260415-191605.enc"),
-            Some("my-workspace".to_string())
-        );
-        assert_eq!(
-            parse_workspace_name("lucidos-backup-dev-20260101-000000.enc"),
-            Some("dev".to_string())
-        );
-        // Unexpected format
-        assert_eq!(parse_workspace_name("random-file.enc"), None);
-        assert_eq!(parse_workspace_name("lucidos-backup-.enc"), None);
-        assert_eq!(parse_workspace_name("not-a-backup.txt"), None);
-    }
-
-    #[test]
     fn test_validate_workspace_name() {
         assert!(validate_workspace_name("personal").is_ok());
         assert!(validate_workspace_name("my-workspace").is_ok());
@@ -994,6 +973,64 @@ mod tests {
         assert!(
             found_paths.contains(&"lucidos_backup.dump".to_string()),
             "archive should contain lucidos_backup.dump: {found_paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_tar_and_compress_excludes_postgres_migrated_archives() {
+        // `scripts/lib/workspace.sh` archives the old PGDATA as
+        // `data/postgres.migrated-<timestamp>/` when migrating from a host bind
+        // mount to a Docker named volume. These can be many GB and must NOT be
+        // included in the backup (the live DB is captured via pg_dump).
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path();
+
+        // Live pgdata (already excluded by the existing rule)
+        std::fs::create_dir_all(ws.join("data/postgres/global")).unwrap();
+        std::fs::write(ws.join("data/postgres/global/pg_filenode.map"), "live").unwrap();
+
+        // Archived pgdata sibling — the regression case
+        std::fs::create_dir_all(ws.join("data/postgres.migrated-20260503094805/global")).unwrap();
+        std::fs::write(
+            ws.join("data/postgres.migrated-20260503094805/global/pg_filenode.map"),
+            "stale",
+        )
+        .unwrap();
+
+        // Real workspace content that MUST still be included
+        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+        std::fs::write(ws.join("data/artifacts/profile.md"), "# Profile").unwrap();
+
+        let sql_dump = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
+
+        let output = tempfile::NamedTempFile::new().unwrap();
+        tar_and_compress(ws, sql_dump.path(), output.path(), None).unwrap();
+
+        let file = std::fs::File::open(output.path()).unwrap();
+        let decoder = zstd::Decoder::new(file).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let mut found_paths: Vec<String> = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            found_paths.push(entry.path().unwrap().to_string_lossy().to_string());
+        }
+
+        assert!(
+            !found_paths
+                .iter()
+                .any(|p| p.starts_with("data/postgres.migrated-")),
+            "archive must not contain data/postgres.migrated-*: {found_paths:?}"
+        );
+        assert!(
+            !found_paths.iter().any(|p| p.starts_with("data/postgres/")),
+            "archive must not contain data/postgres/: {found_paths:?}"
+        );
+        assert!(
+            found_paths
+                .iter()
+                .any(|p| p == "data/artifacts/profile.md"),
+            "archive must contain data/artifacts/profile.md: {found_paths:?}"
         );
     }
 

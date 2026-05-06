@@ -32,47 +32,24 @@
     cursor: default;
 }
 
-.thread-drawer-header {
-    display: none;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.5rem 1rem;
-    border-bottom: 1px solid var(--border-color);
-    flex-shrink: 0;
-    -webkit-user-select: none;
-    user-select: none;
-}
-
-.thread-drawer-header-title {
-    font-size: 0.875rem;
-    font-weight: 600;
-    color: var(--text-primary);
-}
-
-.thread-drawer-header-actions {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-}
-
-.thread-drawer-close-btn {
-    display: none;
-}
-
 /* Filter active indicator — no color override; count badge shows state */
 
 /* Filter dropdown */
 .thread-filter-dropdown {
     position: absolute;
     top: 100%;
-    right: 0;
+    left: 0;
     z-index: var(--z-dropdown);
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 0.5rem;
     padding: 0.5rem;
-    min-width: 10rem;
+    min-width: 22rem;
+    max-width: calc(100vw - 1rem);
     box-shadow: var(--shadow-md);
+    max-height: calc(100dvh - 6rem);
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 
 .thread-filter-title {
@@ -99,6 +76,20 @@
     background: var(--bg-hover);
 }
 
+.thread-filter-option-child {
+    padding-left: 1.5rem;
+    font-size: 0.75rem;
+}
+
+.thread-filter-option-deleted {
+    color: var(--text-secondary);
+}
+
+.thread-filter-deleted {
+    font-size: 0.75em;
+    font-style: italic;
+}
+
 .thread-drawer-list {
     flex: 1;
     overflow-y: auto;
@@ -109,6 +100,9 @@
     cursor: pointer;
     position: relative;
     padding-left: 1.25rem;
+    /* Right padding matches `.threads-header`'s `padding: 0 0.5rem` so action
+     * icons sit in the same horizontal slot as the filter/search above. */
+    padding-right: 0.5rem;
     -webkit-touch-callout: none;
     -webkit-user-select: none;
     user-select: none;
@@ -139,11 +133,8 @@
 }
 
 .thread-row-title-row {
-    display: flex;
-    align-items: baseline;
-    gap: 0.375rem;
+    display: block;
     min-width: 0;
-    flex-wrap: wrap;
 }
 
 .thread-row-title {
@@ -154,6 +145,7 @@
 }
 
 .draft-indicator {
+    display: inline-block;
     font-size: 0.625rem;
     font-weight: 500;
     color: var(--text-muted);
@@ -161,7 +153,8 @@
     padding: 0.0625rem 0.25rem;
     border-radius: 0.1875rem;
     white-space: nowrap;
-    flex-shrink: 0;
+    vertical-align: middle;
+    margin-left: 0.375rem;
 }
 
 .thread-row-meta {
@@ -184,6 +177,7 @@
     align-items: flex-end;
     gap: 0.25rem;
     flex-shrink: 0;
+    align-self: stretch;
 }
 
 .thread-row-time {
@@ -195,24 +189,44 @@
     white-space: nowrap;
 }
 
-.thread-row-tag-line {
+.thread-row-actions {
     display: flex;
     align-items: center;
     gap: 0.25rem;
+    /* Pins actions to the row bottom; relies on `align-self: stretch` on
+     * .thread-row-right to give the auto-margin space to consume. */
+    margin-top: auto;
 }
 
-.thread-row-tag-line .icon-btn {
-    padding-right: 0;
+/* Action buttons (copy) reveal on hover/focus on desktop, always visible on touch. */
+.thread-row-action {
+    opacity: 0;
+    transition: opacity 0.12s ease-in-out;
 }
 
-.thread-row-tag-line .icon-btn svg {
-    width: var(--icon-size-md);
-    height: var(--icon-size-md);
+@media (hover: hover) {
+    .thread-row:hover .thread-row-action,
+    .thread-row-action:focus-visible {
+        opacity: 1;
+    }
+}
+
+@media (hover: none) {
+    .thread-row-action {
+        opacity: 1;
+    }
 }
 
 .thread-status {
     display: flex;
     align-items: center;
+}
+
+/* Drawer-row copy glyph uses --icon-size-md at every viewport — the
+ * button shrinks on desktop (see @media block) but the SVG inside doesn't. */
+.thread-row-actions .icon-btn.header-icon svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
 }
 
 .thread-row > .thread-status {
@@ -231,6 +245,43 @@
 .thread-status svg {
     width: var(--icon-size-sm);
     height: var(--icon-size-sm);
+}
+
+@media (min-width: 769px) {
+    /* Don't pin actions to the row's bottom — sit them just below the time so
+     * the label-to-icons gap stays tight even when the left column is short. */
+    .thread-row-actions {
+        margin-top: 0;
+        gap: 0.25rem;
+    }
+
+    .thread-row-actions .icon-btn.header-icon {
+        width: 1.25rem;
+        height: 1.25rem;
+    }
+
+    .thread-row-right {
+        gap: 0.125rem;
+    }
+
+    .thread-row {
+        padding-bottom: 0.125rem;
+    }
+
+    .thread-row > .thread-status {
+        top: 1.125rem;
+    }
+}
+
+@media (max-width: 768px) {
+    .thread-row > .thread-status {
+        top: 1.3125rem;
+    }
+
+    .thread-row-actions .icon-btn.header-icon {
+        width: 1.75rem;
+        height: 1.5rem;
+    }
 }
 
 /* --- Thread search bar (inline in threads-header) --- */
@@ -330,10 +381,17 @@
     gap: 0.25rem;
 }
 
-.section-count {
+.section-review-badge {
     margin-left: auto;
-    font-weight: 400;
-    color: var(--text-muted);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    color: var(--text-on-accent);
+    background: var(--accent);
+    padding: 0 0.375rem;
+    border-radius: 0.625rem;
+    line-height: 1.1rem;
+    min-width: 1.1rem;
+    text-align: center;
 }
 
 @media (hover: hover) {
@@ -357,7 +415,9 @@
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    padding: 0.5rem 1rem;
+    /* Right padding matches `.pane-header`'s `--header-padding-x` so the action
+     * icons land in the same horizontal slot as the AppHeader icons above. */
+    padding: 0.25rem 0.625rem 0.25rem 1rem;
     background: color-mix(in srgb, var(--accent) 12%, var(--bg-primary));
     -webkit-user-select: none;
     user-select: none;
@@ -365,15 +425,42 @@
     flex-shrink: 0;
 }
 
-.thread-view-header > .icon-btn,
-.mobile-thread-title-row > .icon-btn {
-    padding: 0;
+/* Desktop title-bar icons run smaller than the AppHeader slot — keep the
+ * thread title row compact rather than matching the 2.25rem header-icon. */
+.thread-view-header .icon-btn.header-icon {
+    width: 1.75rem;
+    height: 1.75rem;
 }
 
-.thread-view-header > .icon-btn svg,
-.mobile-thread-title-row > .icon-btn svg {
+.thread-view-header .icon-btn.header-icon svg {
     width: var(--icon-size-md);
     height: var(--icon-size-md);
+}
+
+.thread-view-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* (hover: none) branch is for desktops with touch — mobile hides this
+ * whole header in favor of the app header. */
+.thread-view-header-actions .icon-btn {
+    opacity: 0;
+    transition: opacity var(--duration-fast) ease-in-out;
+}
+
+@media (hover: hover) {
+    .thread-view-header:hover .thread-view-header-actions .icon-btn,
+    .thread-view-header-actions .icon-btn:focus-visible {
+        opacity: 1;
+    }
+}
+
+@media (hover: none) {
+    .thread-view-header-actions .icon-btn {
+        opacity: 1;
+    }
 }
 
 
@@ -390,7 +477,7 @@
 .thread-title-input {
     font-family: inherit;
     font-weight: 600;
-    font-size: 0.875rem;
+    font-size: 0.8125rem;
     line-height: 1.3;
     color: var(--text-primary);
     background: var(--bg-tertiary);
@@ -511,6 +598,18 @@
 
     .drawer-divider {
         display: none;
+    }
+
+    /* Anchored to a tiny parent at the screen's right edge — on mobile,
+       break out and span the viewport so contents stay visible. */
+    .thread-filter-dropdown {
+        position: fixed;
+        top: calc(var(--mobile-header-height, 2.75rem) + 0.25rem);
+        left: 0.5rem;
+        right: 0.5rem;
+        min-width: 0;
+        max-width: none;
+        max-height: calc(100dvh - var(--mobile-header-height, 2.75rem) - 1rem);
     }
 
 }

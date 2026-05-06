@@ -17,12 +17,13 @@ import {
   exchangeResponseEvents,
   exchangeResponseText,
   exchangeError,
+  isEmptyContinuedExchange,
   getCCWaitingInfo,
-  isAbortedByRestart,
   type ThreadState,
   type ThreadEvent,
   type Exchange,
 } from '../thread-events';
+import { handleEventWithAgg } from './aggregate-test-helper';
 import { statusLabel, isActive } from '../exchange-status';
 import { displaySection } from '../../generated/thread-lifecycle';
 import { getEventToggleState, getCollapsedVisibleEvents } from '../event-rendering';
@@ -41,13 +42,12 @@ function makeThread(id = 'thread-1', status: 'idle' | 'running' | 'waiting' = 'i
       title: '...',
       channel: 'chat',
       initiator: 'user',
-      pinned: false,
+      saved: false,
       createdAt: '',
       updatedAt: '',
-      unread: false,
       status,
       messageCount: 0,
-      section: 'default',
+      section: 'archived',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
       ccHasChanges: false,
@@ -55,6 +55,7 @@ function makeThread(id = 'thread-1', status: 'idle' | 'running' | 'waiting' = 'i
       ccIsExternalRepo: false,
       ccApplying: false,
       lastRevivedAt: '',
+      state: 'active',
     },
     events: new Map(),
     streamingBuffer: '',
@@ -82,7 +83,9 @@ function insertEvents(
     const clean = { ...event };
     delete (clean as any).created;
     delete (clean as any).event_id;
-    handleEvent(map, threadId, seqCounter++, clean, created, eventId);
+    // Use handleEventWithAgg so a synthesized ThreadAggregate (mirroring
+    // backend update_thread_projection rules) is applied to thread.meta.
+    handleEventWithAgg(map, threadId, seqCounter++, clean, created, eventId);
   }
 }
 
@@ -742,7 +745,11 @@ describe('Flow: Thread status', () => {
     expect(map.get(id)!.meta.status).toBe('running');
   });
 
-  it('has completion + last event not completion → idle (backfill)', () => {
+  it('activity event after completion bumps status back to running', () => {
+    // Chat-side mirror of the CC premature-Idled recovery — see
+    // thread_lifecycle.rs status_transitions: any activity event proves
+    // work is in progress and re-marks the thread Running so it leaves
+    // the REVIEW section while streaming continues.
     const { map, id } = makeThread();
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'hi', created: '2026-01-01T00:00:00Z' },
@@ -750,7 +757,7 @@ describe('Flow: Thread status', () => {
       { type: 'ResponseGenerated', created: '2026-01-01T00:00:02Z' },
       { type: 'ToolResult', name: 'search', result: 'found', created: '2026-01-01T00:00:03Z' },
     ]);
-    expect(map.get(id)!.meta.status).toBe('idle');
+    expect(map.get(id)!.meta.status).toBe('running');
   });
 });
 
@@ -1010,6 +1017,91 @@ describe('Flow: Interrupted exchanges', () => {
     expect(exchangeStatus(exchanges[2], '', true)).toBe('done');
   });
 
+  it('CC exchange with only SessionStarted (no body events) before follow-up: interrupted with no visible events', () => {
+    // Reproduces the bug: user sends a message, CC starts (SessionStarted lands)
+    // but produces no tool calls or text before the user fires off another
+    // message. The middle exchange is 'interrupted' with hasSteps=true but
+    // exchangeResponseEvents=[] — ChatExchange must hide the empty
+    // "Continued below ↳" header, same as it does for empty 'done' exchanges.
+    const { map, id } = makeThread();
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'so now u can use gh correctly?', created: '2026-01-01T00:00:00Z' },
+      { type: 'SessionStarted', session_id: 'cc-1', created: '2026-01-01T00:00:02Z' },
+      { type: 'MessageReceived', text: 'and git?', created: '2026-01-01T00:00:05Z' },
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(2);
+    // Middle exchange has only SessionStarted as a step → status 'interrupted'…
+    expect(exchangeStatus(exchanges[0], '', false, false, true)).toBe('interrupted');
+    expect(getLabel(exchanges[0], '', false, false, true)).toBe('Continued below');
+    // …but exchangeResponseEvents emits nothing (SessionStarted alone produces
+    // no section_break — hasCCContent is false), so the response panel body
+    // would be empty. The visible-noise placeholder must be hidden.
+    expect(exchangeResponseEvents(exchanges[0])).toEqual([]);
+    expect(exchangeResponseText(exchanges[0])).toBe('');
+  });
+
+  it('CC exchange with SessionStarted + Thinking only before follow-up: panel is empty-continued', () => {
+    // Reproduces the bug from the screenshot: user sends a message, CC emits
+    // SessionStarted then a Thinking event (the model began thinking but
+    // produced no tool call or text yet) before the user fires off another
+    // message. exchangeResponseEvents preserves the Thinking step (the data
+    // layer correctly reflects what was emitted), but the rendering layer
+    // must treat a Thinking-only payload the same as no payload — the
+    // single "Thinking" line conveys nothing the next exchange's user
+    // message doesn't already imply.
+    const { map, id } = makeThread();
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'What does that mean?', created: '2026-01-01T00:00:00Z' },
+      { type: 'SessionStarted', session_id: 'cc-1', created: '2026-01-01T00:00:01Z' },
+      { type: 'Thinking', text: '', created: '2026-01-01T00:00:02Z' },
+      { type: 'MessageReceived', text: 'follow-up', created: '2026-01-01T00:01:00Z' },
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(2);
+    expect(exchangeStatus(exchanges[0], '', false, false, true)).toBe('interrupted');
+
+    // The data layer keeps the Thinking event (auditable record of what happened).
+    const events = exchangeResponseEvents(exchanges[0]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: 'step', description: 'Thinking' });
+
+    // The rendering layer must classify this as empty-continued — the panel
+    // is suppressed in ChatExchange for non-last done/interrupted exchanges
+    // whose only events are bare Thinking steps.
+    expect(isEmptyContinuedExchange('interrupted', false, events, false)).toBe(true);
+  });
+
+  it('CC follow-up with whitespace-only CodingAgentTextStreamed + CodingAgentPromptSent before next follow-up: panel is empty-continued', () => {
+    // CC echoes a follow-up prompt as a whitespace-only CodingAgentTextStreamed
+    // ("\n\n" header) + CodingAgentPromptSent (Thinking spinner). When the
+    // user fires another follow-up before CC produces real output, the
+    // "\n\n" text event survives mergeAdjacentTextEvents (textBuf is truthy)
+    // and the predicate must still classify the panel as empty-continued —
+    // otherwise the orphan Thinking spinner panel renders.
+    const { map, id } = makeThread();
+
+    const reqId = 'cc-session-req-id';
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'What?? Running???', created: '2026-01-01T00:00:00.000Z' },
+      { type: 'CodingAgentTextStreamed', text: '\n\n', request_event_id: reqId, created: '2026-01-01T00:00:00.020Z' } as any,
+      { type: 'CodingAgentPromptSent', text: 'What?? Running???', request_event_id: reqId, created: '2026-01-01T00:00:00.030Z' } as any,
+      { type: 'MessageReceived', text: 'There should be no Archive btn...', created: '2026-01-01T00:01:00.000Z' },
+      { type: 'CodingAgentPromptSent', text: 'There should be no Archive btn...', request_event_id: reqId, created: '2026-01-01T00:01:00.010Z' } as any,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(2);
+    expect(exchangeStatus(exchanges[0], '', false, false, true)).toBe('interrupted');
+
+    const events = exchangeResponseEvents(exchanges[0]);
+    expect(isEmptyContinuedExchange('interrupted', false, events, false)).toBe(true);
+  });
+
   it('regular (non-CC) exchange followed by another shows Done, not interrupted', () => {
     const { map, id } = makeThread();
 
@@ -1027,6 +1119,42 @@ describe('Flow: Interrupted exchanges', () => {
     // Non-CC, not last → done (not interrupted)
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
     expect(getLabel(exchanges[0], '', false)).toBe('Done');
+  });
+
+  it('chat exchange interrupted by mid-flight UPI shows interrupted, not Working', () => {
+    // Reproduces the bug from the "Verifying Git Pull Permission Error" thread:
+    // user sends MR1, agent starts processing (steps with req_id=MR1), user sends MR2
+    // mid-flight, engine emits UPI absorbed into MR2. Both panels showed "Working"
+    // because the prior chat exchange had visible steps and no terminator — falling
+    // through to 'streaming'. Only the LAST panel should be Working.
+    const { map, id } = makeThread();
+    const mr1Id = 'mr1-event-id';
+    const mr2Id = 'mr2-event-id';
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'Organize nodes on same level...', created: '2026-01-01T00:00:00Z', event_id: mr1Id },
+      { type: 'MemorySearched', request_event_id: mr1Id, results: [], query: 'q', created: '2026-01-01T00:00:02Z' } as any,
+      { type: 'Thinking', request_event_id: mr1Id, text: 'thinking...', created: '2026-01-01T00:00:03Z' } as any,
+      { type: 'ToolCalled', name: 'Read', args: {}, request_event_id: mr1Id, created: '2026-01-01T00:00:10Z' } as any,
+      { type: 'ToolResult', name: 'Read', result: 'ok', request_event_id: mr1Id, created: '2026-01-01T00:00:11Z' } as any,
+      { type: 'MessageReceived', text: 'Also use more horizontal space...', created: '2026-01-01T00:00:30Z', event_id: mr2Id },
+      // UPI absorbs into MR2's exchange and sets reqIdRedirect[mr1Id]=E2 —
+      // subsequent req_id=mr1Id events redirect to E2.
+      { type: 'UserPromptInjected', text: 'Also use more horizontal space...', mode: 'human',
+        request_event_id: mr1Id, injected_message_id: mr2Id, created: '2026-01-01T00:01:00Z' } as any,
+      { type: 'Thinking', request_event_id: mr1Id, text: 'more thinking', created: '2026-01-01T00:01:05Z' } as any,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(2);
+    // E1 (not last) should NOT be 'streaming' / Working — the user has moved on.
+    // It should be 'interrupted' (label "Continued below ↳") matching the
+    // existing CC pattern for mid-work interruptions.
+    expect(exchangeStatus(exchanges[0], '', false)).toBe('interrupted');
+    expect(getLabel(exchanges[0], '', false)).toBe('Continued below');
+    // E2 (last) — still actively processing → Working
+    expect(exchangeStatus(exchanges[1], '', true)).toBe('streaming');
+    expect(getLabel(exchanges[1], '', true)).toBe('Working');
   });
 });
 
@@ -1103,7 +1231,7 @@ describe('Flow: SessionRecovered recovery', () => {
     expect(exchanges).toHaveLength(1);
     // SessionRecovered is the user event (system-initiated, no user message)
     expect(exchanges[0].userEvent.type).toBe('SessionRecovered');
-    expect(exchangeUserMessage(exchanges[0])).toBe('Thread auto-resumed after engine restart');
+    expect(exchangeUserMessage(exchanges[0])).toBe('Resumed after engine restart');
     expect(exchangeUserChannel(exchanges[0])).toBe('claude_code');
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
     expect(exchangeResponseText(exchanges[0])).toContain('Reviewed and continuing.');
@@ -1254,7 +1382,7 @@ describe('Flow: Edge cases', () => {
     const exchanges = getExchanges(map, id);
     const steps = exchangeSteps(exchanges[0]);
     expect(steps).toHaveLength(2);
-    expect(steps[0].description).toBe('Memory: 12 results');
+    expect(steps[0].description).toBe('Memory searched');
     expect(steps[0].success).toBe(true);
     expect(steps[1].description).toBe('Thinking');
 
@@ -1395,13 +1523,12 @@ describe('CC thread follow-up: channel detection', () => {
         title: 'CC Thread',
         channel: 'claude_code',
         initiator: 'user',
-        pinned: false,
+        saved: false,
         createdAt: '',
         updatedAt: '',
-        unread: false,
         status: 'idle',
         messageCount: 0,
-        section: 'default',
+        section: 'archived',
         activeChildrenCount: 0,
         totalChildrenCount: 0,
         ccHasChanges: false,
@@ -1409,6 +1536,7 @@ describe('CC thread follow-up: channel detection', () => {
         ccIsExternalRepo: false,
         ccApplying: false,
         lastRevivedAt: '',
+        state: 'active',
       },
       events: new Map(),
       streamingBuffer: '',
@@ -1431,13 +1559,12 @@ describe('CC thread follow-up: channel detection', () => {
         title: 'Chat',
         channel: 'chat',
         initiator: 'user',
-        pinned: false,
+        saved: false,
         createdAt: '',
         updatedAt: '',
-        unread: false,
         status: 'idle',
         messageCount: 0,
-        section: 'default',
+        section: 'archived',
         activeChildrenCount: 0,
         totalChildrenCount: 0,
         ccHasChanges: false,
@@ -1445,6 +1572,7 @@ describe('CC thread follow-up: channel detection', () => {
         ccIsExternalRepo: false,
         ccApplying: false,
         lastRevivedAt: '',
+        state: 'active',
       },
       events: new Map(),
       streamingBuffer: '',
@@ -2163,7 +2291,7 @@ describe('Timestamps', () => {
     expect(stored.created).toBe(serverTime);
   });
 
-  it('pending exchange shows queued when prior exchange is active', () => {
+  it('non-last chat exchange with steps shows interrupted when follow-up arrives', () => {
     const { map, id } = makeThread();
 
     // First exchange is still processing (no ResponseGenerated)
@@ -2180,14 +2308,18 @@ describe('Timestamps', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // First exchange is actively streaming
+    // First exchange (non-last, has steps, no terminator) → 'interrupted'.
+    // The user moved on with the follow-up; the chat fast-path will fold the
+    // follow-up into the running loop via UPI, with post-UPI events redirected
+    // to the new exchange. Only the last panel shows "Working".
     const firstStatus = exchangeStatus(exchanges[0], '', false);
-    expect(firstStatus).toBe('done'); // non-last is 'done'
+    expect(firstStatus).toBe('interrupted');
 
-    // Second exchange (last, no steps) with prior active
-    const secondStatus = exchangeStatus(exchanges[1], '', true, true);
-    expect(secondStatus).toBe('queued');
-    expect(getLabel(exchanges[1], '', true, true)).toBe('Queued');
+    // Second exchange (last, no steps yet). hasPriorActive is false because
+    // the prior is now 'interrupted' (not in ACTIVE_STATUSES) — the follow-up
+    // is no longer "queued behind" the prior; it's the new active panel.
+    const secondStatus = exchangeStatus(exchanges[1], '', true, false);
+    expect(secondStatus).toBe('pending');
   });
 
   it('pending exchange is not queued when no prior active exchange', () => {
@@ -2773,13 +2905,12 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
         title: '...',
         channel: 'chat',
         initiator: 'user',
-        pinned: false,
+        saved: false,
         createdAt: '',
         updatedAt: '',
-        unread: true,
         status: 'idle',
         messageCount: 0,
-        section: 'default',
+        section: 'archived',
         activeChildrenCount: 0,
         totalChildrenCount: 0,
         ccHasChanges: false,
@@ -2787,6 +2918,7 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
         ccIsExternalRepo: false,
         ccApplying: false,
         lastRevivedAt: '',
+        state: 'active',
       },
       events: new Map(),
       streamingBuffer: '',
@@ -2798,11 +2930,11 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
     const map = new Map([[id, skeleton]]);
 
     // SSE delivers events for this thread — handleEvent updates meta.status
-    handleEvent(map, id, seqCounter++, {
+    handleEventWithAgg(map, id, seqCounter++, {
       type: 'TriggerStarted', trigger_id: 'task-1', trigger_name: 'Varmepumpe', prompt: 'Run control loop',
     } as any, new Date().toISOString());
 
-    handleEvent(map, id, seqCounter++, {
+    handleEventWithAgg(map, id, seqCounter++, {
       type: 'ToolCalled', name: 'execute_intent', args: { intent_id: 'heatpump' },
     } as any, new Date().toISOString());
 
@@ -2884,7 +3016,7 @@ describe('Bug: first message missing when only pending messages exist', () => {
 // ---------------------------------------------------------------------------
 describe('Bug: dismissed thread keeps red status dot until SSE round-trip lands', () => {
   it('effectiveThreadStatus returns idle once dismiss is requested, even on a failed thread', async () => {
-    const { dismissingThreadIds } = await import('../store');
+    const { archivingThreadIds } = await import('../store');
     const { map, id } = makeThread('failed-thread');
     const thread = map.get(id)!;
     thread.meta.status = 'failed';
@@ -2893,11 +3025,45 @@ describe('Bug: dismissed thread keeps red status dot until SSE round-trip lands'
     expect(effectiveThreadStatus(thread)).toBe('failed');
 
     // User clicks dismiss → optimistic state added before SSE arrives.
-    dismissingThreadIds.value = new Set([id]);
+    archivingThreadIds.value = new Set([id]);
     try {
       expect(effectiveThreadStatus(thread)).toBe('idle');
     } finally {
-      dismissingThreadIds.value = new Set();
+      archivingThreadIds.value = new Set();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bug: applying a change should not move the thread to the Active section
+// ---------------------------------------------------------------------------
+describe('Bug: applying a change keeps thread in Review until CC actually runs', () => {
+  it('effectiveThreadStatus does not flip to running just because Apply was clicked', async () => {
+    const { applyingNowThreadIds } = await import('../store');
+    const { map, id } = makeThread('cc-with-changes');
+    const thread = map.get(id)!;
+    thread.meta.channel = 'claude_code';
+    thread.meta.status = 'waiting';
+    thread.meta.section = 'inbox';
+    thread.meta.ccHasChanges = true;
+
+    expect(effectiveThreadStatus(thread)).toBe('waiting');
+
+    applyingNowThreadIds.value = new Map([[id, 'requesting']]);
+    try {
+      // Status must stay 'waiting' — only CC activity events (or harden/conflict
+      // boundary events that precede them) should flip the thread to running.
+      expect(effectiveThreadStatus(thread)).toBe('waiting');
+
+      // displaySection then routes to Review, not Active.
+      const section = displaySection(
+        thread.meta.section, effectiveThreadStatus(thread),
+        thread.meta.saved, thread.meta.activeChildrenCount > 0,
+        thread.meta.ccHasChanges,
+      );
+      expect(section).toBe('review');
+    } finally {
+      applyingNowThreadIds.value = new Map();
     }
   });
 });
@@ -3588,7 +3754,7 @@ describe('SessionStarted does not alter thread status', () => {
     expect(status).toBe('idle');
 
     // displaySection with idle status + default section → history
-    expect(displaySection('default', status, false, false)).toBe('history');
+    expect(displaySection('archived', status, false, false, false)).toBe('archive');
   });
 
   it('ChangeDiscarded + SessionStarted → idle (SessionStarted does not change status)', () => {
@@ -3632,9 +3798,9 @@ describe('SessionStarted does not alter thread status', () => {
 
 // Bug: CC session aborted by engine restart should show as needing attention
 // The engine no longer emits CodingAgentIdled during shutdown, so the last event
-// is ResponseAborted → thread should be in review (unread), not idle/history.
+// is ResponseAborted → thread should be in review (inbox), not idle/history.
 // ---------------------------------------------------------------------------
-describe('Bug: aborted CC session (engine restart) should be unread for review', () => {
+describe('Bug: aborted CC session (engine restart) should be in inbox for review', () => {
   it('ResponseAborted without pending changes → failed (red triangle indicates interruption)', () => {
     // Scenario: CC is actively working (tools running), engine restarts.
     // shutdown_agent_sessions sets shutting_down → ResponseAborted emitted.
@@ -3656,10 +3822,10 @@ describe('Bug: aborted CC session (engine restart) should be unread for review',
     expect(map.get(id)!.meta.status).toBe('failed');
   });
 
-  it('ResponseAborted + unread stored section → displaySection is review', () => {
+  it('ResponseAborted + inbox stored section → displaySection is review', () => {
     // ResponseAborted sets status='failed' when no CC changes are pending and
-    // marks the section as 'unread' — together they place the thread in REVIEW.
-    expect(displaySection('unread', 'failed', false, false)).toBe('review');
+    // marks the section as 'inbox' — together they place the thread in REVIEW.
+    expect(displaySection('inbox', 'failed', false, false, false)).toBe('review');
   });
 
   it('aborted then recovered → running while recovery CC works', () => {
@@ -3690,11 +3856,15 @@ describe('Bug: aborted CC session (engine restart) should be unread for review',
 // Bug: CC thread with mid-session ResponseGenerated + resolved changes from prior session
 // shows as idle (HISTORY) while CC is still actively working
 // ---------------------------------------------------------------------------
-describe('Bug: CC thread with post-completion activity should stay running', () => {
-  it('CC thread with ResponseGenerated mid-session → idle (status follows events)', () => {
-    // ResponseGenerated sets idle (no ccHasChanges). Tool calls after that don't
-    // change status. In the real backend flow, ResponseGenerated is followed by
-    // another MessageReceived (agentic loop iteration) which sets running.
+describe('CC thread with post-completion activity bumps status back to running', () => {
+  // CC may emit a `Result` mid-session (e.g. when the model invokes a Skill
+  // tool that triggers another model turn), making the engine emit
+  // `ResponseGenerated` / `CodingAgentIdled` while CC is actually still
+  // working. The next activity event proves work is in progress and bumps
+  // status back to `running` — see thread_lifecycle.rs for the matching
+  // status transitions.
+
+  it('CC tool call after ResponseGenerated bumps status back to running', () => {
     const { map, id } = makeThread();
     const now = Date.now();
     const t = (offset: number) => new Date(now + offset).toISOString();
@@ -3715,17 +3885,16 @@ describe('Bug: CC thread with post-completion activity should stay running', () 
       { type: 'SessionStarted', session_id: 's2', created: t(-59000) },
       { type: 'CodingAgentToolCalled', name: 'Read', args: {}, created: t(-50000) },
       { type: 'CodingAgentToolResult', name: 'Read', result: 'ok', created: t(-49000) },
-      // Engine's agentic loop completes one iteration
+      // ResponseGenerated emitted prematurely (e.g. CC's mid-session Result)
       { type: 'ResponseGenerated', created: t(-30000) },
-      // CC tool calls don't change status — only status-changing events do
+      // CC continues working — activity event bumps status back to running
       { type: 'CodingAgentToolCalled', name: 'Edit', args: {}, created: t(-5000) },
     ]);
 
-    // ResponseGenerated set idle (no ccHasChanges). Tool calls don't change status.
-    expect(map.get(id)!.meta.status).toBe('idle');
+    expect(map.get(id)!.meta.status).toBe('running');
   });
 
-  it('CC thread with post-completion TextStreamed → idle (text streaming is not a status event)', () => {
+  it('CC text stream after ResponseGenerated bumps status back to running', () => {
     const { map, id } = makeThread();
     const now = Date.now();
     const t = (offset: number) => new Date(now + offset).toISOString();
@@ -3734,12 +3903,11 @@ describe('Bug: CC thread with post-completion activity should stay running', () 
       { type: 'MessageReceived', text: 'Fix it', created: t(-120000) },
       { type: 'SessionStarted', session_id: 's1', created: t(-119000) },
       { type: 'ResponseGenerated', created: t(-60000) },
-      // CodingAgentTextStreamed doesn't change status
+      // CodingAgentTextStreamed proves work is in progress → bump to running
       { type: 'CodingAgentTextStreamed', text: 'Working...', created: t(-5000) },
     ]);
 
-    // ResponseGenerated set idle, text streaming doesn't change it
-    expect(map.get(id)!.meta.status).toBe('idle');
+    expect(map.get(id)!.meta.status).toBe('running');
   });
 
   it('CC thread where last event equals completion time → still goes to idleOrWaiting', () => {
@@ -3760,9 +3928,7 @@ describe('Bug: CC thread with post-completion activity should stay running', () 
     expect(map.get(id)!.meta.status).toBe('idle');
   });
 
-  it('CC tool result straddling ResponseGenerated → idle (tool results are not status events)', () => {
-    // Tool call started before ResponseGenerated, result arrives after.
-    // In event-driven status, neither tool calls nor results change status.
+  it('CC tool result after ResponseGenerated bumps status back to running', () => {
     const { map, id } = makeThread();
     const now = Date.now();
     const t = (offset: number) => new Date(now + offset).toISOString();
@@ -3772,11 +3938,11 @@ describe('Bug: CC thread with post-completion activity should stay running', () 
       { type: 'SessionStarted', session_id: 's1', created: t(-119000) },
       { type: 'CodingAgentToolCalled', name: 'Bash', args: {}, created: t(-30000) },
       { type: 'ResponseGenerated', created: t(-20000) },
+      // Tool result arrives after ResponseGenerated → bump back to running
       { type: 'CodingAgentToolResult', name: 'Bash', result: 'ok', created: t(-5000) },
     ]);
 
-    // ResponseGenerated set idle, tool results don't change status
-    expect(map.get(id)!.meta.status).toBe('idle');
+    expect(map.get(id)!.meta.status).toBe('running');
   });
 });
 
@@ -4198,9 +4364,9 @@ describe('CC follow-up after resolved changes correctly shows running', () => {
     // MessageReceived → running
     expect(thread.meta.status).toBe('running');
 
-    // And display section must be running, not history
-    const section = displaySection('default', 'running', false, false);
-    expect(section).toBe('running');
+    // And display section must be active, not archive
+    const section = displaySection('archived', 'running', false, false, false);
+    expect(section).toBe('active');
   });
 
   it('CodingAgentUserMessageSent after resolved changes → running (with live process)', () => {
@@ -4243,40 +4409,35 @@ describe('CC follow-up after resolved changes correctly shows running', () => {
 // ResponseAborted from a CC process crash (stdin write failed, EOF race) is
 // NOT an engine restart. The banner should distinguish the two cases.
 // ---------------------------------------------------------------------------
-describe('Bug: CC follow-up aborted by CC crash must NOT say engine restarted', () => {
-  it('ResponseAborted from CC crash (no shutdown) → isAbortedByRestart is false', () => {
-    // Scenario: CC session idle, user sends follow-up, CC process exits (EOF)
-    // simultaneously. The event loop tries to write to dead stdin → fails →
-    // safety-net ResponseAborted emitted. This is a CC crash, NOT engine restart.
+describe('CC follow-up abort: ResponseAborted is now an exchange boundary', () => {
+  // The previous "engine restart vs CC crash" banner discrimination was
+  // replaced by per-event `actor` attribution on ResponseAborted, rendered
+  // by the AbortPanel below the original response. These tests verify the
+  // new boundary semantics rather than the old `isAbortedByRestart` helper.
+  it('CC crash (no shutdown) opens an abort boundary exchange', () => {
     const { map, id } = makeThread();
     map.get(id)!.meta.channel = 'claude_code';
     const now = Date.now();
     const t = (offset: number) => new Date(now + offset).toISOString();
 
     insertEvents(map, id, [
-      // Exchange 1: original CC work, completed
       { type: 'MessageReceived', text: 'Fix the bug', channel: 'claude_code', created: t(-120000) },
       { type: 'SessionStarted', session_id: 's1', created: t(-119000) },
       { type: 'CodingAgentToolCalled', name: 'Edit', args: {}, created: t(-110000) },
       { type: 'ResponseGenerated', created: t(-105000) },
       { type: 'CodingAgentIdled', has_changes: true, created: t(-100000) },
-      // Exchange 2: follow-up → CC process crashed
       { type: 'MessageReceived', text: 'Now fix tests', created: t(-50000) },
       { type: 'ResponseAborted', created: t(-49000) },
       { type: 'SessionEnded', created: t(-48000) },
     ]);
 
     const exchanges = getExchanges(map, id);
-    expect(exchanges).toHaveLength(2);
-    // Exchange 2 is correctly 'aborted'
-    expect(exchangeStatus(exchanges[1], '', true, false, true)).toBe('aborted');
-    // But it is NOT an engine restart — CC process crashed
-    expect(isAbortedByRestart(exchanges[1])).toBe(false);
+    expect(exchanges).toHaveLength(3);
+    expect(exchangeStatus(exchanges[1], '', false, false, true)).toBe('aborted');
+    expect(exchanges[2].userEvent.type).toBe('ResponseAborted');
   });
 
-  it('ResponseAborted + SessionEnded(shutdown) → isAbortedByRestart is true', () => {
-    // Scenario: Engine is shutting down, CC session is killed, ResponseAborted
-    // emitted with shutdown reason. This IS an engine restart.
+  it('shutdown abort still marks the original exchange aborted', () => {
     const { map, id } = makeThread();
     map.get(id)!.meta.channel = 'claude_code';
     const now = Date.now();
@@ -4286,59 +4447,30 @@ describe('Bug: CC follow-up aborted by CC crash must NOT say engine restarted', 
       { type: 'MessageReceived', text: 'Fix the bug', channel: 'claude_code', created: t(-120000) },
       { type: 'SessionStarted', session_id: 's1', created: t(-119000) },
       { type: 'CodingAgentToolCalled', name: 'Edit', args: {}, created: t(-110000) },
-      // Engine shutdown → ResponseAborted + SessionEnded(shutdown)
       { type: 'ResponseAborted', created: t(-100000) },
       { type: 'SessionEnded', reason: 'shutdown', created: t(-99000) },
     ]);
 
     const exchanges = getExchanges(map, id);
-    expect(exchanges).toHaveLength(1);
-    expect(exchangeStatus(exchanges[0], '', true, false, true)).toBe('aborted');
-    // This IS an engine restart
-    expect(isAbortedByRestart(exchanges[0])).toBe(true);
-  });
-
-  it('SessionEnded without reason (Completed default) does NOT count as restart', () => {
-    // Backend serializes SessionEnded { reason: Completed } without the reason
-    // field. Frontend receives event.reason === undefined. This must NOT be
-    // treated as an engine restart.
-    const { map, id } = makeThread();
-    map.get(id)!.meta.channel = 'claude_code';
-    const now = Date.now();
-    const t = (offset: number) => new Date(now + offset).toISOString();
-
-    insertEvents(map, id, [
-      { type: 'MessageReceived', text: 'Fix the bug', channel: 'claude_code', created: t(-120000) },
-      { type: 'SessionStarted', session_id: 's1', created: t(-119000) },
-      { type: 'CodingAgentToolCalled', name: 'Edit', args: {}, created: t(-110000) },
-      { type: 'ResponseAborted', created: t(-100000) },
-      // SessionEnded with no reason field = Completed (default)
-      { type: 'SessionEnded', created: t(-99000) },
-    ]);
-
-    const exchanges = getExchanges(map, id);
-    expect(exchangeStatus(exchanges[0], '', true, false, true)).toBe('aborted');
-    expect(isAbortedByRestart(exchanges[0])).toBe(false);
+    expect(exchanges).toHaveLength(2);
+    expect(exchangeStatus(exchanges[0], '', false, false, true)).toBe('aborted');
   });
 });
 
 // ---------------------------------------------------------------------------
-// Bug: CC follow-up aborted before producing output shows redundant
-// "This response was interrupted." banner below the "Aborted ⚠" label.
-// The aborted banner should only show when the exchange has visible response
-// content. When aborted before any output, the status label is sufficient.
+// Aborted-exchange grouping after the boundary refactor: ResponseAborted now
+// opens its own initiator-only "abort panel" exchange (where the AbortPanel
+// + Continue button live) AND remains a step of the prior exchange so the
+// partial-response panel keeps its 'aborted' status.
 // ---------------------------------------------------------------------------
-describe('Bug: aborted exchange without response content must NOT show interrupted banner', () => {
-  it('CC follow-up aborted before any output → no visible content for banner', () => {
-    // Scenario: CC session completed work, user sends follow-up, CC aborts
-    // immediately before producing any text or tool calls.
+describe('Aborted-exchange boundary: ResponseAborted opens its own panel', () => {
+  it('CC follow-up aborted before any output: AbortPanel exchange is empty', () => {
     const { map, id } = makeThread();
     map.get(id)!.meta.channel = 'claude_code';
     const now = Date.now();
     const t = (offset: number) => new Date(now + offset).toISOString();
 
     insertEvents(map, id, [
-      // Exchange 1: original CC work, completed with changes
       { type: 'MessageReceived', text: 'Fix the bug', channel: 'claude_code', created: t(-120000) },
       { type: 'SessionStarted', session_id: 's1', created: t(-119000) },
       { type: 'CodingAgentToolCalled', name: 'Edit', args: {}, created: t(-110000) },
@@ -4347,52 +4479,32 @@ describe('Bug: aborted exchange without response content must NOT show interrupt
       { type: 'CodingAgentIdled', has_changes: true, created: t(-100000) },
       { type: 'ChangeApplied', change_id: 'c1', created: t(-95000) },
       { type: 'SessionEnded', reason: 'changes_applied', created: t(-94000) },
-      // Exchange 2: follow-up → aborted BEFORE any CC output
       { type: 'MessageReceived', text: 'The ios suite should have been included', channel: 'claude_code', created: t(-50000) },
       { type: 'ResponseAborted', created: t(-49000) },
     ]);
 
     const exchanges = getExchanges(map, id);
-    // 1: original CC, 2: ChangeApplied initiator panel, 3: aborted follow-up
-    expect(exchanges).toHaveLength(3);
-
-    // Exchange 1: completed normally
+    // 1: original CC, 2: ChangeApplied, 3: follow-up (aborted), 4: ResponseAborted boundary
+    expect(exchanges).toHaveLength(4);
     expect(exchangeStatus(exchanges[0], '', false, false, true)).toBe('done');
-
-    // Exchange 2: ChangeApplied — its own initiator panel
     expect(exchanges[1].userEvent.type).toBe('ChangeApplied');
-
-    // Exchange 3: correctly aborted
-    const followUp = exchanges[2];
-    expect(exchangeStatus(followUp, '', true, false, true)).toBe('aborted');
-
-    // But NO visible response content — banner should not show
-    expect(exchangeResponseText(followUp)).toBe('');
-    expect(exchangeResponseEvents(followUp).length).toBe(0);
-
-    // The shouldShowAbortedBanner condition (what ChatExchange uses):
-    const hasResponse = !!exchangeResponseText(followUp);
-    const hasEvents = exchangeResponseEvents(followUp).length > 0;
-    const shouldShowBanner = hasResponse || hasEvents;
-    expect(shouldShowBanner).toBe(false);
+    expect(exchangeStatus(exchanges[2], '', false, false, true)).toBe('aborted');
+    expect(exchanges[3].userEvent.type).toBe('ResponseAborted');
+    expect(exchanges[3].steps).toHaveLength(0);
   });
 
-  it('CC follow-up aborted AFTER producing output → banner should show', () => {
-    // Scenario: CC started work on follow-up, produced tool calls and text,
-    // then crashed. The banner contextualizes the partial output.
+  it('CC follow-up aborted AFTER producing output: prior exchange keeps its content', () => {
     const { map, id } = makeThread();
     map.get(id)!.meta.channel = 'claude_code';
     const now = Date.now();
     const t = (offset: number) => new Date(now + offset).toISOString();
 
     insertEvents(map, id, [
-      // Exchange 1: original CC work
       { type: 'MessageReceived', text: 'Fix the bug', channel: 'claude_code', created: t(-120000) },
       { type: 'SessionStarted', session_id: 's1', created: t(-119000) },
       { type: 'CodingAgentToolCalled', name: 'Edit', args: {}, created: t(-110000) },
       { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok', created: t(-109000) },
       { type: 'CodingAgentIdled', has_changes: false, created: t(-100000) },
-      // Exchange 2: follow-up → CC worked, then crashed
       { type: 'MessageReceived', text: 'Now fix tests', channel: 'claude_code', created: t(-50000) },
       { type: 'CodingAgentToolCalled', name: 'Read', args: {}, description: 'Reading test file', created: t(-48000) },
       { type: 'CodingAgentToolResult', name: 'Read', result: 'ok', created: t(-47000) },
@@ -4401,49 +4513,30 @@ describe('Bug: aborted exchange without response content must NOT show interrupt
     ]);
 
     const exchanges = getExchanges(map, id);
-    expect(exchanges).toHaveLength(2);
-
-    // Exchange 2: aborted after producing output
+    expect(exchanges).toHaveLength(3);
     const followUp = exchanges[1];
-    expect(exchangeStatus(followUp, '', true, false, true)).toBe('aborted');
-
-    // HAS visible response content — banner should show
+    expect(exchangeStatus(followUp, '', false, false, true)).toBe('aborted');
     expect(exchangeResponseText(followUp)).toBe('Looking at the test failures...');
-    expect(exchangeResponseEvents(followUp).length).toBeGreaterThan(0);
-
-    const hasResponse = !!exchangeResponseText(followUp);
-    const hasEvents = exchangeResponseEvents(followUp).length > 0;
-    const shouldShowBanner = hasResponse || hasEvents;
-    expect(shouldShowBanner).toBe(true);
+    expect(exchanges[2].userEvent.type).toBe('ResponseAborted');
   });
 
-  it('chat exchange aborted before any output → no banner', () => {
-    // Same scenario but for a regular chat thread (not CC).
+  it('chat exchange aborted: AbortPanel boundary opens after the original', () => {
     const { map, id } = makeThread();
     const now = Date.now();
     const t = (offset: number) => new Date(now + offset).toISOString();
 
     insertEvents(map, id, [
-      // Exchange 1: completed chat
       { type: 'MessageReceived', text: 'Hello', channel: 'chat', created: t(-120000) },
       { type: 'TextStreamed', text: 'Hi there!', created: t(-119000) },
       { type: 'ResponseGenerated', created: t(-118000) },
-      // Exchange 2: follow-up aborted immediately
       { type: 'MessageReceived', text: 'Now what?', channel: 'chat', created: t(-50000) },
       { type: 'ResponseAborted', created: t(-49000) },
     ]);
 
     const exchanges = getExchanges(map, id);
-    expect(exchanges).toHaveLength(2);
-
-    const followUp = exchanges[1];
-    expect(exchangeStatus(followUp, '', true)).toBe('aborted');
-    expect(exchangeResponseText(followUp)).toBe('');
-    expect(exchangeResponseEvents(followUp).length).toBe(0);
-
-    const hasResponse = !!exchangeResponseText(followUp);
-    const hasEvents = exchangeResponseEvents(followUp).length > 0;
-    expect(hasResponse || hasEvents).toBe(false);
+    expect(exchanges).toHaveLength(3);
+    expect(exchangeStatus(exchanges[1], '', false)).toBe('aborted');
+    expect(exchanges[2].userEvent.type).toBe('ResponseAborted');
   });
 });
 
@@ -4547,7 +4640,7 @@ describe('CC stale resume — SessionEnded(stale_resume) must not cause aborted 
     const thread = map.get(id)!;
     expect(thread.meta.status).toBe('running');
     // displaySection should be 'running', not 'review' or 'history'
-    expect(displaySection(thread.meta.section, thread.meta.status, thread.meta.pinned, thread.meta.activeChildrenCount > 0)).toBe('running');
+    expect(displaySection(thread.meta.section, thread.meta.status, thread.meta.saved, thread.meta.activeChildrenCount > 0, thread.meta.ccHasChanges)).toBe('active');
   });
 });
 
@@ -4649,6 +4742,58 @@ describe('stale exchange recovery (incomplete last exchange)', () => {
     const status = exchangeStatus(exchanges[0], '', true, false, false, false);
     expect(status).toBe('streaming');
   });
+
+  // Regression: chat follow-up posted while a prior request was mid-flight ended
+  // up showing "Aborted ⚠" once the agent finished and the thread idled.
+  // The agentic loop folds the follow-up into the running prompt via
+  // UserPromptInjected (with injected_message_id matching the new MR), and the
+  // ResponseGenerated carries the ORIGINAL request_event_id — so it routes back
+  // to the prior exchange. The follow-up exchange is left with only the
+  // absorbed UPI as its sole step, which the threadIdle stale-detection
+  // fallback misread as a crash.
+  it('chat follow-up absorbed via UserPromptInjected is NOT aborted once thread idles', () => {
+    seqCounter = 1;
+    const { map, id } = makeThread('upi-folded-1', 'idle');
+
+    insertEvents(map, id, [
+      // Prior message — agentic loop is mid-stream when the follow-up arrives.
+      { type: 'MessageReceived', text: 'ferdig', channel: 'chat', created: t(-300000), event_id: 'msg-A' },
+      { type: 'Thinking', text: 'analyzing', request_event_id: 'msg-A', created: t(-299000) } as ThreadEvent,
+      { type: 'ToolCalled', name: 'sql_query', args: {}, description: 'Querying...', request_event_id: 'msg-A', created: t(-298000) } as ThreadEvent,
+      { type: 'ToolResult', name: 'sql_query', result: 'ok', request_event_id: 'msg-A', created: t(-297000) } as ThreadEvent,
+      // Follow-up message — user posts while loop is still working.
+      { type: 'MessageReceived', text: 'men kan ikke ha dette hele tiden', channel: 'chat', created: t(-296000), event_id: 'msg-B' },
+      // More work for A — pre-injection, still belongs to A.
+      { type: 'ToolCalled', name: 'check_creds', args: {}, description: 'Checking creds...', request_event_id: 'msg-A', created: t(-295000) } as ThreadEvent,
+      { type: 'ToolResult', name: 'check_creds', result: 'ok', request_event_id: 'msg-A', created: t(-294000) } as ThreadEvent,
+      // Engine injects the follow-up into the running prompt — split point.
+      { type: 'UserPromptInjected', text: 'men kan ikke ha dette hele tiden', injected_message_id: 'msg-B', request_event_id: 'msg-A', created: t(-293000) } as ThreadEvent,
+      // Post-injection events answer B even though they keep A's req_id.
+      { type: 'TextStreamed', text: 'Combined answer', request_event_id: 'msg-A', created: t(-292000) } as ThreadEvent,
+      { type: 'ResponseGenerated', text: 'Combined answer', request_event_id: 'msg-A', created: t(-291000) } as ThreadEvent,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(2);
+
+    // Exchange A: pre-injection work only. No terminal — non-last with steps
+    // → 'interrupted' ("Continued below ↳"). The response continues in the
+    // follow-up exchange after the UPI absorbed the new prompt.
+    expect(exchanges[0].userEvent.type).toBe('MessageReceived');
+    expect((exchanges[0].userEvent as { text: string }).text).toBe('ferdig');
+    expect(exchanges[0].steps.map(s => s.event.type)).toEqual([
+      'Thinking', 'ToolCalled', 'ToolResult', 'ToolCalled', 'ToolResult',
+    ]);
+    expect(exchangeStatus(exchanges[0], '', false, false, false, true)).toBe('interrupted');
+
+    // Exchange B: UPI + post-injection work + final response.
+    expect(exchanges[1].userEvent.type).toBe('MessageReceived');
+    expect((exchanges[1].userEvent as { text: string }).text).toBe('men kan ikke ha dette hele tiden');
+    expect(exchanges[1].steps.map(s => s.event.type)).toEqual([
+      'UserPromptInjected', 'TextStreamed', 'ResponseGenerated',
+    ]);
+    expect(exchangeStatus(exchanges[1], '', true, false, false, true)).toBe('done');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -4704,5 +4849,279 @@ describe('CC SessionEnded(changes_proposed) without preceding CodingAgentIdled',
     const exchanges = getExchanges(map, id);
     const status = exchangeStatus(exchanges[0], '', true, false, true);
     expect(status).toBe('done');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Chat mid-flight injection: a follow-up MR lands while the parent's agentic
+// loop is still running. The loop folds the new prompt in via UPI and keeps
+// emitting events under the parent's request_event_id; the parent must keep
+// its 'Working' state and pending spinners until the real terminator lands,
+// and the follow-up's absorbed UPI must read as 'done', not the threadIdle
+// stale-detector's 'aborted'.
+// ---------------------------------------------------------------------------
+describe('chat follow-up while parent loop still running', () => {
+  const t = (offset: number) => new Date(Date.now() + offset).toISOString();
+
+  it('parent mid-flight is NOT done and pending step stays a spinner when follow-up arrives', () => {
+    seqCounter = 1;
+    const { map, id } = makeThread('parent-midflight-1', 'running');
+
+    insertEvents(map, id, [
+      // Parent message — agentic loop starts processing.
+      { type: 'MessageReceived', text: 'fix the script', channel: 'chat', created: t(-30000), event_id: 'parent-mr' },
+      { type: 'Thinking', text: 'analyzing', request_event_id: 'parent-mr', created: t(-29000) } as ThreadEvent,
+      { type: 'ToolCalled', name: 'run_python', args: {}, description: 'Running Python code...', request_event_id: 'parent-mr', created: t(-25000) } as ThreadEvent,
+      { type: 'ToolResult', name: 'run_python', result: 'ok', request_event_id: 'parent-mr', created: t(-24000) } as ThreadEvent,
+      { type: 'Thinking', text: 'now python again', request_event_id: 'parent-mr', created: t(-22000) } as ThreadEvent,
+      { type: 'ToolCalled', name: 'run_python', args: {}, description: 'Running Python code...', request_event_id: 'parent-mr', created: t(-20000) } as ThreadEvent,
+      // ↑ No matching ToolResult yet — Python is still running.
+      // User sends a follow-up while the Python tool is still in flight.
+      { type: 'MessageReceived', text: 'Uuhh fix the script?', channel: 'chat', created: t(-10000), event_id: 'followup-mr' },
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(2);
+
+    // Parent exchange: it is NOT the last (the follow-up is) but the agentic
+    // loop is still running. The thread DB confirms this — status is 'running'.
+    // Status must NOT be 'done' yet.
+    const parentStatus = exchangeStatus(exchanges[0], '', /* isLast */ false, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ false);
+    expect(parentStatus).not.toBe('done');
+
+    // Pending step (the second run_python) must NOT be auto-resolved to ✓
+    // while the agent is still actively processing (thread still 'running').
+    const events = exchangeResponseEvents(exchanges[0], 0, /* isLast */ false);
+    const pythonSteps = events.filter(e => e.type === 'step' && /python/i.test((e as { description?: string }).description ?? ''));
+    expect(pythonSteps).toHaveLength(2);
+    const lastPython = pythonSteps[pythonSteps.length - 1] as { success: boolean | null };
+    expect(lastPython.success).toBeNull(); // spinner, not ✓
+  });
+
+  // Verbatim event shape from a production thread: parent emits two
+  // run_python tool calls, follow-up MR lands while the second is in flight,
+  // engine drains injection and emits UPI absorbing into the follow-up,
+  // ResponseGenerated routes back to the parent via request_event_id.
+  it('production-style absorbed UPI: follow-up status is done, not aborted', () => {
+    seqCounter = 1;
+    const { map, id } = makeThread('upi-prod', 'idle');
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: "No way! I'm not going into the terminal, pls fix", channel: 'chat', created: '2026-05-04T11:51:39.438Z', event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31' },
+      { type: 'MemorySearched', results: 5, request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:51:54.537Z' } as ThreadEvent,
+      { type: 'Thinking', text: '', context_tokens:5147, context_messages: 1, request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:51:54.557Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'run_bash', args: {}, description: 'Running bash...', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:52:00.358Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'run_bash', result: 'ok', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:52:00.403Z' } as ThreadEvent,
+      { type: 'Thinking', text: '', context_tokens:7242, context_messages: 3, request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:52:00.410Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'run_python', args: {}, description: 'Running Python code...', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:52:17.583Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'run_python', result: 'ok', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:52:17.789Z' } as ThreadEvent,
+      { type: 'Thinking', text: '', context_tokens:7634, context_messages: 5, request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:52:17.793Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'run_python', args: {}, description: 'Running Python code...', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:52:30.133Z' } as ThreadEvent,
+      // User sends follow-up while the second run_python is executing.
+      { type: 'MessageReceived', text: 'Uuhh fix the script?', channel: 'chat', created: '2026-05-04T11:52:38.205Z', event_id: 'a7d179ab-f451-4ff7-89dd-61ed413aaa88' },
+      { type: 'ToolResult', name: 'run_python', result: 'ok', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:01.080Z' } as ThreadEvent,
+      { type: 'UserPromptInjected', text: 'Uuhh fix the script?', mode: 'human', injected_message_id: 'a7d179ab-f451-4ff7-89dd-61ed413aaa88', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:01.092Z' } as ThreadEvent,
+      { type: 'Thinking', text: '', context_tokens:15806, context_messages: 8, request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:01.098Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'emit_event', args: {}, description: 'Emitting event…', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:27.707Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'emit_event', result: 'ok', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:27.731Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'run_claude', args: {}, description: 'Executing Claude Code…', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:27.737Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'run_claude', result: 'ok', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:27.768Z' } as ThreadEvent,
+      { type: 'Thinking', text: '', context_tokens:16425, context_messages: 10, request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:27.776Z' } as ThreadEvent,
+      { type: 'TextStreamed', text: 'Released first…', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:31.886Z' } as ThreadEvent,
+      { type: 'ResponseGenerated', text: 'Released first…', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:31.893Z' } as ThreadEvent,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(2);
+    // Parent owns pre-injection work only; the response splits to the follow-up.
+    expect(exchanges[0].steps.length).toBeGreaterThan(0);
+    expect(exchanges[0].steps.some(s => s.event.type === 'ResponseGenerated')).toBe(false);
+    // Follow-up: UPI plus everything from injection onwards.
+    const followupTypes = exchanges[1].steps.map(s => s.event.type);
+    expect(followupTypes[0]).toBe('UserPromptInjected');
+    expect(followupTypes).toContain('ResponseGenerated');
+
+    const followupStatus = exchangeStatus(exchanges[1], '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ true);
+    expect(followupStatus).toBe('done');
+  });
+
+  // Empty non-last chat exchange (no steps, no prior active, thread still
+  // running) — the engine moved on to a later exchange. Must not register as
+  // an ACTIVE status, otherwise the next exchange's priorActive gate flips it
+  // to 'queued' indefinitely.
+  it('empty non-last chat exchange does not lock the next exchange into queued', () => {
+    seqCounter = 1;
+    const { map, id } = makeThread('empty-non-last-1', 'running');
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'A done', channel: 'chat', created: t(-30000) },
+      { type: 'ResponseGenerated', text: 'A reply', created: t(-29000) } as ThreadEvent,
+      // B never gets processed (no steps).
+      { type: 'MessageReceived', text: 'B empty', channel: 'chat', created: t(-20000) },
+      // C is the active exchange.
+      { type: 'MessageReceived', text: 'C running', channel: 'chat', created: t(-10000) },
+      { type: 'ToolCalled', name: 'run_bash', args: {}, description: 'Running bash...', created: t(-9000) } as ThreadEvent,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(3);
+    const bStatus = exchangeStatus(exchanges[1], '', /* isLast */ false, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ false);
+    expect(bStatus).toBe('done');
+    // Sanity: not in ACTIVE_STATUSES.
+    expect(isActive(bStatus)).toBe(false);
+  });
+
+  // Synthesized minimal version of the production scenario above.
+  it('follow-up with absorbed UPI is done after parent ResponseGenerated, not aborted', () => {
+    seqCounter = 1;
+    const { map, id } = makeThread('followup-absorbed-real', 'idle');
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'fix the script', channel: 'chat', created: t(-30000), event_id: 'parent-mr-2' },
+      { type: 'Thinking', text: 'analyzing', request_event_id: 'parent-mr-2', created: t(-29000) } as ThreadEvent,
+      { type: 'ToolCalled', name: 'run_python', args: {}, description: 'Running Python code...', request_event_id: 'parent-mr-2', created: t(-25000) } as ThreadEvent,
+      // Follow-up arrives mid-Python.
+      { type: 'MessageReceived', text: 'Uuhh fix the script?', channel: 'chat', created: t(-22000), event_id: 'followup-mr-2' },
+      // Python finally returns; engine drains injection and emits UPI.
+      { type: 'ToolResult', name: 'run_python', result: 'ok', request_event_id: 'parent-mr-2', created: t(-15000) } as ThreadEvent,
+      { type: 'UserPromptInjected', text: 'Uuhh fix the script?', mode: 'human', injected_message_id: 'followup-mr-2', request_event_id: 'parent-mr-2', created: t(-14990) } as ThreadEvent,
+      { type: 'Thinking', text: 'now incorporating user note', request_event_id: 'parent-mr-2', created: t(-14000) } as ThreadEvent,
+      { type: 'TextStreamed', text: 'Released first…', request_event_id: 'parent-mr-2', created: t(-2000) } as ThreadEvent,
+      { type: 'ResponseGenerated', text: 'Released first…', request_event_id: 'parent-mr-2', created: t(-1000) } as ThreadEvent,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(2);
+
+    // Follow-up owns the UPI marker plus the post-injection thinking, text
+    // streaming, and final ResponseGenerated.
+    expect(exchanges[1].userEvent.type).toBe('MessageReceived');
+    expect((exchanges[1].userEvent as { text: string }).text).toBe('Uuhh fix the script?');
+    expect(exchanges[1].steps.map(s => s.event.type)).toEqual([
+      'UserPromptInjected', 'Thinking', 'TextStreamed', 'ResponseGenerated',
+    ]);
+
+    const followupStatus = exchangeStatus(exchanges[1], '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ true);
+    expect(followupStatus).toBe('done');
+  });
+
+  // Verbatim production payload from personal workspace thread
+  // a81d6adc-6647-4cf4-9589-edb58eb57571 (2026-05-05). Same MR1 → many tools →
+  // MR2 mid-flight → tools → UPI → tools → ResponseGenerated shape, but using
+  // the actual UUIDs and timestamps so a regression that only hits a specific
+  // ordering or id collision shows up here.
+  it('production thread: absorbed UPI follow-up resolves to done', () => {
+    seqCounter = 1;
+    const { map, id } = makeThread('audit-prod', 'idle');
+    const MR1 = 'c4f1ef84-48c2-4f5a-8319-e79d954c3722';
+    const MR2 = 'ec64bf8b-f37e-4b22-beb5-e76a340f9175';
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'La oss droppe påminnelser trigger - og fjerne ref til den', channel: 'chat', created: '2026-05-05T06:11:30.599Z', event_id: MR1 },
+      { type: 'MemorySearched', results: 60, request_event_id: MR1, created: '2026-05-05T06:11:32.094Z' } as ThreadEvent,
+      { type: 'Thinking', text: '', context_tokens: 6934, context_messages: 1, request_event_id: MR1, created: '2026-05-05T06:11:32.137Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'list_triggers', args: {}, description: 'Listing triggers...', request_event_id: MR1, created: '2026-05-05T06:11:35.045Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'list_triggers', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:35.069Z' } as ThreadEvent,
+      { type: 'Thinking', text: '', context_tokens: 7668, context_messages: 3, request_event_id: MR1, created: '2026-05-05T06:11:35.090Z' } as ThreadEvent,
+      // MR2 lands while MR1 is still working.
+      { type: 'MessageReceived', text: 'for calendar altså', channel: 'chat', created: '2026-05-05T06:11:39.201Z', event_id: MR2 },
+      { type: 'ToolCalled', name: 'delete_trigger', args: {}, description: 'Deleting trigger...', request_event_id: MR1, created: '2026-05-05T06:11:41.445Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'delete_trigger', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:41.479Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'delete_file', args: {}, description: 'Deleting file...', request_event_id: MR1, created: '2026-05-05T06:11:41.489Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'delete_file', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:41.544Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'delete_file', args: {}, description: 'Deleting file...', request_event_id: MR1, created: '2026-05-05T06:11:41.549Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'delete_file', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:41.568Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'grep_files', args: {}, description: 'Grepping...', request_event_id: MR1, created: '2026-05-05T06:11:41.572Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'grep_files', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:42.239Z' } as ThreadEvent,
+      // Engine drains injection and emits UPI.
+      { type: 'UserPromptInjected', text: 'for calendar altså', mode: 'human', injected_message_id: MR2, request_event_id: MR1, created: '2026-05-05T06:11:42.244Z' } as ThreadEvent,
+      { type: 'Thinking', text: '', context_tokens: 8329, context_messages: 6, request_event_id: MR1, created: '2026-05-05T06:11:42.248Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'read_file', args: {}, description: 'Reading file...', request_event_id: MR1, created: '2026-05-05T06:11:47.792Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'read_file', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:47.802Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'run_bash', args: {}, description: 'Running bash...', request_event_id: MR1, created: '2026-05-05T06:11:47.807Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'run_bash', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:48.031Z' } as ThreadEvent,
+      { type: 'Thinking', text: '', context_tokens: 8630, context_messages: 8, request_event_id: MR1, created: '2026-05-05T06:11:48.041Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'edit_file', args: {}, description: 'Editing file...', request_event_id: MR1, created: '2026-05-05T06:11:56.694Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'edit_file', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:56.740Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'edit_file', args: {}, description: 'Editing file...', request_event_id: MR1, created: '2026-05-05T06:11:56.746Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'edit_file', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:56.770Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'grep_files', args: {}, description: 'Grepping...', request_event_id: MR1, created: '2026-05-05T06:11:56.774Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'grep_files', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:56.787Z' } as ThreadEvent,
+      { type: 'Thinking', text: '', context_tokens: 9013, context_messages: 10, request_event_id: MR1, created: '2026-05-05T06:11:56.791Z' } as ThreadEvent,
+      { type: 'TextStreamed', text: 'Ferdig.', request_event_id: MR1, created: '2026-05-05T06:12:00.037Z' } as ThreadEvent,
+      { type: 'ResponseGenerated', text: 'Ferdig.', request_event_id: MR1, created: '2026-05-05T06:12:00.046Z' } as ThreadEvent,
+      // ThreadSaved lands AFTER ResponseGenerated as a metadata event with
+      // no request_event_id. Without `current` being reset by the absorbed
+      // UPI, this leaks into exchange 2 → onlyStep check fails (length > 1) →
+      // threadIdle stale-detector flips status to 'aborted'.
+      { type: 'ThreadSaved', created: '2026-05-05T06:12:00.056Z' } as ThreadEvent,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(2);
+    // Exchange 2 starts with the UPI and includes everything after — the
+    // post-injection tools and the final ResponseGenerated.
+    expect(exchanges[1].userEvent.type).toBe('MessageReceived');
+    expect((exchanges[1].userEvent as { text: string }).text).toBe('for calendar altså');
+    const followupTypes = exchanges[1].steps.map(s => s.event.type);
+    expect(followupTypes[0]).toBe('UserPromptInjected');
+    expect(followupTypes[followupTypes.length - 1]).toBe('ResponseGenerated');
+
+    const followupStatus = exchangeStatus(exchanges[1], '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ true);
+    expect(followupStatus).toBe('done');
+  });
+
+  // The injection point is a real boundary: it's the moment the agentic loop
+  // actually saw the new prompt. Pre-UPI work still belongs to the original
+  // request; everything from UPI onwards (including the final response) is
+  // the answer to the absorbed follow-up. Without this split, the user can't
+  // tell which steps reacted to which message.
+  it('post-UPI events route to the absorbed-into exchange, not the original request', () => {
+    seqCounter = 1;
+    const { map, id } = makeThread('upi-split', 'idle');
+    const MR1 = 'aaaaaaaa-1111-1111-1111-111111111111';
+    const MR2 = 'bbbbbbbb-2222-2222-2222-222222222222';
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'first', channel: 'chat', created: '2026-05-05T10:00:00.000Z', event_id: MR1 },
+      { type: 'Thinking', text: 'pre', request_event_id: MR1, created: '2026-05-05T10:00:01.000Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'pre_tool', args: {}, description: 'Pre tool...', request_event_id: MR1, created: '2026-05-05T10:00:02.000Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'pre_tool', result: 'ok', request_event_id: MR1, created: '2026-05-05T10:00:03.000Z' } as ThreadEvent,
+      // MR2 lands while the loop is still working on MR1.
+      { type: 'MessageReceived', text: 'second', channel: 'chat', created: '2026-05-05T10:00:04.000Z', event_id: MR2 },
+      // Loop finishes its current tool, then the engine drains the injection.
+      { type: 'ToolCalled', name: 'in_flight', args: {}, description: 'In-flight tool...', request_event_id: MR1, created: '2026-05-05T10:00:05.000Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'in_flight', result: 'ok', request_event_id: MR1, created: '2026-05-05T10:00:06.000Z' } as ThreadEvent,
+      // UPI lands — split point. From here onwards the loop "knows about"
+      // the follow-up.
+      { type: 'UserPromptInjected', text: 'second', mode: 'human', injected_message_id: MR2, request_event_id: MR1, created: '2026-05-05T10:00:07.000Z' } as ThreadEvent,
+      { type: 'ToolCalled', name: 'post_tool', args: {}, description: 'Post tool...', request_event_id: MR1, created: '2026-05-05T10:00:08.000Z' } as ThreadEvent,
+      { type: 'ToolResult', name: 'post_tool', result: 'ok', request_event_id: MR1, created: '2026-05-05T10:00:09.000Z' } as ThreadEvent,
+      { type: 'TextStreamed', text: 'Combined', request_event_id: MR1, created: '2026-05-05T10:00:10.000Z' } as ThreadEvent,
+      { type: 'ResponseGenerated', text: 'Combined', request_event_id: MR1, created: '2026-05-05T10:00:11.000Z' } as ThreadEvent,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(2);
+
+    // Exchange 1 owns the work BEFORE the injection: the pre-UPI tools and
+    // any work done while the prompt was sitting in the queue.
+    const ex1Steps = exchanges[0].steps.map(s => s.event.type);
+    expect(ex1Steps).toEqual([
+      'Thinking',
+      'ToolCalled', 'ToolResult',  // pre_tool
+      'ToolCalled', 'ToolResult',  // in_flight
+    ]);
+
+    // Exchange 2 owns the UPI itself plus everything from injection time on,
+    // including the final response.
+    const ex2Steps = exchanges[1].steps.map(s => s.event.type);
+    expect(ex2Steps).toEqual([
+      'UserPromptInjected',
+      'ToolCalled', 'ToolResult',  // post_tool
+      'TextStreamed',
+      'ResponseGenerated',
+    ]);
+
+    // E1 (non-last with pre-injection steps) → 'interrupted' ("Continued
+    // below ↳"). E2 (last, with full response) → 'done'.
+    expect(exchangeStatus(exchanges[0], '', /* isLast */ false, false, false, /* threadIdle */ true)).toBe('interrupted');
+    expect(exchangeStatus(exchanges[1], '', /* isLast */ true, false, false, /* threadIdle */ true)).toBe('done');
   });
 });

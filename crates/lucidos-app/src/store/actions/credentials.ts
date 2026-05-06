@@ -1,12 +1,11 @@
 import {
   credentials,
   activeInlineForm,
-  panelOverlay,
   closeInlineForm,
   showToast,
   showConfirm,
 } from '../store';
-import { toFailed } from '../types';
+import { toFailed, setLoadingIfFresh } from '../types';
 import type { AuthType, CredentialRequest } from '../types';
 import {
   listCredentials,
@@ -14,38 +13,32 @@ import {
   updateCredential,
   deleteCredentialApi,
 } from '../../api/client';
-import { navigateToAccounts } from './menu';
+import { landOnAccountsWithOverlay } from './menu';
 import { pushNavState } from './navigation';
 import { errorDetail } from '../../utils/errorDetail';
 
 export async function loadCredentials(): Promise<void> {
-  if (credentials.value.status !== 'loaded') {
-    credentials.value = { status: 'loading' };
-  }
+  setLoadingIfFresh(credentials);
   try {
     const data = await listCredentials();
     credentials.value = { status: 'loaded', data: data.credentials || [] };
   } catch (error) {
-    console.error('Failed to load credentials:', error);
     credentials.value = toFailed(error);
   }
 }
 
 export function openAddCredential(): void {
-  navigateToAccounts();
-  panelOverlay.value = { type: 'form', form: { type: 'credential' } };
+  landOnAccountsWithOverlay({ type: 'form', form: { type: 'credential' } });
   pushNavState();
 }
 
 export function openEditCredential(serviceName: string): void {
-  navigateToAccounts();
-  panelOverlay.value = { type: 'form', form: { type: 'credential', editing: serviceName } };
+  landOnAccountsWithOverlay({ type: 'form', form: { type: 'credential', editing: serviceName } });
   pushNavState();
 }
 
 export function openCredentialRequest(request: CredentialRequest): void {
-  navigateToAccounts();
-  panelOverlay.value = { type: 'form', form: { type: 'credential', request } };
+  landOnAccountsWithOverlay({ type: 'form', form: { type: 'credential', request } });
   pushNavState();
 }
 
@@ -96,7 +89,6 @@ export async function submitCredential(
     await loadCredentials();
     return true;
   } catch (error) {
-    console.error('Failed to save credential:', error);
     showToast('Failed to save credential: ' + errorDetail(error), 'error');
     return false;
   }
@@ -115,7 +107,6 @@ export async function deleteCredential(serviceName: string): Promise<void> {
       showToast(data.error || 'Failed to delete credential', 'error');
     }
   } catch (error) {
-    console.error('Failed to delete credential:', error);
     showToast('Failed to delete credential: ' + errorDetail(error), 'error');
   }
 }

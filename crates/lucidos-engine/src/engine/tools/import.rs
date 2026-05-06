@@ -74,9 +74,16 @@ impl LucidosEngine {
                     .and_then(|n| n.to_str())
                     .unwrap_or("imported_file");
 
-                let dest_relative = args
-                    .get("destination")
-                    .and_then(|v| v.as_str())
+                let dest_arg = args.get("destination").and_then(|v| v.as_str());
+                if let Some(d) = dest_arg {
+                    if crate::api::is_path_traversal(d) {
+                        return Ok(
+                            "Error: destination must be relative with no '..' components"
+                                .to_string(),
+                        );
+                    }
+                }
+                let dest_relative = dest_arg
                     .map(|s| format!("imported/{}", s.trim_start_matches("imported/")))
                     .unwrap_or_else(|| format!("imported/{}", filename));
 
@@ -108,18 +115,18 @@ impl LucidosEngine {
                     // Try pdf_extract first (for text-based PDFs), fall back to OCR (for scanned)
                     let extracted_text = match safe_extract_pdf_text(source) {
                         Ok(text) if !text.trim().is_empty() => {
-                            log!("PDF text extracted successfully for {:?}", source);
+                            log!("[Import] PDF text extracted successfully for {:?}", source);
                             Some(text)
                         }
                         Ok(_) | Err(_) => {
-                            log!("PDF text extraction failed, trying OCR for {:?}", source);
+                            log!("[Import] PDF text extraction failed, trying OCR for {:?}", source);
                             match extract_text_with_ocr(source) {
                                 Ok(text) => {
-                                    log!("OCR successful for {:?}", source);
+                                    log!("[Import] OCR successful for {:?}", source);
                                     Some(text)
                                 }
                                 Err(e) => {
-                                    log!("OCR failed for {:?}: {}", source, e);
+                                    log!("[Import] OCR failed for {:?}: {}", source, e);
                                     None
                                 }
                             }
@@ -138,7 +145,7 @@ impl LucidosEngine {
                             )
                             .await
                         {
-                            log!("Warning: Failed to write/commit extracted text: {}", e);
+                            log!("[Import] Failed to write/commit extracted text: {}", e);
                         }
 
                         // Generate summary from extracted text
@@ -203,17 +210,6 @@ impl LucidosEngine {
                                     summary: Some(summary.clone()),
                                 }))
                                 .await?;
-                            self.index_memory(
-                                MemorySource::Artifact {
-                                    path: dest_relative.clone(),
-                                    commit: commit_sha.clone(),
-                                },
-                                &format!("Imported file: {}\n{}", dest_relative, summary),
-                                Utc::now(),
-                                Some(extraction_ctx),
-                            )
-                            .await;
-
                             let short_sha = &commit_sha[..commit_sha.floor_char_boundary(7)];
                             return Ok(format!("[ACTION COMPLETED] IMPORTED: artifacts/{} (binary, {} bytes, commit: {})", dest_relative, size, short_sha));
                         }
@@ -233,7 +229,6 @@ impl LucidosEngine {
                     (summary, size, main_commit)
                 };
 
-                // Emit ArtifactImported event
                 self.event_bus
                     .emit(BusEvent::System(SystemEvent::ArtifactImported {
                         artifact_path: dest_relative.clone(),
@@ -243,35 +238,6 @@ impl LucidosEngine {
                         summary: summary.clone(),
                     }))
                     .await?;
-
-                // Index in memory - send raw content to Flash for fact extraction
-                if let Ok(content) = self.artifact_manager.read_artifact(&dest_relative) {
-                    self.index_artifact_memory(
-                        &dest_relative,
-                        &content,
-                        &commit_sha,
-                        Utc::now(),
-                        Some(extraction_ctx),
-                    )
-                    .await;
-                } else {
-                    // Fallback: index summary if content isn't readable
-                    let fallback = if let Some(ref s) = summary {
-                        format!("Imported file: {}\n{}", dest_relative, s)
-                    } else {
-                        format!("Imported file: {}", dest_relative)
-                    };
-                    self.index_memory(
-                        MemorySource::Artifact {
-                            path: dest_relative.clone(),
-                            commit: commit_sha.clone(),
-                        },
-                        &fallback,
-                        Utc::now(),
-                        Some(extraction_ctx),
-                    )
-                    .await;
-                }
 
                 let short_sha = &commit_sha[..commit_sha.floor_char_boundary(7)];
                 Ok(format!(

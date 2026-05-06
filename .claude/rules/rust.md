@@ -32,7 +32,7 @@ Lucidos uses **event sourcing** — the `events` table is the central source of 
 |---|---|
 | `events` | Event store. Columns: `id` (uuid), `event_type` (text), `payload` (jsonb), `created` (timestamptz), `thread_id` (uuid), `sequence` (bigserial), `aggregate` (text), `aggregate_id` (text). |
 | `changes` | CC proposed changes. Columns: `id`, `request_id`, `branch_name`, `repo_root`, `description`, `file_count`, `files` (text[]), `requires_restart`, `status` (`pending`/`applied`/`discarded`), `created_at`, `resolved_at`, `thread_id`. |
-| `thread_summaries` | Projection — cached thread metadata (title, source, last_activity, message_count, is_pinned, has_response). Maintained by EventBus. |
+| `thread_summaries` | Projection — cached thread metadata (title, source, last_activity, message_count, is_saved, has_response). Maintained by EventBus. |
 | `notifications` | Projection — from `NotificationCreated` events. |
 | `preferences` | Key-value store with optional `device_id` scoping. |
 | `memory_entries` | Vector memory with pgvector embeddings (384-dim). |
@@ -55,7 +55,7 @@ SELECT thread_id, branch_name, description, status FROM changes WHERE status = '
 
 ### Key event types
 
-- **Thread lifecycle:** `SessionStarted`, `SessionEnded`, `ThreadTitleGenerated`, `ThreadPinned`/`ThreadUnpinned`
+- **Thread lifecycle:** `SessionStarted`, `SessionEnded`, `ThreadTitleGenerated`, `ThreadSaved`/`ThreadUnsaved`/`ThreadArchived`
 - **Chat:** `MessageReceived`, `ResponseGenerated`, `ResponseCanceled`, `ResponseAborted`, `TextStreamed`, `Thinking`
 - **Claude Code:** `ClaudeCodeUserMessageSent`, `ClaudeCodeTextStreamed`, `ClaudeCodeToolCalled`, `ClaudeCodeToolResult`, `ClaudeCodeIdled`
 - **Changes:** `ChangeProposed`, `ChangeApplied`, `ChangeDiscarded`

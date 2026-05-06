@@ -20,6 +20,18 @@ export function getDbPort(): string {
   return cachedDbPort;
 }
 
+/** Wipe every composing thread and its compose payload so siblings of
+ *  drafts.spec don't see each other's leftover compose state piled up in
+ *  the New section. The DB resets between Playwright projects but not
+ *  between tests in the same project. compose_images is NOT NULL with
+ *  default '[]'::jsonb — clear it to the empty-array literal, not NULL. */
+export function clearAllDrafts(): void {
+  psql([
+    "UPDATE thread_summaries SET state = 'discarded', compose_text = '', compose_images = '[]'::jsonb, compose_mode = NULL WHERE state = 'composing'",
+    "UPDATE thread_summaries SET compose_text = '', compose_images = '[]'::jsonb, compose_mode = NULL WHERE compose_text <> '' OR compose_images <> '[]'::jsonb OR compose_mode IS NOT NULL",
+  ].join(';\n'));
+}
+
 /** Run SQL via stdin to avoid shell escaping issues with JSON payloads. */
 export function psql(sql: string): string {
   const dbPort = getDbPort();
@@ -50,7 +62,7 @@ export function createCCThreadWithChange(titlePrefix: string, suffix: string): {
   const idleEventId = randomUUID();
   const requestId = randomUUID();
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_pinned, has_response, status, section, is_cc, active_children_count, cc_has_changes, cc_requires_restart, cc_is_external_repo) VALUES ('${threadId}', '${titlePrefix} ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'unread', true, 0, true, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count, cc_has_changes, cc_requires_restart, cc_is_external_repo) VALUES ('${threadId}', '${titlePrefix} ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, true, false, false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${msgEventId}', 'MessageReceived', '{"text":"test","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${respEventId}', 'ResponseGenerated', '{"text":"Done.","images":[]}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${idleEventId}', 'CodingAgentIdled', '{"has_changes":true,"is_external_repo":false,"requires_restart":false}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,

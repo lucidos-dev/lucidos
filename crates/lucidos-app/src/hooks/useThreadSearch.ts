@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { threadSearchQuery, threadSearchResults } from '../store/store';
 import { searchThreads } from '../api/threads';
+import { toFailed } from '../store/types';
 import { composeHandlers } from '../components/chat/promptFocus';
 import { moveHighlight, selectHighlighted } from '../components/drawer/ThreadDrawer';
 
@@ -32,7 +33,7 @@ export function useThreadSearch() {
         }
       } catch (e) {
         if (!controller.signal.aborted) {
-          threadSearchResults.value = { status: 'failed', error: String(e) };
+          threadSearchResults.value = toFailed(e);
         }
       }
     }, 300);

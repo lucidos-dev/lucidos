@@ -1,20 +1,188 @@
 use super::*;
+use axum::body::Body;
+use tokio::io::AsyncWriteExt;
+
+/// SSE keep-alive cadence — sent as an SSE comment line so the connection
+/// doesn't appear idle to intermediaries / EventSource. Matches the prior
+/// `KeepAlive::new().interval(...)` value so observable behavior is unchanged.
+const SSE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Inter-task pipe size between the gzip encoder writer and the response body
+/// reader. 64 KiB is large enough that a burst of small events doesn't have to
+/// round-trip through the writer for every single frame, but small enough to
+/// bound memory if a client stalls.
+const GZIP_PIPE_BUF_BYTES: usize = 64 * 1024;
 
 pub(super) async fn global_events(
     State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    headers: HeaderMap,
+) -> Response {
     let rx = state.engine.event_bus.subscribe();
-    let stream = BroadcastStream::new(rx)
-        .filter_map(|r| match r {
-            Ok(emitted) => Some(emitted.to_sse_json()),
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                log!("[SSE] Event stream lagged by {} events", n);
-                None
-            }
-        })
-        .map(|json| Ok(Event::default().data(json)));
+    let json_stream = BroadcastStream::new(rx).map(|r| match r {
+        Ok(emitted) => emitted.to_sse_json(),
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+            log!("[SSE] Event stream lagged by {} events", n);
+            lagged_event_json(n)
+        }
+    });
 
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(30)))
+    if accepts_gzip(&headers) {
+        gzipped_sse_response(json_stream)
+    } else {
+        plain_sse_response(json_stream)
+    }
+}
+
+/// Plain (uncompressed) SSE response — same shape as the pre-gzip handler.
+/// Used when the client doesn't advertise `gzip` in `Accept-Encoding`.
+fn plain_sse_response<S>(json_stream: S) -> Response
+where
+    S: Stream<Item = String> + Send + 'static,
+{
+    let event_stream = json_stream.map(|json| Ok::<_, Infallible>(Event::default().data(json)));
+    Sse::new(event_stream)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
+        .into_response()
+}
+
+/// Gzip-compressed SSE response. Uses a streaming `GzipEncoder` with explicit
+/// per-event `flush()` (Z_SYNC_FLUSH) so each event reaches the client as
+/// soon as it's emitted — not buffered until the encoder fills its window.
+///
+/// Wire format is identical to plain SSE (`data: <json>\n\n` per event,
+/// `:keepalive\n\n` for keep-alives) — only the transport bytes are
+/// compressed, so EventSource parsers in browsers / curl `--compressed`
+/// see the same event stream.
+fn gzipped_sse_response<S>(json_stream: S) -> Response
+where
+    S: Stream<Item = String> + Send + 'static,
+{
+    use async_compression::tokio::write::GzipEncoder;
+    use async_compression::Level;
+    use tokio_util::io::ReaderStream;
+
+    let (writer, reader) = tokio::io::duplex(GZIP_PIPE_BUF_BYTES);
+    let body_stream = ReaderStream::new(reader);
+
+    tokio::spawn(async move {
+        // Avoid per-event allocations: write the SSE wire framing in fixed
+        // byte slices around the borrowed JSON payload. The encoder buffers
+        // internally until flush(), so the three writes coalesce into one
+        // Z_SYNC_FLUSH block on the wire.
+        const DATA_PREFIX: &[u8] = b"data: ";
+        const FRAME_SUFFIX: &[u8] = b"\n\n";
+        const KEEPALIVE_FRAME: &[u8] = b":keepalive\n\n";
+
+        enum Frame {
+            Data(String),
+            Keepalive,
+        }
+
+        let mut encoder = GzipEncoder::with_quality(writer, Level::Fastest);
+        let mut keepalive = tokio::time::interval(SSE_KEEPALIVE_INTERVAL);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First tick fires immediately — skip it so we don't send a keep-alive
+        // before the first real event has had a chance to arrive.
+        keepalive.tick().await;
+        tokio::pin!(json_stream);
+        loop {
+            // Decide what to write inside the select (no encoder borrows here),
+            // then do the IO sequentially below so each write's `&mut encoder`
+            // borrow is released before the next.
+            let frame = tokio::select! {
+                item = json_stream.next() => match item {
+                    Some(json) => Frame::Data(json),
+                    None => break,
+                },
+                _ = keepalive.tick() => Frame::Keepalive,
+            };
+            // Sequential `?` short-circuits on the first IO error (client
+            // gone), avoiding extra writes into a half-broken encoder.
+            let write_result: std::io::Result<()> = async {
+                match &frame {
+                    Frame::Data(json) => {
+                        encoder.write_all(DATA_PREFIX).await?;
+                        encoder.write_all(json.as_bytes()).await?;
+                        encoder.write_all(FRAME_SUFFIX).await?;
+                    }
+                    Frame::Keepalive => {
+                        encoder.write_all(KEEPALIVE_FRAME).await?;
+                    }
+                }
+                // flush() emits a Z_SYNC_FLUSH block — bytes leave the
+                // encoder immediately so latency stays close to plain SSE.
+                encoder.flush().await
+            }
+            .await;
+            if write_result.is_err() {
+                break;
+            }
+        }
+        // Best-effort gzip trailer; client may have already disconnected.
+        let _ = encoder.shutdown().await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CONTENT_ENCODING, "gzip")
+        .header(header::CACHE_CONTROL, "no-cache")
+        // Hint to reverse proxies (e.g. nginx) not to buffer the body.
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(body_stream))
+        .expect("static SSE response builder is infallible")
+}
+
+/// Returns true iff `Accept-Encoding` advertises gzip with a non-zero
+/// quality. Honors RFC 7231 §5.3.5: a `q=0` weight on `gzip` is an
+/// explicit opt-out (e.g. for clients with broken decompressors), so
+/// callers must skip compression even though the token is present.
+/// Strict on the token name — `x-gzip` (a distinct historical encoding)
+/// is not accepted.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    let Some(val) = headers.get(header::ACCEPT_ENCODING) else {
+        return false;
+    };
+    let Ok(s) = val.to_str() else {
+        return false;
+    };
+    s.split(',').any(|piece| {
+        let mut params = piece.split(';');
+        let token = params.next().unwrap_or("").trim();
+        if !token.eq_ignore_ascii_case("gzip") {
+            return false;
+        }
+        // Default weight is 1.0 when no q parameter is present.
+        params.all(|param| {
+            let Some((name, value)) = param.split_once('=') else {
+                return true;
+            };
+            if !name.trim().eq_ignore_ascii_case("q") {
+                return true;
+            }
+            // Treat unparseable / explicitly-zero weights as opt-out.
+            // (Per RFC, valid q is in [0, 1] with up to 3 decimals; any
+            // strictly positive value keeps gzip acceptable.)
+            value
+                .trim()
+                .parse::<f32>()
+                .map(|q| q > 0.0)
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// Wire frame the frontend sees when its broadcast subscriber falls behind the
+/// 4096-event buffer. Without this, lagged events vanish silently and the UI
+/// keeps a "Thinking" spinner forever waiting for a `ResponseGenerated` that
+/// already happened. The frontend treats this as a signal to resync loaded
+/// thread state from `/api/threads/<id>/events`.
+fn lagged_event_json(count: u64) -> String {
+    serde_json::json!({
+        "type": "Lagged",
+        "data": { "count": count },
+    })
+    .to_string()
 }
 
 pub(super) async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -69,9 +237,19 @@ fn read_app_version() -> String {
 /// Spawn `web-dev.sh --engine-only` to rebuild and restart the engine binary,
 /// leaving Vite and parent scripts untouched. Errors return `{"error": msg}`
 /// so the UI can show the actual reason instead of a silent failure.
+///
+/// Before spawning the restart script: enumerates all in-flight chat + CC
+/// threads and pre-emits boundary events with `actor: <user>` so the post-
+/// restart timeline reads "You restarted" instead of "⚙ System restarted".
+/// Recovery on the new engine sees these threads are already terminated and
+/// skips them.
 pub(super) async fn restart_engine(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    state.engine.abort_in_flight_for_restart(actor).await;
+
     let script = crate::paths::script("web-dev.sh").map_err(|e| {
         log!("[Restart] {}", e);
         (
@@ -112,7 +290,7 @@ pub(super) async fn restart_engine(
         }
         Err(e) => {
             log!(
-                "Failed to open log file for restart: {} — spawning with no output",
+                "[Restart] Failed to open log file for restart: {} — spawning with no output",
                 e
             );
             cmd.stdout(std::process::Stdio::null())
@@ -261,12 +439,29 @@ pub(super) struct EventsQueryParams {
     since: Option<String>,
     #[serde(default)]
     until: Option<String>,
+    #[serde(default)]
+    before_event_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    after_event_id: Option<uuid::Uuid>,
     #[serde(default = "default_events_limit")]
     limit: i64,
 }
 
 fn default_events_limit() -> i64 {
     100
+}
+
+/// Reject paging requests that pin both ends of the cursor at once: there's
+/// no coherent semantics for "strictly older than X AND strictly newer than
+/// Y" in a paging API. Returned as a 400 by the HTTP handler.
+fn validate_cursor_pair(
+    before_event_id: Option<uuid::Uuid>,
+    after_event_id: Option<uuid::Uuid>,
+) -> Result<(), String> {
+    if before_event_id.is_some() && after_event_id.is_some() {
+        return Err("before_event_id and after_event_id are mutually exclusive".into());
+    }
+    Ok(())
 }
 
 /// REST endpoint to query stored events by type/time (not SSE)
@@ -277,9 +472,19 @@ pub(super) async fn query_events(
     let since = parse_optional_rfc3339(q.since.as_deref());
     let until = parse_optional_rfc3339(q.until.as_deref());
     let limit = q.limit.clamp(1, 1000);
-    let events = state
+    if let Err(msg) = validate_cursor_pair(q.before_event_id, q.after_event_id) {
+        return Err((StatusCode::BAD_REQUEST, msg));
+    }
+    let result = state
         .event_store
-        .query_events(q.event_type.as_deref(), since, until, limit)
+        .query_events_paged(
+            q.event_type.as_deref(),
+            since,
+            until,
+            q.before_event_id,
+            q.after_event_id,
+            limit,
+        )
         .await
         .map_err(|e| {
             (
@@ -287,7 +492,13 @@ pub(super) async fn query_events(
                 format!("Failed to query events: {}", e),
             )
         })?;
-    Ok(Json(events))
+    match result {
+        crate::core::store::QueryEventsResult::Events(events) => Ok(Json(events)),
+        crate::core::store::QueryEventsResult::CursorNotFound => Err((
+            StatusCode::NOT_FOUND,
+            "cursor event_id not found".to_string(),
+        )),
+    }
 }
 
 /// Well-known persisted event types — always available even in empty workspaces.
@@ -456,6 +667,44 @@ mod tests {
         assert!(validate_emittable_event_type("").is_err());
     }
 
+    /// `Accept-Encoding` parser must recognise gzip in any of its standard
+    /// shapes — bare token, with a q-value, anywhere in a comma-separated list,
+    /// case-insensitive — and reject look-alikes like `x-gzip` (which is a
+    /// distinct historical encoding).
+    #[test]
+    fn accepts_gzip_recognises_standard_offers() {
+        fn h(value: &str) -> axum::http::HeaderMap {
+            let mut m = axum::http::HeaderMap::new();
+            m.insert(
+                axum::http::header::ACCEPT_ENCODING,
+                axum::http::HeaderValue::from_str(value).unwrap(),
+            );
+            m
+        }
+        assert!(accepts_gzip(&h("gzip")));
+        assert!(accepts_gzip(&h("GZIP")));
+        assert!(accepts_gzip(&h("gzip;q=1.0")));
+        assert!(accepts_gzip(&h("deflate, gzip")));
+        assert!(accepts_gzip(&h("br, gzip;q=0.9, deflate;q=0.5")));
+        assert!(!accepts_gzip(&h("deflate")));
+        assert!(!accepts_gzip(&h("br")));
+        assert!(!accepts_gzip(&h("x-gzip")));
+        assert!(!accepts_gzip(&h("")));
+        assert!(!accepts_gzip(&axum::http::HeaderMap::new()));
+
+        // RFC 7231 §5.3.5: a quality of 0 means "not acceptable" — clients
+        // use this to explicitly opt OUT of an encoding (e.g. broken
+        // intermediaries, decompression bugs). Compressing the response
+        // anyway forces gzip on a client that asked us not to.
+        assert!(!accepts_gzip(&h("gzip;q=0")));
+        assert!(!accepts_gzip(&h("gzip; q=0")));
+        assert!(!accepts_gzip(&h("gzip;q=0.0")));
+        assert!(!accepts_gzip(&h("gzip;q=0.000")));
+        assert!(!accepts_gzip(&h("deflate, gzip;q=0")));
+        // Other encodings at q=0 don't change gzip's acceptability.
+        assert!(accepts_gzip(&h("gzip, deflate;q=0")));
+    }
+
     /// Spoofing prevention: untrusted apps must not be able to emit a
     /// domain event whose name collides with a `SystemEvent` variant —
     /// after the SSE unwrap, the wire frame would be indistinguishable
@@ -494,6 +743,33 @@ mod tests {
                 "{name} should be allowed as a domain event",
             );
         }
+    }
+
+    #[test]
+    fn validate_cursor_pair_allows_zero_or_one_cursor() {
+        assert!(validate_cursor_pair(None, None).is_ok());
+        assert!(validate_cursor_pair(Some(uuid::Uuid::new_v4()), None).is_ok());
+        assert!(validate_cursor_pair(None, Some(uuid::Uuid::new_v4())).is_ok());
+    }
+
+    #[test]
+    fn validate_cursor_pair_rejects_both_cursors_set() {
+        let err = validate_cursor_pair(Some(uuid::Uuid::new_v4()), Some(uuid::Uuid::new_v4()))
+            .unwrap_err();
+        assert!(
+            err.contains("mutually exclusive"),
+            "error should mention mutual exclusion: {err}"
+        );
+    }
+
+    /// The frontend's SSE handler keys off `type` and reads `data.count`.
+    /// If the wire shape drifts, lagged tabs lose their resync signal and
+    /// stuck "Thinking" spinners come back.
+    #[test]
+    fn lagged_event_json_has_stable_wire_shape() {
+        let parsed: serde_json::Value = serde_json::from_str(&lagged_event_json(42)).unwrap();
+        assert_eq!(parsed["type"], "Lagged");
+        assert_eq!(parsed["data"]["count"], 42);
     }
 
     /// read_engine_version reads the engine VERSION from disk on each call,

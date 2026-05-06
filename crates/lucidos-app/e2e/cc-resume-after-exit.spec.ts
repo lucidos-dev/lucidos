@@ -34,7 +34,7 @@ test.describe('CC resume after process exit', () => {
     // Step 1: Send initial CC message and wait for idle
     const msg1 = uniqueMessage('cc-resume-exit-1');
     await sendMessage(page, `Say exactly: "first ${msg1}" and nothing else. Do not create any files.`);
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
 
     // Verify first response has content
     const firstResponseCount = await countVisibleResponses(page);
@@ -173,7 +173,7 @@ test.describe('CC resume after process exit', () => {
 
     const msg1 = uniqueMessage('cc-status-label-1');
     await sendMessage(page, `Say exactly: "first ${msg1}" and nothing else. Do not create any files.`);
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
 
     // Kill CC process to simulate natural exit
     try {

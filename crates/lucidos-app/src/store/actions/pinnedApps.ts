@@ -31,7 +31,6 @@ export async function loadPinnedApps(): Promise<void> {
     pinnedApps.value = deduped;
     persistToLocalStorage(deduped);
   } catch (e) {
-    console.error('[PinnedApps] Failed to load pinned apps:', e);
     showToast(`Failed to load pinned apps: ${errorDetail(e)}`, 'error');
   }
 }
@@ -46,7 +45,6 @@ export async function pinApp(appId: string): Promise<void> {
   try {
     await pinAppApi(appId, getDeviceId());
   } catch (e) {
-    console.error('[PinnedApps] Failed to pin app:', e);
     showToast(`Failed to pin app: ${errorDetail(e)}`, 'error');
     // Revert
     const reverted = pinnedApps.value.filter((entry) => entry.app_id !== appId);
@@ -64,7 +62,6 @@ export async function unpinApp(appId: string): Promise<void> {
   try {
     await unpinAppApi(appId, getDeviceId());
   } catch (e) {
-    console.error('[PinnedApps] Failed to unpin app:', e);
     showToast(`Failed to unpin app: ${errorDetail(e)}`, 'error');
     // Revert
     const reverted = [...pinnedApps.value, { app_id: appId }];

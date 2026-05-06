@@ -9,6 +9,25 @@ cd "$PROJECT_DIR"
 
 source "$SCRIPT_DIR/lib/workspace.sh"
 
+# Resolve a container's workspace directory.
+# Prefers the `lucidos.workspace` label (set by docker-compose.dev.yml).
+# Falls back to the bind-mount source for legacy pre-named-volume containers
+# (where the host path was <workspace>/data/postgres → strip last two segments).
+_inspect_workspace_dir() {
+    local container="$1"
+    local ws_dir
+    ws_dir=$(docker inspect --format='{{index .Config.Labels "lucidos.workspace"}}' "$container" 2>/dev/null || echo "")
+    if [ -n "$ws_dir" ]; then
+        echo "$ws_dir"
+        return
+    fi
+    local mount_src
+    mount_src=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{if eq .Type "bind"}}{{.Source}}{{end}}{{end}}{{end}}' "$container" 2>/dev/null || echo "")
+    if [ -n "$mount_src" ]; then
+        echo "$(dirname "$(dirname "$mount_src")")"
+    fi
+}
+
 # Parse arguments
 WORKSPACE=""
 JSON_MODE=""
@@ -215,9 +234,8 @@ if [ -n "$JSON_MODE" ]; then
 
     while IFS= read -r container; do
         [ -z "$container" ] && continue
-        ws_dir=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Source}}{{end}}{{end}}' "$container" 2>/dev/null || echo "")
+        ws_dir=$(_inspect_workspace_dir "$container")
         if [ -n "$ws_dir" ]; then
-            ws_dir="$(dirname "$(dirname "$ws_dir")")"
             if [ -d "$ws_dir/.lucidos" ]; then
                 # Skip the requesting workspace
                 if [ -n "$EXCLUDE_WS" ] && [ "$ws_dir" = "$EXCLUDE_WS" ]; then
@@ -246,11 +264,8 @@ else
     FOUND=""
     while IFS= read -r container; do
         [ -z "$container" ] && continue
-        # Extract workspace path from the postgres data mount
-        ws_dir=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Source}}{{end}}{{end}}' "$container" 2>/dev/null || echo "")
-        # Mount points to <workspace>/data/postgres — go up two levels
+        ws_dir=$(_inspect_workspace_dir "$container")
         if [ -n "$ws_dir" ]; then
-            ws_dir="$(dirname "$(dirname "$ws_dir")")"
             if [ -d "$ws_dir/.lucidos" ]; then
                 if [ -n "$FOUND" ]; then
                     echo "---"

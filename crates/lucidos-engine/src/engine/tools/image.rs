@@ -44,14 +44,30 @@ pub(crate) fn resolve_thread_image_refs<E: HasEventPayload>(
 }
 
 impl LucidosEngine {
+    /// Build the image provider implied by the current `image_model`
+    /// preference. Resolved per call so Settings changes take effect
+    /// without an engine restart.
+    pub(crate) async fn current_image_provider(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::llm::ImageProvider>> {
+        crate::llm::image::build_image_provider(
+            &self.pool,
+            self.openai_api_key.as_deref(),
+            &self.vertex_project_id,
+            &self.vertex_location,
+            &self.vertex_token_cache,
+        )
+        .await
+    }
+
     pub(crate) async fn execute_generate_image(
         &self,
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let provider = self
-            .image_provider
-            .as_ref()
+            .current_image_provider()
+            .await
             .ok_or("No image provider configured. Set OPENAI_API_KEY or VERTEX_PROJECT_ID.")?;
 
         let prompt = args
@@ -118,6 +134,13 @@ impl LucidosEngine {
 
         // Save as artifact if requested
         if let Some(artifact_path) = save_as_artifact {
+            if crate::api::is_path_traversal(artifact_path) {
+                return Err(format!(
+                    "Invalid save_as_artifact path (must not contain '..' or start with '/' or '\\'): {}",
+                    artifact_path
+                )
+                .into());
+            }
             let raw_bytes = base64::engine::general_purpose::STANDARD.decode(&compressed.base64)?;
             self.artifact_manager
                 .write_and_commit(

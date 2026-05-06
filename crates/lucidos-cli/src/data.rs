@@ -18,10 +18,7 @@ pub(crate) fn resolve_data_path(ws: &Workspace, relative: &str) -> Result<PathBu
     if trimmed.starts_with('/') || trimmed.starts_with('\\') {
         return Err(format!("path must be relative, got {:?}", relative).into());
     }
-    if trimmed
-        .split(|c| c == '/' || c == '\\')
-        .any(|seg| seg == "..")
-    {
+    if trimmed.split(['/', '\\']).any(|seg| seg == "..") {
         return Err(format!("path may not contain '..' segments, got {:?}", relative).into());
     }
 

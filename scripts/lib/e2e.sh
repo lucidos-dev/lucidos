@@ -88,6 +88,36 @@ ensure_workspace_running() {
     export VITE_PORT="$engine_port"
 }
 
+# Remove orphan dirs under $E2E_WORKSPACE/.lucidos/worktrees/ — directories
+# with no .git pointer, or with a .git pointer to a gitdir that no longer
+# exists. CC test sessions register worktrees in their spawning repo's
+# .git/worktrees/; when that registration disappears (parent repo's worktree
+# pruned first, partial cleanup, etc.) the directory remains. With dozens of
+# leftover dirs the engine's startup recovery iterates over them and exceeds
+# its 30s API readiness budget.
+prune_orphan_worktree_dirs() {
+    local wt_root="$E2E_WORKSPACE/.lucidos/worktrees"
+    [ -d "$wt_root" ] || return 0
+
+    local removed=0
+    local d
+    for d in "$wt_root"/*; do
+        [ -d "$d" ] || continue
+        if [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
+            rmdir "$d" 2>/dev/null && removed=$((removed + 1))
+            continue
+        fi
+        if [ -f "$d/.git" ]; then
+            local gitdir
+            gitdir=$(sed -n 's/^gitdir: //p' "$d/.git" 2>/dev/null | head -1)
+            if [ -n "$gitdir" ] && [ ! -d "$gitdir" ]; then
+                rm -rf "$d" 2>/dev/null && removed=$((removed + 1))
+            fi
+        fi
+    done
+    [ "$removed" -gt 0 ] && echo "Pruned $removed orphan worktree dir(s)" || true
+}
+
 cleanup_e2e_worktrees() {
     echo "Cleaning up e2e worktrees..."
     local original_dir="$PWD"
@@ -134,6 +164,78 @@ cleanup_e2e_worktrees() {
 
     cd "$original_dir"
     [ "$removed" -gt 0 ] && echo "Removed $removed worktree(s)" || true
+
+    prune_orphan_worktree_dirs
+}
+
+# ── kill_orphan_simulator ────────────────────────────────────────────
+# The Simulator's Virtualization VM survives `simctl shutdown` (XPC service
+# persists for fast reboot) and holds multiple GB resident — pkill it too.
+# Gate on CoreSimulatorService being alive so we don't clobber other
+# Virtualization.framework consumers (Docker Desktop, etc.).
+kill_orphan_simulator() {
+    pgrep -x Simulator >/dev/null 2>&1 || pgrep -f "com.apple.CoreSimulator.CoreSimulatorService" >/dev/null 2>&1 || return 0
+    xcrun simctl shutdown all >/dev/null 2>&1 || true
+    killall Simulator 2>/dev/null || true
+    if pgrep -f "com.apple.CoreSimulator.CoreSimulatorService" >/dev/null 2>&1; then
+        pkill -f "com.apple.Virtualization.VirtualMachine" 2>/dev/null || true
+    fi
+}
+
+# ── setup_e2e_session ────────────────────────────────────────────────
+# Standard sub-script lifecycle: lock, ensure workspace running, optional
+# initial reset, and an EXIT trap teardown that mirrors the reset choice.
+# When invoked under the umbrella ($LUCIDOS_E2E_UMBRELLA set), defers all
+# of that to the umbrella and only refreshes port globals.
+# NO_RESET is read from the caller's env (sub-scripts already parse --no-reset).
+#
+# Usage:
+#   setup_e2e_session <lock-label>
+#       Skip cleanup_e2e_worktrees on teardown (api default).
+#   setup_e2e_session <lock-label> --cleanup-worktrees-on-teardown
+#       Browser tests can leave CC worktrees behind; clean them on exit too.
+setup_e2e_session() {
+    local label="$1"
+    local cleanup_on_teardown=""
+    case "${2:-}" in
+        "") ;;
+        --cleanup-worktrees-on-teardown) cleanup_on_teardown=1 ;;
+        *) echo "setup_e2e_session: unknown option '$2'" >&2; exit 1 ;;
+    esac
+
+    if [ -n "${LUCIDOS_E2E_UMBRELLA:-}" ]; then
+        # Umbrella owns lock + workspace + initial reset; we just need port globals.
+        ensure_workspace_running
+        return 0
+    fi
+
+    acquire_e2e_lock "$label" || exit 1
+    kill_orphan_simulator
+    ensure_workspace_running
+
+    if [ -n "${NO_RESET:-}" ]; then
+        # Leave the workspace running so the next invocation starts immediately
+        # instead of paying the boot cost again.
+        teardown_e2e() { release_e2e_lock; }
+    elif [ -n "$cleanup_on_teardown" ]; then
+        teardown_e2e() {
+            cleanup_e2e_worktrees
+            stop_e2e_workspace
+            release_e2e_lock
+        }
+    else
+        teardown_e2e() {
+            stop_e2e_workspace
+            release_e2e_lock
+        }
+    fi
+    trap teardown_e2e EXIT
+    trap 'exit 130' INT TERM
+
+    if [ -z "${NO_RESET:-}" ]; then
+        cleanup_e2e_worktrees
+        reset_e2e_database
+    fi
 }
 
 stop_e2e_workspace() {

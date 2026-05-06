@@ -115,3 +115,60 @@ describe('Service Worker fetch handler', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 });
+
+function makeNotificationCloseEvent(notificationId: string | null, tag?: string) {
+  const data = notificationId ? { notification_id: notificationId } : undefined;
+  return {
+    notification: {
+      data,
+      tag: tag ?? notificationId ?? 'lucidos-notification',
+    },
+    waitUntil: vi.fn((p: Promise<any>) => p),
+  };
+}
+
+describe('Service Worker notificationclose handler', () => {
+  let handlers: Record<string, (event: any) => void>;
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    const sw = loadSw();
+    handlers = sw.handlers;
+    mockFetch = sw.mockFetch;
+    mockFetch.mockResolvedValue(new Response('ok'));
+  });
+
+  it('POSTs notification id to /api/notification-dismissed when user dismisses the OS notification', () => {
+    const event = makeNotificationCloseEvent('notif-abc');
+    handlers.notificationclose(event);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe('https://example.com/api/notification-dismissed');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body)).toEqual({ notification_id: 'notif-abc' });
+  });
+
+  it('falls back to the notification tag when data.notification_id is missing (iOS)', () => {
+    const event = makeNotificationCloseEvent(null, 'notif-xyz');
+    handlers.notificationclose(event);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body)).toEqual({ notification_id: 'notif-xyz' });
+  });
+
+  it('does nothing when there is no notification id and the tag is the default', () => {
+    const event = makeNotificationCloseEvent(null, 'lucidos-notification');
+    handlers.notificationclose(event);
+
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('swallows fetch errors so the close handler does not throw', async () => {
+    mockFetch.mockRejectedValueOnce(new TypeError('Load failed'));
+    const event = makeNotificationCloseEvent('notif-abc');
+    handlers.notificationclose(event);
+
+    await expect(event.waitUntil.mock.calls[0][0]).resolves.toBeUndefined();
+  });
+});

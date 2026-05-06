@@ -3,19 +3,19 @@
 
 export type EventChannel = 'chat' | 'claude_code' | 'trigger';
 export const EVENT_CHANNELS: readonly EventChannel[] = ['chat', 'claude_code', 'trigger'] as const;
-export type SessionEndReason = 'shutdown' | 'panic' | 'closed' | 'legacy_non_terminal';
-export const SESSION_END_REASONS: readonly SessionEndReason[] = ['shutdown', 'panic', 'closed', 'legacy_non_terminal'] as const;
+export type SessionEndReason = 'shutdown' | 'panic' | 'closed' | 'stale_resume' | 'legacy_non_terminal';
+export const SESSION_END_REASONS: readonly SessionEndReason[] = ['shutdown', 'panic', 'closed', 'stale_resume', 'legacy_non_terminal'] as const;
 export type ThreadType = 'chat' | 'claude_code';
-export type StoredSection = 'default' | 'unread';
-export type DisplaySection = 'running' | 'waiting' | 'review' | 'pinned' | 'history';
+export type ArchiveState = 'archived' | 'inbox';
+export type DisplaySection = 'active' | 'saved' | 'review' | 'archive';
 export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'failed';
 export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';
-export type Action = 'done' | 'apply' | 'discard';
+export type Action = 'archive' | 'apply' | 'discard';
 export type MessageLabel = 'Requesting' | 'Working' | 'Waiting' | 'Canceled' | 'Aborted';
 
-export const LEGAL_SECTIONS: Readonly<Record<ThreadType, readonly StoredSection[]>> = {
-  chat: ['default', 'unread'],
-  claude_code: ['default', 'unread'],
+export const LEGAL_SECTIONS: Readonly<Record<ThreadType, readonly ArchiveState[]>> = {
+  chat: ['archived', 'inbox'],
+  claude_code: ['archived', 'inbox'],
 } as const;
 
 export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
@@ -42,11 +42,11 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   MissingHardeningDetected: 'start',
   ThreadTitleGenerated: 'metadata',
   ThreadTitleRenamed: 'metadata',
-  ThreadPinned: 'metadata',
-  ThreadUnpinned: 'metadata',
-  ThreadMarkedRead: 'metadata',
-  ThreadMarkedUnread: 'metadata',
-  ThreadDismissed: 'terminal',
+  ThreadSaved: 'metadata',
+  ThreadUnsaved: 'metadata',
+  ThreadArchived: 'terminal',
+  ThreadStarted: 'metadata',
+  ThreadDiscarded: 'metadata',
   TriggerStarted: 'start',
   TriggerCompleted: 'terminal',
   ChangeProposed: 'action_required',
@@ -111,21 +111,22 @@ export const LAST_ACTIVITY_EVENTS: ReadonlySet<string> = new Set([
   'CodingAgentToolResult',
 ]);
 
-export function isSectionLegal(threadType: ThreadType, section: StoredSection): boolean {
+export function isSectionLegal(threadType: ThreadType, section: ArchiveState): boolean {
   return (LEGAL_SECTIONS[threadType] as readonly string[]).includes(section);
 }
 
 export function displaySection(
-  stored: StoredSection,
+  stored: ArchiveState,
   status: ThreadStatus,
-  isPinned: boolean,
+  isSaved: boolean,
   hasActiveChildren: boolean,
+  hasPendingChanges: boolean,
 ): DisplaySection {
-  if (status === 'running') return 'running';
-  if (status === 'waiting_for_user_answer') return 'review';
-  if (hasActiveChildren) return 'waiting';
-  if (stored === 'unread') return 'review';
-  return isPinned ? 'pinned' : 'history';
+  if (isSaved) return 'saved';
+  if (status === 'running' || hasActiveChildren) return 'active';
+  if (hasPendingChanges) return 'review';
+  if (stored === 'archived') return 'archive';
+  return 'review';
 }
 
 export function isCcOnlyEvent(eventType: string): boolean {
@@ -135,66 +136,14 @@ export function isCcOnlyEvent(eventType: string): boolean {
 export function resolveActions(
   threadType: ThreadType,
   status: ThreadStatus,
-  storedSection: StoredSection,
+  storedSection: ArchiveState,
   hasPendingChanges: boolean,
 ): Action[] {
-  if (storedSection !== 'unread') return [];
-  if (status === 'running') return [];
-  if (status === 'waiting_for_user_answer') return ['done'];
-  if (threadType === 'chat') return ['done'];
-  return hasPendingChanges ? ['discard', 'apply'] : ['done'];
+  if (status === 'running' || status === 'waiting_for_user_answer') return [];
+  if (hasPendingChanges && threadType === 'claude_code') return ['discard', 'apply'];
+  if (storedSection !== 'inbox') return [];
+  return ['archive'];
 }
-
-export type StatusRule =
-  | { kind: 'set'; status: ThreadStatus }
-  | { kind: 'conditional_cc'; withChanges: ThreadStatus; withoutChanges: ThreadStatus }
-  | { kind: 'no_change' };
-
-export type CcFlagRule =
-  | { kind: 'clear_all' }
-  | { kind: 'set_changes' }
-  | { kind: 'set_applying' }
-  | { kind: 'clear_applying' }
-  | { kind: 'from_payload' }
-  | null;
-
-export type StatusTransition = {
-  status: StatusRule;
-  ccFlags: CcFlagRule;
-};
-
-export const STATUS_TRANSITIONS: Readonly<Record<string, StatusTransition>> = {
-  MessageReceived: { status: { kind: 'set', status: 'running' }, ccFlags: null },
-  TriggerStarted: { status: { kind: 'set', status: 'running' }, ccFlags: null },
-  CodingAgentUserMessageSent: { status: { kind: 'set', status: 'running' }, ccFlags: null },
-  UserPromptInjected: { status: { kind: 'set', status: 'running' }, ccFlags: null },
-  CodingAgentPromptSent: { status: { kind: 'set', status: 'running' }, ccFlags: null },
-  ContinueSignal: { status: { kind: 'set', status: 'running' }, ccFlags: null },
-  ResponseGenerated: { status: { kind: 'conditional_cc', withChanges: 'waiting', withoutChanges: 'idle' }, ccFlags: null },
-  ResponseCanceled: { status: { kind: 'conditional_cc', withChanges: 'waiting', withoutChanges: 'idle' }, ccFlags: null },
-  SessionEnded: { status: { kind: 'conditional_cc', withChanges: 'waiting', withoutChanges: 'idle' }, ccFlags: null },
-  ResponseAborted: { status: { kind: 'conditional_cc', withChanges: 'waiting', withoutChanges: 'failed' }, ccFlags: null },
-  ResponseFailed: { status: { kind: 'set', status: 'failed' }, ccFlags: null },
-  TriggerCompleted: { status: { kind: 'set', status: 'idle' }, ccFlags: null },
-  CodingAgentIdled: { status: { kind: 'conditional_cc', withChanges: 'waiting', withoutChanges: 'idle' }, ccFlags: { kind: 'from_payload' } },
-  ChangeProposed: { status: { kind: 'no_change' }, ccFlags: { kind: 'set_changes' } },
-  ChangeApplied: { status: { kind: 'set', status: 'idle' }, ccFlags: { kind: 'clear_all' } },
-  ChangeDiscarded: { status: { kind: 'set', status: 'idle' }, ccFlags: { kind: 'clear_all' } },
-  MergeConflictDetected: { status: { kind: 'no_change' }, ccFlags: { kind: 'set_applying' } },
-  ChangeApplyFailed: { status: { kind: 'no_change' }, ccFlags: { kind: 'clear_applying' } },
-  UserQuestionAsked: { status: { kind: 'set', status: 'waiting_for_user_answer' }, ccFlags: null },
-  UserQuestionAnswered: { status: { kind: 'set', status: 'running' }, ccFlags: null },
-  CodingAgentPermissionRequest: { status: { kind: 'set', status: 'waiting_for_user_answer' }, ccFlags: null },
-  CodingAgentPermissionResolved: { status: { kind: 'set', status: 'running' }, ccFlags: null },
-  ThreadDismissed: { status: { kind: 'set', status: 'idle' }, ccFlags: { kind: 'clear_all' } },
-} as const;
-
-export const SECTION_TRANSITIONS: Readonly<Record<string, StoredSection>> = {
-  ThreadMarkedRead: 'default',
-  ThreadMarkedUnread: 'unread',
-  ThreadDismissed: 'default',
-} as const;
-
 export const MESSAGE_COUNT_EVENTS: ReadonlySet<string> = new Set([
   'MessageReceived',
   'TriggerStarted',

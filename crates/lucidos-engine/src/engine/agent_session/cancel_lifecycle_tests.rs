@@ -66,7 +66,12 @@ fn cancel_classifies_as_canceled_with_emit_idle_true() {
     let user_hit_stop = true;
     let is_shutdown = false;
 
-    let (terminal, emit_idle) = classify_result(is_silent_resume, user_hit_stop, is_shutdown);
+    let (terminal, emit_idle) = classify_result(
+        is_silent_resume,
+        user_hit_stop,
+        is_shutdown,
+        None,
+    );
 
     assert_eq!(
         terminal,
@@ -97,18 +102,21 @@ fn cancel_terminal_event_is_response_canceled() {
     );
 }
 
-/// Phase 4.1 removed `SessionEndReason::UserEnded`. The remaining variants are
-/// terminal-only: `Shutdown` / `Panic` / `Closed` (plus the read-side
-/// `LegacyNonTerminal` catch-all). This test pins the absence of the old
-/// variant by constructing each remaining one explicitly — if a future patch
-/// re-adds `UserEnded`, this test won't fail, but the integration test below
+/// Phase 4.1 removed `SessionEndReason::UserEnded`. The current variants are
+/// `Shutdown` / `Panic` / `Closed` (terminal — frontend renders as Aborted /
+/// Failed) and `StaleResume` (transient internal-retry marker — frontend treats
+/// as a normal lifecycle event), plus the read-side `LegacyNonTerminal`
+/// catch-all. This test pins the absence of `UserEnded` by constructing each
+/// remaining variant explicitly — if a future patch re-adds `UserEnded`, this
+/// test won't fail, but the integration test below
 /// (`cancel_does_not_terminate_session`) will, because it asserts no
 /// `SessionEnded` appears after a cancel sequence.
 #[test]
-fn session_end_reason_is_terminal_only() {
+fn session_end_reason_variants() {
     let _shutdown = SessionEndReason::Shutdown;
     let _panic = SessionEndReason::Panic;
     let _closed = SessionEndReason::Closed;
+    let _stale_resume = SessionEndReason::StaleResume;
     // No SessionEndReason::UserEnded — the variant is gone.
 }
 

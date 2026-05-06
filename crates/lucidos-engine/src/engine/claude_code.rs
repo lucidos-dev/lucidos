@@ -1,34 +1,237 @@
 use super::{CcCommandsResult, LucidosEngine};
 use crate::engine::thread_events::{ActorMode, EngineReason, MessageOrigin};
+use crate::engine::types::CcCommandsInfo;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
-// NOTE: Editing this list does NOT update existing users — `cc_allowed_tools`
-// seeds `~/.lucidos/cc-allowed-tools` on first run and reads from the file
-// thereafter. To roll out a new entry, also append it to your own
-// `~/.lucidos/cc-allowed-tools` (and tell users to do the same) — otherwise
-// they keep their old seed and the CLI flag still excludes the new tool.
-const DEFAULT_CC_ALLOWED_TOOLS: &[&str] = &[
-    "Bash",
-    "Read",
-    "Edit",
-    "Write",
-    "Glob",
-    "Grep",
-    "Skill(superpowers:*)",
-    "Skill(superpowers-chrome:*)",
-    "AskUserQuestion",
-];
+/// Look up a repo's cached CC commands by its on-disk path.
+///
+/// Returns the cached entry for `repo_path`, or empty defaults on miss.
+/// **Never falls back to another repo's entry** — surfacing skills from a
+/// repo the user did not select would mislead the compose-view menu, which
+/// is the bug this helper exists to prevent.
+pub(crate) fn lookup_repo_commands_in_cache(
+    cache: &HashMap<String, CcCommandsInfo>,
+    repo_path: &str,
+) -> CcCommandsInfo {
+    cache.get(repo_path).cloned().unwrap_or_default()
+}
+
+// Empty by default: a fresh install grants nothing implicitly. Users build
+// their allowlist via the per-prompt "Always allow" buttons (which append to
+// `~/.lucidos/cc-allowed-tools`) or by editing the file directly via the
+// settings UI. Editing this list only affects fresh installs — existing users
+// keep whatever they already wrote to the file.
+const DEFAULT_CC_ALLOWED_TOOLS: &[&str] = &[];
+
+// Tools whose bare entry in `--allowedTools` cannot be respected by CC.
+// Two reasons a tool ends up here:
+//   * Edit / Write / NotebookEdit — `--permission-mode acceptEdits` always
+//     sends them through `--permission-prompt-tool` for the paths CC keeps
+//     protected (`.claude/` and `.git/`, which never auto-approve in any
+//     mode), and the rest of the worktree's in-cwd writes are auto-approved
+//     before the engine ever sees them. A bare `Edit` line in
+//     `cc-allowed-tools` does nothing useful in either case.
+//   * ExitPlanMode — CC always routes plan-mode exit through the permission
+//     prompt regardless of `--allowedTools`, because the plan must be
+//     reviewed by the user before the assistant continues. A bare
+//     `ExitPlanMode` line never suppresses the card.
+// The "Always allow" broad button is hidden for these tools (see
+// `BROAD_ALLOW_INEFFECTIVE` in `PermissionCard.tsx`); users wanting in-thread
+// persistence should use the session-allow button instead, which the engine
+// intercepts before CC's gate.
+const BROAD_ALLOW_INEFFECTIVE: &[&str] = &["Edit", "ExitPlanMode", "NotebookEdit", "Write"];
+
+// Tools whose `AllowScope::Session` pattern is per-file, derived from the
+// input's `file_path` / `notebook_path` field rather than the tool name.
+// Overlaps with but is not identical to `BROAD_ALLOW_INEFFECTIVE`: this set
+// is "tools where remembering one path doesn't imply remembering all paths,"
+// while `BROAD_ALLOW_INEFFECTIVE` is "tools whose bare allowlist entry is a
+// lie." Edit/Write/NotebookEdit are in both; ExitPlanMode is only in the
+// latter (no per-path identifier — its session pattern is the bare tool
+// name). Mirrors the TS-side `SESSION_PATH_TOOLS` constant in
+// `PermissionCard.tsx`.
+const SESSION_PATH_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
 const CC_ALLOWED_TOOLS_FILE: &str = "cc-allowed-tools";
+const CC_ALLOWED_TOOLS_HEADER: &str =
+    "# One pattern per line. Lines starting with '#' are ignored.\n";
+
+/// Where a granted "Always allow" click is remembered.
+///
+///   * `Narrow` / `Broad` — persisted to `~/.lucidos/cc-allowed-tools` and
+///     handed to CC via `--allowedTools` on every spawn. Survives engine
+///     restart, but only takes effect for tools/paths CC actually respects.
+///   * `Session` — kept in memory on `CcPermissionState::session_allows`,
+///     scoped to one thread. Lost on engine restart. Works for *every* tool
+///     and *every* path (including CC's own protected paths like `.claude/`
+///     and `.git/`), because the engine intercepts before the prompt fires.
+///
+/// Wire form: `"narrow"` / `"broad"` / `"session"` (snake_case enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AllowScope {
+    Narrow,
+    Broad,
+    Session,
+}
+
+/// Derive the pattern to record when the user grants an "Always allow"-style
+/// click. Interpretation depends on `scope`:
+///
+///   * `Broad` / `Narrow` → appended verbatim to `cc-allowed-tools` so it
+///     reaches CC as `--allowedTools` on the next spawn. `Broad` returns
+///     `Some(tool_name)` only for tools whose bare entry actually bypasses
+///     CC's prompt routing — for `BROAD_ALLOW_INEFFECTIVE` (Edit / Write /
+///     NotebookEdit) it returns `None` because CC ignores those bare entries
+///     for protected paths and auto-approves them everywhere else, so
+///     persisting would mislead the user. `Narrow` returns `Some` only for
+///     tools with a meaningful sub-scope in the input:
+///       * `Skill { skill: "plugin:name" }` → `Skill(plugin:*)`
+///       * `Bash  { command: "git status" }` → `Bash(git:*)`
+///     All other tools return `None` for `Narrow` (the UI hides that button).
+///
+///   * `Session` → stored on `CcPermissionState::session_allows` and matched
+///     exact-string against patterns derived from future prompts in the same
+///     thread. Always returns `Some(_)` so any prompt can be remembered for
+///     the rest of the thread, including CC-protected paths the persisted
+///     scopes can't reach:
+///       * `Edit | Write` → `Tool(<file_path>)` (per-file)
+///       * `NotebookEdit` → `NotebookEdit(<notebook_path>)`
+///       * `Bash` → `Bash(<first-token>:*)` (same as narrow)
+///       * `Skill` → `Skill(<plugin>:*)` (same as narrow)
+///       * everything else → bare `tool_name`
+pub(crate) fn derive_allow_pattern(
+    tool_name: &str,
+    input: &serde_json::Value,
+    scope: AllowScope,
+) -> Option<String> {
+    match scope {
+        AllowScope::Broad => {
+            if BROAD_ALLOW_INEFFECTIVE.contains(&tool_name) {
+                return None;
+            }
+            Some(tool_name.to_string())
+        }
+        AllowScope::Narrow => narrow_subscope(tool_name, input),
+        AllowScope::Session => {
+            if SESSION_PATH_TOOLS.contains(&tool_name) {
+                let path_key = if tool_name == "NotebookEdit" {
+                    "notebook_path"
+                } else {
+                    "file_path"
+                };
+                let path = input.get(path_key).and_then(|v| v.as_str())?;
+                if path.is_empty() {
+                    return None;
+                }
+                return Some(format!("{}({})", tool_name, path));
+            }
+            if let Some(narrow) = narrow_subscope(tool_name, input) {
+                return Some(narrow);
+            }
+            // Bare tool name — session scope is engine-side, so the
+            // `BROAD_ALLOW_INEFFECTIVE` constraint that applies to persisted
+            // patterns doesn't apply: the engine's pre-prompt check fires
+            // before CC's gate ever runs, regardless of CC's behavior.
+            Some(tool_name.to_string())
+        }
+    }
+}
+
+/// Narrow `--allowedTools`-style sub-scope for tools whose input carries a
+/// meaningful identifier. Returns `None` for tools without one — Narrow
+/// callers treat that as "no narrow button"; Session callers fall back to
+/// the bare tool name.
+fn narrow_subscope(tool_name: &str, input: &serde_json::Value) -> Option<String> {
+    match tool_name {
+        "Skill" => {
+            let skill = input.get("skill").and_then(|v| v.as_str())?;
+            let plugin = skill.split_once(':').map(|(p, _)| p).unwrap_or(skill);
+            if plugin.is_empty() {
+                return None;
+            }
+            Some(format!("Skill({}:*)", plugin))
+        }
+        "Bash" => {
+            let command = input.get("command").and_then(|v| v.as_str())?;
+            let first = command.split_whitespace().next()?;
+            if first.is_empty() {
+                return None;
+            }
+            Some(format!("Bash({}:*)", first))
+        }
+        _ => None,
+    }
+}
+
+/// Append `pattern` to `<user_dir>/cc-allowed-tools` if not already present.
+/// Creates the file (with the header comment) if it doesn't exist. Atomic
+/// write via tmp + rename. No-op when `user_dir` is `None`.
+pub(crate) fn append_allowed_tool_pattern(
+    user_dir: Option<&Path>,
+    pattern: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(dir) = user_dir else {
+        return Ok(());
+    };
+    let path = dir.join(CC_ALLOWED_TOOLS_FILE);
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CC_ALLOWED_TOOLS_HEADER.to_string(),
+        Err(e) => return Err(e.into()),
+    };
+    if existing
+        .lines()
+        .map(str::trim)
+        .any(|l| !l.is_empty() && !l.starts_with('#') && l == pattern)
+    {
+        return Ok(());
+    }
+    let mut next = existing;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(pattern);
+    next.push('\n');
+    write_allowed_tools_file(dir, &next)
+}
+
+/// Read the raw contents of `<user_dir>/cc-allowed-tools`. Returns the seeded
+/// header for a missing file (mirrors what `cc_allowed_tools` would produce)
+/// so the settings UI shows something coherent even before the first prompt.
+pub(crate) fn read_allowed_tools_file(
+    user_dir: &Path,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let path = user_dir.join(CC_ALLOWED_TOOLS_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CC_ALLOWED_TOOLS_HEADER.to_string()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Atomically write the raw contents of `<user_dir>/cc-allowed-tools`.
+pub(crate) fn write_allowed_tools_file(
+    user_dir: &Path,
+    contents: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    std::fs::create_dir_all(user_dir)?;
+    let path = user_dir.join(CC_ALLOWED_TOOLS_FILE);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
 
 /// Resolve the comma-separated tool allowlist for `claude --allowedTools`.
 ///
 /// Reads `<user_dir>/cc-allowed-tools` if present (one entry per line, blank
 /// lines and `#` comments ignored). On first call, seeds the file with the
-/// compiled-in default so the user has something to discover and edit.
-/// Falls back to the default if `user_dir` is `None` or any IO fails.
+/// header comment so the user has something to discover and edit. Falls back
+/// to the empty default if `user_dir` is `None` or any IO fails.
 pub(crate) fn cc_allowed_tools(user_dir: Option<&Path>) -> String {
     let default = || DEFAULT_CC_ALLOWED_TOOLS.join(",");
     let Some(dir) = user_dir else {
@@ -43,12 +246,8 @@ pub(crate) fn cc_allowed_tools(user_dir: Option<&Path>) -> String {
             .collect::<Vec<_>>()
             .join(","),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let seeded = format!(
-                "# One pattern per line. Lines starting with '#' are ignored.\n{}\n",
-                DEFAULT_CC_ALLOWED_TOOLS.join("\n"),
-            );
-            if let Err(e) =
-                std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&path, &seeded))
+            if let Err(e) = std::fs::create_dir_all(dir)
+                .and_then(|_| std::fs::write(&path, CC_ALLOWED_TOOLS_HEADER))
             {
                 log!("[ClaudeCode] Failed to seed {}: {}", path.display(), e);
             }
@@ -74,6 +273,40 @@ pub(crate) const STALE_RESUME_ERROR: &str = "CC_STALE_RESUME";
 
 /// Marker file written to each CC worktree identifying the owning workspace.
 pub(crate) const WORKTREE_WORKSPACE_MARKER: &str = ".lucidos-workspace";
+
+/// Engine-injected runtime directory under every workspace.
+/// `ensure_workspace_bin_symlink` writes `.lucidos/bin/lucidos` (the CLI
+/// symlink) here. External repos rarely gitignore `.lucidos/`, so without
+/// the exclude every auto-commit drags the symlink along as a fake "diff".
+/// `branch_changed_files` filters the same prefix so already-committed
+/// instances also stop showing up.
+pub(crate) const RUNTIME_PATH_PREFIX: &str = ".lucidos/";
+
+/// Paths the engine writes into every CC worktree as runtime artifacts.
+/// Each is appended to the worktree's `.git/info/exclude` at session start so
+/// external repos never accumulate Lucidos-internal files in their git. Files
+/// stay visible on disk (CC reads them); git just doesn't see them. No-op for
+/// the Lucidos repo itself, where the skill file is intentionally tracked —
+/// gitignore rules are silent for already-tracked paths.
+pub(crate) const WORKTREE_EXCLUDE_PATHS: &[&str] = &[
+    WORKTREE_WORKSPACE_MARKER,
+    ".claude/skills/lucidos-cli/",
+    RUNTIME_PATH_PREFIX,
+];
+
+/// True for paths the engine injects into every CC worktree (see
+/// `WORKTREE_EXCLUDE_PATHS`). Trailing-`/` entries match by directory prefix;
+/// other entries match exactly so `.lucidos-workspace-archive` doesn't
+/// false-positive against `.lucidos-workspace`.
+pub(crate) fn is_engine_injected_path(path: &str) -> bool {
+    WORKTREE_EXCLUDE_PATHS.iter().any(|entry| {
+        if let Some(dir) = entry.strip_suffix('/') {
+            path == dir || path.starts_with(entry)
+        } else {
+            path == *entry
+        }
+    })
+}
 
 use super::agent_session::build_merge_prompt;
 use super::change_ops::{CodingAgent, LiveSessionInfo};
@@ -250,7 +483,7 @@ impl CodingAgent for LucidosEngine {
     }
 
     async fn lookup_session_id_for_resume(&self, thread_id: Uuid) -> Option<String> {
-        sqlx::query_scalar(
+        match sqlx::query_scalar(
             "SELECT payload->>'cc_session_id' FROM events \
              WHERE thread_id = $1 AND event_type = 'CodingAgentIdled' \
              ORDER BY sequence DESC LIMIT 1",
@@ -258,7 +491,17 @@ impl CodingAgent for LucidosEngine {
         .bind(thread_id)
         .fetch_optional(self.pool())
         .await
-        .unwrap_or(None)
+        {
+            Ok(opt) => opt,
+            Err(e) => {
+                log!(
+                    "[ClaudeCode] lookup_session_id_for_resume({}) DB error: {} — falling back to fresh session",
+                    thread_id,
+                    e
+                );
+                None
+            }
+        }
     }
 
     async fn run_merge_session_tier2(
@@ -346,18 +589,18 @@ pub(crate) async fn emit_background_task_failure(
     }
 }
 
-/// Emit a terminal `ResponseAborted` event for a thread that the projection
-/// still considers `running` even though no live agent session or in-process
-/// agentic loop is driving it. This is the safety net for stuck threads
-/// (e.g. a `spawn_agent_thread` task that errored before it could emit a
-/// terminal event, or any orphan left over from a prior engine instance).
+/// Emit a terminal `ResponseCanceled` event for a thread the projection still
+/// considers `running` but for which no live agent session or in-process loop
+/// remains. Both callers (`cancel_agent`, `interrupt_agent`) are user stop
+/// clicks, so the actor flows onto the event.
 ///
-/// Returns `Ok(true)` if a `ResponseAborted` was emitted, `Ok(false)` if
-/// the thread was already settled (or doesn't exist).
+/// Returns `Ok(true)` if an event was emitted, `Ok(false)` if the thread was
+/// already settled (or doesn't exist).
 pub(crate) async fn settle_stuck_running_thread(
     pool: &sqlx::PgPool,
     bus: &super::event_bus::EventBus,
     thread_id: Uuid,
+    actor: Option<MessageOrigin>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     if !thread_is_running(pool, thread_id).await? {
         return Ok(false);
@@ -365,13 +608,13 @@ pub(crate) async fn settle_stuck_running_thread(
 
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
-        event: crate::engine::thread_events::ThreadEvent::ResponseAborted {
+        event: crate::engine::thread_events::ThreadEvent::ResponseCanceled {
             text: String::new(),
             images: vec![],
             model: None,
             reasoning_effort: None,
         },
-        meta: crate::engine::thread_events::EventMeta::NONE,
+        meta: crate::engine::thread_events::EventMeta::with_actor(actor),
     })
     .await?;
 
@@ -392,7 +635,7 @@ impl LucidosEngine {
     /// If `auto_apply` is true, the resulting proposed change will be applied immediately.
     /// If `thread_id` is provided, cancel that specific session; otherwise cancel all.
     ///
-    /// `actor` identifies the user who clicked Stop / Apply / Done — flows into
+    /// `actor` identifies the user who clicked Stop / Apply / Archive — flows into
     /// any resulting `ChangeApplied` / `ChangeApplyFailed` events stamped via
     /// the stale-session fallback. HTTP callers build it; engine-internal
     /// shutdowns pass `None`.
@@ -418,20 +661,14 @@ impl LucidosEngine {
                 Ok(())
             } else {
                 drop(guard);
-                self.cancel_thread(tid);
+                if self.cancel_thread(tid) {
+                    return Ok(());
+                }
                 let stale_result = self
-                    .end_stale_waiting_session(tid, auto_apply, discard, actor)
+                    .end_stale_waiting_session(tid, discard, actor.clone())
                     .await;
-                let settled = settle_stuck_running_thread(&self.pool, &self.event_bus, tid)
-                    .await
-                    .unwrap_or_else(|e| {
-                        log!(
-                            "[ClaudeCode] settle_stuck_running_thread failed for {}: {}",
-                            tid,
-                            e
-                        );
-                        false
-                    });
+                let settled =
+                    settle_stuck_running_thread(&self.pool, &self.event_bus, tid, actor).await?;
                 if settled {
                     Ok(())
                 } else {
@@ -455,17 +692,22 @@ impl LucidosEngine {
     /// current work without killing the session (like pressing Esc in the CC terminal).
     /// The CC process stays alive and enters waiting state.
     ///
-    /// Fallbacks (in order) when no live CC subprocess exists for `thread_id`:
+    /// `actor` flows onto the `ResponseCanceled` emitted by the no-session
+    /// settle fallback so the panel reads "You" instead of "⚙ System".
+    ///
+    /// Fallbacks when no live CC subprocess exists for `thread_id`:
     ///   1. Cancel the in-process agentic loop via the `active_threads` token
     ///      (handles run_thread-spawned chat threads and CC threads that are
     ///      mid-startup, before SessionStarted has registered an agent_session).
-    ///   2. If the projection still shows the thread as `running` (no terminal
-    ///      event will ever arrive — e.g. the spawn task errored and was lost),
-    ///      emit a `ResponseAborted` so the UI unsticks. Without this, the
-    ///      stop button on a stuck thread would 404 forever.
+    ///      When the cancel lands, `run_session`'s `chat_cancel` arm emits the
+    ///      terminal `ResponseCanceled` — skip the settle to avoid double-emit.
+    ///   2. Only if the cancel had no entry to land on (truly stuck — spawn
+    ///      task errored and was lost), settle by emitting `ResponseCanceled`
+    ///      ourselves so the UI unsticks.
     pub async fn interrupt_agent(
         &self,
         thread_id: Option<Uuid>,
+        actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let guard = self.agent_sessions.lock().await;
 
@@ -478,16 +720,10 @@ impl LucidosEngine {
                 Ok(())
             } else {
                 drop(guard);
-                self.cancel_thread(tid);
-                if let Err(e) =
-                    settle_stuck_running_thread(&self.pool, &self.event_bus, tid).await
-                {
-                    log!(
-                        "[ClaudeCode] settle_stuck_running_thread failed for {}: {}",
-                        tid,
-                        e
-                    );
+                if self.cancel_thread(tid) {
+                    return Ok(());
                 }
+                settle_stuck_running_thread(&self.pool, &self.event_bus, tid, actor).await?;
                 Ok(())
             }
         } else {
@@ -559,7 +795,7 @@ impl LucidosEngine {
         thread_id: Uuid,
     ) -> (Option<String>, Option<String>) {
         let tid = thread_id.to_string();
-        let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+        let rows: Vec<(serde_json::Value,)> = match sqlx::query_as(
             "SELECT payload FROM events \
              WHERE aggregate_id = $1 AND event_type = 'CodingAgentSettingsChanged' \
              ORDER BY created DESC LIMIT 10",
@@ -567,7 +803,17 @@ impl LucidosEngine {
         .bind(&tid)
         .fetch_all(self.pool())
         .await
-        .unwrap_or_default();
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                log!(
+                    "[ClaudeCode] cc_thread_settings({}) DB error: {} — falling back to no per-thread overrides",
+                    thread_id,
+                    e
+                );
+                Vec::new()
+            }
+        };
         // Fold from newest to oldest — first non-null value wins for each field
         let mut model: Option<String> = None;
         let mut effort: Option<String> = None;
@@ -634,35 +880,36 @@ impl LucidosEngine {
         })
         .ok()
         .flatten();
-        let commands = {
+        let info = if let Some(repo_key) = repo_root {
             let cache = self.cc_commands_cache.read().await;
-            if let Some(repo_key) = repo_root {
-                cache.get(&repo_key).cloned()
-            } else {
-                cache.values().next().cloned()
-            }
+            lookup_repo_commands_in_cache(&cache, &repo_key)
+        } else {
+            // Thread has no recorded repo (no `changes` row yet) — return
+            // empty rather than leaking another repo's skills.
+            CcCommandsInfo::default()
         };
         let (model, effort) = self.cc_thread_settings(thread_id).await;
         CcCommandsResult {
-            info: commands.unwrap_or_default(),
+            info,
             has_active_session: false,
             current_model: model,
             current_reasoning_effort: effort,
         }
     }
 
-    /// Return cached commands without needing a thread (for compose-view menu).
-    pub async fn cc_cached_commands(&self) -> CcCommandsResult {
+    /// Return cached commands for a specific repo path (for compose-view menu).
+    /// Empty result if the repo has never had a CC session — never falls back
+    /// to another repo's cache.
+    pub async fn cc_commands_for_repo(&self, repo_path: &Path) -> CcCommandsResult {
         let cache = self.cc_commands_cache.read().await;
+        let info = lookup_repo_commands_in_cache(&cache, &repo_path.to_string_lossy());
         CcCommandsResult {
-            info: cache.values().next().cloned().unwrap_or_default(),
+            info,
             has_active_session: false,
             current_model: None,
             current_reasoning_effort: None,
         }
     }
-
-    // end_stale_waiting_session, recover_orphaned_worktrees → moved to agent_recovery.rs
 
     /// Spawn a CC subprocess to run `/harden` on the given branch's worktree.
     /// When `auto_apply_change_id` is `Some`, the apply is re-entered after
@@ -830,30 +1077,6 @@ impl LucidosEngine {
         });
     }
 
-    // apply_now, wait_for_idle, send_and_wait, apply_now_inner, merge_via_cc_session,
-    // apply_now_success, reset_worktree_and_idle, kill_cc_and_flush, make_terminal_event,
-    // emit_automated_prompt, spawn_cc_task_guarded, monitor_cc_task, run_direct_agent
-    // → moved to agent_session.rs
-
-    /// End a CC session for a thread — kill process, clean up worktree, emit SessionEnded.
-    /// Called when user clicks Done on a CC thread.
-    /// Passes discard=true so any remaining worktree changes are discarded rather
-    /// than proposed — the user said "Done", so leftover changes shouldn't
-    /// re-activate the thread with a waiting dot.
-    ///
-    /// `actor` is the user who clicked Done — propagated so any
-    /// `ChangeApplyFailed` emitted by the stale-session fallback carries the
-    /// real user instead of falling back to the engine chip.
-    pub async fn end_cc_session_for_thread(
-        self: &Arc<Self>,
-        thread_id: Uuid,
-        actor: Option<MessageOrigin>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // cancel_agent handles both live sessions (cancel.notify_one)
-        // and stale sessions (end_stale_waiting_session) internally
-        self.cancel_agent(false, true, Some(thread_id), actor).await
-    }
-
     /// Discard pending CC changes without ending the session.
     /// Resets the worktree to main and re-enters idle state.
     ///
@@ -873,14 +1096,16 @@ impl LucidosEngine {
                     .clone()
                     .ok_or("No worktree for this session")?
             } else {
-                // No live session — fall back to stale session handling
+                // No live session — fall back to stale session handling.
+                // discard=true because this is the user-clicked Discard
+                // button: explicit user intent.
                 return self
-                    .end_stale_waiting_session(thread_id, false, true, actor)
+                    .end_stale_waiting_session(thread_id, true, actor)
                     .await;
             }
         };
 
-        self.discard_pending_for_thread(thread_id).await;
+        self.discard_pending_for_thread(thread_id, actor).await;
 
         self.reset_worktree_and_idle(thread_id, &wt).await;
 
@@ -1102,11 +1327,59 @@ impl LucidosEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{cc_allowed_tools, settle_stuck_running_thread, DEFAULT_CC_ALLOWED_TOOLS};
+    use super::{
+        append_allowed_tool_pattern, cc_allowed_tools, derive_allow_pattern,
+        lookup_repo_commands_in_cache, read_allowed_tools_file, settle_stuck_running_thread,
+        write_allowed_tools_file, AllowScope, CC_ALLOWED_TOOLS_HEADER, DEFAULT_CC_ALLOWED_TOOLS,
+    };
     use crate::engine::event_bus::{BusEvent, EventBus};
     use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
+    use crate::engine::types::CcCommandsInfo;
     use crate::test_support::{setup_test_db, teardown_test_db};
+    use std::collections::HashMap;
     use uuid::Uuid;
+
+    fn cache_with(entries: &[(&str, &[&str])]) -> HashMap<String, CcCommandsInfo> {
+        entries
+            .iter()
+            .map(|(path, skills)| {
+                (
+                    (*path).to_string(),
+                    CcCommandsInfo {
+                        builtin_commands: vec![],
+                        skill_commands: skills.iter().map(|s| (*s).to_string()).collect(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lookup_returns_cached_entry_for_matching_repo() {
+        let cache = cache_with(&[("/repo/a", &["skill-a"]), ("/repo/b", &["skill-b"])]);
+        let info = lookup_repo_commands_in_cache(&cache, "/repo/a");
+        assert_eq!(info.skill_commands, vec!["skill-a".to_string()]);
+    }
+
+    /// Regression test for the bug where the compose-view menu returned
+    /// `cache.values().next()` — i.e., an arbitrary other repo's skills —
+    /// when the requested repo had no cache entry. Skills from a non-selected
+    /// repo must NEVER surface.
+    #[test]
+    fn lookup_returns_empty_for_unknown_repo_never_falls_back_to_other_repos() {
+        let cache = cache_with(&[("/repo/a", &["skill-a"]), ("/repo/b", &["skill-b"])]);
+        let info = lookup_repo_commands_in_cache(&cache, "/repo/never-cached");
+        assert!(info.skill_commands.is_empty(), "must not leak other repos' skills");
+        assert!(info.builtin_commands.is_empty());
+    }
+
+    #[test]
+    fn lookup_returns_empty_for_empty_cache() {
+        let cache: HashMap<String, CcCommandsInfo> = HashMap::new();
+        let info = lookup_repo_commands_in_cache(&cache, "/any/path");
+        assert!(info.skill_commands.is_empty());
+        assert!(info.builtin_commands.is_empty());
+    }
 
     /// Emit MessageReceived for a CC-channel thread → status='running'.
     /// Mirrors what `spawn_agent_thread` does before kicking off the bg task.
@@ -1143,11 +1416,22 @@ mod tests {
             .unwrap()
     }
 
-    /// Reproduces the user-reported bug: a CC thread is stuck at status='running'
-    /// because its background spawn task errored before any terminal event
-    /// could be emitted. The settle helper unsticks it.
+    fn user_device_actor() -> crate::engine::thread_events::MessageOrigin {
+        crate::engine::thread_events::MessageOrigin::Device {
+            device_id: "test-device".into(),
+            label: "Test Device".into(),
+        }
+    }
+
+    /// User clicks Stop on a CC thread that's stuck at status='running' (the
+    /// background spawn task errored before any terminal event could fire, or
+    /// the CC subprocess hadn't yet registered in agent_sessions when the
+    /// user pressed cancel). The settle helper emits `ResponseCanceled` with
+    /// the user actor — NOT `ResponseAborted` with no actor (which the prior
+    /// implementation produced and rendered as "⚙ System — Response
+    /// interrupted", with a confusing Continue panel).
     #[tokio::test]
-    async fn settle_stuck_running_thread_emits_aborted_and_transitions_to_failed() {
+    async fn settle_stuck_running_thread_emits_canceled_with_user_actor() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
@@ -1155,25 +1439,48 @@ mod tests {
         seed_running_cc_thread(&bus, thread_id).await;
         assert_eq!(read_status(&pool, thread_id).await.as_deref(), Some("running"));
 
-        let did_emit = settle_stuck_running_thread(&pool, &bus, thread_id)
+        let did_emit = settle_stuck_running_thread(&pool, &bus, thread_id, Some(user_device_actor()))
             .await
             .unwrap();
         assert!(did_emit, "stuck running thread should be settled");
-        assert_eq!(
-            read_status(&pool, thread_id).await.as_deref(),
-            Some("failed"),
-            "ResponseAborted on a 'running' thread must transition status → 'failed'",
-        );
 
-        // Verify the actual ResponseAborted event was persisted, not some other event.
-        let count: i64 = sqlx::query_scalar(
+        // Status: a user-driven cancel from a CC thread that never produced
+        // a SessionStarted lands as `failed` in the projection (mirrors the
+        // chat-side cancel-without-response path). The point of the change
+        // is the *event type* and *actor*, not the projection bucket.
+        let canceled_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'ResponseCanceled'"
+        )
+        .bind(thread_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(canceled_count, 1, "exactly one ResponseCanceled must be persisted");
+
+        let aborted_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'ResponseAborted'"
         )
         .bind(thread_id.to_string())
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(count, 1, "exactly one ResponseAborted should be persisted");
+        assert_eq!(
+            aborted_count, 0,
+            "settle on a user-driven cancel must NOT emit ResponseAborted — that renders as 'System' \
+             and creates a misleading Continue panel"
+        );
+
+        // Actor must be persisted so the AbortPanel/exchange status reads "You" not "System".
+        let actor: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload->'actor' FROM events \
+             WHERE aggregate_id = $1 AND event_type = 'ResponseCanceled'"
+        )
+        .bind(thread_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(actor["kind"], "device", "actor.kind must be 'device' (user from a known device)");
+        assert_eq!(actor["device_id"], "test-device");
 
         pool.close().await;
         teardown_test_db(&db_name).await;
@@ -1189,16 +1496,16 @@ mod tests {
 
         seed_running_cc_thread(&bus, thread_id).await;
         // First settle transitions running → failed.
-        assert!(settle_stuck_running_thread(&pool, &bus, thread_id)
+        assert!(settle_stuck_running_thread(&pool, &bus, thread_id, Some(user_device_actor()))
             .await
             .unwrap());
         // Second settle should be a no-op.
-        assert!(!settle_stuck_running_thread(&pool, &bus, thread_id)
+        assert!(!settle_stuck_running_thread(&pool, &bus, thread_id, Some(user_device_actor()))
             .await
             .unwrap());
 
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'ResponseAborted'"
+            "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'ResponseCanceled'"
         )
         .bind(thread_id.to_string())
         .fetch_one(&pool)
@@ -1218,7 +1525,7 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
 
-        let did_emit = settle_stuck_running_thread(&pool, &bus, Uuid::new_v4())
+        let did_emit = settle_stuck_running_thread(&pool, &bus, Uuid::new_v4(), Some(user_device_actor()))
             .await
             .unwrap();
         assert!(!did_emit);
@@ -1233,18 +1540,291 @@ mod tests {
     }
 
     #[test]
-    fn cc_allowed_tools_seeds_default_file_on_first_use() {
+    fn cc_allowed_tools_seeds_empty_default_file_on_first_use() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cc-allowed-tools");
         assert!(!path.exists());
 
         let result = cc_allowed_tools(Some(dir.path()));
 
-        assert_eq!(result, DEFAULT_CC_ALLOWED_TOOLS.join(","));
+        assert_eq!(result, "", "default allowlist must be empty");
         assert!(path.exists(), "seed file should have been written");
         let seeded = std::fs::read_to_string(&path).unwrap();
-        assert!(seeded.contains("Bash"));
-        assert!(seeded.starts_with("# "));
+        assert_eq!(seeded, CC_ALLOWED_TOOLS_HEADER);
+    }
+
+    #[test]
+    fn derive_allow_pattern_skill_narrow_uses_plugin_glob() {
+        let input = serde_json::json!({ "skill": "code-review:code-review" });
+        assert_eq!(
+            derive_allow_pattern("Skill", &input, AllowScope::Narrow).as_deref(),
+            Some("Skill(code-review:*)"),
+        );
+    }
+
+    #[test]
+    fn derive_allow_pattern_skill_narrow_with_no_colon_uses_full_name() {
+        let input = serde_json::json!({ "skill": "loop" });
+        assert_eq!(
+            derive_allow_pattern("Skill", &input, AllowScope::Narrow).as_deref(),
+            Some("Skill(loop:*)"),
+        );
+    }
+
+    #[test]
+    fn derive_allow_pattern_skill_broad_returns_bare_tool_name() {
+        let input = serde_json::json!({ "skill": "code-review:code-review" });
+        assert_eq!(
+            derive_allow_pattern("Skill", &input, AllowScope::Broad).as_deref(),
+            Some("Skill"),
+        );
+    }
+
+    #[test]
+    fn derive_allow_pattern_bash_narrow_uses_first_token() {
+        let input = serde_json::json!({ "command": "git status --short" });
+        assert_eq!(
+            derive_allow_pattern("Bash", &input, AllowScope::Narrow).as_deref(),
+            Some("Bash(git:*)"),
+        );
+    }
+
+    #[test]
+    fn derive_allow_pattern_bash_broad_returns_bare_tool_name() {
+        let input = serde_json::json!({ "command": "ls" });
+        assert_eq!(
+            derive_allow_pattern("Bash", &input, AllowScope::Broad).as_deref(),
+            Some("Bash"),
+        );
+    }
+
+    #[test]
+    fn derive_allow_pattern_other_tool_narrow_returns_none() {
+        let input = serde_json::json!({ "file_path": "/tmp/x" });
+        assert_eq!(derive_allow_pattern("Read", &input, AllowScope::Narrow), None);
+    }
+
+    #[test]
+    fn derive_allow_pattern_other_tool_broad_returns_bare_name() {
+        let input = serde_json::json!({});
+        assert_eq!(
+            derive_allow_pattern("Read", &input, AllowScope::Broad).as_deref(),
+            Some("Read"),
+        );
+    }
+
+    #[test]
+    fn derive_allow_pattern_skill_missing_input_returns_none() {
+        let input = serde_json::json!({});
+        assert_eq!(derive_allow_pattern("Skill", &input, AllowScope::Narrow), None);
+    }
+
+    /// CC's `--permission-mode acceptEdits` routes parametric file-path tools
+    /// (Edit/Write/NotebookEdit) through `--permission-prompt-tool` for any
+    /// out-of-cwd path **regardless** of bare entries in `--allowedTools`.
+    /// Persisting bare `Edit` (etc.) silently does nothing for the very paths
+    /// that surfaced the prompt — so the engine must refuse to write them.
+    /// In-cwd paths never reach this card (acceptEdits auto-approves), so no
+    /// legitimate caller is denied by this guard.
+    #[test]
+    fn derive_allow_pattern_broad_returns_none_for_acceptedits_routed_tools() {
+        let input = serde_json::json!({"file_path": "/x", "old_string": "a", "new_string": "b"});
+        assert_eq!(
+            derive_allow_pattern("Edit", &input, AllowScope::Broad),
+            None,
+            "broad Edit must be suppressed — bare entry doesn't bypass acceptEdits routing"
+        );
+        assert_eq!(
+            derive_allow_pattern("Write", &input, AllowScope::Broad),
+            None,
+            "broad Write must be suppressed for the same reason"
+        );
+        assert_eq!(
+            derive_allow_pattern("NotebookEdit", &input, AllowScope::Broad),
+            None,
+            "broad NotebookEdit must be suppressed for the same reason"
+        );
+    }
+
+    /// CC always routes `ExitPlanMode` through `--permission-prompt-tool`
+    /// regardless of `--allowedTools` — plan-mode exit is the user's plan
+    /// approval step, not a regular tool call. Persisting bare `ExitPlanMode`
+    /// to the allowlist would mislead the user into thinking the prompt would
+    /// stop coming back; suppress so the UI hides the broad button.
+    #[test]
+    fn derive_allow_pattern_broad_returns_none_for_exit_plan_mode() {
+        let input = serde_json::json!({ "plan": "Step 1: do thing" });
+        assert_eq!(
+            derive_allow_pattern("ExitPlanMode", &input, AllowScope::Broad),
+            None,
+            "broad ExitPlanMode must be suppressed — CC always prompts for plan approval"
+        );
+    }
+
+    /// Narrow scope for the same tools is still None (no narrow pattern is
+    /// generated for path-tools today). Documented here so a future addition
+    /// of `Edit(<glob>)` patterns is an intentional change, not a side-effect.
+    #[test]
+    fn derive_allow_pattern_narrow_remains_none_for_path_tools() {
+        let input = serde_json::json!({"file_path": "/x"});
+        assert_eq!(derive_allow_pattern("Edit", &input, AllowScope::Narrow), None);
+        assert_eq!(derive_allow_pattern("Write", &input, AllowScope::Narrow), None);
+        assert_eq!(derive_allow_pattern("NotebookEdit", &input, AllowScope::Narrow), None);
+    }
+
+    #[test]
+    fn derive_allow_pattern_session_edit_uses_per_file_scope() {
+        let input = serde_json::json!({
+            "file_path": "/Users/me/repo/.claude/commands/harden.md",
+            "old_string": "x",
+            "new_string": "y",
+        });
+        assert_eq!(
+            derive_allow_pattern("Edit", &input, AllowScope::Session).as_deref(),
+            Some("Edit(/Users/me/repo/.claude/commands/harden.md)"),
+        );
+    }
+
+    #[test]
+    fn derive_allow_pattern_session_write_uses_per_file_scope() {
+        let input = serde_json::json!({
+            "file_path": "/tmp/new.txt",
+            "content": "hello",
+        });
+        assert_eq!(
+            derive_allow_pattern("Write", &input, AllowScope::Session).as_deref(),
+            Some("Write(/tmp/new.txt)"),
+        );
+    }
+
+    #[test]
+    fn derive_allow_pattern_session_notebookedit_uses_notebook_path() {
+        let input = serde_json::json!({
+            "notebook_path": "/tmp/nb.ipynb",
+            "new_source": "print(1)",
+        });
+        assert_eq!(
+            derive_allow_pattern("NotebookEdit", &input, AllowScope::Session).as_deref(),
+            Some("NotebookEdit(/tmp/nb.ipynb)"),
+        );
+    }
+
+    #[test]
+    fn derive_allow_pattern_session_two_edits_to_same_file_match() {
+        // Different `old_string`/`new_string` payloads must derive the same
+        // session pattern so the second prompt auto-resolves against the first.
+        let a = serde_json::json!({"file_path": "/x", "old_string": "a", "new_string": "b"});
+        let b = serde_json::json!({"file_path": "/x", "old_string": "c", "new_string": "d"});
+        assert_eq!(
+            derive_allow_pattern("Edit", &a, AllowScope::Session),
+            derive_allow_pattern("Edit", &b, AllowScope::Session),
+        );
+    }
+
+    #[test]
+    fn derive_allow_pattern_session_edit_missing_path_returns_none() {
+        let input = serde_json::json!({"old_string": "x"});
+        assert_eq!(derive_allow_pattern("Edit", &input, AllowScope::Session), None);
+    }
+
+    #[test]
+    fn derive_allow_pattern_session_bash_reuses_narrow_pattern() {
+        let input = serde_json::json!({"command": "git push origin main"});
+        assert_eq!(
+            derive_allow_pattern("Bash", &input, AllowScope::Session).as_deref(),
+            Some("Bash(git:*)"),
+        );
+    }
+
+    #[test]
+    fn derive_allow_pattern_session_skill_reuses_narrow_pattern() {
+        let input = serde_json::json!({"skill": "superpowers:test-driven-development"});
+        assert_eq!(
+            derive_allow_pattern("Skill", &input, AllowScope::Session).as_deref(),
+            Some("Skill(superpowers:*)"),
+        );
+    }
+
+    /// Bare-tool fallback for tools without a narrow sub-scope. Session scope
+    /// is engine-side, so `BROAD_ALLOW_INEFFECTIVE` does not apply — the user
+    /// gets to remember any prompt for the rest of the thread.
+    #[test]
+    fn derive_allow_pattern_session_other_tool_falls_back_to_bare_name() {
+        let input = serde_json::json!({"pattern": "foo"});
+        assert_eq!(
+            derive_allow_pattern("Read", &input, AllowScope::Session).as_deref(),
+            Some("Read"),
+        );
+    }
+
+    #[test]
+    fn append_allowed_tool_pattern_creates_file_with_header() {
+        let dir = tempfile::tempdir().unwrap();
+        append_allowed_tool_pattern(Some(dir.path()), "Skill(code-review:*)").unwrap();
+        let body = std::fs::read_to_string(dir.path().join("cc-allowed-tools")).unwrap();
+        assert!(body.starts_with(CC_ALLOWED_TOOLS_HEADER));
+        assert!(body.trim_end().ends_with("Skill(code-review:*)"));
+    }
+
+    #[test]
+    fn append_allowed_tool_pattern_skips_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        append_allowed_tool_pattern(Some(dir.path()), "Skill").unwrap();
+        append_allowed_tool_pattern(Some(dir.path()), "Skill").unwrap();
+        let body = std::fs::read_to_string(dir.path().join("cc-allowed-tools")).unwrap();
+        assert_eq!(body.matches("Skill\n").count(), 1);
+    }
+
+    #[test]
+    fn append_allowed_tool_pattern_appends_to_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("cc-allowed-tools"),
+            "# header\nBash\nRead\n",
+        )
+        .unwrap();
+        append_allowed_tool_pattern(Some(dir.path()), "Skill(code-review:*)").unwrap();
+        let body = std::fs::read_to_string(dir.path().join("cc-allowed-tools")).unwrap();
+        assert_eq!(body, "# header\nBash\nRead\nSkill(code-review:*)\n");
+    }
+
+    #[test]
+    fn append_allowed_tool_pattern_treats_existing_pattern_as_present_even_with_indent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("cc-allowed-tools"),
+            "# header\n  Skill(code-review:*)  \n",
+        )
+        .unwrap();
+        append_allowed_tool_pattern(Some(dir.path()), "Skill(code-review:*)").unwrap();
+        let body = std::fs::read_to_string(dir.path().join("cc-allowed-tools")).unwrap();
+        assert_eq!(body, "# header\n  Skill(code-review:*)  \n");
+    }
+
+    #[test]
+    fn append_allowed_tool_pattern_no_op_when_user_dir_none() {
+        // Should not panic and should not error.
+        append_allowed_tool_pattern(None, "Bash").unwrap();
+    }
+
+    #[test]
+    fn read_allowed_tools_file_returns_header_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = read_allowed_tools_file(dir.path()).unwrap();
+        assert_eq!(body, CC_ALLOWED_TOOLS_HEADER);
+    }
+
+    #[test]
+    fn write_then_read_allowed_tools_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = "# notes\nBash\nSkill(meta:*)\n";
+        write_allowed_tools_file(dir.path(), payload).unwrap();
+        assert_eq!(read_allowed_tools_file(dir.path()).unwrap(), payload);
+    }
+
+    #[test]
+    fn default_cc_allowed_tools_is_empty() {
+        assert_eq!(DEFAULT_CC_ALLOWED_TOOLS, &[] as &[&str]);
     }
 
     #[test]
@@ -1545,12 +2125,14 @@ mod tests {
             repo_root: None,
             cc_session_id: None,
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            external_terminal_emitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control_tx: tokio::sync::mpsc::unbounded_channel().0,
             builtin_commands: vec![],
             skill_commands: vec![],
             current_model: None,
             current_reasoning_effort: None,
             last_event_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            pending_followups: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -1621,5 +2203,57 @@ mod tests {
             origin_event_id: None,
         });
         assert!(result.is_err(), "send should fail when receiver is dropped");
+    }
+
+    /// Idle CC session (waiting for next prompt, process alive) must NOT be
+    /// reported as in-flight. Regression: `abort_in_flight_for_restart` used
+    /// to filter only on `!process_exited`, so every idle CC session got a
+    /// `ResponseAborted` on `/api/restart` — rendering as "Response Interrupted"
+    /// with a Continue button on every restart.
+    #[tokio::test]
+    async fn is_in_flight_false_for_idle_session() {
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = make_test_session(msg_tx, true);
+        assert!(!session.is_in_flight());
+    }
+
+    #[tokio::test]
+    async fn is_in_flight_true_for_busy_session() {
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = make_test_session(msg_tx, false);
+        assert!(session.is_in_flight());
+    }
+
+    #[tokio::test]
+    async fn is_in_flight_false_for_exited_session() {
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut session = make_test_session(msg_tx, false);
+        session.process_exited = true;
+        assert!(!session.is_in_flight());
+    }
+
+    #[test]
+    fn is_engine_injected_path_matches_excluded_paths_only() {
+        assert!(super::is_engine_injected_path(".lucidos-workspace"));
+        assert!(super::is_engine_injected_path(".lucidos/bin/lucidos"));
+        assert!(super::is_engine_injected_path(".lucidos/"));
+        assert!(super::is_engine_injected_path(".lucidos"));
+        assert!(super::is_engine_injected_path(
+            ".claude/skills/lucidos-cli/SKILL.md"
+        ));
+        assert!(super::is_engine_injected_path(".claude/skills/lucidos-cli/"));
+        assert!(super::is_engine_injected_path(".claude/skills/lucidos-cli"));
+
+        // Sibling paths must NOT match — false positives would hide unrelated
+        // user files (e.g. a user-named `.lucidos-workspace-archive` or a
+        // `.claude/skills/lucidos-cli-helper/` skill).
+        assert!(!super::is_engine_injected_path(".lucidos-workspace-archive"));
+        assert!(!super::is_engine_injected_path(".lucidosX/bin"));
+        assert!(!super::is_engine_injected_path(
+            ".claude/skills/lucidos-cli-helper/SKILL.md"
+        ));
+        assert!(!super::is_engine_injected_path(".claude/skills/bugfix/SKILL.md"));
+        assert!(!super::is_engine_injected_path(".claude/CLAUDE.md"));
+        assert!(!super::is_engine_injected_path("src/main.rs"));
     }
 }

@@ -10,6 +10,7 @@ import { ui } from './ui';
 import { sse } from './sse';
 import { utils } from './utils';
 import { capture } from './capture';
+import { proxy } from './proxy';
 
 export const lucidos = {
   configure,
@@ -23,6 +24,7 @@ export const lucidos = {
   ui,
   sse,
   utils,
+  proxy,
   _capture: capture,
 };
 

@@ -6,7 +6,7 @@ export interface Thread {
   source: string;
   last_activity: string;
   message_count: number;
-  is_pinned: boolean;
+  is_saved: boolean;
   has_response: boolean;
 }
 

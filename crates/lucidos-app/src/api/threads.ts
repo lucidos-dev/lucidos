@@ -28,13 +28,31 @@ export interface ThreadInfo {
   parent_thread_id?: string | null;
   /** Cached title of the parent thread — null when no parent or no title yet. */
   parent_thread_title?: string | null;
+  /** Trigger that fired this thread (only for `channel === 'trigger'`). */
+  trigger_id?: string | null;
+  /** Trigger name at fire-time (snapshot — falls back when the trigger is renamed/deleted). */
+  trigger_name?: string | null;
+  /** Repository the CC session bound to (only for `channel === 'claude_code'`). */
+  cc_repo_id?: string | null;
+  /** Current repo name from the registry — null when the repo was deleted. */
+  cc_repo_name?: string | null;
+  /** Compose state machine: 'composing' (draft) | 'active' | 'discarded' | 'archived'. */
+  state: 'composing' | 'active' | 'discarded' | 'archived';
+  /** In-progress compose text. Empty when nothing typed. */
+  compose_text: string;
+  /** Currently-attached compose image URLs. Empty array when none. */
+  compose_images: string[];
+  /** User's mode preference while composing. Null once the thread is no longer composing. */
+  compose_mode?: 'lucidos' | 'claude_code' | null;
 }
 
 export interface ThreadsResponse {
-    pinned: ThreadInfo[];
+    saved: ThreadInfo[];
     history: ThreadInfo[];
     active: string[];
     active_threads: ThreadInfo[];
+    /** Threads in `composing` state — the Drafts surface. Newest-first. */
+    composing: ThreadInfo[];
     /** Included when the focused thread isn't in the other lists. */
     focused_thread?: ThreadInfo;
 }
@@ -44,31 +62,31 @@ export async function fetchThreads(focusedThreadId?: string): Promise<ThreadsRes
     return json(`${API_BASE}/api/threads${params}`);
 }
 
-export async function pinThread(threadId: string): Promise<void> {
-    const res = await fetch(`${API_BASE}/api/threads/pin`, {
+export async function saveThread(threadId: string): Promise<void> {
+    const res = await fetch(`${API_BASE}/api/threads/save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ thread_id: threadId }),
     });
-    if (!res.ok) throw new ApiError(res.status, 'Failed to pin thread');
+    if (!res.ok) throw new ApiError(res.status, 'Failed to save thread');
 }
 
-export async function unpinThread(threadId: string): Promise<void> {
-    const res = await fetch(`${API_BASE}/api/threads/unpin`, {
+export async function unsaveThread(threadId: string): Promise<void> {
+    const res = await fetch(`${API_BASE}/api/threads/unsave`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ thread_id: threadId }),
     });
-    if (!res.ok) throw new ApiError(res.status, 'Failed to unpin thread');
+    if (!res.ok) throw new ApiError(res.status, 'Failed to unsave thread');
 }
 
-export async function dismissThread(threadId: string): Promise<void> {
-    const res = await fetch(`${API_BASE}/api/threads/dismiss`, {
+export async function archiveThread(threadId: string): Promise<void> {
+    const res = await fetch(`${API_BASE}/api/threads/archive`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ thread_id: threadId }),
     });
-    if (!res.ok) throw new ApiError(res.status, 'Failed to dismiss thread');
+    if (!res.ok) throw new ApiError(res.status, 'Failed to archive thread');
 }
 
 export async function renameThread(threadId: string, title: string): Promise<void> {
@@ -112,9 +130,13 @@ export async function fetchOlderThreads(
   before: string,
   limit = 15,
   sources?: string[],
+  triggerIds?: string[],
+  repoIds?: string[],
 ): Promise<OlderThreadsResponse> {
     const params = new URLSearchParams({ before, limit: String(limit) });
     if (sources && sources.length > 0) params.set('sources', sources.join(','));
+    if (triggerIds && triggerIds.length > 0) params.set('trigger_ids', triggerIds.join(','));
+    if (repoIds && repoIds.length > 0) params.set('repo_ids', repoIds.join(','));
     const res = await fetch(`${API_BASE}/api/threads/older?${params}`);
     if (!res.ok) throw new ApiError(res.status, 'Failed to fetch older threads');
     return res.json();
@@ -128,10 +150,21 @@ export type ThreadEventRow = {
   event_id: string;
 };
 
+import type { ThreadAggregate } from '../store/thread-events';
+
+/** Wraps `events[]` with `currentAggregate` so the historical-replay path
+ *  applies meta from a fetched snapshot — same source-of-truth model as live
+ *  SSE per-event aggregate. Without it, refresh paths can't reconstruct meta
+ *  from events alone (event types no longer carry derivation rules). */
+export type ThreadEventsSnapshot = {
+  events: ThreadEventRow[];
+  currentAggregate: ThreadAggregate | null;
+};
+
 export async function fetchThreadEvents(
   threadId: string,
   afterSeq?: number,
-): Promise<ThreadEventRow[]> {
+): Promise<ThreadEventsSnapshot> {
   const params = afterSeq !== undefined ? `?after=${afterSeq}` : '';
   return json(`${API_BASE}/api/threads/${threadId}/events${params}`);
 }

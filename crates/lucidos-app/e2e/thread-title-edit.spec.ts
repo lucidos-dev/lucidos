@@ -39,6 +39,19 @@ async function getVisibleTitleText(page: import('@playwright/test').Page): Promi
   });
 }
 
+/** Height (px) of the visible mobile thread-title-display textarea, ignoring
+ *  the desktop copy. Returns 0 if neither layout's display is rendered. */
+async function getMobileTitleHeight(page: import('@playwright/test').Page): Promise<number> {
+  return page.evaluate(() => {
+    const els = document.querySelectorAll('.mobile-thread-title-row .thread-title-display');
+    for (const el of els) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0) return rect.height;
+    }
+    return 0;
+  });
+}
+
 test.describe('Thread title editing — desktop', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
@@ -75,6 +88,41 @@ test.describe('Thread title editing — desktop', () => {
 
     const displayed = await getVisibleTitleText(page);
     expect(displayed).toBe(newTitle);
+  });
+
+  test('after saving, clicking the title again re-enters edit mode', async ({ page }) => {
+    await navigateToApp(page);
+
+    const msg = uniqueMessage('title-reedit');
+    await sendMessage(page, `Say exactly: "${msg}"`);
+    await waitForResponse(page);
+
+    await waitForThreadTitle(page);
+
+    // First edit cycle
+    await clickVisibleElement(page, '.thread-title-display');
+    let input = await waitForTitleInput(page);
+    const firstTitle = `First ${Date.now()}`;
+    await input.fill(firstTitle);
+    await input.press('Enter');
+
+    // Wait for the editor to leave edit mode (is-editing class removed)
+    await page.waitForFunction(() => {
+      return document.querySelectorAll('.thread-title-edit.is-editing').length === 0;
+    }, undefined, { timeout: 10_000 });
+
+    // Click the title again — without the fix, the still-focused overlay
+    // input swallows the click and onFocus never re-fires, so editing
+    // stays false and waitForTitleInput times out.
+    await clickVisibleElement(page, '.thread-title-display');
+    input = await waitForTitleInput(page);
+
+    // Sanity: the input is the active element and editable.
+    const isFocused = await page.evaluate(() => {
+      const el = document.activeElement;
+      return el?.tagName === 'INPUT' && el.classList.contains('thread-title-edit-input');
+    });
+    expect(isFocused).toBe(true);
   });
 
   test('press Escape cancels editing without saving', async ({ page }) => {
@@ -222,6 +270,56 @@ test.describe('Thread title editing — mobile', () => {
     const userSelectAtFocus = await page.evaluate(() => (window as any).__userSelectAtFocus);
     expect(userSelectAtFocus).toBeDefined();
     expect(userSelectAtFocus).not.toBe('none');
+  });
+
+  test('title display retains full height after rename (SSE race)', async ({ page }) => {
+    // Repro for: editing the title on mobile and saving causes the title
+    // display to collapse to ~2px (border height) — title appears to "disappear"
+    // until reload restores it.
+    //
+    // Race: SSE delivers ThreadTitleRenamed before the rename HTTP response
+    // resolves. The new title flows into ThreadTitleEditor via the threadMap
+    // signal; its [title]-keyed useEffect runs autoResizeTextarea against the
+    // display textarea while editing is still true (display:none → scrollHeight
+    // 0 → style.height pinned to ~2px). When setEditing(false) finally runs,
+    // the display becomes visible at the broken 2px height and never recomputes.
+    //
+    // We force the race by delaying /api/threads/rename so SSE always wins.
+    await page.route('**/api/threads/rename', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await route.continue();
+    });
+
+    await navigateToApp(page);
+
+    const msg = uniqueMessage('mobile-rename-race');
+    await sendMessage(page, `Say exactly: "${msg}"`);
+    await waitForResponse(page);
+    await waitForThreadTitle(page);
+
+    // Capture pre-edit height as the baseline for "natural" height.
+    const baselineHeight = await getMobileTitleHeight(page);
+    expect(baselineHeight).toBeGreaterThan(10);
+
+    await clickVisibleElement(page, '.thread-title-display');
+    const input = await waitForTitleInput(page);
+    const newTitle = `Race Rename ${Date.now()}`;
+    await input.fill(newTitle);
+    await input.press('Enter');
+
+    // Wait for the new title to be reflected in the visible display.
+    await page.waitForFunction((expected) => {
+      const els = document.querySelectorAll('.thread-title-display');
+      return Array.from(els).some(el => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && ((el as HTMLTextAreaElement).value ?? '').trim() === expected;
+      });
+    }, newTitle, { timeout: 10_000 });
+
+    // The bug: the display's height collapses to the border-only height
+    // (~2px). Assert the rendered height is at least most of the baseline.
+    const postSaveHeight = await getMobileTitleHeight(page);
+    expect(postSaveHeight).toBeGreaterThanOrEqual(baselineHeight - 1);
   });
 
   test('title hides with header on scroll down', async ({ page }) => {

@@ -14,12 +14,19 @@
 //! Lives entirely in memory; on engine restart, in-flight CC HTTP calls are
 //! dropped (their MCP client returns deny), so there's nothing to recover.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// User-facing reason on a denied permission. Surfaces in the response body
 /// returned to CC's MCP middleware and in the persisted `Resolved` event.
 pub const DENIAL_REASON: &str = "User denied";
+
+/// Reason returned to CC's MCP middleware when `permission_prompt` auto-
+/// allows a request via a session-allow match. Echoed in the HTTP response
+/// body so CC's tool-call log records *why* the prompt was bypassed; no
+/// `CodingAgentPermissionRequest`/`Resolved` event is emitted on the
+/// auto-allow path, so this string never reaches the chat UI.
+pub const SESSION_ALLOW_REASON: &str = "Allowed for this thread";
 
 /// Grouping key for collapsing identical concurrent permission requests.
 /// `canonical_input` is `serde_json::to_string(&input)` — sufficient for CC's
@@ -29,19 +36,28 @@ pub type DedupKey = (Uuid, String, String);
 
 /// Canonical pending entry — owns the broadcast channel that fans out the
 /// answer to every blocked HTTP handler waiting on this `(thread, tool,
-/// input)` triple.
+/// input)` triple. `tool_name` and `input` are kept on the entry (in addition
+/// to being part of the `DedupKey`) so the consent handler can derive an
+/// "Always allow" persistence pattern without re-parsing the canonical input.
 pub struct CcPermissionEntry {
     pub thread_id: Uuid,
     pub request_id: String,
+    pub tool_name: String,
+    pub input: serde_json::Value,
     pub tx: tokio::sync::broadcast::Sender<bool>,
 }
 
 /// Two-way index: lookup by `DedupKey` when a new HTTP request arrives,
-/// lookup by `request_id` when the user submits consent.
+/// lookup by `request_id` when the user submits consent. `session_allows`
+/// remembers the user's "Allow for this thread" choices so subsequent
+/// identical-pattern requests skip the prompt entirely. In-memory only —
+/// engine restart wipes it (sessions resume but the user re-approves once,
+/// matching the engine-statelessness rule).
 #[derive(Default)]
 pub struct CcPermissionState {
     pub by_dedup_key: HashMap<DedupKey, CcPermissionEntry>,
     pub by_request_id: HashMap<String, DedupKey>,
+    pub session_allows: HashMap<Uuid, HashSet<String>>,
 }
 
 impl CcPermissionState {
@@ -52,6 +68,26 @@ impl CcPermissionState {
     pub fn take(&mut self, request_id: &str) -> Option<CcPermissionEntry> {
         let key = self.by_request_id.remove(request_id)?;
         self.by_dedup_key.remove(&key)
+    }
+
+    /// Record a session-allow pattern for a thread. Idempotent — duplicate
+    /// inserts are a no-op. The pattern is whatever `derive_allow_pattern`
+    /// returned for `AllowScope::Session` on the originating prompt; matching
+    /// is exact-string against the set returned by the same derivation on
+    /// future prompts.
+    pub fn allow_session(&mut self, thread_id: Uuid, pattern: String) {
+        self.session_allows
+            .entry(thread_id)
+            .or_default()
+            .insert(pattern);
+    }
+
+    /// True iff `pattern` is recorded for `thread_id`. Caller derives the
+    /// pattern from the new request's input via `derive_allow_pattern`.
+    pub fn matches_session_allow(&self, thread_id: Uuid, pattern: &str) -> bool {
+        self.session_allows
+            .get(&thread_id)
+            .is_some_and(|set| set.contains(pattern))
     }
 
     /// Drop entries whose subscribers have all been canceled (HTTP handler
@@ -83,6 +119,8 @@ mod tests {
         CcPermissionEntry {
             thread_id: Uuid::nil(),
             request_id: req_id.to_string(),
+            tool_name: "Edit".to_string(),
+            input: serde_json::json!({}),
             tx,
         }
     }
@@ -104,6 +142,32 @@ mod tests {
         assert_eq!(taken.request_id, "req-1");
         assert!(state.by_dedup_key.is_empty());
         assert!(state.by_request_id.is_empty());
+    }
+
+    #[test]
+    fn allow_session_inserts_and_matches_per_thread() {
+        let mut state = CcPermissionState::default();
+        let thread_a = Uuid::new_v4();
+        let thread_b = Uuid::new_v4();
+        state.allow_session(thread_a, "Edit(/tmp/foo.md)".into());
+        assert!(state.matches_session_allow(thread_a, "Edit(/tmp/foo.md)"));
+        // Different thread does NOT inherit the allow.
+        assert!(!state.matches_session_allow(thread_b, "Edit(/tmp/foo.md)"));
+        // Different pattern in the same thread does NOT match.
+        assert!(!state.matches_session_allow(thread_a, "Edit(/tmp/bar.md)"));
+    }
+
+    #[test]
+    fn allow_session_is_idempotent() {
+        let mut state = CcPermissionState::default();
+        let thread = Uuid::new_v4();
+        state.allow_session(thread, "Bash(git:*)".into());
+        state.allow_session(thread, "Bash(git:*)".into());
+        assert_eq!(
+            state.session_allows.get(&thread).map(|s| s.len()),
+            Some(1),
+            "duplicate insert must not grow the set"
+        );
     }
 
     #[test]

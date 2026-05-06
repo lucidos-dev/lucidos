@@ -29,41 +29,50 @@ vi.hoisted(() => {
 
 import { focusedThreadId, threadMap, mobileView, threadDrawerOpen, ccPendingModel, ccPendingReasoningEffort, resetCCPendingPreferences } from '../store';
 import type { ThreadState, ThreadMeta } from '../thread-events';
+import { _resetComposeDraftsForTesting, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import {
   focusThread,
   unfocusThread,
-  handlePinThread,
-  handleUnpinThread,
-  handleDismissThread,
+  handleSaveThread,
+  handleUnsaveThread,
+  handleArchiveThread,
 } from './threads';
 import { scrolledUp, notAtTop, getResizeMode } from '../../components/chat/scrollState';
+import { threadScrollKey } from '../../hooks/useScrollMemory';
 import { drawerOpen } from '../../components/layout/Drawer';
 
-import { loadAllThreads, ensureThreadInMap, upsertThread } from './thread-loading';
+import { loadAllThreads, ensureThreadInMap, ensureThreadByIdInMap, upsertThread } from './thread-loading';
 import { threadsLoaded, generatedTitleIds } from '../store';
 
 // Mock the API module
 vi.mock('../../api/threads', () => ({
   fetchThreads: vi.fn(),
-  fetchThreadEvents: vi.fn().mockResolvedValue([]),
+  fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
   fetchThreadMessages: vi.fn(),
-  pinThread: vi.fn().mockResolvedValue(undefined),
-  unpinThread: vi.fn().mockResolvedValue(undefined),
-  dismissThread: vi.fn().mockResolvedValue(undefined),
+  saveThread: vi.fn().mockResolvedValue(undefined),
+  unsaveThread: vi.fn().mockResolvedValue(undefined),
+  archiveThread: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../../components/chat/promptFocus', () => ({
+// Use the real isComposeFocusedHere — the compose-preservation tests below
+// plant a fake activeElement + querySelectorAll to drive its branches. Mocking
+// only the focus-side-effect helpers keeps the predicate honest if it grows.
+vi.mock('../../components/chat/promptFocus', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../components/chat/promptFocus')>()),
   focusPromptNow: vi.fn(),
   focusIfNeeded: vi.fn(),
   composeHandlers: vi.fn(),
 }));
 
-vi.mock('../../api/client', () => ({
+vi.mock('../../api/client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../api/client')>()),
   API_BASE: '',
   submitChat: vi.fn().mockResolvedValue(undefined),
   cancelChat: vi.fn(),
   cancelClaudeCode: vi.fn(),
-  interruptClaudeCode: vi.fn(),
+  putComposeOnThread: vi.fn().mockResolvedValue(undefined),
+  ensureThreadStarted: vi.fn().mockResolvedValue(undefined),
+  deleteThread: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { fetchThreads } from '../../api/threads';
@@ -73,17 +82,32 @@ import { focusPromptNow } from '../../components/chat/promptFocus';
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeThreadState(id: string, overrides: Partial<Omit<ThreadState, 'meta'>> & { meta?: Partial<ThreadMeta> } = {}): ThreadState {
+interface MakeThreadOverrides extends Partial<Omit<ThreadState, 'meta'>> {
+  meta?: Partial<ThreadMeta> & {
+    composeText?: string;
+    composeImages?: string[];
+    composeMode?: ComposeDraft['mode'];
+  };
+}
+
+function makeThreadState(id: string, overrides: MakeThreadOverrides = {}): ThreadState {
+  const { composeText, composeImages, composeMode, ...metaOverrides } = overrides.meta ?? {};
+  if (composeText !== undefined || composeImages !== undefined || composeMode !== undefined) {
+    setDraft(id, {
+      text: composeText ?? '',
+      images: composeImages ?? [],
+      mode: composeMode ?? null,
+    });
+  }
   return {
     meta: {
       id,
       title: `Thread ${id}`,
       channel: 'chat',
       initiator: 'user',
-      pinned: false,
+      saved: false,
       createdAt: '2026-01-01T00:00:00Z',
       updatedAt: '2026-01-01T00:00:00Z',
-      unread: false,
       status: 'idle',
       ccHasChanges: false,
       ccRequiresRestart: false,
@@ -91,10 +115,11 @@ function makeThreadState(id: string, overrides: Partial<Omit<ThreadState, 'meta'
       ccApplying: false,
       lastRevivedAt: '',
       messageCount: 0,
-      section: 'default',
+      section: 'archived',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
-      ...(overrides.meta || {}),
+      state: 'active',
+      ...metaOverrides,
     },
     events: overrides.events || new Map(),
     streamingBuffer: overrides.streamingBuffer || '',
@@ -111,6 +136,7 @@ function makeThreadState(id: string, overrides: Partial<Omit<ThreadState, 'meta'
 
 beforeEach(() => {
   threadMap.value = new Map();
+  _resetComposeDraftsForTesting();
   focusedThreadId.value = null;
   mobileView.value = 'thread';
   threadDrawerOpen.value = false;
@@ -168,6 +194,20 @@ describe('focusThread', () => {
     }
   });
 
+  it('skips scroll-to-bottom when target thread has a saved scroll position', () => {
+    // scrollToBottom's first action is `scrolledUp.value = false` —
+    // an unchanged `true` proves it wasn't called.
+    const key = threadScrollKey('tSaved');
+    try {
+      localStorage.setItem(key, '500');
+      scrolledUp.value = true;
+      focusThread('tSaved');
+      expect(scrolledUp.value).toBe(true);
+    } finally {
+      localStorage.removeItem(key);
+    }
+  });
+
   it('navigates to thread pane on mobile', () => {
     // Bug: toast onClick handlers call focusThread() but the user stays on
     // whichever pane they were on. On mobile, focusing a thread must also
@@ -215,6 +255,22 @@ describe('focusThread', () => {
       mobileView.value = 'threads';
       focusThread('t1');
       // On desktop, mobileView is unused — must not be mutated
+      expect(mobileView.value).toBe('threads');
+    } finally {
+      (globalThis as any).innerWidth = origWidth;
+    }
+  });
+
+  it('skipPaneNav keeps the user on the threads pane on mobile', () => {
+    // History chevrons in the threads-list header walk the nav stack while
+    // keeping the user on the list — they preview where they've been instead
+    // of jumping into the thread chat view.
+    const origWidth = globalThis.innerWidth;
+    (globalThis as any).innerWidth = 375;
+    try {
+      mobileView.value = 'threads';
+      focusThread('t1', { skipPaneNav: true });
+      expect(focusedThreadId.value).toBe('t1');
       expect(mobileView.value).toBe('threads');
     } finally {
       (globalThis as any).innerWidth = origWidth;
@@ -306,30 +362,30 @@ describe('focusedThreadId persistence', () => {
 });
 
 // ---------------------------------------------------------------------------
-// handlePinThread / handleUnpinThread
+// handleSaveThread / handleUnsaveThread
 // ---------------------------------------------------------------------------
 
-describe('handlePinThread', () => {
-  it('sets pinned to true in threadMap', async () => {
+describe('handleSaveThread', () => {
+  it('sets saved to true in threadMap', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1'));
     threadMap.value = map;
 
-    await handlePinThread('t1');
+    await handleSaveThread('t1');
 
-    expect(threadMap.value.get('t1')!.meta.pinned).toBe(true);
+    expect(threadMap.value.get('t1')!.meta.saved).toBe(true);
   });
 });
 
-describe('handleUnpinThread', () => {
-  it('sets pinned to false in threadMap', async () => {
+describe('handleUnsaveThread', () => {
+  it('sets saved to false in threadMap', async () => {
     const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', { meta: { id: 't1', title: 'Thread t1', channel: 'chat', pinned: true, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'default', activeChildrenCount: 0 } }));
+    map.set('t1', makeThreadState('t1', { meta: { id: 't1', title: 'Thread t1', channel: 'chat', saved: true, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 } }));
     threadMap.value = map;
 
-    await handleUnpinThread('t1');
+    await handleUnsaveThread('t1');
 
-    expect(threadMap.value.get('t1')!.meta.pinned).toBe(false);
+    expect(threadMap.value.get('t1')!.meta.saved).toBe(false);
   });
 });
 
@@ -344,14 +400,15 @@ describe('loadAllThreads', () => {
 
   function mockApiResponse(threads: { thread_id: string; title: string; channel: string; last_activity: string; status?: string; cc_has_changes?: boolean; cc_requires_restart?: boolean; cc_is_external_repo?: boolean; cc_applying?: boolean }[]) {
     (fetchThreads as any).mockResolvedValue({
-      pinned: [],
+      saved: [],
       active_threads: [],
+      composing: [],
       active: [],
       history: threads.map(t => ({
         ...t,
         created_at: t.last_activity,
         message_count: 1,
-        section: 'default',
+        section: 'archived',
         status: t.status || 'idle',
         cc_has_changes: t.cc_has_changes || false,
         cc_requires_restart: t.cc_requires_restart || false,
@@ -366,7 +423,7 @@ describe('loadAllThreads', () => {
     // SSE skeleton has stale title but newer updatedAt from live events
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: '...', channel: 'chat', pinned: false, createdAt: '', updatedAt: '2026-03-15T17:00:00Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'default', activeChildrenCount: 0 },
+      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T17:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
@@ -387,7 +444,7 @@ describe('loadAllThreads', () => {
     // SSE delivered ThreadTitleGenerated → generatedTitleIds has this thread
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Generated Title', channel: 'chat', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'default', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Generated Title', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     generatedTitleIds.add('t1');
@@ -405,7 +462,7 @@ describe('loadAllThreads', () => {
   it('does not overwrite title with placeholder "..."', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Good Title From SSE', channel: 'chat', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'default', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Good Title From SSE', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
@@ -449,10 +506,10 @@ describe('loadAllThreads', () => {
     // SSE skeletons with timestamps from live events
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: '...', channel: 'chat', pinned: false, createdAt: '', updatedAt: '2026-03-15T19:30:00Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'default', activeChildrenCount: 0 },
+      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T19:30:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: '...', channel: 'chat', pinned: false, createdAt: '', updatedAt: '2026-03-15T15:00:00Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'default', activeChildrenCount: 0 },
+      meta: { id: 't2', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T15:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
@@ -479,12 +536,13 @@ describe('loadAllThreads', () => {
 
   it('populates messageCount from API message_count', async () => {
     (fetchThreads as any).mockResolvedValue({
-      pinned: [],
+      saved: [],
       active_threads: [],
+      composing: [],
       active: [],
       history: [
-        { thread_id: 't1', title: 'Thread 1', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 5, section: 'default', status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null, active_children_count: 0 },
-        { thread_id: 't2', title: 'Thread 2', channel: 'claude_code', last_activity: '2026-03-15T17:00:00Z', created_at: '2026-03-15T17:00:00Z', message_count: 12, section: 'default', status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null, active_children_count: 0 },
+        { thread_id: 't1', title: 'Thread 1', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 5, section: 'archived', status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null, active_children_count: 0 },
+        { thread_id: 't2', title: 'Thread 2', channel: 'claude_code', last_activity: '2026-03-15T17:00:00Z', created_at: '2026-03-15T17:00:00Z', message_count: 12, section: 'archived', status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null, active_children_count: 0 },
       ],
     });
 
@@ -497,16 +555,17 @@ describe('loadAllThreads', () => {
   it('updates messageCount on existing threads from API', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: '...', channel: 'chat', pinned: false, createdAt: '', updatedAt: '2026-03-15T19:00:00Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'default', activeChildrenCount: 0 },
+      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T19:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
     (fetchThreads as any).mockResolvedValue({
-      pinned: [],
+      saved: [],
       active_threads: [],
+      composing: [],
       active: [],
       history: [
-        { thread_id: 't1', title: 'Thread 1', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 7, section: 'default', status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null, active_children_count: 0 },
+        { thread_id: 't1', title: 'Thread 1', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 7, section: 'archived', status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null, active_children_count: 0 },
       ],
     });
 
@@ -517,14 +576,15 @@ describe('loadAllThreads', () => {
 
   it('marks active threads from API active set', async () => {
     (fetchThreads as any).mockResolvedValue({
-      pinned: [],
+      saved: [],
       active_threads: [
-        { thread_id: 't1', title: 'Active', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'default', active_children_count: 0, status: 'running', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null },
+        { thread_id: 't1', title: 'Active', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'archived', active_children_count: 0, status: 'running', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null },
       ],
       active: ['t1'],
       history: [
-        { thread_id: 't2', title: 'Idle', channel: 'chat', last_activity: '2026-03-15T17:00:00Z', created_at: '2026-03-15T17:00:00Z', message_count: 3, section: 'default', active_children_count: 0, status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null },
+        { thread_id: 't2', title: 'Idle', channel: 'chat', last_activity: '2026-03-15T17:00:00Z', created_at: '2026-03-15T17:00:00Z', message_count: 3, section: 'archived', active_children_count: 0, status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null },
       ],
+      composing: [],
     });
 
     await loadAllThreads();
@@ -548,17 +608,18 @@ describe('loadAllThreads', () => {
     // Events may carry different channels (e.g., a follow-up MessageReceived with
     // channel='chat'), but the API value must win on initial load.
     (fetchThreads as any).mockResolvedValue({
-      pinned: [],
+      saved: [],
       active_threads: [
-        { thread_id: 't1', title: 'Trigger Run', channel: 'trigger', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'default', status: 'running', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null, active_children_count: 0 },
+        { thread_id: 't1', title: 'Trigger Run', channel: 'trigger', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'archived', status: 'running', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null, active_children_count: 0 },
       ],
       active: ['t1'],
       history: [],
+      composing: [],
     });
 
     // Event has a different channel — this must NOT overwrite the API channel
     const { fetchThreadEvents } = await import('../../api/threads');
-    (fetchThreadEvents as any).mockResolvedValue([
+    (fetchThreadEvents as any).mockResolvedValue({ events: [
       {
         sequence: 1,
         event_type: 'MessageReceived',
@@ -566,13 +627,250 @@ describe('loadAllThreads', () => {
         created: '2026-03-15T18:00:00Z',
         event_id: 'e1',
       },
-    ]);
+    ], currentAggregate: null });
 
     await loadAllThreads();
 
     // API channel is preserved — events don't overwrite on initial load
     const thread = threadMap.value.get('t1')!;
     expect(thread.meta.channel).toBe('trigger');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadAllThreads — compose-state preservation while user is typing
+//
+// loadAllThreads runs on SSE reconnect / Lagged events / resume. The API
+// returns the LAST PERSISTED compose state, which can be 250ms+ stale due
+// to the debounced PUT. Without a guard, upsertThread overwrites the user's
+// in-flight keystrokes, losing text and jumping the cursor.
+// ---------------------------------------------------------------------------
+
+describe('loadAllThreads — compose preservation', () => {
+  beforeEach(() => {
+    threadsLoaded.value = false;
+  });
+
+  function mockComposeApiResponse(threadId: string, composeText: string, composeImages: string[] = []) {
+    (fetchThreads as any).mockResolvedValue({
+      saved: [],
+      active_threads: [],
+      composing: [],
+      active: [],
+      history: [{
+        thread_id: threadId,
+        title: 'T',
+        channel: 'chat',
+        last_activity: '2026-03-15T18:00:00Z',
+        created_at: '2026-03-15T18:00:00Z',
+        message_count: 0,
+        section: 'archived',
+        status: 'idle',
+        cc_has_changes: false,
+        cc_requires_restart: false,
+        cc_is_external_repo: false,
+        cc_applying: false,
+        last_revived_at: null,
+        active_children_count: 0,
+        state: 'composing',
+        compose_text: composeText,
+        compose_images: composeImages,
+        compose_mode: null,
+      }],
+    });
+  }
+
+  /** Plant a fake textarea matching `[data-role="prompt-input"]` and mark it as
+   *  document.activeElement so isComposeFocusedHere() returns true. */
+  function focusPromptOnThread(threadId: string): void {
+    const el: any = {
+      dataset: { threadId, role: 'prompt-input' },
+      getBoundingClientRect: () => ({ width: 200, height: 30 }),
+    };
+    el.getAttribute = (name: string) => name === 'data-role' ? 'prompt-input' : el.dataset[name];
+    (globalThis.document as any).querySelectorAll = (sel: string) => sel === '[data-role="prompt-input"]' ? [el] : [];
+    (globalThis.document as any).activeElement = el;
+  }
+
+  function unfocusPrompt(): void {
+    (globalThis.document as any).querySelectorAll = () => [];
+    (globalThis.document as any).activeElement = null;
+  }
+
+  it('preserves local composeText when textarea is focused on this thread', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', { meta: { state: 'composing', composeText: 'hello world I am typing' } }));
+    threadMap.value = map;
+    focusedThreadId.value = 't1';
+    focusPromptOnThread('t1');
+
+    // API returns stale compose_text from before the user's keystrokes
+    mockComposeApiResponse('t1', 'hello');
+
+    await loadAllThreads();
+
+    expect(getDraft('t1').text).toBe('hello world I am typing');
+    unfocusPrompt();
+  });
+
+  it('preserves local composeImages when textarea is focused on this thread', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', { meta: { state: 'composing', composeImages: ['local-img-base64'] } }));
+    threadMap.value = map;
+    focusedThreadId.value = 't1';
+    focusPromptOnThread('t1');
+
+    mockComposeApiResponse('t1', '', []);
+
+    await loadAllThreads();
+
+    expect(getDraft('t1').images).toEqual(['local-img-base64']);
+    unfocusPrompt();
+  });
+
+  it('preserves local composeText when a PUT is in flight (debounced push not yet acked)', async () => {
+    const { pendingComposePuts } = await import('./compose');
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', { meta: { state: 'composing', composeText: 'half-typed sentence' } }));
+    threadMap.value = map;
+    pendingComposePuts.add('t1');
+    unfocusPrompt(); // textarea may have lost focus mid-PUT
+
+    mockComposeApiResponse('t1', 'half'); // server has older state
+
+    try {
+      await loadAllThreads();
+      expect(getDraft('t1').text).toBe('half-typed sentence');
+    } finally {
+      pendingComposePuts.delete('t1');
+    }
+  });
+
+  it('does refresh composeText when no local edit is in flight (cross-device sync still works)', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', { meta: { state: 'composing', composeText: 'old local' } }));
+    threadMap.value = map;
+    unfocusPrompt(); // not actively typing here
+    // pendingComposePuts is empty
+
+    mockComposeApiResponse('t1', 'updated by peer');
+
+    await loadAllThreads();
+
+    expect(getDraft('t1').text).toBe('updated by peer');
+  });
+
+  // iOS PWA photo-attach regression: PHPicker dismissal fires visibilitychange
+  // (which kicks off loadAllThreads) right around the same instant as the file
+  // input's change event. The change handler resolves a FileReader and calls
+  // updateCompose, which only commits the optimistic image to threadMap and
+  // schedules the PUT for 250ms later. If loadAllThreads lands inside that
+  // debounce window, the textarea isn't focused (the picker stole it) and
+  // pendingComposePuts is still empty, so upsertThread overwrites the freshly
+  // attached image with the server's stale empty array — preview never appears.
+  it('preserves locally-attached image when loadAllThreads lands inside the PUT debounce window', async () => {
+    const { updateCompose, pendingComposePuts, composeEditedAt } = await import('./compose');
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: '', composeImages: [] } }));
+    threadMap.value = map;
+    focusedThreadId.value = 't1';
+    unfocusPrompt(); // PHPicker took focus away from the textarea
+
+    // User just attached an image — optimistic update committed, PUT debounced
+    updateCompose('t1', { images: ['attached-img-base64'] });
+
+    // Server's last persisted state is still empty (PUT hasn't been sent yet)
+    mockComposeApiResponse('t1', '', []);
+
+    try {
+      await loadAllThreads();
+      expect(getDraft('t1').images).toEqual(['attached-img-base64']);
+    } finally {
+      // Clean up the entries the real updateCompose put there. The 250ms timer
+      // it also scheduled will still fire after this test, but pushNow's
+      // missing-thread guard will see threadMap empty and bail without an HTTP
+      // call — so the leak is bounded to the entries below.
+      composeEditedAt.delete('t1');
+      pendingComposePuts.delete('t1');
+    }
+  });
+
+  // "Preview appears then disappears" — the user reports this on macOS Chrome
+  // and iOS Safari PWA. The previous fix covers the case where loadAllThreads
+  // lands DURING the debounce window. This test covers the harder case: the
+  // GET was sent BEFORE the optimistic write (so server's snapshot has empty
+  // images), but its RESPONSE arrives AFTER pushNow's PUT has completed and
+  // pendingComposePuts has been cleared. The guard sees no pending entry and
+  // overwrites the freshly attached image with the stale server snapshot.
+  it('preserves locally-attached image when stale loadAllThreads response lands after PUT completes', async () => {
+    const { updateCompose, pendingComposePuts, composeEditedAt } = await import('./compose');
+
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: '', composeImages: [] } }));
+    threadMap.value = map;
+    focusedThreadId.value = 't1';
+    unfocusPrompt(); // textarea isn't focused (picker stole focus)
+
+    // Server's snapshot is from BEFORE the user's PUT. fetchThreads is mocked
+    // to defer until we resolve the gate, simulating a slow GET.
+    let releaseFetch: (() => void) | null = null;
+    const fetchGate = new Promise<void>((resolve) => { releaseFetch = resolve; });
+    (fetchThreads as any).mockImplementationOnce(async () => {
+      await fetchGate;
+      return {
+        saved: [],
+        active_threads: [],
+        composing: [],
+        active: [],
+        history: [{
+          thread_id: 't1',
+          title: 'T',
+          channel: 'chat',
+          last_activity: '2026-03-15T18:00:00Z',
+          created_at: '2026-03-15T18:00:00Z',
+          message_count: 0,
+          section: 'archived',
+          status: 'idle',
+          cc_has_changes: false,
+          cc_requires_restart: false,
+          cc_is_external_repo: false,
+          cc_applying: false,
+          last_revived_at: null,
+          active_children_count: 0,
+          state: 'active',
+          compose_text: '',
+          compose_images: [], // STALE — pre-PUT snapshot
+          compose_mode: null,
+        }],
+      };
+    });
+
+    try {
+      // Kick off loadAllThreads. Its HTTP is in flight.
+      const loadPromise = loadAllThreads();
+
+      // User attaches an image. updateCompose: optimistic + pending mark + 250ms timer.
+      updateCompose('t1', { images: ['attached-img-base64'] });
+      expect(pendingComposePuts.has('t1')).toBe(true);
+
+      // Wait for the 250ms debounce + pushNow's await to drain. After this,
+      // pendingComposePuts is cleared (PUT completed).
+      await new Promise((r) => setTimeout(r, 300));
+      expect(pendingComposePuts.has('t1')).toBe(false);
+
+      // NOW the slow loadAllThreads response arrives with stale empty images.
+      releaseFetch!();
+      await loadPromise;
+
+      // Bug: stale loadAllThreads overwrites composeImages with []. Preview disappears.
+      expect(getDraft('t1').images).toEqual(['attached-img-base64']);
+    } finally {
+      // updateCompose stamps composeEditedAt; clear so the next test using 't1'
+      // sees a clean slate (the 'cross-device sync still works' test would
+      // otherwise see this thread as still-locally-edited and skip the apply).
+      composeEditedAt.delete('t1');
+      pendingComposePuts.delete('t1');
+    }
   });
 });
 
@@ -585,7 +883,7 @@ describe('ensureThreadInMap', () => {
     threadsLoaded.value = true;
 
     const { fetchThreadEvents } = await import('../../api/threads');
-    (fetchThreadEvents as any).mockResolvedValue([
+    (fetchThreadEvents as any).mockResolvedValue({ events: [
       {
         sequence: 1,
         event_type: 'MessageReceived',
@@ -593,7 +891,7 @@ describe('ensureThreadInMap', () => {
         created: '2026-03-15T18:00:00Z',
         event_id: 'e1',
       },
-    ]);
+    ], currentAggregate: null });
 
     expect(threadMap.value.has('search-t1')).toBe(false);
 
@@ -605,7 +903,7 @@ describe('ensureThreadInMap', () => {
       last_activity: '2026-03-15T18:00:00Z',
       created_at: '2026-03-15T18:00:00Z',
       message_count: 3,
-      section: 'default',
+      section: 'archived',
       active_children_count: 0,
       total_children_count: 0,
       status: 'idle',
@@ -613,6 +911,9 @@ describe('ensureThreadInMap', () => {
       cc_requires_restart: false,
       cc_is_external_repo: false,
       cc_applying: false, last_revived_at: null,
+      state: 'active',
+      compose_text: '',
+      compose_images: [],
     });
 
     const thread = threadMap.value.get('search-t1');
@@ -626,7 +927,7 @@ describe('ensureThreadInMap', () => {
   it('does not overwrite a thread already in the map', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Existing Title', channel: 'claude_code', initiator: 'user', pinned: true, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 5, section: 'default', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Existing Title', channel: 'claude_code', initiator: 'user', saved: true, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 5, section: 'archived', activeChildrenCount: 0 },
       eventsLoaded: true,
     }));
     threadMap.value = map;
@@ -639,7 +940,7 @@ describe('ensureThreadInMap', () => {
       last_activity: '2026-03-15T18:00:00Z',
       created_at: '2026-03-15T18:00:00Z',
       message_count: 1,
-      section: 'default',
+      section: 'archived',
       active_children_count: 0,
       total_children_count: 0,
       status: 'idle',
@@ -647,11 +948,94 @@ describe('ensureThreadInMap', () => {
       cc_requires_restart: false,
       cc_is_external_repo: false,
       cc_applying: false, last_revived_at: null,
+      state: 'active',
+      compose_text: '',
+      compose_images: [],
     });
 
     const thread = threadMap.value.get('t1')!;
     expect(thread.meta.title).toBe('Existing Title');
-    expect(thread.meta.pinned).toBe(true);
+    expect(thread.meta.saved).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ensureThreadByIdInMap — thread-link click bootstrapping when only the ID
+// is known (the thread isn't in the loaded list — e.g. an archived thread
+// past the per-source History window).
+// ---------------------------------------------------------------------------
+
+describe('ensureThreadByIdInMap', () => {
+  it('fetches metadata for a thread not in the map and adds it', async () => {
+    threadsLoaded.value = true;
+    threadMap.value = new Map();
+
+    (fetchThreads as any).mockResolvedValue({
+      saved: [],
+      history: [],
+      active: [],
+      active_threads: [],
+      composing: [],
+      focused_thread: {
+        thread_id: 'old-archived-1',
+        title: 'Old Archived Thread',
+        channel: 'chat',
+        initiator: 'user',
+        last_activity: '2026-01-01T00:00:00Z',
+        created_at: '2026-01-01T00:00:00Z',
+        message_count: 4,
+        section: 'archived',
+        active_children_count: 0,
+        total_children_count: 0,
+        status: 'idle',
+        cc_has_changes: false,
+        cc_requires_restart: false,
+        cc_is_external_repo: false,
+        cc_applying: false,
+        last_revived_at: null,
+      },
+    });
+
+    const ok = await ensureThreadByIdInMap('old-archived-1');
+    expect(ok).toBe(true);
+    expect(fetchThreads).toHaveBeenCalledWith('old-archived-1');
+    const added = threadMap.value.get('old-archived-1');
+    expect(added).toBeDefined();
+    expect(added!.meta.title).toBe('Old Archived Thread');
+    expect(added!.meta.channel).toBe('chat');
+  });
+
+  it('returns true without fetching when the thread is already in the map', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('already-here', makeThreadState('already-here', {
+      meta: { id: 'already-here', title: 'Already Here', channel: 'chat', initiator: 'user', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+    }));
+    threadMap.value = map;
+    (fetchThreads as any).mockClear();
+
+    const ok = await ensureThreadByIdInMap('already-here');
+    expect(ok).toBe(true);
+    expect(fetchThreads).not.toHaveBeenCalled();
+  });
+
+  it('returns false when the API has no record of the thread', async () => {
+    threadMap.value = new Map();
+    (fetchThreads as any).mockResolvedValue({
+      saved: [], history: [], active: [], active_threads: [], composing: [],
+      // no focused_thread → API doesn't know this thread
+    });
+
+    const ok = await ensureThreadByIdInMap('does-not-exist');
+    expect(ok).toBe(false);
+    expect(threadMap.value.has('does-not-exist')).toBe(false);
+  });
+
+  it('propagates fetch errors to the caller (no swallow)', async () => {
+    threadMap.value = new Map();
+    const apiError = new Error('network down');
+    (fetchThreads as any).mockRejectedValue(apiError);
+
+    await expect(ensureThreadByIdInMap('any-id')).rejects.toThrow('network down');
   });
 });
 
@@ -672,10 +1056,9 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
         id: 'cc-1',
         title: 'Fix OAuth URLs',
         channel: 'claude_code',
-        pinned: false,
+        saved: false,
         createdAt: '2026-03-19T20:00:00Z',
         updatedAt: '2026-03-19T20:00:00Z',
-        unread: false,
         status: 'running',
       ccHasChanges: false,
       ccRequiresRestart: false,
@@ -683,7 +1066,7 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
       ccApplying: false,  // Set by SSE skeleton
         lastRevivedAt: '',
         messageCount: 0,
-        section: 'default',
+        section: 'archived',
         activeChildrenCount: 0,
       },
     }));
@@ -692,11 +1075,12 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
     // API response includes the CC thread in history but NOT in active set
     // (because the CC session hasn't registered itself yet)
     (fetchThreads as any).mockResolvedValue({
-      pinned: [],
+      saved: [],
       active_threads: [],
+      composing: [],
       active: [],  // CC thread NOT in active set
       history: [
-        { thread_id: 'cc-1', title: 'Fix OAuth URLs', channel: 'claude_code', last_activity: '2026-03-19T20:00:00Z', created_at: '2026-03-19T20:00:00Z', message_count: 1, section: 'default', active_children_count: 0, status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null },
+        { thread_id: 'cc-1', title: 'Fix OAuth URLs', channel: 'claude_code', last_activity: '2026-03-19T20:00:00Z', created_at: '2026-03-19T20:00:00Z', message_count: 1, section: 'archived', active_children_count: 0, status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null },
       ],
     });
 
@@ -716,10 +1100,9 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
         id: 'cc-1',
         title: 'Aborted Session',
         channel: 'claude_code',
-        pinned: false,
+        saved: false,
         createdAt: '2026-03-19T20:00:00Z',
         updatedAt: '2026-03-19T20:00:00Z',
-        unread: false,
         status: 'running',
       ccHasChanges: false,
       ccRequiresRestart: false,
@@ -727,7 +1110,7 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
       ccApplying: false,  // Was running before restart
         lastRevivedAt: '',
         messageCount: 0,
-        section: 'default',
+        section: 'archived',
         activeChildrenCount: 0,
       },
       eventsLoaded: true,  // Events have been loaded — downgrade is safe
@@ -735,11 +1118,12 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
     threadMap.value = map;
 
     (fetchThreads as any).mockResolvedValue({
-      pinned: [],
+      saved: [],
       active_threads: [],
+      composing: [],
       active: [],  // Thread no longer active after restart
       history: [
-        { thread_id: 'cc-1', title: 'Aborted Session', channel: 'claude_code', last_activity: '2026-03-19T20:00:00Z', created_at: '2026-03-19T20:00:00Z', message_count: 1, section: 'unread', status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null, active_children_count: 0 },
+        { thread_id: 'cc-1', title: 'Aborted Session', channel: 'claude_code', last_activity: '2026-03-19T20:00:00Z', created_at: '2026-03-19T20:00:00Z', message_count: 1, section: 'inbox', status: 'idle', cc_has_changes: false, cc_requires_restart: false, cc_is_external_repo: false, cc_applying: false, last_revived_at: null, active_children_count: 0 },
       ],
     });
 
@@ -765,7 +1149,7 @@ describe('event replay must not override API status', () => {
     // This is the exact bug: thread shows "In Progress" in the drawer despite
     // the backend knowing it's idle.
     (fetchThreads as any).mockResolvedValue({
-      pinned: [],
+      saved: [],
       active_threads: [
         {
           thread_id: 'stuck-t1',
@@ -774,7 +1158,7 @@ describe('event replay must not override API status', () => {
           last_activity: '2026-03-30T09:00:00Z',
           created_at: '2026-03-28T19:00:00Z',
           message_count: 5,
-          section: 'default',
+          section: 'archived',
           active_children_count: 0,
           status: 'idle',  // Backend says idle (session is dead)
           cc_has_changes: false,
@@ -785,10 +1169,11 @@ describe('event replay must not override API status', () => {
       ],
       active: ['stuck-t1'],
       history: [],
+      composing: [],
     });
 
     const { fetchThreadEvents } = await import('../../api/threads');
-    (fetchThreadEvents as any).mockResolvedValue([
+    (fetchThreadEvents as any).mockResolvedValue({ events: [
       {
         sequence: 1,
         event_type: 'MessageReceived',
@@ -826,12 +1211,37 @@ describe('event replay must not override API status', () => {
         event_id: 'e5',
       },
       // No terminal event — session crashed here
-    ]);
+    ], currentAggregate: {
+      // Backend snapshot: status='idle' (last revival is in the past, agent dead).
+      // currentAggregate is the source of truth — frontend overlays it after
+      // replaying events, preventing per-event derivations from leaking through.
+      threadId: 'stuck-t1',
+      title: 'Stuck Thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      createdAt: '2026-03-28T19:00:00Z',
+      lastActivity: '2026-03-30T08:41:01Z',
+      messageCount: 5,
+      section: 'inbox',
+      status: 'idle',
+      activeChildrenCount: 0,
+      totalChildrenCount: 0,
+      ccHasChanges: false,
+      ccRequiresRestart: false,
+      ccIsExternalRepo: false,
+      ccApplying: false,
+      isSaved: false,
+      hasResponse: true,
+      lastRevivedAt: null,
+      parentThreadId: null,
+      parentThreadTitle: null,
+      state: 'active',
+    } });
 
     await loadAllThreads();
 
     const thread = threadMap.value.get('stuck-t1')!;
-    // API said 'idle' — event replay must NOT override this to 'running'
+    // currentAggregate said 'idle' — replay must NOT override this to 'running'
     expect(thread.meta.status).toBe('idle');
   });
 
@@ -841,14 +1251,14 @@ describe('event replay must not override API status', () => {
     // The event must update status to 'running' — it's a real live event, not stale replay.
     const map = new Map<string, ThreadState>();
     map.set('refresh-t1', makeThreadState('refresh-t1', {
-      meta: { id: 'refresh-t1', title: 'Refresh Thread', channel: 'claude_code', pinned: false, createdAt: '2026-03-28T19:00:00Z', updatedAt: '2026-03-28T19:00:00Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'default', activeChildrenCount: 0 },
+      meta: { id: 'refresh-t1', title: 'Refresh Thread', channel: 'claude_code', saved: false, createdAt: '2026-03-28T19:00:00Z', updatedAt: '2026-03-28T19:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'archived', activeChildrenCount: 0 },
       eventsLoaded: true,
       lastDbSeq: 3,
     }));
     threadMap.value = map;
 
     const { fetchThreadEvents } = await import('../../api/threads');
-    (fetchThreadEvents as any).mockResolvedValue([
+    (fetchThreadEvents as any).mockResolvedValue({ events: [
       {
         sequence: 4,
         event_type: 'MessageReceived',
@@ -856,7 +1266,30 @@ describe('event replay must not override API status', () => {
         created: '2026-03-30T10:00:00Z',
         event_id: 'e4',
       },
-    ]);
+    ], currentAggregate: {
+      // Backend snapshot after the new MessageReceived: status='running'.
+      threadId: 'refresh-t1',
+      title: 'Refresh Thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      createdAt: '2026-03-28T19:00:00Z',
+      lastActivity: '2026-03-30T10:00:00Z',
+      messageCount: 2,
+      section: 'archived',
+      status: 'running',
+      activeChildrenCount: 0,
+      totalChildrenCount: 0,
+      ccHasChanges: false,
+      ccRequiresRestart: false,
+      ccIsExternalRepo: false,
+      ccApplying: false,
+      isSaved: false,
+      hasResponse: false,
+      lastRevivedAt: '2026-03-30T10:00:00Z',
+      parentThreadId: null,
+      parentThreadTitle: null,
+      state: 'active',
+    } });
 
     const { refreshThreadEvents } = await import('./thread-loading');
     await refreshThreadEvents('refresh-t1');
@@ -867,24 +1300,24 @@ describe('event replay must not override API status', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Section — focusThread does NOT auto-read (user must click Done/Apply/Discard)
+// Section — focusThread does NOT auto-archive (user must click Archive/Apply/Discard)
 // ---------------------------------------------------------------------------
 
 describe('focusThread — section', () => {
-  it('does not mark an unread thread as read when focused', () => {
+  it('does not archive an inbox thread when focused', () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Unread Thread', channel: 'chat', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Inbox Thread', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
     focusThread('t1');
 
-    // Section stays 'unread' — no auto-read on focus
-    expect(threadMap.value.get('t1')!.meta.section).toBe('unread');
+    // Section stays 'inbox' — no auto-archive on focus
+    expect(threadMap.value.get('t1')!.meta.section).toBe('inbox');
   });
 
-  it('does not update threadMap when section is already default', () => {
+  it('does not update threadMap when section is already archived', () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1'));
     threadMap.value = map;
@@ -908,70 +1341,42 @@ describe('loadAllThreads — section', () => {
 
   it('populates section from API section', async () => {
     (fetchThreads as any).mockResolvedValue({
-      pinned: [],
+      saved: [],
       active_threads: [],
+      composing: [],
       active: [],
       history: [
-        { thread_id: 't1', title: 'Unread', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'unread' },
-        { thread_id: 't2', title: 'Normal', channel: 'chat', last_activity: '2026-03-15T17:00:00Z', created_at: '2026-03-15T17:00:00Z', message_count: 2, section: 'default' },
+        { thread_id: 't1', title: 'Unread', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'inbox' },
+        { thread_id: 't2', title: 'Normal', channel: 'chat', last_activity: '2026-03-15T17:00:00Z', created_at: '2026-03-15T17:00:00Z', message_count: 2, section: 'archived' },
       ],
     });
 
     await loadAllThreads();
 
-    expect(threadMap.value.get('t1')!.meta.section).toBe('unread');
-    expect(threadMap.value.get('t2')!.meta.section).toBe('default');
-  });
-
-  it('event replay does not override API section with stale ThreadMarkedUnread', async () => {
-    // Scenario: CC session idled (ThreadMarkedUnread persisted), then change was applied
-    // (section cleared to 'default' in thread_summaries). But ThreadMarkedRead wasn't
-    // persisted (e.g., fix wasn't deployed yet). On reload, event replay must not
-    // override the authoritative API section with the stale ThreadMarkedUnread.
-    (fetchThreads as any).mockResolvedValue({
-      pinned: [],
-      active_threads: [
-        { thread_id: 't1', title: 'CC Thread', channel: 'claude_code', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'default' },
-      ],
-      active: ['t1'],
-      history: [],
-    });
-
-    const { fetchThreadEvents } = await import('../../api/threads');
-    (fetchThreadEvents as any).mockResolvedValue([
-      { sequence: 1, event_type: 'CodingAgentUserMessageSent', payload: { text: 'fix bug' }, created: '2026-01-01T00:00:01Z', event_id: 'e1' },
-      { sequence: 2, event_type: 'CodingAgentIdled', payload: { has_changes: true }, created: '2026-01-01T00:00:05Z', event_id: 'e2' },
-      { sequence: 3, event_type: 'ThreadMarkedUnread', payload: {}, created: '2026-01-01T00:00:05Z', event_id: 'e3' },
-      { sequence: 4, event_type: 'ChangeApplied', payload: { change_id: 'c-1' }, created: '2026-01-01T00:00:10Z', event_id: 'e4' },
-      { sequence: 5, event_type: 'SessionEnded', payload: { reason: 'completed' }, created: '2026-01-01T00:00:11Z', event_id: 'e5' },
-      // Note: no ThreadMarkedRead event — this is the bug scenario
-    ]);
-
-    await loadAllThreads();
-
-    // API says section='default' — event replay of ThreadMarkedUnread must not override it
-    expect(threadMap.value.get('t1')!.meta.section).toBe('default');
+    expect(threadMap.value.get('t1')!.meta.section).toBe('inbox');
+    expect(threadMap.value.get('t2')!.meta.section).toBe('archived');
   });
 
   it('updates section on existing threads from API', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: '...', channel: 'chat', pinned: false, createdAt: '', updatedAt: '2026-03-15T19:00:00Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'default', activeChildrenCount: 0 },
+      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T19:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
     (fetchThreads as any).mockResolvedValue({
-      pinned: [],
+      saved: [],
       active_threads: [],
+      composing: [],
       active: [],
       history: [
-        { thread_id: 't1', title: 'Thread 1', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'unread' },
+        { thread_id: 't1', title: 'Thread 1', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'inbox' },
       ],
     });
 
     await loadAllThreads();
 
-    expect(threadMap.value.get('t1')!.meta.section).toBe('unread');
+    expect(threadMap.value.get('t1')!.meta.section).toBe('inbox');
   });
 });
 
@@ -989,12 +1394,12 @@ describe('upsertThread — updatedAt monotonic', () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: {
-        id: 't1', title: 'CC Thread', channel: 'claude_code', pinned: false,
+        id: 't1', title: 'CC Thread', channel: 'claude_code', saved: false,
         createdAt: '2026-03-31T19:21:38Z',
         updatedAt: '2026-03-31T19:31:54Z', // SSE-updated (newer)
-        unread: false, status: 'running', ccHasChanges: false,
+        status: 'running', ccHasChanges: false,
         ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '',
-        messageCount: 0, section: 'default', activeChildrenCount: 0,
+        messageCount: 0, section: 'archived', activeChildrenCount: 0,
       },
     }));
 
@@ -1005,7 +1410,7 @@ describe('upsertThread — updatedAt monotonic', () => {
       last_activity: '2026-03-31T19:21:38Z', // stale backend value
       created_at: '2026-03-31T19:21:38Z',
       message_count: 1,
-      section: 'default',
+      section: 'archived',
       status: 'running',
     } as any, false);
 
@@ -1017,12 +1422,12 @@ describe('upsertThread — updatedAt monotonic', () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: {
-        id: 't1', title: 'Thread', channel: 'chat', pinned: false,
+        id: 't1', title: 'Thread', channel: 'chat', saved: false,
         createdAt: '2026-03-31T10:00:00Z',
         updatedAt: '2026-03-31T10:00:00Z',
-        unread: false, status: 'idle', ccHasChanges: false,
+        status: 'idle', ccHasChanges: false,
         ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '',
-        messageCount: 0, section: 'default', activeChildrenCount: 0,
+        messageCount: 0, section: 'archived', activeChildrenCount: 0,
       },
     }));
 
@@ -1033,7 +1438,7 @@ describe('upsertThread — updatedAt monotonic', () => {
       last_activity: '2026-03-31T12:00:00Z', // newer
       created_at: '2026-03-31T10:00:00Z',
       message_count: 2,
-      section: 'default',
+      section: 'archived',
       status: 'idle',
     } as any, false);
 
@@ -1043,23 +1448,23 @@ describe('upsertThread — updatedAt monotonic', () => {
 });
 
 // ---------------------------------------------------------------------------
-// handleDismissThread — focus next review thread
+// handleArchiveThread — focus next review thread
 // ---------------------------------------------------------------------------
 
-describe('handleDismissThread', () => {
+describe('handleArchiveThread', () => {
   it('focuses the next review thread after dismissing', async () => {
-    // Set up: t1 (focused, waiting/unread = review), t2 (also waiting/unread = review)
+    // Set up: t1 (focused, waiting/inbox = review), t2 (also waiting/inbox = review)
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', unread: true, status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: true, status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
 
-    await handleDismissThread('t1');
+    await handleArchiveThread('t1');
 
     // Should focus t2 (next review thread), not unfocus
     expect(focusedThreadId.value).toBe('t2');
@@ -1068,13 +1473,13 @@ describe('handleDismissThread', () => {
   it('unfocuses and resets mobileView when no more review threads remain', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: true, status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
     mobileView.value = 'threads';
 
-    await handleDismissThread('t1');
+    await handleArchiveThread('t1');
 
     expect(focusedThreadId.value).toBeNull();
     expect(mobileView.value).toBe('thread');
@@ -1086,13 +1491,13 @@ describe('handleDismissThread', () => {
     // prompt unfocused and the header visible.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Last review', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: true, status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Last review', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
     (focusPromptNow as ReturnType<typeof vi.fn>).mockClear();
 
-    await handleDismissThread('t1');
+    await handleArchiveThread('t1');
 
     expect(focusPromptNow).not.toHaveBeenCalled();
     expect(focusedThreadId.value).toBeNull();
@@ -1103,39 +1508,39 @@ describe('handleDismissThread', () => {
     // Dismissing t2 should focus t3 (below), not t1 (top)
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', unread: true, status: 'waiting', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', unread: true, status: 'waiting', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t3', makeThreadState('t3', {
-      meta: { id: 't3', title: 'Thread t3', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: true, status: 'waiting', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't3', title: 'Thread t3', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t2');
 
-    await handleDismissThread('t2');
+    await handleArchiveThread('t2');
 
     expect(focusedThreadId.value).toBe('t3');
   });
 
-  it('navigates to next review thread after apply+done (regression: Apply used to skip Done)', async () => {
-    // Simulates the fixed flow: after Apply, thread stays in review (section=unread,
-    // ccHasChanges=false), Done button appears, clicking Done navigates to next thread.
-    // Previously Apply moved the thread to HISTORY immediately, skipping Done.
+  it('navigates to next review thread after apply+archive (regression: Apply used to skip Archive)', async () => {
+    // Simulates the fixed flow: after Apply, thread stays in review (section=inbox,
+    // ccHasChanges=false), Archive button appears, clicking Archive navigates to next thread.
+    // Previously Apply moved the thread to HISTORY immediately, skipping Archive.
     const map = new Map<string, ThreadState>();
-    // t1: just applied — still in review with Done button (unread, no changes, idle)
+    // t1: just applied — still in review with Archive button (inbox, no changes, idle)
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Applied thread', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Applied thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     // t2: another review thread waiting for attention
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: 'Pending thread', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: true, status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't2', title: 'Pending thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
 
-    await handleDismissThread('t1');
+    await handleArchiveThread('t1');
 
     // After Done on t1, should navigate to t2 (next review thread)
     expect(focusedThreadId.value).toBe('t2');
@@ -1143,18 +1548,18 @@ describe('handleDismissThread', () => {
 
   it('keeps thread drawer open on desktop when all reviews are done (compose view)', async () => {
     // Bug: dismissing the last review on desktop closed the thread drawer
-    // because handleDismissThread called navigateToPane('thread'), which
+    // because handleArchiveThread called navigateToPane('thread'), which
     // unconditionally cleared threadDrawerOpen. The drawer must remain open
     // so the user can pick another thread from the compose view.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Last review', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: true, status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Last review', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', ccHasChanges: true, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
     threadDrawerOpen.value = true;
 
-    await handleDismissThread('t1');
+    await handleArchiveThread('t1');
 
     expect(focusedThreadId.value).toBeNull();
     expect(threadDrawerOpen.value).toBe(true);
@@ -1164,15 +1569,15 @@ describe('handleDismissThread', () => {
     // 2 review threads: t1 (top), t2 (bottom). Dismissing t2 should focus t1.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', unread: true, status: 'waiting', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', pinned: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', unread: true, status: 'waiting', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'unread', activeChildrenCount: 0 },
+      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t2');
 
-    await handleDismissThread('t2');
+    await handleArchiveThread('t2');
 
     expect(focusedThreadId.value).toBe('t1');
   });

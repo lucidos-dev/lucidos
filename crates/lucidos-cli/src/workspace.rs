@@ -28,12 +28,16 @@ pub(crate) fn resolve_from_env() -> Result<Workspace, BoxError> {
 
 /// Separated from env reads so tests can drive it without racing the global
 /// env table.
+///
+/// Precedence: `LUCIDOS_WORKSPACE` env var beats walking up from `start_dir`.
+/// The env var is set explicitly by the engine that spawned the subprocess
+/// (CC, scheduler, etc.) and is the authoritative source. Walk-up is the
+/// fallback path for terminal users who haven't set it. Doing it the other way
+/// — walk-up first — was the cause of a production bug: a rogue lucidos-engine
+/// started inside a CC worktree dropped its own `.lucidos/ports` file, so every
+/// `lucidos hardened mark` from CC POSTed to the wrong DB. The parent engine
+/// then saw Missing at apply time and triggered an unnecessary auto-/harden.
 pub(crate) fn resolve(start_dir: &Path, env_workspace: Option<&Path>) -> Result<Workspace, BoxError> {
-    if let Some(root) = walk_up_for_ports(start_dir) {
-        let api_port = read_api_port(&root.join(".lucidos/ports"))?;
-        return Ok(Workspace { root, api_port });
-    }
-
     if let Some(root) = env_workspace {
         let api_port = read_api_port(&root.join(".lucidos/ports")).map_err(|e| {
             format!(
@@ -46,6 +50,11 @@ pub(crate) fn resolve(start_dir: &Path, env_workspace: Option<&Path>) -> Result<
             root: root.to_path_buf(),
             api_port,
         });
+    }
+
+    if let Some(root) = walk_up_for_ports(start_dir) {
+        let api_port = read_api_port(&root.join(".lucidos/ports"))?;
+        return Ok(Workspace { root, api_port });
     }
 
     Err(format!(
@@ -139,13 +148,28 @@ mod tests {
     }
 
     #[test]
-    fn walk_up_takes_precedence_over_env_var() {
+    fn env_var_takes_precedence_over_walk_up() {
         let walked = tempdir().unwrap();
         write_ports(walked.path(), 100);
         let env = tempdir().unwrap();
         write_ports(env.path(), 200);
         let ws = resolve(walked.path(), Some(env.path())).unwrap();
-        assert_eq!(ws.api_port, 100);
+        assert_eq!(ws.api_port, 200);
+        assert_eq!(ws.root, env.path());
+    }
+
+    #[test]
+    fn env_var_wins_when_nested_workspace_lurks_in_cwd_ancestry() {
+        let parent_ws = tempdir().unwrap();
+        write_ports(parent_ws.path(), 5173);
+
+        let worktree = parent_ws.path().join(".lucidos/worktrees/thread-abc");
+        fs::create_dir_all(&worktree).unwrap();
+        write_ports(&worktree, 5177);
+
+        let ws = resolve(&worktree, Some(parent_ws.path())).unwrap();
+        assert_eq!(ws.api_port, 5173);
+        assert_eq!(ws.root, parent_ws.path());
     }
 
     #[test]

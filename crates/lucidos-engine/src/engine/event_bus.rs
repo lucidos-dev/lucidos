@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::core::store::LegacyInitiator;
 use crate::engine::thread_events::{ActorMode, EventMeta, MessageOrigin, ThreadEvent};
-use crate::engine::thread_lifecycle::{self, resolve_transition, StoredSection, ThreadType};
+use crate::engine::thread_lifecycle::{self, resolve_transition, ArchiveState, ThreadType};
 
 /// DB row from thread_summaries for child-to-parent fan-out:
 /// (parent_thread_id, is_cc, title, first_message, parent_callback_sent).
@@ -41,6 +41,11 @@ pub struct EmittedEvent {
     pub created: DateTime<Utc>,
     /// Typed event — consumers match on the variant.
     pub typed: BusEvent,
+    /// Post-event projection snapshot. Set for persisted Thread events
+    /// (fetched in-tx after the projection update). `None` for transient
+    /// Thread events, System events, and child-count broadcasts — those
+    /// don't represent a state delta the frontend needs to apply.
+    pub aggregate: Option<crate::core::store::ThreadAggregate>,
 }
 
 /// Typed union of all aggregate events.
@@ -100,6 +105,13 @@ pub enum SystemEvent {
         phase: String,
         progress: usize,
         total: usize,
+    },
+    BackupCompleted {
+        filename: String,
+        size_bytes: u64,
+    },
+    BackupFailed {
+        error: String,
     },
     RecoveryProgress {
         completed: usize,
@@ -237,6 +249,43 @@ pub enum SystemEvent {
         thread_id: Uuid,
         device_id: String,
     },
+    /// A plugin was installed (or updated — overwrite=true reuses this variant).
+    /// `manifest` carries the full parsed manifest so future fields are additive.
+    /// `files` are paths under `data/` so a future tracked-uninstall can derive
+    /// ownership without a schema change.
+    PluginInstalled {
+        manifest: serde_json::Value,
+        files: Vec<String>,
+        installed_at: String,
+        source_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A plugin was marked uninstalled. Guide-only in v1 — files stay until the
+    /// LLM (or user) deletes them. Listed `files` is what was installed; some
+    /// may have been edited or shared with another plugin.
+    PluginUninstalled {
+        id: String,
+        version: String,
+        files: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// Compose state on a thread changed (text, images, or mode). Broadcast
+    /// to SSE for cross-device sync; intentionally NOT persisted to the events
+    /// table — the `thread_summaries` row holds the current state, and
+    /// keystroke history isn't audit-worthy. Receivers reconcile via the
+    /// `origin_device_id` echo check + "don't clobber my focused textarea"
+    /// guard described in `docs/plans/2026-05-03-threads-as-drafts-design.md`.
+    ThreadComposeChanged {
+        id: Uuid,
+        text: String,
+        images: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_device_id: Option<String>,
+    },
 }
 
 impl SystemEvent {
@@ -285,6 +334,8 @@ impl SystemEvent {
                     transient: false,
                     ..
                 }
+                | Self::PluginInstalled { .. }
+                | Self::PluginUninstalled { .. }
         )
     }
 
@@ -297,6 +348,8 @@ impl SystemEvent {
             Self::MemoryRebuildProgress { .. } => "MemoryRebuildProgress",
             Self::ChangesUpdated { .. } => "ChangesUpdated",
             Self::BackupProgress { .. } => "BackupProgress",
+            Self::BackupCompleted { .. } => "BackupCompleted",
+            Self::BackupFailed { .. } => "BackupFailed",
             Self::RecoveryProgress { .. } => "RecoveryProgress",
             Self::Toast { .. } => "Toast",
             Self::ArtifactImported { .. } => "ArtifactImported",
@@ -320,6 +373,9 @@ impl SystemEvent {
             Self::ChangeDiscarded { .. } => "ChangeDiscarded",
             Self::ThreadFocused { .. } => "ThreadFocused",
             Self::ThreadUnfocused { .. } => "ThreadUnfocused",
+            Self::PluginInstalled { .. } => "PluginInstalled",
+            Self::PluginUninstalled { .. } => "PluginUninstalled",
+            Self::ThreadComposeChanged { .. } => "ThreadComposeChanged",
         }
     }
 
@@ -337,6 +393,8 @@ impl SystemEvent {
         "MemoryRebuildProgress",
         "ChangesUpdated",
         "BackupProgress",
+        "BackupCompleted",
+        "BackupFailed",
         "RecoveryProgress",
         "Toast",
         "ArtifactImported",
@@ -360,6 +418,9 @@ impl SystemEvent {
         "ChangeDiscarded",
         "ThreadFocused",
         "ThreadUnfocused",
+        "PluginInstalled",
+        "PluginUninstalled",
+        "ThreadComposeChanged",
         "ThreadEvent",
     ];
 
@@ -378,6 +439,8 @@ impl SystemEvent {
             Self::ChangesUpdated { .. } | Self::ChangeDiscarded { .. } => "change",
             Self::MemoryRebuildProgress { .. }
             | Self::BackupProgress { .. }
+            | Self::BackupCompleted { .. }
+            | Self::BackupFailed { .. }
             | Self::RecoveryProgress { .. }
             | Self::Toast { .. } => "ops",
             Self::ArtifactImported { .. }
@@ -395,6 +458,8 @@ impl SystemEvent {
             Self::AppCreated { .. } | Self::AppUpdated { .. } | Self::AppDeleted { .. } => "app",
             Self::DomainEvent { .. } => "domain",
             Self::ThreadFocused { .. } | Self::ThreadUnfocused { .. } => "presence",
+            Self::PluginInstalled { .. } | Self::PluginUninstalled { .. } => "plugin",
+            Self::ThreadComposeChanged { .. } => "thread",
         }
     }
 
@@ -421,6 +486,15 @@ impl SystemEvent {
             Self::ThreadFocused { thread_id, .. } | Self::ThreadUnfocused { thread_id, .. } => {
                 thread_id.to_string()
             }
+            // Raw manifest is nested one layer in — see `InstalledRecord` for the path.
+            Self::PluginInstalled { manifest, .. } => manifest
+                .get("manifest")
+                .and_then(|m| m.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            Self::PluginUninstalled { id, .. } => id.clone(),
+            Self::ThreadComposeChanged { id, .. } => id.to_string(),
             _ => "global".into(),
         }
     }
@@ -465,6 +539,11 @@ impl EmittedEvent {
                     data["seq"] = serde_json::json!(seq);
                 }
                 data["event_id"] = serde_json::json!(self.event_id.to_string());
+                if let Some(agg) = &self.aggregate {
+                    if let Ok(agg_json) = serde_json::to_value(agg) {
+                        data["aggregate"] = agg_json;
+                    }
+                }
                 serde_json::json!({ "type": "ThreadEvent", "data": data })
             }
             BusEvent::System(SystemEvent::DomainEvent {
@@ -530,7 +609,8 @@ impl EventBus {
     pub fn new(pool: PgPool) -> (Self, mpsc::UnboundedReceiver<ParentCallback>) {
         let (event_tx, _) = broadcast::channel(BUS_CAPACITY);
         let (parent_callback_tx, parent_callback_rx) = mpsc::unbounded_channel();
-        let changes_projection = crate::core::changes_projection::ChangesProjection::new(pool.clone());
+        let changes_projection =
+            crate::core::changes_projection::ChangesProjection::new(pool.clone());
         (
             Self {
                 pool,
@@ -600,7 +680,7 @@ impl EventBus {
     /// `ctx` should identify the call site, e.g. `"[ChangeOps] ChangeApplied"`.
     pub async fn emit_or_log(&self, event: BusEvent, ctx: &str) {
         if let Err(e) = self.emit(event).await {
-            log!("{} emit failed: {}", ctx, e);
+            log!("[EventBus] {} emit failed: {}", ctx, e);
         }
     }
 
@@ -652,6 +732,26 @@ impl EventBus {
                     let side_effects = self
                         .update_thread_projection(&mut tx, *thread_id, te, meta)
                         .await?;
+                    // Read-your-write within the same tx so the snapshot reflects
+                    // exactly this event's post-state — no race with a concurrent
+                    // emit for the same thread committing between the projection
+                    // update and a post-commit fetch. A failed fetch logs and
+                    // broadcasts without aggregate (frontend tolerates absence
+                    // with a warning, but it indicates a backend bug).
+                    let aggregate =
+                        match crate::core::store::fetch_thread_aggregate(&mut *tx, *thread_id)
+                            .await
+                        {
+                            Ok(agg) => agg,
+                            Err(e) => {
+                                crate::log!(
+                                    "[EventBus] Failed to fetch ThreadAggregate for {}: {}",
+                                    thread_id,
+                                    e
+                                );
+                                None
+                            }
+                        };
                     tx.commit().await?;
                     let broadcast_created = Utc::now();
 
@@ -664,6 +764,7 @@ impl EventBus {
                         seq: Some(seq),
                         created: broadcast_created,
                         typed: event,
+                        aggregate,
                     });
                     // Run after broadcast so a panic here can't skip SSE delivery
                     self.notify_parent_if_child(notify_thread_id, &notify_event)
@@ -676,17 +777,14 @@ impl EventBus {
                     {
                         self.broadcast_children_count(*pid).await;
                     }
-                    // Process side-effect events (separate transactions, after main commit).
-                    let has_side_effects = !side_effects.is_empty();
+                    // Side-effect events run in their own transactions, after the
+                    // main commit. Section changes are NOT among them — the
+                    // per-event aggregate already carries the post-projection
+                    // section to subscribers, no follow-up broadcast required.
                     for effect in side_effects {
                         if let Err(e) = Box::pin(self.emit(effect)).await {
                             crate::log!("[EventBus] Side-effect emit failed: {}", e);
                         }
-                    }
-                    // Re-broadcast children count after side effects so the frontend
-                    // has consistent section + activeChildrenCount data.
-                    if has_side_effects {
-                        self.broadcast_children_count(notify_thread_id).await;
                     }
                     Ok(Some(EmitResult { event_id, seq }))
                 } else {
@@ -695,6 +793,7 @@ impl EventBus {
                         seq: None,
                         created: Utc::now(),
                         typed: event,
+                        aggregate: None,
                     });
                     Ok(None)
                 }
@@ -725,6 +824,7 @@ impl EventBus {
                         seq: Some(seq),
                         created: Utc::now(),
                         typed: event,
+                        aggregate: None,
                     });
                     Ok(Some(EmitResult { event_id, seq }))
                 } else {
@@ -741,6 +841,7 @@ impl EventBus {
                             seq: None,
                             created: Utc::now(),
                             typed: event,
+                            aggregate: None,
                         });
                     }
                     Ok(None)
@@ -782,7 +883,15 @@ impl EventBus {
     // ---- Parent callback ----
 
     /// Send a ChildrenCountChanged transient event to the parent thread's SSE channel.
-    fn send_children_count_event(&self, parent_id: Uuid, active: i64, total: i64) {
+    /// `aggregate` carries any other projection changes (e.g. archive_state) the
+    /// caller made before emitting — the frontend overlays it onto thread.meta.
+    fn send_children_count_event(
+        &self,
+        parent_id: Uuid,
+        active: i64,
+        total: i64,
+        aggregate: Option<crate::core::store::ThreadAggregate>,
+    ) {
         let _ = self.event_tx.send(EmittedEvent {
             event_id: Uuid::new_v4(),
             seq: None,
@@ -792,6 +901,7 @@ impl EventBus {
                 event: ThreadEvent::ChildrenCountChanged { active, total },
                 meta: EventMeta::default(),
             },
+            aggregate,
         });
     }
 
@@ -810,7 +920,7 @@ impl EventBus {
             }
         };
         if let Some((active, total)) = counts {
-            self.send_children_count_event(parent_id, active, total);
+            self.send_children_count_event(parent_id, active, total, None);
         }
     }
 
@@ -820,15 +930,18 @@ impl EventBus {
     async fn notify_parent_if_child(&self, child_thread_id: Uuid, event: &ThreadEvent) {
         // Terminal events that mean a child is done (decrement counter).
         // Canceled/Aborted children didn't complete — no callback, but still done.
-        let is_terminal = matches!(
-            event,
+        // Transient SessionEnded reasons (StaleResume) are mid-retry: they must
+        // not decrement the parent counter or fire the completion callback, or
+        // the real CodingAgentIdled that lands seconds later would be orphaned.
+        let is_terminal = match event {
             ThreadEvent::CodingAgentIdled { .. }
-                | ThreadEvent::ResponseGenerated { .. }
-                | ThreadEvent::ResponseFailed { .. }
-                | ThreadEvent::ResponseCanceled { .. }
-                | ThreadEvent::ResponseAborted { .. }
-                | ThreadEvent::SessionEnded { .. }
-        );
+            | ThreadEvent::ResponseGenerated { .. }
+            | ThreadEvent::ResponseFailed { .. }
+            | ThreadEvent::ResponseCanceled { .. }
+            | ThreadEvent::ResponseAborted { .. } => true,
+            ThreadEvent::SessionEnded { reason } => !reason.is_transient(),
+            _ => false,
+        };
         if !is_terminal {
             return;
         }
@@ -860,15 +973,20 @@ impl EventBus {
             return;
         }
 
-        // CC threads normally end with CodingAgentIdled — it's the primary decrement
-        // point for CC. However, if a CC session is canceled/aborted before ever
-        // idling (e.g., user cancels immediately), SessionEnded fires without a
-        // prior CodingAgentIdled. In that case, SessionEnded is the fallback
-        // decrement point (only if callback wasn't already sent by an earlier idle).
-        // Non-CC threads decrement on any terminal event since they only emit one.
+        // CC sessions can terminate without ever emitting CodingAgentIdled or
+        // SessionEnded — e.g. the user cancels and the session sits archived,
+        // leaving only ResponseCanceled/ResponseAborted as terminal signals. The
+        // `!callback_already_sent` guard collapses multiple terminal events for
+        // the same child to a single decrement.
         let should_decrement = if is_cc {
             matches!(event, ThreadEvent::CodingAgentIdled { .. })
-                || (!callback_already_sent && matches!(event, ThreadEvent::SessionEnded { .. }))
+                || (!callback_already_sent
+                    && matches!(
+                        event,
+                        ThreadEvent::SessionEnded { .. }
+                            | ThreadEvent::ResponseCanceled { .. }
+                            | ThreadEvent::ResponseAborted { .. }
+                    ))
         } else {
             matches!(
                 event,
@@ -879,24 +997,10 @@ impl EventBus {
                     | ThreadEvent::SessionEnded { .. }
             )
         };
-        if should_decrement {
-            match sqlx::query_as::<_, (i64, i64)>(
-                "UPDATE thread_summaries SET active_children_count = GREATEST(0, active_children_count - 1) \
-                 WHERE thread_id = $1 RETURNING active_children_count::bigint, total_children_count::bigint"
-            )
-            .bind(parent_id)
-            .fetch_optional(&self.pool)
-            .await {
-                Ok(Some((active, total))) => self.send_children_count_event(parent_id, active, total),
-                Ok(None) => {},
-                Err(e) => crate::log!("[FanOut] Failed to decrement active_children_count for parent {}: {}", parent_id, e),
-            }
-        }
-
-        // Only send callback + mark unread for completion events (not cancel/abort).
-        // For CC children, also send callback on SessionEnded if no prior callback
-        // was sent — this handles CC sessions that end without ever idling (crash,
-        // shutdown, user-ended). Without this, the parent never learns the child finished.
+        // Completion events (not cancel/abort) trigger a callback to the parent
+        // and surface the parent to inbox. For CC children, SessionEnded also
+        // counts when no prior callback was sent — handles CC sessions that end
+        // without ever idling (crash, shutdown, user-ended).
         let should_callback = matches!(
             (is_cc, event),
             (true, ThreadEvent::CodingAgentIdled { .. })
@@ -905,6 +1009,31 @@ impl EventBus {
         ) || (is_cc
             && !callback_already_sent
             && matches!(event, ThreadEvent::SessionEnded { .. }));
+
+        if should_decrement || should_callback {
+            self.update_parent_after_child_terminal(
+                parent_id,
+                should_decrement,
+                should_callback,
+            )
+            .await;
+        }
+
+        // For CC cancel/abort the should_callback path doesn't fire (we don't
+        // want to tell the parent LLM "your child was canceled" — that's UI
+        // noise the user already sees). But we still need to mark the callback
+        // as sent so a subsequent CodingAgentIdled or SessionEnded for the
+        // same child doesn't decrement again.
+        if should_decrement
+            && is_cc
+            && matches!(
+                event,
+                ThreadEvent::ResponseCanceled { .. } | ThreadEvent::ResponseAborted { .. }
+            )
+        {
+            self.mark_parent_callback_sent(child_thread_id).await;
+        }
+
         if !should_callback {
             return;
         }
@@ -970,25 +1099,70 @@ impl EventBus {
 
         let callback_text = format!(
             "[Child thread completed] Thread \"{}\" (id: {}) {}.\
-             \nReview the result below. If it's incomplete or unsatisfactory, \
-             you can use run_thread with a refined prompt to get a better answer.{}",
+             \nPhrases like \"session can finish\" or \"## Session Summary\" describe \
+             the child subprocess only — if you were following a multi-step procedure, \
+             continue with the next step. Otherwise use run_thread to refine.{}",
             label, child_thread_id, status, result_section
         );
 
-        // Mark parent as unread to surface the child's results.
-        // Parents are always Chat threads, so always emit ThreadMarkedUnread.
-        if let Err(e) = Box::pin(self.emit(BusEvent::Thread {
-            thread_id: parent_id,
-            event: ThreadEvent::ThreadMarkedUnread,
-            meta: EventMeta::NONE,
-        }))
-        .await
-        {
-            crate::log!("[FanOut] Failed to mark parent {}: {}", parent_id, e);
-        }
-
         self.mark_parent_callback_sent(child_thread_id).await;
         self.send_parent_callback(parent_id, child_thread_id, &callback_text);
+    }
+
+    /// Combined into one round-trip + one broadcast so subscribers see the
+    /// count change and the section change in the same envelope — replaces the
+    /// old separate `ThreadMarkedUnread` side-effect that raced with the
+    /// children-count broadcast.
+    async fn update_parent_after_child_terminal(
+        &self,
+        parent_id: Uuid,
+        decrement: bool,
+        surface_to_inbox: bool,
+    ) {
+        let dec = if decrement { 1_i64 } else { 0 };
+        let new_archive = if surface_to_inbox {
+            Some(ArchiveState::Inbox.as_str())
+        } else {
+            None
+        };
+        let row: Option<(i64, i64)> = match sqlx::query_as(
+            "UPDATE thread_summaries SET \
+             active_children_count = GREATEST(0, active_children_count - $2), \
+             archive_state = COALESCE($3, archive_state) \
+             WHERE thread_id = $1 \
+             RETURNING active_children_count::bigint, total_children_count::bigint",
+        )
+        .bind(parent_id)
+        .bind(dec)
+        .bind(new_archive)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(opt) => opt,
+            Err(e) => {
+                crate::log!(
+                    "[FanOut] Failed to update parent {} after child terminal: {}",
+                    parent_id,
+                    e
+                );
+                return;
+            }
+        };
+        let Some((active, total)) = row else { return };
+        let aggregate = match crate::core::store::fetch_thread_aggregate(&self.pool, parent_id)
+            .await
+        {
+            Ok(agg) => agg,
+            Err(e) => {
+                crate::log!(
+                    "[FanOut] Failed to fetch aggregate for parent {}: {}",
+                    parent_id,
+                    e
+                );
+                None
+            }
+        };
+        self.send_children_count_event(parent_id, active, total, aggregate);
     }
 
     async fn mark_parent_callback_sent(&self, child_thread_id: Uuid) {
@@ -1050,44 +1224,32 @@ impl EventBus {
     async fn get_current_section(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         thread_id: &Uuid,
-    ) -> StoredSection {
+    ) -> ArchiveState {
         let section: Option<String> =
-            sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+            sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
                 .bind(thread_id)
                 .fetch_optional(&mut **tx)
                 .await
                 .unwrap_or(None);
         section
-            .map(|s| StoredSection::parse(&s))
-            .unwrap_or(StoredSection::Default)
+            .map(|s| ArchiveState::parse(&s))
+            .unwrap_or(ArchiveState::Archived)
     }
 
-    /// Apply a contract transition result to the database and collect side effects.
+    /// Apply a contract transition result to the database. Only effect is the
+    /// section update — the per-event aggregate snapshot then carries the new
+    /// state to subscribers, so no follow-up section-changing event is emitted.
     async fn apply_transition(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         thread_id: Uuid,
         result: &thread_lifecycle::TransitionResult,
-        side_effects: &mut Vec<BusEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(new_section) = result.new_section {
-            sqlx::query("UPDATE thread_summaries SET section = $1 WHERE thread_id = $2")
+            sqlx::query("UPDATE thread_summaries SET archive_state = $1 WHERE thread_id = $2")
                 .bind(new_section.as_str())
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
-        }
-        for effect in &result.side_effects {
-            let event = match effect {
-                thread_lifecycle::SideEffect::EmitThreadMarkedUnread => {
-                    ThreadEvent::ThreadMarkedUnread
-                }
-                thread_lifecycle::SideEffect::EmitThreadMarkedRead => ThreadEvent::ThreadMarkedRead,
-            };
-            side_effects.push(BusEvent::Thread {
-                thread_id,
-                event,
-                meta: EventMeta::NONE,
-            });
         }
         Ok(())
     }
@@ -1138,10 +1300,22 @@ impl EventBus {
                     (0, msg_initiator)
                 };
                 sqlx::query(
-                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, parent_thread_id, spawning_event_id, depth, status, last_revived_at)
-                       VALUES ($1, $2, $3, $6, NOW(), NOW(), 1, $4, $7, $5, 'running', NOW())
+                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, parent_thread_id, spawning_event_id, depth, status, last_revived_at, state)
+                       VALUES ($1, $2, $3, $6, NOW(), NOW(), 1, $4, $7, $5, 'running', NOW(), 'active')
                        ON CONFLICT (thread_id) DO UPDATE
-                       SET last_activity = NOW(), message_count = thread_summaries.message_count + 1, status = 'running', last_revived_at = NOW()"#,
+                       SET last_activity = NOW(),
+                           message_count = thread_summaries.message_count + 1,
+                           status = 'running',
+                           last_revived_at = NOW(),
+                           state = 'active',
+                           first_message = COALESCE(thread_summaries.first_message, EXCLUDED.first_message),
+                           source = CASE WHEN thread_summaries.source = 'chat' THEN EXCLUDED.source ELSE thread_summaries.source END,
+                           compose_text = '',
+                           compose_images = '[]'::jsonb,
+                           compose_mode = NULL
+                       -- Defense in depth: refuse to resurrect a discarded thread if a
+                       -- stale MessageReceived slips past the API-layer guard.
+                       WHERE thread_summaries.state != 'discarded'"#,
                 )
                 .bind(thread_id)
                 .bind(text)
@@ -1164,6 +1338,7 @@ impl EventBus {
                     .execute(&mut **tx)
                     .await?;
                 }
+
                 Vec::new()
             }
             // CC session lifecycle — session start/recovery don't update last_activity
@@ -1176,12 +1351,22 @@ impl EventBus {
                     _ => None,
                 };
                 sqlx::query(
-                    r#"INSERT INTO thread_summaries (thread_id, source, is_cc, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id)
-                       VALUES ($1, $2, TRUE, NOW(), NOW(), 0, 'running', NOW(), $3)
+                    r#"INSERT INTO thread_summaries (thread_id, source, is_cc, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id, state)
+                       VALUES ($1, $2, TRUE, NOW(), NOW(), 0, 'running', NOW(), $3, 'active')
                        ON CONFLICT (thread_id) DO UPDATE
                        SET is_cc = TRUE, source = $2,
                            initiator = COALESCE(thread_summaries.initiator, 'unknown'),
-                           cc_repo_id = COALESCE($3, thread_summaries.cc_repo_id)"#,
+                           -- Existing value wins: a thread's repo is locked at first SessionStarted.
+                           -- The chat handler enforces that follow-ups can't pick a different repo,
+                           -- but defend the projection so any drift (legacy data, replay) doesn't
+                           -- silently flip the thread to a different repo's skill set.
+                           cc_repo_id = COALESCE(thread_summaries.cc_repo_id, $3),
+                           state = 'active',
+                           compose_text = '',
+                           compose_images = '[]'::jsonb,
+                           compose_mode = NULL
+                       -- Defense in depth (see MessageReceived above for rationale).
+                       WHERE thread_summaries.state != 'discarded'"#,
                 )
                 .bind(thread_id)
                 .bind(source)
@@ -1190,17 +1375,28 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
-            ThreadEvent::TriggerStarted { trigger_name, .. } => {
+            ThreadEvent::TriggerStarted { trigger_id, trigger_name, go_to_review, .. } => {
                 let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("trigger");
                 sqlx::query(
-                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, status, last_revived_at)
-                       VALUES ($1, $2, $3, 'system', NOW(), NOW(), 1, 'running', NOW())
+                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, status, last_revived_at, trigger_id, trigger_name, trigger_go_to_review, state)
+                       VALUES ($1, $2, $3, 'system', NOW(), NOW(), 1, 'running', NOW(), $4, $5, $6, 'active')
                        ON CONFLICT (thread_id) DO UPDATE
-                       SET last_activity = NOW(), message_count = thread_summaries.message_count + 1, status = 'running', last_revived_at = NOW()"#,
+                       SET last_activity = NOW(),
+                           message_count = thread_summaries.message_count + 1,
+                           status = 'running',
+                           last_revived_at = NOW(),
+                           state = 'active',
+                           trigger_id = COALESCE(thread_summaries.trigger_id, EXCLUDED.trigger_id),
+                           trigger_name = COALESCE(thread_summaries.trigger_name, EXCLUDED.trigger_name)
+                       -- Defense in depth (see MessageReceived above for rationale).
+                       WHERE thread_summaries.state != 'discarded'"#,
                 )
                 .bind(thread_id)
                 .bind(trigger_name.as_deref())
                 .bind(source)
+                .bind(trigger_id.as_str())
+                .bind(trigger_name.as_deref())
+                .bind(*go_to_review)
                 .execute(&mut **tx)
                 .await?;
                 Vec::new()
@@ -1325,19 +1521,19 @@ impl EventBus {
                 Vec::new()
             }
 
-            // Pin/unpin
-            ThreadEvent::ThreadPinned => {
+            // Save/unsave
+            ThreadEvent::ThreadSaved => {
                 sqlx::query(
-                    "UPDATE thread_summaries SET is_pinned = TRUE WHERE thread_id = $1",
+                    "UPDATE thread_summaries SET is_saved = TRUE WHERE thread_id = $1",
                 )
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
                 Vec::new()
             }
-            ThreadEvent::ThreadUnpinned => {
+            ThreadEvent::ThreadUnsaved => {
                 sqlx::query(
-                    "UPDATE thread_summaries SET is_pinned = FALSE WHERE thread_id = $1",
+                    "UPDATE thread_summaries SET is_saved = FALSE WHERE thread_id = $1",
                 )
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -1345,18 +1541,56 @@ impl EventBus {
                 Vec::new()
             }
 
-            // Section transition events — metadata handled by contract below
-            ThreadEvent::ThreadMarkedRead
-            | ThreadEvent::ThreadMarkedUnread => Vec::new(),
-            ThreadEvent::ThreadDismissed => {
-                // Dismissed — go idle and clear CC flags. The user explicitly
-                // dismissed this thread, so it should not remain in waiting.
+            ThreadEvent::ThreadArchived => {
+                // Archived — go idle and clear CC flags. The user explicitly
+                // archived this thread, so it should not remain in waiting.
                 sqlx::query(
                     "UPDATE thread_summaries SET status = 'idle', \
+                     state = 'archived', \
                      cc_has_changes = FALSE, cc_requires_restart = FALSE, \
                      cc_is_external_repo = FALSE, cc_applying = FALSE, \
                      active_children_count = 0, total_children_count = 0 \
                      WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            ThreadEvent::ThreadStarted { mode, .. } => {
+                // Compose-time thread creation — the row appears in
+                // `thread_summaries` with `state='composing'` so the frontend
+                // can render it as a draft via cross-device SSE. Default
+                // initiator is `user` since only humans open compose. Source
+                // mirrors the user's chosen mode so a draft that auto-archives
+                // before being sent still surfaces with the correct channel
+                // pill. Send events later re-assert source via the
+                // `source = 'chat'`-keyed CASE in MessageReceived.
+                let source = if mode == "claude_code" { "claude_code" } else { "chat" };
+                sqlx::query(
+                    r#"INSERT INTO thread_summaries
+                        (thread_id, initiator, source, created_at, last_activity, message_count,
+                         state, compose_mode, status)
+                       VALUES ($1, 'user', $3, NOW(), NOW(), 0, 'composing', $2, 'idle')
+                       ON CONFLICT (thread_id) DO NOTHING"#,
+                )
+                .bind(thread_id)
+                .bind(mode)
+                .bind(source)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            ThreadEvent::ThreadDiscarded { .. } => {
+                // Terminal transition. Only valid from `composing` — the
+                // state-machine guard at the API boundary already rejected
+                // discard from active/archived, so this UPDATE is safe to run
+                // without re-checking. Compose fields are wiped so a stale
+                // SSE replay can't show ghost text.
+                sqlx::query(
+                    "UPDATE thread_summaries SET state = 'discarded', \
+                     compose_text = '', compose_images = '[]'::jsonb, compose_mode = NULL \
+                     WHERE thread_id = $1 AND state = 'composing'",
                 )
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -1390,20 +1624,20 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
-            ThreadEvent::SessionEnded { reason: _ } => {
-                // Phase 4: SessionEnded is terminal-only (Shutdown/Panic/Closed
-                // and the LegacyNonTerminal catch-all for old DB rows). The
-                // stale-resume "internal retry" carve-out is gone — that path
-                // now emits SessionEnded { Panic } and the dispatcher (Phase 5)
-                // owns the retry. Either way, the thread should reach a
-                // terminal status with has_response set.
-                sqlx::query(&format!(
-                    "UPDATE thread_summaries SET has_response = TRUE, \
-                     status = {STATUS_FROM_CC_HAS_CHANGES} WHERE thread_id = $1"
-                ))
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
+            ThreadEvent::SessionEnded { reason } => {
+                // Transient reasons (StaleResume) are mid-retry — the chat
+                // handler is about to spawn a fresh session within the same
+                // request. Flipping to terminal here would render the exchange
+                // as "Aborted" until the retry's SessionStarted lands.
+                if !reason.is_transient() {
+                    sqlx::query(&format!(
+                        "UPDATE thread_summaries SET has_response = TRUE, \
+                         status = {STATUS_FROM_CC_HAS_CHANGES} WHERE thread_id = $1"
+                    ))
+                    .bind(thread_id)
+                    .execute(&mut **tx)
+                    .await?;
+                }
                 Vec::new()
             }
             ThreadEvent::TriggerCompleted { .. } => {
@@ -1521,8 +1755,22 @@ impl EventBus {
                 // Update last_activity so the thread list timestamp stays current during
                 // long-running agentic responses. Without this, the timestamp only
                 // advances on discrete lifecycle events, not during streaming.
+                //
+                // Also bump status back to 'running' if the projection drifted to a
+                // non-running state (e.g. CC emitted a mid-session `Result` that the
+                // engine treated as idle, then continued working). `last_revived_at`
+                // is gated by CASE rather than set unconditionally — sibling UPDATEs
+                // for one-shot transitions (`ContinueSignal`, etc.) refresh it every
+                // time, but activity events fire many times per turn and would
+                // constantly reshuffle IN PROGRESS sort order if treated the same
+                // way. Mirrors `status_transitions()` for these event types — see
+                // `thread_lifecycle.rs`.
                 sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW() WHERE thread_id = $1",
+                    "UPDATE thread_summaries SET last_activity = NOW(), \
+                     last_revived_at = CASE WHEN status != 'running' THEN NOW() \
+                                            ELSE last_revived_at END, \
+                     status = 'running' \
+                     WHERE thread_id = $1",
                 )
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -1623,21 +1871,22 @@ impl EventBus {
         // This runs after metadata updates so upsert events have created the row.
         let thread_type = Self::get_thread_type(tx, &thread_id).await;
         let current = Self::get_current_section(tx, &thread_id).await;
-        let (depth, source): (i32, Option<String>) = sqlx::query_as(
-            "SELECT COALESCE(depth, 0), source FROM thread_summaries WHERE thread_id = $1",
+        let (depth, source, trigger_go_to_review): (i32, Option<String>, bool) = sqlx::query_as(
+            "SELECT COALESCE(depth, 0), source, COALESCE(trigger_go_to_review, FALSE) \
+             FROM thread_summaries WHERE thread_id = $1",
         )
         .bind(thread_id)
         .fetch_optional(&mut **tx)
         .await
         .unwrap_or(None)
-        .unwrap_or((0, None));
-        // Trigger executions run unattended — don't surface in REVIEW.
-        // But user followups on trigger threads ARE attended and should surface.
-        // Check if the most recent exchange-start event is a user MessageReceived (followup)
-        // or still the original TriggerStarted.
+        .unwrap_or((0, None, false));
+        // Trigger executions run unattended — don't surface in REVIEW. But
+        // user followups on trigger threads ARE attended (latest start =
+        // MessageReceived), and triggers with `go_to_review=true` opt back in
+        // for reports/alerts the user is meant to read.
         let is_top_level = if depth > 0 {
             false
-        } else if source.as_deref() != Some("trigger") {
+        } else if source.as_deref() != Some("trigger") || trigger_go_to_review {
             true
         } else {
             let latest_start: Option<String> = sqlx::query_scalar(
@@ -1650,12 +1899,10 @@ impl EventBus {
             .await?;
             latest_start.as_deref() == Some("MessageReceived")
         };
-        let mut side_effects = match_side_effects;
         match resolve_transition(event.event_type(), thread_type, current, is_top_level) {
             Ok(mut transition) => {
                 // CodingAgentIdled(has_changes=false) after apply/discard is a housekeeping
-                // event — the section is already 'unread' so setting it again is redundant.
-                // Suppress only when section is already Unread (avoids duplicate side-effects).
+                // event — the section is already 'inbox' so setting it again is redundant.
                 // When section is Default (first idle with no changes), let the transition
                 // through so the thread surfaces in REVIEW — the user needs to know the
                 // CC session completed.
@@ -1665,19 +1912,18 @@ impl EventBus {
                         has_changes: false,
                         ..
                     }
-                ) && current == StoredSection::Unread
+                ) && current == ArchiveState::Inbox
                 {
                     transition.new_section = None;
-                    transition.side_effects.clear();
                 }
-                Self::apply_transition(tx, thread_id, &transition, &mut side_effects).await?;
+                Self::apply_transition(tx, thread_id, &transition).await?;
             }
             Err(v) => {
                 crate::log!("[EventBus] {}", v);
                 return Err(Box::new(v));
             }
         }
-        Ok(side_effects)
+        Ok(match_side_effects)
     }
 
     // ---- System projection ----

@@ -3,8 +3,8 @@ import type { ComponentChild } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
 import { TimeTravelDropdown } from '../apps/TimeTravelDropdown';
-import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, appPseudoFullscreen } from '../../store/store';
-import { closeUrl } from '../../store/actions/artifacts';
+import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, appPseudoFullscreen, parseRepoPath } from '../../store/store';
+import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
 import { getAppFrameSrc, getVisibleAppFrame, exitPseudoFullscreen, refreshAppUI } from '../../store/actions/apps';
 import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon } from '../shared/icons';
 import { RENDERABLE_EXTS } from '../files/FilePreviewInline';
@@ -90,13 +90,26 @@ export function ContentHeaderActions() {
     actions.push({ key, el });
   }
 
+  function reloadButton(onClick: () => void, label: 'Refresh' | 'Reload' = 'Refresh', disabledTooltip?: string) {
+    if (disabledTooltip) {
+      // Override .icon-btn:disabled { pointer-events: none } so the tooltip
+      // (which relies on hover events) can still explain why the button is off.
+      return (
+        <button class="icon-btn header-icon" disabled aria-label={disabledTooltip} data-tooltip={disabledTooltip} style="pointer-events: auto; cursor: default;">
+          <ReloadIcon />
+        </button>
+      );
+    }
+    return (
+      <button class="icon-btn header-icon" onClick={onClick} aria-label={label} data-tooltip={label}>
+        <ReloadIcon />
+      </button>
+    );
+  }
+
   // Context-specific actions — mutually exclusive via if/else
   if (overlay?.type === 'app-ui') {
-    addAction('refresh',
-      <button class="icon-btn header-icon" onClick={() => refreshAppUI()} aria-label="Refresh" data-tooltip="Refresh">
-        <ReloadIcon />
-      </button>,
-    );
+    addAction('refresh', reloadButton(() => refreshAppUI()));
     addAction('time-travel', <TimeTravelDropdown />);
     // iOS standalone PWA cannot open same-origin links in an external browser
     // (all WebKit-based browsers on iOS share this limitation).
@@ -114,16 +127,9 @@ export function ContentHeaderActions() {
       </button>,
     );
   } else if (overlay?.type === 'url-preview') {
-    addAction('reload',
-      <button
-        class="icon-btn header-icon"
-        onClick={() => { if (isTauri()) { const url = panelUrl.value; if (url) webviewReload(url); } }}
-        aria-label="Reload"
-        data-tooltip="Reload"
-      >
-        <ReloadIcon />
-      </button>,
-    );
+    addAction('reload', reloadButton(() => {
+      if (isTauri()) { const url = panelUrl.value; if (url) webviewReload(url); }
+    }, 'Reload'));
     addAction('close',
       <button class="icon-btn header-icon" onClick={closeUrl} aria-label="Close browser" data-tooltip="Close browser">
         <CloseIcon />
@@ -132,6 +138,12 @@ export function ContentHeaderActions() {
   } else if (overlay?.type === 'file-preview') {
     const ext = overlay.path.split('.').pop()?.toLowerCase() || '';
     const hasRendered = RENDERABLE_EXTS.includes(ext);
+    const isDiff = parseRepoPath(overlay.path)?.mode === 'diff';
+    addAction('refresh', reloadButton(
+      refreshFilePreview,
+      'Refresh',
+      isDiff ? 'Diff is fixed to this change' : undefined,
+    ));
     if (hasRendered) {
       const isSource = filePreviewSource.value;
       addAction('source-toggle',

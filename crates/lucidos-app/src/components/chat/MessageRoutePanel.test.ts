@@ -6,8 +6,17 @@ import {
   renderChannelSection,
   renderAuditSection,
   renderEngineExplainerSection,
+  renderInitiatorRow,
 } from './MessageRoutePanel';
 import type { Exchange, StoredEvent } from '../../store/thread-events';
+
+/** Wrap a single StoredEvent as an Exchange so each test can keep declaring
+ *  the userEvent inline — `resolveOrigin` takes the full exchange (it walks
+ *  steps for divider-starter ActionRequired events, see the divider cases
+ *  below). */
+function exch(userEvent: StoredEvent, steps: Exchange['steps'] = []): Exchange {
+  return { userEvent, userSeq: 1, steps };
+}
 
 describe('resolveOrigin', () => {
   it('returns the explicit origin when present on MessageReceived', () => {
@@ -17,7 +26,7 @@ describe('resolveOrigin', () => {
       mode: 'human',
       origin: { kind: 'workspace', workspace: 'personal', thread_id: 't1', event_id: 'e1' },
     };
-    const o = resolveOrigin(ev);
+    const o = resolveOrigin(exch(ev));
     expect(o).toEqual({ kind: 'workspace', workspace: 'personal', thread_id: 't1', event_id: 'e1' });
   });
 
@@ -29,7 +38,7 @@ describe('resolveOrigin', () => {
       device_id: 'dev-1',
       device: 'Chrome',
     };
-    expect(resolveOrigin(ev)).toEqual({ kind: 'device', device_id: 'dev-1', label: 'Chrome' });
+    expect(resolveOrigin(exch(ev))).toEqual({ kind: 'device', device_id: 'dev-1', label: 'Chrome' });
   });
 
   it('synthesizes a ThreadLink (direction=parent) origin for agent-mode legacy events', () => {
@@ -39,7 +48,7 @@ describe('resolveOrigin', () => {
       mode: 'agent',
       parent_thread_id: 'parent-id',
     };
-    expect(resolveOrigin(ev)).toEqual({
+    expect(resolveOrigin(exch(ev))).toEqual({
       kind: 'thread_link',
       thread_id: 'parent-id',
       spawning_event_id: undefined,
@@ -50,7 +59,7 @@ describe('resolveOrigin', () => {
 
   it('returns undefined for non-MessageReceived events without an origin (panel branches separately)', () => {
     const ev: StoredEvent = { type: 'TriggerStarted', trigger_id: 't' };
-    expect(resolveOrigin(ev)).toBeUndefined();
+    expect(resolveOrigin(exch(ev))).toBeUndefined();
   });
 
   it('extracts engine origin from SessionRecovered events', () => {
@@ -59,7 +68,7 @@ describe('resolveOrigin', () => {
       branch: 'claude-code/x',
       origin: { kind: 'engine', reason: { kind: 'session_recovered' } },
     };
-    expect(resolveOrigin(ev)).toEqual({
+    expect(resolveOrigin(exch(ev))).toEqual({
       kind: 'engine',
       reason: { kind: 'session_recovered' },
     });
@@ -71,7 +80,7 @@ describe('resolveOrigin', () => {
       text: '/harden',
       origin: { kind: 'engine', reason: { kind: 'harden_retrigger' } },
     };
-    expect(resolveOrigin(ev)?.kind).toBe('engine');
+    expect(resolveOrigin(exch(ev))?.kind).toBe('engine');
   });
 
   it('extracts engine origin from TriggerStarted events when present', () => {
@@ -80,7 +89,7 @@ describe('resolveOrigin', () => {
       trigger_id: 'abc',
       origin: { kind: 'engine', reason: { kind: 'scheduler', trigger_id: 'abc', trigger_name: 'nightly' } },
     };
-    expect(resolveOrigin(ev)).toEqual({
+    expect(resolveOrigin(exch(ev))).toEqual({
       kind: 'engine',
       reason: { kind: 'scheduler', trigger_id: 'abc', trigger_name: 'nightly' },
     });
@@ -92,7 +101,7 @@ describe('resolveOrigin', () => {
       change_id: 'c1',
       origin: { kind: 'engine', reason: { kind: 'stale_session' } },
     };
-    expect(resolveOrigin(ev)).toEqual({
+    expect(resolveOrigin(exch(ev))).toEqual({
       kind: 'engine',
       reason: { kind: 'stale_session' },
     });
@@ -100,12 +109,30 @@ describe('resolveOrigin', () => {
 
   it('returns undefined when SessionRecovered has no origin field set (legacy DB row)', () => {
     const ev: StoredEvent = { type: 'SessionRecovered', branch: 'x' };
-    expect(resolveOrigin(ev)).toBeUndefined();
+    expect(resolveOrigin(exch(ev))).toBeUndefined();
+  });
+
+  // Regression: when the user clicks Continue on an interrupted CC thread the
+  // backend stamps the device on `EventMeta.actor` (renders the chip as "You")
+  // but until this fix forgot to mirror it onto the variant's `origin` field —
+  // the popover then read `event.origin`, found nothing, and rendered
+  // "Unknown" alongside the "You" chip.
+  it('falls back to the actor on SessionRecovered when origin is missing (user-clicked Continue)', () => {
+    const ev: StoredEvent = {
+      type: 'SessionRecovered',
+      branch: '',
+      actor: { kind: 'device', device_id: 'dev-ios', label: 'iOS Safari PWA' },
+    };
+    expect(resolveOrigin(exch(ev))).toEqual({
+      kind: 'device',
+      device_id: 'dev-ios',
+      label: 'iOS Safari PWA',
+    });
   });
 
   it('returns undefined when device_id and parent_thread_id are both missing', () => {
     const ev: StoredEvent = { type: 'MessageReceived', text: 'hi', mode: 'human' };
-    expect(resolveOrigin(ev)).toBeUndefined();
+    expect(resolveOrigin(exch(ev))).toBeUndefined();
   });
 
   it('surfaces the explicit actor on ChangeApplied', () => {
@@ -114,7 +141,7 @@ describe('resolveOrigin', () => {
       change_id: 'c1',
       actor: { kind: 'device', device_id: 'd1', label: 'Chrome on Mac' },
     };
-    expect(resolveOrigin(ev)).toEqual({ kind: 'device', device_id: 'd1', label: 'Chrome on Mac' });
+    expect(resolveOrigin(exch(ev))).toEqual({ kind: 'device', device_id: 'd1', label: 'Chrome on Mac' });
   });
 
   it('surfaces the actor on ChangeApplyFailed (so the failure has auditability)', () => {
@@ -124,7 +151,80 @@ describe('resolveOrigin', () => {
       error: 'merge conflict',
       actor: { kind: 'api', user_agent: 'curl/8' },
     };
-    expect(resolveOrigin(ev)).toEqual({ kind: 'api', user_agent: 'curl/8' });
+    expect(resolveOrigin(exch(ev))).toEqual({ kind: 'api', user_agent: 'curl/8' });
+  });
+
+  // Divider-starter ActionRequired events: the Origin is the device that
+  // *answered* the question / *resolved* the permission — read from the
+  // matching resolution step's actor.
+
+  it('reads the answering device from UserQuestionAnswered.actor on a divider exchange', () => {
+    const userEvent: StoredEvent = {
+      type: 'UserQuestionAsked',
+      tool_use_id: 'tu1',
+      cc_session_id: 's1',
+      question: 'Pick one',
+      options: [{ id: 'a', label: 'A' }],
+    };
+    // Cast through unknown because UserQuestionAnswered's TS type doesn't yet
+    // declare `actor` — Task 11 will land the Rust stamp + the regen.
+    const answered = {
+      type: 'UserQuestionAnswered',
+      tool_use_id: 'tu1',
+      answer: { kind: 'Selected', option_id: 'a' },
+      actor: { kind: 'device', device_id: 'dev-ipad', label: 'iPad Safari' },
+    } as unknown as StoredEvent;
+    expect(resolveOrigin(exch(userEvent, [{ seq: 2, event: answered }]))).toEqual({
+      kind: 'device', device_id: 'dev-ipad', label: 'iPad Safari',
+    });
+  });
+
+  it('returns undefined for a pending UserQuestionAsked divider (no answer event yet)', () => {
+    const userEvent: StoredEvent = {
+      type: 'UserQuestionAsked',
+      tool_use_id: 'tu1',
+      cc_session_id: 's1',
+      question: 'Pick one',
+      options: [],
+    };
+    expect(resolveOrigin(exch(userEvent))).toBeUndefined();
+  });
+
+  it('reads the resolving device from CodingAgentPermissionResolved.actor on a divider exchange', () => {
+    const userEvent: StoredEvent = {
+      type: 'CodingAgentPermissionRequest',
+      request_id: 'r1',
+      tool_use_id: 'tu',
+      tool_name: 'Bash',
+      input: {},
+      summary: 'ls',
+    };
+    const resolved = {
+      type: 'CodingAgentPermissionResolved',
+      request_id: 'r1',
+      allowed: true,
+      actor: { kind: 'device', device_id: 'dev-mac', label: 'Chrome on Mac' },
+    } as unknown as StoredEvent;
+    expect(resolveOrigin(exch(userEvent, [{ seq: 2, event: resolved }]))).toEqual({
+      kind: 'device', device_id: 'dev-mac', label: 'Chrome on Mac',
+    });
+  });
+
+  it('returns undefined for pending CodingAgentPermissionRequest divider (no resolution yet)', () => {
+    const userEvent: StoredEvent = {
+      type: 'CodingAgentPermissionRequest',
+      request_id: 'r1',
+      tool_use_id: 'tu',
+      tool_name: 'Bash',
+      input: {},
+      summary: 'ls',
+    };
+    expect(resolveOrigin(exch(userEvent))).toBeUndefined();
+  });
+
+  it('returns undefined for CredentialRequested / McpConsentRequested (no answer event today)', () => {
+    expect(resolveOrigin(exch({ type: 'CredentialRequested', provider: 'github' }))).toBeUndefined();
+    expect(resolveOrigin(exch({ type: 'McpConsentRequested', tool: 'fs.read', args: {} }))).toBeUndefined();
   });
 });
 
@@ -386,5 +486,50 @@ describe('renderEngineExplainerSection', () => {
   });
   it('scheduler renders nothing (trigger renderer handles it)', () => {
     expect(renderEngineExplainerSection({ kind: 'scheduler', trigger_id: 't' })).toBeNull();
+  });
+});
+
+describe('renderInitiatorRow', () => {
+  it('discloses Claude Code as the asker for UserQuestionAsked', () => {
+    const node = renderInitiatorRow({
+      type: 'UserQuestionAsked',
+      tool_use_id: 'tu',
+      cc_session_id: 's',
+      question: 'q',
+      options: [],
+    });
+    const s = JSON.stringify(node);
+    expect(s).toContain('Asked by');
+    expect(s).toContain('Claude Code');
+  });
+
+  it('discloses Claude Code (permission gate) for CodingAgentPermissionRequest', () => {
+    const node = renderInitiatorRow({
+      type: 'CodingAgentPermissionRequest',
+      request_id: 'r1',
+      tool_use_id: 'tu',
+      tool_name: 'Edit',
+      input: {},
+      summary: 's',
+    });
+    const s = JSON.stringify(node);
+    expect(s).toContain('Asked by');
+    expect(s).toContain('Claude Code (permission gate)');
+  });
+
+  it('discloses Lucidos as the asker for CredentialRequested', () => {
+    const node = renderInitiatorRow({ type: 'CredentialRequested', provider: 'github' });
+    expect(JSON.stringify(node)).toContain('Lucidos (credential request)');
+  });
+
+  it('discloses Lucidos as the asker for McpConsentRequested', () => {
+    const node = renderInitiatorRow({ type: 'McpConsentRequested', tool: 'fs.read', args: {} });
+    expect(JSON.stringify(node)).toContain('Lucidos (tool consent)');
+  });
+
+  it('returns null for non-divider event types (their initiator is implied)', () => {
+    expect(renderInitiatorRow({ type: 'MessageReceived', text: 'hi', mode: 'human' })).toBeNull();
+    expect(renderInitiatorRow({ type: 'TriggerStarted', trigger_id: 't' })).toBeNull();
+    expect(renderInitiatorRow({ type: 'ChangeApplied', change_id: 'c1' })).toBeNull();
   });
 });

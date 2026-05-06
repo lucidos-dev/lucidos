@@ -103,7 +103,7 @@ mod tests {
 
     async fn insert_thread_summary(pool: &PgPool, thread_id: Uuid, title: &str) {
         sqlx::query(
-            "INSERT INTO thread_summaries (thread_id, title, source, message_count, last_activity, has_response, is_pinned) \
+            "INSERT INTO thread_summaries (thread_id, title, source, message_count, last_activity, has_response, is_saved) \
              VALUES ($1, $2, 'chat', 0, NOW(), false, false)"
         )
         .bind(thread_id).bind(title)

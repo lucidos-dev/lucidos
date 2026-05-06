@@ -8,6 +8,7 @@ import type {
   OAuthAccountInfo,
   PinnedAppEntry,
   TriggerInfo,
+  HistoricalTriggerInfo,
   App,
   ConfirmState,
   ConfirmDetails,
@@ -20,10 +21,12 @@ import type { ThreadState, ThreadStatus, Exchange } from './thread-events';
 import { computeExchanges } from './thread-events';
 import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
-import type { EventChannel, StoredSection } from '../generated/thread-lifecycle';
-import { isMobile } from '../utils/viewport';
-import { scanDraftIds, loadDraftText, loadDraftUpdatedAt, FOCUSED_DRAFT_KEY, FOCUSED_THREAD_KEY } from '../utils/draftStorage';
-import { draftTitle } from '../utils/draftTitle';
+import type { EventChannel, ArchiveState } from '../generated/thread-lifecycle';
+import { resetContentScroll } from '../hooks/useScrollMemory';
+
+/** localStorage key holding the focused thread id across reloads. Focus is
+ *  per-device, not worth round-tripping through the server. */
+export const FOCUSED_THREAD_KEY = 'lucidos-focused-thread';
 
 // --- Inline form (replaces 5 separate modal booleans) ---
 export type InlineForm =
@@ -77,13 +80,18 @@ export const viewingNotification = computed(() => {
 });
 
 export function closeInlineForm(): void {
+  // Trigger forms reset the list scroll on close (Save/Cancel/Escape) so the
+  // user lands at the top instead of the row they just edited. Other form
+  // types preserve their underlying view's scroll.
+  const form = activeInlineForm.value;
+  if (form?.type === 'trigger') resetContentScroll('triggers');
   panelOverlay.value = null;
 }
 import type { Change, CCModelValue, CCReasoningEffort } from '../api/client';
 import { markSwUpdateDismissed } from '../hooks/sw-update';
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'disk-usage';
+export type SettingsSubview = 'main' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'disk-usage' | 'tool-permissions';
 export const settingsSubview = signal<SettingsSubview>('main');
 /** Anchor to scroll/highlight after navigating from Search Everywhere. SettingsView clears it after applying. */
 export const settingsScrollTarget = signal<string | null>(null);
@@ -96,6 +104,7 @@ export const SETTINGS_NAV_ITEMS: Array<{ key: Exclude<SettingsSubview, 'main'>; 
   { key: 'repositories', label: 'Repositories' },
   { key: 'backup', label: 'Backup' },
   { key: 'memory', label: 'Memory' },
+  { key: 'tool-permissions', label: 'Tool permissions' },
   { key: 'disk-usage', label: 'Disk Usage' },
 ];
 
@@ -144,6 +153,11 @@ export const isProcessing = computed(() => {
 export const threadDrawerOpen = signal(
   localStorage.getItem('lucidos-thread-drawer-open') === 'true'
 );
+/** Drawer-as-drafts-filter toggle. When true, the thread list collapses to a
+ *  single "Drafts" section showing every thread with an unsent draft (composing
+ *  threads + existing threads with composeText/composeImages). Session-only —
+ *  always starts off; the user opts in. */
+export const draftsViewActive = signal(false);
 export const DEFAULT_DRAWER_WIDTH = 300;
 export const MIN_DRAWER_WIDTH = 200;
 export const threadDrawerWidth = signal(
@@ -153,31 +167,92 @@ export const focusedThreadId = signal<string | null>(
   localStorage.getItem(FOCUSED_THREAD_KEY)
 );
 
+/** Single setter that keeps focusedThreadId and FOCUSED_THREAD_KEY in lockstep.
+ *  Every production-code mutation of focusedThreadId must go through here so
+ *  the next reload resumes the same thread (especially compose drafts whose
+ *  id was allocated client-side and never touches the server until a Send).
+ *  Idempotent: hot-path callers (sendMessage, focusThread on the focused row)
+ *  fire with the same id repeatedly; skip the synchronous storage write when
+ *  nothing changed. */
+export function setFocusedThread(id: string | null): void {
+  if (focusedThreadId.peek() === id) return;
+  focusedThreadId.value = id;
+  if (id) {
+    localStorage.setItem(FOCUSED_THREAD_KEY, id);
+  } else {
+    localStorage.removeItem(FOCUSED_THREAD_KEY);
+  }
+}
+
 // True while the prompt FLIP animation is sliding from compose→thread position.
 // ThreadView gates its content behind this to avoid rendering exchanges mid-slide.
 export const promptAnimating = signal(false);
 
 // True when the next focusThread should trigger slide-up reveal animation.
-// Set only by handleDismissThread → focusThread (Done → next thread).
+// Set only by handleArchiveThread → focusThread (Done → next thread).
 export const revealOnFocus = signal(false);
 
 // --- Thread channel filter ---
 export type ThreadChannel = EventChannel;
 export const ALL_CHANNELS: ThreadChannel[] = [...EVENT_CHANNELS];
 
+export const THREAD_CHANNEL_FILTER_KEY = 'lucidos-thread-channel-filter';
+
 function restoreThreadChannelFilter(): Set<ThreadChannel> {
+  const saved = localStorage.getItem(THREAD_CHANNEL_FILTER_KEY);
+  if (saved === null) return new Set(ALL_CHANNELS);
   try {
-    const saved = localStorage.getItem('lucidos-thread-channel-filter');
-    if (saved) {
-      const parsed = JSON.parse(saved) as ThreadChannel[];
-      const valid = parsed.filter(s => ALL_CHANNELS.includes(s));
-      if (valid.length > 0) return new Set(valid);
+    const parsed = JSON.parse(saved) as ThreadChannel[];
+    if (Array.isArray(parsed)) {
+      return new Set(parsed.filter(s => ALL_CHANNELS.includes(s)));
     }
   } catch { /* ignore */ }
   return new Set(ALL_CHANNELS);
 }
 
 export const threadChannelFilter = signal<Set<ThreadChannel>>(restoreThreadChannelFilter());
+
+// Empty set = "all triggers". Non-empty = filter to those trigger_ids only.
+const SELECTED_TRIGGER_IDS_KEY = 'lucidos-selected-trigger-ids';
+
+function restoreSelectedTriggerIds(): Set<string> {
+  try {
+    const saved = localStorage.getItem(SELECTED_TRIGGER_IDS_KEY);
+    if (!saved) return new Set();
+    const parsed = JSON.parse(saved);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((x): x is string => typeof x === 'string'));
+  } catch { return new Set(); }
+}
+
+export const selectedTriggerIds = signal<Set<string>>(restoreSelectedTriggerIds());
+
+export function setSelectedTriggerIds(next: Set<string>): void {
+  selectedTriggerIds.value = next;
+  localStorage.setItem(SELECTED_TRIGGER_IDS_KEY, JSON.stringify([...next]));
+}
+
+// Empty set = "all repos". Non-empty = filter Claude Code threads to those
+// cc_repo_ids only. Mirrors `selectedTriggerIds` exactly — the dropdown turns
+// the Claude Code parent indeterminate when this set is non-empty.
+const SELECTED_REPO_IDS_KEY = 'lucidos-selected-repo-ids';
+
+function restoreSelectedRepoIds(): Set<string> {
+  try {
+    const saved = localStorage.getItem(SELECTED_REPO_IDS_KEY);
+    if (!saved) return new Set();
+    const parsed = JSON.parse(saved);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((x): x is string => typeof x === 'string'));
+  } catch { return new Set(); }
+}
+
+export const selectedRepoIds = signal<Set<string>>(restoreSelectedRepoIds());
+
+export function setSelectedRepoIds(next: Set<string>): void {
+  selectedRepoIds.value = next;
+  localStorage.setItem(SELECTED_REPO_IDS_KEY, JSON.stringify([...next]));
+}
 
 // --- Thread search ---
 export const threadSearchQuery = signal('');
@@ -194,31 +269,29 @@ export const threadHasMore = signal(true);
 export const threadLoadingMore = signal(false);
 /** Derive effective thread status, accounting for in-progress apply operations and pending messages. */
 export function effectiveThreadStatus(thread: ThreadState): ThreadStatus {
-  // Dismiss = user acknowledged any prior failed/aborted state. Drop the red
-  // status dot immediately, before the ThreadDismissed SSE round-trip lands.
-  if (dismissingThreadIds.value.has(thread.meta.id)) return 'idle';
-  if (applyingNowThreadIds.value.has(thread.meta.id)) return 'running';
+  // Archive = user acknowledged any prior failed/aborted state. Drop the red
+  // status dot immediately, before the ThreadArchived SSE round-trip lands.
+  if (archivingThreadIds.value.has(thread.meta.id)) return 'idle';
+  // Apply is *not* an optimistic running flip — the thread should stay in
+  // Review while the backend either finishes a clean fast-path apply (status
+  // stays Idle/Waiting) or wakes CC for harden / merge-conflict resolution
+  // (CC's own activity events will transition status to Running). The
+  // disabled "Apply..." button in WaitingBanner is the visual feedback.
   // Pending user messages = request sent, thread is running before SSE event arrives
   if (thread.pendingUserMessages.length > 0) return 'running';
   return thread.meta.status;
 }
 
-/** All threads whose display section is 'review'. Threads with unsent drafts
- *  are excluded so the badge count matches what the drawer shows — drafts
- *  appear in the Drafts section, not Review. The desktop carve-out matches
- *  ThreadDrawer.categorizeThreads: a focused-on-desktop draft stays in its
- *  natural section. */
+/** All threads whose display section is 'review'. Section membership is a pure
+ *  function of thread state — thread-attached drafts route to their natural
+ *  section per the lifecycle contract, so no draft carve-out is needed. */
 export function getReviewThreads(): ThreadState[] {
   const result: ThreadState[] = [];
-  const draftMap = drafts.value;
-  const focused = focusedThreadId.value;
-  const mobile = isMobile();
   for (const thread of threadMap.value.values()) {
-    if (thread.meta.section !== 'unread') continue;
-    if (draftMap.has(thread.meta.id) && (mobile || thread.meta.id !== focused)) continue;
     const display = displaySection(
-      thread.meta.section as StoredSection, effectiveThreadStatus(thread),
-      thread.meta.pinned, thread.meta.activeChildrenCount > 0,
+      thread.meta.section as ArchiveState, effectiveThreadStatus(thread),
+      thread.meta.saved, thread.meta.activeChildrenCount > 0,
+      thread.meta.ccHasChanges,
     );
     if (display === 'review') result.push(thread);
   }
@@ -250,6 +323,12 @@ export const activeStreamingBuffer = computed(() => {
   const thread = threadMap.value.get(id);
   if (!thread) return '';
   return thread.streamingBuffer;
+});
+
+export const activeThreadIsComposing = computed(() => {
+  const id = focusedThreadId.value;
+  if (!id) return false;
+  return threadMap.value.get(id)?.meta.state === 'composing';
 });
 
 // --- Split layout ---
@@ -351,7 +430,10 @@ export const repoDiff = signal<Loadable<RepoDiff>>({ status: 'not-loaded' });
 export const repoPending = signal<RepoPendingInfo | null>(null);
 export const repoViewMode = signal<'all' | 'changes'>('all');
 export const selectedLines = signal<{ start: number; end: number } | null>(null);
-export const repoSelectedChangeId = signal<string | null>(null);
+export const SELECTED_CHANGE_KEY = 'lucidos-repo-selected-change-id';
+// Hydrated from localStorage so the persistence effect's first synchronous
+// fire doesn't wipe a saved ID before useStartup can call restore on it.
+export const repoSelectedChangeId = signal<string | null>(localStorage.getItem(SELECTED_CHANGE_KEY));
 export const repoChanges = signal<Loadable<import('../api/client').RepoChangesState>>({ status: 'not-loaded' });
 export const repoChangesLoadingMore = signal(false);
 export const selectedChange = computed(() => {
@@ -399,14 +481,33 @@ export const applyingChangeIds = signal<Set<string>>(new Set());
  *  Tracks the phase: 'requesting' (waiting for backend) → 'applying' (ChangeProposed arrived).
  *  Cleared when the apply completes, fails, or the backend takes over. */
 export const applyingNowThreadIds = signal<Map<string, 'requesting' | 'applying'>>(new Map());
-/** Thread IDs where dismiss is in progress (prevents duplicate API calls). */
-export const dismissingThreadIds = signal<Set<string>>(new Set());
+/** Thread IDs where archive is in progress (prevents duplicate API calls). */
+export const archivingThreadIds = signal<Set<string>>(new Set());
 /** Thread IDs where CC changes discard is in progress (hides Apply, shows "Discard..."). */
 export const discardingCCThreadIds = signal<Set<string>>(new Set());
+/** Thread IDs where Cancel was clicked while an exchange is active. Disables
+ *  the Cancel button (shows "Cancel...") and drives the spinner status label.
+ *  Cleared when the thread leaves active status (via PromptInput effect). */
+export const cancelingThreadIds = signal<Set<string>>(new Set());
 /** All changes from Claude Code sessions. Updated via SSE push or API fetch. */
 export const changes = signal<Change[]>([]);
 /** Recently applied/reverted changes. Updated via SSE push. */
 export const appliedChanges = signal<Change[]>([]);
+/** Per-id cache for changes fetched on-demand by `ChangeBody` when the id
+ *  isn't in `changes` or `appliedChanges`. `loading` doubles as the dedup
+ *  token; `failed` prevents refetching a 404. */
+export const lazyChanges = signal<Map<string, Loadable<Change>>>(new Map());
+/** Look up a change by id across all three chat-change sources. Returns the
+ *  resolved `Change` only — callers that need to distinguish loading/failed
+ *  should read `lazyChanges.value.get(id)` directly. */
+export function findChangeById(id: string): Change | undefined {
+  const pending = changes.value.find(c => c.id === id);
+  if (pending) return pending;
+  const applied = appliedChanges.value.find(c => c.id === id);
+  if (applied) return applied;
+  const lazy = lazyChanges.value.get(id);
+  return lazy?.status === 'loaded' ? lazy.data : undefined;
+}
 /** All change IDs currently being applied — single source of truth combining
  *  change-level tracking (applyingChangeIds) and thread-level tracking (applyingNowThreadIds). */
 export const busyChangeIds = computed(() => {
@@ -442,9 +543,6 @@ export const stepsExpanded = signal(
 );
 export const detailsExpanded = signal(
   localStorage.getItem('lucidos-details-expanded') === 'true'
-);
-export const contextExpanded = signal(
-  localStorage.getItem('lucidos-context-expanded') === 'true'
 );
 
 /** Signal + toggle pair backed by a localStorage-persisted Set of "threadId:userSeq" keys. */
@@ -520,6 +618,8 @@ export const oauthAccounts = signal<Loadable<OAuthAccountInfo[]>>({ status: 'not
 // --- Triggers ---
 export const triggers = signal<Loadable<TriggerInfo[]>>({ status: 'not-loaded' });
 
+export const historicalTriggers = signal<Loadable<HistoricalTriggerInfo[]>>({ status: 'not-loaded' });
+
 // --- Pending message (used to send a message from outside the chat module) ---
 export const pendingChatMessage = signal<string | null>(null);
 
@@ -569,31 +669,59 @@ export const confirmState = signal<ConfirmState>({
 // --- Toasts ---
 let toastIdCounter = 0;
 export const toasts = signal<ToastItem[]>([]);
+/** Pending auto-dismiss timers for keyed toasts. Cleared when the same key is
+ *  re-shown (window restarts) or when the toast is dismissed by other means
+ *  (close button, explicit dismissToast call) — without this cleanup, the
+ *  Map entry would survive until the setTimeout fires. */
+const keyedDismissTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; onClick?: () => void; spinning?: boolean }) {
-  const { key, action, onClick, spinning } = opts ?? {};
+export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; onClick?: () => void; spinning?: boolean; autoDismissMs?: number }) {
+  const { key, action, onClick, spinning, autoDismissMs } = opts ?? {};
   // If a key is provided, update an existing toast with the same key instead of creating a new one
   if (key) {
     const existing = toasts.value.find((t) => t.key === key);
     if (existing) {
       toasts.value = toasts.value.map((t) => t.key === key ? { ...t, message, type, action, onClick, spinning } : t);
+      scheduleAutoDismiss(key, autoDismissMs);
       return;
     }
   }
   const id = ++toastIdCounter;
   toasts.value = [...toasts.value, { id, message, type, key, action, onClick, spinning }];
-  // Errors, warnings, and toasts with actions/onClick require manual dismissal; other types auto-close
-  if (!key && !action && !onClick && type !== 'error' && type !== 'warning') {
+  if (key) {
+    scheduleAutoDismiss(key, autoDismissMs);
+    return;
+  }
+  // Unkeyed: errors, warnings, and toasts with actions/onClick require manual dismissal; other types auto-close
+  const ms = autoDismissMs ?? (action || onClick || type === 'error' || type === 'warning' ? undefined : 5000);
+  if (ms !== undefined) {
     setTimeout(() => {
       toasts.value = toasts.value.filter((t) => t.id !== id);
-    }, 5000);
+    }, ms);
   }
+}
+
+function scheduleAutoDismiss(key: string, autoDismissMs: number | undefined): void {
+  const prior = keyedDismissTimers.get(key);
+  if (prior) clearTimeout(prior);
+  if (autoDismissMs === undefined) {
+    keyedDismissTimers.delete(key);
+    return;
+  }
+  keyedDismissTimers.set(key, setTimeout(() => dismissToast(key), autoDismissMs));
 }
 
 export function dismissToast(idOrKey: number | string) {
   toasts.value = toasts.value.filter((t) =>
     typeof idOrKey === 'string' ? t.key !== idOrKey : t.id !== idOrKey
   );
+  if (typeof idOrKey === 'string') {
+    const t = keyedDismissTimers.get(idOrKey);
+    if (t) {
+      clearTimeout(t);
+      keyedDismissTimers.delete(idOrKey);
+    }
+  }
   if (idOrKey === 'update-available') {
     updateAvailable.value = false;
     markSwUpdateDismissed();
@@ -678,41 +806,14 @@ export const memoryRebuildProgress = signal<{ processed: number; total: number; 
 /** Updated from SSE BackupProgress events. null = not backing up/restoring. */
 export const backupProgress = signal<{ phase: string; progress: number; total: number } | null>(null);
 
+/** Bumped on every BackupCompleted SSE event. BackupSection re-fetches the
+ *  list when this changes, so any mounted instance (in either layout copy)
+ *  sees the new entry without each running its own completion handler. */
+export const backupListVersion = signal(0);
+
 /** Updated from SSE RecoveryProgress events. null = not recovering. */
 export const recoveryProgress = signal<{ completed: number; total: number } | null>(null);
 
 // --- Update available ---
 export const updateAvailable = signal(false);
 
-// --- Per-thread drafts ---
-
-export interface DraftMeta {
-  title: string;
-  updatedAt: string;
-}
-
-export function newDraftId(): string {
-  return `draft-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function bootstrapFocusedDraftId(): string {
-  const saved = localStorage.getItem(FOCUSED_DRAFT_KEY);
-  if (saved) return saved;
-  const id = newDraftId();
-  localStorage.setItem(FOCUSED_DRAFT_KEY, id);
-  return id;
-}
-
-function bootstrapDrafts(): Map<string, DraftMeta> {
-  const map = new Map<string, DraftMeta>();
-  for (const id of scanDraftIds()) {
-    map.set(id, {
-      title: draftTitle(loadDraftText(id)),
-      updatedAt: loadDraftUpdatedAt(id) ?? '',
-    });
-  }
-  return map;
-}
-
-export const focusedDraftId = signal<string>(bootstrapFocusedDraftId());
-export const drafts = signal<Map<string, DraftMeta>>(bootstrapDrafts());

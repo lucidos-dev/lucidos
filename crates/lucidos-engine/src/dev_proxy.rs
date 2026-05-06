@@ -68,7 +68,7 @@ pub async fn proxy(vite_base: String, req: axum::extract::Request) -> Response {
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(e) => {
-            crate::log!("Failed to proxy {} -> {}: {:?}", uri, url, e);
+            crate::log!("[DevProxy] Failed to proxy {} -> {}: {:?}", uri, url, e);
             StatusCode::BAD_GATEWAY.into_response()
         }
     }

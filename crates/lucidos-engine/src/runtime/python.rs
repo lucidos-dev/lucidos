@@ -14,12 +14,24 @@ impl PythonRuntime {
         // Canonicalize to absolute path to avoid issues when changing directories
         let workspace_path = workspace_path.canonicalize().unwrap_or(workspace_path);
         let exhaust_path = workspace_path.join(".lucidos").join("exhaust");
-        fs::create_dir_all(&exhaust_path).ok();
+        if let Err(e) = fs::create_dir_all(&exhaust_path) {
+            log!(
+                "[Python] Failed to create exhaust dir at {}: {}",
+                exhaust_path.display(),
+                e
+            );
+        }
 
         // Clean up orphaned staging dirs from previous crashed runs
         let staging_root = workspace_path.join(".lucidos/staging");
         if staging_root.exists() {
-            fs::remove_dir_all(&staging_root).ok();
+            if let Err(e) = fs::remove_dir_all(&staging_root) {
+                log!(
+                    "[Python] Failed to clean up orphaned staging dir {}: {}",
+                    staging_root.display(),
+                    e
+                );
+            }
         }
 
         let venv_path = workspace_path.join(".lucidos/runtime/python/venv");
@@ -95,8 +107,12 @@ impl PythonRuntime {
         let stdout = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stdout));
         let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stderr));
 
-        fs::write(task_dir.join("stdout.txt"), &stdout).ok();
-        fs::write(task_dir.join("stderr.txt"), &stderr).ok();
+        if let Err(e) = fs::write(task_dir.join("stdout.txt"), &stdout) {
+            log!("[Python] Failed to write stdout debug log: {}", e);
+        }
+        if let Err(e) = fs::write(task_dir.join("stderr.txt"), &stderr) {
+            log!("[Python] Failed to write stderr debug log: {}", e);
+        }
 
         if output.status.success() {
             Ok(stdout)

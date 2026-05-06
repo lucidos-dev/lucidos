@@ -5,11 +5,7 @@ use uuid::Uuid;
 // Re-export types from core::store for backwards compatibility
 pub use crate::core::{ConversationMessage, ConversationSnapshot, SessionMessage};
 
-/// App context sent when an app UI is open — tells the LLM which app is active.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AppContext {
-    pub app_id: String,
-}
+pub use crate::api::AppContext;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ProcessResult {
@@ -49,28 +45,6 @@ pub struct ContextSection {
     pub char_count: usize,
 }
 
-/// A condensed view of a message in the agentic loop, for the context inspector.
-#[derive(Clone, Debug, Serialize)]
-pub struct ContextMessage {
-    pub role: String,
-    pub text: String,
-    pub tool_calls: Vec<ContextToolCall>,
-    pub tool_results: Vec<ContextToolResult>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ContextToolCall {
-    pub name: String,
-    pub input_summary: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ContextToolResult {
-    pub tool_name: String,
-    pub content_preview: String,
-    pub success: bool,
-}
-
 /// Result of an App UI capture from the frontend
 pub struct CaptureResult {
     pub screenshot: String, // base64 PNG
@@ -98,7 +72,7 @@ pub struct CcCommandsInfo {
     pub skill_commands: Vec<String>,
 }
 
-/// Response from cc_categorized_commands / cc_cached_commands.
+/// Response from cc_categorized_commands / cc_commands_for_repo.
 /// Commands come from the repo-level cache; model/effort come from per-thread events.
 pub struct CcCommandsResult {
     pub info: CcCommandsInfo,
@@ -151,6 +125,14 @@ pub struct AgentSession {
     /// reason SessionEndReason::Shutdown — the frontend uses this to show "Aborted"
     /// instead of "Done" for engine-interrupted exchanges.
     pub shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by `abort_in_flight_for_restart` when it pre-emits a `ResponseAborted`
+    /// on `/api/restart` for this thread. The run_session loop's Result-classify
+    /// and safety-net paths read this flag and skip their own terminal emit so
+    /// the user only sees ONE "Response interrupted" panel (with the device
+    /// actor) instead of two (one device, one system). Without this flag, CC's
+    /// graceful interrupt → Result event → classify_result(is_shutdown=true)
+    /// path emits a duplicate `ResponseAborted` 3s after the pre-emit.
+    pub external_terminal_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Channel for sending control requests (set_model, set_permission_mode, etc.)
     /// from outside the event loop. The event loop forwards them to the runtime.
     pub control_tx: tokio::sync::mpsc::UnboundedSender<crate::runtime::ControlRequest>,
@@ -163,6 +145,20 @@ pub struct AgentSession {
     /// Current reasoning effort level (low/medium/high).
     /// Not reported in CC's init event — only set via control request.
     pub current_reasoning_effort: Option<String>,
+    /// Number of user-input messages routed to CC since the last `Result`.
+    /// Incremented when a message is queued for CC (initial spawn input +
+    /// each fast-path follow-up via msg_tx); reset to zero by `swap(0)`
+    /// inside the Result handler because every Result is a turn boundary
+    /// (CC merges back-to-back stdin inputs into a single Result, so a 1:1
+    /// decrement leaks the counter). The pre-swap value drives only the
+    /// idle-exit cancel: > 1 means a follow-up was inflight (queued in
+    /// msg_rx OR forwarded but merged) so CC stays alive to avoid killing
+    /// the subprocess between a routed follow-up and its consumption by
+    /// `msg_rx.recv`. Without this guard, a follow-up routed via msg_tx
+    /// during the cancel + follow-up race would get killed mid-second-task
+    /// because the previous turn's Result triggers `agent_cancel.cancel()`
+    /// while CC is still processing the new prompt.
+    pub pending_followups: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl AgentSession {
@@ -172,6 +168,12 @@ impl AgentSession {
             builtin_commands: self.builtin_commands.clone(),
             skill_commands: self.skill_commands.clone(),
         }
+    }
+
+    /// True when the session has an in-flight response: process alive and
+    /// not waiting at a turn boundary.
+    pub fn is_in_flight(&self) -> bool {
+        !self.process_exited && !self.is_waiting
     }
 }
 

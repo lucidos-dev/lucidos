@@ -1,9 +1,5 @@
 import { marked } from 'marked';
-import { COPY_ICON, CHECK_ICON } from './markedConfig';
-
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
+import { COPY_ICON, CHECK_ICON, escapeHtmlAttr } from './markedConfig';
 
 // Unique marker prefix for copy block boundaries (survives marked processing)
 const COPY_MARKER = 'LUCIDOS_COPY_BLOCK';
@@ -94,14 +90,19 @@ export function renderMarkdown(md: string): string {
   // Wrap multiline copy blocks that used comment markers
   html = postprocessCopyBlocks(html, encodedTexts);
   // Escape dangerous HTML elements from raw markdown source
-  html = html.replace(DANGEROUS_TAG, (match) => escapeHtml(match));
+  html = html.replace(DANGEROUS_TAG, (match) => escapeHtmlAttr(match));
   // Wrap tables in a scrollable container so columns auto-size naturally
   html = html.replace(/<table>/g, '<div class="table-scroll-wrapper"><table>');
   html = html.replace(/<\/table>/g, '</table></div>');
-  // Convert thread: links to clickable thread navigation
+  // Convert thread: links to clickable thread navigation. Accepts both the
+  // bare-UUID form (`thread:UUID`, same workspace) and the workspace-qualified
+  // form emitted by the copy-ref button (`thread:workspace/UUID`).
   html = html.replace(
-    /href="thread:([0-9a-f-]+)"/g,
-    'href="#" data-thread-id="$1" class="thread-link"'
+    /href="thread:(?:([a-zA-Z0-9_-]+)\/)?([0-9a-f-]+)"/g,
+    (_match, workspace: string | undefined, threadId: string) => {
+      const wsAttr = workspace ? ` data-thread-workspace="${escapeHtmlAttr(workspace)}"` : '';
+      return `href="#" data-thread-id="${threadId}"${wsAttr} class="thread-link"`;
+    }
   );
   return html;
 }

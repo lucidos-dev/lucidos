@@ -1,7 +1,14 @@
 use crate::llm::provider::{LlmProvider, LlmResponse, Message, MessageContent};
-use crate::llm::vertex::{TokenCache, VertexProvider};
+use crate::llm::vertex::{location_handle, LocationHandle, TokenCache, VertexProvider};
 use crate::memory::RETRIEVAL_MIN_IMPORTANCE;
 use serde::{Deserialize, Serialize};
+
+/// Bump when extractor logic changes in a way that produces materially
+/// different facts from the same input — new prompt, new filter, new context
+/// injection. Stamped on each `memory_entries` row by `index_entry`. Lets
+/// `rebuild_memory(re_extract_stale=true)` re-extract entries written by an
+/// older version without paying for a full rebuild.
+pub const EXTRACTOR_VERSION: i32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedFact {
@@ -129,29 +136,22 @@ const EXTRACTION_MODEL: &str = "gemini-3-flash-preview";
 pub struct MemoryExtractor {
     provider: VertexProvider,
     project_id: String,
-    location: String,
+    location: LocationHandle,
     token_cache: TokenCache,
 }
 
 impl MemoryExtractor {
     pub fn new(project_id: String, location: String) -> Self {
         let token_cache: TokenCache = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let provider = VertexProvider::with_token_cache(
-            project_id.clone(),
-            location.clone(),
-            EXTRACTION_MODEL.to_string(),
-            token_cache.clone(),
-        );
-        Self {
-            provider,
-            project_id,
-            location,
-            token_cache,
-        }
+        Self::with_location_handle(project_id, location_handle(location), token_cache)
     }
 
-    pub fn with_token_cache(project_id: String, location: String, token_cache: TokenCache) -> Self {
-        let provider = VertexProvider::with_token_cache(
+    pub fn with_location_handle(
+        project_id: String,
+        location: LocationHandle,
+        token_cache: TokenCache,
+    ) -> Self {
+        let provider = VertexProvider::with_location_handle(
             project_id.clone(),
             location.clone(),
             EXTRACTION_MODEL.to_string(),
@@ -170,13 +170,13 @@ impl MemoryExtractor {
         &self.provider
     }
 
-    /// Create a VertexProvider for a specific model, sharing the token cache.
-    /// If model is "default" or empty, returns a clone of the default provider.
+    /// Create a VertexProvider for a specific model, sharing the token cache
+    /// and live region handle.
     pub fn provider_for_model(&self, model: &str) -> VertexProvider {
         if model.is_empty() || model == "default" {
             self.provider.clone()
         } else {
-            VertexProvider::with_token_cache(
+            VertexProvider::with_location_handle(
                 self.project_id.clone(),
                 self.location.clone(),
                 model.to_string(),
@@ -258,7 +258,10 @@ impl MemoryExtractor {
         for fact in &mut facts {
             fact.importance = fact.importance.clamp(0.0, 1.0);
         }
-        facts.retain(|f| f.importance >= RETRIEVAL_MIN_IMPORTANCE);
+        facts.retain(|f| {
+            f.importance >= RETRIEVAL_MIN_IMPORTANCE
+                && !is_fabricated_engine_internal_claim(&f.fact)
+        });
 
         Ok(facts)
     }
@@ -340,6 +343,41 @@ impl MemoryExtractor {
             entities: vec![],
         }
     }
+}
+
+/// True for facts asserting engine internals the chat agent cannot observe
+/// (per-turn caps, tool-call counts, internal symbols). Filters at extract
+/// time so memory rebuild can't recreate them.
+pub(crate) fn is_fabricated_engine_internal_claim(text: &str) -> bool {
+    // Normalize "tool-call(s)" → "tool call(s)" so we only branch on one form.
+    let lower = text.to_lowercase().replace("tool-call", "tool call");
+
+    if lower.contains("max_iterations") || lower.contains("agentic_loop.rs") {
+        return true;
+    }
+
+    // Token-match framings so "unlimited" doesn't trigger "limit",
+    // "capacity" doesn't trigger "cap", etc.
+    const FRAMINGS: &[&str] = &["cap", "limit", "budget", "reached", "count", "exceeded"];
+    let has_framing = || {
+        lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| FRAMINGS.contains(&w))
+    };
+
+    // "per turn" is rare in legitimate user facts — when paired with any
+    // cap/limit framing it's almost always meta-commentary about the engine.
+    if (lower.contains("per turn") || lower.contains("per-turn")) && has_framing() {
+        return true;
+    }
+
+    // "tool call(s)" combined with cap/limit framing is meta-engine talk the
+    // chat agent should not be indexing as fact about the user.
+    if lower.contains("tool call") && has_framing() {
+        return true;
+    }
+
+    false
 }
 
 /// Strip markdown code fences from LLM response.
@@ -440,6 +478,58 @@ mod tests {
         let c: QueryClassification = serde_json::from_str(json).unwrap();
         assert!(!c.needs_memory);
         assert!(c.sub_queries.is_empty());
+    }
+
+    #[test]
+    fn test_filter_drops_tool_call_cap_phrasings() {
+        let contaminated = [
+            "Is testing a system that has a per-turn tool-call limit of approximately 25, with a hard cap at 100 defined in agentic_loop.rs:103.",
+            "Flagged a system failure when the tool-call count reached 114.",
+            "Pointed out that a ~25-call soft cap per turn was being reached due to cumulative tool calls during changelog refinement.",
+            "Advocated for fixing a misleading error message blaming the user when the MAX_ITERATIONS tool call limit was reached.",
+            "Considered adding a guardrail to prevent the LLM from claiming it hit a tool-call cap.",
+            "Per turn limit observed during release flow.",
+            "Identified a system cap issue at 114 tool calls on April 26.",
+        ];
+        for text in contaminated {
+            assert!(
+                is_fabricated_engine_internal_claim(text),
+                "should filter: {}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn test_filter_keeps_legitimate_facts() {
+        let legitimate = [
+            "Started the cognos migration to Rust.",
+            "Has a colleague named Anna who works as a designer.",
+            "Prefers integration tests over mocks for refactors.",
+            "Set a daily reading limit of 30 minutes.",
+            "Uses pgvector for vector search.",
+            // Substring collisions that would fire if we matched substrings:
+            // "unlimited" / "limited", "capacity" / "escape", "discount" / "account",
+            // "budgeted", "encountered". None contain "tool call" or "per turn".
+            "Has unlimited cloud storage and a 5 GB capacity ceiling.",
+            "Discount applied to the user's account.",
+            "Budgeted 30 minutes for the call with Anna.",
+            "Encountered an error when reaching the API.",
+        ];
+        for text in legitimate {
+            assert!(
+                !is_fabricated_engine_internal_claim(text),
+                "should keep: {}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn test_filter_is_case_insensitive() {
+        assert!(is_fabricated_engine_internal_claim("TOOL-CALL CAP hit"));
+        assert!(is_fabricated_engine_internal_claim("Per-Turn Limit reached"));
+        assert!(is_fabricated_engine_internal_claim("see Agentic_Loop.RS"));
     }
 
     #[test]

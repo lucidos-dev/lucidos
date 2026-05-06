@@ -1,6 +1,6 @@
 ---
 name: Lucidos CLI (`lucidos`)
-description: Shell command available on PATH for any subprocess Lucidos spawns (Python, bash, Claude Code) — writes files under `data/`, emits and queries domain events. Prefer this over hand-rolling HTTP calls back to the engine.
+description: Shell command available on PATH for any subprocess Lucidos spawns (Python, bash, Claude Code) — writes files under `data/`, emits and queries domain events, and calls external APIs through the engine proxy so credentials never appear in script source, args, env vars, or logs. Prefer this over hand-rolling HTTP calls back to the engine and over `curl -H "Authorization: Bearer $CRED_..."`.
 ---
 
 # `lucidos` CLI
@@ -9,6 +9,7 @@ A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos 
 
 - write files into the workspace's `data/` directory
 - emit or query domain events on the workspace's event store
+- call an external API that's configured in `data/config/apis.json` (auth header injected by the engine — credential never appears in the script)
 
 The CLI is a thin Rust wrapper around the engine's HTTP API and filesystem conventions — for app UI usage see the JS [`lucidos.data.*`](./js-sdk.md) reference. Scripts should always prefer the CLI over hand-rolling HTTP calls back to the engine.
 
@@ -71,9 +72,9 @@ $ lucidos events emit AnalysisCompleted \
 
 The CLI prints the server's JSON response on stdout (`{"success": true, "event_id": "..."}`).
 
-### `lucidos events query [--type T] [--since iso] [--until iso] [--limit N]`
+### `lucidos events query [--type T] [--since iso] [--until iso] [--before-event-id UUID | --after-event-id UUID] [--limit N]`
 
-GET events from the parent workspace's event store. Outputs the raw JSON array on stdout.
+GET events from the parent workspace's event store. Outputs the raw JSON array on stdout, newest-first.
 
 ```bash
 $ lucidos events query --type AnalysisCompleted --limit 1 | jq '.[0]'
@@ -87,25 +88,102 @@ $ lucidos events query --type AnalysisCompleted --limit 1 | jq '.[0]'
 
 `--since` / `--until` are ISO 8601 (e.g. `2026-04-01T00:00:00Z`). `--limit` is clamped to `1..=1000` server-side, default 100.
 
+#### Stable paging with `--before-event-id` / `--after-event-id`
+
+Walking `--until` backwards through time is fragile at the page boundary: events sharing one timestamp get duplicated or dropped depending on inclusivity. The cursor flags solve that by ordering results lexicographically on `(created, id)` — guaranteed stable even when many events share a millisecond.
+
+- `--before-event-id <UUID>` — return only events strictly older than that event. For backwards-walk paging.
+- `--after-event-id <UUID>` — return only events strictly newer than that event. For tail-following.
+
+The two are mutually exclusive (`400 Bad Request` if both are passed); a non-existent cursor is `404 Not Found` rather than a silently empty result.
+
+```bash
+# Page 1 — newest 100.
+PAGE=$(lucidos events query --type BrowserLearningObserved --limit 100)
+OLDEST_ID=$(echo "$PAGE" | jq -r '.[-1].id')
+
+# Page 2+ — strictly older than the last event of the previous page.
+lucidos events query --type BrowserLearningObserved --limit 100 \
+  --before-event-id "$OLDEST_ID"
+```
+
+For tail-following, save the newest id and ask for anything strictly newer:
+
+```bash
+NEWEST_ID=$(lucidos events query --type SomeEvent --limit 1 | jq -r '.[0].id')
+# ... time passes ...
+lucidos events query --type SomeEvent --after-event-id "$NEWEST_ID"
+```
+
+### `lucidos proxy <name> [path] [-X METHOD] [-H "Hdr: val"] [-d body | --data-stdin] [-i] [--fail]`
+
+Call a backend configured in `data/config/apis.json` through the engine. The engine resolves the credential from the workspace's credential store, injects the configured auth header, and strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request. **The credential value never reaches the script** — neither in `argv`, env vars, the request line, nor any log.
+
+**This is the preferred way for scripts to call external APIs.** The previous pattern — `curl -H "Authorization: Bearer $CRED_FOO" ...` with `$CRED_FOO` injected into the script's environment — leaks the secret into process args and shell history. Configure the API in `data/config/apis.json` once, then use `lucidos proxy` everywhere.
+
+#### Configure the backend (one-time)
+
+`data/config/apis.json`:
+
+```json
+{
+  "sonos":   { "base_url": "http://localhost:5005" },
+  "comfort": {
+    "base_url": "https://accsmart.panasonic.com",
+    "auth": { "type": "bearer", "credential": "comfort-cloud" }
+  },
+  "weather": {
+    "base_url": "https://api.weather.example",
+    "auth": { "type": "api_key", "credential": "weather-api", "header": "X-API-Key" }
+  }
+}
+```
+
+`auth.type` is one of `bearer`, `api_key`, `basic`. `auth.credential` is the `service_name` already in the engine credential store (the same store `request_credential` writes to). Entries without `auth` forward unauthenticated — useful for local services like Sonos.
+
+#### Usage (curl-style ergonomics)
+
+```bash
+# GET; body to stdout, exit 0 even on 4xx/5xx (curl convention)
+lucidos proxy sonos /Spisestua/play
+
+# POST with inline body
+lucidos proxy comfort /api/v1/devices -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"deviceGuid":"abc"}'
+
+# POST with body from stdin
+cat payload.json | lucidos proxy comfort /api/v1/devices -X POST --data-stdin
+
+# Status line + headers + body (curl -i)
+lucidos proxy sonos /zones -i
+
+# Exit non-zero on HTTP errors and suppress body (curl --fail) — use in scripts
+# that need to react to upstream failures
+lucidos proxy sonos /zones --fail
+```
+
+Output is the response body on **stdout**. With `--include`, the status line and headers are prepended to stdout (curl convention — single stream). With `--fail`, the body is suppressed and a one-line `lucidos proxy: HTTP <code>` summary is written to stderr instead. Transport errors (DNS failure, connection refused, …) print to stderr (`lucidos: ...`) and exit non-zero. Exit codes mirror curl: `0` on success (including 4xx/5xx by default), `22` when `--fail` and the response is 4xx/5xx, `1` on transport failure.
+
+#### When to use which
+
+| Want to … | Use |
+|---|---|
+| Call a backend the workspace will reuse | `lucidos proxy` (configure once in `apis.json`, then no auth in script) |
+| One-off `curl` to a service the workspace will never reuse | Plain `curl` (no proxy entry needed) |
+| Emit/query domain events | `lucidos events …` |
+| Write a file under `data/` | `lucidos data write …` |
+
+If you find a script doing `curl -H "Authorization: Bearer $CRED_..."` against an API the workspace already owns a credential for, that's drift — add an `apis.json` entry and switch the script to `lucidos proxy`.
+
 ## Workspace resolution
 
 The CLI figures out **which workspace** to talk to in this order:
 
-1. **Walk up from `$PWD`** looking for the first ancestor directory that contains a `.lucidos/ports` file. That ancestor is the workspace.
-2. **Fall back to `$LUCIDOS_WORKSPACE`** environment variable. The engine sets this on every spawned subprocess (Python, bash, CC), so the fallback always works in the engine-spawned case.
+1. **`$LUCIDOS_WORKSPACE`** environment variable. The engine sets this on every spawned subprocess (Python, bash, CC), so this is the authoritative path for the engine-spawned case.
+2. **Walk up from `$PWD`** looking for the first ancestor directory that contains a `.lucidos/ports` file. Fallback for terminal users running the CLI by hand without the env var set.
 
-The walk-up step naturally finds the right workspace from inside a worktree:
-
-```
-<workspace>/.lucidos/worktrees/<id>/foo/bar     <- $PWD
-<workspace>/.lucidos/worktrees/<id>/foo
-<workspace>/.lucidos/worktrees/<id>
-<workspace>/.lucidos/worktrees
-<workspace>/.lucidos                           <- no .lucidos/ports here
-<workspace>                                    <- .lucidos/ports found, stop
-```
-
-You should never need to think about this — both fallbacks are configured automatically when the engine spawns the subprocess.
+You should never need to think about this — the env var is configured automatically when the engine spawns the subprocess.
 
 ## Common patterns
 
@@ -126,6 +204,33 @@ lucidos events emit AnalysisCompleted \
 ```
 
 Both calls speak the same `data/`-rooted path convention, so an SSE listener that does `lucidos.data.url(payload.artifact)` in the frontend will resolve the link correctly.
+
+### Call an external API and persist the response
+
+The canonical "pull from a service, store under `artifacts/imported/`, signal completion" loop. Auth is handled by the engine — the script never sees the credential.
+
+```bash
+DATE=$(date +%Y-%m-%d)
+ARTIFACT="artifacts/imported/comfort/$DATE/state.json"
+
+# Configured in data/config/apis.json under "comfort" with bearer auth.
+# Engine injects Authorization: Bearer <stored credential> automatically.
+lucidos proxy comfort /api/v1/devices --fail \
+  | lucidos data write "$ARTIFACT"
+
+lucidos events emit ComfortStateImported \
+  --summary "Imported Comfort Cloud device state for $DATE" \
+  --payload "{\"date\": \"$DATE\", \"artifact\": \"$ARTIFACT\"}"
+```
+
+Compare to the pre-proxy form, which leaks the credential into argv and shell history:
+
+```bash
+# Don't do this — $CRED_COMFORT shows up in `ps`, in shell history, and
+# in any log that captures the script's invocation.
+curl -sf -H "Authorization: Bearer $CRED_COMFORT" \
+  https://accsmart.panasonic.com/api/v1/devices > /tmp/x.json
+```
 
 ### Idempotent skip-if-already-done
 

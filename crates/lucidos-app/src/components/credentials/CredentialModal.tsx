@@ -15,7 +15,7 @@ export function CredentialModal() {
   // When editing, wait for credentials to load before rendering the form —
   // otherwise useState hooks initialise with empty values that never update.
   if (editing && credentials.value.status !== 'loaded') {
-    return <div class="inline-form"><div class="empty">Loading...</div></div>;
+    return <div class="inline-form"><div class="loading-spinner" /></div>;
   }
 
   const creds = loadedOr(credentials.value, []);

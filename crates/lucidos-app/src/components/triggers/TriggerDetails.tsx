@@ -4,18 +4,27 @@ import {
   closeTriggerForm,
   submitTrigger,
 } from '../../store/actions/triggers';
-import { deriveTriggerType } from '../../store/types';
-import type { TriggerInfo, TriggerRun } from '../../store/types';
+import { deriveTriggerType, toFailed } from '../../store/types';
+import type { TriggerInfo, TriggerRun, Loadable } from '../../store/types';
 import { describeCron, validateCron } from '../../utils/describeCron';
 import { Dropdown } from '../shared/Dropdown';
 import { fetchEventTypes } from '../../api/client';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { resizeTextarea, useFontMetricsResize } from '../chat/promptResize';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 
 type TriggerFormType = 'schedule' | 'event' | 'both';
 type RunType = 'intent' | 'script';
 
-let cachedEventTypes: string[] | null = null;
+function knowhowPreviewPath(id: string): string {
+  if (id.startsWith('system-knowhow/')) return `${id}.md`;
+  return `knowhow/${id}.md`;
+}
+
+// Module-level cache: shared across all TriggerFormInner mounts (open/reopen
+// the form without refetching). Loadable so consumers see all 4 states.
+let cachedEventTypes: Loadable<string[]> = { status: 'not-loaded' };
+let inflightFetch: Promise<string[]> | null = null;
 
 export function TriggerDetails() {
   const form = activeInlineForm.value;
@@ -25,7 +34,7 @@ export function TriggerDetails() {
 
   if (editingId) {
     if (triggers.value.status !== 'loaded') {
-      return <div class="inline-form"><div class="empty">Loading...</div></div>;
+      return <div class="inline-form"><div class="loading-spinner" /></div>;
     }
     const task = triggers.value.data.find((t) => t.id === editingId);
     if (!task) {
@@ -49,7 +58,7 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
   const existingRun = existingTask?.run;
   const [runType, setRunType] = useState<RunType>(existingRun?.type === 'script' ? 'script' : 'intent');
   const [intentText, setIntentText] = useState(
-    existingRun?.type === 'intent' ? existingRun.text : ''
+    existingRun?.type === 'intent' ? existingRun.intent : ''
   );
   const [knowhowIds, setKnowhowIds] = useState<string[]>(
     existingRun?.type === 'intent' ? [...existingRun.knowhow] : []
@@ -65,18 +74,35 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
   const [cronInput, setCronInput] = useState('');
   const [cronError, setCronError] = useState<string | null>(null);
   const [eventType, setEventType] = useState(existingTask?.on || '');
-  const [knownEventTypes, setKnownEventTypes] = useState<string[]>(cachedEventTypes ?? []);
+  const [eventTypesLoadable, setEventTypesLoadable] = useState<Loadable<string[]>>(cachedEventTypes);
+  const showEventTypesLoading = useDelayedLoading(eventTypesLoadable);
 
   useEffect(() => {
-    if (cachedEventTypes) return;
-    fetchEventTypes()
-      .then(types => { cachedEventTypes = types; setKnownEventTypes(types); })
-      .catch(() => showToast('Failed to load event types', 'error'));
+    if (cachedEventTypes.status === 'loaded') return;
+    setEventTypesLoadable({ status: 'loading' });
+    cachedEventTypes = { status: 'loading' };
+    if (!inflightFetch) {
+      inflightFetch = fetchEventTypes();
+    }
+    inflightFetch
+      .then(types => {
+        cachedEventTypes = { status: 'loaded', data: types };
+        setEventTypesLoadable(cachedEventTypes);
+      })
+      .catch((e: unknown) => {
+        cachedEventTypes = toFailed(e);
+        setEventTypesLoadable(cachedEventTypes);
+      })
+      .finally(() => { inflightFetch = null; });
   }, []);
+
+  const knownEventTypes = eventTypesLoadable.status === 'loaded' ? eventTypesLoadable.data : [];
 
   const [conditionJson, setConditionJson] = useState(
     existingTask?.condition ? JSON.stringify(existingTask.condition, null, 2) : ''
   );
+
+  const [goToReview, setGoToReview] = useState(existingTask?.go_to_review ?? false);
 
   const intentRef = useRef<HTMLTextAreaElement>(null);
   const resizeIntent = () => { if (intentRef.current) resizeTextarea(intentRef.current); };
@@ -146,7 +172,7 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
       const knowhow = pending && !knowhowIds.includes(pending)
         ? [...knowhowIds, pending]
         : knowhowIds;
-      return { type: 'intent', text: intentText.trim(), knowhow };
+      return { type: 'intent', intent: intentText.trim(), knowhow };
     }
     if (!scriptPath.trim()) {
       showToast('Script path is required', 'error');
@@ -190,7 +216,7 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
 
     await submitTrigger({
       name, run, cronExpressions: finalCrons, taskId: editingId,
-      onEvent, condition, showEvent,
+      onEvent, condition, showEvent, goToReview,
     });
   }
 
@@ -302,6 +328,12 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
                   placeholder="e.g. OuraSleepImported"
                   freeText
                 />
+                {eventTypesLoadable.status === 'failed' && (
+                  <div class="form-error">Failed to load event types: {eventTypesLoadable.error}</div>
+                )}
+                {eventTypesLoadable.status === 'loading' && showEventTypesLoading && (
+                  <div class="form-hint">Loading event types...</div>
+                )}
               </div>
 
               <div class="form-group">
@@ -364,7 +396,7 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
                         <button
                           type="button"
                           class="knowhow-id accent-link"
-                          onClick={() => openFilePreview(`knowhow/${id}.md`)}
+                          onClick={() => openFilePreview(knowhowPreviewPath(id))}
                           aria-label={`Open knowhow ${id}`}
                         >
                           {id}
@@ -400,7 +432,7 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
                 </div>
 
                 <div class="form-hint">
-                  ID of a markdown file under <code>data/knowhow/</code> (without <code>.md</code>). Use slashes for subdirectories.
+                  ID of a markdown file under <code>data/knowhow/</code> (without <code>.md</code>). Use slashes for subdirectories. Prefix with <code>system-knowhow/</code> to reference engine-shipped reference docs (e.g. <code>system-knowhow/best-practices</code>).
                 </div>
               </div>
             </>
@@ -415,6 +447,20 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
               />
             </div>
           )}
+
+          <div class="form-group">
+            <label class="form-checkbox-row">
+              <input
+                type="checkbox"
+                checked={goToReview}
+                onChange={(e) => setGoToReview((e.target as HTMLInputElement).checked)}
+              />
+              <span>Send to Review on completion</span>
+            </label>
+            <div class="form-hint">
+              By default, runs land in History. Turn this on for triggers whose output you're meant to read — daily summaries, alerts, scheduled reports.
+            </div>
+          </div>
 
           <div class="form-actions">
             <button

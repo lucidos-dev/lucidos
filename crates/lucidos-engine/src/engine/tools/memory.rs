@@ -7,7 +7,6 @@ impl LucidosEngine {
     pub(crate) async fn execute_memory_tool(
         &self,
         args: &serde_json::Value,
-        _extraction_ctx: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let search_query = args["search_query"].as_str().unwrap_or("");
         let wrong_fact = args
@@ -236,6 +235,7 @@ If NONE should be deleted, reply with "none"."#,
                     &embedding,
                     self.embedder.model_id(),
                     chrono::Utc::now(),
+                    crate::memory::EXTRACTOR_VERSION,
                 )
                 .await
                 .map_err(|e| format!("Insert correction failed: {}", e))?;

@@ -2,18 +2,19 @@ import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { currentApp, appCommit } from '../../store/store';
 import { getAppVersions, type AppVersion } from '../../api/client';
 import { formatTimeAgo } from '../../utils/formatTime';
-import { errorDetail } from '../../utils/errorDetail';
+import type { Loadable } from '../../store/types';
+import { toFailed } from '../../store/types';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 
 const PAGE_SIZE = 10;
 
 export function TimeTravelDropdown() {
   const app = currentApp.value;
   const [open, setOpen] = useState(false);
-  const [versions, setVersions] = useState<AppVersion[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [versionsLoadable, setVersionsLoadable] = useState<Loadable<AppVersion[]>>({ status: 'not-loaded' });
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const showLoading = useDelayedLoading(versionsLoadable);
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const lastAppId = useRef<string | null>(null);
@@ -39,14 +40,13 @@ export function TimeTravelDropdown() {
 
   if (!app) return null;
   const appId = app.id;
+  const versions = versionsLoadable.status === 'loaded' ? versionsLoadable.data : [];
 
   // Reset cached versions when app changes
   if (lastAppId.current !== appId) {
     lastAppId.current = appId;
-    if (versions.length > 0) setVersions([]);
-    if (error) setError(null);
+    if (versionsLoadable.status !== 'not-loaded') setVersionsLoadable({ status: 'not-loaded' });
     setHasMore(false);
-    setLoading(false);
     setLoadingMore(false);
   }
 
@@ -54,21 +54,22 @@ export function TimeTravelDropdown() {
     if (append) {
       setLoadingMore(true);
     } else {
-      setLoading(true);
+      setVersionsLoadable({ status: 'loading' });
     }
-    setError(null);
     try {
       const page = await getAppVersions(appId, PAGE_SIZE, skip);
       if (append) {
-        setVersions(prev => [...prev, ...page.versions]);
+        setVersionsLoadable(prev => ({
+          status: 'loaded',
+          data: prev.status === 'loaded' ? [...prev.data, ...page.versions] : page.versions,
+        }));
       } else {
-        setVersions(page.versions);
+        setVersionsLoadable({ status: 'loaded', data: page.versions });
       }
       setHasMore(page.has_more);
     } catch (err) {
-      setError(errorDetail(err));
+      setVersionsLoadable(toFailed(err));
     } finally {
-      setLoading(false);
       setLoadingMore(false);
     }
   }
@@ -119,8 +120,12 @@ export function TimeTravelDropdown() {
           >
             <span class="time-travel-label">Latest</span>
           </div>
-          {loading && <div class="time-travel-item time-travel-loading">Loading...</div>}
-          {error && <div class="time-travel-item time-travel-error">{error}</div>}
+          {versionsLoadable.status === 'loading' && showLoading && (
+            <div class="time-travel-item time-travel-loading">Loading...</div>
+          )}
+          {versionsLoadable.status === 'failed' && (
+            <div class="time-travel-item time-travel-error">{versionsLoadable.error}</div>
+          )}
           {versions.map((v) => (
             <div
               key={v.commit}
@@ -133,7 +138,7 @@ export function TimeTravelDropdown() {
             </div>
           ))}
           {loadingMore && <div class="time-travel-item time-travel-loading">Loading more...</div>}
-          {!loading && !error && versions.length === 0 && (
+          {versionsLoadable.status === 'loaded' && versions.length === 0 && (
             <div class="time-travel-item time-travel-empty">No history</div>
           )}
         </div>

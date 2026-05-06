@@ -24,6 +24,25 @@ export function CloseIcon() {
   );
 }
 
+export function CopyIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/>
+      <path d="M3 10.5V3a1.5 1.5 0 0 1 1.5-1.5H10"/>
+    </svg>
+  );
+}
+
+export function DownloadIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M8 2v8"/>
+      <path d="M4.5 6.5L8 10l3.5-3.5"/>
+      <path d="M2.5 12.5h11"/>
+    </svg>
+  );
+}
+
 export function ClearIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -109,14 +128,6 @@ export function ChevronDownIcon({ size = '1.25rem' }: { size?: string }) {
   );
 }
 
-export function StopIcon({ size = '0.5625rem' }: { size?: string }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" style={{ display: 'block' }}>
-      <rect x="4" y="4" width="16" height="16" rx="3"/>
-    </svg>
-  );
-}
-
 export function FileIcon({ size = '1rem' }: { size?: string }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -152,6 +163,18 @@ export function ComposeIcon() {
     <svg viewBox="-1 -1 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
       <path d="M8 2H3a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V9.5" />
       <path d="M12.5 1.5l-6 6V10h2.5l6-6-2.5-2.5z" />
+    </svg>
+  );
+}
+
+export function DraftsIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+      <polyline points="14 2 14 8 20 8" />
+      <line x1="16" y1="13" x2="8" y2="13" />
+      <line x1="16" y1="17" x2="8" y2="17" />
+      <polyline points="10 9 9 9 8 9" />
     </svg>
   );
 }

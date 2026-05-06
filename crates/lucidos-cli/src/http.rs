@@ -36,7 +36,9 @@ mod tests {
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
             let mut buf = [0u8; 8192];
-            stream.read(&mut buf).expect("read request");
+            // Best-effort: drain whatever the client sent (typically a single
+            // GET line + headers). We don't care about the contents.
+            let _ = stream.read(&mut buf);
             thread::sleep(delay);
             let body = b"{}";
             let response = format!(

@@ -1,6 +1,6 @@
 import { useRef, useCallback } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
-import { changes, appliedChanges, changesHasMore, changesLoadingMore, busyChangeIds, threadMap, showConfirm } from '../../store/store';
+import { changes, appliedChanges, changesHasMore, changesLoadingMore, busyChangeIds, showConfirm } from '../../store/store';
 import { applySingleChange, discardSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges } from '../../store/actions/chat-changes';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { formatTimeAgo } from '../../utils/formatTime';
@@ -50,10 +50,7 @@ export function ChangesView() {
         <div class="empty-state">No changes</div>
       ) : (
         <>
-          {pending.length > 1 && pending.some(c => {
-            const t = c.thread_id ? threadMap.value.get(c.thread_id) : null;
-            return !(t?.meta.ccIsExternalRepo ?? false);
-          }) && (
+          {pending.length > 1 && (
             <div class="changes-bulk-actions">
               <button class="action-btn action-btn-danger" onClick={() => discardAllChanges()}>Discard All</button>
               <button class="action-btn action-btn-confirm" onClick={() => applyAllChanges()}>Apply All</button>
@@ -61,8 +58,6 @@ export function ChangesView() {
           )}
           {pending.map(change => {
             const busy = busyIds.value.has(change.id) || busyChangeIds.value.has(change.id);
-            const thread = change.thread_id ? threadMap.value.get(change.thread_id) : null;
-            const isExternal = thread?.meta.ccIsExternalRepo ?? false;
             return (
               <div class="list-row" key={change.id}>
                 <div class="list-row-info">
@@ -70,24 +65,16 @@ export function ChangesView() {
                   <ChangeDescription description={change.description} />
                   <span class="list-row-details">
                     {change.file_count} file{change.file_count !== 1 ? 's' : ''}
-                    {!isExternal && change.requires_restart && ' · Requires engine restart'}
-                    {!isExternal && !change.hardened && ' · Not hardened'}
+                    {change.requires_restart && ' · Requires engine restart'}
+                    {!change.hardened && ' · Not hardened'}
                   </span>
                 </div>
                 <div class="list-row-actions">
                   <button class="action-btn" onClick={(e) => { e.stopPropagation(); viewChangeDiff(change); }}>Diff</button>
-                  {isExternal ? (
-                    <button class="action-btn" disabled={busy} onClick={() => guardedAction(change.id, applySingleChange)}>
-                      {busy ? 'Done...' : 'Done'}
-                    </button>
-                  ) : (
-                    <>
-                      <button class="action-btn action-btn-danger" disabled={busy} onClick={() => guardedAction(change.id, discardSingleChange)}>Discard</button>
-                      <button class="action-btn action-btn-confirm" disabled={busy} data-tooltip={change.requires_restart ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart' : undefined} onClick={() => guardedAction(change.id, applySingleChange)}>
-                        {busy ? 'Applying...' : 'Apply'}
-                      </button>
-                    </>
-                  )}
+                  <button class="action-btn action-btn-danger" disabled={busy} onClick={() => guardedAction(change.id, discardSingleChange)}>Discard</button>
+                  <button class="action-btn action-btn-confirm" disabled={busy} data-tooltip={change.requires_restart ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart' : undefined} onClick={() => guardedAction(change.id, applySingleChange)}>
+                    {busy ? 'Applying...' : 'Apply'}
+                  </button>
                 </div>
               </div>
             );

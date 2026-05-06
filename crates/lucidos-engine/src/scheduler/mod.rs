@@ -10,14 +10,12 @@
 //! - Panic-safe task execution
 //! - Fresh task data fetch on each execution
 
-pub mod config;
 pub mod notifications;
 pub mod push;
 #[cfg(test)]
 mod tasks;
 pub mod user_tasks;
 
-pub use config::SchedulerConfig;
 pub use notifications::{Notification, NotificationStore};
 pub use push::{PushSubscription, PushSubscriptionStore};
 
@@ -67,7 +65,6 @@ pub struct SchedulerManager {
     scheduler: JobScheduler,
     engine: SharedEngine,
     pool: PgPool,
-    config: SchedulerConfig,
     /// Track spawned task handles for lifecycle management
     /// Key: task_id, Value: JoinHandle and metadata
     tracked_tasks: Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
@@ -88,7 +85,6 @@ impl SchedulerManager {
     pub async fn new(
         engine: SharedEngine,
         pool: PgPool,
-        config: SchedulerConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let scheduler = JobScheduler::new().await?;
 
@@ -104,7 +100,6 @@ impl SchedulerManager {
             scheduler,
             engine,
             pool,
-            config,
             tracked_tasks: Arc::new(RwLock::new(HashMap::new())),
             backup_job_id: None,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
@@ -141,7 +136,7 @@ impl SchedulerManager {
 
         // Start the scheduler
         self.scheduler.start().await?;
-        log!("Started");
+        log!("[Scheduler] Started");
 
         Ok(())
     }
@@ -168,7 +163,7 @@ impl SchedulerManager {
         })?;
 
         self.scheduler.add(health_job).await?;
-        log!("Registered system task: task_health_monitor");
+        log!("[Scheduler] Registered system task: task_health_monitor");
 
         Ok(())
     }
@@ -244,7 +239,7 @@ impl SchedulerManager {
                 "name": name,
                 "schedule": schedule,
                 "timezone": timezone,
-                "run": serde_json::to_value(TriggerRun::Intent { text: format!("Run trigger {}", legacy_target), knowhow: vec![] }).unwrap(),
+                "run": serde_json::to_value(TriggerRun::Intent { intent: format!("Run trigger {}", legacy_target), knowhow: vec![] }).unwrap(),
             });
 
             if let Err(e) = self
@@ -309,7 +304,7 @@ impl SchedulerManager {
         .fetch_all(&self.pool)
         .await
         .unwrap_or_else(|e| {
-            log!("Failed to replay trigger events: {}", e);
+            log!("[Scheduler] Failed to replay trigger events: {}", e);
             vec![]
         });
 
@@ -334,7 +329,7 @@ impl SchedulerManager {
 
         if count > 0 {
             log!(
-                "Replayed {} trigger events → {} triggers ({} active)",
+                "[Scheduler] Replayed {} trigger events → {} triggers ({} active)",
                 count,
                 total,
                 active
@@ -355,7 +350,7 @@ impl SchedulerManager {
         let stale_configs: Vec<TriggerConfig> = {
             let configs = self.trigger_configs.read().unwrap();
             configs.values()
-                .filter(|c| matches!(&c.run, TriggerRun::Intent { text, .. } if text.starts_with("Run skill ") || text.starts_with("Run trigger ")))
+                .filter(|c| matches!(&c.run, TriggerRun::Intent { intent, .. } if intent.starts_with("Run skill ") || intent.starts_with("Run trigger ")))
                 .cloned()
                 .collect()
         };
@@ -373,7 +368,7 @@ impl SchedulerManager {
         for config in &stale_configs {
             let new_run = if let Some(intent) = intents_by_name.get(config.name.as_str()) {
                 Some(TriggerRun::Intent {
-                    text: intent.content.clone(),
+                    intent: intent.content.clone(),
                     knowhow: intent.knowhow.clone(),
                 })
             } else {
@@ -468,7 +463,6 @@ impl SchedulerManager {
         }
 
         let (handle, cancel_token) = spawn_task_runner(
-            task_id,
             config.id.clone(),
             config.name.clone(),
             config.schedule.clone(),
@@ -492,7 +486,7 @@ impl SchedulerManager {
         }
 
         log!(
-            "Registered trigger: {} ({} in {})",
+            "[Scheduler] Registered trigger: {} ({} in {})",
             config.name,
             config.schedule.join(", "),
             config.timezone
@@ -676,7 +670,7 @@ impl SchedulerManager {
                 "timezone": tz,
                 "on": on_event,
                 "run": serde_json::to_value(TriggerRun::Intent {
-                    text: intent_text.to_string(),
+                    intent: intent_text.to_string(),
                     knowhow: vec![],
                 }).unwrap(),
             });
@@ -820,7 +814,7 @@ impl SchedulerManager {
     /// 2. Waits up to 60s for in-flight task executions to complete
     /// 3. Aborts any remaining task handles
     pub async fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        log!("Shutting down...");
+        log!("[Scheduler] Shutting down...");
 
         // Signal all task runners to stop — they'll exit after their current execution finishes
         self.shutdown_flag.store(true, Ordering::SeqCst);
@@ -837,7 +831,7 @@ impl SchedulerManager {
                     .map(|t| t.task_name.as_str())
                     .collect();
                 log!(
-                    "{} task(s) still executing ({}), waiting for completion...",
+                    "[Scheduler] {} task(s) still executing ({}), waiting for completion...",
                     active,
                     running.join(", ")
                 );
@@ -845,12 +839,12 @@ impl SchedulerManager {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
                 if ACTIVE_TASK_COUNT.load(Ordering::Relaxed) == 0 {
-                    log!("All in-flight tasks completed");
+                    log!("[Scheduler] All in-flight tasks completed");
                     break;
                 }
                 if tokio::time::Instant::now() >= deadline {
                     let remaining = ACTIVE_TASK_COUNT.load(Ordering::Relaxed);
-                    log!("Timeout waiting for {} task(s), aborting", remaining);
+                    log!("[Scheduler] Timeout waiting for {} task(s), aborting", remaining);
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -866,24 +860,10 @@ impl SchedulerManager {
         }
 
         self.scheduler.shutdown().await?;
-        log!("Shutdown complete");
+        log!("[Scheduler] Shutdown complete");
         Ok(())
     }
 
-    /// Get reference to the database pool
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
-    /// Get reference to the config
-    pub fn config(&self) -> &SchedulerConfig {
-        &self.config
-    }
-
-    /// Get a clone of the trigger_configs Arc for sharing with other components.
-    pub fn trigger_configs_arc(&self) -> Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>> {
-        self.trigger_configs.clone()
-    }
 }
 
 /// Spawn a task runner that executes on schedule.
@@ -894,7 +874,6 @@ impl SchedulerManager {
 /// events before exiting.
 #[allow(clippy::too_many_arguments)]
 fn spawn_task_runner(
-    task_id: uuid::Uuid,
     trigger_id: String,
     task_name: String,
     cron_expressions: Vec<String>,
@@ -909,7 +888,6 @@ fn spawn_task_runner(
     let handle = tokio::spawn(async move {
         // Wrap the entire task in a panic catcher
         let result = run_task_loop(
-            task_id,
             trigger_id,
             task_name.clone(),
             cron_expressions,
@@ -924,10 +902,10 @@ fn spawn_task_runner(
 
         match result {
             Ok(reason) => {
-                log!("Task '{}' exited: {}", task_name, reason);
+                log!("[Scheduler] Task '{}' exited: {}", task_name, reason);
             }
             Err(e) => {
-                log!("Task '{}' crashed: {}", task_name, e);
+                log!("[Scheduler] Task '{}' crashed: {}", task_name, e);
             }
         }
     });
@@ -937,7 +915,6 @@ fn spawn_task_runner(
 /// The main task loop - runs until task is deleted/disabled, shutdown is requested, or an error occurs
 #[allow(clippy::too_many_arguments)]
 async fn run_task_loop(
-    _task_id: uuid::Uuid,
     trigger_id: String,
     task_name: String,
     cron_expressions: Vec<String>,
@@ -969,7 +946,7 @@ async fn run_task_loop(
     // Parse timezone
     let tz: chrono_tz::Tz = timezone.parse().unwrap_or_else(|_| {
         log!(
-            "Invalid timezone '{}' for task {}, using UTC",
+            "[Scheduler] Invalid timezone '{}' for task {}, using UTC",
             timezone,
             task_name
         );
@@ -1012,7 +989,7 @@ async fn run_task_loop(
             let wait_secs = (next_utc - now_utc).num_seconds();
             if wait_secs > 3600 {
                 log!(
-                    "Task '{}' waiting until {} ({:.1} hours)",
+                    "[Scheduler] Task '{}' waiting until {} ({:.1} hours)",
                     task_name,
                     next.format("%Y-%m-%d %H:%M:%S %Z"),
                     wait_secs as f64 / 3600.0
@@ -1058,7 +1035,7 @@ async fn run_task_loop(
         let actual_now = chrono::Utc::now();
         let delay = actual_now - next_utc;
         if delay > chrono::Duration::minutes(MISSED_TASK_GRACE_MINUTES) {
-            log!("Task '{}' woke up {} minutes late (scheduled {}, actual {}), skipping this occurrence",
+            log!("[Scheduler] Task '{}' woke up {} minutes late (scheduled {}, actual {}), skipping this occurrence",
                 task_name,
                 delay.num_minutes(),
                 next.format("%H:%M:%S"),
@@ -1071,7 +1048,7 @@ async fn run_task_loop(
         // Log execution timing
         if delay.num_seconds() > 5 {
             log!(
-                "Task '{}' executing {}s after scheduled time",
+                "[Scheduler] Task '{}' executing {}s after scheduled time",
                 task_name,
                 delay.num_seconds()
             );
@@ -1081,7 +1058,7 @@ async fn run_task_loop(
         let active = ACTIVE_TASK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if active > 1 {
             log!(
-                "Concurrent execution: {} tasks now active (starting '{}')",
+                "[Scheduler] Concurrent execution: {} tasks now active (starting '{}')",
                 active,
                 task_name
             );
@@ -1103,7 +1080,7 @@ async fn run_task_loop(
         engine.record_trigger_executed(&trigger_id).await;
 
         if let Err(e) = result {
-            log!("Task '{}' execution failed: {}", task_name, e);
+            log!("[Scheduler] Task '{}' execution failed: {}", task_name, e);
             // Continue to next occurrence rather than crashing
         }
     }
@@ -1165,7 +1142,7 @@ async fn check_and_execute_missed(
         }
 
         log!(
-            "Task '{}' missed at {} ({}s ago), executing now",
+            "[Scheduler] Task '{}' missed at {} ({}s ago), executing now",
             task_name,
             missed.format("%H:%M:%S"),
             delay.num_seconds()
@@ -1181,7 +1158,7 @@ async fn check_and_execute_missed(
         )
         .await
         {
-            log!("Task '{}' grace period execution failed: {}", task_name, e);
+            log!("[Scheduler] Task '{}' grace period execution failed: {}", task_name, e);
         }
         engine.record_trigger_executed(trigger_id).await;
     }
@@ -1327,7 +1304,6 @@ async fn register_and_track(
 ) {
     let task_uuid = trigger_id_to_uuid(&config.id);
     let (handle, cancel_token) = spawn_task_runner(
-        task_uuid,
         config.id.clone(),
         config.name.clone(),
         config.schedule.clone(),
@@ -1496,7 +1472,7 @@ async fn check_task_health_and_restart(
                 if let Some(config) = matching_config {
                     if !config.paused && !config.schedule.is_empty() {
                         log!(
-                            "Task '{}' crashed or exited unexpectedly, will restart",
+                            "[Scheduler] Task '{}' crashed or exited unexpectedly, will restart",
                             task_info.task_name
                         );
                         to_restart.push((
@@ -1522,7 +1498,6 @@ async fn check_task_health_and_restart(
 
         // Spawn new task runner
         let (handle, cancel_token) = spawn_task_runner(
-            task_id,
             trigger_id,
             task_name.clone(),
             schedule,
@@ -1546,14 +1521,100 @@ async fn check_task_health_and_restart(
             );
         }
 
-        log!("Restarted task '{}'", task_name);
+        log!("[Scheduler] Restarted task '{}'", task_name);
+    }
+}
+
+/// RAII guard for `engine.backup_in_progress`. Acquired atomically so two
+/// concurrent backup attempts can't both pass the check; cleared on drop so
+/// a panic mid-backup doesn't permanently strand the flag.
+pub(crate) struct BackupGuard(SharedEngine);
+
+impl BackupGuard {
+    /// Returns `Some` when the caller has exclusive ownership of the backup
+    /// slot, `None` if another backup is already running.
+    pub(crate) fn try_acquire(engine: &SharedEngine) -> Option<Self> {
+        engine
+            .backup_in_progress
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .ok()
+            .map(|_| Self(engine.clone()))
+    }
+}
+
+impl Drop for BackupGuard {
+    fn drop(&mut self) {
+        self.0
+            .backup_in_progress
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Run the backup pipeline and emit terminal SSE events. Caller must hold a
+/// `BackupGuard`. Used by both the manual API handler and the scheduled cron.
+pub(crate) async fn run_backup(
+    engine: &SharedEngine,
+    pool: &sqlx::PgPool,
+    workspace: &std::path::Path,
+    database_url: &str,
+    key: &[u8],
+    provider: &dyn crate::core::backup::BackupProvider,
+) {
+    use crate::core::backup;
+    use crate::engine::event_bus::{BusEvent, SystemEvent};
+
+    let progress = crate::api::backup::progress_sender(engine.event_bus.sender());
+
+    match backup::create_backup(workspace, database_url, key, provider, progress).await {
+        Ok(entry) => {
+            log!(
+                "[Backup] Completed: {} ({:.1} MB)",
+                entry.filename,
+                entry.size_bytes as f64 / 1024.0 / 1024.0
+            );
+            engine
+                .event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::BackupCompleted {
+                        filename: entry.filename.clone(),
+                        size_bytes: entry.size_bytes,
+                    }),
+                    "[Backup] BackupCompleted",
+                )
+                .await;
+            let keep = backup::get_retention_count(pool).await;
+            if let Err(e) = backup::prune_old_backups(provider, keep).await {
+                log!("[Backup] Pruning failed (non-fatal): {}", e);
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            log!("[Backup] Failed: {}", msg);
+            engine
+                .event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::BackupFailed { error: msg.clone() }),
+                    "[Backup] BackupFailed",
+                )
+                .await;
+            notify_backup_failure(engine, &msg).await;
+        }
     }
 }
 
 /// Execute a scheduled backup. Called by the cron job.
 async fn run_scheduled_backup(engine: SharedEngine, provider_id: String) {
     use crate::core::backup::{self, crypto};
-    use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
+
+    let Some(_guard) = BackupGuard::try_acquire(&engine) else {
+        log!("[Backup] Skipping scheduled backup — another backup is already running");
+        return;
+    };
 
     log!(
         "[Backup] Starting scheduled backup (provider: {})",
@@ -1572,7 +1633,6 @@ async fn run_scheduled_backup(engine: SharedEngine, provider_id: String) {
         }
     };
 
-    // Load the encryption key
     let key_path = backup::key_file_path(&workspace);
     let key = match crypto::load_key_file(&key_path) {
         Ok(Some(k)) => k,
@@ -1593,47 +1653,22 @@ async fn run_scheduled_backup(engine: SharedEngine, provider_id: String) {
     };
 
     let database_url = crate::core::database_url();
-
-    let bus_sender = engine.event_bus.sender();
-    let progress = move |phase: &str, current: usize, total: usize| {
-        let _ = bus_sender.send(EmittedEvent {
-            event_id: uuid::Uuid::new_v4(),
-            seq: None,
-            created: chrono::Utc::now(),
-            typed: BusEvent::System(SystemEvent::BackupProgress {
-                phase: phase.to_string(),
-                progress: current,
-                total,
-            }),
-        });
-    };
-
-    match backup::create_backup(&workspace, &database_url, &key, provider.as_ref(), progress).await
-    {
-        Ok(entry) => {
-            log!(
-                "[Backup] Scheduled backup completed: {} ({:.1} MB)",
-                entry.filename,
-                entry.size_bytes as f64 / 1024.0 / 1024.0
-            );
-            // Prune old backups beyond retention limit
-            let keep = backup::get_retention_count(pool).await;
-            if let Err(e) = backup::prune_old_backups(provider.as_ref(), keep).await {
-                log!("[Backup] Pruning failed (non-fatal): {}", e);
-            }
-        }
-        Err(e) => {
-            log!("[Backup] Scheduled backup failed: {}", e);
-            notify_backup_failure(&engine, &e.to_string()).await;
-        }
-    }
+    run_backup(
+        &engine,
+        pool,
+        &workspace,
+        &database_url,
+        &key,
+        provider.as_ref(),
+    )
+    .await;
 }
 
 const BACKUP_FAILURE_TITLE: &str = "Backup failed";
 const BACKUP_FAILURE_DEDUP_MINUTES: i64 = 30;
 
 /// Deduplicates backup failure notifications (max 1 per 30 minutes).
-async fn notify_backup_failure(engine: &SharedEngine, error: &str) {
+pub(crate) async fn notify_backup_failure(engine: &SharedEngine, error: &str) {
     use crate::engine::event_bus::{BusEvent, SystemEvent};
 
     let pool = engine.pool();

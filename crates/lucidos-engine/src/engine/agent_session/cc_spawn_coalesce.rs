@@ -19,21 +19,30 @@
 //!
 //! 1. Caller arrives at the CC spawn entry with a `QueuedMessage`.
 //! 2. Caller calls [`CcSpawnCoalescer::try_become_leader`].
-//!    - If the entry is empty or the previous leader has expired
-//!      (`leader_at` older than `debounce_window`), the caller becomes the new
-//!      leader; the helper returns [`LeaderElection::Leader`].
+//!    - If the entry is empty or the previous leader has held the slot longer
+//!      than [`LEADER_LOCK_TIMEOUT`] (assume it crashed without clearing), the
+//!      caller becomes the new leader; the helper returns
+//!      [`LeaderElection::Leader`].
 //!    - Otherwise the caller appends its message to the leader's queue and the
 //!      helper returns [`LeaderElection::Queued`].
-//! 3. The leader optionally waits up to `debounce_window` for additional
-//!     follow-ups, then calls [`CcSpawnCoalescer::drain_queue`] to collect any
-//!     queued follow-ups, combines them with its own message, and spawns CC.
+//! 3. The leader sleeps a short queue-coalescing window (decided externally,
+//!    e.g. 250ms in `chat::process`), then calls [`CcSpawnCoalescer::drain_queue`]
+//!    to collect any queued follow-ups, combines them with its own message,
+//!    and spawns CC.
 //! 4. After the spawn completes (success or failure) the leader calls
-//!     [`CcSpawnCoalescer::clear`] to release the entry.
+//!    [`CcSpawnCoalescer::clear`] to release the entry. Late followers that
+//!    arrived after `drain_queue` are returned as residual for re-routing.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// Maximum time the leader's slot is held before assuming the leader crashed
+/// without calling [`CcSpawnCoalescer::clear`]. Sized to comfortably exceed
+/// worst-case CC spawn duration (worktree creation + npm install + CC startup,
+/// typically 5-10s, occasionally up to ~30s on cold starts).
+const LEADER_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A user message queued for inclusion in the leader's spawn input.
 /// Mirrors the relevant fields of `engine::AgentUserInput` but lives in this
@@ -85,8 +94,8 @@ impl CcSpawnCoalescer {
 
     /// Try to become the spawn leader for `thread_id`.
     ///
-    /// If no leader exists for this thread, or the existing leader has been
-    /// active longer than `debounce_window` (assume it crashed without
+    /// If no leader exists for this thread, or the existing leader has held
+    /// the slot longer than [`LEADER_LOCK_TIMEOUT`] (assume it crashed without
     /// clearing), the caller becomes the new leader: the queue is reset and
     /// `LeaderElection::Leader` is returned.
     ///
@@ -96,12 +105,11 @@ impl CcSpawnCoalescer {
         &self,
         thread_id: Uuid,
         message: QueuedMessage,
-        debounce_window: Duration,
     ) -> LeaderElection {
         let mut guard = self.state.lock().expect("CcSpawnCoalescer mutex poisoned");
         let now = Instant::now();
         match guard.get_mut(&thread_id) {
-            Some(entry) if now.duration_since(entry.leader_at) < debounce_window => {
+            Some(entry) if now.duration_since(entry.leader_at) < LEADER_LOCK_TIMEOUT => {
                 entry.queue.push(message);
                 LeaderElection::Queued
             }
@@ -149,7 +157,6 @@ impl CcSpawnCoalescer {
             .map(|entry| entry.queue)
             .unwrap_or_default()
     }
-
 }
 
 impl Default for CcSpawnCoalescer {
@@ -229,7 +236,7 @@ mod tests {
         let c = CcSpawnCoalescer::new();
         let tid = Uuid::new_v4();
         assert_eq!(
-            c.try_become_leader(tid, msg("first"), Duration::from_millis(250)),
+            c.try_become_leader(tid, msg("first")),
             LeaderElection::Leader
         );
     }
@@ -238,9 +245,9 @@ mod tests {
     fn second_caller_within_window_is_queued() {
         let c = CcSpawnCoalescer::new();
         let tid = Uuid::new_v4();
-        let _ = c.try_become_leader(tid, msg("first"), Duration::from_millis(250));
+        let _ = c.try_become_leader(tid, msg("first"));
         assert_eq!(
-            c.try_become_leader(tid, msg("second"), Duration::from_millis(250)),
+            c.try_become_leader(tid, msg("second")),
             LeaderElection::Queued
         );
     }
@@ -249,7 +256,7 @@ mod tests {
     fn leader_message_is_not_queued() {
         let c = CcSpawnCoalescer::new();
         let tid = Uuid::new_v4();
-        let _ = c.try_become_leader(tid, msg("first"), Duration::from_millis(250));
+        let _ = c.try_become_leader(tid, msg("first"));
         let drained = c.drain_queue(tid);
         assert!(
             drained.is_empty(),
@@ -261,9 +268,9 @@ mod tests {
     fn queued_messages_are_drained_in_order() {
         let c = CcSpawnCoalescer::new();
         let tid = Uuid::new_v4();
-        let _ = c.try_become_leader(tid, msg("leader"), Duration::from_millis(250));
-        let _ = c.try_become_leader(tid, msg("queued1"), Duration::from_millis(250));
-        let _ = c.try_become_leader(tid, msg("queued2"), Duration::from_millis(250));
+        let _ = c.try_become_leader(tid, msg("leader"));
+        let _ = c.try_become_leader(tid, msg("queued1"));
+        let _ = c.try_become_leader(tid, msg("queued2"));
         let drained = c.drain_queue(tid);
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].text, "queued1");
@@ -274,12 +281,12 @@ mod tests {
     fn drain_does_not_clear_leader_entry() {
         let c = CcSpawnCoalescer::new();
         let tid = Uuid::new_v4();
-        let _ = c.try_become_leader(tid, msg("leader"), Duration::from_millis(250));
-        let _ = c.try_become_leader(tid, msg("queued1"), Duration::from_millis(250));
+        let _ = c.try_become_leader(tid, msg("leader"));
+        let _ = c.try_become_leader(tid, msg("queued1"));
         let _ = c.drain_queue(tid);
         // A follower arriving immediately after the drain still sees the leader.
         assert_eq!(
-            c.try_become_leader(tid, msg("late"), Duration::from_millis(250)),
+            c.try_become_leader(tid, msg("late")),
             LeaderElection::Queued,
             "leader entry must persist past drain so late followers still queue"
         );
@@ -292,29 +299,15 @@ mod tests {
     fn clear_releases_leader_and_returns_residual_queue() {
         let c = CcSpawnCoalescer::new();
         let tid = Uuid::new_v4();
-        let _ = c.try_become_leader(tid, msg("leader"), Duration::from_millis(250));
-        let _ = c.try_become_leader(tid, msg("queued1"), Duration::from_millis(250));
+        let _ = c.try_become_leader(tid, msg("leader"));
+        let _ = c.try_become_leader(tid, msg("queued1"));
         let residual = c.clear(tid);
         assert_eq!(residual.len(), 1);
         assert_eq!(residual[0].text, "queued1");
         // After clear, a new caller becomes leader.
         assert_eq!(
-            c.try_become_leader(tid, msg("after_clear"), Duration::from_millis(250)),
+            c.try_become_leader(tid, msg("after_clear")),
             LeaderElection::Leader
-        );
-    }
-
-    #[test]
-    fn expired_leader_is_replaced() {
-        let c = CcSpawnCoalescer::new();
-        let tid = Uuid::new_v4();
-        // Use a tiny debounce window so the prior leader expires immediately.
-        let _ = c.try_become_leader(tid, msg("first"), Duration::from_millis(1));
-        std::thread::sleep(Duration::from_millis(5));
-        assert_eq!(
-            c.try_become_leader(tid, msg("second"), Duration::from_millis(1)),
-            LeaderElection::Leader,
-            "expired leader must allow re-election"
         );
     }
 
@@ -324,11 +317,11 @@ mod tests {
         let tid_a = Uuid::new_v4();
         let tid_b = Uuid::new_v4();
         assert_eq!(
-            c.try_become_leader(tid_a, msg("a1"), Duration::from_millis(250)),
+            c.try_become_leader(tid_a, msg("a1")),
             LeaderElection::Leader
         );
         assert_eq!(
-            c.try_become_leader(tid_b, msg("b1"), Duration::from_millis(250)),
+            c.try_become_leader(tid_b, msg("b1")),
             LeaderElection::Leader,
             "different thread must elect its own leader"
         );
@@ -390,24 +383,48 @@ mod tests {
         assert!(l_pos < q1_pos && q1_pos < q2_pos && q2_pos < q3_pos);
     }
 
+    /// Regression: a CC spawn takes 5-10s (worktree creation + npm install +
+    /// CC startup). Production previously passed `CC_SPAWN_DEBOUNCE` (250ms)
+    /// as the leader-lock timeout, so a follow-up arriving in the multi-second
+    /// spawn window after the debounce expired but before `clear()` was called
+    /// re-elected itself as a new leader and spawned a parallel CC subprocess
+    /// against the same worktree. The fix: the slot is held for the full
+    /// `LEADER_LOCK_TIMEOUT` regardless of any caller-supplied window.
+    #[test]
+    fn second_caller_during_spawn_window_is_queued_not_re_elected() {
+        let c = CcSpawnCoalescer::new();
+        let tid = Uuid::new_v4();
+        assert_eq!(
+            c.try_become_leader(tid, msg("first")),
+            LeaderElection::Leader
+        );
+        // Sleep past any reasonable debounce window. With the prior bug
+        // (250ms timeout), the second call became a new leader here.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            c.try_become_leader(tid, msg("second")),
+            LeaderElection::Queued,
+            "follow-up arriving during the multi-second spawn window must queue, \
+             not start a parallel spawn"
+        );
+    }
+
     /// Regression for the bug Task 2.3 fixes: two CC spawn requests arriving
-    /// within the debounce window must produce exactly one leader and one
+    /// while no CC subprocess is alive must produce exactly one leader and one
     /// queued follower; the leader's combined input must contain BOTH
     /// messages in arrival order.
     #[test]
     fn rapid_fire_idle_messages_coalesce_into_one_spawn() {
         let c = CcSpawnCoalescer::new();
         let tid = Uuid::new_v4();
-        let window = Duration::from_millis(250);
 
         // msg1 — first caller, becomes leader.
-        let r1 = c.try_become_leader(tid, msg("msg1"), window);
+        let r1 = c.try_become_leader(tid, msg("msg1"));
         assert_eq!(r1, LeaderElection::Leader);
 
-        // msg2 — arrives 100ms later (well inside the debounce window),
-        // before the leader has spawned anything.
+        // msg2 — arrives 100ms later, before the leader has spawned anything.
         std::thread::sleep(Duration::from_millis(100));
-        let r2 = c.try_become_leader(tid, msg("msg2"), window);
+        let r2 = c.try_become_leader(tid, msg("msg2"));
         assert_eq!(
             r2, LeaderElection::Queued,
             "second rapid message must be queued, not spawn its own CC"

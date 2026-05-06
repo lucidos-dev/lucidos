@@ -5,12 +5,17 @@ import { invoke, listen } from '../../utils/tauri';
 import { panelUrl, panelTitle, webviewInitialUrl, showToast } from '../../store/store';
 import { isMainFrameUrl } from '../../utils/urlFilter';
 import { errorDetail } from '../../utils/errorDetail';
+import { viewportIsMobile } from '../../utils/viewport';
 
 interface Props {
   url: string;
+  /** Skip mounting in the inactive dual-rendered layout — otherwise both
+   *  SplitLayout and MobileSwipeContainer copies create a webview / iframe. */
+  layout: 'desktop' | 'mobile';
 }
 
-export function UrlPreviewInline({ url }: Props) {
+export function UrlPreviewInline({ url, layout }: Props) {
+  const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
   const containerRef = useRef<HTMLDivElement>(null);
   const webviewCreated = useRef(false);
   // Track the URL the native webview is currently showing (may differ from prop
@@ -60,6 +65,7 @@ export function UrlPreviewInline({ url }: Props) {
 
   useEffect(() => {
     if (!isTauri()) return;
+    if (!isActiveLayout) return;
 
     // Reset so the first panel-url-changed for the new URL captures redirects.
     initialUrlCaptured.current = false;
@@ -80,10 +86,11 @@ export function UrlPreviewInline({ url }: Props) {
     } else if (!webviewCreated.current) {
       createWebview(url);
     }
-  }, [url, createWebview]);
+  }, [url, createWebview, isActiveLayout]);
 
   useEffect(() => {
     if (!isTauri()) return;
+    if (!isActiveLayout) return;
 
     // Listen for URL changes from on_page_load (main-frame navigations only).
     // isMainFrameUrl filters as a safety net in case non-page URLs slip through.
@@ -142,7 +149,11 @@ export function UrlPreviewInline({ url }: Props) {
       panelTitle.value = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [isActiveLayout]);
+
+  // Skip rendering in the inactive dual-rendered layout — otherwise both
+  // SplitLayout and MobileSwipeContainer copies create a webview/iframe.
+  if (!isActiveLayout) return null;
 
   // Browser mode: render an iframe (many sites block framing, but it's the best
   // we can do without a native webview). Tauri mode uses an overlay native webview.

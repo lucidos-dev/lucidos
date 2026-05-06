@@ -18,13 +18,6 @@ fn resolve_file_ctx(
     })
 }
 
-/// Parse an optional UUID string, mapping malformed input to `BAD_REQUEST`.
-fn parse_optional_uuid(opt: Option<&str>) -> Result<Option<Uuid>, StatusCode> {
-    opt.map(Uuid::parse_str)
-        .transpose()
-        .map_err(|_| StatusCode::BAD_REQUEST)
-}
-
 /// Parsed spawn / caller UUIDs returned by `validate_mode_and_spawn`.
 ///
 /// Carrying parsed `caller_*` UUIDs out of validation lets the handler avoid
@@ -108,12 +101,60 @@ fn validate_mode_and_spawn(request: &ChatRequest) -> Result<ValidatedSpawn, Stat
     })
 }
 
+/// Wire-format string for `ThreadType::CodingAgent` (`thread_summaries.source`
+/// and the `channel` payload field). Mirrored here to avoid pulling the engine
+/// enum across the API boundary just for this single comparison; the source of
+/// truth is the `#[serde(rename = "claude_code")]` on `ThreadType::CodingAgent`.
+const CC_SOURCE: &str = "claude_code";
+
+/// A thread is locked to the (mode, repo) it picked on its first message.
+/// Subsequent follow-ups must match — switching either makes the executor card
+/// disagree with the commands menu (the menu collapses to one repo) and breaks
+/// the assumption that the thread's worktree branch lives in one repo.
+///
+/// `existing_source` is the thread's `thread_summaries.source`; `None` means
+/// no row yet (new thread — nothing to lock against). `existing_repo_id` is
+/// the bound `cc_repo_id`, only meaningful when the source is `claude_code`.
+pub(super) fn validate_thread_continuity(
+    existing_source: Option<&str>,
+    existing_repo_id: Option<&str>,
+    requested_use_cc: Option<bool>,
+    requested_repo_id: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    let Some(source) = existing_source else {
+        return Ok(());
+    };
+    let existing_is_cc = source == CC_SOURCE;
+    let requested_is_cc = requested_use_cc == Some(true);
+    if existing_is_cc != requested_is_cc {
+        let from = if existing_is_cc { "Claude Code" } else { "Lucidos" };
+        let to = if requested_is_cc { "Claude Code" } else { "Lucidos" };
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Thread is locked to {from} mode; cannot switch to {to}"),
+        ));
+    }
+    if existing_is_cc {
+        if let (Some(req_repo), Some(existing_repo)) = (requested_repo_id, existing_repo_id) {
+            if req_repo != existing_repo {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Thread is locked to repo {existing_repo}; cannot switch to {req_repo}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn chat(
     State(state): State<AppState>,
     Json(request): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, StatusCode> {
     if let Some(ref model) = request.model {
-        log!("Using model: {}", model);
+        log!("[Chat] Using model: {}", model);
     }
 
     let validated = validate_mode_and_spawn(&request)?;
@@ -124,20 +165,16 @@ pub(super) async fn chat(
     } = validated;
     let mode = request.mode;
 
-    // Convert API contexts to engine contexts
-    let app_ctx = request
-        .app_context
-        .map(|ctx| crate::engine::AppContext { app_id: ctx.app_id });
+    let app_ctx = request.app_context;
     let file_ctx = resolve_file_ctx(
         request.file_context.as_ref(),
         request.repo_file_context.as_ref(),
     );
     let url_ctx = request.url_context;
 
-    let thread_id = request
-        .thread_id
-        .as_ref()
-        .and_then(|s| Uuid::parse_str(s).ok());
+    // Reject malformed thread_id with 400 instead of silently starting a new
+    // thread (CLAUDE.md "no silent defaults").
+    let thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
     Ok(
         match state
             .engine
@@ -265,10 +302,7 @@ pub(super) async fn chat_submit(
         caller,
     );
 
-    // Convert API contexts to engine contexts
-    let app_ctx = request
-        .app_context
-        .map(|ctx| crate::engine::AppContext { app_id: ctx.app_id });
+    let app_ctx = request.app_context;
     let file_ctx = resolve_file_ctx(
         request.file_context.as_ref(),
         request.repo_file_context.as_ref(),
@@ -278,15 +312,40 @@ pub(super) async fn chat_submit(
     let use_claude_code = request.use_claude_code;
     let cc_model = request.cc_model;
     let event_id = request.event_id;
-    let thread_id = request
-        .thread_id
-        .as_ref()
-        .and_then(|s| Uuid::parse_str(s).ok());
-    let conflict_change_id = request
-        .conflict_change_id
-        .as_ref()
-        .and_then(|s| Uuid::parse_str(s).ok());
+    // Reject malformed ids with 400 instead of silently dropping them and
+    // starting a fresh thread / unscoped change (CLAUDE.md "no silent defaults").
+    let thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
+    let conflict_change_id = parse_optional_uuid(request.conflict_change_id.as_deref())?;
     let repo_id = request.repo_id;
+
+    // Lock thread to its first (mode, repo). Switching either mid-thread
+    // makes the executor card and commands menu disagree (different repo's
+    // skills, branch can't follow across repos). Frontend should already
+    // disable the selectors for existing threads — this is the backend
+    // backstop. See `validate_thread_continuity`.
+    if let Some(tid) = thread_id {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT source, cc_repo_id FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(tid)
+        .fetch_optional(state.engine.pool())
+        .await
+        .map_err(|e| {
+            log!("[Chat] thread_summaries lookup failed for {}: {}", tid, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        if let Some((source, existing_repo)) = row {
+            if let Err((sc, msg)) = validate_thread_continuity(
+                Some(&source),
+                existing_repo.as_deref(),
+                use_claude_code,
+                repo_id.as_deref(),
+            ) {
+                log!("[Chat] Reject follow-up on thread {}: {}", tid, msg);
+                return Err(sc);
+            }
+        }
+    }
     let title = request.title;
     // Generate an event_id for tracking progress events
     let response_event_id = event_id
@@ -340,10 +399,10 @@ pub(super) async fn chat_submit(
                                 .await
                             {
                                 Ok(result) => {
-                                    log!("Auto-applied change: {}", result.message);
+                                    log!("[Chat] Auto-applied change: {}", result.message);
                                 }
                                 Err(e) => {
-                                    log!("Failed to auto-apply change: {}", e);
+                                    log!("[Chat] Failed to auto-apply change: {}", e);
                                     engine_clone
                                         .event_bus
                                         .emit_or_log(
@@ -449,7 +508,7 @@ pub(super) async fn chat_submit(
                 }
             }
             Err(ref e) => {
-                log!("Chat error: {}", e);
+                log!("[Chat] Chat error: {}", e);
                 // Signal frontend to exit "running" state with error
                 if let Some(tid) = thread_id {
                     if let Err(emit_err) = engine_clone
@@ -463,7 +522,7 @@ pub(super) async fn chat_submit(
                         })
                         .await
                     {
-                        log!("Failed to emit ResponseFailed: {}", emit_err);
+                        log!("[Chat] Failed to emit ResponseFailed: {}", emit_err);
                     }
                 }
             }
@@ -497,15 +556,14 @@ pub(super) struct CancelChatQuery {
 pub(super) async fn cancel_chat(
     State(state): State<AppState>,
     Query(query): Query<CancelChatQuery>,
-) -> StatusCode {
-    if let Some(ref tid) = query.thread_id {
-        if let Ok(uuid) = Uuid::parse_str(tid) {
+) -> Result<StatusCode, StatusCode> {
+    match parse_optional_uuid(query.thread_id.as_deref())? {
+        Some(uuid) => {
             state.engine.cancel_thread(uuid);
         }
-    } else {
-        state.engine.cancel_all_threads();
+        None => state.engine.cancel_all_threads(),
     }
-    StatusCode::OK
+    Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
@@ -520,6 +578,7 @@ pub(super) struct InjectRequest {
 /// Returns 409 if the thread is not currently active.
 pub(super) async fn inject_prompt(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<InjectRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let thread_id = Uuid::parse_str(&request.thread_id).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -528,10 +587,13 @@ pub(super) async fn inject_prompt(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let event_id = request
-        .event_id
-        .as_deref()
-        .and_then(|s| Uuid::parse_str(s).ok());
+    // Reject malformed event_id with 400 instead of silently dropping the
+    // injection's correlation handle (CLAUDE.md "no silent defaults").
+    let event_id = parse_optional_uuid(request.event_id.as_deref())?;
+
+    // Stamp the user actor so the injected MessageReceived event carries the
+    // device that submitted it (mutating-endpoint actor rule).
+    let origin = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     if state.engine.inject_prompt(
         thread_id,
@@ -539,7 +601,7 @@ pub(super) async fn inject_prompt(
         event_id,
         crate::engine::thread_events::ActorMode::Human,
         None,
-        None,
+        origin,
     ) {
         Ok(StatusCode::OK)
     } else {
@@ -768,5 +830,104 @@ mod tests {
         req.caller_thread_id = Some(Uuid::new_v4().to_string());
         req.caller_event_id = Some(Uuid::new_v4().to_string());
         assert!(validate_mode_and_spawn(&req).is_ok());
+    }
+
+    // -- validate_thread_continuity ---------------------------------------
+
+    #[test]
+    fn continuity_new_thread_is_always_ok() {
+        // No existing summary => new thread, anything goes
+        assert!(validate_thread_continuity(None, None, None, None).is_ok());
+        assert!(validate_thread_continuity(None, None, Some(true), Some("repo-a")).is_ok());
+    }
+
+    #[test]
+    fn continuity_chat_thread_with_chat_followup_is_ok() {
+        assert!(validate_thread_continuity(Some("chat"), None, None, None).is_ok());
+        assert!(validate_thread_continuity(Some("chat"), None, Some(false), None).is_ok());
+    }
+
+    #[test]
+    fn continuity_chat_thread_rejects_cc_followup() {
+        let err = validate_thread_continuity(Some("chat"), None, Some(true), Some("repo-a"))
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("Lucidos"));
+        assert!(err.1.contains("Claude Code"));
+    }
+
+    #[test]
+    fn continuity_cc_thread_rejects_chat_followup() {
+        let err = validate_thread_continuity(Some("claude_code"), Some("repo-a"), None, None)
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let err = validate_thread_continuity(
+            Some("claude_code"),
+            Some("repo-a"),
+            Some(false),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn continuity_cc_thread_with_matching_repo_is_ok() {
+        assert!(validate_thread_continuity(
+            Some("claude_code"),
+            Some("repo-a"),
+            Some(true),
+            Some("repo-a"),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn continuity_cc_thread_rejects_different_repo() {
+        let err = validate_thread_continuity(
+            Some("claude_code"),
+            Some("repo-a"),
+            Some(true),
+            Some("repo-b"),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("repo-a"));
+        assert!(err.1.contains("repo-b"));
+    }
+
+    #[test]
+    fn continuity_cc_thread_with_no_request_repo_is_ok() {
+        // Request omits repo_id => frontend will inherit from the thread.
+        // Don't 409 just because the field is missing.
+        assert!(validate_thread_continuity(
+            Some("claude_code"),
+            Some("repo-a"),
+            Some(true),
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn continuity_cc_thread_with_no_existing_repo_is_ok() {
+        // First CC session bound but cc_repo_id wasn't recorded (e.g. older
+        // event before SessionStarted carried repo_id). Don't gate on a
+        // missing existing value — just let the request through.
+        assert!(validate_thread_continuity(
+            Some("claude_code"),
+            None,
+            Some(true),
+            Some("repo-b"),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn continuity_trigger_thread_treated_as_chat() {
+        // Trigger threads aren't claude_code, so use_claude_code=true is a
+        // mode switch and must be rejected.
+        let err = validate_thread_continuity(Some("trigger"), None, Some(true), None).unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
     }
 }

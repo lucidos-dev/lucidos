@@ -3,7 +3,7 @@ import {
   navigateToApp, sendMessage, sendFollowUp, uniqueMessage,
   assertHealthy, switchToClaudeMode, newThread,
   waitForCCToStart, waitForCCToFinish, waitForExchangeCount,
-  cancelCCResponse, countVisibleResponses, dismissCCSession,
+  cancelStreamingResponse, countVisibleResponses, dismissCCSession,
   waitForStreamingToStart,
 } from './helpers';
 
@@ -20,7 +20,7 @@ test.describe('Claude Code cancel and stop', () => {
     await assertHealthy(page);
   });
 
-  test('cancel a CC response via stop button', async ({ page }) => {
+  test('cancel a CC response via Cancel button', async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);
     await switchToClaudeMode(page);
@@ -31,7 +31,7 @@ test.describe('Claude Code cancel and stop', () => {
     await waitForCCToStart(page, 60_000);
     await waitForStreamingToStart(page, 1, 60_000);
 
-    await cancelCCResponse(page);
+    await cancelStreamingResponse(page);
 
     // Response should have partial content (not empty — text was streaming)
     const responseCount = await countVisibleResponses(page);
@@ -48,7 +48,7 @@ test.describe('Claude Code cancel and stop', () => {
     await waitForCCToStart(page, 60_000);
     await waitForStreamingToStart(page, 1, 60_000);
 
-    await cancelCCResponse(page);
+    await cancelStreamingResponse(page);
 
     // Send a follow-up and verify it works
     const msg2 = uniqueMessage('cc-after-stop');
@@ -66,7 +66,7 @@ test.describe('Claude Code cancel and stop', () => {
     }, msg2, { timeout: 120_000 });
   });
 
-  test('dismiss idle CC session with Done button', async ({ page }) => {
+  test('dismiss idle CC session with Archive button', async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);
     await switchToClaudeMode(page);

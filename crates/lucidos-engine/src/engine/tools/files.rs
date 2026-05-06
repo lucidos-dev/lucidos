@@ -3,7 +3,6 @@ use super::super::document::{extract_text_with_ocr, safe_extract_pdf_text};
 use super::super::LucidosEngine;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use base64::Engine as _;
-use chrono::Utc;
 
 const IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
@@ -14,36 +13,111 @@ fn read_only_reason(data_path: &str) -> Option<&'static str> {
         .then_some("system knowhow is read-only (shipped with the engine)")
 }
 
-/// Convert dot-bracket notation (e.g. `sections[1].slides[0].title`)
-/// to a JSON Pointer string (e.g. `/sections/1/slides/0/title`).
-/// If the input already starts with `/`, return it as-is (assume JSON Pointer).
-/// Empty string returns empty string (targets root).
+/// Convert a flexible "dot-bracket" path expression to an RFC 6901 JSON Pointer.
+///
+/// Accepted syntaxes (mix freely in one path):
+///
+/// | Input                            | Output                  | Notes                          |
+/// |----------------------------------|-------------------------|--------------------------------|
+/// | `metadata.author.name`           | `/metadata/author/name` | Dot-separated identifiers      |
+/// | `sections[0]`                    | `/sections/0`           | Bracket array index            |
+/// | `matrix[1][2]`                   | `/matrix/1/2`           | Consecutive brackets           |
+/// | `dailyLog["2026-05-04"]`         | `/dailyLog/2026-05-04`  | Double-quoted key in brackets  |
+/// | `dailyLog['2026-05-04']`         | `/dailyLog/2026-05-04`  | Single-quoted key in brackets  |
+/// | `data["foo.bar"]`                | `/data/foo.bar`         | Quoted keys may contain `.`    |
+/// | `$.streak` / `$`                 | `/streak` / ``          | JSONPath-style root marker     |
+/// | `[0].name`                       | `/0/name`               | Path may start with brackets   |
+/// | `/sections/1/title`              | `/sections/1/title`     | Already-pointer is returned as-is |
+/// | `` (empty)                       | `` (empty)              | Targets the document root      |
+///
+/// Quoted keys honor RFC 6901 escaping (`~` → `~0`, `/` → `~1`), so a key like
+/// `"a/b"` in `data["a/b"]` becomes `/data/a~1b`. Inside a quoted key, `\` escapes
+/// the next character (use `\"` to embed a double-quote in a double-quoted key).
 pub(crate) fn dot_path_to_pointer(path: &str) -> String {
     if path.is_empty() || path.starts_with('/') {
         return path.to_string();
     }
+    // Tolerate the JSONPath root marker — `$.foo` and `$['foo']` are common shapes.
+    let stripped = path
+        .strip_prefix("$.")
+        .or_else(|| path.strip_prefix('$'))
+        .unwrap_or(path);
+    if stripped.is_empty() {
+        return String::new();
+    }
+
     let mut pointer = String::new();
-    for segment in path.split('.') {
-        if let Some(bracket_pos) = segment.find('[') {
-            // e.g. "sections[1]" → "/sections/1"
-            pointer.push('/');
-            pointer.push_str(&segment[..segment.floor_char_boundary(bracket_pos)]);
-            // Handle one or more bracket indices: "a[1][2]" → "/a/1/2"
-            let rest = &segment[segment.floor_char_boundary(bracket_pos)..];
-            for part in rest.split('[') {
-                if part.is_empty() {
-                    continue;
-                }
-                let idx = part.trim_end_matches(']');
+    let mut buf = String::new();
+    let mut chars = stripped.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '.' => flush_segment(&mut pointer, &mut buf),
+            '[' => {
+                flush_segment(&mut pointer, &mut buf);
+                let key = match chars.peek() {
+                    Some(&q @ ('\'' | '"')) => {
+                        chars.next();
+                        read_quoted_key(&mut chars, q)
+                    }
+                    _ => read_unquoted_bracket(&mut chars),
+                };
                 pointer.push('/');
-                pointer.push_str(idx);
+                pointer.push_str(&pointer_escape(&key));
             }
-        } else {
-            pointer.push('/');
-            pointer.push_str(segment);
+            _ => buf.push(c),
         }
     }
+    flush_segment(&mut pointer, &mut buf);
     pointer
+}
+
+fn flush_segment(pointer: &mut String, buf: &mut String) {
+    if !buf.is_empty() {
+        pointer.push('/');
+        pointer.push_str(&pointer_escape(buf));
+        buf.clear();
+    }
+}
+
+fn read_quoted_key<I: Iterator<Item = char>>(
+    chars: &mut std::iter::Peekable<I>,
+    quote: char,
+) -> String {
+    let mut key = String::new();
+    while let Some(c) = chars.next() {
+        if c == quote {
+            break;
+        }
+        if c == '\\' {
+            if let Some(esc) = chars.next() {
+                key.push(esc);
+            }
+        } else {
+            key.push(c);
+        }
+    }
+    // Optional — caller's input may be malformed and lack the closing `]`.
+    if let Some(&']') = chars.peek() {
+        chars.next();
+    }
+    key
+}
+
+fn read_unquoted_bracket<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) -> String {
+    let mut key = String::new();
+    for c in chars.by_ref() {
+        if c == ']' {
+            break;
+        }
+        key.push(c);
+    }
+    key
+}
+
+fn pointer_escape(s: &str) -> String {
+    // RFC 6901: '~' must be escaped first, then '/'.
+    s.replace('~', "~0").replace('/', "~1")
 }
 
 /// Set a value at the given JSON Pointer path in a parsed JSON document.
@@ -110,7 +184,6 @@ impl LucidosEngine {
         new_string: Option<&str>,
         replace_all: bool,
         message: Option<&str>,
-        extraction_ctx: Option<&str>,
     ) -> Result<FileEditResult, String> {
         let (data_path, full_path) = self.resolve_data_path(raw_path)?;
         let path = data_path.as_str();
@@ -188,14 +261,6 @@ impl LucidosEngine {
                 }))
                 .await
                 .map_err(|e| format!("Failed to emit event: {}", e))?;
-            self.index_artifact_memory(
-                artifact_path,
-                &new_content,
-                &commit_sha,
-                Utc::now(),
-                extraction_ctx,
-            )
-            .await;
             if artifact_path == "user_profile.md" {
                 *self.user_profile.write().await = new_content;
             }
@@ -250,7 +315,6 @@ impl LucidosEngine {
         &self,
         name: &str,
         args: &serde_json::Value,
-        extraction_ctx: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             "read_file" => {
@@ -291,14 +355,21 @@ impl LucidosEngine {
                                         let artifact_path =
                                             path.strip_prefix("artifacts/").unwrap();
                                         let text_path = format!("{}.txt", artifact_path);
-                                        let _ = self
+                                        if let Err(e) = self
                                             .artifact_manager
                                             .write_and_commit(
                                                 &text_path,
                                                 &text,
                                                 &format!("PDF text extracted: {}", artifact_path),
                                             )
-                                            .await;
+                                            .await
+                                        {
+                                            log!(
+                                                "[Files] Failed to cache PDF text sidecar for {}: {}",
+                                                path,
+                                                e
+                                            );
+                                        }
                                     }
                                     Ok(format!("[PDF Text Content]\n\n{}", text))
                                 }
@@ -310,7 +381,13 @@ impl LucidosEngine {
                                             if path.starts_with("artifacts/") {
                                                 let artifact_path = path.strip_prefix("artifacts/").unwrap();
                                                 let text_path = format!("{}.txt", artifact_path);
-                                                let _ = self.artifact_manager.write_and_commit(&text_path, &text, &format!("PDF OCR extracted: {}", artifact_path)).await;
+                                                if let Err(e) = self.artifact_manager.write_and_commit(&text_path, &text, &format!("PDF OCR extracted: {}", artifact_path)).await {
+                                                    log!(
+                                                        "[Files] Failed to cache PDF OCR sidecar for {}: {}",
+                                                        path,
+                                                        e
+                                                    );
+                                                }
                                             }
                                             Ok(format!("[PDF OCR Content]\n\n{}", text))
                                         }
@@ -419,9 +496,7 @@ impl LucidosEngine {
                     .commit_file_change(path, &full_path, &commit_msg)
                     .await?;
 
-                // Only emit events and index for artifacts/ paths
-                if path.starts_with("artifacts/") {
-                    let artifact_path = path.strip_prefix("artifacts/").unwrap();
+                if let Some(artifact_path) = path.strip_prefix("artifacts/") {
                     self.event_bus
                         .emit(BusEvent::System(SystemEvent::artifact_change(
                             file_exists,
@@ -431,17 +506,8 @@ impl LucidosEngine {
                         )))
                         .await?;
 
-                    // Index raw content via Flash extraction
-                    self.index_artifact_memory(
-                        artifact_path,
-                        content,
-                        &commit_sha,
-                        Utc::now(),
-                        Some(extraction_ctx),
-                    )
-                    .await;
-
-                    // Keep in-memory profile cache in sync
+                    // Keep in-memory profile cache in sync (not memory indexing —
+                    // this is the user_profile read-cache backing extraction context).
                     if artifact_path == "user_profile.md" {
                         *self.user_profile.write().await = content.to_string();
                     }
@@ -465,7 +531,6 @@ impl LucidosEngine {
                         args.get("new_string").and_then(|v| v.as_str()),
                         args["replace_all"].as_bool().unwrap_or(false),
                         args.get("message").and_then(|v| v.as_str()),
-                        Some(extraction_ctx),
                     )
                     .await
                 {
@@ -504,6 +569,74 @@ impl LucidosEngine {
                 };
 
                 Ok(all_files.join("\n"))
+            }
+            "glob_files" => {
+                use super::search;
+                let pattern = args
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(search::GLOB_DEFAULT_LIMIT);
+                let workspace = self.workspace_path().to_path_buf();
+                let result = tokio::task::spawn_blocking(move || {
+                    search::glob_files(&workspace, &pattern, limit)
+                })
+                .await
+                .map_err(|e| format!("glob_files task panicked: {}", e))?;
+                match result {
+                    Ok(r) => Ok(serde_json::to_string(&r)
+                        .unwrap_or_else(|e| format!("Error serializing result: {}", e))),
+                    Err(e) => Ok(format!("Error: {}", e)),
+                }
+            }
+            "grep_files" => {
+                use super::search;
+                let pattern = args
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let path_glob = args
+                    .get("path_glob")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let case_insensitive = args
+                    .get("case_insensitive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let max_matches = args
+                    .get("max_matches")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(search::GREP_DEFAULT_MAX_MATCHES);
+                let context_lines = args
+                    .get("context_lines")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(0);
+                let workspace = self.workspace_path().to_path_buf();
+                let result = tokio::task::spawn_blocking(move || {
+                    search::grep_files(
+                        &workspace,
+                        &pattern,
+                        path_glob.as_deref(),
+                        case_insensitive,
+                        max_matches,
+                        context_lines,
+                    )
+                })
+                .await
+                .map_err(|e| format!("grep_files task panicked: {}", e))?;
+                match result {
+                    Ok(r) => Ok(serde_json::to_string(&r)
+                        .unwrap_or_else(|e| format!("Error serializing result: {}", e))),
+                    Err(e) => Ok(format!("Error: {}", e)),
+                }
             }
             "copy_file" => {
                 let (src_data_path, src_path) =
@@ -870,6 +1003,71 @@ mod tests {
     #[test]
     fn test_dot_path_to_pointer_consecutive_brackets() {
         assert_eq!(dot_path_to_pointer("matrix[1][2]"), "/matrix/1/2");
+    }
+
+    #[test]
+    fn test_dot_path_to_pointer_double_quoted_key() {
+        assert_eq!(
+            dot_path_to_pointer(r#"dailyLog["2026-05-04"]"#),
+            "/dailyLog/2026-05-04"
+        );
+    }
+
+    #[test]
+    fn test_dot_path_to_pointer_single_quoted_key() {
+        assert_eq!(
+            dot_path_to_pointer("dailyLog['2026-05-04']"),
+            "/dailyLog/2026-05-04"
+        );
+    }
+
+    #[test]
+    fn test_dot_path_to_pointer_quoted_key_in_chain() {
+        assert_eq!(
+            dot_path_to_pointer(r#"habits[0].dailyLog["2026-05-04"]"#),
+            "/habits/0/dailyLog/2026-05-04"
+        );
+    }
+
+    #[test]
+    fn test_dot_path_to_pointer_quoted_key_with_dot() {
+        assert_eq!(
+            dot_path_to_pointer(r#"data["foo.bar"]"#),
+            "/data/foo.bar"
+        );
+    }
+
+    #[test]
+    fn test_dot_path_to_pointer_quoted_key_pointer_escapes() {
+        // RFC 6901: '~' → '~0', '/' → '~1'.
+        assert_eq!(dot_path_to_pointer(r#"data["a/b"]"#), "/data/a~1b");
+        assert_eq!(dot_path_to_pointer(r#"data["a~b"]"#), "/data/a~0b");
+    }
+
+    #[test]
+    fn test_dot_path_to_pointer_jsonpath_root() {
+        assert_eq!(dot_path_to_pointer("$.streak"), "/streak");
+        assert_eq!(dot_path_to_pointer("$"), "");
+        assert_eq!(
+            dot_path_to_pointer(r#"$.habits[0].dailyLog["2026-05-04"]"#),
+            "/habits/0/dailyLog/2026-05-04"
+        );
+    }
+
+    #[test]
+    fn test_dot_path_to_pointer_leading_bracket() {
+        assert_eq!(dot_path_to_pointer("[0].name"), "/0/name");
+        assert_eq!(dot_path_to_pointer(r#"["key"]"#), "/key");
+    }
+
+    #[test]
+    fn test_json_set_value_with_quoted_key_path() {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(r#"{"habits":[{"dailyLog":{"2026-05-04":2}}]}"#).unwrap();
+        let pointer = dot_path_to_pointer(r#"habits[0].dailyLog["2026-05-04"]"#);
+        let result = json_set_value(&mut doc, &pointer, serde_json::json!(3));
+        assert!(result.is_ok(), "Failed to set value at {}: {:?}", pointer, result);
+        assert_eq!(doc["habits"][0]["dailyLog"]["2026-05-04"], 3);
     }
 
     #[test]

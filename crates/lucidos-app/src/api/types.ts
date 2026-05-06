@@ -1,6 +1,7 @@
 // API response types that match the Rust backend
 
 import type { ActorMode } from '../store/thread-events';
+import type { AuthType } from '../store/types';
 
 export interface ChatRequestBody {
   message: string;
@@ -64,8 +65,6 @@ export interface NotificationsResponse {
   unread_count: number;
   has_more: boolean;
 }
-
-import type { AuthType } from '../store/types';
 
 export interface CredentialsListResponse {
   credentials: Array<{

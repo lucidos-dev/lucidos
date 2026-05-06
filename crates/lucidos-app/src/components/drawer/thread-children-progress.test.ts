@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { threadMap, threadsLoaded } from '../../store/store';
 import { displaySection } from '../../generated/thread-lifecycle';
 import type { ThreadState, ThreadMeta, ThreadStatus } from '../../store/thread-events';
-import type { StoredSection } from '../../generated/thread-lifecycle';
+import type { ArchiveState } from '../../generated/thread-lifecycle';
 import { resolveVisualStatus } from '../shared/ThreadStatusIcon';
 
 function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadState {
@@ -22,10 +22,9 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
       title: 'Test Thread',
       channel: 'chat',
       initiator: 'user',
-      pinned: false,
+      saved: false,
       createdAt: '2026-04-12T00:00:00Z',
       updatedAt: '2026-04-12T00:00:00Z',
-      unread: false,
       status: 'idle',
       ccHasChanges: false,
       ccRequiresRestart: false,
@@ -33,9 +32,10 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
       ccApplying: false,
       lastRevivedAt: '',
       messageCount: 1,
-      section: 'default',
+      section: 'archived',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
+      state: 'active',
       ...overrides,
     },
     events: new Map(),
@@ -68,33 +68,33 @@ beforeEach(() => {
 
 describe('children progress visibility', () => {
   it('shows progress when thread has children (any section)', () => {
-    const sections: Array<{ section: StoredSection; status: ThreadStatus; pinned: boolean; activeChildren: number }> = [
+    const sections: Array<{ section: ArchiveState; status: ThreadStatus; saved: boolean; activeChildren: number }> = [
       // Waiting: idle + active children
-      { section: 'default', status: 'idle', pinned: false, activeChildren: 2 },
-      // Review: unread + no active children (all done)
-      { section: 'unread', status: 'idle', pinned: false, activeChildren: 0 },
-      // Pinned: default + pinned + no active children
-      { section: 'default', status: 'idle', pinned: true, activeChildren: 0 },
-      // History: default + not pinned + no active children
-      { section: 'default', status: 'idle', pinned: false, activeChildren: 0 },
+      { section: 'archived', status: 'idle', saved: false, activeChildren: 2 },
+      // Review: inbox + no active children (all done)
+      { section: 'inbox', status: 'idle', saved: false, activeChildren: 0 },
+      // Saved: default + saved + no active children
+      { section: 'archived', status: 'idle', saved: true, activeChildren: 0 },
+      // History: default + not saved + no active children
+      { section: 'archived', status: 'idle', saved: false, activeChildren: 0 },
     ];
 
-    for (const { section, status, pinned, activeChildren } of sections) {
+    for (const { section, status, saved, activeChildren } of sections) {
       const thread = makeThread('t1', {
         section,
         status,
-        pinned,
+        saved,
         totalChildrenCount: 3,
         activeChildrenCount: activeChildren,
       });
 
-      const display = displaySection(section, status, pinned, activeChildren > 0);
+      const display = displaySection(section, status, saved, activeChildren > 0, false);
       const render = threadRowRenderState(thread.meta, status);
 
       expect(render.showChildrenProgress).toBe(true);
       expect(render.progressText).toBe(`${3 - activeChildren}/3 done`);
       // Verify this is a valid display section
-      expect(['running', 'waiting', 'review', 'pinned', 'history']).toContain(display);
+      expect(['active', 'waiting', 'review', 'saved', 'archive']).toContain(display);
     }
   });
 
@@ -185,33 +185,41 @@ describe('visual status resolution', () => {
 });
 
 describe('displaySection routing with children', () => {
-  it('idle thread with active children goes to waiting section', () => {
-    expect(displaySection('default', 'idle', false, true)).toBe('waiting');
+  it('idle thread with active children goes to active section', () => {
+    expect(displaySection('archived', 'idle', false, true, false)).toBe('active');
   });
 
-  it('idle thread with all children done goes to history', () => {
-    expect(displaySection('default', 'idle', false, false)).toBe('history');
+  it('idle thread with all children done goes to archive', () => {
+    expect(displaySection('archived', 'idle', false, false, false)).toBe('archive');
   });
 
-  it('unread thread with active children goes to waiting (not review)', () => {
-    expect(displaySection('unread', 'idle', false, true)).toBe('waiting');
+  it('inbox thread with active children goes to active (not review)', () => {
+    expect(displaySection('inbox', 'idle', false, true, false)).toBe('active');
   });
 
-  it('unread thread with all children done goes to review', () => {
-    expect(displaySection('unread', 'idle', false, false)).toBe('review');
+  it('inbox thread with all children done goes to review', () => {
+    expect(displaySection('inbox', 'idle', false, false, false)).toBe('review');
   });
 
-  it('pinned thread with active children goes to waiting (not pinned)', () => {
-    expect(displaySection('default', 'idle', true, true)).toBe('waiting');
+  it('saved thread with active children goes to saved (save overrides everything)', () => {
+    expect(displaySection('archived', 'idle', true, true, false)).toBe('saved');
   });
 
-  it('pinned thread with all children done goes to pinned', () => {
-    expect(displaySection('default', 'idle', true, false)).toBe('pinned');
+  it('saved thread with all children done goes to saved', () => {
+    expect(displaySection('archived', 'idle', true, false, false)).toBe('saved');
   });
 
-  it('running thread always goes to running regardless of children', () => {
-    expect(displaySection('default', 'running', false, true)).toBe('running');
-    expect(displaySection('default', 'running', false, false)).toBe('running');
+  it('running thread always goes to active regardless of children', () => {
+    expect(displaySection('archived', 'running', false, true, false)).toBe('active');
+    expect(displaySection('archived', 'running', false, false, false)).toBe('active');
+  });
+
+  it('archived thread with pending changes routes to review (no work lost behind archive)', () => {
+    expect(displaySection('archived', 'idle', false, false, true)).toBe('review');
+  });
+
+  it('saved thread with pending changes still saves (save wins over pending)', () => {
+    expect(displaySection('archived', 'idle', true, false, true)).toBe('saved');
   });
 });
 
@@ -240,10 +248,9 @@ describe('children progress consistency across row types', () => {
       title: 'Search Result Thread',
       channel: 'chat',
       initiator: 'user',
-      pinned: false,
+      saved: false,
       createdAt: '2026-04-12T00:00:00Z',
       updatedAt: '2026-04-12T00:00:00Z',
-      unread: false,
       status: 'idle',
       ccHasChanges: false,
       ccRequiresRestart: false,
@@ -251,9 +258,10 @@ describe('children progress consistency across row types', () => {
       ccApplying: false,
       lastRevivedAt: '',
       messageCount: 5,
-      section: 'default',
+      section: 'archived',
       activeChildrenCount: 1,
       totalChildrenCount: 3,
+      state: 'active',
     };
 
     // ThreadRow path

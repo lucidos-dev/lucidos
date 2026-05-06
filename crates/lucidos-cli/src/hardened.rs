@@ -4,8 +4,37 @@ use std::process::Command;
 use crate::http::client as http_client;
 use crate::workspace::{BoxError, Workspace};
 
+/// Hardening marker state for a branch, mirroring the engine's
+/// `HardenMarkerState`. Wire format on the HTTP API is the literal string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardenedState {
+    Fresh,
+    Stale,
+    Missing,
+}
+
+impl HardenedState {
+    pub(crate) fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "FRESH" => HardenedState::Fresh,
+            "STALE" => HardenedState::Stale,
+            // Unknown / unreachable engine / empty body => treat like Missing
+            // so transient errors don't silently mask the reminder.
+            _ => HardenedState::Missing,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            HardenedState::Fresh => "FRESH",
+            HardenedState::Stale => "STALE",
+            HardenedState::Missing => "MISSING",
+        }
+    }
+}
+
 /// Resolve `(repo_root, branch, head_sha)` for the worktree at `cwd`.
-fn git_context(cwd: &std::path::Path) -> Result<(PathBuf, String, String), BoxError> {
+pub(crate) fn git_context(cwd: &std::path::Path) -> Result<(PathBuf, String, String), BoxError> {
     let common = run_git(cwd, &["rev-parse", "--git-common-dir"])?;
     // git-common-dir may be relative (`.git`) or absolute (`/repo/.git`).
     let common_path = if std::path::Path::new(&common).is_absolute() {
@@ -32,7 +61,7 @@ fn git_context(cwd: &std::path::Path) -> Result<(PathBuf, String, String), BoxEr
     Ok((repo_root, branch, head_sha))
 }
 
-fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, BoxError> {
+pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, BoxError> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -74,9 +103,9 @@ pub(crate) fn cmd_mark(ws: &Workspace) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Print `FRESH`, `STALE`, or `MISSING` for the current branch to stdout.
-/// Transport / git-context errors go to stderr with exit 1.
-pub(crate) fn cmd_query(ws: &Workspace) -> Result<(), BoxError> {
+/// GET the hardening state of the current branch from the parent engine.
+/// Used by `cmd_query` (printing) and `cc_stop_reminder` (deciding).
+pub(crate) fn query_state(ws: &Workspace) -> Result<HardenedState, BoxError> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
     let (repo_root, branch, _head_sha) = git_context(&cwd)?;
     let url = format!("{}/api/internal/hardened-state", ws.base_url());
@@ -102,6 +131,40 @@ pub(crate) fn cmd_query(ws: &Workspace) -> Result<(), BoxError> {
         .get("state")
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("GET {} response missing `state`: {}", url, body))?;
-    println!("{}", state);
+    Ok(HardenedState::parse(state))
+}
+
+/// Print `FRESH`, `STALE`, or `MISSING` for the current branch to stdout.
+/// Transport / git-context errors go to stderr with exit 1.
+pub(crate) fn cmd_query(ws: &Workspace) -> Result<(), BoxError> {
+    let state = query_state(ws)?;
+    println!("{}", state.as_str());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_round_trips_known_states() {
+        assert_eq!(HardenedState::parse("FRESH"), HardenedState::Fresh);
+        assert_eq!(HardenedState::parse("STALE"), HardenedState::Stale);
+        assert_eq!(HardenedState::parse("MISSING"), HardenedState::Missing);
+    }
+
+    #[test]
+    fn parse_falls_back_to_missing_for_unknown_or_empty() {
+        // Empty body / unreachable engine must not silently mask a real
+        // unhardened branch — treat as Missing so the reminder still fires.
+        assert_eq!(HardenedState::parse(""), HardenedState::Missing);
+        assert_eq!(HardenedState::parse("???"), HardenedState::Missing);
+    }
+
+    #[test]
+    fn parse_strips_trailing_whitespace() {
+        // The HTTP body is JSON-extracted so trim is belt-and-braces, but
+        // covers the case where someone pipes `lucidos hardened query` output.
+        assert_eq!(HardenedState::parse("FRESH\n"), HardenedState::Fresh);
+    }
 }

@@ -6,6 +6,56 @@ use std::sync::{Arc, Mutex};
 
 use super::ARTIFACTS_DIR;
 
+/// Subdirectories under `data/` that browseable workspace tools (list_files,
+/// glob_files, grep_files) walk. Anything outside these — postgres event
+/// store, .lucidos/ runtime cache, etc. — is intentionally excluded.
+pub const BROWSEABLE_DATA_SUBDIRS: &[&str] = &["artifacts", "apps", "knowhow", "triggers"];
+
+/// Walk the four browseable data/ subdirs and return each file as
+/// `(data-relative path, absolute path)`, sorted lexicographically.
+/// Shared by `ArtifactManager::list_artifacts` and the search tools so
+/// the ignore policy stays consistent. Symlinks are intentionally skipped:
+/// `entry.file_type()` doesn't follow them, which prevents both leaks
+/// outside data/ and infinite recursion on symlink loops.
+pub fn list_searchable_data_files(
+    workspace_path: &Path,
+) -> Result<Vec<(String, PathBuf)>, std::io::Error> {
+    let data_path = workspace_path.join("data");
+    let mut out = Vec::new();
+    if !data_path.exists() {
+        return Ok(out);
+    }
+    fn walk(
+        dir: &Path,
+        base: &Path,
+        prefix: &str,
+        out: &mut Vec<(String, PathBuf)>,
+    ) -> Result<(), std::io::Error> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            let path = entry.path();
+            if ft.is_dir() {
+                walk(&path, base, prefix, out)?;
+            } else if ft.is_file() {
+                if let Ok(rel) = path.strip_prefix(base) {
+                    out.push((format!("{}/{}", prefix, rel.to_string_lossy()), path));
+                }
+            }
+            // symlinks (and other special entries) are intentionally ignored
+        }
+        Ok(())
+    }
+    for sub in BROWSEABLE_DATA_SUBDIRS {
+        let dir = data_path.join(sub);
+        if dir.exists() {
+            walk(&dir, &dir, sub, &mut out)?;
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
 pub struct ArtifactChange {
     pub path: String,
     pub commit_hash: String,
@@ -316,41 +366,10 @@ impl ArtifactManager {
     }
 
     pub fn list_artifacts(&self) -> Result<Vec<String>, std::io::Error> {
-        let data_path = self.workspace_path.join("data");
-        if !data_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut paths = Vec::new();
-
-        fn walk(
-            dir: &Path,
-            base: &Path,
-            prefix: &str,
-            paths: &mut Vec<String>,
-        ) -> Result<(), std::io::Error> {
-            if dir.is_dir() {
-                for entry in fs::read_dir(dir)? {
-                    let entry = entry?;
-                    let path = entry.path();
-                    if path.is_dir() {
-                        walk(&path, base, prefix, paths)?;
-                    } else if let Ok(relative) = path.strip_prefix(base) {
-                        paths.push(format!("{}/{}", prefix, relative.to_string_lossy()));
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        for dir_name in &["artifacts", "apps", "knowhow", "triggers"] {
-            let dir_path = data_path.join(dir_name);
-            if dir_path.exists() {
-                walk(&dir_path, &dir_path, dir_name, &mut paths)?;
-            }
-        }
-
-        Ok(paths)
+        Ok(list_searchable_data_files(&self.workspace_path)?
+            .into_iter()
+            .map(|(rel, _)| rel)
+            .collect())
     }
 
     /// Read an artifact file at a specific git commit

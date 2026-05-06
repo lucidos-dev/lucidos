@@ -164,16 +164,16 @@ mod tests {
         );
     }
 
-    /// Norwegian synonyms ("pappa"/"fars" both mean "father") must encode close
+    /// Norwegian synonyms ("bil"/"kjøretøy" both mean "vehicle") must encode close
     /// together in the embedding space — required for cross-language semantic
     /// search. Threshold 0.7 is empirically conservative for MultilingualE5Small.
     #[tokio::test]
     async fn test_norwegian_synonyms_have_high_similarity() {
         let provider = shared_provider();
-        let pappa = provider.embed("pappa").await.unwrap();
-        let fars = provider.embed("fars").await.unwrap();
+        let bil = provider.embed("bil").await.unwrap();
+        let kjoretoy = provider.embed("kjøretøy").await.unwrap();
 
-        let sim = crate::memory::cosine_similarity(&pappa, &fars);
+        let sim = crate::memory::cosine_similarity(&bil, &kjoretoy);
         assert!(
             sim > 0.7,
             "Expected high similarity for Norwegian synonyms, got {}",
@@ -181,18 +181,18 @@ mod tests {
         );
     }
 
-    /// Cross-language semantic search: "pappa øye" must rank Norwegian text
-    /// containing "fars" / "fødselsnummer" above unrelated Norwegian text.
+    /// Cross-language semantic search: "bil verksted" must rank Norwegian text
+    /// containing "kjøretøy" / "service" above unrelated Norwegian text.
     /// Thread search ranks by the same cosine similarity, so this is the
     /// property the search depends on.
     #[tokio::test]
-    async fn test_pappa_oye_query_matches_norwegian_father_id_thread() {
+    async fn test_bil_verksted_query_matches_norwegian_vehicle_service_thread() {
         let provider = shared_provider();
 
         let embeddings = provider
             .embed_batch(&[
-                "pappa øye",
-                "Hva er fars fødselsnummer? Jeg trenger det til skattemeldingen.",
+                "bil verksted",
+                "Når er kjøretøyet ferdig på service? Jeg trenger det til arbeidsuken.",
                 "Oppskrift på sjokoladekake med kremost",
             ])
             .await
@@ -203,14 +203,14 @@ mod tests {
 
         assert!(
             target_sim > 0.75,
-            "Expected 'pappa øye' to have non-trivial similarity to Norwegian \
-             father/fødselsnummer text, got {} (unrelated baseline {})",
+            "Expected 'bil verksted' to have non-trivial similarity to Norwegian \
+             vehicle/service text, got {} (unrelated baseline {})",
             target_sim,
             unrelated_sim
         );
         assert!(
             target_sim > unrelated_sim,
-            "Expected 'pappa øye' to rank Norwegian father-text ABOVE unrelated \
+            "Expected 'bil verksted' to rank Norwegian vehicle-text ABOVE unrelated \
              Norwegian cake-text. target={} unrelated={}",
             target_sim,
             unrelated_sim

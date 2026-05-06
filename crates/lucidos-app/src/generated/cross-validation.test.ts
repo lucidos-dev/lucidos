@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { resolveActions, displaySection } from './thread-lifecycle';
-import type { ThreadType, ThreadStatus, StoredSection, Action, DisplaySection } from './thread-lifecycle';
+import type { ThreadType, ThreadStatus, ArchiveState, Action, DisplaySection } from './thread-lifecycle';
 import fixture from './cross-validation-fixture.json';
 
 interface ResolveActionsCase {
@@ -20,7 +20,7 @@ interface ResolveActionsCase {
 
 interface DisplaySectionCase {
   fn: 'displaySection';
-  args: [string, string, boolean, boolean];
+  args: [string, string, boolean, boolean, boolean];
   expected: string;
 }
 
@@ -50,7 +50,7 @@ describe('Cross-validation: generated TS matches Rust', () => {
         const result = resolveActions(
           threadType as ThreadType,
           status as ThreadStatus,
-          section as StoredSection,
+          section as ArchiveState,
           pending,
         );
         expect(result).toEqual(tc.expected as Action[]);
@@ -62,20 +62,21 @@ describe('Cross-validation: generated TS matches Rust', () => {
     const displaySectionCases = cases.filter((c): c is DisplaySectionCase => c.fn === 'displaySection');
 
     it(`has exhaustive coverage (${displaySectionCases.length} cases)`, () => {
-      // 2 sections × 5 statuses × 2 pinned × 2 activeChildren = 40
-      expect(displaySectionCases.length).toBe(40);
+      // 2 sections × 5 statuses × 2 saved × 2 activeChildren × 2 pending = 80
+      expect(displaySectionCases.length).toBe(80);
     });
 
     for (const tc of displaySectionCases) {
-      const [section, status, pinned, activeChildren] = tc.args;
-      const label = `(${section}, ${status}, pinned=${pinned}, active=${activeChildren})`;
+      const [section, status, saved, activeChildren, pending] = tc.args;
+      const label = `(${section}, ${status}, saved=${saved}, active=${activeChildren}, pending=${pending})`;
 
       it(`${label} → ${tc.expected}`, () => {
         const result = displaySection(
-          section as StoredSection,
+          section as ArchiveState,
           status as ThreadStatus,
-          pinned,
+          saved,
           activeChildren,
+          pending,
         );
         expect(result).toBe(tc.expected as DisplaySection);
       });

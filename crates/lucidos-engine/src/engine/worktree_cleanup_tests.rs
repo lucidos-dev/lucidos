@@ -91,17 +91,51 @@ async fn add_worktree_for_thread(
         tokio::fs::write(cache.join("c.dat"), b"x").await.unwrap();
     }
 
+    // Commit so the branch is ahead of main; without this Tier 0 would
+    // claim every fixture worktree, masking the Tier 1/2 behavior under
+    // test. Tier-0-eligible tests use `add_worktree_at_main_for_thread`.
+    tokio::fs::write(worktree.join("branch_marker.txt"), b"on branch")
+        .await
+        .unwrap();
+    git_cmd(&["add", "branch_marker.txt"], &worktree).await.unwrap();
+    git_cmd(&["commit", "-m", "branch work"], &worktree).await.unwrap();
+
     worktree
 }
 
-/// Insert a thread_summaries row matching the deterministic id, optionally pinned.
-async fn insert_thread_summary(pool: &PgPool, thread_id: Uuid, is_pinned: bool) {
+/// Like `add_worktree_for_thread` but leaves the branch at main HEAD with no
+/// commits — the state Tier 0 looks for (after Apply has merged the thread's
+/// work and `change_ops::reset_worktree_to_main_after_apply` has reset the
+/// working tree).
+async fn add_worktree_at_main_for_thread(repo_root: &Path, thread_id: Uuid) -> PathBuf {
+    let short = &thread_id.simple().to_string()[..8];
+    let dir_name = format!("thread-{}", short);
+    let worktree = worktrees_dir(repo_root).join(&dir_name);
+    let branch = format!("test/{}", short);
+    git_cmd(
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &worktree.to_string_lossy(),
+            "main",
+        ],
+        repo_root,
+    )
+    .await
+    .expect("git worktree add");
+    worktree
+}
+
+/// Insert a thread_summaries row matching the deterministic id, optionally saved.
+async fn insert_thread_summary(pool: &PgPool, thread_id: Uuid, is_saved: bool) {
     sqlx::query(
-        "INSERT INTO thread_summaries (thread_id, title, source, message_count, last_activity, has_response, is_pinned) \
+        "INSERT INTO thread_summaries (thread_id, title, source, message_count, last_activity, has_response, is_saved) \
          VALUES ($1, 'cleanup test', 'claude_code', 1, NOW(), false, $2)",
     )
     .bind(thread_id)
-    .bind(is_pinned)
+    .bind(is_saved)
     .execute(pool)
     .await
     .expect("insert thread_summary");
@@ -128,6 +162,7 @@ async fn insert_old_event(pool: &PgPool, thread_id: Uuid, age_secs: i64) {
 /// thresholds so the alert never fires by accident. Tests that need a trigger
 /// override these fields directly.
 fn make_worker(pool: PgPool, bus: Arc<EventBus>, workspace: PathBuf) -> WorktreeCleanup {
+    let changes = crate::core::changes_projection::ChangesProjection::new(pool.clone());
     WorktreeCleanup {
         pool,
         bus,
@@ -136,7 +171,11 @@ fn make_worker(pool: PgPool, bus: Arc<EventBus>, workspace: PathBuf) -> Worktree
         free_soft_bytes: 0,
         free_hard_bytes: 0,
         force_tier1_idle: Duration::from_secs(60 * 60),
+        // Default to the production threshold; tests that exercise the
+        // small-vs-large branching override this.
+        large_footprint_bytes: super::LARGE_FOOTPRINT_BYTES,
         alerts: Mutex::new(super::AlertState::default()),
+        changes,
     }
 }
 
@@ -239,7 +278,7 @@ async fn tier_1_strips_build_artifacts_after_24h_idle() {
 }
 
 #[tokio::test]
-async fn tier_2_removes_worktree_after_30_days_clean_unpinned() {
+async fn tier_2_removes_worktree_after_30_days_clean_unsaved() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
@@ -266,7 +305,7 @@ async fn tier_2_removes_worktree_after_30_days_clean_unpinned() {
 }
 
 #[tokio::test]
-async fn pinned_threads_are_exempt_from_tier_2() {
+async fn saved_threads_are_exempt_from_tier_2() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
@@ -274,7 +313,7 @@ async fn pinned_threads_are_exempt_from_tier_2() {
     let (_tmp, root) = fresh_workspace().await;
     let thread_id = Uuid::new_v4();
     let worktree = add_worktree_for_thread(&root, thread_id, false).await;
-    insert_thread_summary(&pool, thread_id, true /* pinned */).await;
+    insert_thread_summary(&pool, thread_id, true /* saved */).await;
     insert_old_event(&pool, thread_id, TIER_2_AGE).await;
 
     let rx = bus.subscribe();
@@ -285,10 +324,10 @@ async fn pinned_threads_are_exempt_from_tier_2() {
     let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
     assert!(
         cleaned.iter().all(|(_, tier, _, _)| *tier != 2),
-        "no Tier 2 event for a pinned thread, got: {:?}",
+        "no Tier 2 event for a saved thread, got: {:?}",
         cleaned
     );
-    assert!(worktree.exists(), "pinned worktree must remain on disk");
+    assert!(worktree.exists(), "saved worktree must remain on disk");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -356,9 +395,95 @@ async fn soft_threshold_breach_emits_low_disk_notification() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let alerts: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t == "Lucidos disk space low")
+        .filter(|(t, _)| t == "Low disk space on your machine")
         .collect();
     assert_eq!(alerts.len(), 1, "expected exactly one low-disk notification, got: {:?}", alerts);
+    let (_, body) = &alerts[0];
+    assert!(
+        !body.contains("Lucidos disk space"),
+        "body must not lead with the old 'Lucidos disk space' framing: {}",
+        body,
+    );
+    assert!(
+        body.contains("volume hosting"),
+        "body must explicitly call out the volume, not Lucidos itself: {}",
+        body,
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Small Lucidos footprint + low volume → message must steer the user to look
+/// elsewhere on their machine, not at Lucidos.
+#[tokio::test]
+async fn soft_threshold_with_tiny_lucidos_footprint_blames_the_machine() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    // No worktrees on disk → Lucidos footprint is 0.
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.free_soft_bytes = u64::MAX;
+    worker.free_hard_bytes = 0;
+
+    let rx = bus.subscribe();
+    worker.run_once().await;
+
+    let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
+    let alerts: Vec<_> = notifications
+        .into_iter()
+        .filter(|(t, _)| t == "Low disk space on your machine")
+        .collect();
+    assert_eq!(alerts.len(), 1);
+    let (_, body) = &alerts[0];
+    assert!(
+        body.contains("other apps") || body.contains("not Lucidos") || body.contains("isn't Lucidos"),
+        "tiny-footprint body must point at the user's machine, not Lucidos: {}",
+        body,
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Large Lucidos footprint + low volume → message steers to Settings → Disk Usage.
+#[tokio::test]
+async fn soft_threshold_with_large_lucidos_footprint_suggests_cleanup() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let _wt = add_worktree_for_thread(&root, thread_id, true).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, 5).await;
+
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.free_soft_bytes = u64::MAX;
+    worker.free_hard_bytes = 0;
+    // Boundary at 1 byte forces the "large footprint" branch — the planted
+    // worktree's artifacts comfortably exceed that without us having to write
+    // gigabytes to disk.
+    worker.large_footprint_bytes = 1;
+
+    let rx = bus.subscribe();
+    worker.run_once().await;
+
+    let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
+    let alerts: Vec<_> = notifications
+        .into_iter()
+        .filter(|(t, _)| t == "Low disk space on your machine")
+        .collect();
+    assert_eq!(alerts.len(), 1);
+    let (_, body) = &alerts[0];
+    assert!(
+        body.contains("Settings") && body.contains("Disk Usage"),
+        "large-footprint body must point at Settings → Disk Usage: {}",
+        body,
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -449,7 +574,7 @@ async fn ample_free_disk_emits_no_notification() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let alerts: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t.starts_with("Lucidos") && t.contains("disk"))
+        .filter(|(t, _)| t.contains("disk") || t.contains("Disk") || t.contains("auto-cleanup"))
         .collect();
     assert!(alerts.is_empty(), "no disk-related notifications when free disk is ample, got: {:?}", alerts);
 
@@ -458,18 +583,22 @@ async fn ample_free_disk_emits_no_notification() {
 }
 
 #[tokio::test]
-async fn tier_2_deletes_branch_if_fully_merged() {
+async fn tier_0_deletes_branch_if_fully_merged() {
+    // After Tier 0 was introduced, a fully-merged branch (no commits ahead
+    // of main, clean worktree, no pending change) is removed by Tier 0 long
+    // before Tier 2's 30d window — but the destructive call is shared, so
+    // `branch_deleted=true` semantics still hold. This test pins both:
+    // Tier 0 fires AND deletes the merged branch.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
 
     let (_tmp, root) = fresh_workspace().await;
     let thread_id = Uuid::new_v4();
-    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
     let short = &thread_id.simple().to_string()[..8];
     let branch = format!("test/{}", short);
 
-    // Branch has zero commits ahead of main → fully merged for our purposes.
     insert_thread_summary(&pool, thread_id, false).await;
     insert_old_event(&pool, thread_id, TIER_2_AGE).await;
 
@@ -479,8 +608,9 @@ async fn tier_2_deletes_branch_if_fully_merged() {
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
     let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
-    assert_eq!(cleaned.len(), 1, "Tier 2 should fire");
-    let (_, _, _, branch_deleted) = cleaned[0];
+    assert_eq!(cleaned.len(), 1, "Tier 0 should fire on fully-merged worktree");
+    let (_, tier, _, branch_deleted) = cleaned[0];
+    assert_eq!(tier, 0, "should be reclaimed by Tier 0, not Tier 2");
     assert!(branch_deleted, "fully-merged branch must be deleted");
 
     let res = git_cmd(&["rev-parse", "--verify", &branch], &root).await;
@@ -699,7 +829,7 @@ async fn inventory_worktrees_returns_thread_metadata_sorted_by_size() {
 
     let small_id = Uuid::new_v4();
     let _small_wt = add_worktree_for_thread(&root, small_id, false).await;
-    insert_thread_summary(&pool, small_id, true /* pinned */).await;
+    insert_thread_summary(&pool, small_id, true /* saved */).await;
     insert_old_event(&pool, small_id, 60).await;
 
     let rows = inventory_worktrees(&pool, &root).await;
@@ -722,10 +852,10 @@ async fn inventory_worktrees_returns_thread_metadata_sorted_by_size() {
     );
 
     let small = &rows[small_idx];
-    assert!(small.is_pinned, "pinned flag must be carried through");
+    assert!(small.is_saved, "saved flag must be carried through");
 
     let big = &rows[big_idx];
-    assert!(!big.is_pinned, "unpinned flag must be carried through");
+    assert!(!big.is_saved, "unsaved flag must be carried through");
     assert!(big.size_bytes > small.size_bytes);
     assert!(big.last_activity.is_some());
     assert!(big.thread_title.is_some(), "thread_title must be carried through");
@@ -771,7 +901,7 @@ async fn soft_threshold_does_not_re_emit_on_subsequent_ticks() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let lows: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t == "Lucidos disk space low")
+        .filter(|(t, _)| t == "Low disk space on your machine")
         .collect();
     assert_eq!(
         lows.len(),
@@ -808,7 +938,7 @@ async fn soft_threshold_re_arms_after_recovery() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let lows: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t == "Lucidos disk space low")
+        .filter(|(t, _)| t == "Low disk space on your machine")
         .collect();
     assert_eq!(
         lows.len(),
@@ -846,7 +976,7 @@ async fn hard_threshold_emits_auto_cleanup_when_bytes_freed() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let cleanups: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t == "Lucidos auto-cleanup running")
+        .filter(|(t, _)| t == "Lucidos reclaimed disk space")
         .collect();
     assert_eq!(
         cleanups.len(),
@@ -879,13 +1009,189 @@ async fn hard_threshold_no_auto_cleanup_when_nothing_freed() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let cleanups: usize = notifications
         .iter()
-        .filter(|(t, _)| t == "Lucidos auto-cleanup running")
+        .filter(|(t, _)| t == "Lucidos reclaimed disk space")
         .count();
     assert_eq!(
         cleanups, 0,
         "auto-cleanup notification must not fire when nothing was reclaimed; saw: {:?}",
         notifications
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+// ---------------------------------------------------------------------------
+// Tier 0: applied/clean fast removal.
+// ---------------------------------------------------------------------------
+
+const TIER_0_AGE_SECS: i64 = 90 * 60; // > 1h grace
+
+#[tokio::test]
+async fn tier_0_removes_clean_worktree_with_no_commits_after_grace() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_0_AGE_SECS).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    assert_eq!(cleaned.len(), 1, "exactly one Tier 0 event");
+    let (_, tier, _, branch_deleted) = cleaned[0];
+    assert_eq!(tier, 0);
+    assert!(branch_deleted, "Tier 0 must delete the merged branch");
+    assert!(!worktree.exists(), "Tier 0 must remove the worktree dir");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn tier_0_skips_branch_with_commits_ahead_of_main() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    // `add_worktree_for_thread` adds a commit, so the branch IS ahead of main.
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_0_AGE_SECS).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    assert!(
+        cleaned.iter().all(|(_, tier, _, _)| *tier != 0),
+        "no Tier 0 event when branch has commits ahead, got: {:?}",
+        cleaned
+    );
+    assert!(worktree.exists(), "worktree with commits must remain");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn tier_0_respects_one_hour_grace_window() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    // 30 min — within the 1h grace.
+    insert_old_event(&pool, thread_id, 30 * 60).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    assert!(
+        cleaned.iter().all(|(_, tier, _, _)| *tier != 0),
+        "no Tier 0 event within grace, got: {:?}",
+        cleaned
+    );
+    assert!(worktree.exists(), "worktree must remain within grace window");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn tier_0_fires_within_grace_under_disk_pressure() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    // 30s — well within the 1h grace.
+    insert_old_event(&pool, thread_id, 30).await;
+
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    // Force disk pressure: pretend the volume is entirely below the hard
+    // threshold so `under_hard` is true.
+    worker.free_hard_bytes = u64::MAX;
+
+    let rx = bus.subscribe();
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    assert_eq!(cleaned.len(), 1, "exactly one Tier 0 event under pressure");
+    let (_, tier, _, _) = cleaned[0];
+    assert_eq!(tier, 0);
+    assert!(
+        !worktree.exists(),
+        "Tier 0 must remove worktree under pressure even within grace"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn tier_0_skips_thread_with_pending_change() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_0_AGE_SECS).await;
+
+    // Insert a pending change for this thread on its branch — Tier 0 must
+    // skip while pending work awaits the user's decision.
+    let short = &thread_id.simple().to_string()[..8];
+    let branch = format!("test/{}", short);
+    sqlx::query(
+        "INSERT INTO changes (id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, status, created_at, thread_id) \
+         VALUES ($1, $2, $3, $4, $5, 0, '{}'::text[], false, 'pending', NOW(), $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(&branch)
+    .bind(root.to_string_lossy().to_string())
+    .bind("pending change for tier 0 test")
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("insert pending change");
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    assert!(
+        cleaned.iter().all(|(_, tier, _, _)| *tier != 0),
+        "Tier 0 must skip thread with pending change, got: {:?}",
+        cleaned
+    );
+    assert!(worktree.exists(), "worktree with pending change must remain");
 
     pool.close().await;
     teardown_test_db(&db_name).await;

@@ -1,8 +1,7 @@
 #!/bin/bash
 # Pre-push hook: block git push unless `lucidos hardened query` reports FRESH
-# (i.e. /harden has run for the current HEAD). Tests-ran marker is still a
-# filesystem flag at ~/.lucidos/harden-markers/lucidos-tests-<repo-hash>; the
-# user touches it by hand after `cargo test` / `npm test` succeed.
+# (i.e. /harden has run for the current HEAD). FRESH implies tests passed —
+# /harden runs the test suites for the layers touched as part of its flow.
 
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
@@ -20,45 +19,14 @@ if [ -z "$UNPUSHED" ]; then
   exit 0
 fi
 
-REPO_HASH=$(echo -n "$REPO_ROOT" | shasum -a 256 | cut -d' ' -f1)
-TESTS_MARKER="$HOME/.lucidos/harden-markers/lucidos-tests-$REPO_HASH"
 COMMIT_COUNT=$(echo "$UNPUSHED" | wc -l | tr -d ' ')
-
 STATE=$(cd "$REPO_ROOT" && lucidos hardened query 2>/dev/null)
 
 case "$STATE" in
   FRESH)
-    if [ ! -f "$TESTS_MARKER" ]; then
-      CHANGED=$(git -C "$REPO_ROOT" diff --name-only @{u}..HEAD 2>/dev/null)
-      NEED_RUST=false
-      NEED_TS=false
-      echo "$CHANGED" | grep -qE '\.rs$' && NEED_RUST=true
-      echo "$CHANGED" | grep -qE '\.(ts|tsx)$' && NEED_TS=true
-
-      if $NEED_RUST || $NEED_TS; then
-        CMDS=""
-        $NEED_RUST && CMDS="cargo test -p lucidos-engine"
-        $NEED_TS && CMDS="${CMDS:+$CMDS && }cd crates/lucidos-app && npm test"
-        cat >&2 << TESTEOF
-BLOCKED: Run tests before pushing.
-
-/harden is done, but tests haven't been verified after review changes.
-
-Run: $CMDS
-After tests pass, write the marker:
-  touch $TESTS_MARKER
-Then retry the push.
-TESTEOF
-        exit 2
-      fi
-    fi
-
-    # Clear tests marker so the next push re-verifies.
-    rm -f "$TESTS_MARKER"
     exit 0
     ;;
   STALE)
-    rm -f "$TESTS_MARKER"
     cat >&2 << EOF
 BLOCKED: /harden marker is stale (HEAD moved since it was run).
 

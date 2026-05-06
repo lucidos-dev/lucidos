@@ -55,11 +55,17 @@ export function switchMenuItem(item: MenuItem) {
 export function openSettingsSubview(key: Exclude<SettingsSubview, 'main'>) {
   settingsSubview.value = key;
   if (key === 'accounts') loadCredentials();
+  panelOverlay.value = null;
+  localStorage.removeItem('file-preview-open');
+  localStorage.removeItem('app-window-open');
   pushNavState();
 }
 
-/** Navigate to Settings > Accounts (from outside settings — loads credentials). */
-export function navigateToAccounts() {
-  switchMenuItem('settings');
-  openSettingsSubview('accounts');
+/** Land on Settings > Accounts with `overlay` in a single render — caller
+ *  pushes nav state so Back returns to where the user was, not to an empty
+ *  Accounts intermediate. */
+export function landOnAccountsWithOverlay(overlay: PanelOverlay): void {
+  setActiveMenu('settings', overlay);
+  settingsSubview.value = 'accounts';
+  loadCredentials();
 }

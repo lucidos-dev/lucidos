@@ -18,7 +18,7 @@ if (typeof globalThis.document === 'undefined') {
     querySelector: () => null,
     querySelectorAll: () => [],
     documentElement: {
-      style: { setProperty: () => {}, getPropertyValue: () => '' },
+      style: { setProperty: () => {}, getPropertyValue: () => '', removeProperty: () => {} },
       toggleAttribute: () => {},
       setAttribute: () => {},
       removeAttribute: () => {},

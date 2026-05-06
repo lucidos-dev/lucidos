@@ -108,9 +108,24 @@ describe('renderMarkdown', () => {
     it('does not affect HTML inside code blocks', () => {
       const html = renderMarkdown('```\n<iframe src="x"></iframe>\n```');
       expect(html).toContain('code-block-wrapper');
-      // marked pre-escapes code block content, so <iframe> is already &lt;iframe&gt;
-      // and won't be double-escaped by the dangerous tag filter
       expect(html).not.toContain('<iframe');
+      expect(html).toContain('&lt;iframe');
+    });
+
+    it('escapes structural HTML tags inside code blocks so they render as text', () => {
+      // Regression: <html>, <head>, <body>, <title>, <!DOCTYPE> are not in the
+      // DANGEROUS_TAG filter. If the code renderer doesn't escape its text,
+      // the browser parses these as actual elements and the code block renders
+      // empty (the user-reported bug for the JS SDK boilerplate snippet).
+      const md = '```html\n<!DOCTYPE html>\n<html>\n  <head>\n    <title>X</title>\n  </head>\n  <body>hi</body>\n</html>\n```';
+      const html = renderMarkdown(md);
+      expect(html).not.toContain('<!DOCTYPE html>');
+      expect(html).not.toContain('<html>');
+      expect(html).not.toContain('<title>');
+      expect(html).not.toContain('<body>');
+      expect(html).toContain('&lt;!DOCTYPE html&gt;');
+      expect(html).toContain('&lt;title&gt;X&lt;/title&gt;');
+      expect(html).toContain('&lt;body&gt;hi&lt;/body&gt;');
     });
 
     it('preserves HTML inside inline code', () => {
@@ -296,6 +311,24 @@ Use this pattern for all prompts.`;
       const matches = html.match(/copyable-block/g);
       // Each block has the class once in the element, so at least 2
       expect(matches!.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  describe('thread reference links', () => {
+    it('rewrites bare-UUID thread links into clickable thread chips', () => {
+      const html = renderMarkdown('See [the bug](thread:1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff)');
+      expect(html).toContain('class="thread-link"');
+      expect(html).toContain('data-thread-id="1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff"');
+      expect(html).not.toContain('href="thread:');
+      expect(html).not.toContain('data-thread-workspace');
+    });
+
+    it('rewrites workspace-qualified thread links and preserves the workspace', () => {
+      const html = renderMarkdown('See [the bug](thread:dev/1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff)');
+      expect(html).toContain('class="thread-link"');
+      expect(html).toContain('data-thread-id="1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff"');
+      expect(html).toContain('data-thread-workspace="dev"');
+      expect(html).not.toContain('href="thread:');
     });
   });
 });

@@ -8,18 +8,15 @@ import {
   showToast,
   dismissToast,
 } from '../store';
-import { loadedOr, toFailed } from '../types';
+import { loadedOr, toFailed, setLoadingIfFresh } from '../types';
 import { listArtifacts, uploadFile } from '../../api/client';
-import { navigateToPane } from './pane';
+import { revealContentPane } from './pane';
 import { pushNavState } from './navigation';
-import { isMobile } from '../../utils/viewport';
 import { isTauri } from '../../utils/platform';
 import { errorDetail } from '../../utils/errorDetail';
 
 export async function loadArtifacts(): Promise<void> {
-  if (artifacts.value.status !== 'loaded') {
-    artifacts.value = { status: 'loading' };
-  }
+  setLoadingIfFresh(artifacts);
   try {
     const data = await listArtifacts();
     const paths = data.artifacts || [];
@@ -46,7 +43,6 @@ export async function loadArtifacts(): Promise<void> {
       }
     }
   } catch (error) {
-    console.error('Failed to load artifacts:', error);
     artifacts.value = toFailed(error);
   }
 }
@@ -145,8 +141,12 @@ export function openFilePreview(path: string, opts?: { preserveSource?: boolean 
   if (!opts?.preserveSource) filePreviewSource.value = false;
   panelOverlay.value = { type: 'file-preview', path };
   localStorage.setItem('file-preview-open', path);
-  if (isMobile()) navigateToPane('content');
+  revealContentPane();
   pushNavState();
+}
+
+export function refreshFilePreview(): void {
+  artifactRevision.value++;
 }
 
 // --- URL preview in panel ---
@@ -166,7 +166,7 @@ export function openUrl(url: string): void {
   localStorage.removeItem('file-preview-open');
   panelOverlay.value = { type: 'url-preview', url: normalized };
   webviewInitialUrl.value = normalized;
-  if (isMobile()) navigateToPane('content');
+  revealContentPane();
   pushNavState();
 }
 

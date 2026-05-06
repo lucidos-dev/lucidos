@@ -21,6 +21,7 @@ import {
   ensureOnThreadPane,
   waitForVisibleInput,
   userMessageBody,
+  REAL_THREAD_NAV,
 } from './helpers';
 
 test.describe('Mobile thread content rendering', () => {
@@ -66,7 +67,7 @@ test.describe('Mobile thread content rendering', () => {
 
     // Get thread A's nav element for later
     await openThreadDrawer(page);
-    const threadANav = page.locator('[data-thread-nav]:visible').first();
+    const threadANav = page.locator(`${REAL_THREAD_NAV}:visible`).first();
     await expect(threadANav).toBeVisible({ timeout: 10_000 });
     const threadAId = await threadANav.getAttribute('data-thread-nav');
 
@@ -105,7 +106,7 @@ test.describe('Mobile thread content rendering', () => {
 
     // Get thread A's ID
     await openThreadDrawer(page);
-    const threadANav = page.locator('[data-thread-nav]:visible').first();
+    const threadANav = page.locator(`${REAL_THREAD_NAV}:visible`).first();
     const threadAId = await threadANav.getAttribute('data-thread-nav');
 
     // Create thread B to force a thread switch
@@ -146,7 +147,7 @@ test.describe('Mobile thread content rendering', () => {
     await waitForResponse(page);
 
     await openThreadDrawer(page);
-    const threadANav = page.locator('[data-thread-nav]:visible').first();
+    const threadANav = page.locator(`${REAL_THREAD_NAV}:visible`).first();
     const threadAId = await threadANav.getAttribute('data-thread-nav');
 
     // Create thread B

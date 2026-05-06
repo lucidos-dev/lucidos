@@ -83,7 +83,7 @@ export function Drawer() {
   return (
     <div
       class={`drawer-backdrop ${drawerClosing.value ? 'closing' : ''}`}
-      onClick={() => closeDrawer()}
+      onClick={closeDrawer}
     >
       <nav
         class={`drawer ${drawerClosing.value ? 'closing' : ''}`}

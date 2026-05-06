@@ -64,6 +64,11 @@ pub(super) enum TerminalKind {
     Generated,
     Canceled,
     Aborted,
+    /// CC reported the turn ended in failure (mid-stream API error,
+    /// `error_max_turns`, etc.). Carries the user-facing reason so
+    /// `make_terminal_event` can populate `ResponseFailed.error` —
+    /// without this the partial response renders as a complete answer.
+    Failed { error: String },
 }
 
 /// True when CC was woken up with no user-initiated content — engine-internal
@@ -82,22 +87,106 @@ pub(super) fn is_silent_resume(user_text_empty: bool, has_images: bool) -> bool 
 /// `is_shutdown` were read twice and observed different values across the two
 /// branches: `ResponseGenerated` would fire (CC really finished) but the idle
 /// event would be skipped, leaving the thread row stuck at `running`.
+///
+/// Every non-silent, non-shutdown Result is a turn boundary and emits
+/// `CodingAgentIdled`. Inflight-followup race protection (deciding whether to
+/// keep the subprocess alive) is the run-loop's responsibility — see
+/// `AgentSession.pending_followups`.
+///
+/// Precedence: shutdown > cc_error > user_hit_stop > generated. Shutdown wins
+/// because the engine is going down regardless of how CC ended the turn — the
+/// next process emits `Aborted` and the recovery path re-resumes from there.
 pub(super) fn classify_result(
     is_silent_resume: bool,
     user_hit_stop: bool,
     is_shutdown: bool,
+    cc_error: Option<String>,
 ) -> (Option<TerminalKind>, bool) {
     if is_silent_resume {
         return (None, false);
     }
     let terminal = if is_shutdown {
         TerminalKind::Aborted
+    } else if let Some(error) = cc_error {
+        TerminalKind::Failed { error }
     } else if user_hit_stop {
         TerminalKind::Canceled
     } else {
         TerminalKind::Generated
     };
-    (Some(terminal), !is_shutdown)
+    let emit_idle = !is_shutdown;
+    (Some(terminal), emit_idle)
+}
+
+/// True when an arriving `Result` is the "stale --resume" signal — CC echoed
+/// our forwarded user message back as an empty answer because the persisted
+/// session id no longer exists. The run-loop responds by killing the worktree
+/// and retrying with a fresh spawn.
+///
+/// `cc_error.is_none()` is load-bearing: an empty Result with `is_error: true`
+/// is a real upstream failure (network drop, 5xx), not an expired session.
+/// Without that gate a transient API error would delete the worktree and
+/// branch, destroying user work.
+pub(super) fn is_stale_resume_signal(
+    has_resume_session: bool,
+    result_text_empty: bool,
+    buffered_text_empty: bool,
+    no_prior_results_this_turn: bool,
+    user_message_present: bool,
+    cc_error: bool,
+) -> bool {
+    has_resume_session
+        && result_text_empty
+        && buffered_text_empty
+        && no_prior_results_this_turn
+        && user_message_present
+        && !cc_error
+}
+
+/// Decide what terminal event the cancel arm of the run loop should emit when
+/// the cancel signal fires (user clicked Cancel, or engine shutdown propagated
+/// the cancel via the same channel).
+///
+/// User-driven cancel always emits `Canceled` — including when CC has just
+/// transitioned to `is_waiting` (the race between `CodingAgentIdled` landing
+/// and `cancel.notified()` firing). Without this, the prior `CodingAgentIdled`
+/// alone would render the exchange as "Done" even though the user explicitly
+/// clicked Cancel.
+///
+/// Shutdown of an actively-working CC emits `Aborted`. Shutdown of an
+/// already-idle CC emits nothing — the exchange completed legitimately and
+/// must not be relabeled "Aborted" by the engine going down.
+pub(super) fn cancel_terminal_kind(
+    is_shutdown: bool,
+    is_waiting: bool,
+) -> Option<TerminalKind> {
+    match (is_shutdown, is_waiting) {
+        (true, true) => None,
+        (true, false) => Some(TerminalKind::Aborted),
+        (false, _) => Some(TerminalKind::Canceled),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SessionEndAction {
+    Propose,
+    KeepExternalBranch,
+    CleanupBranches,
+}
+
+/// External repos with commits keep their branch even when the diff is empty —
+/// the user owns push/PR for that ref and we won't `branch -D` something they
+/// might want to keep.
+pub(super) fn classify_session_end_action(
+    has_commits: bool,
+    proposal_files_empty: bool,
+    is_external_repo: bool,
+) -> SessionEndAction {
+    match (has_commits, is_external_repo) {
+        (true, true) => SessionEndAction::KeepExternalBranch,
+        (true, false) if !proposal_files_empty => SessionEndAction::Propose,
+        _ => SessionEndAction::CleanupBranches,
+    }
 }
 
 /// Clear all per-turn flags at a turn boundary so prior-turn state can't
@@ -230,13 +319,134 @@ mod tests {
         );
     }
 
+    /// CC merges back-to-back stdin inputs into a single Result, so the
+    /// engine's `pending_followups` counter cannot be relied on to predict
+    /// whether more Results are coming. A normal `Generated` Result must
+    /// always emit `CodingAgentIdled` regardless of inflight inputs —
+    /// otherwise the thread sits in stored=Archived → DisplaySection::Archive
+    /// instead of Review. Inflight-followup race protection lives in the
+    /// run-loop's subprocess-termination decision, not here.
+    #[test]
+    fn generated_result_always_emits_idle() {
+        let (terminal, emit_idle) = classify_result(false, false, false, None);
+        assert_eq!(terminal, Some(TerminalKind::Generated));
+        assert!(
+            emit_idle,
+            "Generated Result must emit CodingAgentIdled so the thread reaches \
+             Review — not Archive — after CC produces a Result"
+        );
+    }
+
+    /// CC's stream-json result with `is_error: true` — produced when the
+    /// upstream API call dies mid-stream — must classify as `Failed` so the
+    /// frontend renders the partial response with a red failure indicator
+    /// instead of the green check ResponseGenerated would produce.
+    #[test]
+    fn cc_error_classifies_as_failed() {
+        let err = "Stream interrupted: connection reset".to_string();
+        let (terminal, emit_idle) =
+            classify_result(false, false, false, Some(err.clone()));
+        assert_eq!(terminal, Some(TerminalKind::Failed { error: err }));
+        assert!(
+            emit_idle,
+            "Failed Result is still a turn boundary — must emit CodingAgentIdled \
+             so the next follow-up resumes via --resume"
+        );
+    }
+
+    /// Shutdown beats CC error — the engine is going down regardless of how
+    /// CC ended its turn. Without this, an `Aborted` recovery path would
+    /// double-emit on restart (Failed already landed, then Aborted overwrites).
+    #[test]
+    fn shutdown_wins_over_cc_error() {
+        let (terminal, emit_idle) = classify_result(
+            false,
+            false,
+            true,
+            Some("api timeout".to_string()),
+        );
+        assert_eq!(terminal, Some(TerminalKind::Aborted));
+        assert!(
+            !emit_idle,
+            "shutdown must skip CodingAgentIdled regardless of cc_error"
+        );
+    }
+
+    /// CC error beats user_hit_stop — the user clicking Stop and CC failing
+    /// in the same window is rare, but the underlying failure is more
+    /// actionable than a benign cancel label.
+    #[test]
+    fn cc_error_wins_over_user_hit_stop() {
+        let err = "upstream 503".to_string();
+        let (terminal, _) =
+            classify_result(false, true, false, Some(err.clone()));
+        assert_eq!(terminal, Some(TerminalKind::Failed { error: err }));
+    }
+
+    /// Empty Result on a resumed turn with no error → real stale-resume
+    /// signal. The run-loop kills the worktree+branch and retries with a
+    /// fresh spawn.
+    #[test]
+    fn empty_result_on_resume_with_no_error_is_stale_resume() {
+        assert!(is_stale_resume_signal(
+            true,  // has_resume_session
+            true,  // result_text_empty
+            true,  // buffered_text_empty
+            true,  // no_prior_results_this_turn
+            true,  // user_message_present
+            false, // cc_error
+        ));
+    }
+
+    /// Empty Result on a resumed turn WITH a CC-reported error → real
+    /// upstream failure, NOT stale resume. Without this guard a transient
+    /// network drop would `worktree remove --force` + `branch -D`, destroying
+    /// user work that the live session was about to commit.
+    #[test]
+    fn empty_result_on_resume_with_cc_error_is_not_stale_resume() {
+        assert!(!is_stale_resume_signal(
+            true,  // has_resume_session
+            true,  // result_text_empty
+            true,  // buffered_text_empty
+            true,  // no_prior_results_this_turn
+            true,  // user_message_present
+            true,  // cc_error
+        ));
+    }
+
+    /// Non-resumed turn never qualifies (the retry path only makes sense
+    /// when the dead session id actually came from a prior CodingAgentIdled).
+    #[test]
+    fn fresh_session_is_never_stale_resume() {
+        assert!(!is_stale_resume_signal(false, true, true, true, true, false));
+    }
+
+    /// Silent resume (warmup with no user content) still drops every Result,
+    /// even when CC reports an error. Without this, an error-during-warmup
+    /// would emit ResponseFailed against a thread the user never engaged.
+    #[test]
+    fn silent_resume_drops_cc_error_too() {
+        let (terminal, emit_idle) = classify_result(
+            true,
+            false,
+            false,
+            Some("error_during_execution".to_string()),
+        );
+        assert!(terminal.is_none());
+        assert!(!emit_idle);
+    }
+
     /// Pin every input combination to its expected (terminal, emit_idle) pair.
-    /// The two invariants this guards:
+    /// The invariants this guards:
     ///   - `Generated` → `emit_idle = true`. Skipping idle here is the bug —
-    ///     CC really finished, so the thread row must flip to `waiting`/`idle`.
+    ///     CC really finished, so the thread row must flip to `waiting`/`idle`
+    ///     and the section must move to Review.
     ///   - `Aborted` → `emit_idle = false`. Emitting idle on shutdown makes
     ///     `recover_orphaned_worktrees` think the session is "truly idle" and
     ///     skip recovery on restart.
+    ///   - `Canceled` (user-driven stop) → `emit_idle = true`. Cancel is a
+    ///     turn boundary; the dispatcher needs `CodingAgentIdled` to pick up
+    ///     the next message via `--resume`.
     #[test]
     fn classify_result_table() {
         let cases = [
@@ -254,7 +464,7 @@ mod tests {
         ];
         for ((silent, stop, shutdown), expected) in cases {
             assert_eq!(
-                classify_result(silent, stop, shutdown),
+                classify_result(silent, stop, shutdown, None),
                 expected,
                 "(is_silent_resume={}, user_hit_stop={}, is_shutdown={})",
                 silent,
@@ -262,6 +472,49 @@ mod tests {
                 shutdown,
             );
         }
+    }
+
+    /// User-driven cancel always emits `Canceled`, even when CC has just
+    /// reached `is_waiting=true` between cancel.notify_one() and the cancel
+    /// arm firing. Without this, the prior `CodingAgentIdled` alone would
+    /// resolve the exchange to "Done" — but the user explicitly clicked
+    /// Cancel and expects to see "Canceled".
+    #[test]
+    fn user_cancel_emits_canceled_even_when_idle_raced_in_first() {
+        assert_eq!(
+            cancel_terminal_kind(false, true),
+            Some(TerminalKind::Canceled),
+            "user cancel during the is_waiting race must still emit Canceled"
+        );
+        assert_eq!(
+            cancel_terminal_kind(false, false),
+            Some(TerminalKind::Canceled),
+            "user cancel of an actively-working CC must emit Canceled"
+        );
+    }
+
+    /// Shutdown of an idle CC must emit nothing — the prior exchange already
+    /// completed cleanly via `CodingAgentIdled`, and emitting `Aborted` here
+    /// would relabel a finished exchange as crashed when the engine goes
+    /// down.
+    #[test]
+    fn shutdown_of_idle_session_emits_no_terminal_event() {
+        assert_eq!(
+            cancel_terminal_kind(true, true),
+            None,
+            "shutdown when CC is already idle must NOT emit a terminal event"
+        );
+    }
+
+    /// Shutdown of a working CC emits `Aborted` — the in-flight exchange was
+    /// killed by the engine, not finished by CC.
+    #[test]
+    fn shutdown_of_working_session_emits_aborted() {
+        assert_eq!(
+            cancel_terminal_kind(true, false),
+            Some(TerminalKind::Aborted),
+            "shutdown during active work must emit Aborted"
+        );
     }
 
     /// Only "no text AND no images" counts as silent — image-only turns are
@@ -274,5 +527,43 @@ mod tests {
         assert!(is_silent_resume(true, false));
         assert!(!is_silent_resume(false, false));
         assert!(!is_silent_resume(false, true));
+    }
+
+    /// Pin every input combination of `classify_session_end_action`. The
+    /// invariants this guards:
+    ///   - `(has_commits=true, files_empty=true, external=false)` → `CleanupBranches`,
+    ///     not `Propose`. This is the phantom-Change regression — observed
+    ///     when CC's auto-commit on cleanup advances the branch ref while
+    ///     the user concurrently clicked Apply Now, leaving the post-Apply
+    ///     branch with commits whose contents already live on main. Without
+    ///     this filter the engine emits a `ChangeProposed` with no files
+    ///     and the thread title as the fallback description, which the
+    ///     frontend renders as a pending Change the user can only Discard.
+    ///   - External repos with commits keep their branch regardless of
+    ///     `files_empty` — the user owns push/PR there; deleting the ref
+    ///     because the net diff happens to be zero would lose work.
+    ///   - No commits on the branch always cleans up, regardless of the
+    ///     other inputs (the diff signal is moot).
+    #[test]
+    fn classify_session_end_action_table() {
+        use SessionEndAction::*;
+        let cases = [
+            // (has_commits, files_empty, is_external) → action
+            ((true, false, false), Propose),
+            ((true, true, false), CleanupBranches), // ← phantom-Change regression
+            ((true, false, true), KeepExternalBranch),
+            ((true, true, true), KeepExternalBranch),
+            ((false, false, false), CleanupBranches),
+            ((false, true, false), CleanupBranches),
+            ((false, false, true), CleanupBranches),
+            ((false, true, true), CleanupBranches),
+        ];
+        for ((has_commits, files_empty, is_external), expected) in cases {
+            assert_eq!(
+                classify_session_end_action(has_commits, files_empty, is_external),
+                expected,
+                "(has_commits={has_commits}, files_empty={files_empty}, is_external={is_external})",
+            );
+        }
     }
 }

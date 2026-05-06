@@ -1,5 +1,6 @@
 use super::super::document::safe_extract_pdf_text;
 use super::super::LucidosEngine;
+use super::credentials::credential_request_payload;
 use crate::api::is_path_traversal;
 use crate::core::format_byte_size;
 use crate::core::oauth;
@@ -192,14 +193,12 @@ impl LucidosEngine {
                 .await
                 .map_err(|e| format!("Error: {}", e))?;
 
-                let prompt = format!("Enter the app password for {}", email_address);
-                let payload = serde_json::json!({
-                    "service": format!("email:{}", name),
-                    "prompt": prompt,
-                    "base_url": format!("smtp://{}", smtp_host),
-                    "auth_type": "email_password",
-                });
-                Ok(format!("[CREDENTIAL_REQUEST]{}", payload))
+                Ok(credential_request_payload(
+                    &format!("email:{}", name),
+                    &format!("Enter the app password for {}", email_address),
+                    &format!("smtp://{}", smtp_host),
+                    "email_password",
+                ))
             }
             tn::SEND_EMAIL => {
                 use crate::core::email::EmailClient;

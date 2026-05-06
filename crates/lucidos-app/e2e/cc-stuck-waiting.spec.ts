@@ -8,20 +8,20 @@ import {
 import { randomUUID } from 'crypto';
 import type { Page } from '@playwright/test';
 
-/** Click Apply, wait for Done (ChangeApplied keeps section=unread), click Done, poll until dismissed. */
+/** Click Apply, wait for Archive (ChangeApplied keeps archive_state=inbox), click Archive, poll until archived. */
 async function applyAndDismiss(page: Page, threadId: string): Promise<void> {
   const applyBtn = page.locator('.thread-action-buttons:visible button.action-btn-confirm:has-text("Apply")').first();
   await expect(applyBtn).toBeVisible({ timeout: 15_000 });
   await applyBtn.click();
 
-  const doneBtn = page.locator('.thread-action-buttons:visible button.action-btn:has-text("Done")').first();
-  await expect(doneBtn).toBeVisible({ timeout: 15_000 });
-  await doneBtn.click();
+  const archiveBtn = page.locator('.thread-action-buttons:visible button.action-btn:has-text("Archive")').first();
+  await expect(archiveBtn).toBeVisible({ timeout: 15_000 });
+  await archiveBtn.click();
 
   await expect.poll(
-    () => psql(`SELECT section FROM thread_summaries WHERE thread_id = '${threadId}'`),
+    () => psql(`SELECT archive_state FROM thread_summaries WHERE thread_id = '${threadId}'`),
     { intervals: [500], timeout: 10_000 },
-  ).toBe('default');
+  ).toBe('archived');
 }
 
 /**
@@ -32,7 +32,7 @@ async function applyAndDismiss(page: Page, threadId: string): Promise<void> {
  * permanently stuck in the Review section after engine restart.
  *
  * Fix: CodingAgentIdled now conditionally sets status — 'waiting' only if
- * has_changes=true, 'idle' otherwise. ThreadDismissed clears all CC flags.
+ * has_changes=true, 'idle' otherwise. ThreadArchived clears all CC flags.
  * Startup query resets orphaned waiting threads with no changes.
  */
 
@@ -42,7 +42,7 @@ function seedStuckThread(suffix: string): { threadId: string } {
   const now = new Date().toISOString();
 
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_pinned, has_response, status, section, is_cc, active_children_count, cc_has_changes, cc_requires_restart, cc_is_external_repo) VALUES ('${threadId}', 'E2E Stuck No Changes ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'unread', true, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count, cc_has_changes, cc_requires_restart, cc_is_external_repo) VALUES ('${threadId}', 'E2E Stuck No Changes ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, false, false, false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"test","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'ResponseGenerated', '{"text":"Done.","images":[]}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'CodingAgentIdled', '{"has_changes":false,"is_external_repo":false,"requires_restart":false}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
@@ -56,7 +56,7 @@ test.describe('CC stuck-in-waiting regression', () => {
     await assertHealthy(page);
     // Clean up stale waiting CC threads from previous tests to avoid
     // Done banners from old sessions interfering with these tests.
-    psql("UPDATE thread_summaries SET status = 'idle', section = 'default' WHERE status = 'waiting' AND is_cc = true");
+    psql("UPDATE thread_summaries SET status = 'idle', archive_state = 'archived' WHERE status = 'waiting' AND is_cc = true");
   });
 
   test('apply change moves thread from Review to History', async ({ page }) => {
@@ -89,8 +89,8 @@ test.describe('CC stuck-in-waiting regression', () => {
     }
   });
 
-  test('Done button dismisses stuck thread without changes', async ({ page }) => {
-    const suffix = `done-dismisses-${Date.now()}`;
+  test('Archive button dismisses stuck thread without changes', async ({ page }) => {
+    const suffix = `archive-dismisses-${Date.now()}`;
     const { threadId } = seedStuckThread(suffix);
 
     try {
@@ -99,17 +99,17 @@ test.describe('CC stuck-in-waiting regression', () => {
       }, threadId);
       await navigateToApp(page);
 
-      const doneBtn = page.locator('.thread-action-buttons:visible button.action-btn:has-text("Done")').first();
-      await expect(doneBtn).toBeVisible({ timeout: 15_000 });
+      const archiveBtn = page.locator('.thread-action-buttons:visible button.action-btn:has-text("Archive")').first();
+      await expect(archiveBtn).toBeVisible({ timeout: 15_000 });
 
       // Should NOT show Apply/Discard (no pending changes)
       await expect(page.locator('.thread-action-buttons:visible button:has-text("Apply")')).toHaveCount(0);
       await expect(page.locator('.thread-action-buttons:visible button:has-text("Discard")')).toHaveCount(0);
 
-      await doneBtn.click();
+      await archiveBtn.click();
 
       // Verify the seeded thread was dismissed — poll DB until status changes.
-      // Don't check banner visibility: handleDismissThread may focus
+      // Don't check banner visibility: handleArchiveThread may focus
       // another review thread (from a previous test's idle CC session).
       await expect.poll(
         () => psql(`SELECT status FROM thread_summaries WHERE thread_id = '${threadId}'`),

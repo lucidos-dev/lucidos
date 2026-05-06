@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -160,7 +160,6 @@ struct BrowserState {
     browser: Browser,
     current_page: Option<Page>,
     handler_task: JoinHandle<()>,
-    last_activity: Instant,
     session_id: Uuid,
     visible: bool,
 }
@@ -198,7 +197,7 @@ impl BrowserRuntime {
                 }
                 // Visibility mismatch — scan logins if headful, then close
                 log!(
-                    "Browser visibility mismatch (was {}, need {}), relaunching",
+                    "[Browser] Browser visibility mismatch (was {}, need {}), relaunching",
                     state.visible,
                     visible
                 );
@@ -223,7 +222,7 @@ impl BrowserRuntime {
                         .await;
                 }
                 state.handler_task.abort();
-                log!("Closed browser for session {} (profile lock)", key);
+                log!("[Browser] Closed browser for session {} (profile lock)", key);
             }
         }
 
@@ -235,7 +234,6 @@ impl BrowserRuntime {
                         browser,
                         current_page: None,
                         handler_task,
-                        last_activity: Instant::now(),
                         session_id: Uuid::new_v4(),
                         visible,
                     },
@@ -249,7 +247,7 @@ impl BrowserRuntime {
                     || e.contains("websocket") =>
             {
                 // Stale state from a previous crash — clean up and retry
-                log!("Launch failed ({}), cleaning up and retrying...", e);
+                log!("[Browser] Launch failed ({}), cleaning up and retrying...", e);
                 Self::cleanup_stale_profile(&profile_dir);
                 Self::kill_zombie_browsers(&profile_dir);
                 let (browser, handler_task) = Self::launch_browser(visible, &profile_dir)
@@ -261,7 +259,6 @@ impl BrowserRuntime {
                         browser,
                         current_page: None,
                         handler_task,
-                        last_activity: Instant::now(),
                         session_id: Uuid::new_v4(),
                         visible,
                     },
@@ -320,7 +317,7 @@ impl BrowserRuntime {
                 if let Err(e) = event {
                     let err_msg = e.to_string();
                     if !err_msg.contains("untagged enum Message") {
-                        log!("Handler error: {}", e);
+                        log!("[Browser] Handler error: {}", e);
                     }
                 }
             }
@@ -336,7 +333,7 @@ impl BrowserRuntime {
             for name in &["SingletonLock", "SingletonSocket", "SingletonCookie"] {
                 let p = profile_dir.join(name);
                 if p.exists() {
-                    log!("Removing stale {}", p.display());
+                    log!("[Browser] Removing stale {}", p.display());
                     let _ = std::fs::remove_file(&p);
                 }
             }
@@ -380,7 +377,7 @@ impl BrowserRuntime {
             s.handler_task.abort();
         }
         log!(
-            "Force-killed browser for session {} due to connection failure",
+            "[Browser] Force-killed browser for session {} due to connection failure",
             session_key
         );
     }
@@ -452,9 +449,9 @@ impl BrowserRuntime {
                     // Record for future fast-fail
                     if let (Some(ref pool), Some(ref domain)) = (&self.pool, &domain) {
                         if let Err(e) = HeadlessBlocklist::block(pool, domain, &reason).await {
-                            log!("Failed to record headless block for {}: {}", domain, e);
+                            log!("[Browser] Failed to record headless block for {}: {}", domain, e);
                         } else {
-                            log!("Recorded headless block for {}: {}", domain, reason);
+                            log!("[Browser] Recorded headless block for {}: {}", domain, reason);
                         }
                     }
                     return Err(format!(
@@ -479,7 +476,6 @@ impl BrowserRuntime {
         let browser_state = instances
             .get_mut(session_key)
             .ok_or("Browser not initialized")?;
-        browser_state.last_activity = Instant::now();
 
         // Close previous page to avoid leaking tabs
         if let Some(old_page) = browser_state.current_page.take() {
@@ -509,7 +505,7 @@ impl BrowserRuntime {
         } else {
             // Wait for page to load
             if let Err(e) = page.wait_for_navigation().await {
-                log!("Navigation timeout (continuing): {}", e);
+                log!("[Browser] Navigation timeout (continuing): {}", e);
             }
         }
 
@@ -567,7 +563,6 @@ impl BrowserRuntime {
         let browser_state = instances
             .get_mut(session_key)
             .ok_or("Browser not initialized")?;
-        browser_state.last_activity = Instant::now();
 
         let page = browser_state
             .current_page
@@ -688,7 +683,6 @@ impl BrowserRuntime {
         let browser_state = instances
             .get_mut(session_key)
             .ok_or("Browser not initialized")?;
-        browser_state.last_activity = Instant::now();
 
         let page = browser_state
             .current_page
@@ -746,7 +740,6 @@ impl BrowserRuntime {
         let browser_state = instances
             .get_mut(session_key)
             .ok_or("Browser not initialized")?;
-        browser_state.last_activity = Instant::now();
 
         let page = browser_state
             .current_page
@@ -815,7 +808,6 @@ impl BrowserRuntime {
         let browser_state = instances
             .get_mut(session_key)
             .ok_or("Browser not initialized")?;
-        browser_state.last_activity = Instant::now();
 
         let page = browser_state
             .current_page
@@ -884,7 +876,6 @@ impl BrowserRuntime {
         let browser_state = instances
             .get_mut(session_key)
             .ok_or("Browser not initialized")?;
-        browser_state.last_activity = Instant::now();
 
         let page = browser_state
             .current_page
@@ -1031,7 +1022,7 @@ impl BrowserRuntime {
 
         if let Some(ref pool) = self.pool {
             if let Err(e) = BrowserLogins::clear(pool).await {
-                log!("Failed to clear browser_logins table: {}", e);
+                log!("[Browser] Failed to clear browser_logins table: {}", e);
             }
         }
 
@@ -1049,7 +1040,7 @@ impl BrowserRuntime {
         let cookies = match browser.get_cookies().await {
             Ok(c) => c,
             Err(e) => {
-                log!("Failed to scan cookies: {}", e);
+                log!("[Browser] Failed to scan cookies: {}", e);
                 return;
             }
         };
@@ -1077,13 +1068,13 @@ impl BrowserRuntime {
 
         for domain in auth_domains.keys() {
             if let Err(e) = BrowserLogins::record(pool, domain, domain).await {
-                log!("Failed to record browser login for {}: {}", domain, e);
+                log!("[Browser] Failed to record browser login for {}: {}", domain, e);
             }
         }
 
         if !auth_domains.is_empty() {
             log!(
-                "Recorded {} probable login domains from cookies",
+                "[Browser] Recorded {} probable login domains from cookies",
                 auth_domains.len()
             );
         }
@@ -1093,12 +1084,12 @@ impl BrowserRuntime {
             if let Some(domain) = Self::scan_localstorage_for_auth(page).await {
                 if let Err(e) = BrowserLogins::record(pool, &domain, &domain).await {
                     log!(
-                        "Failed to record login from localStorage for {}: {}",
+                        "[Browser] Failed to record login from localStorage for {}: {}",
                         domain,
                         e
                     );
                 } else {
-                    log!("Recorded login from localStorage: {}", domain);
+                    log!("[Browser] Recorded login from localStorage: {}", domain);
                 }
             }
         }
@@ -1127,26 +1118,4 @@ impl BrowserRuntime {
         }
     }
 
-    /// Check if any browser instance is inactive past the timeout, and close idle ones.
-    /// Returns true if there are no active instances remaining.
-    pub async fn is_inactive(&self, timeout: Duration) -> bool {
-        let mut instances = self.instances.lock().await;
-
-        // Collect keys of inactive instances
-        let inactive_keys: Vec<String> = instances
-            .iter()
-            .filter(|(_, s)| s.last_activity.elapsed() > timeout)
-            .map(|(k, _)| k.clone())
-            .collect();
-
-        // Close inactive instances
-        for key in &inactive_keys {
-            if let Some(state) = instances.remove(key) {
-                state.handler_task.abort();
-                log!("Closed idle browser for session {}", key);
-            }
-        }
-
-        instances.is_empty()
-    }
 }

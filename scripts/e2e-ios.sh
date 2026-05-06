@@ -58,10 +58,8 @@ check_xcode() {
 
 # ── Kill simulator ──
 if [ -n "$KILL_SIM" ]; then
-    check_xcode
     echo "Shutting down iOS Simulator..."
-    xcrun simctl shutdown all 2>/dev/null || true
-    killall "Simulator" 2>/dev/null || true
+    kill_orphan_simulator
     echo "Done"
     exit 0
 fi

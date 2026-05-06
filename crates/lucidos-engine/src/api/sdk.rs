@@ -89,6 +89,7 @@ pub(super) struct NavigateRequest {
 
 pub(super) async fn ui_navigate(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<NavigateRequest>,
 ) -> Response {
     if body.target.is_empty() {
@@ -108,6 +109,7 @@ pub(super) async fn ui_navigate(
     }
     let payload = serde_json::Value::Object(payload);
 
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     if let Err(e) = state
         .engine
         .event_bus
@@ -116,7 +118,7 @@ pub(super) async fn ui_navigate(
             event: crate::engine::thread_events::ThreadEvent::NavigationRequested {
                 payload: payload.to_string(),
             },
-            meta: crate::engine::thread_events::EventMeta::NONE,
+            meta: crate::engine::thread_events::EventMeta::with_actor(actor),
         })
         .await
     {

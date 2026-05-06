@@ -1,11 +1,13 @@
 import type { ComponentChildren } from 'preact';
-import { useMemo, useRef, useEffect } from 'preact/hooks';
+import { useEffect, useMemo, useRef } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
 import { loadedOr } from '../../store/types';
-import type { ResponseEvent, App } from '../../store/types';
+import type { Loadable, ResponseEvent, App } from '../../store/types';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import type { Exchange } from '../../store/thread-events';
 import {
   ENGINE_LABEL,
+  LUCIDOS_AGENT_ICON,
   LUCIDOS_AGENT_LABEL,
   actorInitiator,
   exchangeUserMessage,
@@ -17,21 +19,26 @@ import {
   exchangeResponseEvents,
   exchangeStatus,
   exchangeError,
-  isAbortedByRestart,
+  isEmptyContinuedExchange,
+  findPermissionResolution,
+  findQuestionAnswer,
   isChangeLifecycleEvent,
   modeToInitiator,
+  originMode,
+  responseAbortedSummary,
+  resumeEngineNote,
 } from '../../store/thread-events';
 import type { Change } from '../../api/client';
-import { artifacts, appsList, popupImageSrc, stepsExpanded, detailsExpanded, threadMap, changes, appliedChanges, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
-import { cancelCurrentExchange, interruptCurrentExchange } from '../../store/actions/chat';
-import { StopIcon, ClaudeIcon } from '../shared/icons';
+import { continueThread } from '../../api/client';
+import { artifacts, appsList, popupImageSrc, stepsExpanded, detailsExpanded, threadMap, findChangeById, lazyChanges, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel, showToast, cancelingThreadIds } from '../../store/store';
+import { ClaudeIcon } from '../shared/icons';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openApp } from '../../store/actions/apps';
-import { revertChange } from '../../store/actions/chat-changes';
+import { revertChange, ensureChangeLoaded } from '../../store/actions/chat-changes';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { withScrollAnchor } from './CreateThreadView';
-import { QuestionCard } from './QuestionCard';
-import { PermissionCard } from './PermissionCard';
+import { QuestionBody } from './QuestionCard';
+import { PermissionBody } from './PermissionCard';
 import { getEventToggleState, getCollapsedVisibleEvents, splitEventSections } from '../../store/event-rendering';
 import { statusLabel as getStatusLabel, isActive as isStatusActive } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
@@ -58,9 +65,13 @@ interface Props {
   imageOffset?: number;
   priorModel?: string;
   priorEffort?: string;
+  /** True when this exchange is the most recent ResponseAborted with no
+   *  later SessionRecovered in the thread — the only one that shows the
+   *  Continue button. */
+  isUnresumedAbort?: boolean;
 }
 
-export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasPriorActive, imageOffset = 0, priorModel, priorEffort }: Props) {
+export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasPriorActive, imageOffset = 0, priorModel, priorEffort, isUnresumedAbort }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
@@ -75,7 +86,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
   const threadIsCC = threadMeta?.channel === 'claude_code';
   const threadIdle = threadMeta?.status === 'idle';
   const steps = exchangeSteps(exchange, isLast, threadIdle);
-  const events = exchangeResponseEvents(exchange, imageOffset, isLast);
+  const events = exchangeResponseEvents(exchange, imageOffset, isLast, threadIdle);
   const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle);
   const error = exchangeError(exchange);
 
@@ -119,8 +130,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
       e.preventDefault();
       const appId = appTarget.dataset.appId;
       if (appId) {
-        const loadedApps = loadedOr(appsList.value, []);
-        const app = loadedApps.find((s: App) => s.id === appId);
+        const app = apps.find((s: App) => s.id === appId);
         if (app) openApp(app);
       }
       return;
@@ -139,20 +149,15 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
     });
   }
 
-  const canceling = useSignal(false);
-  useEffect(() => {
-    if (!isStatusActive(status)) canceling.value = false;
-  }, [status]);
-
   const exchangeActive = isStatusActive(status);
-  const showAsContinued = status === 'done' && !hasResponse && !hasEvents && !isLast;
-  const displayStatus = showAsContinued ? 'interrupted' : status;
-  const sl = canceling.value
+  const isEmptyContinued = isEmptyContinuedExchange(status, hasResponse, events, isLast);
+  const isCanceling = exchangeActive && cancelingThreadIds.value.has(threadId);
+  const sl = isCanceling
     ? { label: 'Canceling', className: 'working' }
-    : getStatusLabel(displayStatus, hasSteps);
+    : getStatusLabel(status, hasSteps);
   const statusLabelText = sl.label;
   const statusClass = sl.className;
-  const showStatus = exchangeActive || hasResponse || hasEvents || showAsContinued || status === 'queued' || status === 'interrupted' || status === 'canceled' || status === 'error' || status === 'aborted';
+  const showStatus = exchangeActive || hasResponse || hasEvents || status === 'queued' || status === 'interrupted' || status === 'canceled' || status === 'error' || status === 'aborted';
 
   const responseTimestamp = exchangeResponseTimestamp(exchange);
 
@@ -227,38 +232,29 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
     [responseText, artifactPaths, apps],
   );
 
-  const initiator = describeInitiator(exchange, userMessageHtml, userImages);
+  const initiator = useMemo(
+    () => describeInitiator(exchange, userMessageHtml, userImages, threadId),
+    [exchange, userMessageHtml, userImages, threadId],
+  );
   const canCollapseInitiator = !!initiator.summary || !!initiator.details;
   const isInitiatorCollapsed = canCollapseInitiator
     && collapsedInitiators.value.has(`${threadId}:${exchange.userSeq}`);
   const isChangePanel = isChangeLifecycleEvent(exchange.userEvent);
-  // Change lifecycle exchanges are terminal — they have no response, just the
-  // initiator panel with optional Diff/Revert actions and a body for description/error.
-  const showResponsePanel = !isChangePanel && (hasResponse || hasEvents || showStatus);
-  const initiatorActions = isChangePanel
-    ? changeActions(
-        (exchange.userEvent as { change_id?: string }).change_id,
-        exchange.userEvent.type === 'ChangeApplyFailed',
-      )
-    : undefined;
+  const isAbortPanel = exchange.userEvent.type === 'ResponseAborted';
+  // Change lifecycle and abort-boundary exchanges are terminal — they have no
+  // response, just the initiator panel with optional actions (Diff/Revert,
+  // Continue).
+  const showResponsePanel = !isChangePanel && !isAbortPanel && !isEmptyContinued && (hasResponse || hasEvents || showStatus);
+  let initiatorActions: ComponentChildren | undefined;
+  if (isChangePanel) {
+    initiatorActions = changeActions(
+      (exchange.userEvent as { change_id?: string }).change_id,
+      exchange.userEvent.type === 'ChangeApplyFailed',
+    );
+  } else if (isAbortPanel && isUnresumedAbort) {
+    initiatorActions = <ContinueButton threadId={threadId} />;
+  }
   const executor = describeExecutor(threadIsCC);
-
-  const stopBtn = exchangeActive && !canceling.value ? (
-    <button
-      class="exchange-stop-btn"
-      data-tooltip="Stop"
-      onClick={async (e) => {
-        e.stopPropagation();
-        canceling.value = true;
-        const ok = threadIsCC
-          ? await interruptCurrentExchange()
-          : await cancelCurrentExchange();
-        if (!ok) canceling.value = false;
-      }}
-    >
-      <StopIcon />
-    </button>
-  ) : null;
 
   function renderResponseEvents(eventsList: ResponseEvent[]) {
     return eventsList.map((evt, i) => {
@@ -267,21 +263,12 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
       }
       if (evt.type === 'step' && showSteps) return <InlineStep key={`s${i}`} event={evt} />;
       if (evt.type === 'image') return <GeneratedImage key={`img${i}`} event={evt} />;
-      if (evt.type === 'question') return <QuestionCard key={`q${i}`} threadId={threadId} event={evt} />;
-      if (evt.type === 'permission') return <PermissionCard key={`p${i}`} event={evt} />;
       return null;
     });
   }
 
   return (
     <div class="chat-exchange" ref={rootRef}>
-      {error && (
-        <div class="exchange-error">
-          <strong>Event stream error</strong>
-          <p>{error}</p>
-        </div>
-      )}
-
       <InitiatorPanel
         initiator={initiator}
         timestamp={formatMessageTimestamp(timestamp)}
@@ -298,28 +285,26 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
         <ResponsePanel
           executor={executor}
           onExecutorClick={(e) => openInfoPanel('executor', e)}
+          hasBody={hasResponse || hasEvents}
           status={showStatus ? (
             <span class={`exchange-status-label exchange-status-${statusClass}`}>
               {statusLabelText}
               {statusClass === 'queued' && <span class="exchange-status-queued">{'○'}</span>}
+              {statusClass === 'working' && <span class="mini-spinner" aria-hidden="true" />}
               {statusClass === 'waiting' && <span class="progress-dot progress-dot-waiting" />}
               {statusClass === 'awaiting' && <span class="exchange-status-awaiting">{'?'}</span>}
-              {statusClass === 'done' && displayStatus !== 'interrupted' && <span class="exchange-status-check">{'✓'}</span>}
-              {displayStatus === 'interrupted' && <span class="exchange-status-continued">{'↳'}</span>}
+              {statusClass === 'done' && status !== 'interrupted' && <span class="exchange-status-check">{'✓'}</span>}
+              {status === 'interrupted' && <span class="exchange-status-continued">{'↳'}</span>}
               {statusClass === 'canceled' && <span class="exchange-status-x">{'✕'}</span>}
               {statusClass === 'error' && <span class="exchange-status-x">{'✕'}</span>}
               {statusClass === 'aborted' && <span class="exchange-status-warning">{'⚠'}</span>}
             </span>
           ) : null}
           timestamp={formatMessageTimestamp(responseTimestamp || timestamp)}
-          stopBtn={stopBtn}
           collapsible={canCollapse}
           collapsed={isCollapsed}
           onToggle={canCollapse
             ? () => toggleExchangeCollapsed(threadId, exchange.userSeq)
-            : undefined}
-          aborted={status === 'aborted' && (hasResponse || hasEvents)
-            ? (isAbortedByRestart(exchange) ? 'Engine restart interrupted this response' : 'Response interrupted')
             : undefined}
         >
           {hasEvents && hasSections ? (
@@ -345,6 +330,13 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
           )}
         </ResponsePanel>
       )}
+
+      {error && (
+        <div class="exchange-error">
+          <strong>Event stream error</strong>
+          <p>{error}</p>
+        </div>
+      )}
     </div>
   );
 }
@@ -359,7 +351,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
 // Click the actor to open the route popover for finer origin info.
 // ---------------------------------------------------------------------------
 
-export type InitiatorVariant = 'user' | 'system' | 'trigger';
+export type InitiatorVariant = 'user' | 'system' | 'trigger' | 'lucidos';
 
 export interface InitiatorDescriptor {
   variant: InitiatorVariant;
@@ -381,9 +373,11 @@ export interface InitiatorDescriptor {
 export function initiatorSummary(ev: Exchange['userEvent']): string {
   switch (ev.type) {
     case 'TriggerStarted':           return 'Trigger fired';
-    case 'SessionRecovered':         return 'Engine restarted';
+    case 'SessionRecovered':         return 'Resumed after engine restart';
+    case 'ResponseAborted':            return responseAbortedSummary(ev.actor);
     case 'MissingHardeningDetected': return 'Hardening required';
     case 'MergeConflictDetected':    return 'Merging changes from main';
+    case 'CodingAgentPromptSent':    return 'Engine-injected prompt';
     case 'ChangeApplied':            return 'Change applied';
     case 'ChangeDiscarded':          return 'Change discarded';
     case 'ChangeReverted':           return 'Change reverted';
@@ -393,14 +387,43 @@ export function initiatorSummary(ev: Exchange['userEvent']): string {
       if (ev.origin?.kind === 'api') return 'API message';
       if (modeToInitiator(ev.mode) === 'system') return 'Forwarded message';
       return '';
+    // Divider exchanges — the body component carries the question/permission
+    // text, so the panel needs no separate summary line.
+    case 'UserQuestionAsked':            return '';
+    case 'CodingAgentPermissionRequest': return '';
+    case 'CredentialRequested':          return `Credentials requested: ${ev.provider}`;
+    case 'McpConsentRequested':          return `Tool consent requested: ${ev.tool}`;
     default:                         return '';
   }
+}
+
+/** Pick the panel variant for an event whose actor IS the initiator (forwarded
+ *  message, child→parent callback). Engine-narrated events (change lifecycle,
+ *  recovery) hardcode `'system'` regardless of the actor in their header. */
+function actorVariant(actor: Parameters<typeof actorInitiator>[0]): InitiatorVariant {
+  return originMode(actor) === 'agent' ? 'lucidos' : 'system';
+}
+
+/** Build a `'user'`-variant initiator descriptor with the standard human chip
+ *  (icon + "You" label) and a caller-supplied summary/details/accent. Shared by
+ *  every arm where the device-owner is the initiator (MessageReceived from a
+ *  device, divider-starter ActionRequired events, …). */
+function youInitiator(rest: Partial<InitiatorDescriptor> = {}): InitiatorDescriptor {
+  return { variant: 'user', icon: '\u{1F464}', label: 'You', ...rest };
+}
+
+/** Build a `'system'`-variant descriptor with the engine chip (⚙ + Lucidos
+ *  Engine). Shared by every arm where the engine narrates its own action
+ *  (hardening / merge-conflict detection, legacy bare CC prompt). */
+function engineInitiator(summary: string, details?: ComponentChildren): InitiatorDescriptor {
+  return { variant: 'system', icon: '⚙', label: ENGINE_LABEL, summary, details };
 }
 
 export function describeInitiator(
   exchange: Exchange,
   userMessageHtml: string,
   userImages: { base64: string; mimeType: string }[],
+  threadId: string,
 ): InitiatorDescriptor {
   const ev = exchange.userEvent;
   const summary = initiatorSummary(ev);
@@ -414,16 +437,37 @@ export function describeInitiator(
         details: ev.prompt ? <MarkdownBlock html={renderMarkdown(ev.prompt)} /> : undefined,
       };
     case 'SessionRecovered':
-    case 'MissingHardeningDetected':
-      return { variant: 'system', icon: '⚙', label: ENGINE_LABEL, summary };
-    case 'MergeConflictDetected':
+      // SessionRecovered carries an actor (device when triggered by Continue,
+      // engine if auto-resume returns). Drive the chip from that actor.
       return {
-        variant: 'system',
-        icon: '⚙',
-        label: ENGINE_LABEL,
+        variant: actorVariant(ev.actor),
+        ...actorInitiator(ev.actor),
         summary,
-        details: (ev.files?.length ?? 0) > 0 ? <FileList files={ev.files!} /> : undefined,
+        details: <ResumeNoteBody exchange={exchange} />,
       };
+    case 'ResponseAborted':
+      // ResponseAborted is now an exchange boundary. Engine-attributed crashes
+      // render '⚙ System'; device-attributed restarts render '👤 You'.
+      return {
+        variant: actorVariant(ev.actor),
+        ...actorInitiator(ev.actor),
+        summary,
+      };
+    case 'MissingHardeningDetected':
+      return engineInitiator(summary);
+    case 'MergeConflictDetected':
+      return engineInitiator(
+        summary,
+        (ev.files?.length ?? 0) > 0 ? <FileList files={ev.files!} /> : undefined,
+      );
+    case 'CodingAgentPromptSent':
+      // Reached only when the prompt has no preceding boundary (legacy
+      // engine-spawned CC threads). Render the prompt text as the panel body
+      // so the merge-conflict / hardening instructions are visible.
+      return engineInitiator(
+        summary,
+        ev.text ? <MarkdownBlock html={renderMarkdown(ev.text)} /> : undefined,
+      );
     case 'ChangeApplied':
     case 'ChangeDiscarded':
     case 'ChangeReverted':
@@ -443,7 +487,7 @@ export function describeInitiator(
     case 'UserPromptInjected':
       // Legacy rows lack `origin` and fall back to the engine label.
       return {
-        variant: 'system',
+        variant: actorVariant(ev.origin),
         ...actorInitiator(ev.origin),
         summary,
         details: <MarkdownBlock html={userMessageHtml} />,
@@ -453,15 +497,57 @@ export function describeInitiator(
         ? <UserMessageBody html={userMessageHtml} images={userImages} />
         : undefined;
       if (ev.origin?.kind === 'api' || modeToInitiator(ev.mode) === 'system') {
-        return { variant: 'system', summary, details, ...actorInitiator(ev.origin) };
+        return { variant: actorVariant(ev.origin), summary, details, ...actorInitiator(ev.origin) };
       }
-      return { variant: 'user', icon: '\u{1F464}', label: 'You', details };
+      return youInitiator({ details });
     }
+    case 'UserQuestionAsked': {
+      // Resolution lives on this exchange's steps as UserQuestionAnswered;
+      // matched by tool_use_id so a stale Answered from a different question
+      // can't bleed in.
+      const answered = findQuestionAnswer(exchange, ev.tool_use_id);
+      return youInitiator({
+        details: (
+          <QuestionBody
+            threadId={threadId}
+            toolUseId={ev.tool_use_id}
+            question={ev.question}
+            options={ev.options ?? []}
+            resolved={answered?.answer}
+          />
+        ),
+      });
+    }
+    case 'CodingAgentPermissionRequest': {
+      const resolvedStep = findPermissionResolution(exchange, ev.request_id);
+      const resolved = resolvedStep
+        ? { allowed: resolvedStep.allowed, reason: resolvedStep.reason }
+        : undefined;
+      return youInitiator({
+        details: (
+          <PermissionBody
+            event={{
+              request_id: ev.request_id,
+              tool_use_id: ev.tool_use_id,
+              tool_name: ev.tool_name,
+              input: ev.input,
+              summary: ev.summary,
+            }}
+            resolved={resolved}
+          />
+        ),
+      });
+    }
+    case 'CredentialRequested':
+    case 'McpConsentRequested':
+      // Minimal divider rendering — chip + summary line. No body component
+      // today; the engine surfaces these via separate transient flows.
+      return youInitiator({ summary });
     default:
       // Unreachable in production (groupIntoExchanges only assigns starter
       // types to userEvent), but `userEvent: StoredEvent` covers every event
       // variant for legacy reasons, so TS can't enforce exhaustiveness here.
-      return { variant: 'user', icon: '\u{1F464}', label: 'You' };
+      return youInitiator();
   }
 }
 
@@ -482,7 +568,7 @@ function MarkdownBlock({ html }: { html: string }) {
 function FileList({ files }: { files: string[] }) {
   return (
     <ul class="initiator-files">
-      {files.map(f => <li><code>{f}</code></li>)}
+      {files.map(f => <li key={f}><code>{f}</code></li>)}
     </ul>
   );
 }
@@ -515,15 +601,26 @@ function UserMessageBody({ html, images }: { html: string; images: { base64: str
  *  file count, and (when failed) the error message. The resolved timestamp is
  *  the panel header timestamp (the change-lifecycle event time IS resolved_at). */
 function ChangeBody({ changeId, error }: { changeId?: string; error?: string }) {
-  const change: Change | undefined = changeId
-    ? (changes.value.find(c => c.id === changeId)
-       || appliedChanges.value.find(c => c.id === changeId))
+  const change: Change | undefined = changeId ? findChangeById(changeId) : undefined;
+  const lazy: Loadable<Change> = (changeId ? lazyChanges.value.get(changeId) : undefined) ?? { status: 'not-loaded' };
+  const showLoading = useDelayedLoading(lazy);
+
+  useEffect(() => {
+    if (changeId) void ensureChangeLoaded(changeId);
+  }, [changeId]);
+
+  // Lifecycle error and live data both win over the lazy-fetch state — a 404
+  // for a row that arrives via SSE moments later shouldn't strand a stale
+  // "Failed to load" row beneath the now-resolved description.
+  const lazyFailedError = !error && !change && lazy.status === 'failed'
+    ? `Failed to load change details: ${lazy.error}`
     : undefined;
+  const lazyLoading = !change && lazy.status === 'loading' && showLoading;
 
   const desc = change ? change.description.split('\n')[0] : undefined;
   const fileCount = change?.file_count;
 
-  if (!desc && fileCount == null && !error) return null;
+  if (!desc && fileCount == null && !error && !lazyFailedError && !lazyLoading) return null;
   return (
     <div class="change-body">
       {desc && <div class="change-body-desc">{desc}</div>}
@@ -531,7 +628,55 @@ function ChangeBody({ changeId, error }: { changeId?: string; error?: string }) 
         <div class="change-body-meta">{fileCount} file{fileCount !== 1 ? 's' : ''}</div>
       )}
       {error && <div class="change-body-error">{error}</div>}
+      {lazyFailedError && <div class="change-body-error">{lazyFailedError}</div>}
+      {lazyLoading && <div class="change-body-meta">Loading...</div>}
     </div>
+  );
+}
+
+/** "Continue" button rendered on the most recent unresumed ResponseAborted
+ *  exchange. Disables itself between click and response so a double-click
+ *  can't double-emit. Surfaces network failures via toast and re-enables. */
+function ContinueButton({ threadId }: { threadId: string }) {
+  const inFlight = useSignal(false);
+  const onClick = async (e: MouseEvent) => {
+    e.stopPropagation();
+    if (inFlight.value) return;
+    inFlight.value = true;
+    try {
+      await continueThread(threadId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      showToast(`Failed to continue: ${msg}`, 'error');
+      inFlight.value = false;
+      return;
+    }
+    // SessionRecovered will arrive via SSE and remove the button by hiding
+    // this exchange's `isUnresumedAbort` — re-enable as a safety net in case
+    // the SSE event is delayed.
+    setTimeout(() => { inFlight.value = false; }, 5000);
+  };
+  return (
+    <button class="action-btn" onClick={onClick} disabled={inFlight.value}>
+      {inFlight.value ? 'Continuing...' : 'Continue'}
+    </button>
+  );
+}
+
+/** Render the engine note for a SessionRecovered exchange — a one-line
+ *  subline followed by a `<details>` expansion showing the full injected text.
+ *  Returns null when no engine note is present (e.g. CC resume path). */
+function ResumeNoteBody({ exchange }: { exchange: Exchange }) {
+  const note = resumeEngineNote(exchange);
+  if (!note) return null;
+  const subline = note.toolCount > 0
+    ? `Reminded the model about ${note.toolCount} prior tool call${note.toolCount === 1 ? '' : 's'}`
+    : 'Reminded the model that no actions had completed';
+  return (
+    <details class="resume-note">
+      <summary>{subline}</summary>
+      <pre class="resume-note-body">{note.text}</pre>
+    </details>
   );
 }
 
@@ -541,8 +686,7 @@ function ChangeBody({ changeId, error }: { changeId?: string; error?: string }) 
  *  pending — user reads the error, doesn't diff/revert). */
 function changeActions(changeId?: string, suppress?: boolean): ComponentChildren {
   if (suppress || !changeId) return null;
-  const change = changes.value.find(c => c.id === changeId)
-    || appliedChanges.value.find(c => c.id === changeId);
+  const change = findChangeById(changeId);
   if (!change) return null;
   const showDiff = change.status === 'pending' || !!change.pre_merge_sha;
   const showRevert = change.status === 'applied';
@@ -621,7 +765,7 @@ export function describeExecutor(
   isCC: boolean,
 ): { icon: ComponentChildren; label: string } {
   if (isCC) return { icon: <ClaudeIcon />, label: 'Claude Code' };
-  return { icon: '💡', label: LUCIDOS_AGENT_LABEL };
+  return { icon: LUCIDOS_AGENT_ICON, label: LUCIDOS_AGENT_LABEL };
 }
 
 interface ResponsePanelProps {
@@ -629,19 +773,18 @@ interface ResponsePanelProps {
   onExecutorClick?: (e: MouseEvent) => void;
   status: ComponentChildren;
   timestamp: string;
-  stopBtn: ComponentChildren;
   collapsible: boolean;
   collapsed: boolean;
   onToggle?: () => void;
-  aborted?: string;
+  hasBody: boolean;
   children: ComponentChildren;
 }
 
 function ResponsePanel({
-  executor, onExecutorClick, status, timestamp, stopBtn, collapsible, collapsed, onToggle, aborted, children,
+  executor, onExecutorClick, status, timestamp, collapsible, collapsed, onToggle, hasBody, children,
 }: ResponsePanelProps) {
   return (
-    <div class={`response-panel${collapsed ? ' response-panel-collapsed' : ''}`}>
+    <div class={`response-panel${collapsed ? ' response-panel-collapsed' : ''}${hasBody ? '' : ' response-panel-bodyless'}`}>
       <div
         class={`response-header${collapsible ? ' response-header-clickable' : ''}`}
         onClick={(e) => handlePanelHeaderClick(e, onToggle)}
@@ -657,19 +800,12 @@ function ResponsePanel({
         </button>
         <span class="response-meta">
           {status}
-          {stopBtn}
           <span class="response-timestamp">{timestamp}</span>
         </span>
       </div>
-      {!collapsed && (
+      {hasBody && !collapsed && (
         <div class="response-body">
           {children}
-          {aborted && (
-            <div class="response-aborted-marker">
-              <span class="response-aborted-icon">{'⚠'}</span>
-              <span>{aborted}</span>
-            </div>
-          )}
         </div>
       )}
     </div>
@@ -695,9 +831,10 @@ function GeneratedImage({ event }: { event: Extract<ResponseEvent, { type: 'imag
 function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
   const statusClass = event.success === null ? 'pending' : event.success ? 'success' : 'error';
   const hasContext = event.context_tokens != null;
+  const tooltip = event.full !== event.description ? event.full : undefined;
 
   return (
-    <div class={`inline-step ${statusClass}`}>
+    <div class={`inline-step ${statusClass}`} data-tooltip={tooltip}>
       <span class="step-icon">
         {event.success === null ? <span class="mini-spinner" /> : event.success ? '✓' : '⚠'}
       </span>

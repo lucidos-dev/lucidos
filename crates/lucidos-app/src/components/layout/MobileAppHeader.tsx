@@ -1,9 +1,11 @@
 import type { ComponentType } from 'preact';
 import { useState, useRef, useCallback } from 'preact/hooks';
 import { ConnectionStatus } from './ConnectionStatus';
-import { createComposeDraft } from '../../store/actions/drafts';
+import { unfocusThread } from '../../store/actions/threads';
 import { composeHandlers } from '../chat/promptFocus';
-import { ComposeIcon, GridIcon, SearchIcon, FilterIcon, ThreadsIcon } from '../shared/icons';
+import { ComposeIcon, GridIcon, SearchIcon, FilterIcon, ThreadsIcon, DraftsIcon } from '../shared/icons';
+import { CopyThreadRefButton } from '../shared/CopyThreadRefButton';
+import { ExportThreadButton } from '../shared/ExportThreadButton';
 import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './PanelNav';
@@ -11,12 +13,12 @@ import { ContentHeaderActions } from './ContentHeaderActions';
 import { ControlPanel, controlPanelOpen, controlPanelBadgeCount, controlPanelBadgeTooltip } from './ControlPanel';
 import { ThreadFilterDropdown } from './ThreadFilterDropdown';
 import { getContentTitle, getDiffDescription } from './headerHelpers';
-import { attentionThreadCount, threadSearchQuery, mobileView, MOBILE_VIEWS, threadChannelFilter, ALL_CHANNELS, unreadCount, changes, focusedThreadId, threadMap, effectiveThreadStatus, type MobileView } from '../../store/store';
+import { attentionThreadCount, threadSearchQuery, mobileView, MOBILE_VIEWS, threadChannelFilter, ALL_CHANNELS, unreadCount, focusedThreadId, threadMap, effectiveThreadStatus, draftsViewActive, type MobileView } from '../../store/store';
 import { navigateToPane, toggleThreads } from '../../store/actions/pane';
 import { useThreadSearch } from '../../hooks/useThreadSearch';
 import { ThreadTitleEditor } from '../chat/ThreadTitleEditor';
 import { ThreadStatusIcon, resolveVisualStatus } from '../shared/ThreadStatusIcon';
-import { PinButton } from '../shared/PinButton';
+import { threadDisplayTitle } from '../../utils/threadTitle';
 import { MobileThreadsPane } from './MobileThreadsPane';
 import { ThreadPane } from './ThreadPane';
 import { ContentPane } from './ContentPane';
@@ -34,11 +36,11 @@ export interface MobilePaneConfig {
 export const MOBILE_PANE_CONFIGS: Record<MobileView, MobilePaneConfig> = {
   threads: { Header: MobileThreadsHeader, Pane: MobileThreadsPane },
   thread:  { Header: MobileThreadHeader,  Pane: ThreadPane },
-  content: { Header: MobileContentHeader, Pane: ContentPane },
+  content: { Header: MobileContentHeader, Pane: () => <ContentPane layout="mobile" /> },
 };
 
 /** Mobile threads header — search and filter for the threads pane */
-export function MobileThreadsHeader() {
+function MobileThreadsHeader() {
   const [filterOpen, setFilterOpen] = useState(false);
   const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadSearch();
   const toggleRef = useRef<HTMLButtonElement>(null);
@@ -68,28 +70,37 @@ export function MobileThreadsHeader() {
             </svg>
           </button>
         </div>
-        <span class="icon-btn header-icon" style={{ visibility: 'hidden' }} aria-hidden="true" />
-        <span class="icon-btn header-icon" style={{ visibility: 'hidden' }} aria-hidden="true" />
-        <span class="pane-header-title mobile-header-title">Threads</span>
-        <div class="pane-header-spacer" />
-        <button
-          class="icon-btn header-icon brand-compose-btn"
-          {...composeHandlers(() => { createComposeDraft(); navigateToPane('thread'); })}
-          aria-label="New thread"
-        >
-          <ComposeIcon />
-        </button>
         <div style={{ position: 'relative' }}>
           <button
             ref={toggleRef}
             class={`icon-btn header-icon${filterActive ? ' filter-active' : ''}`}
             onClick={() => setFilterOpen(!filterOpen)}
+            disabled={draftsViewActive.value}
             aria-label="Filter threads"
+            data-tooltip={draftsViewActive.value ? 'Filter unavailable in drafts view' : 'Filter threads'}
+            style={draftsViewActive.value ? 'pointer-events: auto; cursor: default;' : undefined}
           >
             <FilterIcon />
           </button>
-          {filterOpen && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
+          {filterOpen && !draftsViewActive.value && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
         </div>
+        <div class="mobile-nav-slot"><ThreadNav keepCurrentPane /></div>
+        <span class="pane-header-title mobile-header-title">Threads</span>
+        <div class="pane-header-spacer" />
+        <button
+          class="icon-btn header-icon brand-compose-btn"
+          {...composeHandlers(() => { unfocusThread(); navigateToPane('thread'); })}
+          aria-label="New thread"
+        >
+          <ComposeIcon />
+        </button>
+        <button
+          class={`icon-btn header-icon${draftsViewActive.value ? ' drafts-active' : ''}`}
+          onClick={() => { draftsViewActive.value = !draftsViewActive.value; }}
+          aria-label="Toggle drafts view"
+        >
+          <DraftsIcon />
+        </button>
         <button
           class="icon-btn header-icon"
           {...openSearchHandlers}
@@ -103,9 +114,8 @@ export function MobileThreadsHeader() {
 }
 
 /** Mobile thread header — brand mode with thread grid icon to navigate to threads pane */
-export function MobileThreadHeader() {
+function MobileThreadHeader() {
   const badgeCount = controlPanelBadgeCount();
-  const contentBadge = unreadCount.value + changes.value.length;
 
   return (
     <div class="mobile-thread-header">
@@ -137,7 +147,7 @@ export function MobileThreadHeader() {
         <div class="pane-header-spacer" />
         <button
           class="icon-btn header-icon brand-compose-btn"
-          {...composeHandlers(() => createComposeDraft())}
+          {...composeHandlers(() => unfocusThread())}
           aria-label="New thread"
         >
           <ComposeIcon />
@@ -149,8 +159,8 @@ export function MobileThreadHeader() {
           aria-label="Show content"
         >
           <GridIcon />
-          {contentBadge > 0 && (
-            <span class="badge">{contentBadge > 99 ? '99+' : contentBadge}</span>
+          {unreadCount.value > 0 && (
+            <span class="badge">{unreadCount.value > 99 ? '99+' : unreadCount.value}</span>
           )}
         </button>
       </div>
@@ -159,7 +169,7 @@ export function MobileThreadHeader() {
 }
 
 /** Mobile content header — same as desktop content side */
-export function MobileContentHeader() {
+function MobileContentHeader() {
   const title = getContentTitle();
   const diffDesc = getDiffDescription();
 
@@ -204,22 +214,23 @@ export function MobileDotIndicator() {
 export function MobileThreadTitleBar() {
   const threadId = focusedThreadId.value;
   const eventThread = threadId ? threadMap.value.get(threadId) : undefined;
-  const threadTitle = eventThread?.meta.title || '';
-  const visualStatus = eventThread
-    ? resolveVisualStatus(
-        effectiveThreadStatus(eventThread),
-        eventThread.meta.activeChildrenCount > 0,
-        eventThread.meta.ccHasChanges,
-      )
-    : undefined;
+  if (!threadId || !eventThread) return null;
 
-  if (!threadId) return null;
+  const threadTitle = threadDisplayTitle(eventThread);
+  const visualStatus = resolveVisualStatus(
+    effectiveThreadStatus(eventThread),
+    eventThread.meta.activeChildrenCount > 0,
+    eventThread.meta.ccHasChanges,
+  );
 
   return (
     <div class="mobile-thread-title-row">
-      <PinButton threadId={threadId} pinned={eventThread?.meta.pinned ?? false} />
+      <ThreadStatusIcon status={visualStatus} />
       <ThreadTitleEditor threadId={threadId} title={threadTitle} />
-      {visualStatus && <ThreadStatusIcon status={visualStatus} />}
+      <span class="thread-view-header-actions">
+        <CopyThreadRefButton threadId={threadId} title={threadTitle} />
+        <ExportThreadButton threadId={threadId} title={threadTitle} />
+      </span>
     </div>
   );
 }

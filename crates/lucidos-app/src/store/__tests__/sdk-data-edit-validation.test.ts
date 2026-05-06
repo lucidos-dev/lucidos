@@ -59,7 +59,7 @@ describe('SDK runtime input validation', () => {
       expect(() => {
         (lucidos.triggers.create as Function)({
           name: 'test',
-          run: { type: 'intent', text: 'test', knowhow: [] },
+          run: { type: 'intent', intent: 'test', knowhow: [] },
           cron_expressions: '0 0 8 * * *',
         });
       }).toThrow(TypeError);

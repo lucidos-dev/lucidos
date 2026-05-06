@@ -6,7 +6,8 @@
 #
 # Options:
 #   -f <filter>      Filter tests by name (passed to cargo test as filter)
-#   --no-reset       Skip database reset
+#   --no-reset       Skip DB reset AND leave the workspace running for the next
+#                    invocation. Use for fast iteration on a single test.
 #   --               Everything after this is passed to cargo test
 #
 # Examples:
@@ -33,16 +34,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-acquire_e2e_lock e2e-api || exit 1
-ensure_workspace_running
-teardown_e2e() {
-    stop_e2e_workspace
-    release_e2e_lock
-}
-trap teardown_e2e EXIT
-trap 'exit 130' INT TERM
-[ -z "$NO_RESET" ] && cleanup_e2e_worktrees
-[ -z "$NO_RESET" ] && reset_e2e_database
+setup_e2e_session e2e-api
 
 echo "Running API e2e tests (port $VITE_PORT)"
 
@@ -50,13 +42,12 @@ cd "$PROJECT_DIR"
 
 export E2E_WORKSPACE
 
-# The CLI tests in api_e2e shell out to the `lucidos` binary. Make sure it's
-# built and at the expected target path before tests run.
+# The CLI tests shell out to the `lucidos` binary. Make sure it's built and at
+# the expected target path before tests run.
 cargo build -p lucidos-cli
 
-CMD=(cargo test -p lucidos-engine --test api_e2e)
+CMD=(cargo test -p lucidos-e2e --test api)
 [ -n "$FILTER" ] && CMD+=("$FILTER")
-CMD+=("--" "--ignored")
-[ ${#CARGO_ARGS[@]} -gt 0 ] && CMD+=("${CARGO_ARGS[@]}")
+[ ${#CARGO_ARGS[@]} -gt 0 ] && CMD+=("--" "${CARGO_ARGS[@]}")
 
 "${CMD[@]}"

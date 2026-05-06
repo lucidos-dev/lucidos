@@ -15,7 +15,6 @@ use types::McpTool;
 struct RunningServer {
     client: McpClient,
     server_config: McpServer,
-    last_used: tokio::time::Instant,
 }
 
 /// Manages MCP server lifecycle: start, stop, tool discovery, tool calls.
@@ -119,7 +118,6 @@ impl McpManager {
             RunningServer {
                 client,
                 server_config: server.clone(),
-                last_used: tokio::time::Instant::now(),
             },
         );
 
@@ -238,7 +236,6 @@ impl McpManager {
             .get_mut(server_id)
             .ok_or_else(|| format!("MCP server '{}' not running after start attempt", server_id))?;
 
-        entry.last_used = tokio::time::Instant::now();
         let server_name = entry.server_config.name.clone();
         let auto_approve = entry.server_config.auto_approve;
 
@@ -303,33 +300,6 @@ impl McpManager {
         Some((server_id.to_string(), tool_name.to_string()))
     }
 
-    /// Stop servers that have been idle for longer than the timeout.
-    pub async fn stop_idle_servers(&self, idle_timeout: std::time::Duration) {
-        let mut running = self.running.lock().await;
-        let now = tokio::time::Instant::now();
-
-        let idle_ids: Vec<String> = running
-            .iter()
-            .filter(|(_, entry)| now.duration_since(entry.last_used) > idle_timeout)
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for id in idle_ids {
-            if let Some(mut entry) = running.remove(&id) {
-                log!("[MCP] Stopping idle server '{}'", entry.server_config.name);
-                entry.client.shutdown().await;
-            }
-        }
-    }
-
-    /// Shutdown all running servers (called on engine shutdown).
-    pub async fn shutdown_all(&self) {
-        let mut running = self.running.lock().await;
-        for (_, mut entry) in running.drain() {
-            log!("[MCP] Shutting down server '{}'", entry.server_config.name);
-            entry.client.shutdown().await;
-        }
-    }
 }
 
 /// Convert an MCP tool to a Lucidos ToolDefinition with namespaced name.

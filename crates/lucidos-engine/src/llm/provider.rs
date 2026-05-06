@@ -69,6 +69,17 @@ pub struct ToolCall {
 pub struct LlmResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Provider stop_reason ("end_turn", "max_tokens", etc.). None when
+    /// not captured. Distinguishes legitimate empty completions from
+    /// truncation when content is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    /// Total characters of thinking text. High value with empty content
+    /// distinguishes "thought hard then gave up" from "said nothing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_chars: Option<usize>,
 }
 
 #[async_trait]

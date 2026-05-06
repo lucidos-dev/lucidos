@@ -21,13 +21,12 @@ impl JsonRpcRequest {
     }
 }
 
-/// JSON-RPC 2.0 notification (no id).
+/// JSON-RPC 2.0 notification (no id, no params — Lucidos only sends
+/// `notifications/initialized` which has no parameters).
 #[derive(Debug, Serialize)]
 pub struct JsonRpcNotification {
     pub jsonrpc: &'static str,
     pub method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<serde_json::Value>,
 }
 
 impl JsonRpcNotification {
@@ -35,7 +34,6 @@ impl JsonRpcNotification {
         Self {
             jsonrpc: "2.0",
             method: method.to_string(),
-            params: None,
         }
     }
 }

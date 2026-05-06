@@ -40,7 +40,15 @@ export default defineConfig({
     screenshot: 'only-on-failure',
   },
   projects: [
-    { name: 'chromium', use: { browserName: 'chromium' } },
+    {
+      name: 'chromium',
+      // *-mobile.spec.ts files target mobile-only UI (edge-swipe overlay,
+      // touch-specific stacking contexts) that doesn't render on desktop —
+      // exclude them rather than runtime-skipping so the chromium results
+      // stay clean.
+      testIgnore: /-mobile\.spec\.ts$/,
+      use: { browserName: 'chromium' },
+    },
     {
       name: 'mobile',
       use: {

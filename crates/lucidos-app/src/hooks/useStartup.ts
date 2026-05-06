@@ -5,7 +5,8 @@ import { refreshUnreadCount, viewNotification, loadNotifications } from '../stor
 import { loadApps, openAppById } from '../store/actions/apps';
 import { loadCredentials } from '../store/actions/credentials';
 import { loadDevices, registerCurrentDevice } from '../store/actions/devices';
-import { loadTriggers } from '../store/actions/triggers';
+import { loadTriggers, loadHistoricalTriggers } from '../store/actions/triggers';
+import { loadRepositories } from '../store/actions/chat';
 import { loadPreferences } from '../store/actions/preferences';
 import { loadPinnedApps } from '../store/actions/pinnedApps';
 import { connectThreadEvents, disconnectThreadEvents } from '../store/actions/thread-sync';
@@ -16,27 +17,26 @@ import { API_BASE } from '../api/client';
 import { isTauri } from '../utils/platform';
 import { invoke } from '../utils/tauri';
 import { refreshChangesState, restoreRestartToast } from '../store/actions/chat-changes';
-import { focusThread } from '../store/actions/threads';
+import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
+import { focusThreadOrBootstrap } from '../store/actions/threads';
+import { openThreadInWorkspace, THREAD_HASH_RE } from '../store/actions/cross-workspace';
 import { CHECK_ICON, COPY_ICON } from '../utils/renderMarkdown';
-import { activeMenuItem, focusedThreadId, settingsSubview, updateAvailable, threadsLoaded, showToast, showConfirm } from '../store/store';
+import { activeMenuItem, settingsSubview, updateAvailable, threadsLoaded, showToast, showConfirm, FOCUSED_THREAD_KEY, setFocusedThread, workspaceName } from '../store/store';
 import { shouldShowSwUpdateToast, markSwUpdateDismissed } from './sw-update';
-import { FOCUSED_THREAD_KEY } from '../utils/draftStorage';
+import { resolveDeepLink, type DeepLinkTarget } from '../store/actions/notification-deeplink';
 
 const CONNECTION_POLL_INTERVAL = 5000;
 const API = `${API_BASE}/api`;
 
-/** Route a notification deep-link to the right action.
- *
- *  Precedence is `thread > app > notification` — a tap that targets a specific
- *  thread (e.g. the seeded "Claude is asking" trigger) opens the conversation
- *  directly; opening the notification modal on top would just hide it.
- *  Returns true when something was dispatched.
- */
-function dispatchDeepLink(target: { thread?: string | null; app?: string | null; notification?: string | null }): boolean {
-  if (target.thread) { focusThread(target.thread); return true; }
-  if (target.app) { openAppById(target.app); return true; }
-  if (target.notification) { viewNotification(target.notification); return true; }
-  return false;
+/** Route a notification deep-link to the right action. Returns true when
+ *  something was dispatched. */
+function dispatchDeepLink(target: DeepLinkTarget): boolean {
+  const action = resolveDeepLink(target);
+  switch (action.type) {
+    case 'open-app': openAppById(action.id); return true;
+    case 'view-notification': viewNotification(action.id); return true;
+    case 'noop': return false;
+  }
 }
 
 /** Check backend for a pending notification click stored by the SW via fetch().
@@ -56,7 +56,7 @@ async function checkPendingNotification(includePushFallback = false): Promise<bo
         return true;
       }
     }
-  } catch {}
+  } catch { /* engine unreachable — best-effort check, health poll will retry */ }
 
   // Fallback: notification-pushed (stored by SW push handler at delivery time)
   if (includePushFallback) {
@@ -69,7 +69,7 @@ async function checkPendingNotification(includePushFallback = false): Promise<bo
           return true;
         }
       }
-    } catch {}
+    } catch { /* engine unreachable — best-effort check, health poll will retry */ }
   }
 
   return false;
@@ -77,10 +77,12 @@ async function checkPendingNotification(includePushFallback = false): Promise<bo
 
 export function useStartup(): void {
   useEffect(() => {
-    // Restore focused thread from localStorage (set at signal init, reinforce here)
+    // Restore focused thread from localStorage (set at signal init, reinforce here).
+    // setFocusedThread short-circuits when the value is unchanged, so this is a
+    // no-op on cold start where the signal initializer already populated it.
     const savedThreadId = localStorage.getItem(FOCUSED_THREAD_KEY);
     if (savedThreadId) {
-      focusedThreadId.value = savedThreadId;
+      setFocusedThread(savedThreadId);
     }
 
     // Initial loads
@@ -109,12 +111,19 @@ export function useStartup(): void {
     function onGlobalClick(e: MouseEvent) {
       const target = e.target as HTMLElement;
 
-      // Thread links
       const threadLink = target.closest('.thread-link') as HTMLElement | null;
       if (threadLink) {
         e.preventDefault();
         const threadId = threadLink.getAttribute('data-thread-id');
-        if (threadId) focusThread(threadId);
+        if (!threadId) return;
+        // Cross-workspace links carry data-thread-workspace; route to that
+        // workspace's UI since the thread isn't in our threadMap.
+        const linkWorkspace = threadLink.getAttribute('data-thread-workspace');
+        if (linkWorkspace && workspaceName.value && linkWorkspace !== workspaceName.value) {
+          openThreadInWorkspace(linkWorkspace, threadId);
+          return;
+        }
+        focusThreadOrBootstrap(threadId);
         return;
       }
 
@@ -158,20 +167,22 @@ export function useStartup(): void {
     }
     document.addEventListener('click', onGlobalClick);
 
-    // Check for push notification deep-link (?notification=<id> / ?app=<id> / ?thread=<id> in URL).
+    // Strip any deep-link params so a refresh doesn't re-open them. `thread`
+    // is included because a stale SW may still append ?thread=<id>; auto-
+    // jumping to the source thread on tap pulled the user away from whatever
+    // they were doing, so the param is intentionally never acted on.
     const params = new URLSearchParams(window.location.search);
+    const stale = ['notification', 'app', 'thread'].filter((k) => params.has(k));
+    if (stale.length > 0) {
+      const url = new URL(window.location.href);
+      for (const k of stale) url.searchParams.delete(k);
+      window.history.replaceState({}, '', url.toString());
+    }
     const target = {
       notification: params.get('notification'),
       app: params.get('app'),
-      thread: params.get('thread'),
     };
-    if (target.notification || target.app || target.thread) {
-      // Clear the params from URL so refreshing doesn't re-open
-      const url = new URL(window.location.href);
-      url.searchParams.delete('notification');
-      url.searchParams.delete('app');
-      url.searchParams.delete('thread');
-      window.history.replaceState({}, '', url.toString());
+    if (target.notification || target.app) {
       // Defer so stores have a tick to hydrate before navigation
       setTimeout(() => dispatchDeepLink(target), 500);
     } else {
@@ -179,15 +190,36 @@ export function useStartup(): void {
       setTimeout(() => checkPendingNotification(true), 500);
     }
 
+    // Hash channel for cross-workspace navigation (see openThreadInWorkspace).
+    // Clear the hash so a refresh doesn't re-trigger the jump.
+    const hashMatch = THREAD_HASH_RE.exec(window.location.hash);
+    if (hashMatch) {
+      const threadId = hashMatch[1];
+      window.history.replaceState({}, '', window.location.pathname + window.location.search);
+      setTimeout(() => focusThreadOrBootstrap(threadId), 500);
+    }
+
     loadArtifacts();
     loadApps();
+    // Triggers are global (thread filter dropdown + form titles), not tab-scoped.
+    // Without this eager load, the dropdown lies on cold start to a non-triggers
+    // tab — every trigger in the registry shows as "(deleted)" because the
+    // registry is empty. Same shape as loadApps above.
+    loadTriggers();
+    loadHistoricalTriggers();
+    // Repositories power the Claude Code parent's expandable child rows in the
+    // thread filter dropdown. Same eager-load reasoning as triggers — without
+    // it the dropdown lies on cold start to a non-Settings tab.
+    loadRepositories();
 
     // Load data for the restored active menu item (switchMenuItem isn't called on reload)
     const tab = activeMenuItem.value;
-    if (tab === 'triggers') loadTriggers();
     if (tab === 'settings') {
       loadDevices();
       if (settingsSubview.value === 'accounts') loadCredentials();
+    }
+    if (tab === 'files') {
+      restoreRepoSelectionFromStorage();
     }
     // Register/update the service worker on every load so the browser
     // picks up new sw.js versions (skipWaiting activates them immediately).
@@ -229,14 +261,13 @@ export function useStartup(): void {
       }
       navigator.serviceWorker.ready.then(reg => {
         reg.addEventListener('updatefound', onUpdateFound);
-      });
+      }).catch(() => { /* SW not ready in this environment — update toast is best-effort */ });
     }
 
     // Handle notification deep-link from SW (via postMessage — instant on Chrome).
     function onSwMessage(event: MessageEvent) {
       if (event.data?.type === 'open-notification') {
         dispatchDeepLink({
-          thread: event.data.thread_id,
           app: event.data.app_id,
           notification: event.data.id,
         });

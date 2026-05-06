@@ -71,19 +71,14 @@ impl EventStore {
                     });
                 }
                 "MemorySearched" => {
-                    let results = event
+                    let has_results = event
                         .payload
                         .get("results")
                         .and_then(|v| v.as_u64())
-                        .map(|v| v as usize)
-                        .unwrap_or(0);
-                    let desc = if results > 0 {
-                        format!("Memory: {} results", results)
-                    } else {
-                        "Memory: no results".to_string()
-                    };
+                        .is_some_and(|n| n > 0);
+                    let desc = if has_results { "Memory searched" } else { "Memory: no results" };
                     current_steps.push(Step {
-                        description: desc,
+                        description: desc.to_string(),
                         tool_name: None,
                         success: true,
                         context_tokens: None,

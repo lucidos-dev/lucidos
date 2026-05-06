@@ -1,4 +1,4 @@
-import { connectionStatus, dismissToast, showToast, isProcessing, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, updateAvailable, panelOverlay, activeInlineForm, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired } from '../store';
+import { connectionStatus, dismissToast, showToast, isProcessing, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired } from '../store';
 import { checkHealth, API_BASE } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
@@ -35,18 +35,13 @@ let emptyRefreshState: { id: string; count: number } | null = null;
 const MAX_EMPTY_REFRESHES = 3;
 
 /** Run all state-sync operations needed after sleep/wake or reconnect.
- *  Called from handleResume (on visibility change) and checkConnection (deferred retry). */
+ *  Called from handleResume (on visibility change) and checkConnection (deferred retry).
+ *
+ *  Inline forms must NOT be cleared here — filling them requires the user to
+ *  alt-tab, take a screenshot, or look something up, and the panel must
+ *  survive every focus event. The form's data lives on `panelOverlay` and is
+ *  persisted via the nav stack, so reconnect doesn't need to refetch it. */
 function runResumeSync(): void {
-  // Clear transient inline forms — they were triggered by one-shot SSE events
-  // that are no longer valid after reconnect. Only clear credential forms that
-  // were SSE-triggered (have a `request`), not user-initiated add/edit forms.
-  // Email-confirm forms are NOT cleared — they require explicit user action
-  // (Send or Cancel) and must persist through focus/resume events.
-  const form = activeInlineForm.value;
-  if (form && (form.type === 'credential' && form.request)) {
-    panelOverlay.value = null;
-  }
-
   // Reset forced-retry tracking so the watchdog can retry threads again.
   // On iOS Safari PWA, the app stays alive for days without a full reload.
   // Without this, forcedRetries accumulates permanently and the watchdog
@@ -219,9 +214,12 @@ export async function checkConnection(): Promise<boolean> {
       engineRestarting.value = false;
       localStorage.removeItem(RESTART_LS_KEY);
       dismissToast('restart-required');
-      showToast('Engine restarted', 'success');
       // Frontend code may have changed — Vite HMR is dead after restart,
       // so the client needs a reload to pick up new assets.
+      showToast('Engine restarted', 'success', {
+        action: { label: 'Refresh', onClick: () => window.location.reload() },
+        autoDismissMs: 4000,
+      });
       updateAvailable.value = true;
     }
     runResumeSync();

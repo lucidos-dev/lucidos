@@ -13,7 +13,7 @@ How files and data are organized in a Lucidos workspace.
 | Path | Purpose |
 |------|---------|
 | `user_profile.md` | Learned facts about the user (auto-maintained) |
-| `imported/{service}/` | Data from APIs or local filesystem (e.g., `imported/oura/`, `imported/finn-jobs/`) |
+| `imported/{service}/` | Data from APIs or local filesystem (e.g., `imported/oura/`, `imported/weather/`) |
 | `projects/{name}/` | Major project folders — each has `notes.md` and related files |
 | `screenshots/` | Browser screenshots (auto-named with timestamp) |
 | `research/` | Research documents, deep dives, technical analysis |
@@ -68,6 +68,16 @@ Intent definitions not tied to a single app. App-specific intents go in `apps/{i
 Scripts invoked by triggers, not tied to a single app:
 - `scripts/{name}/run.py`
 - App-specific scripts go in `apps/{id}/scripts/`
+
+## config/ — Engine Configuration
+
+Engine-read JSON files. Currently:
+
+| File | Purpose |
+|------|---------|
+| `config/apis.json` | API proxy entries — maps a name to a `base_url` (and optional `auth` referencing a stored credential). Powers `lucidos proxy <name> ...` (CLI), `lucidos.proxy(name).fetch(...)` (SDK), and the `proxy_request` LLM tool. See `system-knowhow/lucidos-cli.md` § `lucidos proxy` for the schema and `system-knowhow/js-sdk.md` § `lucidos.proxy` for the iframe-side API. |
+
+**This is the preferred way for scripts and apps to call external APIs.** Add an entry here once, then call the backend by name everywhere — the credential never appears in script source, args, env vars, log lines, or LLM tool transcripts. The pre-proxy pattern (`curl -H "Authorization: Bearer $CRED_..."` in scripts; `fetch` with the credential pasted into the iframe) is drift — see the workspace audit.
 
 ## Key Rules
 

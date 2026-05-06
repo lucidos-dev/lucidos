@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { cancelChat, interruptClaudeCode, submitChat } from './client';
+import { cancelChat, fetchCCCommands, submitChat } from './client';
 
 // iOS Safari rejects with TypeError("Load failed") when the PWA's HTTP/2
 // connection is half-closed (typical after backgrounding). The service worker
@@ -38,17 +38,6 @@ describe('mutating fetch retry on TypeError', () => {
     expect(init2.method).toBe('POST');
   });
 
-  it('interruptClaudeCode retries once on TypeError("Load failed") and succeeds', async () => {
-    mockFetch
-      .mockRejectedValueOnce(new TypeError('Load failed'))
-      .mockResolvedValueOnce(new Response(null, { status: 200 }));
-
-    await interruptClaudeCode('thread-123');
-
-    expect(mockFetch).toHaveBeenCalledTimes(2);
-    expect(mockFetch.mock.calls[0][0]).toContain('/api/claude-code/interrupt');
-  });
-
   it('cancelChat propagates error if both attempts fail', async () => {
     mockFetch
       .mockRejectedValueOnce(new TypeError('Load failed'))
@@ -79,5 +68,56 @@ describe('mutating fetch retry on TypeError', () => {
       submitChat({ message: 'hi', mode: 'human', event_id: 'evt-1', thread_id: 't-1' }),
     ).rejects.toThrow('Load failed');
     expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('fetchCCCommands url construction', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockFetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      control_commands: [],
+      builtin_commands: [],
+      skill_commands: [],
+      current_model: null,
+      current_reasoning_effort: null,
+      has_active_session: false,
+    }), { status: 200 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('passes repo_id="" explicitly when repoId is empty string (default Lucidos)', async () => {
+    await fetchCCCommands(undefined, '');
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe('/api/claude-code/commands?repo_id=');
+  });
+
+  it('passes repo_id when a specific repoId is given', async () => {
+    await fetchCCCommands(undefined, 'repo-uuid-123');
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe('/api/claude-code/commands?repo_id=repo-uuid-123');
+  });
+
+  it('omits repo_id when repoId is undefined (no compose context)', async () => {
+    await fetchCCCommands('thread-abc');
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe('/api/claude-code/commands?thread_id=thread-abc');
+  });
+
+  it('passes both thread_id and repo_id when both are given', async () => {
+    await fetchCCCommands('thread-abc', 'repo-uuid-123');
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe('/api/claude-code/commands?thread_id=thread-abc&repo_id=repo-uuid-123');
+  });
+
+  it('omits the query string entirely when neither argument is given', async () => {
+    await fetchCCCommands();
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe('/api/claude-code/commands');
   });
 });

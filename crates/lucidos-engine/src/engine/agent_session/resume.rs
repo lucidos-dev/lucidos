@@ -243,12 +243,69 @@ async fn lookup_session_branch_for_thread(
     .flatten()
 }
 
+/// `(repo_id, branch)` from the most recent `SessionStarted` event for the
+/// thread that recorded both. Pre-Mar-2026 SessionStarted payloads sometimes
+/// omitted `repo_id`; the filter skips those rather than returning a partial
+/// result, since both fields are needed to recover a diff.
+pub(crate) async fn lookup_latest_session_repo_and_branch(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+) -> Option<(String, String)> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT payload->>'repo_id', payload->>'branch' FROM events \
+         WHERE thread_id = $1 AND event_type = 'SessionStarted' \
+           AND payload->>'repo_id' IS NOT NULL AND payload->>'repo_id' <> '' \
+           AND payload->>'branch' IS NOT NULL AND payload->>'branch' <> '' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        log!(
+            "[ClaudeCode] Failed to look up session repo+branch for {}: {}",
+            thread_id,
+            e
+        );
+        e
+    })
+    .ok()
+    .flatten()
+}
+
 /// Return the `cc_session_id` from the most recent `CodingAgentIdled` event
 /// for the thread, or `None` if there is no idled event yet (truly first turn)
 /// or the recorded sid is empty. Used to recover the resume target when CC
 /// must continue an existing conversation (e.g., after a pending change, or
 /// after the in-memory `agent_sessions` entry has been removed because the
 /// CC subprocess exited at idle).
+/// Look up the most recent "originating event" id for a thread — the
+/// MessageReceived / TriggerStarted / CodingAgentUserMessageSent that
+/// kicked off the latest exchange. Used by abort/recovery paths to stamp
+/// `request_event_id` on ResponseAborted so the rerun can find the prompt
+/// to resume. `event_types` controls which start events count for this
+/// caller (chat threads use `&["MessageReceived","TriggerStarted"]`; CC
+/// callers also include `CodingAgentUserMessageSent`).
+pub(crate) async fn latest_originating_event_id(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+    event_types: &[&str],
+) -> Option<uuid::Uuid> {
+    let placeholders: Vec<String> = (2..=event_types.len() + 1).map(|i| format!("${}", i)).collect();
+    let q = format!(
+        "SELECT id FROM events \
+         WHERE aggregate_id = $1 \
+           AND event_type IN ({}) \
+         ORDER BY sequence DESC LIMIT 1",
+        placeholders.join(",")
+    );
+    let mut query = sqlx::query_scalar::<_, uuid::Uuid>(&q).bind(thread_id.to_string());
+    for et in event_types {
+        query = query.bind(*et);
+    }
+    query.fetch_optional(pool).await.ok().flatten()
+}
+
 pub(crate) async fn lookup_latest_cc_session_id(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,

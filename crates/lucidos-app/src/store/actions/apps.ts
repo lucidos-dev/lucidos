@@ -11,10 +11,9 @@ import {
   appPseudoFullscreen,
   appRefreshKey,
 } from '../store';
-import { toFailed } from '../types';
+import { toFailed, setLoadingIfFresh } from '../types';
 import type { App } from '../types';
-import { navigateToPane } from './pane';
-import { isMobile } from '../../utils/viewport';
+import { revealContentPane } from './pane';
 import {
   listAppsApi,
   deleteAppApi,
@@ -27,9 +26,7 @@ import { isElementVisible } from '../../components/chat/scrollState';
 import { errorDetail } from '../../utils/errorDetail';
 
 export async function loadApps(): Promise<void> {
-  if (appsList.value.status !== 'loaded') {
-    appsList.value = { status: 'loading' };
-  }
+  setLoadingIfFresh(appsList);
   try {
     const apps = await listAppsApi();
     appsList.value = { status: 'loaded', data: apps };
@@ -45,7 +42,6 @@ export async function loadApps(): Promise<void> {
       }
     }
   } catch (error) {
-    console.error('Error loading apps:', error);
     appsList.value = toFailed(error);
   }
 }
@@ -56,7 +52,7 @@ export function openApp(app: App): void {
   if (appRefreshKey.value) appRefreshKey.value = 0;
   localStorage.setItem('app-window-open', app.id);
   inputMode.value = { type: 'do' };
-  if (isMobile()) navigateToPane('content');
+  revealContentPane();
   pushNavState();
 }
 
@@ -92,7 +88,6 @@ export async function saveAppMetadata(
     await loadApps();
     return true;
   } catch (error) {
-    console.error('Failed to save app:', error);
     showToast('Failed to save app: ' + errorDetail(error), 'error');
     return false;
   }
@@ -113,7 +108,6 @@ export async function confirmDeleteApp(
     }
     loadApps();
   } catch (error) {
-    console.error('Error deleting app:', error);
     showToast('Failed to delete app: ' + errorDetail(error), 'error');
   }
 }
@@ -141,14 +135,11 @@ function cancelPendingRefresh(): void {
 }
 
 export async function refreshAppUI(appId?: string): Promise<void> {
-  let app = currentApp.value;
-
-  // If the target app isn't open, open it first so the iframe exists.
-  if (!app && appId) {
-    await openAppById(appId);
-    app = currentApp.value;
-  }
-
+  // Pure refresh: reload the open iframe so it picks up on-disk changes.
+  // Never opens the app — that's what app-link clicks and navigate_ui are for.
+  // Otherwise an LLM that incidentally edits a file under apps/{id}/ would
+  // pop the app pane open mid-conversation.
+  const app = currentApp.value;
   if (!app) return;
   if (appId && app.id !== appId) return;
 
@@ -191,13 +182,10 @@ export async function captureAppUI(appId: string, requestId: string): Promise<vo
 }
 
 async function captureAppUIInner(appId: string, requestId: string): Promise<void> {
-  // Find the visible app-ui iframe. Both desktop (SplitLayout) and mobile
-  // (MobileSwipeContainer) render ContentPane simultaneously, so there may be
-  // two iframes. Prefer the one with non-zero dimensions (the visible layout).
   const iframe = getVisibleAppFrame();
 
   if (!iframe) {
-    await postAppCapture(requestId, '', 'Error: No app UI is currently open. Use refresh_app to open it first.');
+    await postAppCapture(requestId, '', 'Error: No app UI is currently open. Ask the user to open the app, or use navigate_ui (target=app-ui) first — refresh_app no longer opens.');
     return;
   }
 
@@ -237,8 +225,8 @@ async function captureAppUIInner(appId: string, requestId: string): Promise<void
   await postAppCapture(requestId, result.screenshot, mismatchNote + result.dom);
 }
 
-/** Find the visible app-ui iframe, preferring the one with non-zero dimensions
- *  to handle dual-rendering (desktop + mobile layouts render simultaneously). */
+/** Find the visible app-ui iframe — tolerates transient duplicates during a
+ *  layout swap by preferring non-zero dimensions. */
 export function getVisibleAppFrame(): HTMLIFrameElement | null {
   const frames = document.querySelectorAll('[data-role="app-ui-frame"]') as NodeListOf<HTMLIFrameElement>;
   let fallback: HTMLIFrameElement | null = null;
@@ -254,5 +242,3 @@ export function getVisibleAppFrame(): HTMLIFrameElement | null {
 export function exitPseudoFullscreen(): void {
   appPseudoFullscreen.value = false;
 }
-
-export { openCredentialRequest } from './credentials';

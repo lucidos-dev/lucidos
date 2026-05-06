@@ -18,11 +18,11 @@ use crate::memory::{
 #[derive(Deserialize)]
 pub struct ListThreadsQuery {
     /// Thread ID the frontend currently has focused — ensures it's included in the
-    /// response even if it's not in the recent/pinned/active lists.
+    /// response even if it's not in the recent/saved/active lists.
     pub focused: Option<String>,
 }
 
-/// GET /api/threads — returns pinned threads, recent history, and active thread IDs
+/// GET /api/threads — returns saved threads, recent history, and active thread IDs
 pub(super) async fn list_threads(
     State(state): State<AppState>,
     Query(query): Query<ListThreadsQuery>,
@@ -37,19 +37,20 @@ pub(super) async fn list_threads(
         .map(|id| id.to_string())
         .collect();
 
-    // Run all three DB queries in parallel
+    // Run all four DB queries in parallel
     let store = state.engine.event_store();
-    let (pinned_result, recent_result, active_result) = tokio::join!(
-        store.get_pinned_threads(),
+    let (saved_result, recent_result, active_result, composing_result) = tokio::join!(
+        store.get_saved_threads(),
         store.get_recent_threads(15),
         store.get_threads_by_ids(&active_id_strings),
+        store.get_composing_threads(),
     );
 
-    let pinned = pinned_result.map_err(|e| {
-        log!("[API] Failed to get pinned threads: {}", e);
+    let saved = saved_result.map_err(|e| {
+        log!("[API] Failed to get saved threads: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to get pinned threads: {}", e),
+            format!("Failed to get saved threads: {}", e),
         )
     })?;
     let recent = recent_result.map_err(|e| {
@@ -66,14 +67,22 @@ pub(super) async fn list_threads(
             format!("Failed to get active thread info: {}", e),
         )
     })?;
+    let composing = composing_result.map_err(|e| {
+        log!("[API] Failed to get composing threads: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get composing threads: {}", e),
+        )
+    })?;
 
     // If the frontend has a focused thread, ensure it's in the response.
-    // The focused thread may be older than the recent 15 per source, not pinned,
+    // The focused thread may be older than the recent 15 per source, not saved,
     // and not actively processing — without this, reload would lose it.
     let focused_thread = if let Some(ref focused_id) = query.focused {
-        let already_included = pinned.iter().any(|t| t.thread_id == *focused_id)
+        let already_included = saved.iter().any(|t| t.thread_id == *focused_id)
             || recent.iter().any(|t| t.thread_id == *focused_id)
-            || active_threads.iter().any(|t| t.thread_id == *focused_id);
+            || active_threads.iter().any(|t| t.thread_id == *focused_id)
+            || composing.iter().any(|t| t.thread_id == *focused_id);
         if !already_included {
             let mut threads = store
                 .get_threads_by_ids(std::slice::from_ref(focused_id))
@@ -94,10 +103,11 @@ pub(super) async fn list_threads(
     };
 
     let mut response = serde_json::json!({
-        "pinned": pinned,
+        "saved": saved,
         "history": recent,
         "active": active_id_strings,
         "active_threads": active_threads,
+        "composing": composing,
     });
     if let Some(ft) = focused_thread {
         response["focused_thread"] = match serde_json::to_value(&ft) {
@@ -115,18 +125,24 @@ pub(super) async fn list_threads(
     Ok(Json(response))
 }
 
-/// POST /api/threads/pin — pin a thread
-pub(super) async fn pin_thread(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<serde_json::Value>,
-) -> Result<StatusCode, (StatusCode, String)> {
+/// Extract a `thread_id` UUID from a JSON body that uses the
+/// `{"thread_id": "<uuid>"}` shape. Used by save/unsave/rename/archive handlers.
+fn extract_thread_uuid(request: &serde_json::Value) -> Result<Uuid, (StatusCode, String)> {
     let thread_id = request
         .get("thread_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing thread_id".to_string()))?;
-    let thread_uuid = Uuid::parse_str(thread_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
+    Uuid::parse_str(thread_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))
+}
+
+/// POST /api/threads/save — save a thread
+pub(super) async fn save_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let thread_uuid = extract_thread_uuid(&request)?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     state
@@ -134,21 +150,21 @@ pub(super) async fn pin_thread(
         .event_bus
         .emit(crate::engine::event_bus::BusEvent::Thread {
             thread_id: thread_uuid,
-            event: crate::engine::thread_events::ThreadEvent::ThreadPinned,
+            event: crate::engine::thread_events::ThreadEvent::ThreadSaved,
             meta: crate::engine::thread_events::EventMeta::with_actor(actor),
         })
         .await
         .map_err(|e| {
-            log!("[API] Failed to pin thread: {}", e);
+            log!("[API] Failed to save thread: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to pin thread: {}", e),
+                format!("Failed to save thread: {}", e),
             )
         })?;
 
-    // Generate title in background — don't block the pin response
+    // Generate title in background — don't block the save response
     let engine = state.engine.clone();
-    let tid = thread_id.to_string();
+    let tid = thread_uuid.to_string();
     tokio::spawn(async move {
         let has_title = engine
             .event_store()
@@ -163,18 +179,13 @@ pub(super) async fn pin_thread(
     Ok(StatusCode::OK)
 }
 
-/// POST /api/threads/unpin — unpin a thread
-pub(super) async fn unpin_thread(
+/// POST /api/threads/unsave — unsave a thread
+pub(super) async fn unsave_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let thread_id = request
-        .get("thread_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing thread_id".to_string()))?;
-    let thread_uuid = Uuid::parse_str(thread_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
+    let thread_uuid = extract_thread_uuid(&request)?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     state
@@ -182,15 +193,15 @@ pub(super) async fn unpin_thread(
         .event_bus
         .emit(crate::engine::event_bus::BusEvent::Thread {
             thread_id: thread_uuid,
-            event: crate::engine::thread_events::ThreadEvent::ThreadUnpinned,
+            event: crate::engine::thread_events::ThreadEvent::ThreadUnsaved,
             meta: crate::engine::thread_events::EventMeta::with_actor(actor),
         })
         .await
         .map_err(|e| {
-            log!("[API] Failed to unpin thread: {}", e);
+            log!("[API] Failed to unsave thread: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to unpin thread: {}", e),
+                format!("Failed to unsave thread: {}", e),
             )
         })?;
 
@@ -203,10 +214,7 @@ pub(super) async fn rename_thread(
     headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let thread_id = request
-        .get("thread_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing thread_id".to_string()))?;
+    let thread_uuid = extract_thread_uuid(&request)?;
     let title = request
         .get("title")
         .and_then(|v| v.as_str())
@@ -215,9 +223,6 @@ pub(super) async fn rename_thread(
     if title.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Title cannot be empty".to_string()));
     }
-
-    let thread_uuid = Uuid::parse_str(thread_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     state
@@ -315,21 +320,26 @@ pub(super) async fn suggest_title(
     Ok(Json(serde_json::json!({ "title": title })))
 }
 
-/// POST /api/threads/:thread_id/continue — resume an interrupted CC session.
+/// POST /api/threads/:thread_id/continue — resume an interrupted thread.
 ///
-/// Phase 5.3: when the engine restarts mid-turn, recovery surfaces the
-/// interrupted thread as a synthetic
-/// `CodingAgentIdled { reason: "engine_restart_interrupt", .. }` instead of
-/// auto-spawning CC. The user clicks the continue affordance in the UI; that
-/// click POSTs here. We emit a `ContinueSignal { reason: "user_clicked_continue" }`
-/// on the CC channel — the spawn dispatcher subscribes, dedupes via the
-/// event id, and routes a `SpawnRequest::Continue` to the engine-side
-/// receiver, which re-enters CC via `--resume` against the recorded
-/// `cc_session_id`.
+/// Dispatches by thread type:
 ///
-/// Body is empty. The endpoint is idempotent at the dispatcher layer: if a
-/// previous click already produced a CC lifecycle event, the dispatcher's
-/// `already_spawned` check rejects the duplicate.
+/// **CC threads.** Phase 5.3: the engine surfaces a mid-turn-crashed CC
+/// session as a synthetic `CodingAgentIdled { reason: "engine_restart_interrupt", .. }`
+/// instead of auto-spawning. We emit `ContinueSignal { reason: "user_clicked_continue" }`
+/// on the CC channel — the spawn dispatcher dedupes via the event id and
+/// re-enters CC via `--resume` against the recorded `cc_session_id`. The
+/// resume path then emits `SessionRecovered { actor: <user> }` BEFORE the
+/// first CC text arrives so the timeline reads "You restarted" → resume.
+///
+/// **Chat / trigger threads.** Calls into `engine.continue_chat(...)` which
+/// emits `SessionRecovered` + `UserPromptInjected` (engine note summarizing
+/// completed tool pairs from the aborted run) and re-enters the agentic loop
+/// with a fresh `request_event_id`.
+///
+/// Body is empty. Idempotent — the chat path checks for an existing
+/// SessionRecovered newer than the latest abort; the CC dispatcher's
+/// `already_spawned` check rejects duplicates.
 pub(super) async fn continue_thread(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -339,26 +349,58 @@ pub(super) async fn continue_thread(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
+    // Decide which dispatch path to take based on the thread's recorded type.
+    let is_cc: bool = sqlx::query_scalar(
+        "SELECT is_cc FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_uuid)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        log!("[API] Failed to read thread type for continue: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read thread: {}", e),
+        )
+    })?
+    .unwrap_or(false);
+
+    if is_cc {
+        state
+            .engine
+            .event_bus
+            .emit(crate::engine::event_bus::BusEvent::Thread {
+                thread_id: thread_uuid,
+                event: crate::engine::thread_events::ThreadEvent::ContinueSignal {
+                    reason: USER_CLICKED_CONTINUE_REASON.to_string(),
+                },
+                meta: crate::engine::thread_events::EventMeta {
+                    channel: Some(crate::engine::thread_events::EventChannel::CodingAgent),
+                    actor,
+                    ..crate::engine::thread_events::EventMeta::NONE
+                },
+            })
+            .await
+            .map_err(|e| {
+                log!("[API] Failed to emit ContinueSignal: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to emit ContinueSignal: {}", e),
+                )
+            })?;
+        return Ok(StatusCode::OK);
+    }
+
+    // Chat / trigger thread — route through chat::rerun.
     state
         .engine
-        .event_bus
-        .emit(crate::engine::event_bus::BusEvent::Thread {
-            thread_id: thread_uuid,
-            event: crate::engine::thread_events::ThreadEvent::ContinueSignal {
-                reason: USER_CLICKED_CONTINUE_REASON.to_string(),
-            },
-            meta: crate::engine::thread_events::EventMeta {
-                channel: Some(crate::engine::thread_events::EventChannel::CodingAgent),
-                actor,
-                ..crate::engine::thread_events::EventMeta::NONE
-            },
-        })
+        .continue_chat(thread_uuid, actor)
         .await
         .map_err(|e| {
-            log!("[API] Failed to emit ContinueSignal: {}", e);
+            log!("[API] continue_chat failed for thread {}: {}", thread_uuid, e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to emit ContinueSignal: {}", e),
+                format!("Failed to continue thread: {}", e),
             )
         })?;
 
@@ -408,9 +450,24 @@ pub struct OlderThreadsQuery {
     pub limit: Option<i64>,
     /// Comma-separated list of sources to filter by (e.g. "chat,claude_code")
     pub sources: Option<String>,
+    /// Comma-separated list of trigger ids to filter by — narrows to
+    /// trigger-channel threads spawned by one of the given triggers.
+    pub trigger_ids: Option<String>,
+    /// Comma-separated list of repository UUIDs to filter by — narrows to
+    /// CC-channel threads bound to one of the given repos. Composes with
+    /// `trigger_ids` via OR (see `EventStore::get_older_threads`).
+    pub repo_ids: Option<String>,
 }
 
-/// GET /api/threads/older?before=ISO8601&limit=15&sources=chat,claude_code — paginated older threads
+fn parse_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// GET /api/threads/older?before=ISO8601&limit=15&sources=chat,claude_code&trigger_ids=t1,t2&repo_ids=r1,r2
 pub(super) async fn get_older_threads(
     State(state): State<AppState>,
     Query(query): Query<OlderThreadsQuery>,
@@ -422,17 +479,20 @@ pub(super) async fn get_older_threads(
         )
     })?;
     let limit = query.limit.unwrap_or(15).min(50);
-    let sources: Option<Vec<String>> = query.sources.as_ref().map(|s| {
-        s.split(',')
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .collect()
-    });
+    let sources: Option<Vec<String>> = query.sources.as_deref().map(parse_csv);
+    let trigger_ids: Option<Vec<String>> = query.trigger_ids.as_deref().map(parse_csv);
+    let repo_ids: Option<Vec<String>> = query.repo_ids.as_deref().map(parse_csv);
 
     let threads = state
         .engine
         .event_store()
-        .get_older_threads(before, limit, sources.as_deref())
+        .get_older_threads(
+            before,
+            limit,
+            sources.as_deref(),
+            trigger_ids.as_deref(),
+            repo_ids.as_deref(),
+        )
         .await
         .map_err(|e| {
             log!("[API] Failed to get older threads: {}", e);
@@ -453,29 +513,60 @@ pub struct ThreadEventsQuery {
     pub after: Option<i64>,
 }
 
-/// GET /api/threads/:thread_id/events — snapshot of persisted thread events
+/// Response shape for `GET /api/threads/:thread_id/events`. Wraps the event
+/// rows with a `current_aggregate` snapshot of `thread_summaries` so the
+/// frontend's historical-replay path applies meta from a fetched snapshot
+/// — same source-of-truth model as live SSE's per-event aggregate.
+#[derive(serde::Serialize)]
+pub struct ThreadEventsSnapshot {
+    pub events: Vec<ThreadEventRow>,
+    #[serde(rename = "currentAggregate")]
+    pub current_aggregate: Option<crate::core::store::ThreadAggregate>,
+}
+
+/// GET /api/threads/:thread_id/events — snapshot of persisted thread events,
+/// plus the current `thread_summaries` projection snapshot.
 pub(super) async fn get_thread_events_snapshot(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
     Query(query): Query<ThreadEventsQuery>,
-) -> Result<Json<Vec<ThreadEventRow>>, (StatusCode, String)> {
+) -> Result<Json<ThreadEventsSnapshot>, (StatusCode, String)> {
     let thread_uuid = Uuid::parse_str(&thread_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
 
-    let mut events = state
-        .event_store
-        .get_thread_events_by_seq(thread_uuid, query.after)
-        .await
-        .map_err(|e| {
-            log!("[API] Failed to get thread events: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+    // Independent fetches against the same pool — run in parallel.
+    let pool = state.engine.pool();
+    let (events_res, aggregate_res) = tokio::join!(
+        state
+            .event_store
+            .get_thread_events_by_seq(thread_uuid, query.after),
+        crate::core::store::fetch_thread_aggregate(pool, thread_uuid),
+    );
+
+    let mut events = events_res.map_err(|e| {
+        log!("[API] Failed to get thread events: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     for row in &mut events {
         strip_image_content_in_tool_result(row);
     }
 
-    Ok(Json(events))
+    // Aggregate fetch is best-effort — absence just means no snapshot to apply
+    // (frontend logs a warning).
+    let current_aggregate = aggregate_res.unwrap_or_else(|e| {
+        log!(
+            "[API] Failed to fetch ThreadAggregate for {}: {}",
+            thread_uuid,
+            e
+        );
+        None
+    });
+
+    Ok(Json(ThreadEventsSnapshot {
+        events,
+        current_aggregate,
+    }))
 }
 
 /// Replace `[IMAGE_CONTENT:...]\n<base64>` payloads in `ToolResult.result` with a small stub.
@@ -498,21 +589,22 @@ pub struct ThreadSearchQuery {
     pub q: String,
 }
 
-/// POST /api/threads/dismiss — dismiss a thread (emits ThreadDismissed, moves to history)
-pub(super) async fn dismiss_thread(
+/// Bound on how long archive_thread waits for cancel-fallout terminal event
+/// (ResponseCanceled / ResponseAborted / ResponseFailed) before emitting
+/// ThreadArchived anyway. The signal-driven cancel path normally lands the
+/// event in <100 ms; this is the safety net for a stuck CC subprocess.
+const CANCEL_FALLOUT_TIMEOUT_MS: u64 = 2000;
+
+/// POST /api/threads/archive — archive a thread (emits ThreadArchived, moves to history)
+pub(super) async fn archive_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let thread_id = request
-        .get("thread_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing thread_id".to_string()))?;
-    let thread_uuid = Uuid::parse_str(thread_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
+    let thread_uuid = extract_thread_uuid(&request)?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
-    // For external repo threads, mark pending changes as applied before dismissing.
+    // For external repo threads, mark pending changes as applied before archiving.
     // "Done" replaces "Apply" for external repos — the CC already pushed to the remote,
     // so we shouldn't discard the change.
     let is_external: bool = sqlx::query_scalar::<_, bool>(
@@ -550,39 +642,67 @@ pub(super) async fn dismiss_thread(
         state.engine.broadcast_changes_updated().await;
     }
 
-    // If CC paused on AskUserQuestion, resolve the card before dismissing so the
+    // If CC paused on AskUserQuestion, resolve the card before archiving so the
     // QuestionCard renders "Canceled" instead of leaving stale answer buttons in
     // the now-archived thread. CC was killed when the question fired, so this is
     // just an event emit — no resume.
-    if let Some(tool_use_id) = crate::engine::agent_question::lookup_pending_question_tool_use_id(
-        state.engine.pool(),
+    crate::engine::agent_question::resolve_pending_question_as_canceled(
+        &state.engine,
         thread_uuid,
+        actor.clone(),
     )
-    .await
-    {
-        let result = crate::engine::agent_question::answer_pending_question(
-            &state.engine,
-            thread_uuid,
-            tool_use_id,
-            crate::engine::thread_events::AnswerKind::Canceled,
+    .await;
+
+    // Live CC subprocess: subscribe BEFORE cancel so the cancel-fallout
+    // terminal event lands in our buffer, then wait for it before emitting
+    // ThreadArchived. The wait serializes ResponseCanceled's projection update
+    // (section='inbox' per the lifecycle rule) BEFORE ThreadArchived's
+    // (section='archived') — without it, the trailing terminal commits last
+    // and undoes the archive ("click Archive twice" bug).
+    //
+    // Idle threads need no cancel: end_stale_waiting_session would emit a
+    // spurious ResponseCanceled with the same race.
+    if state.engine.is_agent_running_for(thread_uuid).await {
+        let mut bus_rx = state.engine.event_bus.subscribe();
+        if let Err(e) = state
+            .engine
+            .cancel_agent(false, false, Some(thread_uuid), actor.clone())
+            .await
+        {
+            log!("[API] Failed to end CC session on archive: {}", e);
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(CANCEL_FALLOUT_TIMEOUT_MS),
+            async {
+                loop {
+                    match bus_rx.recv().await {
+                        Ok(evt) => {
+                            let crate::engine::event_bus::BusEvent::Thread {
+                                thread_id: tid,
+                                event,
+                                ..
+                            } = &evt.typed
+                            else {
+                                continue;
+                            };
+                            if *tid == thread_uuid
+                                && matches!(
+                                    event,
+                                    crate::engine::thread_events::ThreadEvent::ResponseCanceled { .. }
+                                        | crate::engine::thread_events::ThreadEvent::ResponseAborted { .. }
+                                        | crate::engine::thread_events::ThreadEvent::ResponseFailed { .. }
+                                )
+                            {
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            },
         )
         .await;
-        if let crate::engine::agent_question::AnswerResult::Conflict(msg) = result {
-            // Conflicts here mean the question was answered between lookup and emit
-            // (rare). Log and continue — dismiss should not fail because of it.
-            log!("[API] dismiss: pending question already resolved: {}", msg);
-        }
-    }
-
-    // CC cleanup emits CodingAgentIdled, which re-marks the thread unread via
-    // lifecycle side effect. ThreadDismissed must emit LAST to win — see
-    // cc_idled_then_dismissed_ends_in_default_section in event_bus_tests.rs.
-    if let Err(e) = state
-        .engine
-        .end_cc_session_for_thread(thread_uuid, actor.clone())
-        .await
-    {
-        log!("[API] Failed to end CC session on dismiss: {}", e);
     }
 
     state
@@ -590,15 +710,15 @@ pub(super) async fn dismiss_thread(
         .event_bus
         .emit(crate::engine::event_bus::BusEvent::Thread {
             thread_id: thread_uuid,
-            event: crate::engine::thread_events::ThreadEvent::ThreadDismissed,
+            event: crate::engine::thread_events::ThreadEvent::ThreadArchived,
             meta: crate::engine::thread_events::EventMeta::with_actor(actor.clone()),
         })
         .await
         .map_err(|e| {
-            log!("[API] Failed to dismiss thread: {}", e);
+            log!("[API] Failed to archive thread: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to dismiss thread: {}", e),
+                format!("Failed to archive thread: {}", e),
             )
         })?;
 

@@ -1,11 +1,14 @@
-import { showToast, dismissToast, changes, appliedChanges, changesHasMore, changesLoadingMore, restartRequired, updateAvailable, restartGroups, applyingChangeIds, toasts, engineRestarting, engineVersion, latestEngineVersion, threadMap } from '../store';
+import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, updateAvailable, restartGroups, applyingChangeIds, toasts, engineRestarting, engineVersion, latestEngineVersion, threadMap } from '../store';
+import { toFailed } from '../types';
+import type { Loadable } from '../types';
 import type { RestartGroup } from '../store';
-import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, restartEngine, ApiError } from '../../api/client';
+import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, restartEngine, ApiError } from '../../api/client';
 import { isNewerVersion } from '../../utils/version';
 import { errorDetail } from '../../utils/errorDetail';
 import { PENDING_TITLE_PLACEHOLDER } from '../thread-events';
 import { focusThread } from './threads';
 import type { Change } from '../../api/client';
+import type { ToastAction } from '../types';
 
 const RESTART_TOAST_KEY = 'restart-required';
 export const RESTART_LS_KEY = 'lucidos-restart-required';
@@ -15,6 +18,15 @@ export const RESTART_LS_KEY = 'lucidos-restart-required';
 const PAGE_LOADED_AT = Date.now();
 
 const CLIENT_FILE_RE = /\.(ts|tsx|css|html|js|jsx)$/;
+
+/** Restart-required changes reload on reconnect; offering Refresh too would race. */
+export function appliedToastRefreshAction(
+  requiresRestart: boolean,
+  clientUpdate: boolean,
+): ToastAction | undefined {
+  if (!clientUpdate || requiresRestart) return undefined;
+  return { label: 'Refresh', onClick: () => window.location.reload() };
+}
 
 /** Check if any applied change with frontend files was resolved after the page loaded.
  *  This replaces the backend's `client_update_available` flag which checks "since engine
@@ -221,6 +233,29 @@ export async function revertChange(id: string): Promise<void> {
     await apiRevert(id);
   } catch (e) {
     showToast(errorDetail(e) || 'Failed to revert change', 'error');
+  }
+}
+
+function setLazyChange(id: string, value: Loadable<Change>): void {
+  const next = new Map(lazyChanges.value);
+  next.set(id, value);
+  lazyChanges.value = next;
+}
+
+/** Fetch a `Change` row on demand when its id falls outside the
+ *  `changes`/`appliedChanges` windows. No-op if already cached, in flight, or
+ *  known unfetchable — the `loading` and `failed` entries in `lazyChanges`
+ *  serve as the dedup token and negative cache respectively. */
+export async function ensureChangeLoaded(id: string): Promise<void> {
+  if (findChangeById(id)) return;
+  if (lazyChanges.value.has(id)) return;
+
+  setLazyChange(id, { status: 'loading' });
+  try {
+    const change = await apiGetChangeById(id);
+    setLazyChange(id, { status: 'loaded', data: change });
+  } catch (e) {
+    setLazyChange(id, toFailed<Change>(e));
   }
 }
 

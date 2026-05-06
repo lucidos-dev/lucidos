@@ -419,9 +419,8 @@ describe('useHideOnScroll title bar height var', () => {
   });
 
   it('multiline title (80px) converts to rem — chevron must track wrapped height', () => {
-    // Two-line title like "Fullmakt og tilgang til Helsenorge" measures
-    // ~5rem (80px @ 16px). The chevron must use this real height, not the
-    // 2.75rem single-line fallback.
+    // A two-line title measures ~5rem (80px @ 16px). The chevron must use this
+    // real height, not the 2.75rem single-line fallback.
     expect(computeTitleBarHeightVar(80, 16)).toBe(`${80 / 16}rem`);
   });
 

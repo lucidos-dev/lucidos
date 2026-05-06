@@ -8,7 +8,7 @@ use std::time::Duration;
 /// Auto-dismiss cookie consent dialogs.
 /// Tries multiple strategies including CMP APIs and button clicking.
 pub(super) async fn dismiss_cookie_consent(page: &Page) {
-    log!("Starting cookie consent dismissal...");
+    log!("[BrowserConsent] Starting cookie consent dismissal...");
 
     // JavaScript to find and click cookie consent buttons
     let consent_js = r#"
@@ -162,7 +162,7 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
     if let Ok(result) = page.evaluate(cmp_api_js).await {
         if let Ok(msg) = result.into_value::<String>() {
             if !msg.contains("no API") {
-                log!("Tried CMP API: {}", msg);
+                log!("[BrowserConsent] Tried CMP API: {}", msg);
                 tokio::time::sleep(Duration::from_millis(1000)).await;
                 // Don't return - continue to verify with other methods
             }
@@ -202,7 +202,7 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
 
     if let Ok(result) = page.evaluate(sourcepoint_postmessage_js).await {
         if let Ok(Some(msg)) = result.into_value::<Option<String>>() {
-            log!("{}", msg);
+            log!("[BrowserConsent] {}", msg);
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
@@ -211,9 +211,9 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
     for attempt in 1..=3 {
         if let Ok(result) = page.evaluate(consent_js).await {
             if let Ok(msg) = result.into_value::<String>() {
-                log!("Consent search attempt {}: {}", attempt, msg);
+                log!("[BrowserConsent] Consent search attempt {}: {}", attempt, msg);
                 if msg.starts_with("clicked") {
-                    log!("Cookie consent dismissed (attempt {}): {}", attempt, msg);
+                    log!("[BrowserConsent] Cookie consent dismissed (attempt {}): {}", attempt, msg);
                     // Wait longer for dialog to close
                     tokio::time::sleep(Duration::from_millis(1000)).await;
                     return;
@@ -299,11 +299,11 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
             if let Ok(coords) = serde_json::from_str::<serde_json::Value>(&json_str) {
                 if let (Some(x), Some(y)) = (coords["x"].as_f64(), coords["y"].as_f64()) {
                     let text = coords["text"].as_str().unwrap_or("unknown");
-                    log!("Found consent button at ({}, {}): {}", x, y, text);
+                    log!("[BrowserConsent] Found consent button at ({}, {}): {}", x, y, text);
 
                     // Click at coordinates using CDP
                     if click_at_coordinates(page, x, y).await {
-                        log!("Cookie consent dismissed via CDP click");
+                        log!("[BrowserConsent] Cookie consent dismissed via CDP click");
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         return;
                     }
@@ -364,7 +364,7 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
                 let iframe_h = coords["iframe_height"].as_f64().unwrap_or(0.0);
 
                 log!(
-                    "Found consent iframe at ({}, {}) size {}x{}: {}",
+                    "[BrowserConsent] Found consent iframe at ({}, {}) size {}x{}: {}",
                     iframe_x,
                     iframe_y,
                     iframe_w,
@@ -408,7 +408,7 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
                 };
 
                 for (click_x, click_y) in click_positions {
-                    log!("Trying CDP click at ({:.0}, {:.0})", click_x, click_y);
+                    log!("[BrowserConsent] Trying CDP click at ({:.0}, {:.0})", click_x, click_y);
                     click_at_coordinates(page, click_x, click_y).await;
                     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -420,14 +420,14 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
                         "#;
                     if let Ok(result) = page.evaluate(check_js).await {
                         if let Ok(true) = result.into_value::<bool>() {
-                            log!("Cookie consent iframe dismissed!");
+                            log!("[BrowserConsent] Cookie consent iframe dismissed!");
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             return;
                         }
                     }
                 }
 
-                log!("Clicked multiple positions but iframe still present");
+                log!("[BrowserConsent] Clicked multiple positions but iframe still present");
             }
         }
     }
@@ -436,22 +436,22 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
     // Retry a few times with increasing wait to allow iframes to load
     for attempt in 1..=3 {
         if attempt > 1 {
-            log!("Waiting for iframes to load (attempt {})...", attempt);
+            log!("[BrowserConsent] Waiting for iframes to load (attempt {})...", attempt);
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
 
-        log!("Trying to find button in all frames via CDP...");
+        log!("[BrowserConsent] Trying to find button in all frames via CDP...");
         if let Some((x, y, text)) = find_consent_button_in_frames(page).await {
-            log!("Found consent button '{}' at ({}, {})", text, x, y);
+            log!("[BrowserConsent] Found consent button '{}' at ({}, {})", text, x, y);
             if click_at_coordinates(page, x, y).await {
-                log!("Clicked consent button via CDP");
+                log!("[BrowserConsent] Clicked consent button via CDP");
                 tokio::time::sleep(Duration::from_millis(1000)).await;
                 return;
             }
         }
     }
 
-    log!("No cookie consent dialog found after all attempts");
+    log!("[BrowserConsent] No cookie consent dialog found after all attempts");
 }
 
 /// Find consent button position by executing in all frames (including cross-origin)
@@ -463,7 +463,7 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
     let mut frame_ids = Vec::new();
     let mut frame_urls = Vec::new();
     collect_frame_ids_with_urls(&frame_tree.frame_tree, &mut frame_ids, &mut frame_urls);
-    log!("Found {} frames to search", frame_ids.len());
+    log!("[BrowserConsent] Found {} frames to search", frame_ids.len());
 
     // Sort frames: consent-related iframes first, skip main frame (index 0)
     let mut frame_indices: Vec<usize> = (0..frame_ids.len()).collect();
@@ -576,7 +576,7 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
         let frame_id = &frame_ids[idx];
         let frame_url = &frame_urls[idx];
         log!(
-            "Searching frame {}: {}",
+            "[BrowserConsent] Searching frame {}: {}",
             idx,
             if frame_url.len() > 60 {
                 &frame_url[..frame_url.floor_char_boundary(60)]
@@ -620,7 +620,7 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
                                                     coords["buttonCount"].as_i64().unwrap_or(0);
                                                 let url = coords["url"].as_str().unwrap_or("");
                                                 log!(
-                                                    "Frame {}: {} buttons, url={}, preview='{}'",
+                                                    "[BrowserConsent] Frame {}: {} buttons, url={}, preview='{}'",
                                                     idx,
                                                     btn_count,
                                                     url,
@@ -635,7 +635,7 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
                                                     .unwrap_or("")
                                                     .to_string();
                                                 log!(
-                                                    "Frame {}: FOUND '{}' at ({}, {})",
+                                                    "[BrowserConsent] Frame {}: FOUND '{}' at ({}, {})",
                                                     idx,
                                                     text,
                                                     x,
@@ -646,17 +646,17 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
                                         }
                                     }
                                 } else {
-                                    log!("Frame {}: null result", idx);
+                                    log!("[BrowserConsent] Frame {}: null result", idx);
                                 }
                             }
                             Err(e) => {
-                                log!("Frame {}: eval error: {}", idx, e);
+                                log!("[BrowserConsent] Frame {}: eval error: {}", idx, e);
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    log!("Frame {}: create world error: {}", idx, e);
+                    log!("[BrowserConsent] Frame {}: create world error: {}", idx, e);
                 }
             }
         }

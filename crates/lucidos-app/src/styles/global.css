@@ -33,6 +33,7 @@ html {
 
     /* Layout */
     --divider-width: 0.1875rem;
+    --content-max-width: 50rem;
 
     /* Icon sizes (used by .icon-btn variants) */
     --icon-size-sm: 0.875rem;
@@ -64,6 +65,15 @@ html, html[data-theme="dark"] {
     --accent-yellow: #d29922;
     --accent-red: #f85149;
     --accent-orange: #D97757;
+    --initiator-you: #3b82f6;
+    --initiator-agent: #fbbf24;
+    --initiator-engine: #14b8a6;
+    --initiator-cc: #fb923c;
+    /* Reason hues — only ever paint the summary line of an engine panel. */
+    --reason-trigger: #f59e0b;
+    --reason-applied: #10b981;
+    --reason-failed: #ef4444;
+    --reason-muted: #888888;
     --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.3);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
     --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);
@@ -99,6 +109,15 @@ html[data-theme="light"] {
     --accent-yellow: #9a6700;
     --accent-red: #cf222e;
     --accent-orange: #c26a4a;
+    /* Light-theme variants — darkened so each hue passes contrast on the white surface. */
+    --initiator-you: #2563eb;
+    --initiator-agent: #ca8a04;
+    --initiator-engine: #0d9488;
+    --initiator-cc: #ea7c2a;
+    --reason-trigger: #b45309;
+    --reason-applied: #047857;
+    --reason-failed: #b91c1c;
+    --reason-muted: #6e7781;
     --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.08);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.1);
     --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.1);
@@ -301,6 +320,18 @@ h4, h5, h6 { font-size: 0.8125rem; }
     pointer-events: none;
 }
 
+/* Off-screen but still rendered — for inputs we trigger programmatically.
+   iOS WebKit (especially in standalone PWA mode) drops the `change` event
+   on `display:none` / `visibility:hidden` file inputs after the picker
+   dismisses; keeping the element in the layout makes events deliver. */
+.visually-hidden {
+    position: absolute;
+    width: 0;
+    height: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+
 /* Shared label — small uppercase badge used across the app */
 .label {
     display: inline-block;
@@ -375,7 +406,8 @@ h4, h5, h6 { font-size: 0.8125rem; }
     height: var(--icon-size-lg);
 }
 
-.icon-btn.filter-active {
+.icon-btn.filter-active,
+.icon-btn.drafts-active {
     color: var(--accent);
     background: var(--bg-tertiary);
     border-radius: 0.375rem;
@@ -387,7 +419,8 @@ h4, h5, h6 { font-size: 0.8125rem; }
         color: var(--text-primary);
     }
 
-    .icon-btn.filter-active:hover {
+    .icon-btn.filter-active:hover,
+    .icon-btn.drafts-active:hover {
         background: var(--bg-quaternary);
         color: var(--accent);
     }
@@ -414,6 +447,7 @@ h4, h5, h6 { font-size: 0.8125rem; }
     border: none;
     color: var(--text-on-accent);
     cursor: pointer;
+    min-width: 3.5rem;
     padding: 0.25rem 0.625rem;
     border-radius: 0.25rem;
     font-size: 0.6875rem;
@@ -514,6 +548,12 @@ h4, h5, h6 { font-size: 0.8125rem; }
     }
 }
 
+.dropdown-trigger:focus-visible {
+    color: var(--text-primary);
+    outline: 0.125rem solid var(--accent);
+    outline-offset: 0.125rem;
+}
+
 .dropdown-trigger:disabled {
     opacity: 0.5;
     cursor: not-allowed;
@@ -588,13 +628,13 @@ h4, h5, h6 { font-size: 0.8125rem; }
 
 @media (hover: hover) {
     .dropdown-option:hover {
-        background: var(--bg-secondary);
+        background: var(--bg-tertiary);
         color: var(--text-primary);
     }
 }
 
 .dropdown-option.focused {
-    background: var(--bg-secondary);
+    background: var(--bg-tertiary);
     color: var(--text-primary);
 }
 
@@ -612,7 +652,8 @@ h4, h5, h6 { font-size: 0.8125rem; }
 }
 
 .dropdown-input-wrap:focus-within {
-    border-color: var(--text-muted);
+    outline: 0.125rem solid var(--accent);
+    outline-offset: 0.125rem;
 }
 
 .dropdown-input-wrap .dropdown-chevron {
@@ -913,9 +954,10 @@ h4, h5, h6 { font-size: 0.8125rem; }
 .empty-state {
     grid-column: 1 / -1;
     text-align: center;
-    padding: 2rem;
+    padding: 2.5rem 1.5rem;
     color: var(--text-muted);
     font-size: 0.8125rem;
+    line-height: 1.5;
 }
 
 /* ─── Shared modal overlay base ─── */

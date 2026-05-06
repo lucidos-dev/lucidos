@@ -1,25 +1,43 @@
 use super::*;
 
-/// Allowed top-level directories the API will serve.
-/// `system-knowhow/` is intentionally absent: those are engine-shipped LLM-only
-/// reference knowhow served in-process via `SystemKnowhowStore`, never over HTTP.
-const ALLOWED_PREFIXES: &[&str] = &["artifacts/", "apps/", "knowhow/", "triggers/"];
+/// Mutable workspace-data prefixes — the four user-owned trees the API may write/delete.
+const MUTABLE_PREFIXES: &[&str] = &["artifacts/", "apps/", "knowhow/", "triggers/"];
 
-fn validate_data_path(path: &str) -> Result<(), (StatusCode, String)> {
+/// Read-only prefix for engine-shipped reference knowhow served from `<repo>/system-knowhow/`.
+/// Allowed for GET so the trigger UI's knowhow links resolve; rejected for PUT/DELETE/edit.
+const READ_ONLY_PREFIXES: &[&str] = &["system-knowhow/"];
+
+const READ_PREFIX_ERR: &str =
+    "Path must start with one of: artifacts/, apps/, knowhow/, triggers/, system-knowhow/";
+const MUTATE_PREFIX_ERR: &str =
+    "Path must start with one of: artifacts/, apps/, knowhow/, triggers/";
+
+fn validate_path_basics(path: &str) -> Result<(), (StatusCode, String)> {
     if path.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Path is required".to_string()));
     }
     if is_path_traversal(path) {
         return Err((StatusCode::BAD_REQUEST, "Invalid path".to_string()));
     }
-    if !ALLOWED_PREFIXES.iter().any(|p| path.starts_with(p)) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Path must start with one of: {}",
-                ALLOWED_PREFIXES.join(", ")
-            ),
-        ));
+    Ok(())
+}
+
+fn validate_data_path_read(path: &str) -> Result<(), (StatusCode, String)> {
+    validate_path_basics(path)?;
+    if !MUTABLE_PREFIXES
+        .iter()
+        .chain(READ_ONLY_PREFIXES.iter())
+        .any(|p| path.starts_with(p))
+    {
+        return Err((StatusCode::BAD_REQUEST, READ_PREFIX_ERR.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_data_path_mutate(path: &str) -> Result<(), (StatusCode, String)> {
+    validate_path_basics(path)?;
+    if !MUTABLE_PREFIXES.iter().any(|p| path.starts_with(p)) {
+        return Err((StatusCode::BAD_REQUEST, MUTATE_PREFIX_ERR.to_string()));
     }
     Ok(())
 }
@@ -74,12 +92,13 @@ pub(super) async fn list_data(
     }
 }
 
-/// Walk every workspace-data prefix under `data_dir`. With `pattern` set, only
-/// paths the pattern matches are returned; with `None`, all walked paths are
-/// returned.
+/// Walk every workspace-mutable prefix under `data_dir`. With `pattern` set,
+/// only paths the pattern matches are returned; with `None`, all walked paths
+/// are returned. Intentionally excludes engine-shipped read-only trees
+/// (system-knowhow) — those shouldn't surface in the workspace Files panel.
 fn list_data_inner(data_dir: &std::path::Path, pattern: Option<&glob::Pattern>) -> Vec<String> {
     let mut files = Vec::new();
-    for prefix in ALLOWED_PREFIXES {
+    for prefix in MUTABLE_PREFIXES {
         let subdir = data_dir.join(prefix.trim_end_matches('/'));
         if !subdir.is_dir() {
             continue;
@@ -123,11 +142,18 @@ fn walkdir(root: &std::path::Path, dir: &std::path::Path) -> Result<Vec<String>,
 
 /// GET /api/v1/data/*path — read a data file
 pub(super) async fn read_data(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    if let Err((code, msg)) = validate_data_path(&path) {
+    if let Err((code, msg)) = validate_data_path_read(&path) {
         return (code, msg).into_response();
     }
 
-    let file_path = state.workspace_path.join(crate::core::DATA_DIR).join(&path);
+    let file_path = if let Some(rel) = path.strip_prefix(crate::core::knowhow::SYSTEM_KNOWHOW_PREFIX) {
+        let Some(dir) = state.engine.system_knowhow_dir() else {
+            return (StatusCode::NOT_FOUND, "System knowhow not available").into_response();
+        };
+        dir.join(rel)
+    } else {
+        state.workspace_path.join(crate::core::DATA_DIR).join(&path)
+    };
     let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
     let content_type = content_type_for_ext(&ext);
 
@@ -150,7 +176,7 @@ pub(super) async fn write_data(
     Path(path): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Err((code, msg)) = validate_data_path(&path) {
+    if let Err((code, msg)) = validate_data_path_mutate(&path) {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
 
@@ -159,8 +185,7 @@ pub(super) async fn write_data(
         Err(resp) => return *resp,
     };
 
-    if path.starts_with("artifacts/") {
-        let artifact_path = path.strip_prefix("artifacts/").unwrap();
+    if let Some(artifact_path) = path.strip_prefix("artifacts/") {
         let content = String::from_utf8_lossy(&body).to_string();
         match am
             .write_and_commit(
@@ -217,7 +242,7 @@ pub(super) async fn delete_data(
     State(state): State<AppState>,
     Path(path): Path<String>,
 ) -> Response {
-    if let Err((code, msg)) = validate_data_path(&path) {
+    if let Err((code, msg)) = validate_data_path_mutate(&path) {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
 
@@ -226,8 +251,7 @@ pub(super) async fn delete_data(
         Err(resp) => return *resp,
     };
 
-    if path.starts_with("artifacts/") {
-        let artifact_path = path.strip_prefix("artifacts/").unwrap();
+    if let Some(artifact_path) = path.strip_prefix("artifacts/") {
         match am
             .delete_and_commit(artifact_path, &format!("Delete {}", artifact_path))
             .await
@@ -279,7 +303,7 @@ pub(super) async fn edit_data(
     State(state): State<AppState>,
     Json(body): Json<DataEditRequest>,
 ) -> Response {
-    if let Err((code, msg)) = validate_data_path(&body.path) {
+    if let Err((code, msg)) = validate_data_path_mutate(&body.path) {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
 
@@ -320,7 +344,6 @@ pub(super) async fn edit_data(
                 op.find.as_deref(),
                 op.replace.as_deref(),
                 false,
-                None,
                 None,
             )
             .await
@@ -415,30 +438,55 @@ mod tests {
         assert_eq!(result, vec!["artifacts/x.md", "knowhow/y.md"]);
     }
 
+    /// system-knowhow files are engine-shipped reference docs and must NOT
+    /// surface in the workspace Files panel even if a workspace happens to
+    /// contain a `data/system-knowhow/` directory.
+    #[test]
+    fn list_data_inner_excludes_system_knowhow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        touch(data, "artifacts/x.md");
+        touch(data, "system-knowhow/best-practices.md");
+
+        let result = list_data_inner(data, None);
+        assert_eq!(result, vec!["artifacts/x.md"]);
+    }
+
     #[test]
     fn validate_rejects_traversal() {
-        assert!(validate_data_path("../etc/passwd").is_err());
-        assert!(validate_data_path("/etc/passwd").is_err());
+        assert!(validate_data_path_read("../etc/passwd").is_err());
+        assert!(validate_data_path_read("/etc/passwd").is_err());
+        assert!(validate_data_path_mutate("../etc/passwd").is_err());
+        assert!(validate_data_path_mutate("/etc/passwd").is_err());
     }
 
     #[test]
     fn validate_rejects_unknown_prefix() {
-        assert!(validate_data_path("postgres/data").is_err());
-        assert!(validate_data_path("secret/file").is_err());
+        assert!(validate_data_path_read("postgres/data").is_err());
+        assert!(validate_data_path_read("secret/file").is_err());
+        assert!(validate_data_path_mutate("postgres/data").is_err());
+        assert!(validate_data_path_mutate("secret/file").is_err());
     }
 
     #[test]
-    fn validate_rejects_system_knowhow() {
-        assert!(validate_data_path("system-knowhow/best-practices.md").is_err());
-        assert!(validate_data_path("system-knowhow/scripts/list.sh").is_err());
+    fn read_accepts_system_knowhow_but_mutate_rejects() {
+        assert!(validate_data_path_read("system-knowhow/best-practices.md").is_ok());
+        assert!(validate_data_path_read("system-knowhow/scripts/list.sh").is_ok());
+        assert!(validate_data_path_mutate("system-knowhow/best-practices.md").is_err());
+        assert!(validate_data_path_mutate("system-knowhow/scripts/list.sh").is_err());
     }
 
     #[test]
     fn validate_accepts_allowed_paths() {
-        assert!(validate_data_path("artifacts/report.md").is_ok());
-        assert!(validate_data_path("apps/myapp/index.html").is_ok());
-        assert!(validate_data_path("knowhow/guide.md").is_ok());
-        assert!(validate_data_path("triggers/daily/config.json").is_ok());
+        for p in [
+            "artifacts/report.md",
+            "apps/myapp/index.html",
+            "knowhow/guide.md",
+            "triggers/daily/config.json",
+        ] {
+            assert!(validate_data_path_read(p).is_ok());
+            assert!(validate_data_path_mutate(p).is_ok());
+        }
     }
 
     #[test]

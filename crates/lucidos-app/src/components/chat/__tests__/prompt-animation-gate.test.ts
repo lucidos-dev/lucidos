@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { promptAnimating, focusedThreadId, threadMap } from '../../../store/store';
 import { activeExchanges } from '../../../store/store';
-import type { ThreadState, StoredEvent } from '../../../store/thread-events';
+import { hasContentEvents, type ThreadState, type StoredEvent } from '../../../store/thread-events';
 import { emptyReason } from '../ThreadView';
 
 function makeThreadState(id: string): ThreadState {
@@ -13,7 +13,7 @@ function makeThreadState(id: string): ThreadState {
   events.set(1, { type: 'MessageReceived', text: 'hello', channel: 'chat', created: '2026-01-01T00:00:00Z' });
   events.set(2, { type: 'ResponseGenerated', text: 'hi back', created: '2026-01-01T00:00:01Z' });
   return {
-    meta: { id, title: 'Test', channel: 'chat', initiator: 'user', pinned: false, createdAt: '', updatedAt: '', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'default', activeChildrenCount: 0, totalChildrenCount: 0 },
+    meta: { id, title: 'Test', channel: 'chat', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, state: 'active' },
     events,
     streamingBuffer: '',
     eventsLoaded: true,
@@ -71,29 +71,29 @@ describe('promptAnimating gate', () => {
   });
 
   it('emptyReason returns loading during animation regardless of event state', () => {
-    // The bug: during FLIP animation, events arrive via SSE (eventCount > 0) and
+    // The bug: during FLIP animation, events arrive via SSE (hasContent=true) and
     // eventsLoaded=true, but exchanges are gated to []. Old boolean logic showed
     // "Messages could not be displayed" error. Union type makes this impossible.
-    expect(emptyReason(true, false, false, 0, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
-    expect(emptyReason(true, true, false, 0, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
-    expect(emptyReason(true, true, false, 5, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
-    expect(emptyReason(true, false, true, 0, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
+    expect(emptyReason(true, false, false, false, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
+    expect(emptyReason(true, true, false, false, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
+    expect(emptyReason(true, true, false, true, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
+    expect(emptyReason(true, false, true, false, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
   });
 
   it('emptyReason returns failed when load failed', () => {
-    expect(emptyReason(false, false, true, 0, 't1')).toEqual({ kind: 'failed', threadId: 't1' });
+    expect(emptyReason(false, false, true, false, 't1')).toEqual({ kind: 'failed', threadId: 't1' });
   });
 
-  it('emptyReason returns corrupt when events exist but exchanges are empty', () => {
-    expect(emptyReason(false, true, false, 3, 't1')).toEqual({ kind: 'corrupt', threadId: 't1' });
+  it('emptyReason returns corrupt only when CONTENT events exist but exchanges are empty', () => {
+    expect(emptyReason(false, true, false, true, 't1')).toEqual({ kind: 'corrupt', threadId: 't1' });
   });
 
   it('emptyReason returns empty for genuinely empty thread', () => {
-    expect(emptyReason(false, true, false, 0, 't1')).toEqual({ kind: 'empty' });
+    expect(emptyReason(false, true, false, false, 't1')).toEqual({ kind: 'empty' });
   });
 
   it('emptyReason returns loading when events not yet loaded', () => {
-    expect(emptyReason(false, false, false, 0, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
+    expect(emptyReason(false, false, false, false, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
   });
 
   it('error state must NOT flash during animation even when events exist (thread creation bug)', () => {
@@ -103,7 +103,7 @@ describe('promptAnimating gate', () => {
     events.set(1, { type: 'MessageReceived', text: 'hello', channel: 'chat', created: '2026-01-01T00:00:00Z' });
 
     const state: ThreadState = {
-      meta: { id, title: '', channel: 'chat', initiator: 'user', pinned: false, createdAt: '', updatedAt: '', unread: false, status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'default', activeChildrenCount: 0, totalChildrenCount: 0 },
+      meta: { id, title: '', channel: 'chat', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 1, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, state: 'active' },
       events,
       streamingBuffer: '',
       eventsLoaded: true,
@@ -114,7 +114,7 @@ describe('promptAnimating gate', () => {
     threadMap.value = new Map([[id, state]]);
 
     // During animation: emptyReason forces loading (never error)
-    const reason = emptyReason(true, state.eventsLoaded, state.eventsLoadFailed, state.events.size, id);
+    const reason = emptyReason(true, state.eventsLoaded, state.eventsLoadFailed, hasContentEvents(state.events), id);
     expect(reason.kind).toBe('loading');
 
     // After animation: events compute into exchanges normally — no empty state

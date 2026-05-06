@@ -12,7 +12,7 @@ async function setupIdleCCThread(page: Page) {
   await switchToClaudeMode(page);
 
   await sendMessage(page, 'Say exactly: "setup". Do not create any files.');
-  await waitForActionPanel(page, 'Done', 120_000);
+  await waitForActionPanel(page, 'Archive', 120_000);
 }
 
 /** Install API route handlers that force has_active_session: true in commands

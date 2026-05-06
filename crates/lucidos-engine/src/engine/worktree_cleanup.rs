@@ -16,7 +16,7 @@
 //!
 //! - **Tier 2 — auto, safe when nothing depends on the working tree.** When
 //!   a thread has been idle longer than [`TIER_2_IDLE`], `git status` is
-//!   clean, the thread is not pinned, and the on-disk path matches the
+//!   clean, the thread is not saved, and the on-disk path matches the
 //!   deterministic `thread-<short>` shape (legacy random-suffix worktrees
 //!   are skipped — we don't know which thread owned them), the entire
 //!   worktree directory is removed. If the worktree's branch has no commits
@@ -26,12 +26,16 @@
 //! - **Free-disk monitoring.** Each cycle the worker probes available space
 //!   on the volume hosting the worktrees dir. On the transition from
 //!   above-soft to below [`FREE_DISK_SOFT_BYTES`] (20 GB) it emits a one-shot
-//!   "Lucidos disk space low" `NotificationCreated`; the alert re-arms once
-//!   disk recovers above soft. Below [`FREE_DISK_HARD_BYTES`] (5 GB) it ALSO
-//!   widens its Tier 1 idle window from 24 h to [`FORCE_TIER_1_IDLE`] (1 h)
-//!   so build artifacts from recently-idle worktrees get reclaimed
-//!   aggressively, and emits "Lucidos auto-cleanup running" with the bytes
-//!   reclaimed each cycle that actually freed space. Active and pinned
+//!   "Low disk space on your machine" `NotificationCreated`; the alert re-arms
+//!   once disk recovers above soft. The body is deliberately framed around
+//!   the volume (not Lucidos) and branches on Lucidos's own footprint vs.
+//!   [`LARGE_FOOTPRINT_BYTES`] so the suggestion matches reality — small
+//!   footprint says "look elsewhere on your machine", large footprint
+//!   suggests Settings → Disk Usage. Below [`FREE_DISK_HARD_BYTES`] (5 GB) it
+//!   ALSO widens its Tier 1 idle window from 24 h to [`FORCE_TIER_1_IDLE`]
+//!   (1 h) so build artifacts from recently-idle worktrees get reclaimed
+//!   aggressively, and emits "Lucidos reclaimed disk space" with the bytes
+//!   reclaimed each cycle that actually freed space. Active and saved
 //!   worktrees are always exempt. Routine 24h Tier 1 / 30d Tier 2 sweeps
 //!   stay silent — only disk-pressure cleanup notifies.
 //!
@@ -84,15 +88,33 @@ pub const FREE_DISK_SOFT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// Hard free-disk threshold. When free space drops below this, the worker
 /// widens its Tier 1 idle window from `TIER_1_IDLE` (24 h) to
 /// `FORCE_TIER_1_IDLE` (1 h) so build artifacts get reclaimed aggressively.
-/// Active and pinned worktrees are still untouched. Also emits a stronger
+/// Active and saved worktrees are still untouched. Also emits a stronger
 /// notification telling the user what we just did.
 pub const FREE_DISK_HARD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Tier 1 idle window when disk pressure forces aggressive cleanup. 1 hour.
 pub const FORCE_TIER_1_IDLE: Duration = Duration::from_secs(60 * 60);
 
-/// How often the cleanup loop fires. One hour.
-pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// How often the cleanup loop fires. 15 minutes — fast enough that
+/// applied/clean worktrees (Tier 0) clear within ≤15min after their 1h
+/// grace expires; slow enough that a quiet engine doesn't burn cycles.
+pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// Grace window for Tier 0 (applied + clean + no commits ahead → full
+/// removal). Long enough that the user can apply a change, read the diff,
+/// and send a follow-up message that reuses the worktree before deletion;
+/// short enough that the Disk Usage panel stays accurate. Drops to 0 under
+/// disk pressure (`free_bytes < FREE_DISK_HARD_BYTES`), matching how Tier 1
+/// already accelerates from 24h to 1h under the same condition.
+pub const TIER_0_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// Threshold above which Lucidos's own worktree footprint is "meaningful"
+/// in the disk-low notification. Below this, the heads-up message tells the
+/// user the pressure is from their machine overall (other apps), not Lucidos
+/// — so the framing matches reality. 5 GB is roughly the size of one CC
+/// session's `target/` after a Cargo build, so anything noticeably above
+/// "one fresh worktree" gets the cleanup-suggestion variant.
+pub const LARGE_FOOTPRINT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -121,12 +143,19 @@ pub struct WorktreeCleanup {
     free_soft_bytes: u64,
     free_hard_bytes: u64,
     force_tier1_idle: Duration,
+    /// Boundary used by [`emit_disk_low_alert`] to pick the
+    /// look-elsewhere vs. clean-from-Settings body variant.
+    large_footprint_bytes: u64,
     alerts: Mutex<AlertState>,
+    /// Tier 0 needs `pending_for_thread`; constructed per-worker so the
+    /// `spawn` signature stays pool-only.
+    changes: crate::core::changes_projection::ChangesProjection,
 }
 
 impl WorktreeCleanup {
-    /// Build a worker with production defaults (1-hour cycle, 20 GB soft / 5 GB hard free-disk thresholds).
+    /// Build a worker with production defaults (15-minute cycle, 20 GB soft / 5 GB hard free-disk thresholds).
     pub fn new(pool: PgPool, bus: Arc<EventBus>, workspace_root: PathBuf) -> Self {
+        let changes = crate::core::changes_projection::ChangesProjection::new(pool.clone());
         Self {
             pool,
             bus,
@@ -135,7 +164,9 @@ impl WorktreeCleanup {
             free_soft_bytes: FREE_DISK_SOFT_BYTES,
             free_hard_bytes: FREE_DISK_HARD_BYTES,
             force_tier1_idle: FORCE_TIER_1_IDLE,
+            large_footprint_bytes: LARGE_FOOTPRINT_BYTES,
             alerts: Mutex::new(AlertState::default()),
+            changes,
         }
     }
 
@@ -162,8 +193,8 @@ impl WorktreeCleanup {
             self.free_hard_bytes,
         );
         loop {
-            tokio::time::sleep(self.interval).await;
             self.run_once().await;
+            tokio::time::sleep(self.interval).await;
         }
     }
 
@@ -191,6 +222,16 @@ impl WorktreeCleanup {
         let tier1_idle = if under_hard { self.force_tier1_idle } else { TIER_1_IDLE };
 
         let mut total_freed_under_hard: u64 = 0;
+        // Sum of every recognised worktree's on-disk size — the "Lucidos
+        // worktree footprint" we put in the disk-low notification so the
+        // user can see how much of the volume is actually Lucidos vs. the
+        // rest of their machine.
+        let mut lucidos_footprint_bytes: u64 = 0;
+
+        // Tier 0 / orphan-path grace: 1h normally, 0 under disk pressure.
+        // Same threshold for both since the safety story is identical
+        // (provably zero information on disk).
+        let zero_info_grace = if under_hard { Duration::ZERO } else { TIER_0_GRACE };
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -202,9 +243,6 @@ impl WorktreeCleanup {
             let Some(short) = parse_thread_short(name) else {
                 continue;
             };
-            let Some(thread_id) = lookup_thread_by_short(&self.pool, &short).await else {
-                continue;
-            };
 
             if !is_safe_subpath(&dir, &path) {
                 log!(
@@ -214,14 +252,50 @@ impl WorktreeCleanup {
                 continue;
             }
 
-            if let Some(age) = last_activity_age(&self.pool, thread_id).await {
-                if age >= TIER_2_IDLE && self.try_tier_2(thread_id, &path, pre_size).await.is_some() {
-                    continue;
+            match lookup_thread_by_short(&self.pool, &short).await {
+                Some(thread_id) => {
+                    lucidos_footprint_bytes =
+                        lucidos_footprint_bytes.saturating_add(pre_size);
+
+                    if let Some(age) = last_activity_age(&self.pool, thread_id).await {
+                        if age >= zero_info_grace {
+                            if let Some(freed) =
+                                self.try_tier_0(thread_id, &path, pre_size).await
+                            {
+                                if under_hard {
+                                    total_freed_under_hard =
+                                        total_freed_under_hard.saturating_add(freed);
+                                }
+                                continue;
+                            }
+                        }
+                        if age >= TIER_2_IDLE
+                            && self
+                                .try_tier_2(thread_id, &path, pre_size)
+                                .await
+                                .is_some()
+                        {
+                            continue;
+                        }
+                        if age >= tier1_idle {
+                            if let Some(freed) = self.try_tier_1(thread_id, &path).await {
+                                if under_hard {
+                                    total_freed_under_hard =
+                                        total_freed_under_hard.saturating_add(freed);
+                                }
+                            }
+                        }
+                    }
                 }
-                if age >= tier1_idle {
-                    if let Some(freed) = self.try_tier_1(thread_id, &path).await {
+                None => {
+                    // Orphan worktrees are excluded from the footprint to
+                    // match `inventory_worktrees` (Settings → Disk Usage).
+                    if let Some(freed) =
+                        self.try_orphan_path(&path, pre_size, zero_info_grace).await
+                    {
                         if under_hard {
-                            total_freed_under_hard = total_freed_under_hard.saturating_add(freed);
+                            total_freed_under_hard =
+                                total_freed_under_hard.saturating_add(freed);
                         }
                     }
                 }
@@ -242,7 +316,7 @@ impl WorktreeCleanup {
                 crossed
             };
             if just_crossed_soft {
-                self.emit_disk_low_alert(free).await;
+                self.emit_disk_low_alert(free, lucidos_footprint_bytes).await;
             }
             // Action notification: only when forced cleanup actually ran AND
             // reclaimed something. Routine 24h Tier 1 / 30d Tier 2 sweeps stay
@@ -251,6 +325,78 @@ impl WorktreeCleanup {
                 self.emit_auto_cleanup_alert(free, total_freed_under_hard).await;
             }
         }
+    }
+
+    /// Tier 0: full removal of zero-information worktrees (clean + branch at
+    /// main HEAD + no pending change), typically after Apply merged the work.
+    /// No saved-thread exemption: events stay in Postgres regardless, and the
+    /// worktree itself carries nothing not in main.
+    async fn try_tier_0(
+        &self,
+        thread_id: Uuid,
+        worktree: &Path,
+        pre_size: u64,
+    ) -> Option<u64> {
+        if !self.changes.pending_for_thread(thread_id).await.is_empty() {
+            return None;
+        }
+        if is_worktree_dirty(worktree).await {
+            return None;
+        }
+        let branch = crate::engine::git_ops::worktree_current_branch(worktree).await;
+        let branch_name = branch.as_deref()?;
+        let repo_root = resolve_repo_root_from_worktree(worktree).await?;
+        if has_branch_commits(&repo_root, branch_name).await {
+            return None;
+        }
+
+        let outcome =
+            remove_worktree_and_optionally_delete_branch(worktree, Some(pre_size)).await?;
+        log!(
+            "[WorktreeCleanup] tier-0 freed {} bytes for thread {} (branch_deleted={})",
+            outcome.freed_bytes,
+            thread_id,
+            outcome.branch_deleted
+        );
+        self.emit_cleaned(thread_id, 0, outcome.freed_bytes, outcome.branch_deleted)
+            .await;
+        Some(outcome.freed_bytes)
+    }
+
+    /// Orphan-path sweep: same destructive call as Tier 0 for `thread-<8hex>`
+    /// dirs whose short id resolves to no thread (DB wipe, or aborted spawn
+    /// that died before SessionStarted). Uses directory mtime instead of
+    /// `last_activity_age` since no events exist to query, and skips the
+    /// `WorktreeCleaned` emit because that event is keyed on `thread_id`.
+    async fn try_orphan_path(
+        &self,
+        worktree: &Path,
+        pre_size: u64,
+        mtime_grace: Duration,
+    ) -> Option<u64> {
+        if directory_age(worktree).unwrap_or(Duration::ZERO) < mtime_grace {
+            return None;
+        }
+        if is_worktree_dirty(worktree).await {
+            return None;
+        }
+        let branch = crate::engine::git_ops::worktree_current_branch(worktree).await;
+        if let Some(branch_name) = branch.as_deref() {
+            let repo_root = resolve_repo_root_from_worktree(worktree).await?;
+            if has_branch_commits(&repo_root, branch_name).await {
+                return None;
+            }
+        }
+
+        let outcome =
+            remove_worktree_and_optionally_delete_branch(worktree, Some(pre_size)).await?;
+        log!(
+            "[WorktreeCleanup] orphan-path freed {} bytes at {} (branch_deleted={})",
+            outcome.freed_bytes,
+            worktree.display(),
+            outcome.branch_deleted
+        );
+        Some(outcome.freed_bytes)
     }
 
     /// Tier 1: strip regenerable build artifacts. Safe even when the thread
@@ -269,7 +415,7 @@ impl WorktreeCleanup {
     }
 
     /// Tier 2: remove the entire worktree directory if it's safe — clean
-    /// `git status`, thread not pinned, on-disk path matches the deterministic
+    /// `git status`, thread not saved, on-disk path matches the deterministic
     /// shape. Branch deletion is gated separately on "fully merged".
     ///
     /// `pre_size` is the directory size measured at the top of `run_once`;
@@ -278,14 +424,14 @@ impl WorktreeCleanup {
     async fn try_tier_2(&self, thread_id: Uuid, worktree: &Path, pre_size: u64) -> Option<u64> {
         // Pinned threads are exempt — the user has indicated they care about
         // this thread and may come back to it.
-        match self.is_pinned(thread_id).await {
+        match self.is_saved(thread_id).await {
             Ok(true) => {
                 return None;
             }
             Ok(false) => {}
             Err(e) => {
                 log!(
-                    "[WorktreeCleanup] is_pinned lookup failed for thread {}: {} — skipping tier 2",
+                    "[WorktreeCleanup] is_saved lookup failed for thread {}: {} — skipping tier 2",
                     thread_id,
                     e
                 );
@@ -319,9 +465,9 @@ impl WorktreeCleanup {
         Some(outcome.freed_bytes)
     }
 
-    async fn is_pinned(&self, thread_id: Uuid) -> Result<bool, sqlx::Error> {
+    async fn is_saved(&self, thread_id: Uuid) -> Result<bool, sqlx::Error> {
         let row: Option<(bool,)> = sqlx::query_as(
-            "SELECT is_pinned FROM thread_summaries WHERE thread_id = $1",
+            "SELECT is_saved FROM thread_summaries WHERE thread_id = $1",
         )
         .bind(thread_id)
         .fetch_optional(&self.pool)
@@ -355,29 +501,52 @@ impl WorktreeCleanup {
 
     /// Heads-up that free disk has crossed the soft threshold. Fires once per
     /// pressure episode (re-armed on recovery above soft).
-    async fn emit_disk_low_alert(&self, free_bytes: u64) {
+    ///
+    /// The body is framed around the user's machine, not Lucidos: the trigger
+    /// is system-wide free space, and Lucidos's own footprint is usually a
+    /// small slice of that. Body branches on the footprint so the suggestion
+    /// matches reality (point at Settings only when cleaning would actually
+    /// help).
+    async fn emit_disk_low_alert(&self, free_bytes: u64, lucidos_bytes: u64) {
         let free_gb = free_bytes as f64 / BYTES_PER_GB;
-        let title = "Lucidos disk space low".to_string();
-        let message = format!(
-            "{:.1} GB free on the workspace volume. Old idle worktrees will be reclaimed automatically; visit Settings → Disk Usage to clean specific threads sooner.",
-            free_gb
-        );
+        let lucidos_gb = lucidos_bytes as f64 / BYTES_PER_GB;
+        let title = "Low disk space on your machine".to_string();
+        let message = if lucidos_bytes >= self.large_footprint_bytes {
+            format!(
+                "Only {:.1} GB free on the volume hosting your Lucidos workspace. \
+                 Lucidos worktrees use {:.1} GB — clean idle ones from Settings → Disk Usage to reclaim space. \
+                 New Claude Code sessions may fail to spawn until disk is freed.",
+                free_gb, lucidos_gb,
+            )
+        } else {
+            format!(
+                "Only {:.1} GB free on the volume hosting your Lucidos workspace. \
+                 Lucidos itself uses just {:.1} GB — most of the pressure is from other apps on your machine. \
+                 New Claude Code sessions may fail to spawn until you free space elsewhere.",
+                free_gb, lucidos_gb,
+            )
+        };
         log!(
-            "[WorktreeCleanup] crossed below soft threshold ({:.1} GB free) — emitting disk-low NotificationCreated",
+            "[WorktreeCleanup] crossed below soft threshold ({:.1} GB free, Lucidos {:.1} GB) — emitting disk-low NotificationCreated",
             free_gb,
+            lucidos_gb,
         );
         self.emit_notification(title, message, "disk-low").await;
     }
 
     /// Auto-cleanup action notification: hard pressure forced reclamation and
     /// we actually freed bytes. Fires per cycle that does work, so the user
-    /// sees ongoing progress while disk recovers.
+    /// sees ongoing progress while disk recovers. Title attributes the action
+    /// to Lucidos (it's helpful to know who did it), but the body still names
+    /// the system-wide free space first so the user understands the trigger
+    /// is the volume, not Lucidos eating disk.
     async fn emit_auto_cleanup_alert(&self, free_bytes: u64, freed_bytes: u64) {
         let free_gb = free_bytes as f64 / BYTES_PER_GB;
         let freed_gb = freed_bytes as f64 / BYTES_PER_GB;
-        let title = "Lucidos auto-cleanup running".to_string();
+        let title = "Lucidos reclaimed disk space".to_string();
         let message = format!(
-            "Disk is critical ({:.1} GB free). Reclaimed {:.1} GB by stripping build artifacts from idle worktrees. Close pinned threads or remove unused worktrees from Settings → Disk Usage to reclaim more.",
+            "Your machine is critically low on disk ({:.1} GB free). Lucidos reclaimed {:.1} GB by stripping build artifacts from idle Claude Code worktrees. \
+             Close saved threads or remove unused worktrees from Settings → Disk Usage to reclaim more.",
             free_gb, freed_gb,
         );
         log!(
@@ -444,9 +613,17 @@ pub(crate) fn available_disk_bytes(path: &Path) -> Option<u64> {
     fs2::available_space(path).ok()
 }
 
+/// Time since `path`'s mtime, or `None` if the metadata read fails. Used by
+/// the orphan-path sweep to apply a grace window without an event stream.
+fn directory_age(path: &Path) -> Option<Duration> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    mtime.elapsed().ok()
+}
+
 /// Sum file sizes under `path` recursively. Best-effort — silently skips
 /// entries we can't stat. Returns 0 if the path doesn't exist.
-fn directory_size_bytes(path: &Path) -> u64 {
+pub(crate) fn directory_size_bytes(path: &Path) -> u64 {
     let mut total: u64 = 0;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -693,7 +870,7 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
 
 /// One row in the disk-usage inventory served by `/api/disk-usage/worktrees`.
 /// Combines on-disk facts (path, size, dirty) with thread metadata
-/// (title, last activity, pinned).
+/// (title, last activity, saved).
 #[derive(Debug, serde::Serialize)]
 pub struct WorktreeInventoryRow {
     pub thread_id: Uuid,
@@ -702,7 +879,7 @@ pub struct WorktreeInventoryRow {
     pub size_bytes: u64,
     pub last_activity: Option<chrono::DateTime<Utc>>,
     pub is_dirty: bool,
-    pub is_pinned: bool,
+    pub is_saved: bool,
 }
 
 /// Snapshot the worktrees directory and pair each `thread-<short>` directory
@@ -742,7 +919,7 @@ pub(crate) async fn inventory_worktrees(
         };
         let size_bytes = directory_size_bytes(&path);
         let is_dirty = is_worktree_dirty(&path).await;
-        let (title, is_pinned) = lookup_thread_summary(pool, thread_id).await;
+        let (title, is_saved) = lookup_thread_summary(pool, thread_id).await;
         let last_activity = lookup_last_activity(pool, thread_id).await;
         rows.push(WorktreeInventoryRow {
             thread_id,
@@ -751,7 +928,7 @@ pub(crate) async fn inventory_worktrees(
             size_bytes,
             last_activity,
             is_dirty,
-            is_pinned,
+            is_saved,
         });
     }
     rows.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
@@ -803,7 +980,7 @@ async fn lookup_thread_summary(
     thread_id: Uuid,
 ) -> (Option<String>, bool) {
     let row: Option<(Option<String>, bool)> = sqlx::query_as(
-        "SELECT title, is_pinned FROM thread_summaries WHERE thread_id = $1",
+        "SELECT title, is_saved FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_optional(pool)
@@ -811,7 +988,7 @@ async fn lookup_thread_summary(
     .ok()
     .flatten();
     match row {
-        Some((title, pinned)) => (title, pinned),
+        Some((title, saved)) => (title, saved),
         None => (None, false),
     }
 }

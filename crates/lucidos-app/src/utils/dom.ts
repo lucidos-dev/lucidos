@@ -25,6 +25,12 @@ export function opensSoftwareKeyboard(el: EventTarget | Element | null): boolean
   return KEYBOARD_INPUT_TYPES.has((el as HTMLInputElement).type);
 }
 
+/** Pixels per CSS rem at the document root. Mobile uses 112.5% (18px) base;
+ *  the 16 fallback covers SSR/JSDOM where getComputedStyle returns ''. */
+export function getRemPx(): number {
+  return parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+}
+
 /** Clamp a horizontal `left` coordinate so a `width`-wide element fits inside
  *  the `[min, max]` range, leaving `margin` px of breathing room on either edge. */
 export function clampLeftWithin(left: number, width: number, min: number, max: number, margin = 8): number {

@@ -24,7 +24,7 @@
 
 use std::path::Path;
 
-use crate::engine::git_ops::git_cmd;
+use crate::engine::git_ops::{git_cmd, worktree_current_branch};
 
 /// Result of [`verify_branch`] when the worktree's checked-out branch
 /// doesn't match the engine's expected branch.
@@ -206,6 +206,50 @@ pub(crate) async fn verify_branch(
             found,
         })
     }
+}
+
+/// True iff `ancestor_sha` is reachable from `descendant_ref`.
+pub(crate) async fn is_ancestor(
+    worktree_path: &Path,
+    ancestor_sha: &str,
+    descendant_ref: &str,
+) -> bool {
+    git_cmd(
+        &["merge-base", "--is-ancestor", ancestor_sha, descendant_ref],
+        worktree_path,
+    )
+    .await
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}
+
+/// Decide whether the worktree's current branch can be safely adopted as
+/// the new tracked branch. Safe means HEAD's history contains
+/// `last_sha` — proving the new branch was created on top of our prior
+/// state, so adoption preserves all our commits.
+///
+/// Returns `Some((new_branch_name, note_for_cc))` when adoption is safe.
+/// Returns `None` when there's no last SHA, the worktree HEAD can't be
+/// read, or HEAD has diverged from our state.
+pub(crate) async fn try_adopt_renegade_branch(
+    worktree_path: &Path,
+    last_sha: Option<&str>,
+) -> Option<(String, String)> {
+    let last = last_sha?;
+    let new_branch = worktree_current_branch(worktree_path).await?;
+    if !is_ancestor(worktree_path, last, "HEAD").await {
+        return None;
+    }
+    Some((new_branch.clone(), build_adoption_note(&new_branch)))
+}
+
+fn build_adoption_note(new_branch: &str) -> String {
+    format!(
+        "[Note from engine: while you were idle, your worktree was switched to branch '{0}' \
+         (likely by a skill or external tool). It contains your prior work, so I've adopted \
+         it as the new tracked branch — continuing on '{0}' from now on.]",
+        new_branch
+    )
 }
 
 #[cfg(test)]

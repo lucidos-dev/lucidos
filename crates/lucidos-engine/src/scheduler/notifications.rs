@@ -193,35 +193,6 @@ impl NotificationStore {
         }
     }
 
-    /// Get unread notifications
-    pub async fn get_unread(pool: &PgPool) -> Result<Vec<Notification>, sqlx::Error> {
-        sqlx::query_as::<_, Notification>(
-            r#"
-            SELECT id, task_id, app_id, title, message, read, created_at
-            FROM notifications
-            WHERE read = false
-            ORDER BY created_at DESC
-            "#,
-        )
-        .fetch_all(pool)
-        .await
-    }
-
-    /// Get all notifications (with limit)
-    pub async fn get_all(pool: &PgPool, limit: i64) -> Result<Vec<Notification>, sqlx::Error> {
-        sqlx::query_as::<_, Notification>(
-            r#"
-            SELECT id, task_id, app_id, title, message, read, created_at
-            FROM notifications
-            ORDER BY created_at DESC
-            LIMIT $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-    }
-
     /// Get notifications created before a specific timestamp (for time travel)
     pub async fn get_all_before(
         pool: &PgPool,

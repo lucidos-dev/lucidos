@@ -22,7 +22,7 @@ fn cron_schema(nullable: bool) -> serde_json::Value {
 pub fn get_notification_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::SEND_NOTIFICATION.to_string(),
-        description: "Send a push notification to the user's devices. Use this when you have something important to tell the user — task results, reminders, alerts, etc.".to_string(),
+        description: "Send a push notification to the user's devices. Use this when you have something important to tell the user — task results, reminders, alerts, etc. Only set `app_id` when the notification is a direct call to action inside that specific app — i.e. tapping it opens that app to act on the thing the notification mentions (e.g. a habit-tracker app sending \"check in for today\" sets `app_id` to the habit-tracker id). Do NOT set `app_id` for general reminders, status messages, screen-time / bedtime nudges, or plain informational text. When in doubt, leave `app_id` unset.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -33,6 +33,10 @@ pub fn get_notification_tool() -> ToolDefinition {
                 "message": {
                     "type": "string",
                     "description": "Notification body text (in the user's language)."
+                },
+                "app_id": {
+                    "type": "string",
+                    "description": "Optional id of an app from the Available Apps list. Set this only when the notification is a direct call to action inside that app — tapping it opens the app to act. Omit for general reminders, status messages, screen-time / bedtime nudges, or plain informational text."
                 }
             },
             "required": ["title", "message"]
@@ -202,7 +206,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     },
                     "json_path": {
                         "type": "string",
-                        "description": "JSON mode: dot-bracket path to the target value (e.g., 'sections[1].slides[0].content[2].text'). Supports nested objects and arrays."
+                        "description": "JSON mode: path to the target value. Supports dot notation (`metadata.author.name`), array indices (`sections[1]`), quoted keys for non-identifier chars like dates or slugs (`dailyLog[\"2026-05-04\"]` or `dailyLog['2026-05-04']`), the JSONPath root marker (`$.streak`), and raw JSON Pointers (`/sections/1/title`). Mix freely — e.g. `habits[0].dailyLog[\"2026-05-04\"]`."
                     },
                     "new_value": {
                         "description": "JSON mode: the replacement value — can be any JSON type (string, number, object, array, boolean, null)"
@@ -280,6 +284,54 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: tn::GLOB_FILES.to_string(),
+            description: "Find files in the workspace matching a glob pattern. Patterns are relative to data/ — use the same paths you'd see in list_files (e.g. 'apps/**/index.html', 'artifacts/*.md', '**/*.csv'). Searches artifacts/, apps/, knowhow/, triggers/. Prefer this over run_bash with find/ls.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern relative to data/. Examples: 'apps/**/index.html', 'artifacts/*.md', '**/*.csv'."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max paths to return (default 200, max 1000). Returned paths are sorted; `truncated: true` in the result indicates the cap was hit."
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolDefinition {
+            name: tn::GREP_FILES.to_string(),
+            description: "Search file contents using a regex (Rust regex crate syntax). Searches artifacts/, apps/, knowhow/, triggers/. Skips binary files. Prefer this over run_bash with rg/grep — it's structured and respects workspace ignore rules.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern (Rust regex crate syntax). Case-sensitive by default."
+                    },
+                    "path_glob": {
+                        "type": "string",
+                        "description": "Optional glob to restrict which files are searched (e.g. 'apps/**/*.html', 'artifacts/*.md'). Defaults to all files under data/."
+                    },
+                    "case_insensitive": {
+                        "type": "boolean",
+                        "description": "Match case-insensitively (default false)."
+                    },
+                    "max_matches": {
+                        "type": "integer",
+                        "description": "Total match cap across all files (default 100, max 500). `truncated: true` in the result indicates the cap was hit."
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "Lines of context to return before/after each match (default 0, max 5)."
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolDefinition {
             name: tn::COPY_FILE.to_string(),
             description: "Copy a file within the workspace. Use this instead of read_file + write_file when you need to duplicate or move content — it handles the copy server-side without passing content through the conversation.".to_string(),
             parameters: json!({
@@ -317,6 +369,38 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: tn::PROXY_REQUEST.to_string(),
+            description: "Call a backend configured in `data/config/apis.json` through the engine proxy. Prefer this over `http_request` whenever the API has a proxy entry — the credential is resolved by the engine and never appears in the tool args, the tool transcript, or any logs. Returns the raw response body for 2xx; for non-2xx returns `HTTP Error N: ...`. The proxy `name` indexes into `apis.json`; `path` is appended to the configured `base_url`.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Proxy name as configured in `data/config/apis.json` (e.g., 'sonos', 'comfort')."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Path appended to the configured base_url (e.g., '/Spisestua/play'). Optional — defaults to root."
+                    },
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"],
+                        "description": "HTTP method. Defaults to GET."
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Optional caller-supplied headers (Content-Type, Accept, …). The engine adds the configured auth header automatically.",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional request body for POST/PUT/PATCH."
+                    }
+                },
+                "required": ["name"]
             }),
         },
         ToolDefinition {
@@ -435,7 +519,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::CREATE_TRIGGER.to_string(),
-            description: "Create a trigger that runs a prompt or script. Can be schedule-based (cron), event-based (on_event), or both. Cron times are in the USER'S LOCAL timezone. MUST set timezone first (set_timezone).".to_string(),
+            description: "Create a NEW trigger. Before calling this, list_triggers and prefer update_trigger for any tweak to an existing workflow (schedule, prompt, rename, pause, extra cron entry — append to the cron array even for one-shot extras). Recreating orphans the old trigger's run history. Two live triggers with identical names are a UX trap — name distinctly. Schedule-based (cron), event-based (on_event), or both. Cron times in the USER'S LOCAL timezone. MUST set timezone first (set_timezone).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -445,7 +529,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     },
                     "run": {
                         "type": "object",
-                        "description": "What to execute. Either { type: 'prompt', text: '...', knowhow: ['domain1'] } for LLM prompts, or { type: 'script', path: 'name/run.py' } for scripts."
+                        "description": "What to execute. Either { type: 'intent', intent: '...', knowhow: ['domain1', 'system-knowhow/best-practices'] } for LLM intents (one sentence in the user's voice — keep procedure out, put it in knowhow; prefix engine-shipped reference docs with 'system-knowhow/'), or { type: 'script', path: 'name/run.py' } for scripts."
                     },
                     "cron": cron_schema(false),
                     "on_event": {
@@ -455,6 +539,14 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     "condition": {
                         "type": "object",
                         "description": "Optional payload filter for event triggers. Uses operators: $eq, $ne, $lt, $lte, $gt, $gte, $in. Example: {\"sleep_score\": {\"$lt\": 70}}"
+                    },
+                    "app_id": {
+                        "type": "string",
+                        "description": "Owning app directory name (e.g. 'trigger-workflow'). Set this when the trigger belongs to an app the user can open — notifications will deep-link to that app's UI. Omit for standalone triggers."
+                    },
+                    "go_to_review": {
+                        "type": "boolean",
+                        "description": "When true, threads spawned by this trigger surface in REVIEW on completion instead of going straight to HISTORY. Use for triggers whose output the user is meant to read — daily summaries, alerts, scheduled reports. Default false (silent execution, history-only) suits most cron triggers."
                     }
                 },
                 "required": ["name", "run"]
@@ -471,7 +563,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::UPDATE_TRIGGER.to_string(),
-            description: "Update an existing trigger's name, schedule, event subscription, or run config. Use list_triggers first to find the trigger ID. At least one field besides trigger_id must be provided.".to_string(),
+            description: "Update an existing trigger's name, schedule, event subscription, or run config. PREFER this over delete+create for any change to an existing workflow — the trigger_id stays stable so the run history stays linked. To add an extra firing time (including a temporary one-shot), append to the cron array; don't make a sibling trigger. Use list_triggers first to find the trigger ID. At least one field besides trigger_id must be provided.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -485,7 +577,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     },
                     "run": {
                         "type": "object",
-                        "description": "Change what to execute. { type: 'prompt', text: '...', knowhow: [] } or { type: 'script', path: '...' }"
+                        "description": "Change what to execute. { type: 'intent', intent: '...', knowhow: ['domain', 'system-knowhow/best-practices'] } (prefix engine-shipped reference docs with 'system-knowhow/') or { type: 'script', path: '...' }"
                     },
                     "cron": cron_schema(true),
                     "on_event": {
@@ -499,6 +591,14 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     "paused": {
                         "type": "boolean",
                         "description": "Pause/resume the trigger as part of a multi-field update. For pause/resume alone, prefer the dedicated pause_trigger / resume_trigger tools."
+                    },
+                    "app_id": {
+                        "type": ["string", "null"],
+                        "description": "Owning app directory name (e.g. 'trigger-workflow'). Set to null to clear (e.g. trigger no longer belongs to any app)."
+                    },
+                    "go_to_review": {
+                        "type": "boolean",
+                        "description": "When true, future threads spawned by this trigger surface in REVIEW on completion instead of going straight to HISTORY. Setting this only affects new runs — already-completed threads are not retroactively re-routed."
                     }
                 },
                 "required": ["trigger_id"]
@@ -1020,7 +1120,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::REFRESH_APP.to_string(),
-            description: "Refresh the user's app window to show updated UI. Call this after modifying an app's UI files (HTML, CSS, JS). Returns a screenshot and DOM snapshot of the rendered result unless skip_capture is true.".to_string(),
+            description: "Refresh the iframe of the currently-open app so it reflects on-disk changes, then return a screenshot and DOM snapshot (unless skip_capture is true). If the app isn't currently open, the refresh is a no-op and the capture step will fail — use navigate_ui first when you need to look at an app the user hasn't opened.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1155,7 +1255,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "intent_id": {
                         "type": "string",
-                        "description": "Intent ID (e.g., 'finn-jobs/finn-job-search', 'heatpump/heatpump-control-loop')"
+                        "description": "Intent ID (e.g., 'job-search/find-jobs', 'home-control/run-control-loop')"
                     },
                     "task": {
                         "type": "string",
@@ -1213,6 +1313,65 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                         "description": "Maximum number of events to return (1-1000, default 100)"
                     }
                 }
+            }),
+        },
+        ToolDefinition {
+            name: tn::INSTALL_PLUGIN.to_string(),
+            description: "Install a Lucidos plugin from a git URL or a local .lucidos-plugin archive. A plugin is a coherent bundle of workspace content (apps, knowhow, triggers, scripts) that another author shipped. Files extract under data/ and become indistinguishable from anything you'd author yourself. Source detection: a GitHub tree URL like 'https://github.com/owner/repo/tree/branch/subpath' is treated as a monorepo install (clones the repo at that branch, uses subpath as the plugin root). A plain git URL or .git URL is cloned at the default branch. A path ending in '.lucidos-plugin' is unpacked locally. If install would overwrite existing files, the call fails with the conflict list — re-run with overwrite=true to proceed (used by both fresh installs over your own files and by the update flow).".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "GitHub tree URL (e.g., 'https://github.com/lucidos-dev/plugins/tree/main/browser-learning'), a plain git URL, or an absolute path to a .lucidos-plugin file."
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Allow overwriting existing files under data/. Default: false. Set true when the user has confirmed they want a re-install or update."
+                    }
+                },
+                "required": ["source"]
+            }),
+        },
+        ToolDefinition {
+            name: tn::CHECK_PLUGIN_UPDATES.to_string(),
+            description: "Check installed plugins for newer versions at their `source` URL. With no `id`, surveys all currently-installed plugins. Network failures per plugin are reported as `error` entries — they don't abort the whole check. Returns JSON describing each plugin's installed_version, latest_version, and whether it changed.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Optional plugin id (e.g. 'browser-learning'). Omit to check every installed plugin."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: tn::UPDATE_PLUGIN.to_string(),
+            description: "Apply the update for one installed plugin. Re-fetches the manifest from the recorded source, compares semver, and re-installs (with overwrite=true) if newer. Returns 'Already at latest (vX)' as a no-op when versions match.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The plugin id to update (e.g. 'browser-learning')."
+                    }
+                },
+                "required": ["id"]
+            }),
+        },
+        ToolDefinition {
+            name: tn::UNINSTALL_PLUGIN.to_string(),
+            description: "Mark a plugin uninstalled. v1 is GUIDE-ONLY: it emits a PluginUninstalled event and tells the user which paths to delete. It does NOT remove files from data/ — some may have been edited since install or shared with another plugin. Offer to delete them in a follow-up using delete_file once the user confirms.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The plugin id to uninstall (e.g. 'browser-learning')."
+                    }
+                },
+                "required": ["id"]
             }),
         },
     ]
@@ -1358,4 +1517,38 @@ pub fn get_mcp_tools() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_notification_schema_exposes_optional_app_id() {
+        let tool = get_notification_tool();
+        let props = tool
+            .parameters
+            .get("properties")
+            .expect("schema must have properties");
+        let app_id = props
+            .get("app_id")
+            .expect("send_notification must expose app_id so the LLM can deep-link the push");
+        assert_eq!(
+            app_id.get("type").and_then(|v| v.as_str()),
+            Some("string"),
+            "app_id must be a string"
+        );
+        let required = tool
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("schema must have required array");
+        let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            !required_names.contains(&"app_id"),
+            "app_id must be optional, got required: {:?}",
+            required_names
+        );
+    }
+
 }

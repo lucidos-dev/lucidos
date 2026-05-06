@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   activeMenuItem,
   panelOverlay,
+  settingsSubview,
   currentApp,
   previewFile,
   panelUrl,
@@ -12,6 +13,9 @@ import type { App } from '../types';
 const pushNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState }));
 
+// Mock credentials loader (called by openSettingsSubview('accounts'))
+vi.mock('./credentials', () => ({ loadCredentials: vi.fn().mockResolvedValue(undefined) }));
+
 // Mock API calls triggered by switchMenuItem's data loaders
 vi.mock('../../api/client', () => ({
   getNotifications: vi.fn().mockResolvedValue({ notifications: [], unread_count: 0, has_more: false }),
@@ -20,11 +24,11 @@ vi.mock('../../api/client', () => ({
   listDevices: vi.fn().mockResolvedValue({ devices: [] }),
 }));
 
-const { switchMenuItem } = await import('./menu');
+const { switchMenuItem, openSettingsSubview } = await import('./menu');
 
 const fakeApp: App = {
-  id: 'sommerferie',
-  name: 'Sommerferie 2026',
+  id: 'trip-planner',
+  name: 'Trip Planner 2026',
   description: 'Trip planner',
   knowhow: [],
 };
@@ -90,6 +94,39 @@ describe('switchMenuItem', () => {
 
     pushNavState.mockClear();
     switchMenuItem('settings');
+    expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('openSettingsSubview', () => {
+  beforeEach(() => {
+    activeMenuItem.value = 'settings';
+    settingsSubview.value = 'main';
+    panelOverlay.value = null;
+    pushNavState.mockClear();
+  });
+
+  it('clears app UI overlay when navigating to a settings subview', () => {
+    panelOverlay.value = { type: 'app-ui', app: fakeApp };
+
+    openSettingsSubview('accounts');
+
+    expect(settingsSubview.value).toBe('accounts');
+    expect(panelOverlay.value).toBeNull();
+    expect(currentApp.value).toBeNull();
+  });
+
+  it('clears file preview overlay when navigating to a settings subview', () => {
+    panelOverlay.value = { type: 'file-preview', path: 'some/file.md' };
+
+    openSettingsSubview('devices');
+
+    expect(settingsSubview.value).toBe('devices');
+    expect(previewFile.value).toBeNull();
+  });
+
+  it('pushes navigation state', () => {
+    openSettingsSubview('memory');
     expect(pushNavState).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,6 +1,7 @@
 import { render } from 'preact';
 import { App } from './App';
 import { updateAvailable } from './store/store';
+import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import './styles/global.css';
 import './styles/header.css';
 import './styles/panels.css';
@@ -13,6 +14,8 @@ import './styles/skills.css';
 import './styles/mobile.css';
 import './styles/drawer.css';
 import './store/effects';
+
+installActionBtnBlurListener();
 
 render(<App />, document.getElementById('app')!);
 

@@ -4,6 +4,7 @@ globs:
   - "crates/lucidos-app/src/**/*.test.ts"
   - "crates/lucidos-app/src/**/*.spec.ts"
   - "crates/lucidos-engine/tests/**"
+  - "crates/lucidos-e2e/tests/**"
   - "crates/lucidos-app/src/generated/**"
 ---
 
@@ -36,7 +37,7 @@ DB helpers: `e2e/db-helpers.ts` — `psql()`, `git()`.
 
 ## API E2E (Rust)
 
-Tests in `crates/lucidos-engine/tests/api_e2e_support/`. HTTP contracts, SSE, errors.
+Tests in `crates/lucidos-e2e/tests/api_support/` (workspace member crate `lucidos-e2e`). HTTP contracts, SSE, errors.
 
 ```bash
 ./scripts/e2e-api.sh                    # Run all
@@ -64,3 +65,5 @@ Staleness checks run as part of `cargo test`.
 | Shared Rust logic changed | Contract test |
 | Store/signal behavior | Vitest |
 | Rust engine logic | `cargo test` |
+
+`./scripts/e2e.sh` runs API + browser back-to-back against the e2e workspace.

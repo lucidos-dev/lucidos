@@ -86,27 +86,6 @@ impl PushSubscriptionStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Get all active push subscriptions
-    pub async fn get_all(
-        pool: &PgPool,
-    ) -> Result<Vec<PushSubscription>, Box<dyn std::error::Error + Send + Sync>> {
-        let rows = sqlx::query_as::<_, (String, String, String, Option<String>)>(
-            "SELECT endpoint, p256dh, auth, device_id FROM push_subscriptions",
-        )
-        .fetch_all(pool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|(endpoint, p256dh, auth, device_id)| PushSubscription {
-                endpoint,
-                p256dh,
-                auth,
-                device_id,
-            })
-            .collect())
-    }
-
     /// Get push subscriptions filtered by device push_enabled setting
     pub async fn get_push_enabled(
         pool: &PgPool,
@@ -171,14 +150,13 @@ pub async fn get_or_create_vapid_keys(
     let keys_json = serde_json::to_string(&keys)?;
     PreferenceStore::set(pool, "vapid_keys", &keys_json).await?;
 
-    log!("Generated new VAPID key pair");
+    log!("[Push] Generated new VAPID key pair");
     Ok(keys)
 }
 
 /// Send a push notification to all registered subscriptions.
 /// Non-fatal: logs errors but doesn't fail.
 /// If `notification_id` is provided, clicking the notification deep-links to it.
-/// If `app_id` is provided, clicking the notification can open the app directly.
 pub async fn send_push_to_all(
     pool: &PgPool,
     title: &str,
@@ -222,7 +200,7 @@ pub async fn send_push_to_all_with_app(
     let subscriptions = match subs_result {
         Ok(subs) => subs,
         Err(e) => {
-            log!("Failed to fetch subscriptions: {}", e);
+            log!("[Push] Failed to fetch subscriptions: {}", e);
             return;
         }
     };
@@ -238,7 +216,7 @@ pub async fn send_push_to_all_with_app(
             let filtered = filter_subscriptions_by_presence(subscriptions, &focused);
             if filtered.len() != before {
                 log!(
-                    "Suppressed push to {} device(s) viewing thread {}",
+                    "[Push] Suppressed push to {} device(s) viewing thread {}",
                     before - filtered.len(),
                     thread_id
                 );
@@ -246,7 +224,7 @@ pub async fn send_push_to_all_with_app(
             filtered
         }
         (_, Some(Err(e))) => {
-            log!("Failed to query thread_presence (sending to all): {}", e);
+            log!("[Push] Failed to query thread_presence (sending to all): {}", e);
             subscriptions
         }
         _ => subscriptions,
@@ -259,7 +237,7 @@ pub async fn send_push_to_all_with_app(
     let keys = match get_or_create_vapid_keys(pool).await {
         Ok(k) => k,
         Err(e) => {
-            log!("Failed to get VAPID keys: {}", e);
+            log!("[Push] Failed to get VAPID keys: {}", e);
             return;
         }
     };
@@ -270,7 +248,7 @@ pub async fn send_push_to_all_with_app(
     let client = match web_push::IsahcWebPushClient::new() {
         Ok(c) => c,
         Err(e) => {
-            log!("Failed to create push client: {}", e);
+            log!("[Push] Failed to create push client: {}", e);
             return;
         }
     };
@@ -292,13 +270,13 @@ pub async fn send_push_to_all_with_app(
                 match builder.build() {
                     Ok(sig) => sig,
                     Err(e) => {
-                        log!("Failed to build VAPID signature: {}", e);
+                        log!("[Push] Failed to build VAPID signature: {}", e);
                         continue;
                     }
                 }
             }
             Err(e) => {
-                log!("Failed to create VAPID builder: {}", e);
+                log!("[Push] Failed to create VAPID builder: {}", e);
                 continue;
             }
         };
@@ -313,7 +291,7 @@ pub async fn send_push_to_all_with_app(
         let message = match msg_builder.build() {
             Ok(m) => m,
             Err(e) => {
-                log!("Failed to build push message: {}", e);
+                log!("[Push] Failed to build push message: {}", e);
                 continue;
             }
         };
@@ -322,7 +300,7 @@ pub async fn send_push_to_all_with_app(
         match client.send(message).await {
             Ok(_) => {
                 log!(
-                    "Sent notification to {}",
+                    "[Push] Sent notification to {}",
                     &sub.endpoint[..sub.endpoint.floor_char_boundary(60)]
                 );
             }
@@ -331,13 +309,13 @@ pub async fn send_push_to_all_with_app(
                 // 410 Gone means the subscription is no longer valid
                 if err_str.contains("410") || err_str.contains("Gone") {
                     log!(
-                        "Subscription expired (410), will remove: {}",
+                        "[Push] Subscription expired (410), will remove: {}",
                         &sub.endpoint[..sub.endpoint.floor_char_boundary(60)]
                     );
                     stale_endpoints.push(sub.endpoint.clone());
                 } else {
                     log!(
-                        "Failed to send to {}: {}",
+                        "[Push] Failed to send to {}: {}",
                         &sub.endpoint[..sub.endpoint.floor_char_boundary(60)],
                         e
                     );
@@ -349,7 +327,7 @@ pub async fn send_push_to_all_with_app(
     // Clean up stale subscriptions
     for endpoint in stale_endpoints {
         if let Err(e) = PushSubscriptionStore::unsubscribe(pool, &endpoint).await {
-            log!("Failed to remove stale subscription: {}", e);
+            log!("[Push] Failed to remove stale subscription: {}", e);
         }
     }
 }

@@ -57,7 +57,10 @@ export async function refreshPushSubscription(registration: ServiceWorkerRegistr
     // Re-send the current subscription to the backend (updates device_id, replaces stale rows)
     await subscribePush(existing);
   } catch (err) {
-    console.error('[Push] Failed to refresh subscription:', err);
+    // Background refresh — best-effort, runs on every page load. Failures here
+    // are non-blocking; if the endpoint is stale, the next push attempt will
+    // re-trigger the user-facing initPushSubscription() flow.
+    console.warn('[Push] Failed to refresh subscription:', err);
   }
 }
 
@@ -109,7 +112,6 @@ export async function initPushSubscription(): Promise<boolean> {
     showToast('Push notifications enabled', 'success');
     return true;
   } catch (err) {
-    console.error('[Push] Failed to set up push notifications:', err);
     showToast(`Failed to enable push notifications: ${err}`, 'error');
     return false;
   }

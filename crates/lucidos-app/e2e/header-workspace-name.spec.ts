@@ -20,6 +20,8 @@ function rectsOverlap(a: RectBounds, b: RectBounds): boolean {
 type HeaderScope = '.mobile-thread-header' | '.desktop-header';
 
 async function setLongWorkspaceName(page: Page, scope: HeaderScope): Promise<void> {
+  // workspaceName is populated async from /health.
+  await page.waitForSelector(`${scope} .workspace-name-label`, { state: 'attached' });
   await page.evaluate((s) => {
     const label = document.querySelector(`${s} .workspace-name-label`) as HTMLElement | null;
     if (label) label.textContent = 'a-very-long-workspace-name';
@@ -107,6 +109,8 @@ test.describe('Desktop chat header — brand label centered between actions', ()
         leftActions: leftActions.getBoundingClientRect(),
         search: search.getBoundingClientRect(),
         lucidos: lucidos.getBoundingClientRect(),
+        lucidosClient: lucidos.clientWidth,
+        lucidosScroll: lucidos.scrollWidth,
         dot: dot.getBoundingClientRect(),
         workspaceClient: workspace.clientWidth,
         workspaceScroll: workspace.scrollWidth,
@@ -129,8 +133,119 @@ test.describe('Desktop chat header — brand label centered between actions', ()
     expect(r.workspaceClient,
       'workspace did not truncate at narrow desktop width').toBeLessThan(r.workspaceScroll);
 
+    // Brand priority: while the workspace label is still on screen and able
+    // to absorb shrink, the "lucidos" title must remain at its natural width.
+    // Both truncating at once ("lucid... ● wo...") is the regression we test.
+    expect(r.lucidosClient,
+      `Lucidos truncated (${r.lucidosClient} < ${r.lucidosScroll}) while workspace was still visible`)
+      .toBe(r.lucidosScroll);
+
     // Status dot must remain visible (its width > 0).
     expect(r.dot.right - r.dot.left, 'status dot disappeared').toBeGreaterThan(0);
+  });
+
+  test('priority order: workspace truncates → workspace hidden → brand truncates → only dot stays', async ({ page }) => {
+    // Walk the brand-label width through every truncation tier and verify the
+    // user-visible state at each one. Drives the bug fix so that every
+    // intermediate state stays correct on every commit.
+    await page.setViewportSize({ width: 1400, height: 700 });
+    await navigateToApp(page);
+    await setLongWorkspaceName(page, '.desktop-header');
+
+    type State = {
+      lucidosFull: boolean;
+      lucidosWidth: number;
+      lucidosNatural: number;
+      workspaceVisible: boolean;
+      workspaceTruncated: boolean;
+      workspaceWidth: number;
+      workspaceNatural: number;
+      dotVisible: boolean;
+    };
+
+    // Measure the natural widths of the non-shrinkable parts (lucidos title +
+    // dot block) once at a wide brand-label so we can pick brand-label widths
+    // for each tier RELATIVE to the actual fonts/spacing instead of guessing
+    // pixel constants that drift when CSS changes.
+    const naturals = await page.evaluate(() => {
+      const brandLabel = document.querySelector('.desktop-header .pane-header-brand-label') as HTMLElement;
+      brandLabel.style.flex = 'none';
+      brandLabel.style.width = '500px';
+      const lucidos = brandLabel.querySelector('.pane-header-title') as HTMLElement;
+      const conn = brandLabel.querySelector('.connection-status-inline') as HTMLElement;
+      const ws = brandLabel.querySelector('.workspace-name-label') as HTMLElement;
+      const margin = (el: HTMLElement) => {
+        const cs = getComputedStyle(el);
+        return (parseFloat(cs.marginLeft) || 0) + (parseFloat(cs.marginRight) || 0);
+      };
+      return {
+        lucidosNatural: lucidos.scrollWidth + margin(lucidos),
+        connNatural: conn.scrollWidth + margin(conn),
+        wsMargin: margin(ws),
+      };
+    });
+
+    const nonWs = naturals.lucidosNatural + naturals.connNatural;
+
+    const measureAt = async (brandLabelWidthPx: number): Promise<State> => {
+      return await page.evaluate((w) => {
+        const brandLabel = document.querySelector('.desktop-header .pane-header-brand-label') as HTMLElement;
+        brandLabel.style.flex = 'none';
+        brandLabel.style.width = `${w}px`;
+        return new Promise<State>((resolve) => {
+          // Two RAFs so the ResizeObserver in ConnectionStatus runs and
+          // updates is-hidden, then layout reflects it.
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            const lucidos = brandLabel.querySelector('.pane-header-title') as HTMLElement;
+            const dot = brandLabel.querySelector('.status-dot') as HTMLElement;
+            const workspace = brandLabel.querySelector('.workspace-name-label') as HTMLElement;
+            const wsRect = workspace.getBoundingClientRect();
+            resolve({
+              lucidosFull: lucidos.clientWidth >= lucidos.scrollWidth,
+              lucidosWidth: lucidos.clientWidth,
+              lucidosNatural: lucidos.scrollWidth,
+              workspaceVisible: getComputedStyle(workspace).visibility !== 'hidden' && wsRect.width > 0,
+              workspaceTruncated: workspace.clientWidth < workspace.scrollWidth,
+              workspaceWidth: workspace.clientWidth,
+              workspaceNatural: workspace.scrollWidth,
+              dotVisible: dot.getBoundingClientRect().width > 0,
+            });
+          }));
+        });
+      }, brandLabelWidthPx);
+    };
+
+    // Tier 1: brand-label wide enough for everything full. Sanity check.
+    const wide = await measureAt(500);
+    expect(wide.lucidosFull, 'tier 1 (wide): lucidos full').toBe(true);
+    expect(wide.workspaceVisible, 'tier 1 (wide): workspace visible').toBe(true);
+    expect(wide.workspaceTruncated, 'tier 1 (wide): workspace not truncated').toBe(false);
+
+    // Tier 2: well inside the "workspace can absorb" range. Workspace truncates,
+    // lucidos stays at natural width.
+    const tier2 = await measureAt(Math.ceil(nonWs + naturals.wsMargin) + 60);
+    expect(tier2.lucidosFull,
+      `tier 2 (workspace truncates): lucidos full (${tier2.lucidosWidth}/${tier2.lucidosNatural})`).toBe(true);
+    expect(tier2.workspaceVisible, 'tier 2: workspace visible').toBe(true);
+    expect(tier2.workspaceTruncated, 'tier 2: workspace truncated').toBe(true);
+    expect(tier2.dotVisible, 'tier 2: dot visible').toBe(true);
+
+    // Tier 3: too narrow for workspace's margin gap, but lucidos+dot still fit.
+    // Workspace must be hidden, lucidos still full.
+    const tier3 = await measureAt(Math.ceil(nonWs) + 2);
+    expect(tier3.workspaceVisible,
+      `tier 3 (brand+dot only): workspace hidden (width=${tier3.workspaceWidth})`).toBe(false);
+    expect(tier3.lucidosFull,
+      `tier 3: lucidos still full (${tier3.lucidosWidth}/${tier3.lucidosNatural})`).toBe(true);
+    expect(tier3.dotVisible, 'tier 3: dot visible').toBe(true);
+
+    // Tier 4: too narrow even for full lucidos + dot. Workspace hidden,
+    // lucidos truncates with ellipsis, dot still visible.
+    const tier4 = await measureAt(Math.floor(nonWs) - 20);
+    expect(tier4.workspaceVisible, 'tier 4: workspace hidden').toBe(false);
+    expect(tier4.lucidosFull,
+      `tier 4 (brand truncates): lucidos truncated (${tier4.lucidosWidth}/${tier4.lucidosNatural})`).toBe(false);
+    expect(tier4.dotVisible, 'tier 4: dot still visible — last thing standing').toBe(true);
   });
 
   test('Lucidos itself truncates and stays clear of the search icon', async ({ page }) => {

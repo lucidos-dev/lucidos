@@ -8,14 +8,14 @@
 // Scenarios with only assert_invariant (no steps) are tested in the invariants block.
 
 import { describe, it, expect } from 'vitest';
-import { handleEvent } from '../thread-events';
+import { handleEventWithAgg } from './aggregate-test-helper';
 import type { ThreadState, ThreadMeta, ThreadStatus } from '../thread-events';
 import {
   displaySection,
   isSectionLegal,
   resolveActions,
   EVENT_CLASSIFICATION,
-  type StoredSection,
+  type ArchiveState,
   type ThreadType,
 } from '../../generated/thread-lifecycle';
 import scenarioFileRaw from '../../../../../tests/thread-lifecycle-scenarios.json';
@@ -27,13 +27,11 @@ interface ScenarioStep {
     stored_section?: string;
     status?: string;
     display_section?: string;
-    is_pinned?: boolean;
+    is_saved?: boolean;
     expected_actions?: string[];
   };
   set_pending_changes?: boolean;
   expect_error?: string;
-  assert_no_side_effect?: string;
-  assert_side_effect?: string;
 }
 
 interface Scenario {
@@ -74,13 +72,12 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
           title: 'Test Thread',
           channel: scenario.thread_type === 'claude_code' ? 'claude_code' : 'chat',
           initiator: 'user',
-          pinned: false,
+          saved: false,
           createdAt: new Date(baseTime).toISOString(),
           updatedAt: new Date(baseTime).toISOString(),
-          unread: false,
           status: 'idle' as ThreadStatus,
           messageCount: 0,
-          section: 'default',
+          section: 'archived',
           activeChildrenCount: 0,
           totalChildrenCount: 0,
           ccHasChanges: false,
@@ -88,6 +85,7 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
           ccIsExternalRepo: false,
           ccApplying: false,
           lastRevivedAt: '',
+          state: 'active',
         };
 
         const thread: ThreadState = {
@@ -122,8 +120,15 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
             ...((step.payload || {}) as any),
           };
 
-          // Replay event through handleEvent to update thread state
-          handleEvent(threadMap, threadId, seq, event, created);
+          // Use the step's expected status (and is_saved/section if declared)
+          // as the synthesized aggregate so meta matches what the backend
+          // would project. Falls back to handleEventWithAgg's rule replay when
+          // the step doesn't declare expectations.
+          const overrides: Record<string, unknown> = {};
+          if (step.expected?.status) overrides.status = step.expected.status;
+          if (step.expected?.is_saved !== undefined) overrides.isSaved = step.expected.is_saved;
+          if (step.expected?.stored_section) overrides.section = step.expected.stored_section;
+          handleEventWithAgg(threadMap, threadId, seq, event, created, undefined, overrides);
 
           if (!step.expected) continue;
 
@@ -137,10 +142,11 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
           if (step.expected.display_section && step.expected.stored_section) {
             const status = thread.meta.status;
             const display = displaySection(
-              step.expected.stored_section as StoredSection,
+              step.expected.stored_section as ArchiveState,
               status,
-              step.expected.is_pinned || false,
+              step.expected.is_saved || false,
               false,
+              hasPendingChanges,
             );
             expect(display, `step ${i} (${step.emit}): expected display='${step.expected.display_section}'`).toBe(step.expected.display_section);
           }
@@ -148,7 +154,7 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
           // Test resolve_actions when expected_actions is specified
           if (step.expected.expected_actions) {
             const status = thread.meta.status;
-            const storedSection = (step.expected.stored_section || 'default') as StoredSection;
+            const storedSection = (step.expected.stored_section || 'archived') as ArchiveState;
             const threadType = scenario.thread_type as ThreadType;
             const actions = resolveActions(threadType, status, storedSection, hasPendingChanges);
             expect(actions, `step ${i} (${step.emit}): actions`).toEqual(step.expected.expected_actions);
@@ -160,16 +166,16 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
 
   describe('Contract invariants', () => {
     it('Both thread types share the same legal sections', () => {
-      expect(isSectionLegal('chat', 'default')).toBe(true);
-      expect(isSectionLegal('chat', 'unread')).toBe(true);
-      expect(isSectionLegal('claude_code', 'default')).toBe(true);
-      expect(isSectionLegal('claude_code', 'unread')).toBe(true);
+      expect(isSectionLegal('chat', 'archived')).toBe(true);
+      expect(isSectionLegal('chat', 'inbox')).toBe(true);
+      expect(isSectionLegal('claude_code', 'archived')).toBe(true);
+      expect(isSectionLegal('claude_code', 'inbox')).toBe(true);
     });
 
     it('All critical events are classified in the contract', () => {
       const critical = [
         'MessageReceived', 'ResponseGenerated', 'CodingAgentIdled',
-        'ThreadMarkedRead', 'ThreadMarkedUnread', 'ThreadDismissed',
+        'ThreadArchived',
         'ChangeProposed', 'ChangeApplied', 'ChangeDiscarded',
         'SessionStarted', 'SessionEnded', 'ResponseFailed',
       ];
@@ -183,42 +189,42 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
       if (!scenario.assert_invariant) continue;
       it(`Invariant: ${scenario.name}`, () => {
         const { thread_type, forbidden_section } = scenario.assert_invariant!;
-        expect(isSectionLegal(thread_type as ThreadType, forbidden_section as StoredSection)).toBe(false);
+        expect(isSectionLegal(thread_type as ThreadType, forbidden_section as ArchiveState)).toBe(false);
       });
     }
   });
 
   describe('Negative: illegal section transitions', () => {
-    it('displaySection never returns review for stored=default', () => {
+    it('displaySection never returns review for stored=default (no pending changes)', () => {
       for (const status of ['idle', 'running', 'waiting'] as const) {
-        const display = displaySection('default', status, false, false);
+        const display = displaySection('archived', status, false, false, false);
         expect(display).not.toBe('review');
       }
     });
 
-    it('running status always maps to running section regardless of stored section', () => {
-      for (const stored of ['default', 'unread'] as const) {
-        expect(displaySection(stored, 'running', false, false)).toBe('running');
-        expect(displaySection(stored, 'running', true, false)).toBe('running');
+    it('running status maps to active when not saved, saved when saved (save overrides)', () => {
+      for (const stored of ['archived', 'inbox'] as const) {
+        expect(displaySection(stored, 'running', false, false, false)).toBe('active');
+        expect(displaySection(stored, 'running', true, false, false)).toBe('saved');
       }
     });
 
     it('badge count must not include review threads that display as running', () => {
       // Simulates the attentionThreadCount logic: only count threads whose
-      // displaySection is 'review', not just those with stored section 'unread'.
-      // Bug: a running CC thread with section='unread' showed in RUNNING but
+      // displaySection is 'review', not just those with stored section 'inbox'.
+      // Bug: a running CC thread with section='inbox' showed in RUNNING but
       // the badge counted it, producing a phantom "1" with no REVIEW section.
       const threads = [
-        { section: 'unread' as StoredSection, status: 'running' as const, pinned: false, hasActiveChildren: false },
-        { section: 'unread' as StoredSection, status: 'idle' as const, pinned: false, hasActiveChildren: false },
-        { section: 'unread' as StoredSection, status: 'idle' as const, pinned: false, hasActiveChildren: true },
-        { section: 'default' as StoredSection, status: 'idle' as const, pinned: false, hasActiveChildren: false },
+        { section: 'inbox' as ArchiveState, status: 'running' as const, saved: false, hasActiveChildren: false },
+        { section: 'inbox' as ArchiveState, status: 'idle' as const, saved: false, hasActiveChildren: false },
+        { section: 'inbox' as ArchiveState, status: 'idle' as const, saved: false, hasActiveChildren: true },
+        { section: 'archived' as ArchiveState, status: 'idle' as const, saved: false, hasActiveChildren: false },
       ];
 
       // Only the idle thread without active children should display as 'review'.
       // Running threads and threads with active children display as 'running'/'waiting'.
       const count = threads.filter(t =>
-        displaySection(t.section, t.status, t.pinned, t.hasActiveChildren) === 'review'
+        displaySection(t.section, t.status, t.saved, t.hasActiveChildren, false) === 'review'
       ).length;
       expect(count).toBe(1);
     });

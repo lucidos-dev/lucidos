@@ -1,11 +1,8 @@
 use lucidos_engine::api::{create_router, SharedEngine};
 use lucidos_engine::engine::LucidosEngine;
-use lucidos_engine::llm::{
-    ImageProvider, OpenAiImageProvider, OpenAiProvider, RoutingProvider, VertexImagenProvider,
-    VertexProvider,
-};
+use lucidos_engine::llm::{OpenAiProvider, RoutingProvider, VertexProvider};
 use lucidos_engine::log;
-use lucidos_engine::scheduler::{SchedulerConfig, SchedulerManager};
+use lucidos_engine::scheduler::SchedulerManager;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
@@ -40,7 +37,7 @@ async fn shutdown_signal(
         _ = terminate => {},
     }
 
-    log!("\nShutting down gracefully...");
+    log!("\n[Shutdown] Shutting down gracefully...");
 
     // Gracefully stop Claude Code sessions — interrupts active work,
     // waits for CodingAgentIdled events (which persist cc_session_id),
@@ -60,10 +57,10 @@ async fn shutdown_signal(
 
     // Shutdown the scheduler
     if let Err(e) = scheduler.lock().await.shutdown().await {
-        log!("Error shutting down scheduler: {}", e);
+        log!("[Shutdown] Error shutting down scheduler: {}", e);
     }
 
-    log!("Shutdown complete.");
+    log!("[Shutdown] Shutdown complete.");
 }
 
 async fn read_vertex_region_pref(database_url: &str) -> Option<String> {
@@ -140,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // a Vite dev proxy simultaneously.
     raise_fd_limit();
 
-    log!("Lucidos Engine starting...");
+    log!("[Startup] Lucidos Engine starting...");
 
     // Use local workspace for development, /workspace for Docker
     let workspace_path = std::env::var("LUCIDOS_WORKSPACE")
@@ -154,11 +151,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
 
     std::fs::create_dir_all(&workspace_path)?;
-    log!("Using workspace: {}", workspace_path.display());
+    log!("[Startup] Using workspace: {}", workspace_path.display());
 
     // Get database URL from environment (set by Docker) or use default for local dev
     let database_url = lucidos_engine::core::database_url();
-    log!("Connecting to PostgreSQL...");
+    log!("[Startup] Connecting to PostgreSQL...");
 
     // Vertex AI config — needed for Claude/Gemini models and memory extraction
     let project_id = std::env::var("VERTEX_PROJECT_ID")
@@ -168,41 +165,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let vertex_region_env =
         std::env::var("VERTEX_REGION").unwrap_or_else(|_| "europe-west1".to_string());
-    let vertex_region = read_vertex_region_pref(&database_url)
+    let initial_region = read_vertex_region_pref(&database_url)
         .await
         .unwrap_or(vertex_region_env);
+    let vertex_region = lucidos_engine::llm::vertex::location_handle(initial_region);
 
     // Default model (used when no model_override is specified)
     let model = std::env::var("LUCIDOS_MODEL")
         .unwrap_or_else(|_| lucidos_engine::core::DEFAULT_CHAT_MODEL.to_string());
 
-    log!("Using default model: {}", model);
+    log!("[Startup] Using default model: {}", model);
 
     // Create LLM provider — mock mode bypasses real providers entirely
     let (llm, vertex_token_cache): (
         Arc<dyn lucidos_engine::llm::LlmProvider>,
         Option<lucidos_engine::llm::vertex::TokenCache>,
     ) = if model == "mock" {
-        log!("Mock LLM provider active — no external API calls");
+        log!("[Startup] Mock LLM provider active — no external API calls");
         (
             Arc::new(lucidos_engine::llm::mock::MockProvider::new(model.clone())),
             None,
         )
     } else {
         let (vertex, vtc) = if !project_id.is_empty() {
-            log!("Vertex AI configured (project: {})", project_id);
-            let provider =
-                VertexProvider::new(project_id.clone(), vertex_region.clone(), model.clone());
-            let cache = provider.token_cache().clone();
+            log!("[Startup] Vertex AI configured (project: {})", project_id);
+            let cache: lucidos_engine::llm::vertex::TokenCache =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let provider = VertexProvider::with_location_handle(
+                project_id.clone(),
+                vertex_region.clone(),
+                model.clone(),
+                cache.clone(),
+            );
             (Some(provider), Some(cache))
         } else {
-            log!("Vertex AI not configured — Claude/Gemini models unavailable");
+            log!("[Startup] Vertex AI not configured — Claude/Gemini models unavailable");
             (None, None)
         };
 
         let openai = match std::env::var("OPENAI_API_KEY") {
             Ok(api_key) => {
-                log!("OpenAI API configured");
+                log!("[Startup] OpenAI API configured");
                 Some(OpenAiProvider::new(api_key, model.clone()))
             }
             Err(_) => None,
@@ -215,31 +218,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         (Arc::new(RoutingProvider::new(vertex, openai, model)), vtc)
     };
 
-    // Image generation provider — prefer OpenAI (supports multi-image), fall back to Imagen
-    let image_provider: Option<Box<dyn ImageProvider>> = match std::env::var("OPENAI_API_KEY") {
-        Ok(api_key) => {
-            log!("Image generation: OpenAI gpt-image-1");
-            Some(Box::new(OpenAiImageProvider::new(api_key)))
-        }
-        Err(_) => {
-            if !project_id.is_empty() {
-                if let Some(ref cache) = vertex_token_cache {
-                    log!("Image generation: Vertex AI Imagen 4");
-                    Some(Box::new(VertexImagenProvider::new(
-                        project_id.clone(),
-                        vertex_region.clone(),
-                        cache.clone(),
-                    )))
-                } else {
-                    None
-                }
-            } else {
-                log!("Image generation: not configured (no OPENAI_API_KEY or VERTEX_PROJECT_ID)");
-                None
-            }
-        }
-    };
-
     // Create engine with pgvector for embeddings
     let engine = LucidosEngine::new(
         workspace_path.clone(),
@@ -248,14 +226,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         project_id,
         vertex_region,
         vertex_token_cache,
-        image_provider,
     )
     .await?;
-    log!("PostgreSQL connected");
+    log!("[Startup] PostgreSQL connected");
 
     // Generate user profile if it doesn't exist (uses same code path as session-end updates)
     if !engine.has_user_profile().await {
-        log!("Generating initial user profile...");
+        log!("[Startup] Generating initial user profile...");
         engine.update_user_profile().await;
     }
 
@@ -385,8 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Start scheduler before HTTP server
     let scheduler_engine = shared_engine.clone();
-    let mut scheduler =
-        SchedulerManager::new(scheduler_engine, pool.clone(), SchedulerConfig::default()).await?;
+    let mut scheduler = SchedulerManager::new(scheduler_engine, pool.clone()).await?;
     scheduler.start().await?;
     let scheduler = Arc::new(tokio::sync::Mutex::new(scheduler));
 
@@ -426,7 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let tls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
         log!(
-            "API server listening on https://[::]:{}  (HTTP/2 + TLS, dual-stack)",
+            "[Startup] API server listening on https://[::]:{}  (HTTP/2 + TLS, dual-stack)",
             api_port
         );
         axum_server::bind_rustls(addr, tls_config)
@@ -435,7 +411,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await?;
     } else {
         log!(
-            "API server listening on http://[::]:{}  (dual-stack)",
+            "[Startup] API server listening on http://[::]:{}  (dual-stack)",
             api_port
         );
         axum_server::bind(addr)

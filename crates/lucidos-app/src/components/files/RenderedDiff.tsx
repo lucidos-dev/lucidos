@@ -4,7 +4,7 @@ import { marked } from 'marked';
 import type { Token, Tokens } from 'marked';
 import '../../utils/markedConfig';
 import type { DiffFile } from '../../store/store';
-import { getChangeFileContent } from '../../api/client';
+import { getChangeFileContent, getRepoFileContent } from '../../api/client';
 import { escapeHtml } from '../../utils/escapeHtml';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
@@ -12,7 +12,12 @@ import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 
 interface Props {
   file: DiffFile;
-  changeId: string;
+  /** Lucidos change ID — fetch via /api/changes/:id/file. Null for external-repo
+   *  CC sessions, which have no Change row; in that case `gitRef` carries the
+   *  worktree branch and we fetch via /api/repositories/:id/file?ref=. */
+  changeId: string | null;
+  repoId: string;
+  gitRef: string | null;
 }
 
 type BlockStatus = 'unchanged' | 'added' | 'changed';
@@ -165,7 +170,7 @@ function deletionLines(file: DiffFile): string[] {
 
 interface Strip { top: number; height: number; variant: 'added' | 'changed' }
 
-export function RenderedDiff({ file, changeId }: Props) {
+export function RenderedDiff({ file, changeId, repoId, gitRef }: Props) {
   const [content, setContent] = useState<Loadable<string>>({ status: 'not-loaded' });
   const showLoading = useDelayedLoading(content);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -175,11 +180,14 @@ export function RenderedDiff({ file, changeId }: Props) {
   useEffect(() => {
     let canceled = false;
     setContent({ status: 'loading' });
-    getChangeFileContent(changeId, file.path)
+    const fetchAfter = changeId
+      ? getChangeFileContent(changeId, file.path)
+      : getRepoFileContent(repoId, file.path, gitRef ?? undefined);
+    fetchAfter
       .then(text => { if (!canceled) setContent({ status: 'loaded', data: text }); })
       .catch((e: unknown) => { if (!canceled) setContent(toFailed(e)); });
     return () => { canceled = true; };
-  }, [changeId, file.path]);
+  }, [changeId, repoId, gitRef, file.path]);
 
   const runs = useMemo(() => additionRuns(file), [file]);
   const deletions = useMemo(() => deletionLines(file), [file]);
@@ -201,10 +209,10 @@ export function RenderedDiff({ file, changeId }: Props) {
     const recompute = () => {
       const containerRect = container.getBoundingClientRect();
       const raw: Strip[] = [];
-      const marked = contentEl.querySelectorAll<HTMLElement>(
+      const markedEls = contentEl.querySelectorAll<HTMLElement>(
         '.diff-rendered-added, .diff-rendered-changed, .diff-rendered-block-added',
       );
-      for (const el of Array.from(marked)) {
+      for (const el of Array.from(markedEls)) {
         const r = el.getBoundingClientRect();
         raw.push({
           top: r.top - containerRect.top + container.scrollTop,
@@ -238,7 +246,7 @@ export function RenderedDiff({ file, changeId }: Props) {
   }, [html]);
 
   if (content.status === 'failed') {
-    return <div class="empty-state" style="color:var(--accent-red)">Failed to load: {content.error}</div>;
+    return <div class="empty-state error-text">Failed to load: {content.error}</div>;
   }
   if (content.status !== 'loaded') {
     if (!showLoading) return null;

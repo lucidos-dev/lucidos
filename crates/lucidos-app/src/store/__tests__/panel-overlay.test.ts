@@ -145,6 +145,34 @@ describe('PanelOverlay discriminated union', () => {
     });
   });
 
+  describe('closeInlineForm resets trigger list scroll', () => {
+    // Save/Cancel/Escape on a trigger form all converge here, so the scroll
+    // reset must live at this layer rather than per-button. Without it, the
+    // user lands back at the row they edited (useScrollMemory restores the
+    // pre-edit offset) instead of the top.
+    beforeEach(() => localStorage.clear());
+
+    it('clears the saved trigger list scroll when a trigger form closes', () => {
+      localStorage.setItem('lucidos-scroll-content-triggers', '500');
+      panelOverlay.value = { type: 'form', form: { type: 'trigger', taskId: 't1' } };
+
+      closeInlineForm();
+
+      expect(localStorage.getItem('lucidos-scroll-content-triggers')).toBeNull();
+    });
+
+    it('preserves the trigger list scroll when a non-trigger form closes', () => {
+      // Other form types (credentials, app-edit) shouldn't blow away unrelated
+      // saved positions just because they share the close path.
+      localStorage.setItem('lucidos-scroll-content-triggers', '500');
+      panelOverlay.value = { type: 'form', form: { type: 'credential' } };
+
+      closeInlineForm();
+
+      expect(localStorage.getItem('lucidos-scroll-content-triggers')).toBe('500');
+    });
+  });
+
   describe('switchMenuItem clears overlay (integration)', () => {
     it('clears form overlay when switching menu items', () => {
       panelOverlay.value = { type: 'form', form: { type: 'trigger' } };
@@ -291,6 +319,39 @@ describe('overlaysEqual (via statesEqual)', () => {
     expect(statesEqual(
       makeNav({ type: 'file-preview', path: 'a.md' }),
       makeNav({ type: 'url-preview', url: 'https://a.com' }),
+    )).toBe(false);
+  });
+
+  // Two credential REQUEST forms (engine asking for different services) must
+  // not be considered equal — otherwise the second request silently fails to
+  // push a nav entry and the user can't navigate forward to it after going
+  // back.
+  it('credential request forms for different services → not equal', () => {
+    expect(statesEqual(
+      makeNav({ type: 'form', form: { type: 'credential', request: { service: 'helius' } } }),
+      makeNav({ type: 'form', form: { type: 'credential', request: { service: 'github' } } }),
+    )).toBe(false);
+  });
+
+  it('credential request vs blank Add Credential → not equal', () => {
+    expect(statesEqual(
+      makeNav({ type: 'form', form: { type: 'credential', request: { service: 'helius' } } }),
+      makeNav({ type: 'form', form: { type: 'credential' } }),
+    )).toBe(false);
+  });
+
+  // Email-confirm forms with different draft contents must be distinct entries
+  // — otherwise opening a second confirmation while one is open silently fails.
+  it('email-confirm forms for different drafts → not equal', () => {
+    const draftA = { type: 'email-confirm' as const, request: {
+      to: ['a@example.com'], subject: 'A', body: 'hi', account: 'work', from: 'me@example.com',
+    } };
+    const draftB = { type: 'email-confirm' as const, request: {
+      to: ['b@example.com'], subject: 'B', body: 'hi', account: 'work', from: 'me@example.com',
+    } };
+    expect(statesEqual(
+      makeNav({ type: 'form', form: draftA }),
+      makeNav({ type: 'form', form: draftB }),
     )).toBe(false);
   });
 });

@@ -1,25 +1,28 @@
 use crate::engine::agentic_loop::should_flush;
 use crate::engine::change_ops::{branch_is_hardened, now_epoch_millis};
-use crate::engine::claude_code::{STALE_RESUME_ERROR, WORKTREE_WORKSPACE_MARKER};
+use crate::engine::claude_code::{
+    STALE_RESUME_ERROR, WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER,
+};
 use crate::engine::git_ops::{
-    auto_commit_preserving_marker, branch_changed_files, catchup_with_main, commits_in_range,
-    consume_harden_marker, default_local_branch, describe_branch_changes,
-    detect_origin_default_branch, ff_merge_to_main, files_have_client_update,
-    files_require_restart, git_cmd, has_branch_commits, is_external_repo_path,
-    is_harden_marker_present, main_worktree, worktree_current_branch,
+    add_paths_to_worktree_exclude, auto_commit_preserving_marker, branch_changed_files,
+    catchup_with_main, commits_in_range, consume_harden_marker, default_local_branch,
+    describe_branch_changes, detect_origin_default_branch, ff_merge_to_main,
+    files_have_client_update, files_require_restart, git_cmd, has_branch_commits,
+    is_external_repo_path, is_harden_marker_present, main_worktree, worktree_add,
+    worktree_current_branch,
 };
 use crate::engine::thread_events::{EventChannel, SessionEndReason};
 use crate::engine::{AgentSession, AgentUserInput, LucidosEngine, ProcessResult};
 use crate::runtime::{AgentEvent, AgentInput, AgentKind};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use super::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use super::lifecycle::{
-    classify_result, is_silent_resume, reset_per_turn_flags, should_auto_end_on_idle,
-    should_exit_subprocess_on_idle, should_propose_change_at_idle, TerminalKind,
+    classify_result, classify_session_end_action, is_silent_resume, is_stale_resume_signal,
+    reset_per_turn_flags, should_auto_end_on_idle, should_exit_subprocess_on_idle,
+    should_propose_change_at_idle, SessionEndAction, TerminalKind,
 };
 use super::node_modules_setup::has_install_marker;
 use super::runtime_helpers::{safety_net_outcome, SafetyNetOutcome};
@@ -74,6 +77,9 @@ impl LucidosEngine {
                         // already emitted MessageReceived with the frontend UUID.
                         log!("[ClaudeCode] Session already running and idle — routing follow-up via msg_tx");
                         let images = user_images.map(|imgs| imgs.to_vec());
+                        session
+                            .pending_followups
+                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                         if session
                             .msg_tx
                             .send(AgentUserInput {
@@ -83,6 +89,9 @@ impl LucidosEngine {
                             })
                             .is_err()
                         {
+                            session
+                                .pending_followups
+                                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                             drop(guard);
                             return Err("Claude Code session ended while routing message. Please try again.".into());
                         }
@@ -169,23 +178,41 @@ impl LucidosEngine {
         // CC sessions must branch from main, not from a stale worktree branch.
         let dev_root = main_worktree().await;
 
-        let (repo_root, is_external_repo, external_repo_name) = if let Some(ref rid) = repo_id {
+        // Explicit repo_id wins; otherwise fall back to the workspace's registered
+        // Lucidos repo so SessionStarted always names a real repository. Without
+        // this, the route panel rendered the workspace name as if it were the repo.
+        let repo = if let Some(ref rid) = repo_id {
             let repo_uuid = Uuid::parse_str(rid)?;
-            let repo = crate::core::repositories::RepositoryStore::get(&self.pool, repo_uuid)
-                .await?
-                .ok_or_else(|| format!("Repository {} not found", rid))?;
+            Some(
+                crate::core::repositories::RepositoryStore::get(&self.pool, repo_uuid)
+                    .await?
+                    .ok_or_else(|| format!("Repository {} not found", rid))?,
+            )
+        } else {
+            crate::core::repositories::RepositoryStore::get_by_name(
+                &self.pool,
+                Self::DEFAULT_REPO_NAME,
+            )
+            .await?
+        };
+
+        let (repo_id, repo_root, is_external_repo, external_repo_name) = if let Some(repo) = repo {
             let path = PathBuf::from(&repo.path);
             if !path.exists() {
                 return Err(format!("Repository path does not exist: {}", repo.path).into());
             }
             let is_external = is_external_repo_path(&path, &dev_root);
             let name = if is_external { Some(repo.name) } else { None };
-            (path, is_external, name)
+            (Some(repo.id.to_string()), path, is_external, name)
         } else {
-            (dev_root, false, None)
+            // No default registered (very early startup) and no explicit id.
+            (None, dev_root, false, None)
         };
 
         let workspace_name = self.workspace_name();
+        let last_idle_sha =
+            super::resume::lookup_latest_worktree_head_sha(self.pool(), thread_id).await;
+        let mut adoption_note: Option<String> = None;
         let (cwd, system_prompt, branch_name, worktree_path) = if let Some((wt_path, branch)) =
             recovery_worktree
         {
@@ -315,24 +342,50 @@ impl LucidosEngine {
             //    expectation to violate.
             let branch_name = if let Some(ref existing) = existing_worktree {
                 if reusing_branch {
-                    // `verify_branch` runs `git rev-parse --abbrev-ref HEAD`
-                    // internally; skip the redundant `worktree_current_branch`
-                    // call on this path — `actual` is unused when reusing.
-                    if let Err(mismatch) =
-                        super::external_edits::verify_branch(existing, &branch_name).await
-                    {
-                        log!(
-                            "[ClaudeCode] Refusing spawn for thread {}: {}",
-                            thread_id,
-                            mismatch
-                        );
-                        return Err(format!(
-                            "Refusing to spawn Claude Code: {}",
-                            mismatch
-                        )
-                        .into());
+                    match super::external_edits::verify_branch(existing, &branch_name).await {
+                        Ok(()) => branch_name,
+                        Err(mismatch) => {
+                            // External repos: a skill may legitimately have
+                            // created a feature branch off our tracked one
+                            // (e.g. `git checkout -b UA-1234`). Adopt it
+                            // when its history contains our last commit.
+                            // Internal threads keep the strict refusal so
+                            // Apply has a stable claude-code/<id> branch.
+                            let adopted = if is_external_repo {
+                                super::external_edits::try_adopt_renegade_branch(
+                                    existing,
+                                    last_idle_sha.as_deref(),
+                                )
+                                .await
+                            } else {
+                                None
+                            };
+                            match adopted {
+                                Some((new_branch, note)) => {
+                                    log!(
+                                        "[ClaudeCode] Adopting renegade branch '{}' (was expecting '{}') for thread {}",
+                                        new_branch,
+                                        branch_name,
+                                        thread_id
+                                    );
+                                    adoption_note = Some(note);
+                                    new_branch
+                                }
+                                None => {
+                                    log!(
+                                        "[ClaudeCode] Refusing spawn for thread {}: {}",
+                                        thread_id,
+                                        mismatch
+                                    );
+                                    return Err(format!(
+                                        "Refusing to spawn Claude Code: {}",
+                                        mismatch
+                                    )
+                                    .into());
+                                }
+                            }
+                        }
                     }
-                    branch_name
                 } else {
                     match worktree_current_branch(existing).await {
                         Some(a) if a != branch_name => {
@@ -366,40 +419,16 @@ impl LucidosEngine {
             // collision via the standard `git worktree add` error path so the
             // caller can investigate.
             if existing_worktree.is_none() {
-                let wt_args = if reusing_branch {
-                    // Existing branch — no -b flag
-                    vec![
-                        "-c",
-                        "filter.git-crypt.smudge=",
-                        "-c",
-                        "filter.git-crypt.clean=",
-                        "-c",
-                        "filter.git-crypt.required=false",
-                        "worktree",
-                        "add",
-                        wt_path.to_str().unwrap(),
-                        &branch_name,
-                    ]
+                let wt_extra: Vec<&str> = if reusing_branch {
+                    vec![&branch_name]
                 } else {
-                    let mut args = vec![
-                        "-c",
-                        "filter.git-crypt.smudge=",
-                        "-c",
-                        "filter.git-crypt.clean=",
-                        "-c",
-                        "filter.git-crypt.required=false",
-                        "worktree",
-                        "add",
-                        wt_path.to_str().unwrap(),
-                        "-b",
-                        &branch_name,
-                    ];
+                    let mut args = vec!["-b", &branch_name];
                     if let Some(ref base_ref) = origin_default_branch {
                         args.push(base_ref);
                     }
                     args
                 };
-                match git_cmd(&wt_args, &repo_root).await {
+                match worktree_add(&repo_root, &wt_path, &wt_extra).await {
                     Ok(o) if o.status.success() => {
                         if reusing_branch {
                             log!(
@@ -552,68 +581,23 @@ impl LucidosEngine {
             );
 
             // Tag the worktree with the owning workspace so orphan recovery
-            // only cleans up worktrees belonging to this workspace.
+            // only cleans up worktrees belonging to this workspace. The
+            // optional second line is the external repo's UUID — written only
+            // when the session targets a registered external repo, so the
+            // marker stays interpretable as "second line ⇒ external".
             let marker = wt_path.join(WORKTREE_WORKSPACE_MARKER);
             let ws_id = self.workspace_path.to_string_lossy().to_string();
-            let marker_content = if let Some(ref rid) = repo_id {
-                format!("{}\n{}", ws_id, rid)
-            } else {
-                ws_id
+            let marker_content = match (is_external_repo, repo_id.as_ref()) {
+                (true, Some(rid)) => format!("{}\n{}", ws_id, rid),
+                _ => ws_id,
             };
             if let Err(e) = tokio::fs::write(&marker, &marker_content).await {
                 log!("[ClaudeCode] Failed to write workspace marker: {}", e);
             }
 
-            // Add marker to worktree's git exclude so external repos don't
-            // see it as an untracked file.
-            let git_dir = wt_path.join(".git");
-            let exclude_dir = if tokio::fs::metadata(&git_dir)
-                .await
-                .map(|m| m.is_file())
-                .unwrap_or(false)
-            {
-                if let Ok(content) = tokio::fs::read_to_string(&git_dir).await {
-                    content
-                        .trim()
-                        .strip_prefix("gitdir: ")
-                        .map(|p| wt_path.join(p).join("info"))
-                } else {
-                    None
-                }
-            } else {
-                Some(git_dir.join("info"))
-            };
-            if let Some(info_dir) = exclude_dir {
-                if let Err(e) = tokio::fs::create_dir_all(&info_dir).await {
-                    log!("[ClaudeCode] Failed to create git info dir: {}", e);
-                } else {
-                    let exclude_file = info_dir.join("exclude");
-                    let already_excluded = tokio::fs::read_to_string(&exclude_file)
-                        .await
-                        .map(|c| c.lines().any(|l| l.trim() == WORKTREE_WORKSPACE_MARKER))
-                        .unwrap_or(false);
-                    if !already_excluded {
-                        match tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&exclude_file)
-                            .await
-                        {
-                            Ok(mut f) => {
-                                if let Err(e) = f
-                                    .write_all(
-                                        format!("\n{}\n", WORKTREE_WORKSPACE_MARKER).as_bytes(),
-                                    )
-                                    .await
-                                {
-                                    log!("[ClaudeCode] Failed to write git exclude: {}", e);
-                                }
-                            }
-                            Err(e) => log!("[ClaudeCode] Failed to open git exclude: {}", e),
-                        }
-                    }
-                }
-            }
+            // Add engine-injected paths to the worktree's git exclude so external
+            // repos don't see them as untracked or accidentally commit them.
+            add_paths_to_worktree_exclude(&wt_path, WORKTREE_EXCLUDE_PATHS).await;
 
             let cwd = wt_path.clone();
             let system_prompt = if let Some(ref name) = external_repo_name {
@@ -790,18 +774,19 @@ impl LucidosEngine {
             // note", matching the rest of the resume code's tolerance for
             // best-effort git introspection.
             let final_text = if !user_message.is_empty() {
-                let last_sha = super::resume::lookup_latest_worktree_head_sha(
-                    self.pool(),
-                    thread_id,
-                )
-                .await;
-                let note = match (worktree_path.as_deref(), last_sha.as_deref()) {
+                let edit_note = match (worktree_path.as_deref(), last_idle_sha.as_deref()) {
                     (Some(wt), Some(sha)) => {
                         super::external_edits::compute_external_edit_note(wt, Some(sha)).await
                     }
                     _ => None,
                 };
-                match note {
+                let combined = match (adoption_note.as_deref(), edit_note.as_deref()) {
+                    (Some(a), Some(e)) => Some(format!("{}\n{}", a, e)),
+                    (Some(a), None) => Some(a.to_string()),
+                    (None, Some(e)) => Some(e.to_string()),
+                    (None, None) => None,
+                };
+                match combined {
                     Some(n) => {
                         log!(
                             "[ClaudeCode] Injecting external-edit note for thread {} ({} chars)",
@@ -845,7 +830,14 @@ impl LucidosEngine {
         let interrupt = Arc::new(tokio::sync::Notify::new());
         let idle_notify = Arc::new(tokio::sync::Notify::new());
         let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let external_terminal_emitted =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut normalized_model = cc_model.clone();
+        // Initial input (when has_content) produces one expected `Result` event;
+        // see AgentSession.pending_followups for the full rationale.
+        let pending_followups = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+            if has_content { 1 } else { 0 },
+        ));
         {
             let mut sessions = self.agent_sessions.lock().await;
             let session = AgentSession {
@@ -868,11 +860,13 @@ impl LucidosEngine {
                     now_epoch_millis(),
                 )),
                 shutting_down: shutting_down.clone(),
+                external_terminal_emitted: external_terminal_emitted.clone(),
                 control_tx: agent_control_tx.clone(),
                 builtin_commands: prev_builtin,
                 skill_commands: prev_skill,
                 current_model: normalized_model.clone(),
                 current_reasoning_effort: cc_reasoning_effort.clone(),
+                pending_followups: pending_followups.clone(),
             };
             sessions.insert(thread_id, session);
         }
@@ -885,7 +879,7 @@ impl LucidosEngine {
         // initialization leaves no mapping and recovery creates orphan threads.
         // The cc_session_id is not yet known (comes from CC's Init event), but
         // recovery uses CodingAgentIdled for --resume, not SessionStarted.
-        let _ = self
+        if let Err(e) = self
             .event_bus
             .emit(crate::engine::event_bus::BusEvent::Thread {
                 thread_id,
@@ -896,7 +890,14 @@ impl LucidosEngine {
                 },
                 meta: meta.clone(),
             })
-            .await;
+            .await
+        {
+            log!(
+                "[ClaudeCode] Failed to emit initial SessionStarted for {}: {}",
+                thread_id,
+                e
+            );
+        }
 
         // Persist initial model/effort so cc_thread_settings() can restore them
         // after the session exits. Without this, the frontend loses the model
@@ -954,11 +955,11 @@ impl LucidosEngine {
                         if !claude_text_buf.is_empty() {
                             let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
                             if !delta.is_empty() {
-                                let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
+                                self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                     thread_id,
                                     event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), agent: crate::runtime::AgentKind::ClaudeCode },
                                     meta: meta.clone(),
-                                }).await;
+                                }, "[ClaudeCode] CodingAgentTextStreamed (final flush on exit)").await;
                             }
                         }
                         if is_waiting {
@@ -1104,16 +1105,16 @@ impl LucidosEngine {
                             if should_flush(&claude_text_buf) {
                                 let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
                                 if !delta.is_empty() {
-                                    let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
+                                    self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                         thread_id,
                                         event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), agent: crate::runtime::AgentKind::ClaudeCode },
                                         meta: meta.clone(),
-                                    }).await;
+                                    }, "[ClaudeCode] CodingAgentTextStreamed (Message flush)").await;
                                     last_text_persisted_len = claude_text_buf.len();
                                 }
                             }
                         }
-                        AgentEvent::ToolUse { name, input, id: _ } => {
+                        AgentEvent::ToolUse { name, input, id } => {
                             // CC resumed after waiting — clear waiting state
                             if is_waiting {
                                 is_waiting = false;
@@ -1123,11 +1124,11 @@ impl LucidosEngine {
                             {
                                 let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
                                 if !delta.is_empty() {
-                                    let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
+                                    self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                         thread_id,
                                         event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), agent: crate::runtime::AgentKind::ClaudeCode },
                                         meta: meta.clone(),
-                                    }).await;
+                                    }, "[ClaudeCode] CodingAgentTextStreamed (pre-ToolUse flush)").await;
                                     last_text_persisted_len = claude_text_buf.len();
                                 }
                             }
@@ -1143,31 +1144,36 @@ impl LucidosEngine {
                                 // `UserQuestionAsked`), no kill (CC keeps running), no session removal.
                             } else {
                                 let description = crate::core::describe_cc_tool(&name, &input);
-                                let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
+                                self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                     thread_id,
                                     event: crate::engine::thread_events::ThreadEvent::CodingAgentToolCalled {
                                         name,
                                         args: input,
-                                        description,                                    agent: crate::runtime::AgentKind::ClaudeCode,
+                                        description,
+                                        agent: crate::runtime::AgentKind::ClaudeCode,
+                                        tool_use_id: id,
                                     },
                                     meta: meta.clone(),
-                                }).await;
+                                }, "[ClaudeCode] CodingAgentToolCalled").await;
                             }
                         }
-                        AgentEvent::ToolResult { output, status: _ } => {
+                        AgentEvent::ToolResult { output, status: _, id } => {
                             let summary: String = output.chars().take(200).collect();
-                            let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
+                            self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentToolResult {
                                     name: String::new(),
-                                    result: summary,                                    agent: crate::runtime::AgentKind::ClaudeCode,
+                                    result: summary,
+                                    agent: crate::runtime::AgentKind::ClaudeCode,
+                                    tool_use_id: id,
                                 },
                                 meta: meta.clone(),
-                            }).await;
+                            }, "[ClaudeCode] CodingAgentToolResult").await;
                         }
                         AgentEvent::Exited => unreachable!("Exited handled above"),
-                        AgentEvent::Result { text, .. } => {
-                                        log!("[ClaudeCode] Result event received — entering waiting state");
+                        AgentEvent::Result { text, error: cc_error, .. } => {
+                                        let err_suffix = cc_error.as_deref().map(|e| format!(" (error: {})", e)).unwrap_or_default();
+                                        log!("[ClaudeCode] Result event received — entering waiting state{}", err_suffix);
                                         // Final flush of any pending text
                                         if !claude_text_buf.is_empty() {
                                             // The Result.text may contain text beyond what was
@@ -1190,33 +1196,35 @@ impl LucidosEngine {
                                             }
                                             let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
                                             if !delta.is_empty() {
-                                                let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
+                                                self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                     thread_id,
                                                     event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), agent: crate::runtime::AgentKind::ClaudeCode },
                                                     meta: meta.clone(),
-                                                }).await;
+                                                }, "[ClaudeCode] CodingAgentTextStreamed (Result flush)").await;
                                             }
                                         } else if !text.trim().is_empty() {
                                             // Slash commands (e.g. /model) produce a Result
                                             // without any preceding Message events. Emit the
                                             // result text as CodingAgentTextStreamed so the
                                             // frontend displays it.
-                                            let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
+                                            self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                 thread_id,
                                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: text.trim().to_string(), agent: crate::runtime::AgentKind::ClaudeCode },
                                                 meta: meta.clone(),
-                                            }).await;
+                                            }, "[ClaudeCode] CodingAgentTextStreamed (slash command result)").await;
                                         }
                                         // Detect stale resume: CC returned empty Result immediately
                                         // after resume. The session was expired and produced no output.
                                         // Abort without emitting ResponseGenerated/CodingAgentIdled so
                                         // the caller can retry with a fresh session.
-                                        if resume_session_id.is_some()
-                                            && text.trim().is_empty()
-                                            && claude_text_buf.trim().is_empty()
-                                            && result_texts.is_empty()
-                                            && !user_message.is_empty()
-                                        {
+                                        if is_stale_resume_signal(
+                                            resume_session_id.is_some(),
+                                            text.trim().is_empty(),
+                                            claude_text_buf.trim().is_empty(),
+                                            result_texts.is_empty(),
+                                            !user_message.is_empty(),
+                                            cc_error.is_some(),
+                                        ) {
                                             log!("[ClaudeCode] Stale resume detected — CC returned empty Result for non-empty user message. Aborting session for retry.");
                                             agent_cancel.cancel();
                                             // Remove from sessions map so retry can start fresh
@@ -1228,20 +1236,17 @@ impl LucidosEngine {
                                                 }
                                                 guard.remove(&thread_id);
                                             }
-                                            // Emit SessionEnded { Panic } so the auto-detect
-                                            // resume query finds SessionEnded (not
-                                            // CodingAgentIdled) and starts a fresh session on
-                                            // retry. Stale-resume isn't a panic per se, but
-                                            // until Phase 9 replaces this path with event-based
-                                            // reconstruction, Panic is the closest terminal
-                                            // reason — the JSONL state is unrecoverable.
-                                            let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
+                                            // Shadow the stale CodingAgentIdled so
+                                            // `resolve_resume_context` won't reuse the dead
+                                            // sid on the retry (or after a restart). See
+                                            // SessionEndReason::StaleResume.
+                                            self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                 thread_id,
                                                 event: crate::engine::thread_events::ThreadEvent::SessionEnded {
-                                                    reason: SessionEndReason::Panic,
+                                                    reason: SessionEndReason::StaleResume,
                                                 },
                                                 meta: meta.clone(),
-                                            }).await;
+                                            }, "[ClaudeCode] SessionEnded (stale resume)").await;
                                             // Clean up the worktree and branch so the retry
                                             // starts fresh (otherwise orphaned on disk until
                                             // engine restart).
@@ -1261,23 +1266,26 @@ impl LucidosEngine {
                                             is_silent_resume(user_message.is_empty(), has_user_images),
                                             user_hit_stop,
                                             is_shutdown,
+                                            cc_error,
                                         );
                                         if let Some(kind) = terminal_kind {
                                             if kind == TerminalKind::Aborted {
                                                 // Reset on next user follow-up.
                                                 user_hit_stop = false;
                                             }
-                                            let terminal_event = Self::make_terminal_event(
-                                                kind,
-                                                text.clone(),
-                                                normalized_model.clone(),
-                                                cc_reasoning_effort.clone(),
-                                            );
-                                            let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
-                                                thread_id,
-                                                event: terminal_event,
-                                                meta: meta.clone(),
-                                            }).await;
+                                            if !Self::external_terminal_already_emitted(&external_terminal_emitted, thread_id, "Result classify") {
+                                                let terminal_event = Self::make_terminal_event(
+                                                    kind,
+                                                    text.clone(),
+                                                    normalized_model.clone(),
+                                                    cc_reasoning_effort.clone(),
+                                                );
+                                                self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
+                                                    thread_id,
+                                                    event: terminal_event,
+                                                    meta: meta.clone(),
+                                                }, "[ClaudeCode] terminal event (Result classify)").await;
+                                            }
                                         }
                                         emitted_terminal_event = true;
                                         claude_text_buf.clear();
@@ -1298,13 +1306,10 @@ impl LucidosEngine {
                                         let (wt_has_changes, wt_requires_restart) = if conflict_change.is_some() {
                                             (true, false) // Conflict resolution always has work
                                         } else {
-                                            let diff = git_cmd(&["diff", "--name-only", "main...HEAD"], worktree_path.as_ref().unwrap()).await;
-                                            let changed_files: Vec<String> = diff
-                                                .as_ref()
-                                                .ok()
-                                                .filter(|o| o.status.success())
-                                                .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|l| l.to_string()).collect())
-                                                .unwrap_or_default();
+                                            // Reuse branch_changed_files so the runtime-path filter
+                                            // applies here too — without it `cc_has_changes` would
+                                            // flip to true whenever `.lucidos/` files were committed.
+                                            let changed_files = branch_changed_files(&repo_root, &branch_name).await;
                                             (!changed_files.is_empty(), files_require_restart(&changed_files))
                                         };
 
@@ -1396,21 +1401,14 @@ impl LucidosEngine {
                                             let hardened = is_harden_marker_present(&self.pool, &repo_root, &branch_name).await;
                                             let changed_files = branch_changed_files(&repo_root, &branch_name).await;
                                             if changed_files.is_empty() {
-                                                log!("[ClaudeCode] Skipping proposal — branch has no changed files");
+                                                // Branch had worktree-level dirt at idle but the committed diff
+                                                // against main is empty (commit + revert, or noise that auto-commit
+                                                // captured then a subsequent edit reverted). Leave any pending row
+                                                // for the user to resolve from Review — never auto-discard.
                                                 if let Some(stale) = self.changes().get_pending_by_branch(&branch_name).await {
-                                                    log!("[ClaudeCode] Discarding stale pending change {} for branch {}", stale.id, branch_name);
-                                                    self.event_bus.emit_or_log(
-                                                        crate::engine::event_bus::BusEvent::Thread {
-                                                            thread_id,
-                                                            event: crate::engine::thread_events::ThreadEvent::ChangeDiscarded {
-                                                                change_id: stale.id.to_string(),
-                                                                actor: None,
-                                                                path: String::new(),
-                                                            },
-                                                            meta: crate::engine::thread_events::EventMeta::NONE,
-                                                        },
-                                                        "[ClaudeCode] ChangeDiscarded (stale)",
-                                                    ).await;
+                                                    log!("[ClaudeCode] Branch {} has no actual diff but pending change {} exists — left in Review for user to resolve", branch_name, stale.id);
+                                                } else {
+                                                    log!("[ClaudeCode] Skipping proposal — branch has no changed files");
                                                 }
                                                 self.broadcast_changes_updated().await;
                                             } else {
@@ -1421,7 +1419,6 @@ impl LucidosEngine {
                                                 let description = describe_branch_changes(&repo_root, &log_range, &fallback, None).await;
                                                 let repo_root_str = repo_root.to_string_lossy().to_string();
                                                 match self.propose_change(crate::engine::change_ops::ProposeChangeInput {
-                                                    request_id,
                                                     thread_id,
                                                     branch_name: &branch_name,
                                                     repo_root: &repo_root_str,
@@ -1477,8 +1474,23 @@ impl LucidosEngine {
                                             // event loop reads that on the next iteration and the
                                             // Exited arm returns the ProcessResult with
                                             // `proposed_change` correctly tracked above.
-                                            log!("[ClaudeCode] Idle reached — terminating CC subprocess for thread {} so next turn resumes via --resume", thread_id);
-                                            agent_cancel.cancel();
+                                            //
+                                            // See `AgentSession.pending_followups`. `swap(0)`
+                                            // resets per-Result (turn boundary); pre-swap > 1
+                                            // means a follow-up was inflight (queued in msg_rx
+                                            // or merged into this Result) — keep CC alive so
+                                            // the queued entry can be consumed without
+                                            // round-tripping through a respawn. AcqRel pairs
+                                            // with the fast-path `fetch_add` in
+                                            // `chat::process` so a racing increment is observed.
+                                            let prev = pending_followups
+                                                .swap(0, std::sync::atomic::Ordering::AcqRel);
+                                            if prev > 1 {
+                                                log!("[ClaudeCode] Skipping subprocess termination for thread {} — {} follow-up(s) inflight (queued or merged)", thread_id, prev - 1);
+                                            } else {
+                                                log!("[ClaudeCode] Idle reached — terminating CC subprocess for thread {} so next turn resumes via --resume", thread_id);
+                                                agent_cancel.cancel();
+                                            }
                                         }
                                     }
                                 }
@@ -1498,11 +1510,11 @@ impl LucidosEngine {
                     if !claude_text_buf.is_empty() {
                         let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
                         if !delta.is_empty() {
-                            let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
+                            self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), agent: crate::runtime::AgentKind::ClaudeCode },
                                 meta: meta.clone(),
-                            }).await;
+                            }, "[ClaudeCode] CodingAgentTextStreamed (flush before user_input)").await;
                         }
                         claude_text_buf.clear();
                         last_text_persisted_len = 0;
@@ -1513,13 +1525,13 @@ impl LucidosEngine {
                         text: user_input.text.clone(),
                         images,
                     }).is_err() {
-                        log!("Failed to forward user input to agent runtime — channel closed");
+                        log!("[AgentSession] Failed to forward user input to agent runtime — channel closed");
                         break;
                     }
                     // chat.rs already emitted MessageReceived with the frontend's UUID
                     // for optimistic rendering. Here we just emit CodingAgentPromptSent
                     // as an audit trail for the CC event loop.
-                    let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
+                    self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                         thread_id,
                         event: crate::engine::thread_events::ThreadEvent::CodingAgentPromptSent {
                             text: user_input.text,
@@ -1530,7 +1542,7 @@ impl LucidosEngine {
                             origin: None,
                         },
                         meta: meta.clone(),
-                    }).await;
+                    }, "[ClaudeCode] CodingAgentPromptSent").await;
                 }
 
                 _ = interrupt.notified() => {
@@ -1557,63 +1569,40 @@ impl LucidosEngine {
                 }
 
                 _ = cancel.notified() => {
-                    // Kill CC process and emit terminal event
-                    Self::kill_cc_and_flush(&agent_cancel, &claude_text_buf, last_text_persisted_len, &self.event_bus, thread_id, &meta).await;
-                    if !is_waiting {
-                        let kind = if shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
-                            TerminalKind::Aborted
-                        } else {
-                            TerminalKind::Canceled
-                        };
-                        let terminal_event = Self::make_terminal_event(kind, claude_text_buf.clone(), normalized_model.clone(), cc_reasoning_effort.clone());
-                        let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
-                            thread_id, event: terminal_event, meta: meta.clone(),
-                        }).await;
-                    } else {
-                        log!("[ClaudeCode] Shutdown: session {} was idle, skipping terminal event", thread_id);
-                    }
+                    let is_shutdown = shutting_down.load(std::sync::atomic::Ordering::Relaxed);
+                    self.emit_cancel_terminal(
+                        "cancel",
+                        thread_id,
+                        is_waiting,
+                        is_shutdown,
+                        &agent_cancel,
+                        &claude_text_buf,
+                        last_text_persisted_len,
+                        &meta,
+                        &external_terminal_emitted,
+                        &normalized_model,
+                        &cc_reasoning_effort,
+                    ).await;
                     emitted_terminal_event = true;
                     break;
                 }
 
                 _ = chat_cancel.cancelled() => {
                     // Upstream chat handler cancelled (engine shutdown / request abort).
-                    // Cancel the runtime, flush partial text, emit terminal event.
-                    Self::kill_cc_and_flush(
+                    let is_shutdown = shutting_down.load(std::sync::atomic::Ordering::Relaxed);
+                    self.emit_cancel_terminal(
+                        "chat_cancel",
+                        thread_id,
+                        is_waiting,
+                        is_shutdown,
                         &agent_cancel,
                         &claude_text_buf,
                         last_text_persisted_len,
-                        &self.event_bus,
-                        thread_id,
                         &meta,
-                    )
-                    .await;
-                    if !is_waiting {
-                        let kind = if shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
-                            TerminalKind::Aborted
-                        } else {
-                            TerminalKind::Canceled
-                        };
-                        let terminal_event = Self::make_terminal_event(
-                            kind,
-                            claude_text_buf.clone(),
-                            normalized_model.clone(),
-                            cc_reasoning_effort.clone(),
-                        );
-                        let _ = self
-                            .event_bus
-                            .emit(crate::engine::event_bus::BusEvent::Thread {
-                                thread_id,
-                                event: terminal_event,
-                                meta: meta.clone(),
-                            })
-                            .await;
-                    } else {
-                        log!(
-                            "[ClaudeCode] Cancel: session {} was idle, skipping terminal event",
-                            thread_id
-                        );
-                    }
+                        &external_terminal_emitted,
+                        &normalized_model,
+                        &cc_reasoning_effort,
+                    ).await;
                     emitted_terminal_event = true;
                     break;
                 }
@@ -1647,41 +1636,52 @@ impl LucidosEngine {
                 outcome,
                 claude_text_buf.len()
             );
-            let (event, label) = match outcome {
-                SafetyNetOutcome::Completed => (
-                    crate::engine::thread_events::ThreadEvent::ResponseGenerated {
-                        text: claude_text_buf.clone(),
-                        images: vec![],
-                        model: normalized_model.clone(),
-                        reasoning_effort: cc_reasoning_effort.clone(),
-                    },
-                    "ResponseGenerated",
-                ),
-                SafetyNetOutcome::Aborted => (
-                    crate::engine::thread_events::ThreadEvent::ResponseAborted {
-                        text: claude_text_buf.clone(),
-                        images: vec![],
-                        model: normalized_model.clone(),
-                        reasoning_effort: cc_reasoning_effort.clone(),
-                    },
-                    "ResponseAborted",
-                ),
-            };
-            if let Err(e) = self
-                .event_bus
-                .emit(crate::engine::event_bus::BusEvent::Thread {
-                    thread_id,
-                    event,
-                    meta: meta.clone(),
-                })
-                .await
-            {
-                log!(
-                    "[ClaudeCode] Failed to emit safety-net {} for thread {}: {}",
-                    label,
-                    thread_id,
-                    e
+            // SafetyNetOutcome::Completed emits ResponseGenerated (unrelated to
+            // restart). Aborted is the only variant that can collide.
+            let skip_for_restart = matches!(outcome, SafetyNetOutcome::Aborted)
+                && Self::external_terminal_already_emitted(&external_terminal_emitted, thread_id, "safety net");
+            if !skip_for_restart {
+                let (event, label) = match outcome {
+                    SafetyNetOutcome::Completed => (
+                        crate::engine::thread_events::ThreadEvent::ResponseGenerated {
+                            text: claude_text_buf.clone(),
+                            images: vec![],
+                            model: normalized_model.clone(),
+                            reasoning_effort: cc_reasoning_effort.clone(),
+                        },
+                        "ResponseGenerated",
+                    ),
+                    SafetyNetOutcome::Aborted => (
+                        crate::engine::thread_events::ThreadEvent::ResponseAborted {
+                            text: claude_text_buf.clone(),
+                            images: vec![],
+                            model: normalized_model.clone(),
+                            reasoning_effort: cc_reasoning_effort.clone(),
+                        },
+                        "ResponseAborted",
+                    ),
+                };
+                let mut emit_meta = meta.clone();
+                Self::stamp_system_actor_if_aborted(
+                    &mut emit_meta,
+                    matches!(outcome, SafetyNetOutcome::Aborted),
                 );
+                if let Err(e) = self
+                    .event_bus
+                    .emit(crate::engine::event_bus::BusEvent::Thread {
+                        thread_id,
+                        event,
+                        meta: emit_meta,
+                    })
+                    .await
+                {
+                    log!(
+                        "[ClaudeCode] Failed to emit safety-net {} for thread {}: {}",
+                        label,
+                        thread_id,
+                        e
+                    );
+                }
             }
         }
 
@@ -1760,7 +1760,7 @@ impl LucidosEngine {
             if has_unmerged {
                 let _ = git_cmd(&["merge", "--abort"], &cwd).await;
                 log!(
-                    "Conflict resolution incomplete for {} — merge aborted in worktree",
+                    "[AgentSession] Conflict resolution incomplete for {} — merge aborted in worktree",
                     change.branch_name
                 );
                 let _ = git_cmd(&["worktree", "remove", "--force", wt_str], &repo_root).await;
@@ -1771,7 +1771,7 @@ impl LucidosEngine {
                     "[ConflictResolution] MergeResolutionCleared",
                 )
                 .await;
-                let _ = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
+                self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                     thread_id: change.thread_id.unwrap_or(thread_id),
                     event: crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
                         change_id: change.id.to_string(),
@@ -1779,7 +1779,7 @@ impl LucidosEngine {
                         actor: apply_actor,
                     },
                     meta: crate::engine::thread_events::EventMeta::NONE,
-                }).await;
+                }, "[ConflictResolution] ChangeApplyFailed").await;
             } else {
                 // Ensure merge is committed
                 let merge_committed = git_cmd(&["rev-parse", "MERGE_HEAD"], &cwd)
@@ -1813,7 +1813,7 @@ impl LucidosEngine {
                         )
                         .await;
                         log!(
-                            "Conflict resolution complete — change {} applied via ff-merge",
+                            "[AgentSession] Conflict resolution complete — change {} applied via ff-merge",
                             change.id
                         );
                     }
@@ -1824,22 +1824,24 @@ impl LucidosEngine {
                             "[ConflictResolution] MergeResolutionCleared",
                         )
                         .await;
-                        log!("ff-merge failed after conflict resolution: {}", e);
-                        let _ = self
-                            .event_bus
-                            .emit(crate::engine::event_bus::BusEvent::Thread {
-                                thread_id: change.thread_id.unwrap_or(thread_id),
-                                event:
-                                    crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
-                                        change_id: change.id.to_string(),
-                                        error: format!(
-                                            "Merge failed after conflict resolution: {}",
-                                            e
-                                        ),
-                                        actor: apply_actor,
-                                    },
-                                meta: crate::engine::thread_events::EventMeta::NONE,
-                            })
+                        log!("[AgentSession] ff-merge failed after conflict resolution: {}", e);
+                        self.event_bus
+                            .emit_or_log(
+                                crate::engine::event_bus::BusEvent::Thread {
+                                    thread_id: change.thread_id.unwrap_or(thread_id),
+                                    event:
+                                        crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
+                                            change_id: change.id.to_string(),
+                                            error: format!(
+                                                "Merge failed after conflict resolution: {}",
+                                                e
+                                            ),
+                                            actor: apply_actor,
+                                        },
+                                    meta: crate::engine::thread_events::EventMeta::NONE,
+                                },
+                                "[ConflictResolution] ChangeApplyFailed",
+                            )
                             .await;
                     }
                 }
@@ -1859,24 +1861,26 @@ impl LucidosEngine {
                 // User chose "Discard & End Session" — remove worktree, delete branch
                 // Discard any pending change for this branch so the frontend doesn't show it as waiting
                 if let Some(change) = self.changes().get_pending_by_branch(&branch_name).await {
-                    let _ = self
-                        .event_bus
-                        .emit(crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::ChangeDiscarded {
-                                change_id: change.id.to_string(),
-                                actor: None,
-                                path: String::new(),
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event: crate::engine::thread_events::ThreadEvent::ChangeDiscarded {
+                                    change_id: change.id.to_string(),
+                                    actor: None,
+                                    path: String::new(),
+                                },
+                                meta: meta.clone(),
                             },
-                            meta: meta.clone(),
-                        })
+                            "[ClaudeCode] ChangeDiscarded (worktree cleanup)",
+                        )
                         .await;
                 }
                 let wt_path_str = wt.to_str().unwrap();
                 if let Err(e) =
                     git_cmd(&["worktree", "remove", "--force", wt_path_str], &repo_root).await
                 {
-                    log!("{}", e);
+                    log!("[AgentSession] {}", e);
                 }
                 log!("[ClaudeCode] Discarding changes (branch {})", branch_name);
                 if let Err(e) = git_cmd(&["branch", "-D", &branch_name], &repo_root).await {
@@ -1910,90 +1914,107 @@ impl LucidosEngine {
 
                 let was_hardened = branch_is_hardened(&self.pool, self.changes(), &repo_root, effective_branch).await;
                 let has_commits = has_branch_commits(&repo_root, effective_branch).await;
+                let changed_files = if has_commits {
+                    branch_changed_files(&repo_root, effective_branch).await
+                } else {
+                    Vec::new()
+                };
 
                 // Remove the worktree directory (the branch stays)
                 let wt_path_str = wt.to_str().unwrap();
                 if let Err(e) =
                     git_cmd(&["worktree", "remove", "--force", wt_path_str], &repo_root).await
                 {
-                    log!("{}", e);
+                    log!("[AgentSession] {}", e);
                 }
 
-                if has_commits && is_external_repo {
-                    log!(
-                        "[ClaudeCode] External repo branch {} — keeping branch, no change proposed",
-                        effective_branch
-                    );
-                } else if has_commits {
-                    let changed_files = branch_changed_files(&repo_root, effective_branch).await;
-                    let requires_restart = files_require_restart(&changed_files);
+                match classify_session_end_action(
+                    has_commits,
+                    changed_files.is_empty(),
+                    is_external_repo,
+                ) {
+                    SessionEndAction::KeepExternalBranch => {
+                        log!(
+                            "[ClaudeCode] External repo branch {} — keeping branch, no change proposed",
+                            effective_branch
+                        );
+                    }
+                    SessionEndAction::Propose => {
+                        let requires_restart = files_require_restart(&changed_files);
 
-                    log!(
-                        "Storing change on branch {}{}",
-                        effective_branch,
-                        if requires_restart {
-                            " (requires restart)"
-                        } else {
-                            ""
-                        }
-                    );
-                    let repo_root_str = repo_root.to_string_lossy().to_string();
-
-                    let fallback =
-                        change_description_fallback(self.pool(), thread_id, effective_branch).await;
-                    let base = default_local_branch(&repo_root).await;
-                    let log_range = format!("{}..{}", base, effective_branch);
-                    let description =
-                        describe_branch_changes(&repo_root, &log_range, &fallback, None).await;
-
-                    match self
-                        .propose_change(crate::engine::change_ops::ProposeChangeInput {
-                            request_id,
-                            thread_id,
-                            branch_name: effective_branch,
-                            repo_root: &repo_root_str,
-                            description: &description,
-                            files: &changed_files,
-                            requires_restart,
-                            channel: EventChannel::CodingAgent,
-                            hardened: was_hardened,
-                            // Live agent proposal at session end — origin is
-                            // carried by the surrounding MessageReceived.
-                            origin: None,
-                        })
-                        .await
-                    {
-                        Ok(_change_id) => {
-                            proposed_change = true;
-                            if was_hardened {
-                                consume_harden_marker(&self.pool, &repo_root, effective_branch).await;
+                        log!(
+                            "[AgentSession] Storing change on branch {}{}",
+                            effective_branch,
+                            if requires_restart {
+                                " (requires restart)"
+                            } else {
+                                ""
                             }
-                            if !last_emitted_idle {
-                                self.emit_coding_agent_idled(
-                                    thread_id,
-                                    !changed_files.is_empty(),
-                                    is_external_repo,
-                                    requires_restart,
-                                    worktree_path.as_deref(),
-                                    &meta,
-                                )
-                                .await;
+                        );
+                        let repo_root_str = repo_root.to_string_lossy().to_string();
+
+                        let fallback =
+                            change_description_fallback(self.pool(), thread_id, effective_branch).await;
+                        let base = default_local_branch(&repo_root).await;
+                        let log_range = format!("{}..{}", base, effective_branch);
+                        let description =
+                            describe_branch_changes(&repo_root, &log_range, &fallback, None).await;
+
+                        match self
+                            .propose_change(crate::engine::change_ops::ProposeChangeInput {
+                                thread_id,
+                                branch_name: effective_branch,
+                                repo_root: &repo_root_str,
+                                description: &description,
+                                files: &changed_files,
+                                requires_restart,
+                                channel: EventChannel::CodingAgent,
+                                hardened: was_hardened,
+                                // Live agent proposal at session end — origin is
+                                // carried by the surrounding MessageReceived.
+                                origin: None,
+                            })
+                            .await
+                        {
+                            Ok(_change_id) => {
+                                proposed_change = true;
+                                if was_hardened {
+                                    consume_harden_marker(&self.pool, &repo_root, effective_branch).await;
+                                }
+                                if !last_emitted_idle {
+                                    self.emit_coding_agent_idled(
+                                        thread_id,
+                                        !changed_files.is_empty(),
+                                        is_external_repo,
+                                        requires_restart,
+                                        worktree_path.as_deref(),
+                                        &meta,
+                                    )
+                                    .await;
+                                }
                             }
-                        }
-                        Err(e) => {
-                            log!("Failed to propose change: {}", e);
+                            Err(e) => {
+                                log!("[AgentSession] Failed to propose change: {}", e);
+                            }
                         }
                     }
-                } else {
-                    // No commits on the effective branch — clean up the tracked branch
-                    // if it's different (CC switched branches, original has no changes).
-                    if effective_branch != branch_name
-                        && !self.changes().has_pending_for_branch(&branch_name).await
-                    {
-                        let _ = git_cmd(&["branch", "-D", &branch_name], &repo_root).await;
-                    }
-                    if !self.changes().has_pending_for_branch(effective_branch).await {
-                        let _ = git_cmd(&["branch", "-D", effective_branch], &repo_root).await;
+                    SessionEndAction::CleanupBranches => {
+                        if has_commits {
+                            log!(
+                                "[AgentSession] Branch {} has commits but empty diff vs main — cleaning up without proposing",
+                                effective_branch
+                            );
+                        }
+                        // No real changes on the effective branch — clean up the tracked branch
+                        // if it's different (CC switched branches, original has no changes).
+                        if effective_branch != branch_name
+                            && !self.changes().has_pending_for_branch(&branch_name).await
+                        {
+                            let _ = git_cmd(&["branch", "-D", &branch_name], &repo_root).await;
+                        }
+                        if !self.changes().has_pending_for_branch(effective_branch).await {
+                            let _ = git_cmd(&["branch", "-D", effective_branch], &repo_root).await;
+                        }
                     }
                 }
             }
@@ -2050,23 +2071,25 @@ impl LucidosEngine {
             Some(p) => super::external_edits::git_head_sha(p).await,
             None => None,
         };
-        let _ = self
-            .event_bus
-            .emit(crate::engine::event_bus::BusEvent::Thread {
-                thread_id,
-                event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
-                    has_changes,
-                    is_external_repo,
-                    requires_restart,
-                    cc_session_id,
-                    agent: crate::runtime::AgentKind::ClaudeCode,
-                    reason: None,
-                    worktree_path: worktree_path
-                        .map(|p| p.to_string_lossy().into_owned()),
-                    worktree_head_sha,
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
+                        has_changes,
+                        is_external_repo,
+                        requires_restart,
+                        cc_session_id,
+                        agent: crate::runtime::AgentKind::ClaudeCode,
+                        reason: None,
+                        worktree_path: worktree_path
+                            .map(|p| p.to_string_lossy().into_owned()),
+                        worktree_head_sha,
+                    },
+                    meta: meta.clone(),
                 },
-                meta: meta.clone(),
-            })
+                "[ClaudeCode] CodingAgentIdled",
+            )
             .await;
     }
 }

@@ -19,6 +19,14 @@ pub struct TriggerInfo {
     pub on: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub condition: Option<serde_json::Value>,
+    /// Owning app directory name (e.g. `"trigger-workflow"`), used to deep-link
+    /// notifications back to the right app. None for standalone triggers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    /// When true, threads spawned by this trigger surface in REVIEW on
+    /// completion instead of going straight to HISTORY.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub go_to_review: bool,
 }
 
 impl TriggerInfo {
@@ -42,6 +50,10 @@ impl TriggerInfo {
             run,
             on: config.on.clone(),
             condition: config.condition.clone(),
+            // Surface the resolved (explicit-or-derived) app id so the frontend
+            // matches what the engine will stamp on notifications from this trigger.
+            app_id: config.owning_app_id(),
+            go_to_review: config.go_to_review,
         }
     }
 }
@@ -49,6 +61,22 @@ impl TriggerInfo {
 #[derive(Serialize)]
 pub struct TriggersListResponse {
     pub triggers: Vec<TriggerInfo>,
+}
+
+#[derive(Serialize)]
+pub struct HistoricalTriggerInfo {
+    pub id: String,
+    /// Snapshot from the most recent thread spawned by this trigger. None when
+    /// no `TriggerStarted` event ever carried a name (legacy data).
+    pub name: Option<String>,
+    /// `last_activity` of the most recent thread spawned by this trigger
+    /// (RFC3339, UTC). Frontend uses it to disambiguate same-named entries.
+    pub last_activity: String,
+}
+
+#[derive(Serialize)]
+pub struct HistoricalTriggersResponse {
+    pub triggers: Vec<HistoricalTriggerInfo>,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +89,15 @@ pub struct CreateTriggerCronRequest {
     pub on_event: Option<String>,
     #[serde(default)]
     pub condition: Option<serde_json::Value>,
+    /// Owning app directory name (e.g. `"trigger-workflow"`). Stamped onto
+    /// notifications emitted by this trigger so the popover can deep-link
+    /// to the app. Optional; standalone triggers omit it.
+    #[serde(default)]
+    pub app_id: Option<String>,
+    /// When true, threads spawned by this trigger surface in REVIEW on
+    /// completion instead of going straight to HISTORY. Default false.
+    #[serde(default)]
+    pub go_to_review: bool,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +122,14 @@ pub struct UpdateTriggerCronRequest {
         deserialize_with = "deserialize_optional_nullable::<serde_json::Value, _>"
     )]
     pub condition: Option<Option<serde_json::Value>>,
+    /// None = field absent (don't change), Some(None) = explicitly null (clear), Some(Some(v)) = set.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_nullable::<String, _>"
+    )]
+    pub app_id: Option<Option<String>>,
+    #[serde(default)]
+    pub go_to_review: Option<bool>,
 }
 
 /// Deserialize a field that can be absent, null, or a value.
@@ -107,6 +152,33 @@ pub(super) async fn list_triggers(State(state): State<AppState>) -> Json<Trigger
     let configs = state.scheduler.lock().await.list_trigger_configs();
     let triggers: Vec<TriggerInfo> = configs.iter().map(TriggerInfo::from_config).collect();
     Json(TriggersListResponse { triggers })
+}
+
+/// Every trigger that has ever spawned a thread, deleted or live.
+pub(super) async fn list_historical_triggers(
+    State(state): State<AppState>,
+) -> Result<Json<HistoricalTriggersResponse>, (StatusCode, String)> {
+    let rows = state
+        .engine
+        .event_store()
+        .list_historical_triggers()
+        .await
+        .map_err(|e| {
+            log!("[API] Failed to list historical triggers: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to list historical triggers: {}", e),
+            )
+        })?;
+    let triggers = rows
+        .into_iter()
+        .map(|(id, name, last_activity)| HistoricalTriggerInfo {
+            id,
+            name,
+            last_activity: last_activity.to_rfc3339(),
+        })
+        .collect();
+    Ok(Json(HistoricalTriggersResponse { triggers }))
 }
 
 /// Create a new trigger
@@ -186,6 +258,15 @@ pub(super) async fn create_trigger(
     if let Some(ref cond) = request.condition {
         payload["condition"] = cond.clone();
     }
+    if let Some(ref aid) = request.app_id {
+        let trimmed = aid.trim();
+        if !trimmed.is_empty() {
+            payload["app_id"] = serde_json::json!(trimmed);
+        }
+    }
+    if request.go_to_review {
+        payload["go_to_review"] = serde_json::json!(true);
+    }
 
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     if let Err(e) = state
@@ -198,7 +279,7 @@ pub(super) async fn create_trigger(
         }))
         .await
     {
-        log!("Failed to emit TriggerCreated event: {}", e);
+        log!("[Triggers] Failed to emit TriggerCreated event: {}", e);
     }
 
     ApiResult::ok()
@@ -281,6 +362,18 @@ pub(super) async fn update_trigger(
     if let Some(v) = &request.condition {
         update_payload["condition"] = serde_json::json!(v);
     }
+    // Same null-vs-absent semantics for app_id: explicit null clears the link
+    // (e.g. trigger moved out of an app), absent leaves it alone.
+    if let Some(v) = &request.app_id {
+        let normalized = v
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        update_payload["app_id"] = serde_json::json!(normalized);
+    }
+    if let Some(v) = request.go_to_review {
+        update_payload["go_to_review"] = serde_json::json!(v);
+    }
 
     // Ensure trigger still has at least one firing mechanism after update
     let updated_crons = request
@@ -306,7 +399,7 @@ pub(super) async fn update_trigger(
         }))
         .await
     {
-        log!("Failed to emit TriggerUpdated event: {}", e);
+        log!("[Triggers] Failed to emit TriggerUpdated event: {}", e);
     }
 
     ApiResult::ok()
@@ -342,7 +435,7 @@ pub(super) async fn delete_trigger(
         }))
         .await
     {
-        log!("Failed to emit TriggerDeleted event: {}", e);
+        log!("[Triggers] Failed to emit TriggerDeleted event: {}", e);
     }
 
     ApiResult::ok()

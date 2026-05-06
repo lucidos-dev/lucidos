@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { applyingNowThreadIds, dismissingThreadIds, toasts } from '../store';
+import { applyingNowThreadIds, archivingThreadIds, toasts } from '../store';
 
 vi.mock('../../api/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/client')>();
@@ -20,7 +20,7 @@ const mockedApplyNow = vi.mocked(applyNow);
 
 beforeEach(() => {
   applyingNowThreadIds.value = new Map();
-  dismissingThreadIds.value = new Set();
+  archivingThreadIds.value = new Set();
   toasts.value = [];
   vi.clearAllMocks();
   vi.useFakeTimers();
@@ -70,8 +70,8 @@ describe('endClaudeCodeAndApply 409 safety timeout', () => {
   });
 
   it('refuses to apply while dismiss is in progress — states are mutually exclusive', async () => {
-    // Scenario: user clicked Done (dismiss in progress), apply must not start.
-    dismissingThreadIds.value = new Set(['thread-1']);
+    // Scenario: user clicked Archive (dismiss in progress), apply must not start.
+    archivingThreadIds.value = new Set(['thread-1']);
 
     await endClaudeCodeAndApply('thread-1');
 

@@ -7,7 +7,7 @@ import { MODELS, REASONING_LEVELS, clampReasoningEffort, DEFAULT_CHAT_MODEL } fr
 
 export type Theme = 'light' | 'dark' | 'system';
 export type FontFamily = 'monospace' | 'system' | 'inter' | 'jetbrains-mono' | 'ibm-plex-mono';
-export type ImageModel = 'auto' | 'imagen-4' | 'gpt-image-1';
+export type ImageModel = 'auto' | 'imagen-4' | 'gpt-image-1' | 'gpt-image-1.5' | 'gpt-image-2';
 
 export const UI_SCALE_MIN = 75;
 export const UI_SCALE_MAX = 200;
@@ -29,7 +29,13 @@ const GOOGLE_FONT_URLS: Partial<Record<FontFamily, string>> = {
 };
 
 const loadedFonts = new Set<string>();
-let systemThemeQuery: MediaQueryList | null = null;
+
+// Seeded from currentTheme() so loadPreferences can skip the no-op applyTheme
+// when the stored value is unchanged. We deliberately do NOT install a
+// matchMedia 'change' listener for system mode: iOS WKWebView fires those
+// events with the wrong value at random moments, briefly flipping the page.
+// system mode resolves once per page load (FOUC + initial applyTheme).
+let lastAppliedTheme: Theme = currentTheme();
 
 // --- Generic helpers ---
 
@@ -37,11 +43,10 @@ function currentPreference<T extends string>(
   key: string,
   validValues: readonly T[],
   defaultValue: T,
-  fallbackKey?: string,
   localStorageKey?: string,
 ): T {
   if (preferences.value.status === 'loaded') {
-    const raw = preferences.value.data[key] || (fallbackKey && preferences.value.data[fallbackKey]);
+    const raw = preferences.value.data[key];
     if (raw && (validValues as readonly string[]).includes(raw)) return raw as T;
   }
   if (localStorageKey) {
@@ -75,6 +80,7 @@ export async function savePreference(
 
 export function applyUiScale(scale: number): void {
   const clamped = Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, scale));
+  localStorage.setItem('lucidos-ui-scale', String(clamped));
   document.documentElement.style.setProperty('--user-ui-scale', `${clamped}%`);
 }
 
@@ -105,36 +111,42 @@ function resolveTheme(theme: Theme): 'light' | 'dark' {
 
 export function applyTheme(theme: Theme): void {
   const resolved = resolveTheme(theme);
+  const bg = resolved === 'light' ? '#ffffff' : '#0d1117';
+  // Theme-flash telemetry — index.html installs __themeLogEvt as a fetch shim
+  // that POSTs to /api/internal/client-log (engine.log breadcrumbs).
+  type ThemeLogEvt = (label: string, info: unknown) => void;
+  const logEvt = (window as unknown as { __themeLogEvt?: ThemeLogEvt }).__themeLogEvt;
+  if (logEvt) {
+    logEvt('applyTheme', {
+      input: theme,
+      resolved,
+      priorDataTheme: document.documentElement.getAttribute('data-theme'),
+      mqLight: window.matchMedia('(prefers-color-scheme: light)').matches,
+    });
+  }
   localStorage.setItem('lucidos-theme', theme);
   document.documentElement.setAttribute('data-theme', resolved);
+  document.documentElement.style.setProperty('--bg-primary', bg);
+  // Mirrors the inline FOUC IIFE in index.html — keeps <html> covered on
+  // toggle and on the next cold reload, before global.css re-applies its
+  // `html { background: var(--bg-primary); }` rule.
+  document.documentElement.style.background = bg;
 
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) {
-    meta.setAttribute('content', resolved === 'light' ? '#ffffff' : '#0d1117');
+    meta.setAttribute('content', bg);
   }
 
   document.documentElement.style.colorScheme = resolved;
 
-  // Listen for system theme changes when in system mode
-  if (systemThemeQuery) {
-    systemThemeQuery.removeEventListener('change', onSystemThemeChange);
-    systemThemeQuery = null;
-  }
-  if (theme === 'system') {
-    systemThemeQuery = window.matchMedia('(prefers-color-scheme: light)');
-    systemThemeQuery.addEventListener('change', onSystemThemeChange);
-  }
-}
-
-function onSystemThemeChange(): void {
-  applyTheme('system');
+  lastAppliedTheme = theme;
 }
 
 export function currentTheme(): Theme {
   // localStorage fallback matches the FOUC prevention script in index.html.
   // Covers: backend missing the preference (device_id change, save failure),
   // and the loading window before the API responds.
-  return currentPreference('theme', ['light', 'dark', 'system'], 'dark', undefined, 'lucidos-theme');
+  return currentPreference('theme', ['light', 'dark', 'system'], 'dark', 'lucidos-theme');
 }
 
 export function setTheme(theme: Theme): Promise<void> {
@@ -155,6 +167,7 @@ function ensureFontLoaded(font: FontFamily): void {
 
 export function applyFontFamily(font: FontFamily): void {
   ensureFontLoaded(font);
+  localStorage.setItem('lucidos-font-family', font);
   const value = FONT_FAMILY_VALUES[font] || FONT_FAMILY_VALUES.monospace;
   document.documentElement.style.setProperty('--font-ui', value);
 }
@@ -170,7 +183,7 @@ export function setFontFamily(font: FontFamily): Promise<void> {
 // --- Image model ---
 
 export function currentImageModel(): ImageModel {
-  return currentPreference('image_model', ['auto', 'imagen-4', 'gpt-image-1'], 'auto');
+  return currentPreference('image_model', ['auto', 'imagen-4', 'gpt-image-1', 'gpt-image-1.5', 'gpt-image-2'], 'auto');
 }
 
 export function setImageModel(model: ImageModel): Promise<void> {
@@ -180,7 +193,7 @@ export function setImageModel(model: ImageModel): Promise<void> {
 // --- Notifications filter ---
 
 export function currentNotificationsFilter(): 'all' | 'unread' {
-  return currentPreference('notifications_filter', ['all', 'unread'], 'all', undefined, 'lucidos-notifications-filter');
+  return currentPreference('notifications_filter', ['all', 'unread'], 'all', 'lucidos-notifications-filter');
 }
 
 // --- Chat model & reasoning effort ---
@@ -214,12 +227,20 @@ export function setReasoningEffort(effort: string): Promise<void> {
 // --- Load all preferences ---
 
 export async function loadPreferences(): Promise<void> {
-  preferences.value = { status: 'loading' };
+  // Only flip to 'loading' on the first fetch — refetches (e.g. after an SSE
+  // PreferencesChanged) keep showing existing data through the network round
+  // trip and swap atomically when the response lands. Without this guard,
+  // every preference toggle wipes subscribers to defaults until the GET
+  // completes, which the user sees as a flash.
+  if (preferences.value.status === 'not-loaded') {
+    preferences.value = { status: 'loading' };
+  }
   try {
     const res = await getPreferences(getDeviceId());
     preferences.value = { status: 'loaded', data: res.preferences };
     applyUiScale(currentUiScale());
-    applyTheme(currentTheme());
+    const t = currentTheme();
+    if (t !== lastAppliedTheme) applyTheme(t);
     applyFontFamily(currentFontFamily());
     currentModel.value = currentChatModel();
     reasoningEffort.value = clampReasoningEffort(currentChatReasoningEffort(), currentModel.value);

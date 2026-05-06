@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, ensureOnThreadPane, countVisibleThreadRows, userMessageBody } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, ensureOnThreadPane, countVisibleThreadRows, userMessageBody, REAL_THREAD_ROW } from './helpers';
 
 test.describe('Thread management', () => {
   test.beforeEach(async ({ page }) => {
@@ -29,9 +29,10 @@ test.describe('Thread management', () => {
     const count = await countVisibleThreadRows(page);
     expect(count).toBeGreaterThanOrEqual(2);
 
-    // Click each visible thread to find the one with our first message
+    // Click each visible REAL thread (skip compose-draft rows) to find the
+    // one with our first message
     let foundFirst = false;
-    const visibleRows = page.locator('.thread-row:visible');
+    const visibleRows = page.locator(`${REAL_THREAD_ROW}:visible`);
     const visibleCount = await visibleRows.count();
     for (let i = 0; i < visibleCount; i++) {
       await openThreadDrawer(page);
@@ -64,9 +65,9 @@ test.describe('Thread management', () => {
     // Navigate away
     await newThread(page);
 
-    // Open drawer and click on the most recent thread
+    // Open drawer and click on the most recent REAL thread (skip drafts)
     await openThreadDrawer(page);
-    await page.locator('.thread-row:visible').first().click();
+    await page.locator(`${REAL_THREAD_ROW}:visible`).first().click();
     await ensureOnThreadPane(page);
 
     // Verify the thread content is still there

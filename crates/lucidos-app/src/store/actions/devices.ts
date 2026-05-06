@@ -1,6 +1,6 @@
 import { signal } from '@preact/signals';
 import type { Loadable } from '../types';
-import { toFailed } from '../types';
+import { toFailed, setLoadingIfFresh } from '../types';
 import type { DeviceInfo } from '../../api/types';
 import { registerDevice as apiRegisterDevice, listDevices as apiListDevices, renameDevice as apiRenameDevice, setDevicePush as apiSetDevicePush, deleteDevice as apiDeleteDevice, setPreference } from '../../api/client';
 import { showToast, showConfirm } from '../store';
@@ -10,7 +10,8 @@ const DEVICE_ID_KEY = 'lucidos-device-id';
 
 export const devices = signal<Loadable<DeviceInfo[]>>({ status: 'not-loaded' });
 
-/** Get or create the device ID for this browser */
+/** Get or create the device ID for this browser. Used as the `device_id` query
+ *  param on per-device API calls (preferences, push subscriptions, etc.). */
 export function getDeviceId(): string {
   let id = localStorage.getItem(DEVICE_ID_KEY);
   if (!id) {
@@ -26,13 +27,17 @@ export async function registerCurrentDevice(): Promise<void> {
   try {
     await apiRegisterDevice(deviceId, navigator.userAgent);
   } catch (e) {
-    console.error('[Devices] Failed to register device:', e);
+    // Startup probe — runs on every page load. A toast on every transient
+    // backend hiccup would be too noisy; the device retries on next reload,
+    // and user-facing features that need a registered device (push, per-device
+    // prefs) surface their own toasts when they fail.
+    console.warn('[Devices] Failed to register device:', e);
   }
 }
 
 /** Load all devices from the backend */
 export async function loadDevices(): Promise<void> {
-  devices.value = { status: 'loading' };
+  setLoadingIfFresh(devices);
   try {
     const res = await apiListDevices();
     devices.value = { status: 'loaded', data: res.devices };

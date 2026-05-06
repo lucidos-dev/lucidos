@@ -100,6 +100,9 @@ impl PgVectorIndex {
             .await?;
 
         // Create memory entries table
+        // `extractor_version` is also added by a migration (idempotent ALTER) for
+        // upgrades; including it here covers fresh installs where init_schema
+        // creates the table from scratch.
         sqlx::query(&format!(
             r#"
             CREATE TABLE IF NOT EXISTS memory_entries (
@@ -112,7 +115,8 @@ impl PgVectorIndex {
                 embedding vector({}) NOT NULL,
                 embedding_model TEXT NOT NULL,
                 src_created_at TIMESTAMPTZ NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL
+                created_at TIMESTAMPTZ NOT NULL,
+                extractor_version INTEGER NOT NULL DEFAULT 0
             )
             "#,
             VECTOR_DIM
@@ -222,6 +226,7 @@ impl PgVectorIndex {
         embedding: &[f32],
         embedding_model: &str,
         src_created_at: DateTime<Utc>,
+        extractor_version: i32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let source_json = serde_json::to_value(source)?;
         let entities_json = serde_json::to_value(entities)?;
@@ -231,8 +236,8 @@ impl PgVectorIndex {
         // Upsert: insert or update on conflict
         sqlx::query(
             r#"
-            INSERT INTO memory_entries (id, source, topic, summary, importance, entities, embedding, embedding_model, src_created_at, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10)
+            INSERT INTO memory_entries (id, source, topic, summary, importance, entities, embedding, embedding_model, src_created_at, created_at, extractor_version)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10, $11)
             ON CONFLICT (id) DO UPDATE SET
                 source = EXCLUDED.source,
                 topic = EXCLUDED.topic,
@@ -242,7 +247,8 @@ impl PgVectorIndex {
                 embedding = EXCLUDED.embedding,
                 embedding_model = EXCLUDED.embedding_model,
                 src_created_at = EXCLUDED.src_created_at,
-                created_at = EXCLUDED.created_at
+                created_at = EXCLUDED.created_at,
+                extractor_version = EXCLUDED.extractor_version
             "#,
         )
         .bind(id)
@@ -255,6 +261,7 @@ impl PgVectorIndex {
         .bind(embedding_model)
         .bind(src_created_at)
         .bind(created_at)
+        .bind(extractor_version)
         .execute(&self.pool)
         .await?;
 
@@ -424,33 +431,6 @@ impl PgVectorIndex {
         Ok(count.0 as usize)
     }
 
-    /// Check if index is empty
-    pub async fn is_empty(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.len().await? == 0)
-    }
-
-    /// Get an entry by ID
-    pub async fn get(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<MemoryEntry>, Box<dyn std::error::Error + Send + Sync>> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, source, topic, summary, importance, entities, src_created_at, created_at
-            FROM memory_entries
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(ref r) => Ok(Some(row_to_memory_entry(r)?)),
-            None => Ok(None),
-        }
-    }
-
     /// Delete an entry
     pub async fn delete(&self, id: Uuid) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let result = sqlx::query("DELETE FROM memory_entries WHERE id = $1")
@@ -492,8 +472,7 @@ impl PgVectorIndex {
             .iter()
             .map(|row| {
                 let entities_json: serde_json::Value = row.try_get("entities")?;
-                let entities: Vec<String> =
-                    serde_json::from_value(entities_json).unwrap_or_default();
+                let entities: Vec<String> = serde_json::from_value(entities_json)?;
                 Ok(SimilarEntry {
                     id: row.try_get("id")?,
                     topic: row.try_get("topic")?,
@@ -530,26 +509,19 @@ impl PgVectorIndex {
         Ok(result.rows_affected() as usize)
     }
 
-    /// Get all entries (for debugging/export)
-    pub async fn all_entries(
+    /// Delete entries whose extractor_version is below `min_version`.
+    /// Returns the number of rows deleted. After this, `sources_indexed`
+    /// will report the affected sources as un-indexed, so the normal
+    /// incremental rebuild loop re-extracts them with the current extractor.
+    pub async fn delete_below_extractor_version(
         &self,
-    ) -> Result<Vec<MemoryEntry>, Box<dyn std::error::Error + Send + Sync>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, source, topic, summary, importance, entities, src_created_at, created_at
-            FROM memory_entries
-            ORDER BY src_created_at DESC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let entries = rows
-            .iter()
-            .map(|row| row_to_memory_entry(row))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(entries)
+        min_version: i32,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let result = sqlx::query("DELETE FROM memory_entries WHERE extractor_version < $1")
+            .bind(min_version)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     /// Batch-check which sources are already indexed in memory_entries.
@@ -780,4 +752,93 @@ fn row_to_memory_entry(
         src_created_at,
         created_at,
     })
+}
+
+#[cfg(test)]
+mod extractor_version_tests {
+    use super::*;
+    use crate::test_support::{setup_test_db, teardown_test_db};
+
+    /// `index_entry` must persist whatever extractor_version it was given —
+    /// otherwise the stale-detection query in `count_stale_extractor` is
+    /// looking at a column that always reads 0.
+    #[tokio::test]
+    async fn index_entry_persists_extractor_version() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+
+        let id = Uuid::new_v4();
+        index
+            .index_entry(
+                id,
+                &MemorySource::Event { id: Uuid::new_v4() },
+                "topic",
+                "summary",
+                0.5,
+                &[],
+                &vec![0.1f32; 384],
+                "model",
+                Utc::now(),
+                7,
+            )
+            .await
+            .unwrap();
+
+        let stored: i32 =
+            sqlx::query_scalar("SELECT extractor_version FROM memory_entries WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, 7);
+
+        teardown_test_db(&db_name).await;
+    }
+
+    /// `delete_below_extractor_version(N)` must drop rows with version < N
+    /// and leave rows with version >= N alone — that is the whole contract
+    /// the rebuild relies on for re_extract_stale.
+    #[tokio::test]
+    async fn delete_below_extractor_version_only_touches_old_rows() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+
+        let stale_id = Uuid::new_v4();
+        let current_id = Uuid::new_v4();
+        let future_id = Uuid::new_v4();
+
+        for (id, version) in [(stale_id, 0), (current_id, 1), (future_id, 2)] {
+            index
+                .index_entry(
+                    id,
+                    &MemorySource::Event { id: Uuid::new_v4() },
+                    "topic",
+                    "summary",
+                    0.5,
+                    &[],
+                    &vec![0.1f32; 384],
+                    "model",
+                    Utc::now(),
+                    version,
+                )
+                .await
+                .unwrap();
+        }
+
+        let deleted = index.delete_below_extractor_version(1).await.unwrap();
+        assert_eq!(deleted, 1, "only the stale row should be deleted");
+
+        let remaining: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM memory_entries ORDER BY extractor_version")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec![current_id, future_id]);
+
+        // Re-running the same delete is a no-op now that no rows are below 1.
+        let deleted_again = index.delete_below_extractor_version(1).await.unwrap();
+        assert_eq!(deleted_again, 0);
+
+        teardown_test_db(&db_name).await;
+    }
 }

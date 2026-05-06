@@ -6,9 +6,22 @@ pub mod types;
 use crate::core::EventRow;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-pub use threads::{LegacyInitiator, ThreadInfo, ThreadSearchResult};
+pub use threads::{
+    fetch_thread_aggregate, LegacyInitiator, ThreadAggregate, ThreadInfo, ThreadSearchResult,
+};
 pub use types::*;
 use uuid::Uuid;
+
+/// Escape SQL LIKE / ILIKE metacharacters so user-typed `\` `%` `_` match
+/// literally. Backslash is escaped first because it's the ESCAPE character
+/// — escaping it later would double-escape the inserted backslashes from
+/// `%` / `_`. Pair with `LIKE/ILIKE ... ESCAPE '\'` (or rely on the default
+/// backslash escape if no ESCAPE clause is present).
+pub fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
 
 /// Generate a human-readable description for a tool call event.
 /// Prefers the stored `description` field (new events); falls back to computing it (old events).
@@ -32,6 +45,25 @@ pub(super) fn describe_tool_event(event: &EventRow) -> (String, String) {
             super::describe_tool(&tool_name, args)
         });
     (tool_name, description)
+}
+
+/// Outcome of [`EventStore::query_events_paged`]. Kept separate from
+/// `sqlx::Error` so the HTTP layer can map a missing cursor to a 404 without
+/// string-matching error messages.
+#[derive(Debug)]
+pub enum QueryEventsResult {
+    Events(Vec<EventRow>),
+    CursorNotFound,
+}
+
+/// Internal three-way result of resolving an optional cursor uuid.
+enum CursorResolution {
+    /// Caller didn't pass a cursor.
+    None,
+    /// Cursor exists; carries the `(created, id)` tuple used in WHERE clauses.
+    Found((DateTime<Utc>, Uuid)),
+    /// Cursor uuid was passed but doesn't resolve to any event.
+    Missing,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
@@ -137,7 +169,9 @@ impl EventStore {
     }
 
     /// Query events by type with optional time filter and limit.
-    /// Used by App UIs to fetch domain events (e.g. GoogleDocEdited).
+    /// Used by App UIs and the LLM `query_events` tool to fetch domain events
+    /// (e.g. GoogleDocEdited). Newest-first; rows sharing one timestamp tie-
+    /// break on `id DESC` so the order is deterministic across calls.
     pub async fn query_events(
         &self,
         event_type: Option<&str>,
@@ -145,20 +179,86 @@ impl EventStore {
         until: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<EventRow>, sqlx::Error> {
-        let events = sqlx::query_as::<_, EventRow>(
+        self.fetch_events(event_type, since, until, None, None, limit)
+            .await
+    }
+
+    /// Cursor-paged variant of [`Self::query_events`]. Pass `before_event_id`
+    /// to walk backward (strictly older than the cursor under
+    /// `(created, id)` lexicographic order) or `after_event_id` to
+    /// tail-follow. The HTTP layer rejects "both set" with 400; this method
+    /// AND's them together if both are passed. If a supplied cursor uuid
+    /// doesn't exist, returns [`QueryEventsResult::CursorNotFound`] instead
+    /// of silently returning the unfiltered history.
+    pub async fn query_events_paged(
+        &self,
+        event_type: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        before_event_id: Option<Uuid>,
+        after_event_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<QueryEventsResult, sqlx::Error> {
+        let before_cursor = match self.resolve_cursor(before_event_id).await? {
+            CursorResolution::None => None,
+            CursorResolution::Found(c) => Some(c),
+            CursorResolution::Missing => return Ok(QueryEventsResult::CursorNotFound),
+        };
+        let after_cursor = match self.resolve_cursor(after_event_id).await? {
+            CursorResolution::None => None,
+            CursorResolution::Found(c) => Some(c),
+            CursorResolution::Missing => return Ok(QueryEventsResult::CursorNotFound),
+        };
+        let events = self
+            .fetch_events(event_type, since, until, before_cursor, after_cursor, limit)
+            .await?;
+        Ok(QueryEventsResult::Events(events))
+    }
+
+    /// Project `get_event_by_id` to the `(created, id)` cursor tuple, with a
+    /// three-way result so the paged caller can distinguish "no cursor asked
+    /// for" from "cursor asked for but missing".
+    async fn resolve_cursor(
+        &self,
+        id: Option<Uuid>,
+    ) -> Result<CursorResolution, sqlx::Error> {
+        match id {
+            None => Ok(CursorResolution::None),
+            Some(id) => Ok(match self.get_event_by_id(id).await? {
+                Some(row) => CursorResolution::Found((row.created, row.id)),
+                None => CursorResolution::Missing,
+            }),
+        }
+    }
+
+    async fn fetch_events(
+        &self,
+        event_type: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        before_cursor: Option<(DateTime<Utc>, Uuid)>,
+        after_cursor: Option<(DateTime<Utc>, Uuid)>,
+        limit: i64,
+    ) -> Result<Vec<EventRow>, sqlx::Error> {
+        sqlx::query_as::<_, EventRow>(
             "SELECT id, event_type, payload, created, thread_id, sequence FROM events \
              WHERE ($1::text IS NULL OR event_type = $1) \
              AND ($2::timestamptz IS NULL OR created > $2) \
              AND ($3::timestamptz IS NULL OR created < $3) \
-             ORDER BY created DESC LIMIT $4",
+             AND ($5::timestamptz IS NULL OR created < $5 OR (created = $5 AND id < $6)) \
+             AND ($7::timestamptz IS NULL OR created > $7 OR (created = $7 AND id > $8)) \
+             ORDER BY created DESC, id DESC LIMIT $4",
         )
         .bind(event_type)
         .bind(since)
         .bind(until)
         .bind(limit)
+        .bind(before_cursor.map(|(c, _)| c))
+        .bind(before_cursor.map(|(_, i)| i))
+        .bind(after_cursor.map(|(c, _)| c))
+        .bind(after_cursor.map(|(_, i)| i))
         .fetch_all(&self.pool)
-        .await?;
-        Ok(events)
+        .await
     }
 
     /// Return all distinct event_type values, ordered alphabetically.
@@ -239,3 +339,7 @@ impl EventStore {
         .await
     }
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod mod_tests;

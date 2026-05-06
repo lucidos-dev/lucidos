@@ -1,4 +1,4 @@
-use super::lifecycle::TerminalKind;
+use super::lifecycle::{cancel_terminal_kind, TerminalKind};
 use crate::engine::git_ops::has_branch_commits;
 use crate::engine::thread_events::{EventChannel, MessageOrigin, SessionEndReason};
 use crate::engine::worktree_cleanup::is_worktree_dirty;
@@ -81,6 +81,42 @@ impl LucidosEngine {
         }
     }
 
+    /// Stamp `actor: System` on `meta` when an aborted-by-host-system terminal
+    /// fires (safety-net, shutdown cancel) and no actor has been set already.
+    /// Lets the AbortPanel render '⚙ System' for process-killed aborts —
+    /// distinct from engine-deliberate work like hardening retrigger.
+    pub(super) fn stamp_system_actor_if_aborted(
+        meta: &mut crate::engine::thread_events::EventMeta,
+        is_aborted: bool,
+    ) {
+        if is_aborted && meta.actor.is_none() {
+            meta.actor = Some(crate::engine::thread_events::MessageOrigin::system());
+        }
+    }
+
+    /// True iff an engine-internal path already pre-emitted the boundary
+    /// `ResponseAborted` for this session — `run_session`'s terminal arms
+    /// (Result classify, cancel, chat_cancel, safety net) skip their own emit
+    /// when set, so the user sees one panel instead of two. Set by
+    /// `abort_in_flight_for_restart` (`/api/restart`) and
+    /// `emit_stuck_thread_eviction_abort` (`register_thread_queued` 60s
+    /// timeout).
+    pub(super) fn external_terminal_already_emitted(
+        flag: &std::sync::atomic::AtomicBool,
+        thread_id: Uuid,
+        site: &'static str,
+    ) -> bool {
+        let skip = flag.load(std::sync::atomic::Ordering::Acquire);
+        if skip {
+            crate::log!(
+                "[ClaudeCode] Skipping terminal emit ({}) for thread {} — external pre-emit already landed",
+                site,
+                thread_id
+            );
+        }
+        skip
+    }
+
     /// Build the terminal event for a CC turn from its classified kind.
     pub(super) fn make_terminal_event(
         kind: TerminalKind,
@@ -111,7 +147,83 @@ impl LucidosEngine {
                 model,
                 reasoning_effort,
             },
+            // ResponseFailed has no text/model fields — the partial response is
+            // already in the timeline as CodingAgentTextStreamed events. The
+            // error string is what the frontend renders next to the red dot.
+            TerminalKind::Failed { error } => {
+                crate::engine::thread_events::ThreadEvent::ResponseFailed { error }
+            }
         }
+    }
+
+    /// Run the cancel-arm body shared by both `cancel.notified()` and
+    /// `chat_cancel.cancelled()` in `run_session`. Kills the CC subprocess,
+    /// flushes any unpersisted text, then emits the terminal event chosen by
+    /// `cancel_terminal_kind` (deduping against the restart pre-emit when
+    /// emitting Aborted, stamping `actor: System` when appropriate). `arm`
+    /// is a stable label ("cancel" / "chat_cancel") used in log lines and the
+    /// dedup site so traces stay distinguishable across the two select arms.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn emit_cancel_terminal(
+        &self,
+        arm: &'static str,
+        thread_id: Uuid,
+        is_waiting: bool,
+        is_shutdown: bool,
+        agent_cancel: &tokio_util::sync::CancellationToken,
+        claude_text_buf: &str,
+        last_text_persisted_len: usize,
+        meta: &crate::engine::thread_events::EventMeta,
+        external_terminal_emitted: &std::sync::atomic::AtomicBool,
+        normalized_model: &Option<String>,
+        cc_reasoning_effort: &Option<String>,
+    ) {
+        Self::kill_cc_and_flush(
+            agent_cancel,
+            claude_text_buf,
+            last_text_persisted_len,
+            &self.event_bus,
+            thread_id,
+            meta,
+        )
+        .await;
+        let Some(kind) = cancel_terminal_kind(is_shutdown, is_waiting) else {
+            crate::log!(
+                "[ClaudeCode] {} arm: session {} was idle, skipping terminal event",
+                arm,
+                thread_id
+            );
+            return;
+        };
+        let is_aborted = kind == TerminalKind::Aborted;
+        // Dedup BOTH Aborted and Canceled — eviction-path pre-emits set the
+        // flag with actor=System, so a follow-up Canceled here would mask the
+        // engine-initiated abort as a user cancel.
+        if Self::external_terminal_already_emitted(external_terminal_emitted, thread_id, arm) {
+            return;
+        }
+        let terminal_event = Self::make_terminal_event(
+            kind,
+            claude_text_buf.to_string(),
+            normalized_model.clone(),
+            cc_reasoning_effort.clone(),
+        );
+        // Aborted-during-shutdown means the host system killed the process;
+        // stamp `actor: System` so the AbortPanel reads ⚙ System. User-driven
+        // Canceled inherits the existing meta.
+        let mut emit_meta = meta.clone();
+        Self::stamp_system_actor_if_aborted(&mut emit_meta, is_aborted);
+        let log_label = format!("[ClaudeCode] terminal event ({})", arm);
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event: terminal_event,
+                    meta: emit_meta,
+                },
+                &log_label,
+            )
+            .await;
     }
 
     /// Emit a `CodingAgentPromptSent` event for automated CC sessions (hardening,
@@ -219,6 +331,47 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `stamp_system_actor_if_aborted` stamps `MessageOrigin::System` (NOT
+    /// `Engine{OrphanRecovery}`) on aborted terminals — the host system killed
+    /// the process; the engine just emits the marker. Engine actor stays for
+    /// engine-deliberate work like hardening retrigger or scheduler.
+    #[test]
+    fn stamp_system_actor_stamps_system_when_aborted_and_no_actor() {
+        use crate::engine::thread_events::{EventMeta, MessageOrigin};
+        let mut meta = EventMeta::NONE;
+        LucidosEngine::stamp_system_actor_if_aborted(&mut meta, true);
+        assert!(matches!(meta.actor, Some(MessageOrigin::System)));
+    }
+
+    /// Non-aborted terminals (Generated, Canceled) carry the inbound meta
+    /// untouched — Generated is a normal turn end, Canceled is user-driven.
+    /// Stamping system on those would mis-attribute the AbortPanel.
+    #[test]
+    fn stamp_system_actor_no_op_when_not_aborted() {
+        use crate::engine::thread_events::EventMeta;
+        let mut meta = EventMeta::NONE;
+        LucidosEngine::stamp_system_actor_if_aborted(&mut meta, false);
+        assert!(meta.actor.is_none());
+    }
+
+    /// If a more specific actor is already set (e.g. device for /api/restart
+    /// pre-emit), don't overwrite it. The pre-emit's device attribution must
+    /// survive so the AbortPanel reads "You — Restarted" not "System".
+    #[test]
+    fn stamp_system_actor_does_not_overwrite_existing() {
+        use crate::engine::thread_events::{EventMeta, MessageOrigin};
+        let device = MessageOrigin::Device {
+            device_id: "d-1".into(),
+            label: "iOS Safari PWA".into(),
+        };
+        let mut meta = EventMeta {
+            actor: Some(device.clone()),
+            ..EventMeta::NONE
+        };
+        LucidosEngine::stamp_system_actor_if_aborted(&mut meta, true);
+        assert_eq!(meta.actor, Some(device));
+    }
 
     #[test]
     fn terminal_event_matches_kind() {

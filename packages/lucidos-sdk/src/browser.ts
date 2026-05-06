@@ -1,9 +1,12 @@
 // IIFE bundle entry — adds iframe-only side effects to keep `index.ts` ES-import-safe for the frontend.
 import { lucidos } from './index';
+import { installScrollMemory } from './scroll';
 
 export * from './index';
 
 if (typeof document !== 'undefined') {
+  installScrollMemory();
+
   document.addEventListener('click', (e: MouseEvent) => {
     const target = e.target as Element | null;
     const anchor = target?.closest?.('a[href]') as HTMLAnchorElement | null;

@@ -21,7 +21,9 @@ test.describe('Prompt textarea resize', () => {
     }, longText);
 
     // Wait for Preact to flush hasText so the layout has reached its final form.
-    await expect(page.locator('button[aria-label="Send message"]:not(.invisible)').first())
+    // Both desktop and mobile layout copies render simultaneously and each carries
+    // its own Send button — `:visible` picks the one in the active layout.
+    await expect(page.locator('button[aria-label="Send message"]:visible:not(.invisible)').first())
       .toBeVisible({ timeout: 2_000 });
 
     const dims = await input.evaluate((el: HTMLTextAreaElement) => ({

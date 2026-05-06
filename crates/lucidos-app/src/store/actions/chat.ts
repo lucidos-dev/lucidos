@@ -16,19 +16,20 @@ import {
   ccPendingModel,
   ccPendingReasoningEffort,
   parseRepoPath,
+  cancelingThreadIds,
+  setFocusedThread,
 } from '../store';
-import { promoteDraftToThread } from './drafts';
-import { toFailed } from '../types';
+import { toFailed, setLoadingIfFresh } from '../types';
 import type { ChatRequestBody } from '../../api/types';
-import { API_BASE, submitChat, cancelChat, cancelClaudeCode, interruptClaudeCode } from '../../api/client';
+import { API_BASE, submitChat, cancelChat, cancelClaudeCode } from '../../api/client';
 import { getDisconnectedMsg } from './connection';
 import { getDeviceId } from './devices';
-import { handleEvent, type ThreadState, type StoredEvent } from '../thread-events';
+import { handleEvent, makeOptimisticThreadState, type StoredEvent } from '../thread-events';
+import { pushThreadNavState } from './thread-navigation';
 import { scrollToBottom } from '../../components/chat/scrollState';
 import { refreshThreadEvents } from './thread-loading';
 import { isTauri } from '../../utils/platform';
 import { getWebviewContent } from '../../utils/tauri';
-import { FOCUSED_THREAD_KEY } from '../../utils/draftStorage';
 import { errorDetail } from '../../utils/errorDetail';
 
 /** Safety timeout (ms) for pending messages. If SSE doesn't deliver the
@@ -122,7 +123,7 @@ function addPendingMessage(
 
 /** Load registered repositories from the backend. */
 export async function loadRepositories(): Promise<void> {
-  repositories.value = { status: 'loading' };
+  setLoadingIfFresh(repositories);
   try {
     const res = await fetch(`${API_BASE}/api/repositories`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -178,33 +179,28 @@ function getActiveContext(): {
 /**
  * Send a chat message. Side effects (modals, refreshes) are handled by
  * thread-sync.ts via ThreadEvent SSE events — no listener registry needed.
- *
- * `composeDraftId` is set when sending from a fresh compose draft so the
- * caller's unsent draft entry can be cleaned up once the new thread takes
- * over its identity.
  */
 export async function sendMessage(
   message: string,
   images?: Array<{ base64: string; mimeType: string }>,
-  options?: { useClaudeCode?: boolean; composeDraftId?: string },
+  options?: { useClaudeCode?: boolean },
 ): Promise<void> {
   threadsLoaded.value = true;
   const eventId = crypto.randomUUID();
+  const isNewThread = focusedThreadId.value === null;
   const threadId = focusedThreadId.value || eventId;
 
   // Check connection — show error in thread context, not just a toast
   if (!isConnected.value) {
     const map = threadMap.value;
     if (!map.has(threadId)) {
-      map.set(threadId, {
-        meta: { id: threadId, title: message.slice(0, 40), channel: 'chat', initiator: 'user', pinned: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), unread: false, status: 'running', messageCount: 0, section: 'default', activeChildrenCount: 0, totalChildrenCount: 0, ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: new Date().toISOString() },
-        events: new Map(),
-        streamingBuffer: '',
+      map.set(threadId, makeOptimisticThreadState({
+        id: threadId,
+        title: message.slice(0, 40),
+        channel: 'chat',
+        initiator: 'user',
         eventsLoaded: true,
-        eventsLoadFailed: false,
-        lastDbSeq: 0,
-        pendingUserMessages: [],
-      });
+      }));
     }
     // failedSeq must be > messageSeq so ResponseFailed groups under the user's exchange.
     const messageSeq = -Date.now() - 1;
@@ -218,53 +214,26 @@ export async function sendMessage(
       type: 'ResponseFailed',
       error: getDisconnectedMsg(),
     } as StoredEvent, now);
-    focusedThreadId.value = threadId;
-    localStorage.setItem(FOCUSED_THREAD_KEY, threadId);
+    setFocusedThread(threadId);
+    if (isNewThread) pushThreadNavState({ type: 'thread', id: threadId });
     threadMap.value = new Map(map);
     return;
   }
 
   // Update event-driven store
-  focusedThreadId.value = threadId;
-  localStorage.setItem(FOCUSED_THREAD_KEY, threadId);
-
-  // Clean up the originating compose draft so the next Compose starts blank.
-  if (options?.composeDraftId && options.composeDraftId !== threadId) {
-    promoteDraftToThread(options.composeDraftId);
-  }
+  setFocusedThread(threadId);
+  if (isNewThread) pushThreadNavState({ type: 'thread', id: threadId });
 
   // Set optimistic pending message
   const map = threadMap.value;
   if (!map.has(threadId)) {
-    const newThread: ThreadState = {
-      meta: {
-        id: threadId,
-        title: message.slice(0, 40),
-        channel: options?.useClaudeCode ? 'claude_code' : 'chat',
-        initiator: 'user',
-        pinned: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        unread: false,
-        status: 'running',
-        messageCount: 0,
-        section: 'default',
-        activeChildrenCount: 0,
-        totalChildrenCount: 0,
-        ccHasChanges: false,
-        ccRequiresRestart: false,
-        ccIsExternalRepo: false,
-        ccApplying: false,
-        lastRevivedAt: new Date().toISOString(),
-      },
-      events: new Map(),
-      streamingBuffer: '',
+    map.set(threadId, makeOptimisticThreadState({
+      id: threadId,
+      title: message.slice(0, 40),
+      channel: options?.useClaudeCode ? 'claude_code' : 'chat',
+      initiator: 'user',
       eventsLoaded: true,
-      eventsLoadFailed: false,
-      lastDbSeq: 0,
-      pendingUserMessages: [],
-    };
-    map.set(threadId, newThread);
+    }));
   }
   addPendingMessage(threadId, message, eventId, images);
 
@@ -284,11 +253,27 @@ export async function sendMessage(
   if (ctx?.repo_file_context) body.repo_file_context = ctx.repo_file_context;
   if (images?.length) body.images = images.map(img => ({ base64: img.base64, mime_type: img.mimeType }));
 
-  // Inherit CC mode from existing thread or explicit option
+  // A thread is locked to its (mode, repo) at first message. Existing thread
+  // wins over `options?.useClaudeCode`, and its bound `meta.repoId` wins over
+  // the global compose-view signal — switching either mid-thread caused the
+  // executor card and commands menu to disagree (different repo's skills,
+  // sessions on different repos, branch can't follow). Backend 409s as a
+  // backstop in `validate_thread_continuity`.
   const existingThread = threadMap.value.get(threadId);
-  if (options?.useClaudeCode || existingThread?.meta.channel === 'claude_code') {
+  const isCcThread = existingThread
+    ? existingThread.meta.channel === 'claude_code'
+    : !!options?.useClaudeCode;
+  if (isCcThread) {
     body.use_claude_code = true;
-    if (selectedRepoId.value) {
+    if (existingThread) {
+      // Existing thread: trust the bound repo (undefined `meta.repoId` means
+      // the thread runs on the default Lucidos repo). Never fall back to the
+      // global `selectedRepoId` signal — it reflects whatever the user last
+      // picked in compose view, which is unrelated to this thread.
+      if (existingThread.meta.repoId) {
+        body.repo_id = existingThread.meta.repoId;
+      }
+    } else if (selectedRepoId.value) {
       body.repo_id = selectedRepoId.value;
     }
     // Apply pending CC preferences (set from compose view before session start).
@@ -305,32 +290,23 @@ export async function sendMessage(
     }
   }
 
-  // Include URL context when a page is open in the panel (CC doesn't use it)
+  // CC ignores url_context; only send for non-CC threads. Content extraction is
+  // tauri-only (browser can't read cross-origin iframes); fall back to URL+title.
   if (panelUrl.value && !body.use_claude_code) {
+    let extractedTitle: string | undefined;
+    let extractedContent = '';
     if (isTauri()) {
       try {
-        const { title, content } = await getWebviewContent();
-        body.url_context = {
-          url: panelUrl.value,
-          title: title || panelTitle.value || undefined,
-          content: content.trim() ? content : '',
-        };
-      } catch {
-        // Content extraction failed — still send the URL so the LLM knows what page is open
-        body.url_context = {
-          url: panelUrl.value,
-          title: panelTitle.value || undefined,
-          content: '',
-        };
-      }
-    } else {
-      // Browser mode: can't extract cross-origin iframe content, send URL only
-      body.url_context = {
-        url: panelUrl.value,
-        title: panelTitle.value || undefined,
-        content: '',
-      };
+        const res = await getWebviewContent();
+        extractedTitle = res.title || undefined;
+        extractedContent = res.content.trim() ? res.content : '';
+      } catch { /* fall through with URL+title only */ }
     }
+    body.url_context = {
+      url: panelUrl.value,
+      title: extractedTitle || panelTitle.value || undefined,
+      content: extractedContent,
+    };
   }
   try {
     await submitChat(body);
@@ -342,18 +318,20 @@ export async function sendMessage(
 }
 
 /**
- * Cancel the current processing exchange.
- * Fires the appropriate cancel API based on thread type.
+ * Cancel a thread's in-flight exchange. Routes to the chat or CC endpoint
+ * based on thread channel. Pinning the threadId at call time matters: the
+ * user can switch focus between clicking Cancel and the API resolving, and
+ * we must not cancel the wrong thread.
  * Returns false if the API call failed — caller resets optimistic UI.
  */
-export async function cancelCurrentExchange(): Promise<boolean> {
-  const threadId = focusedThreadId.value ?? undefined;
+export async function cancelCurrentExchange(threadId?: string): Promise<boolean> {
+  const tid = threadId ?? focusedThreadId.value ?? undefined;
   try {
-    const thread = threadId ? threadMap.value.get(threadId) : undefined;
+    const thread = tid ? threadMap.value.get(tid) : undefined;
     if (thread?.meta.channel === 'claude_code') {
-      await cancelClaudeCode(undefined, threadId);
+      await cancelClaudeCode(undefined, tid);
     } else {
-      await cancelChat(threadId);
+      await cancelChat(tid);
     }
     return true;
   } catch (err) {
@@ -363,17 +341,18 @@ export async function cancelCurrentExchange(): Promise<boolean> {
 }
 
 /**
- * Interrupt the current Claude Code exchange — stops the current work
- * but keeps the session alive (like pressing Esc in Claude Code terminal).
- * Returns false if the API call failed — caller resets optimistic UI.
+ * Set the optimistic "canceling" flag for a thread, fire the cancel API, and
+ * roll back the flag on failure. Cleared on success by PromptInput's
+ * status-transition effect once the thread leaves active status.
  */
-export async function interruptCurrentExchange(): Promise<boolean> {
-  const threadId = focusedThreadId.value ?? undefined;
-  try {
-    await interruptClaudeCode(threadId);
-    return true;
-  } catch (err) {
-    showToast(`Failed to interrupt: ${errorDetail(err)}`, 'error');
-    return false;
+export async function handleCancelExchange(threadId: string): Promise<void> {
+  const next = new Set(cancelingThreadIds.value);
+  next.add(threadId);
+  cancelingThreadIds.value = next;
+  const ok = await cancelCurrentExchange(threadId);
+  if (!ok) {
+    const rollback = new Set(cancelingThreadIds.value);
+    rollback.delete(threadId);
+    cancelingThreadIds.value = rollback;
   }
 }

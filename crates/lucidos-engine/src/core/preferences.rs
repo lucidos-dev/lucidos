@@ -17,6 +17,9 @@ pub const DEFAULT_CHAT_MODEL: &str = "claude-opus-4-7";
 // Vertex AI configuration
 pub const PREF_VERTEX_REGION: &str = "vertex_region";
 
+// Image generation model (also written by frontend Settings UI)
+pub const PREF_IMAGE_MODEL: &str = "image_model";
+
 /// Store for managing user preferences in the database
 pub struct PreferenceStore;
 

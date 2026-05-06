@@ -9,6 +9,9 @@ use uuid::Uuid;
 const FIX_INVOCATION_SQL: &str =
     include_str!("../migrations/20260420195145_fix_trigger_invocation_event_only_backfill.sql");
 
+const RENAME_TRIGGER_RUN_TEXT_TO_INTENT_SQL: &str =
+    include_str!("../migrations/20260429213500_rename_trigger_run_text_to_intent.sql");
+
 /// Which payload field naming a `TriggerStarted` row uses.
 #[derive(Clone, Copy)]
 enum StartedShape {
@@ -338,6 +341,198 @@ async fn fix_invocation_uses_latest_trigger_config_at_time_of_run() {
         invocation_of(&pool, started_under_event).await,
         json!({"kind": "Event", "event_type": "UserSignedUp"}),
         "run that happened after trigger became event-only must be Event",
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+async fn insert_event_with_payload(pool: &PgPool, event_type: &str, payload: Value) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO events (id, event_type, payload) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .expect("insert event");
+    id
+}
+
+async fn run_payload_of(pool: &PgPool, event_id: Uuid) -> Value {
+    sqlx::query_scalar::<_, Value>("SELECT payload->'run' FROM events WHERE id = $1")
+        .bind(event_id)
+        .fetch_one(pool)
+        .await
+        .expect("read run payload")
+}
+
+#[tokio::test]
+async fn rename_trigger_run_text_to_intent_rewrites_intent_variant() {
+    let (pool, db_name) = setup_test_db().await;
+
+    let created_id = insert_event_with_payload(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": "11111111-1111-1111-1111-111111111111",
+            "name": "Old-shape Created",
+            "schedule": ["0 0 8 * * *"],
+            "timezone": "Europe/Oslo",
+            "run": { "type": "intent", "text": "Notify me about X", "knowhow": ["domain"] },
+        }),
+    )
+    .await;
+    let updated_id = insert_event_with_payload(
+        &pool,
+        "TriggerUpdated",
+        json!({
+            "trigger_id": "11111111-1111-1111-1111-111111111111",
+            "run": { "type": "intent", "text": "Updated intent", "knowhow": [] },
+        }),
+    )
+    .await;
+
+    sqlx::raw_sql(RENAME_TRIGGER_RUN_TEXT_TO_INTENT_SQL)
+        .execute(&pool)
+        .await
+        .expect("run migration");
+
+    assert_eq!(
+        run_payload_of(&pool, created_id).await,
+        json!({ "type": "intent", "intent": "Notify me about X", "knowhow": ["domain"] }),
+        "TriggerCreated.run.text must move to run.intent",
+    );
+    assert_eq!(
+        run_payload_of(&pool, updated_id).await,
+        json!({ "type": "intent", "intent": "Updated intent", "knowhow": [] }),
+        "TriggerUpdated.run.text must move to run.intent",
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn rename_trigger_run_text_to_intent_leaves_other_shapes_alone() {
+    let (pool, db_name) = setup_test_db().await;
+
+    let script_id = insert_event_with_payload(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": "22222222-2222-2222-2222-222222222222",
+            "name": "Script trigger",
+            "run": { "type": "script", "path": "oura/run.py" },
+        }),
+    )
+    .await;
+    let already_new_id = insert_event_with_payload(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": "33333333-3333-3333-3333-333333333333",
+            "name": "Already migrated",
+            "run": { "type": "intent", "intent": "Already canonical", "knowhow": [] },
+        }),
+    )
+    .await;
+    let unrelated_id = insert_event_with_payload(
+        &pool,
+        "MessageReceived",
+        json!({ "text": "this is the chat text field, not a trigger run" }),
+    )
+    .await;
+
+    sqlx::raw_sql(RENAME_TRIGGER_RUN_TEXT_TO_INTENT_SQL)
+        .execute(&pool)
+        .await
+        .expect("run migration");
+
+    assert_eq!(
+        run_payload_of(&pool, script_id).await,
+        json!({ "type": "script", "path": "oura/run.py" }),
+        "script-variant runs must be untouched",
+    );
+    assert_eq!(
+        run_payload_of(&pool, already_new_id).await,
+        json!({ "type": "intent", "intent": "Already canonical", "knowhow": [] }),
+        "already-canonical runs must be untouched",
+    );
+    let chat_text: String =
+        sqlx::query_scalar("SELECT payload->>'text' FROM events WHERE id = $1")
+            .bind(unrelated_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read chat text");
+    assert_eq!(
+        chat_text, "this is the chat text field, not a trigger run",
+        "non-trigger event types' top-level `text` must be untouched",
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn rename_trigger_run_text_to_intent_strips_stale_text_when_both_keys_present() {
+    // Coexistence case: a row carrying both `text` (old) and `intent` (new) gets
+    // its stale `text` dropped without overwriting the canonical `intent` value.
+    let (pool, db_name) = setup_test_db().await;
+
+    let event_id = insert_event_with_payload(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": "55555555-5555-5555-5555-555555555555",
+            "name": "Both keys",
+            "run": {
+                "type": "intent",
+                "text": "STALE — must be stripped",
+                "intent": "Canonical — must be preserved",
+                "knowhow": [],
+            },
+        }),
+    )
+    .await;
+
+    sqlx::raw_sql(RENAME_TRIGGER_RUN_TEXT_TO_INTENT_SQL)
+        .execute(&pool)
+        .await
+        .expect("run migration");
+
+    assert_eq!(
+        run_payload_of(&pool, event_id).await,
+        json!({ "type": "intent", "intent": "Canonical — must be preserved", "knowhow": [] }),
+        "stale `text` must be stripped without clobbering existing `intent`",
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn rename_trigger_run_text_to_intent_is_idempotent() {
+    let (pool, db_name) = setup_test_db().await;
+
+    let event_id = insert_event_with_payload(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": "44444444-4444-4444-4444-444444444444",
+            "name": "Old shape",
+            "run": { "type": "intent", "text": "Original", "knowhow": [] },
+        }),
+    )
+    .await;
+
+    for _ in 0..3 {
+        sqlx::raw_sql(RENAME_TRIGGER_RUN_TEXT_TO_INTENT_SQL)
+            .execute(&pool)
+            .await
+            .expect("run migration");
+    }
+
+    assert_eq!(
+        run_payload_of(&pool, event_id).await,
+        json!({ "type": "intent", "intent": "Original", "knowhow": [] }),
+        "running the migration multiple times must converge to the same result",
     );
 
     teardown_test_db(&db_name).await;

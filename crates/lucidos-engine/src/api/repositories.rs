@@ -361,6 +361,7 @@ fn parse_diff_output(output: &str) -> Vec<DiffFile> {
         files.push(f);
     }
 
+    files.retain(|f| !crate::engine::claude_code::is_engine_injected_path(&f.path));
     files
 }
 
@@ -451,6 +452,170 @@ pub async fn get_change_diff(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let files = parse_diff_output(&stdout);
     Ok(Json(RepoDiff { files }))
+}
+
+#[derive(Serialize)]
+pub struct ThreadCcDiff {
+    pub files: Vec<DiffFile>,
+    pub repo_root: String,
+    pub branch_name: String,
+    pub base_ref: String,
+}
+
+/// GET /api/threads/:thread_id/cc-diff — 3-dot diff of the CC worktree's
+/// branch vs the repo's default remote branch. Used for external-repo CC
+/// sessions that never create a Lucidos `Change` row.
+///
+/// Falls back to the registered repo + branch ref when the recorded worktree
+/// is gone — pre-May-2026 `agent_recovery` removed worktrees for idle
+/// external-repo sessions without emitting `WorktreeCleaned`, so the
+/// historical state is `cc_has_changes=true` + branch alive + worktree dir
+/// missing.
+pub async fn get_thread_cc_diff(
+    State(state): State<AppState>,
+    axum::extract::Path(thread_id): axum::extract::Path<Uuid>,
+) -> Result<Json<ThreadCcDiff>, (StatusCode, String)> {
+    if let Some(worktree_path) =
+        crate::engine::agent_session::resume::lookup_latest_worktree_path(&state.pool, thread_id)
+            .await
+            .filter(|p| p.exists())
+    {
+        return diff_via_worktree(&worktree_path).await.map(Json);
+    }
+    diff_via_branch_ref(&state.pool, thread_id).await.map(Json)
+}
+
+async fn diff_via_worktree(
+    worktree_path: &std::path::Path,
+) -> Result<ThreadCcDiff, (StatusCode, String)> {
+    let (branch_opt, base_ref, repo_root_res) = tokio::join!(
+        crate::engine::git_ops::worktree_current_branch(worktree_path),
+        resolve_diff_base_ref(worktree_path),
+        resolve_worktree_repo_root(worktree_path),
+    );
+    let branch_name = branch_opt.ok_or((
+        StatusCode::BAD_REQUEST,
+        "Worktree has detached HEAD — cannot diff".into(),
+    ))?;
+    let repo_root = repo_root_res
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "git worktree list returned no main worktree entry".into(),
+        ))?;
+
+    let files = run_git_diff(worktree_path, &format!("{}...HEAD", base_ref)).await?;
+    Ok(ThreadCcDiff {
+        files,
+        repo_root,
+        branch_name,
+        base_ref,
+    })
+}
+
+async fn diff_via_branch_ref(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<ThreadCcDiff, (StatusCode, String)> {
+    let (repo_id_str, branch_name) =
+        crate::engine::agent_session::resume::lookup_latest_session_repo_and_branch(
+            pool, thread_id,
+        )
+        .await
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "No worktree on disk and no SessionStarted recorded for this thread".into(),
+        ))?;
+    if super::is_dangerous_git_ref(&branch_name) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
+    }
+    let repo_id = Uuid::parse_str(&repo_id_str).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SessionStarted.repo_id is not a UUID".into(),
+        )
+    })?;
+    let repo = RepositoryStore::get(pool, repo_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to look up repository: {e}"),
+            )
+        })?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Worktree gone and recorded repository no longer registered".into(),
+        ))?;
+
+    let repo_root = std::path::PathBuf::from(&repo.path);
+    let base_ref = resolve_diff_base_ref(&repo_root).await;
+    let files = run_git_diff(&repo_root, &format!("{}...{}", base_ref, branch_name)).await?;
+    Ok(ThreadCcDiff {
+        files,
+        repo_root: repo.path,
+        branch_name,
+        base_ref,
+    })
+}
+
+async fn run_git_diff(
+    cwd: &std::path::Path,
+    range: &str,
+) -> Result<Vec<DiffFile>, (StatusCode, String)> {
+    let output = crate::engine::git_ops::git_cmd(&["diff", range, "--no-color"], cwd)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !output.status.success() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    Ok(parse_diff_output(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Pick the ref to diff a CC branch against. Prefers `origin/HEAD`'s symbolic
+/// target (handles non-`main` defaults like `master`/`develop`); falls back to
+/// the local default branch.
+async fn resolve_diff_base_ref(worktree_path: &std::path::Path) -> String {
+    if let Ok(o) = crate::engine::git_ops::git_cmd(
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        worktree_path,
+    )
+    .await
+    {
+        if o.status.success() {
+            let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    crate::engine::git_ops::default_local_branch(worktree_path).await
+}
+
+/// Resolve the main worktree's working-tree root for a (possibly linked)
+/// worktree. `git worktree list --porcelain` always lists the main worktree
+/// first, so we read the first `worktree <path>` line.
+async fn resolve_worktree_repo_root(
+    worktree_path: &std::path::Path,
+) -> Result<Option<String>, String> {
+    let output =
+        crate::engine::git_ops::git_cmd(&["worktree", "list", "--porcelain"], worktree_path)
+            .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("worktree ").map(str::to_owned)))
 }
 
 #[derive(Deserialize)]
@@ -658,6 +823,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_diff_output_filters_engine_injected_paths() {
+        let input = concat!(
+            "diff --git a/.lucidos-workspace b/.lucidos-workspace\n",
+            "new file mode 100644\n",
+            "--- /dev/null\n",
+            "+++ b/.lucidos-workspace\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+/Users/me/workspaces/dev\n",
+            "+abc-uuid\n",
+            "diff --git a/.lucidos/bin/lucidos b/.lucidos/bin/lucidos\n",
+            "new file mode 120000\n",
+            "--- /dev/null\n",
+            "+++ b/.lucidos/bin/lucidos\n",
+            "@@ -0,0 +1 @@\n",
+            "+/usr/local/bin/lucidos\n",
+            "diff --git a/.claude/skills/lucidos-cli/SKILL.md b/.claude/skills/lucidos-cli/SKILL.md\n",
+            "new file mode 100644\n",
+            "--- /dev/null\n",
+            "+++ b/.claude/skills/lucidos-cli/SKILL.md\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+# lucidos-cli skill\n",
+            "+content\n",
+            "diff --git a/src/real.rs b/src/real.rs\n",
+            "--- a/src/real.rs\n",
+            "+++ b/src/real.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+        );
+        let files = parse_diff_output(input);
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["src/real.rs"],
+            "engine-injected paths must be filtered from parse_diff_output, got: {:?}",
+            paths
+        );
+    }
+
+    #[test]
     fn parse_binary_file_skipped() {
         // Binary files have no hunks — parser should produce a file with empty hunks
         let input = concat!(
@@ -785,5 +990,91 @@ mod tests {
         );
         assert_eq!(super::expand_tilde("/absolute/path"), "/absolute/path");
         assert_eq!(super::expand_tilde("relative"), "relative");
+    }
+
+    /// End-to-end of the worktree-diff helpers against a real git repo +
+    /// linked worktree on a feature branch with one extra commit. Asserts
+    /// the base ref resolves to a usable target and the diff range produces
+    /// the expected single-file change.
+    #[tokio::test]
+    async fn worktree_diff_helpers_against_real_repo() {
+        async fn run(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
+            tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .await
+                .unwrap()
+        }
+
+        let main_repo = tempfile::tempdir().unwrap();
+        let main_path = main_repo.path();
+
+        // `-c init.defaultBranch=main` makes the test pass on hosts where the
+        // user's git defaults differ (master vs main). Without it,
+        // `git init` creates `master` and our subsequent `worktree add ... main`
+        // fails with "invalid reference: main".
+        run(
+            &["-c", "init.defaultBranch=main", "init", "-q"],
+            main_path,
+        )
+        .await;
+        run(&["config", "user.email", "test@example.com"], main_path).await;
+        run(&["config", "user.name", "Test"], main_path).await;
+        tokio::fs::write(main_path.join("README.md"), "init\n")
+            .await
+            .unwrap();
+        run(&["add", "."], main_path).await;
+        run(&["commit", "-q", "-m", "init"], main_path).await;
+
+        // Linked worktree on a new branch, one extra commit.
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("wt");
+        run(
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/diff-helpers",
+                wt_path.to_str().unwrap(),
+                "main",
+            ],
+            main_path,
+        )
+        .await;
+        tokio::fs::write(wt_path.join("README.md"), "init\nadded line\n")
+            .await
+            .unwrap();
+        run(&["add", "."], &wt_path).await;
+        run(&["commit", "-q", "-m", "edit readme"], &wt_path).await;
+
+        // Base ref: no `origin` remote, so symbolic-ref fails — fallback chain
+        // must land on local `main`.
+        let base = super::resolve_diff_base_ref(&wt_path).await;
+        assert_eq!(
+            base, "main",
+            "expected fallback to local main when no origin remote is set, got {base}"
+        );
+
+        // Repo root: must point back at the main worktree, not the linked one.
+        let root = super::resolve_worktree_repo_root(&wt_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let canonical_main = main_path.canonicalize().unwrap();
+        let canonical_root = std::path::PathBuf::from(&root).canonicalize().unwrap();
+        assert_eq!(
+            canonical_root, canonical_main,
+            "repo root should be the main worktree: got {root}"
+        );
+
+        // 3-dot diff against the resolved base: exactly one modified file.
+        let range = format!("{}...HEAD", base);
+        let out = run(&["diff", &range, "--no-color"], &wt_path).await;
+        assert!(out.status.success(), "git diff failed: {:?}", out);
+        let files = super::parse_diff_output(&String::from_utf8_lossy(&out.stdout));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "README.md");
+        assert_eq!(files[0].status, "modified");
     }
 }

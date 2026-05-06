@@ -188,6 +188,8 @@
     background: var(--bg-tertiary);
     color: var(--text-secondary);
     font-size: 0.9em;
+    /* Engine emits multi-line prompts (numbered steps) — preserve newlines. */
+    white-space: pre-wrap;
 }
 
 .form-group {
@@ -220,6 +222,22 @@
 
 .form-group .dropdown {
     width: 100%;
+}
+
+.form-group label.form-checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    cursor: pointer;
+    margin-bottom: 0;
+}
+
+.form-group .form-checkbox-row input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+    cursor: pointer;
 }
 
 .form-group .dropdown-trigger {

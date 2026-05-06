@@ -1,5 +1,5 @@
 import { useRef } from 'preact/hooks';
-import { messageRoutePanel, closeMessageRoutePanel, triggers, threadMap, repositories, workspaceName } from '../../store/store';
+import { messageRoutePanel, closeMessageRoutePanel, triggers, threadMap, repositories } from '../../store/store';
 import { focusThread } from '../../store/actions/threads';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { loadRepositories } from '../../store/actions/chat';
@@ -10,6 +10,8 @@ import {
   exchangeReasoningEffort,
   displayModelName,
   displayReasoningEffort,
+  findPermissionResolution,
+  findQuestionAnswer,
   isChangeLifecycleEvent,
   legacyOrigin,
   PENDING_TITLE_PLACEHOLDER,
@@ -21,14 +23,40 @@ import {
 } from '../../store/thread-events';
 import { describeEngineReason } from '../../utils/engineEventExplainers';
 
-/** Exported for unit tests — see MessageRoutePanel.test.ts. */
-export function resolveOrigin(userEvent: StoredEvent): MessageOrigin | undefined {
+/** Exported for unit tests — see MessageRoutePanel.test.ts.
+ *
+ *  Takes the full Exchange so the divider-starter cases (UserQuestionAsked,
+ *  CodingAgentPermissionRequest) can walk the exchange's steps for the matching
+ *  resolution event and read the device actor from there. */
+export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
+  const userEvent = exchange.userEvent;
   if (userEvent.type === 'MessageReceived') return legacyOrigin(userEvent);
   if (isChangeLifecycleEvent(userEvent)) return userEvent.actor;
+  // Divider-starter ActionRequired events: the Origin is the device that
+  // *answered* the question / *resolved* the permission — pulled from the
+  // matching resolution step in this exchange. No answer yet → undefined and
+  // the popover degrades to the initiator row only.
+  if (userEvent.type === 'UserQuestionAsked') {
+    return findQuestionAnswer(exchange, userEvent.tool_use_id)?.actor;
+  }
+  if (userEvent.type === 'CodingAgentPermissionRequest') {
+    return findPermissionResolution(exchange, userEvent.request_id)?.actor;
+  }
+  // CredentialRequested / McpConsentRequested have no user-side answer event
+  // today — the initiator row carries the disclosure on its own.
+  if (userEvent.type === 'CredentialRequested' || userEvent.type === 'McpConsentRequested') {
+    return undefined;
+  }
   // Engine-emitted events (SessionRecovered, CodingAgentPromptSent, TriggerStarted, ChangeProposed)
   // carry origin directly — surface it so the popover can render the Engine variant.
   if ('origin' in userEvent && userEvent.origin) {
     return userEvent.origin as MessageOrigin;
+  }
+  // SessionRecovered triggered by the user clicking Continue stamps the device
+  // on `EventMeta.actor` (the chip reads it for the "You" label) but leaves
+  // `origin` empty — fall back so the popover matches the chip.
+  if ('actor' in userEvent && userEvent.actor) {
+    return userEvent.actor as MessageOrigin;
   }
   return undefined;
 }
@@ -85,8 +113,9 @@ export function executorExtras(
     if (event.type === 'SessionStarted') {
       if (event.branch) branch = event.branch;
       if (event.session_id) ccSessionId = event.session_id;
-      // repo_id may be unset for the workspace's own repo — don't fall back to a
-      // prior session's repo_id, since each SessionStarted snapshots its own bind.
+      // Each SessionStarted snapshots its own repo bind — don't fall back to a
+      // prior session's repo_id when the current SessionStarted lacks one
+      // (legacy events from before the engine always stamped repo_id).
       repoId = event.repo_id;
     } else if (event.type === 'SessionRecovered' && event.branch) {
       branch = event.branch;
@@ -119,7 +148,6 @@ export function MessageRoutePanel() {
 
   if (!state) return null;
   const { exchange, threadId, section, priorModel, priorEffort } = state;
-  const userEvent = exchange.userEvent;
   const thread = threadMap.value.get(threadId);
   if (!thread) return null;
 
@@ -132,7 +160,7 @@ export function MessageRoutePanel() {
       aria-label={section === 'origin' ? 'Initiator info' : 'Executor info'}
     >
       {section === 'origin'
-        ? renderOriginSection(userEvent, thread.meta.parentThreadTitle, getLiveThreadTitle)
+        ? renderOriginSection(exchange, thread.meta.parentThreadTitle, getLiveThreadTitle)
         : renderExecutorSection(exchange, thread.events, priorModel, priorEffort)}
     </div>
   );
@@ -143,10 +171,11 @@ function getLiveThreadTitle(threadId: string): string | undefined {
 }
 
 function renderOriginSection(
-  userEvent: StoredEvent,
+  exchange: Exchange,
   parentTitle: string | undefined,
   getLiveTitle: (threadId: string) => string | undefined,
 ) {
+  const userEvent = exchange.userEvent;
   // TriggerStarted keeps its richer renderer (invocation kind + event link).
   if (userEvent.type === 'TriggerStarted') {
     return (
@@ -157,23 +186,15 @@ function renderOriginSection(
     );
   }
 
-  const origin = resolveOrigin(userEvent);
-  if (!origin) {
-    return (
-      <section class="route-section">
-        <h4>Origin</h4>
-        <div class="muted">Unknown</div>
-      </section>
-    );
-  }
-
-  const channel = renderChannelSection(origin, parentTitle, getLiveTitle);
-  const audit = renderAuditSection(origin);
-  const explainer = origin.kind === 'engine'
+  const initiatorRow = renderInitiatorRow(userEvent);
+  const origin = resolveOrigin(exchange);
+  const channel = origin ? renderChannelSection(origin, parentTitle, getLiveTitle) : null;
+  const audit = origin ? renderAuditSection(origin) : null;
+  const explainer = origin?.kind === 'engine'
     ? renderEngineExplainerSection(origin.reason)
     : null;
 
-  if (!channel && !audit && !explainer) {
+  if (!initiatorRow && !channel && !audit && !explainer) {
     return (
       <section class="route-section">
         <h4>Origin</h4>
@@ -185,11 +206,40 @@ function renderOriginSection(
   return (
     <section class="route-section">
       <h4>Origin</h4>
+      {initiatorRow}
       {channel}
       {audit}
       {explainer}
     </section>
   );
+}
+
+/** Initiator row for divider-starter ActionRequired events. The chip itself
+ *  reads "You" (the device-owner who answers); this row discloses who *asked*
+ *  — Claude Code for question/permission prompts, Lucidos for credential and
+ *  MCP-consent requests. Returns null for non-divider events (their initiator
+ *  is implied by the channel/audit rows).
+ *
+ *  Exported for unit tests — see MessageRoutePanel.test.ts. */
+export function renderInitiatorRow(userEvent: StoredEvent): preact.JSX.Element | null {
+  const text = initiatorRowText(userEvent);
+  if (!text) return null;
+  return (
+    <div class="route-row">
+      <strong>Asked by</strong>
+      <span>{text}</span>
+    </div>
+  );
+}
+
+function initiatorRowText(userEvent: StoredEvent): string | null {
+  switch (userEvent.type) {
+    case 'UserQuestionAsked':            return 'Claude Code';
+    case 'CodingAgentPermissionRequest': return 'Claude Code (permission gate)';
+    case 'CredentialRequested':          return 'Lucidos (credential request)';
+    case 'McpConsentRequested':          return 'Lucidos (tool consent)';
+    default:                             return null;
+  }
 }
 
 /** Channel: who, on what surface — device label / API user-agent / workspace
@@ -247,6 +297,7 @@ export function renderChannelSection(
       );
     }
     case 'engine':
+    case 'system':
       return null;
   }
 }
@@ -270,6 +321,7 @@ export function renderAuditSection(origin: MessageOrigin): preact.JSX.Element | 
     case 'device':
     case 'api':
     case 'engine':
+    case 'system':
       return null;
   }
 }
@@ -354,13 +406,10 @@ function renderExecutorSection(
   );
 }
 
-/** CC repo label. Returns undefined when there's nothing meaningful to render
- *  (e.g. workspace name not yet loaded for a workspace-repo session). */
+/** CC repo label. Returns undefined for legacy events from before the engine
+ *  always stamped `repo_id` — those sessions render no Repository row. */
 function resolveRepoLabel(repoId: string | undefined): { text: string; failed?: boolean } | undefined {
-  if (!repoId) {
-    const name = workspaceName.value;
-    return name ? { text: name } : undefined;
-  }
+  if (!repoId) return undefined;
   const repos = repositories.value;
   if (repos.status === 'not-loaded') loadRepositories();
   if (repos.status === 'failed') return { text: `${repoId} (load failed)`, failed: true };

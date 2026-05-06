@@ -1,3 +1,4 @@
+import type { ComponentChildren } from 'preact';
 import { signal } from '@preact/signals';
 import { useEffect, useState } from 'preact/hooks';
 import { API_BASE } from '../../api/client';
@@ -6,13 +7,10 @@ import { toFailed, type Loadable } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatTimeAgo } from '../../utils/formatTime';
+import { formatBytes } from '../../utils/formatBytes';
 
 /**
- * Settings → Disk Usage page (Phase 10.4 of the CC resume architecture).
- *
- * Shows the same per-thread worktree inventory the background cleanup worker
- * sees, so the user can reclaim disk space on demand without waiting for the
- * hourly tick. Per-row actions:
+ * Per-row actions:
  *
  * - **Clean build artifacts** (Tier 1): strips `target/`, `node_modules/`,
  *   `.lucidos/cache/`. Always safe.
@@ -29,7 +27,7 @@ interface WorktreeRow {
   size_bytes: number;
   last_activity: string | null;
   is_dirty: boolean;
-  is_pinned: boolean;
+  is_saved: boolean;
 }
 
 interface InventoryResponse {
@@ -39,6 +37,7 @@ interface InventoryResponse {
 interface DiskSummary {
   free_bytes: number | null;
   total_bytes: number | null;
+  workspace_data_bytes: number;
   soft_threshold_bytes: number;
   hard_threshold_bytes: number;
 }
@@ -93,18 +92,21 @@ async function runCleanup(threadId: string, tier: 1 | 2 | 3): Promise<{ tier: nu
   return res.json();
 }
 
-/** Pretty-print a byte count in the largest sensible unit. */
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ['KB', 'MB', 'GB', 'TB'];
-  let value = bytes / 1024;
-  let unitIdx = 0;
-  while (value >= 1024 && unitIdx < units.length - 1) {
-    value /= 1024;
-    unitIdx += 1;
+
+interface PressureLabel {
+  text: string;
+  cls: string;
+}
+
+function pressureLabelFor(sum: DiskSummary | null): PressureLabel | null {
+  if (!sum || sum.free_bytes == null) return null;
+  if (sum.free_bytes < sum.hard_threshold_bytes) {
+    return { text: 'Disk is critical', cls: 'disk-usage-stat-pressure-hard' };
   }
-  // Show one decimal up to the GB range, none for TB
-  return `${value.toFixed(unitIdx >= 2 ? 1 : 0)} ${units[unitIdx]}`;
+  if (sum.free_bytes < sum.soft_threshold_bytes) {
+    return { text: 'Getting low', cls: 'disk-usage-stat-pressure-soft' };
+  }
+  return null;
 }
 
 // Palette cycled per worktree segment; matches the swatch on each row below.
@@ -130,13 +132,18 @@ function DiskUsageBar({
   totalBytes,
   freeBytes,
   diskTotalBytes,
+  workspaceDataBytes,
 }: {
   rows: WorktreeRow[];
   totalBytes: number;
   freeBytes: number;
   diskTotalBytes: number;
+  workspaceDataBytes: number;
 }) {
-  const otherUsed = Math.max(0, diskTotalBytes - freeBytes - totalBytes);
+  const otherUsed = Math.max(
+    0,
+    diskTotalBytes - freeBytes - totalBytes - workspaceDataBytes,
+  );
   return (
     <div class="disk-usage-bar" role="img" aria-label="Disk usage breakdown">
       {rows.map((row, idx) => (
@@ -147,14 +154,39 @@ function DiskUsageBar({
           label={row.thread_title?.trim() || 'Untitled thread'}
         />
       ))}
+      <Segment
+        cls="disk-usage-segment-workspace-data"
+        bytes={workspaceDataBytes}
+        label="Workspace data"
+      />
       <Segment cls="disk-usage-segment-other" bytes={otherUsed} label="Other apps" />
       <Segment cls="disk-usage-segment-free" bytes={freeBytes} label="Free" />
     </div>
   );
 }
 
+function StatCard({
+  label,
+  value,
+  note,
+}: {
+  label: string;
+  value: ComponentChildren;
+  note?: ComponentChildren;
+}) {
+  return (
+    <div class="disk-usage-stats">
+      <div class="disk-usage-stat">
+        <div class="disk-usage-stat-label">{label}</div>
+        <div class="disk-usage-stat-value">{value}</div>
+        {note && <div class="disk-usage-stat-note">{note}</div>}
+      </div>
+    </div>
+  );
+}
+
 function StatusBadge({ row }: { row: WorktreeRow }) {
-  if (row.is_pinned) return <span class="label" data-tooltip="Pinned threads are exempt from auto-cleanup">Pinned</span>;
+  if (row.is_saved) return <span class="label" data-tooltip="Saved threads are exempt from auto-cleanup">Saved</span>;
   if (row.is_dirty) return <span class="label channel-error" data-tooltip="Worktree has uncommitted changes">Dirty</span>;
   return <span class="label" data-tooltip="No uncommitted changes; safe to remove">Clean</span>;
 }
@@ -260,6 +292,7 @@ export function DiskUsagePage() {
   const loadable = inventory.value;
   const summaryLoadable = summary.value;
   const showLoading = useDelayedLoading(loadable);
+  const showSummarySpinner = useDelayedLoading(summaryLoadable);
 
   useEffect(() => {
     if (loadable.status === 'not-loaded') loadInventory();
@@ -269,7 +302,7 @@ export function DiskUsagePage() {
   if (loadable.status === 'failed') {
     return (
       <div class="settings-section">
-        <div class="settings-section-title">Worktrees</div>
+        <div class="settings-section-title">Disk usage</div>
         <div class="list-rows">
           <div class="empty-state error-text">Failed to load disk usage: {loadable.error}</div>
         </div>
@@ -281,9 +314,9 @@ export function DiskUsagePage() {
     if (!showLoading) return null;
     return (
       <div class="settings-section">
-        <div class="settings-section-title">Worktrees</div>
+        <div class="settings-section-title">Disk usage</div>
         <div class="list-rows">
-          <div class="empty">Loading...</div>
+          <div class="loading-spinner" />
         </div>
       </div>
     );
@@ -293,52 +326,89 @@ export function DiskUsagePage() {
   const sum = summaryLoadable.status === 'loaded' ? summaryLoadable.data : null;
   const freeBytes = sum?.free_bytes ?? null;
   const diskTotalBytes = sum?.total_bytes ?? null;
+  const workspaceDataBytes = sum?.workspace_data_bytes ?? null;
+  const pressureLabel = pressureLabelFor(sum);
+  const pendingOrDash = showSummarySpinner ? <span class="mini-spinner" /> : '—';
 
   return (
-    <div class="settings-section">
-      <div class="settings-section-title">Worktrees</div>
-      <p class="settings-section-desc">
-        {sum && sum.free_bytes != null && sum.total_bytes != null ? (
-          <>
-            <strong>{formatBytes(sum.free_bytes)} free</strong> of {formatBytes(sum.total_bytes)} on this volume.
-            Lucidos worktrees use {formatBytes(totalBytes)}.
-            {sum.free_bytes < sum.hard_threshold_bytes && (
-              <span class="error-text"> Disk is critical — Lucidos is reclaiming idle worktrees aggressively.</span>
-            )}
-            {sum.free_bytes >= sum.hard_threshold_bytes && sum.free_bytes < sum.soft_threshold_bytes && ' Disk is getting low.'}
-          </>
-        ) : (
-          <>Lucidos worktrees use {formatBytes(totalBytes)} on disk.</>
-        )}
-        {summaryLoadable.status === 'failed' && (
-          <span class="error-text"> Couldn't read disk stats: {summaryLoadable.error}</span>
-        )}
-        {' '}
-        Clean build artifacts to reclaim space; remove a worktree entirely when you no longer need its branch.
-      </p>
-      {freeBytes != null && diskTotalBytes != null && (
-        <DiskUsageBar
-          rows={loadable.data}
-          totalBytes={totalBytes}
-          freeBytes={freeBytes}
-          diskTotalBytes={diskTotalBytes}
+    <>
+      <div class="settings-section">
+        <div class="settings-section-title">Disk usage</div>
+        <StatCard
+          label="Free space on volume"
+          value={
+            <>
+              {freeBytes != null ? formatBytes(freeBytes) : pendingOrDash}
+              {diskTotalBytes != null && (
+                <span class="disk-usage-stat-sub"> of {formatBytes(diskTotalBytes)}</span>
+              )}
+            </>
+          }
+          note={
+            pressureLabel && <span class={pressureLabel.cls}>{pressureLabel.text}</span>
+          }
         />
-      )}
-      <div class="list-rows">
-        {loadable.data.length === 0 ? (
-          <div class="empty">No worktrees</div>
-        ) : (
-          loadable.data.map((row, idx) => (
-            <WorktreeRowView
-              key={row.thread_id}
-              row={row}
-              totalBytes={totalBytes}
-              colorIdx={idx}
-              onCleanup={loadInventory}
-            />
-          ))
+        {summaryLoadable.status === 'failed' && (
+          <p class="settings-section-desc error-text">
+            Couldn't read disk stats: {summaryLoadable.error}
+          </p>
+        )}
+        {freeBytes != null && diskTotalBytes != null && (
+          <DiskUsageBar
+            rows={loadable.data}
+            totalBytes={totalBytes}
+            freeBytes={freeBytes}
+            diskTotalBytes={diskTotalBytes}
+            workspaceDataBytes={workspaceDataBytes ?? 0}
+          />
         )}
       </div>
-    </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Workspace data</div>
+        <StatCard
+          label="Workspace data uses"
+          value={workspaceDataBytes != null ? formatBytes(workspaceDataBytes) : pendingOrDash}
+          note={
+            <>
+              <span class="disk-usage-legend-swatch disk-usage-segment-workspace-data" aria-hidden="true" />
+              {' '}Artifacts, postgres, apps &amp; knowhow under <code>data/</code>
+            </>
+          }
+        />
+        <p class="settings-section-desc">
+          The workspace's own data directory — artifacts you and the engine produce, the Postgres event store, and your apps &amp; knowhow. Kept across restarts; no automatic cleanup.
+        </p>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Worktrees</div>
+        <StatCard
+          label="Lucidos worktrees use"
+          value={formatBytes(totalBytes)}
+          note={
+            loadable.data.length === 0
+              ? 'No worktrees on disk'
+              : `${loadable.data.length} ${loadable.data.length === 1 ? 'worktree' : 'worktrees'}`
+          }
+        />
+        <p class="settings-section-desc">
+          Per-thread worktrees Lucidos creates for Claude Code sessions. Clean build artifacts to reclaim space, or remove a worktree entirely when you no longer need its branch.
+        </p>
+        {loadable.data.length > 0 && (
+          <div class="list-rows">
+            {loadable.data.map((row, idx) => (
+              <WorktreeRowView
+                key={row.thread_id}
+                row={row}
+                totalBytes={totalBytes}
+                colorIdx={idx}
+                onCleanup={loadInventory}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </>
   );
 }

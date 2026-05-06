@@ -146,9 +146,10 @@ resolve_workspace() {
         mv "$PROJECT_DIR/.${_old}-workspace" "$PROJECT_DIR/.lucidos-workspace"
     fi
 
-    # Ensure workspace directories exist
+    # Ensure workspace directories exist.
+    # PGDATA is no longer a host directory — it lives on a Docker named volume
+    # (`lucidos-pg-data-$PG_NAME`). See docker-compose.dev.yml for why.
     mkdir -p "$WORKSPACE/artifacts"
-    mkdir -p "$WORKSPACE/data/postgres"
     mkdir -p "$WORKSPACE/.lucidos"
 
     # Workspace-scoped state files
@@ -200,6 +201,7 @@ setup_postgres() {
     export LUCIDOS_PG_PORT="$PG_PORT"
 
     _migrate_postgres_if_needed
+    _migrate_postgres_volume_if_needed
 
     local need_restart=""
     if docker inspect "lucidos-pg-$PG_NAME" >/dev/null 2>&1; then
@@ -208,11 +210,16 @@ setup_postgres() {
         if [ "$container_status" != "running" ]; then
             need_restart="container not running (status: $container_status)"
         else
-            local actual_mount expected_mount
-            actual_mount=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Source}}{{end}}{{end}}' "lucidos-pg-$PG_NAME" 2>/dev/null || echo "")
-            expected_mount="$WORKSPACE/data/postgres"
-            if [ "$actual_mount" != "$expected_mount" ]; then
-                need_restart="mount mismatch (expected $expected_mount, got $actual_mount)"
+            # PGDATA must be on the named Docker volume `lucidos-pg-data-$PG_NAME`.
+            # `.Mounts[].Name` is set for `volume`-type mounts and empty for
+            # `bind`-type mounts, so a legacy bind-mount container fails this
+            # check and triggers a restart (after the volume migration above
+            # has already moved the data into the named volume).
+            local actual_volume expected_volume
+            actual_volume=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' "lucidos-pg-$PG_NAME" 2>/dev/null || echo "")
+            expected_volume="lucidos-pg-data-$PG_NAME"
+            if [ "$actual_volume" != "$expected_volume" ]; then
+                need_restart="volume mismatch (expected $expected_volume, got '${actual_volume:-bind mount or empty}')"
             fi
         fi
     else
@@ -272,7 +279,8 @@ _migrate_postgres_if_needed() {
 
     echo -n "Probing postgres in $container"
     local probe_user=""
-    for _ in {1..30}; do
+    local recovery_announced=false
+    for _ in {1..180}; do
         if docker exec "$container" psql -U lucidos -d postgres -tAc "SELECT 1" >/dev/null 2>&1; then
             probe_user="lucidos"
             break
@@ -280,6 +288,10 @@ _migrate_postgres_if_needed() {
         if docker exec "$container" psql -U "$_old" -d postgres -tAc "SELECT 1" >/dev/null 2>&1; then
             probe_user="$_old"
             break
+        fi
+        if ! $recovery_announced && docker logs --tail 50 "$container" 2>&1 | grep -qE "database system was interrupted|the database system is starting up"; then
+            echo -n " (crash recovery in progress, may take a few minutes)"
+            recovery_announced=true
         fi
         echo -n "."
         sleep 1
@@ -350,6 +362,77 @@ _migrate_postgres_if_needed() {
     fi
 
     echo "Postgres role/db migrated: ${_old} → lucidos"
+}
+
+# One-time migration: workspaces created before the bind-mount → named-volume
+# switch keep their PGDATA at <workspace>/data/postgres on the host. This copies
+# the data into the new named volume so the running container can keep using
+# the same database, then archives the host directory aside (never deleted).
+#
+# Idempotent: skipped if the named volume already exists or if there's no
+# legacy bind-mount data to migrate.
+_migrate_postgres_volume_if_needed() {
+    local pg_data_dir="$WORKSPACE/data/postgres"
+    local volume_name="lucidos-pg-data-$PG_NAME"
+    local container="lucidos-pg-$PG_NAME"
+
+    if docker volume inspect "$volume_name" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ ! -f "$pg_data_dir/PG_VERSION" ]; then
+        return 0
+    fi
+
+    echo ""
+    echo "Migrating Postgres PGDATA from host bind mount to Docker named volume."
+    echo "(One-time. Bind-mounted PGDATA crashes Docker Desktop's VM under sustained writes.)"
+    echo "  Source:  $pg_data_dir"
+    echo "  Target:  Docker volume $volume_name"
+
+    # Release file locks before copy.
+    if docker inspect "$container" >/dev/null 2>&1; then
+        echo "Stopping container $container before migration..."
+        docker rm -f "$container" >/dev/null 2>&1 || true
+    fi
+
+    if ! docker volume create "$volume_name" >/dev/null; then
+        echo "ERROR: failed to create Docker volume $volume_name" >&2
+        return 1
+    fi
+
+    # Run inside the postgres image so `chown postgres` resolves to the right
+    # uid (999 in pgvector/pgvector:pg16; using the name keeps this correct if
+    # the base image ever changes). Postgres refuses to start with PGDATA perms
+    # other than 0700, and `cp -a` preserves the host's perms (often 0755 on
+    # macOS bind mounts) — chmod here, not after the container starts.
+    echo "Copying data into named volume..."
+    if ! docker run --rm \
+        -v "$pg_data_dir:/src:ro" \
+        -v "$volume_name:/dst" \
+        pgvector/pgvector:pg16 \
+        sh -c 'cp -a /src/. /dst/ && chown -R postgres:postgres /dst && chmod 700 /dst'; then
+        echo "ERROR: failed to copy PGDATA into volume $volume_name. Removing partial volume." >&2
+        docker volume rm "$volume_name" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    # Archive the old data dir aside (never delete — user can recover if anything
+    # looks wrong after migration).
+    local archive="$WORKSPACE/data/postgres.migrated-$(date +%Y%m%d%H%M%S)"
+    if ! mv "$pg_data_dir" "$archive"; then
+        echo "WARN: copied to volume but could not archive old dir at $pg_data_dir" >&2
+    else
+        echo "Old PGDATA preserved at: $archive"
+        echo "(Safe to delete after verifying the engine starts and data looks correct.)"
+        # The existing `data/postgres/` gitignore pattern is exact and does NOT
+        # cover `data/postgres.migrated-*/`. Without this guard `git add .` (or
+        # cpa) would happily commit the archived event store. Append once.
+        local gi="$WORKSPACE/.gitignore"
+        if [ -f "$gi" ] && ! grep -q '^data/postgres\.migrated-' "$gi" 2>/dev/null; then
+            echo "data/postgres.migrated-*/" >> "$gi"
+        fi
+    fi
+    echo ""
 }
 
 _start_postgres_container() {
@@ -596,53 +679,109 @@ start_engine() {
     fi
 }
 
-# ── running_frontend_workspaces ────────────────────────────────────────
-# Echo workspace names whose frontend.pid points to a live process.
+# ── running_frontend_workspaces_in_project ─────────────────────────────
+# Echo workspace names whose frontend.pid points to a live Vite process
+# whose physical cwd is inside the given project directory. Comparison
+# uses `pwd -P`, so a Vite running from one physical checkout (e.g. main)
+# does NOT match a different physical checkout (e.g. a CC worktree under
+# .lucidos/worktrees/) — installs in one don't corrupt the other's
+# node_modules. Assumes Vite was spawned with cwd inside its project root
+# (see start_vite); a Vite launched with `--root` from elsewhere would
+# slip past this check.
 # Subshell so `nullglob` doesn't leak into the caller's shell options.
-running_frontend_workspaces() (
+running_frontend_workspaces_in_project() (
     shopt -s nullglob
+    local project="$1"
+    local project_real
+    project_real="$(cd "$project" 2>/dev/null && pwd -P || true)"
+    [ -n "$project_real" ] || return 0
     for pidfile in "$HOME"/workspaces/*/.lucidos/frontend.pid; do
-        local pid ws_dir
+        local pid ws_dir vite_cwd vite_real
         # `cat … || true` keeps a transient unreadable file from killing the
         # subshell under the caller's `set -e`.
         pid="$(cat "$pidfile" 2>/dev/null || true)"
         [ -n "$pid" ] || continue
-        if kill -0 "$pid" 2>/dev/null; then
-            ws_dir="${pidfile%/.lucidos/frontend.pid}"
-            echo "${ws_dir##*/}"
-        fi
+        kill -0 "$pid" 2>/dev/null || continue
+        # `lsof -p PID -a -d cwd -Fn` prints `n<path>` for the cwd FD entry.
+        vite_cwd="$(lsof -p "$pid" -a -d cwd -Fn 2>/dev/null | awk '/^n/ {print substr($0,2); exit}')"
+        [ -n "$vite_cwd" ] || continue
+        vite_real="$(cd "$vite_cwd" 2>/dev/null && pwd -P || true)"
+        [ -n "$vite_real" ] || continue
+        # Conflict if vite's cwd is the project root or anywhere inside it.
+        # Trailing slashes prevent `/a/b` from matching `/a/bb`.
+        case "$vite_real/" in
+            "$project_real/"|"$project_real"/*)
+                ws_dir="${pidfile%/.lucidos/frontend.pid}"
+                echo "${ws_dir##*/}"
+                ;;
+        esac
     done
 )
 
+# ── _resolve_npm_install_root ─────────────────────────────────────────
+# For npm-workspace members, deps are hoisted to the workspace root —
+# the per-package node_modules dir often only holds Vite's cache (or
+# nothing on a fresh git worktree). Walk up looking for an ancestor
+# package.json that lists this dir as a workspace member; if found,
+# use that ancestor as the install root. Echoes the resolved path.
+_resolve_npm_install_root() {
+    local dir="$1"
+    local p="$dir"
+    while [ "$p" != "/" ] && [ -n "$p" ]; do
+        local parent
+        parent="$(dirname "$p")"
+        [ "$parent" = "$p" ] && break
+        p="$parent"
+        if [ -f "$p/package.json" ] && grep -qE '"workspaces"[[:space:]]*:' "$p/package.json" 2>/dev/null; then
+            echo "$p"
+            return 0
+        fi
+    done
+    echo "$dir"
+}
+
 # ── ensure_npm_deps ───────────────────────────────────────────────────
 # Run npm install if node_modules is missing or package.json has changed.
-# Refuses if any other workspace has a running frontend dev server, because
-# mutating node_modules under a running Vite silently corrupts its in-memory
-# module graph (stale inodes) and turns it into a wedged "200 with wrong body"
-# server — manifesting as a blank page in the browser.
+# Refuses if any other workspace has a running frontend dev server inside
+# THIS project ($PROJECT_DIR) — npm workspaces hoists deps to one shared
+# node_modules tree, so mutating it under a running Vite silently corrupts
+# its in-memory module graph (stale inodes) and turns it into a wedged
+# "200 with wrong body" server — manifesting as a blank page in the browser.
+# Vites running from a different physical checkout (e.g. a CC worktree)
+# don't share node_modules with this project and aren't blocked.
 # Usage: ensure_npm_deps "path/to/package" "label"
 ensure_npm_deps() {
     local dir="$1"
     local label="${2:-dependencies}"
     local needs_install=""
 
-    if [ ! -d "$dir/node_modules" ]; then
+    # Resolve the actual install marker. In npm-workspace setups the per-package
+    # node_modules dir is essentially Vite cache — the real install marker is
+    # the workspace-root node_modules. Without this, fresh git worktrees fail
+    # the "node_modules missing" check even though `npm install` already ran at
+    # the root and hoisted everything.
+    local install_root
+    install_root="$(_resolve_npm_install_root "$dir")"
+
+    if [ ! -d "$install_root/node_modules" ]; then
         needs_install="node_modules missing"
-    elif [ "$dir/package.json" -nt "$dir/node_modules" ]; then
+    elif [ "$dir/package.json" -nt "$install_root/node_modules" ]; then
         # node_modules dir mtime is updated by every `npm install` (it always
         # rewrites .package-lock.json). The local .package-lock.json file isn't
         # reliable in npm-workspace setups — installs at the root don't touch
         # the per-package lockfile, so it's permanently "stale" and would
         # trigger spurious reinstalls every startup.
         needs_install="package.json changed"
+    elif [ "$install_root" != "$dir" ] && [ "$install_root/package.json" -nt "$install_root/node_modules" ]; then
+        needs_install="root package.json changed"
     fi
 
     if [ -n "$needs_install" ]; then
         local active
-        active="$(running_frontend_workspaces)"
+        active="$(running_frontend_workspaces_in_project "$PROJECT_DIR")"
         if [ -n "$active" ]; then
             echo "" >&2
-            echo "ERROR: $label install needed ($needs_install), but a frontend is running for:" >&2
+            echo "ERROR: $label install needed ($needs_install), but a frontend in this checkout is running for:" >&2
             while IFS= read -r ws; do
                 [ -n "$ws" ] && echo "  - $ws" >&2
             done <<< "$active"

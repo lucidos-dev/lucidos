@@ -1,11 +1,13 @@
+import { Fragment } from 'preact';
 import { useSignal, useSignalEffect, signal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
-import { showToast, ccSessionVersion, ccPendingModel, ccPendingReasoningEffort } from '../../store/store';
+import { showToast, ccSessionVersion, ccPendingModel, ccPendingReasoningEffort, selectedRepoId } from '../../store/store';
 import { sendCCControl } from '../../store/actions/chat-claude-code';
 import { sendMessage } from '../../store/actions/chat';
 import { fetchCCCommands, type CCCommandDef, type CCCommandsResponse, type CCModelValue, type CCReasoningEffort } from '../../api/client';
 import { ClaudeIcon } from '../shared/icons';
 import { isTextInput } from '../../utils/dom';
+import { errorDetail } from '../../utils/errorDetail';
 import { focusIfNeeded } from './promptFocus';
 
 // Signal for PromptInput to request opening the menu with a filter
@@ -58,7 +60,6 @@ export function CCControlMenu({ threadId }: Props) {
   const currentModel = useSignal<CCModelValue | null>(null);
   const currentReasoningEffort = useSignal<CCReasoningEffort | null>(null);
   const hasActiveSession = useSignal(persistedHasActiveSession.peek());
-  const loaded = useSignal(persistedControlCommands.peek() !== null || persistedBuiltinCommands.peek() !== null || persistedSkillCommands.peek() !== null);
   const filter = useSignal('');
   const highlightIndex = useSignal(-1);
 
@@ -71,14 +72,18 @@ export function CCControlMenu({ threadId }: Props) {
 
   function loadCommands() {
     clearRetryTimer();
-    fetchCCCommands(threadId)
+    // Compose view (no thread) scopes commands to the user-selected repo so
+    // skills from other repos never leak into the menu. selectedRepoId === ''
+    // means "default Lucidos repo" — pass it through verbatim; the backend
+    // resolves "" to the default name.
+    const repoId = threadId ? undefined : selectedRepoId.value;
+    fetchCCCommands(threadId, repoId)
       .then((res: CCCommandsResponse) => {
         // Always update control commands (always present from backend)
         persistedControlCommands.value = res.control_commands;
         controlCommands.value = res.control_commands;
         persistedHasActiveSession.value = res.has_active_session;
         hasActiveSession.value = res.has_active_session;
-        loaded.value = true;
         // Update model/effort from backend response (per-thread, from events).
         // Active session: values come from the live session. No session: values
         // come from CodingAgentSettingsChanged events for this thread (may be null).
@@ -129,7 +134,10 @@ export function CCControlMenu({ threadId }: Props) {
 
   useEffect(() => {
     retryCountRef.current = 0;
-    loadCommands();
+    // Compose view (no threadId) is loaded by the selectedRepoId signal effect
+    // below — fires on first render and on every repo switch. Loading here too
+    // would double-fetch on mount.
+    if (threadId) loadCommands();
     return clearRetryTimer;
   }, [threadId]);
 
@@ -144,6 +152,22 @@ export function CCControlMenu({ threadId }: Props) {
       retryCountRef.current = 0;
       loadCommands();
     }
+  });
+
+  // Re-fetch when the compose-view repo dropdown changes — different repo,
+  // different skills. Clear the module-level cache first so the previous
+  // repo's skills don't flash before the new fetch resolves. Thread-bound
+  // menus are bound to the thread's repo and ignore this signal.
+  useSignalEffect(() => {
+    // Reading the signal here is what subscribes this effect.
+    selectedRepoId.value;
+    if (threadId) return;
+    persistedBuiltinCommands.value = null;
+    persistedSkillCommands.value = null;
+    builtinCommands.value = [];
+    skillCommands.value = [];
+    retryCountRef.current = 0;
+    loadCommands();
   });
 
   // Open from PromptInput when user types "/" prefix.
@@ -236,39 +260,47 @@ export function CCControlMenu({ threadId }: Props) {
     highlightIndex.value = -1;
   }
 
-  async function sendSlashCommand(cmd: string) {
+  function sendSlashCommand(cmd: string) {
     close();
-    await sendMessage(`/${cmd}`, undefined, { useClaudeCode: true });
+    sendMessage(`/${cmd}`, undefined, { useClaudeCode: true }).catch((err) => {
+      showToast(`Failed to send /${cmd}: ${errorDetail(err)}`, 'error');
+    });
   }
 
   /** Send a control request with a single option value (for commands with options).
-   *  Pre-session (no threadId or no active session): store as pending preference. */
+   *  Always captures the selection in a pending preference — for pre-session and
+   *  no-active-session this is the only path; for active sessions it's a fallback
+   *  that survives the race where the live session ends between menu render and
+   *  click (idle exit removes it from agent_sessions, sendCCControl returns 404).
+   *  When a live session accepts the control, loadCommands() clears pending on
+   *  the next refresh. */
   async function selectOption(cmd: CCCommandDef, value: string, label: string) {
+    if (cmd.subtype === 'set_model') {
+      ccPendingModel.value = value === 'default' ? null : value as CCModelValue;
+    } else if (cmd.subtype === 'set_reasoning_effort') {
+      ccPendingReasoningEffort.value = value as CCReasoningEffort;
+    }
+
     if (!threadId || !hasActiveSession.value) {
-      // Pre-session: store as pending preference, consumed when CC session starts
-      if (cmd.subtype === 'set_model') {
-        ccPendingModel.value = value === 'default' ? null : value as CCModelValue;
-      } else if (cmd.subtype === 'set_reasoning_effort') {
-        ccPendingReasoningEffort.value = value as CCReasoningEffort;
-      }
       showToast(`${cmd.label}: ${label}`, 'success');
       close();
       return;
     }
     sending.value = true;
     const request: Record<string, string> = { subtype: cmd.subtype, [cmd.params[0].key]: value };
-    const ok = await sendCCControl(threadId, request);
+    const result = await sendCCControl(threadId, request);
     sending.value = false;
-    if (ok) {
-      // Optimistic update: track the new value (local to this thread only)
+    if (result === 'ok') {
       if (cmd.subtype === 'set_model') {
         currentModel.value = value as CCModelValue;
       } else if (cmd.subtype === 'set_reasoning_effort') {
         currentReasoningEffort.value = value as CCReasoningEffort;
       }
-      showToast(`${cmd.label}: ${label}`, 'success');
-      close();
     }
+    if (result !== 'error') {
+      showToast(`${cmd.label}: ${label}`, 'success');
+    }
+    close();
   }
 
   /** Look up the current value for a control command and return its display label.
@@ -306,9 +338,9 @@ export function CCControlMenu({ threadId }: Props) {
     }
 
     sending.value = true;
-    const ok = await sendCCControl(threadId, request);
+    const result = await sendCCControl(threadId, request);
     sending.value = false;
-    if (ok) {
+    if (result === 'ok') {
       showToast(`${cmd.label} sent`, 'success');
       close();
     }
@@ -407,7 +439,7 @@ export function CCControlMenu({ threadId }: Props) {
                 onInput={(e: Event) => { filter.value = (e.target as HTMLInputElement).value; highlightIndex.value = 0; }}
               />
               {sections.map(section => (
-                <>
+                <Fragment key={section.label}>
                   <div class="cc-control-section-label">{section.label}</div>
                   {section.items.map(item => {
                     const idx = flatIndex(item);
@@ -428,7 +460,7 @@ export function CCControlMenu({ threadId }: Props) {
                       </button>
                     );
                   })}
-                </>
+                </Fragment>
               ))}
               {sections.length === 0 && (
                 <div class="cc-control-empty">No matching commands</div>

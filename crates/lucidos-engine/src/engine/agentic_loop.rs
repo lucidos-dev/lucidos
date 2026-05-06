@@ -63,6 +63,153 @@ fn is_bad_image_description(desc: &str) -> bool {
         || lower.contains("no image provided")
 }
 
+/// Hard cap on per-turn LLM tool-call iterations. The engine returns a
+/// `[ENGINE-LIMIT]`-tagged response when the cap is hit — the chat agent
+/// cannot otherwise observe its own tool-call count, so any "tool-call
+/// cap" claim without this prefix is a hallucination. The chat system
+/// prompt tells the model the same.
+pub(super) const MAX_ITERATIONS: usize = 100;
+
+/// Without this emit the frontend would never see a terminator and the
+/// thread would show "running" forever after hitting the cap.
+pub(super) async fn emit_iteration_cap_response_generated(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    meta: &crate::engine::thread_events::EventMeta,
+    images: Vec<String>,
+    effective_model: Option<String>,
+    effective_effort: Option<String>,
+) -> String {
+    let msg = format!(
+        "[ENGINE-LIMIT] Per-turn limit of {} tool calls reached. Send any message to continue from here.",
+        MAX_ITERATIONS
+    );
+    bus.emit_or_log(
+        crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: crate::engine::thread_events::ThreadEvent::ResponseGenerated {
+                text: msg.clone(),
+                images,
+                model: effective_model,
+                reasoning_effort: effective_effort,
+            },
+            meta: meta.clone(),
+        },
+        "[AgenticLoop] ResponseGenerated (iteration cap)",
+    )
+    .await;
+    msg
+}
+
+/// Critical invariant: the persisted event MUST get a fresh primary key,
+/// NOT `prompt.event_id`. The chat fast-path (`chat::process`) emits
+/// `MessageReceived` with the client-provided UUID before injecting,
+/// so reusing that UUID here causes an `events_pkey` duplicate-key
+/// error and the event is silently dropped under `emit_or_log`. The
+/// frontend correlates pending messages via `MessageReceived.id`;
+/// `UserPromptInjected` is a separate engine-side acknowledgment whose
+/// link back to the request is carried by `meta.request_event_id`.
+pub(super) async fn emit_user_prompt_injected_event(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    base_meta: &crate::engine::thread_events::EventMeta,
+    prompt: &super::InjectedPrompt,
+) {
+    let mut inject_meta = base_meta.clone();
+    inject_meta.event_id = None;
+    bus.emit_or_log(
+        crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: crate::engine::thread_events::ThreadEvent::UserPromptInjected {
+                text: prompt.text.clone(),
+                mode: prompt.mode,
+                origin: prompt.origin.clone(),
+                injected_message_id: prompt.event_id,
+            },
+            meta: inject_meta,
+        },
+        "[AgenticLoop] UserPromptInjected",
+    )
+    .await;
+}
+
+/// Defensive post-loop guard: emits `ResponseAborted` if no terminator
+/// landed for `request_event_id`. Catches future regressions in the
+/// loop's many return paths — every existing path emits explicitly, but
+/// the SQL check is the safety net. Scoped to `request_event_id` so a
+/// previous exchange's terminator doesn't mask a current zombie one.
+///
+/// Skip the SQL when callers can prove a terminator was emitted (success
+/// path) — `chat::process` does this via the `terminator_emitted` flag
+/// threaded through `run_agentic_loop`. Without that fast path this
+/// query runs on every chat turn against a `payload->>'request_event_id'`
+/// expression that has no functional index, walking every event in the
+/// thread on long-lived conversations.
+pub(super) async fn ensure_terminator_emitted(
+    bus: &crate::engine::event_bus::EventBus,
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    request_event_id: Uuid,
+    channel: Option<crate::engine::thread_events::EventChannel>,
+) {
+    let has_terminator: bool = match sqlx::query_scalar(
+        "SELECT EXISTS(\
+            SELECT 1 FROM events \
+            WHERE aggregate_id = $1 \
+              AND event_type = ANY($3::text[]) \
+              AND payload->>'request_event_id' = $2\
+        )",
+    )
+    .bind(thread_id.to_string())
+    .bind(request_event_id.to_string())
+    .bind(crate::engine::thread_events::ThreadEvent::TERMINATOR_EVENT_TYPES)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            // Fail open: assume no terminator and let the defensive emit
+            // run. A phantom abort is much better than silently leaving
+            // the UI stuck on "running" because the DB hiccupped.
+            crate::log!(
+                "[AgenticLoop] terminator-existence query failed for request {} on thread {}: {}",
+                request_event_id,
+                thread_id,
+                e
+            );
+            false
+        }
+    };
+
+    if has_terminator {
+        return;
+    }
+
+    crate::log!(
+        "[AgenticLoop] WARNING: loop exited without emitting a terminator for request {} on thread {} — emitting defensive ResponseAborted",
+        request_event_id,
+        thread_id
+    );
+    bus.emit_or_log(
+        crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: crate::engine::thread_events::ThreadEvent::ResponseAborted {
+                text: String::new(),
+                images: vec![],
+                model: None,
+                reasoning_effort: None,
+            },
+            meta: crate::engine::thread_events::EventMeta {
+                request_event_id: Some(request_event_id),
+                channel,
+                ..crate::engine::thread_events::EventMeta::NONE
+            },
+        },
+        "[AgenticLoop] ResponseAborted (defensive — no terminator emitted)",
+    )
+    .await;
+}
+
 impl LucidosEngine {
     /// The agentic loop: call LLM → parse response → execute tools → repeat.
     ///
@@ -87,6 +234,11 @@ impl LucidosEngine {
         reasoning_effort: Option<&str>,
         cancel_token: &CancellationToken,
         injection_rx: &mut mpsc::UnboundedReceiver<super::InjectedPrompt>,
+        // Set to true at every terminator emission so the post-loop guard
+        // in `chat::process` can skip its `payload->>'request_event_id'`
+        // existence check on the success path. The check has no functional
+        // index and would walk every event in long-lived threads otherwise.
+        terminator_emitted: &mut bool,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         // EventMeta for this request — all persisted events in this cycle share the same context
         let meta = crate::engine::thread_events::EventMeta {
@@ -100,7 +252,6 @@ impl LucidosEngine {
         let effective_effort = reasoning_effort.map(|s| s.to_string());
 
         let mut iterations = 0;
-        const MAX_ITERATIONS: usize = 100;
         let mut images: Vec<String> = Vec::new(); // Track screenshots created during this request
         let mut last_tool_call: Option<(String, String)> = None; // (tool_name, key) - key is path for read_file
         let mut consecutive_same_call = 0;
@@ -114,19 +265,22 @@ impl LucidosEngine {
         loop {
             iterations += 1;
             if cancel_token.is_cancelled() {
-                let _ = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ResponseCanceled {
-                            text: String::new(),
-                            images: images.clone(),
-                            model: effective_model.clone(),
-                            reasoning_effort: effective_effort.clone(),
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ResponseCanceled {
+                                text: String::new(),
+                                images: images.clone(),
+                                model: effective_model.clone(),
+                                reasoning_effort: effective_effort.clone(),
+                            },
+                            meta: meta.clone(),
                         },
-                        meta: meta.clone(),
-                    })
+                        "[AgenticLoop] ResponseCanceled (cancel pre-iter)",
+                    )
                     .await;
+                *terminator_emitted = true;
                 return Ok(ProcessResult {
                     response: String::new(),
                     steps: vec![],
@@ -140,10 +294,16 @@ impl LucidosEngine {
             }
 
             if iterations > MAX_ITERATIONS {
-                let msg = format!(
-                    "Hit the per-turn limit of {} tool calls. Send any message to continue from here.",
-                    MAX_ITERATIONS
-                );
+                let msg = emit_iteration_cap_response_generated(
+                    &self.event_bus,
+                    thread_id,
+                    &meta,
+                    images.clone(),
+                    effective_model.clone(),
+                    effective_effort.clone(),
+                )
+                .await;
+                *terminator_emitted = true;
                 return Ok(ProcessResult {
                     response: msg,
                     steps: vec![],
@@ -168,21 +328,23 @@ impl LucidosEngine {
             let context_tokens = context_chars / 4; // rough estimate
             let context_messages = messages.len();
             let trimmed_str = if trimmed { " (trimmed)" } else { "" };
-            let _ = self
-                .event_bus
-                .emit(crate::engine::event_bus::BusEvent::Thread {
-                    thread_id,
-                    event: crate::engine::thread_events::ThreadEvent::Thinking {
-                        text: format!(
-                            "Context: {} tokens, {} messages{}",
-                            context_tokens, context_messages, trimmed_str
-                        ),
-                        context_tokens: Some(context_tokens),
-                        context_messages: Some(context_messages),
-                        trimmed: if trimmed { Some(true) } else { None },
+            self.event_bus
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::Thread {
+                        thread_id,
+                        event: crate::engine::thread_events::ThreadEvent::Thinking {
+                            text: format!(
+                                "Context: {} tokens, {} messages{}",
+                                context_tokens, context_messages, trimmed_str
+                            ),
+                            context_tokens: Some(context_tokens),
+                            context_messages: Some(context_messages),
+                            trimmed: if trimmed { Some(true) } else { None },
+                        },
+                        meta: meta.clone(),
                     },
-                    meta: meta.clone(),
-                })
+                    "[AgenticLoop] Thinking (context summary)",
+                )
                 .await;
 
             // Create token streaming callback — buffers text, flushes as HTML at paragraph boundaries
@@ -196,15 +358,17 @@ impl LucidosEngine {
                 let persist_meta = meta.clone();
                 tokio::spawn(async move {
                     while let Some(delta) = persist_rx.recv().await {
-                        let _ = bus
-                            .emit(crate::engine::event_bus::BusEvent::Thread {
+                        bus.emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::TextStreamed {
                                     text: delta,
                                 },
                                 meta: persist_meta.clone(),
-                            })
-                            .await;
+                            },
+                            "[AgenticLoop] TextStreamed delta",
+                        )
+                        .await;
                     }
                 });
             }
@@ -229,6 +393,7 @@ impl LucidosEngine {
                                 },
                                 meta: crate::engine::thread_events::EventMeta::NONE,
                             },
+                            aggregate: None,
                         });
                         // Persist new text since last persistence point
                         let mut last = persisted_len.lock().unwrap();
@@ -279,6 +444,7 @@ impl LucidosEngine {
                                 },
                                 "[AgenticLoop] ResponseFailed",
                             ).await;
+                            *terminator_emitted = true;
                             return Err(e);
                         }
                     }
@@ -313,6 +479,7 @@ impl LucidosEngine {
                         },
                         "[AgenticLoop] ResponseCanceled",
                     ).await;
+                    *terminator_emitted = true;
                     return Ok(ProcessResult {
                         response: partial,
                         steps: vec![],
@@ -343,27 +510,31 @@ impl LucidosEngine {
                 (cloned, remaining)
             };
             if let Some(flush) = flush_text {
-                let _ = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::TextStreaming {
-                            text: flush,
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::TextStreaming {
+                                text: flush,
+                            },
+                            meta: crate::engine::thread_events::EventMeta::NONE,
                         },
-                        meta: crate::engine::thread_events::EventMeta::NONE,
-                    })
+                        "[AgenticLoop] TextStreaming final flush",
+                    )
                     .await;
             }
             if let Some(remaining) = remaining_to_persist {
-                let _ = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::TextStreamed {
-                            text: remaining,
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::TextStreamed {
+                                text: remaining,
+                            },
+                            meta: meta.clone(),
                         },
-                        meta: meta.clone(),
-                    })
+                        "[AgenticLoop] TextStreamed final persist",
+                    )
                     .await;
             }
             drop(persist_tx);
@@ -372,37 +543,100 @@ impl LucidosEngine {
             if response.tool_calls.is_empty() {
                 // Refresh any app UIs that were modified during the tool loop
                 for app_id in &modified_app_uis {
-                    let _ = self
-                        .event_bus
-                        .emit(crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::RefreshAppUI {
-                                app_id: app_id.clone(),
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event: crate::engine::thread_events::ThreadEvent::RefreshAppUI {
+                                    app_id: app_id.clone(),
+                                },
+                                meta: crate::engine::thread_events::EventMeta::NONE,
                             },
-                            meta: crate::engine::thread_events::EventMeta::NONE,
-                        })
+                            "[AgenticLoop] RefreshAppUI (post-loop)",
+                        )
                         .await;
                 }
-                let content = response.content.unwrap_or_else(|| "Done.".to_string());
-                let clean_response = self.clean_response(&content);
+                let cleaned = response
+                    .content
+                    .as_deref()
+                    .map(|c| self.clean_response(c))
+                    .filter(|c| !c.is_empty());
 
-                // Emit ResponseGenerated event (memory indexing handled by EventBus consumer)
-                let _ = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
+                if let Some(clean_response) = cleaned {
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event:
+                                    crate::engine::thread_events::ThreadEvent::ResponseGenerated {
+                                        text: clean_response.clone(),
+                                        images: images.clone(),
+                                        model: effective_model.clone(),
+                                        reasoning_effort: effective_effort.clone(),
+                                    },
+                                meta: meta.clone(),
+                            },
+                            "[AgenticLoop] ResponseGenerated",
+                        )
+                        .await;
+
+                    *terminator_emitted = true;
+                    return Ok(ProcessResult {
+                        response: clean_response,
+                        steps: vec![],
+                        images,
+                        request_id,
                         thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ResponseGenerated {
-                            text: clean_response.clone(),
-                            images: images.clone(),
-                            model: effective_model.clone(),
-                            reasoning_effort: effective_effort.clone(),
+                        proposed_change: *proposed_change,
+                        auto_apply: false,
+                        orphaned_injections: vec![],
+                    });
+                }
+
+                // Empty completion (no content, no tool calls). Always a
+                // failure from the user's perspective — surface via
+                // ResponseFailed with full diagnostic in the error string.
+                // stop_reason distinguishes legitimate end_turn from
+                // truncation; thinking_chars distinguishes "thought hard
+                // then gave up" from "said nothing without thinking".
+                let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
+                let output_tokens = response
+                    .output_tokens
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let thinking_chars = response
+                    .thinking_chars
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let hint = match stop_reason {
+                    "end_turn" => " — model decided no action was needed",
+                    "max_tokens" => " — output truncated by token budget",
+                    _ => "",
+                };
+                let error = format!(
+                    "Model returned no response (stop_reason: {}, output_tokens: {}, thinking_chars: {}, model: {}){}.",
+                    stop_reason,
+                    output_tokens,
+                    thinking_chars,
+                    effective_model.as_deref().unwrap_or("unknown"),
+                    hint,
+                );
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                                error,
+                            },
+                            meta: meta.clone(),
                         },
-                        meta: meta.clone(),
-                    })
+                        "[AgenticLoop] ResponseFailed (empty completion)",
+                    )
                     .await;
 
+                *terminator_emitted = true;
                 return Ok(ProcessResult {
-                    response: clean_response,
+                    response: String::new(),
                     steps: vec![],
                     images,
                     request_id,
@@ -487,12 +721,12 @@ impl LucidosEngine {
                 if current_tool == tn::LIST_FILES && consecutive_same_call >= 2 {
                     if let Some(ref cached) = cached_list_files {
                         log!(
-                            "Returning cached list_files result (call #{})",
+                            "[AgentLoop] Returning cached list_files result (call #{})",
                             consecutive_same_call
                         );
                         if consecutive_same_call >= 4 {
                             log!(
-                                "Force-breaking tool loop after {} repeated list_files attempts",
+                                "[AgentLoop] Force-breaking tool loop after {} repeated list_files attempts",
                                 consecutive_same_call
                             );
                             let msg = "I listed the available files but wasn't able to complete the task. Could you give me more specific instructions?";
@@ -506,6 +740,7 @@ impl LucidosEngine {
                                 },
                                 "[AgenticLoop] ResponseGenerated (force-break)",
                             ).await;
+                            *terminator_emitted = true;
                             return Ok(ProcessResult {
                                 response: msg.to_string(),
                                 steps: vec![],
@@ -529,31 +764,34 @@ impl LucidosEngine {
                 // If read_file called 3+ times on SAME file, block it
                 if current_tool == tn::READ_FILE && consecutive_same_call >= 3 {
                     log!(
-                        "Blocking repeated read_file of '{}' (call #{})",
+                        "[AgentLoop] Blocking repeated read_file of '{}' (call #{})",
                         call_key,
                         consecutive_same_call
                     );
                     // After 5 blocked attempts, force-break out of the loop
                     if consecutive_same_call >= 5 {
                         log!(
-                            "Force-breaking tool loop after {} repeated read_file attempts",
+                            "[AgentLoop] Force-breaking tool loop after {} repeated read_file attempts",
                             consecutive_same_call
                         );
                         let msg = format!("I read the file `{}` but wasn't able to complete the task with it. Could you give me more specific instructions?", call_key);
-                        let _ = self
-                            .event_bus
-                            .emit(crate::engine::event_bus::BusEvent::Thread {
-                                thread_id,
-                                event:
-                                    crate::engine::thread_events::ThreadEvent::ResponseGenerated {
-                                        text: msg.clone(),
-                                        images: images.clone(),
-                                        model: effective_model.clone(),
-                                        reasoning_effort: effective_effort.clone(),
-                                    },
-                                meta: meta.clone(),
-                            })
+                        self.event_bus
+                            .emit_or_log(
+                                crate::engine::event_bus::BusEvent::Thread {
+                                    thread_id,
+                                    event:
+                                        crate::engine::thread_events::ThreadEvent::ResponseGenerated {
+                                            text: msg.clone(),
+                                            images: images.clone(),
+                                            model: effective_model.clone(),
+                                            reasoning_effort: effective_effort.clone(),
+                                        },
+                                    meta: meta.clone(),
+                                },
+                                "[AgenticLoop] ResponseGenerated (read_file force-break)",
+                            )
                             .await;
+                        *terminator_emitted = true;
                         return Ok(ProcessResult {
                             response: msg,
                             steps: vec![],
@@ -598,26 +836,29 @@ impl LucidosEngine {
                     if consecutive_same_call >= 5 {
                         // Hard break after 5 — the LLM ignored warnings
                         log!(
-                            "Force-breaking loop: {} called {} times on '{}'",
+                            "[AgentLoop] Force-breaking loop: {} called {} times on '{}'",
                             current_tool,
                             consecutive_same_call,
                             target
                         );
                         let msg = format!("I tried to process `{}` but it failed repeatedly. The error may need to be resolved before retrying.", target);
-                        let _ = self
-                            .event_bus
-                            .emit(crate::engine::event_bus::BusEvent::Thread {
-                                thread_id,
-                                event:
-                                    crate::engine::thread_events::ThreadEvent::ResponseGenerated {
-                                        text: msg.clone(),
-                                        images: images.clone(),
-                                        model: effective_model.clone(),
-                                        reasoning_effort: effective_effort.clone(),
-                                    },
-                                meta: meta.clone(),
-                            })
+                        self.event_bus
+                            .emit_or_log(
+                                crate::engine::event_bus::BusEvent::Thread {
+                                    thread_id,
+                                    event:
+                                        crate::engine::thread_events::ThreadEvent::ResponseGenerated {
+                                            text: msg.clone(),
+                                            images: images.clone(),
+                                            model: effective_model.clone(),
+                                            reasoning_effort: effective_effort.clone(),
+                                        },
+                                    meta: meta.clone(),
+                                },
+                                "[AgenticLoop] ResponseGenerated (generic force-break)",
+                            )
                             .await;
+                        *terminator_emitted = true;
                         return Ok(ProcessResult {
                             response: msg,
                             steps: vec![],
@@ -632,7 +873,7 @@ impl LucidosEngine {
 
                     // Soft break at 3-4 — warn the LLM and let it continue
                     log!(
-                        "Warning LLM: {} called {} times on '{}'",
+                        "[AgentLoop] Warning LLM: {} called {} times on '{}'",
                         current_tool,
                         consecutive_same_call,
                         target
@@ -651,7 +892,12 @@ impl LucidosEngine {
 
             for tool_call in &response.tool_calls {
                 let tool_desc = self.describe_tool(&tool_call.name, &tool_call.arguments);
-                log!("Step {}/{}: {}", iterations, MAX_ITERATIONS, tool_desc);
+                log!(
+                    "[AgentLoop] Step {}/{}: {}",
+                    iterations,
+                    MAX_ITERATIONS,
+                    tool_desc
+                );
 
                 // Persist + broadcast ToolCalled. Capture the event_id so spawn-style
                 // tools (run_thread, run_claude) can record which tool call triggered
@@ -677,7 +923,11 @@ impl LucidosEngine {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     if let Some(cached) = read_cache.get(path) {
-                        log!("Step {}/{}: (cached)", iterations, MAX_ITERATIONS);
+                        log!(
+                            "[AgentLoop] Step {}/{}: (cached)",
+                            iterations,
+                            MAX_ITERATIONS
+                        );
                         cached.clone()
                     } else {
                         let r = self
@@ -791,45 +1041,54 @@ impl LucidosEngine {
                 }
 
                 // Persist + broadcast ToolResult
-                let _ = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ToolResult {
-                            name: tool_call.name.clone(),
-                            result: crate::core::sanitize_for_jsonb(&tool_result_text),
-                            images: tool_result_images,
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ToolResult {
+                                name: tool_call.name.clone(),
+                                result: crate::core::sanitize_for_jsonb(&tool_result_text),
+                                images: tool_result_images,
+                            },
+                            meta: meta.clone(),
                         },
-                        meta: meta.clone(),
-                    })
+                        "[AgenticLoop] ToolResult",
+                    )
                     .await;
 
                 if is_error {
                     had_errors = true;
                     log!(
-                        "Step {}/{}: Error, will retry: {}",
+                        "[AgentLoop] Step {}/{}: Error, will retry: {}",
                         iterations,
                         MAX_ITERATIONS,
                         result
                     );
                 } else {
-                    log!("Step {}/{}: Success", iterations, MAX_ITERATIONS);
+                    log!(
+                        "[AgentLoop] Step {}/{}: Success",
+                        iterations,
+                        MAX_ITERATIONS
+                    );
                 }
 
                 // Send credential request as a dedicated SSE event so frontend can show inline form
-                if result.starts_with("[CREDENTIAL_REQUEST]") {
+                if result.starts_with(crate::engine::tools::credentials::CREDENTIAL_REQUEST_PREFIX)
+                {
                     if let Some(json_start) = result.find('{') {
                         let payload = result[json_start..].to_string();
-                        let _ = self
-                            .event_bus
-                            .emit(crate::engine::event_bus::BusEvent::Thread {
-                                thread_id,
-                                event:
-                                    crate::engine::thread_events::ThreadEvent::CredentialRequest {
-                                        payload,
-                                    },
-                                meta: crate::engine::thread_events::EventMeta::NONE,
-                            })
+                        self.event_bus
+                            .emit_or_log(
+                                crate::engine::event_bus::BusEvent::Thread {
+                                    thread_id,
+                                    event:
+                                        crate::engine::thread_events::ThreadEvent::CredentialRequest {
+                                            payload,
+                                        },
+                                    meta: crate::engine::thread_events::EventMeta::NONE,
+                                },
+                                "[AgenticLoop] CredentialRequest",
+                            )
                             .await;
                     }
                 }
@@ -838,30 +1097,34 @@ impl LucidosEngine {
                 if result.starts_with("[EMAIL_CONFIRM]") {
                     if let Some(json_start) = result.find('{') {
                         let payload = result[json_start..].to_string();
-                        let _ = self
-                            .event_bus
-                            .emit(crate::engine::event_bus::BusEvent::Thread {
-                                thread_id,
-                                event:
-                                    crate::engine::thread_events::ThreadEvent::EmailConfirmRequest {
-                                        payload,
-                                    },
-                                meta: crate::engine::thread_events::EventMeta::NONE,
-                            })
+                        self.event_bus
+                            .emit_or_log(
+                                crate::engine::event_bus::BusEvent::Thread {
+                                    thread_id,
+                                    event:
+                                        crate::engine::thread_events::ThreadEvent::EmailConfirmRequest {
+                                            payload,
+                                        },
+                                    meta: crate::engine::thread_events::EventMeta::NONE,
+                                },
+                                "[AgenticLoop] EmailConfirmRequest",
+                            )
                             .await;
                     }
                 }
 
                 // Send push notification request SSE event to trigger browser permission
                 if result.starts_with("[PUSH_NOTIFICATION_REQUEST]") {
-                    let _ = self
-                        .event_bus
-                        .emit(crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event:
-                                crate::engine::thread_events::ThreadEvent::PushNotificationRequest,
-                            meta: crate::engine::thread_events::EventMeta::NONE,
-                        })
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event:
+                                    crate::engine::thread_events::ThreadEvent::PushNotificationRequest,
+                                meta: crate::engine::thread_events::EventMeta::NONE,
+                            },
+                            "[AgenticLoop] PushNotificationRequest",
+                        )
                         .await;
                 }
 
@@ -892,27 +1155,31 @@ impl LucidosEngine {
                     .iter()
                     .any(|tc| tc.name == tn::EDIT_FILE);
             let instruction = if had_edit_errors {
-                let _ = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::Retrying {
-                            reason: "Retrying with different approach".to_string(),
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::Retrying {
+                                reason: "Retrying with different approach".to_string(),
+                            },
+                            meta: crate::engine::thread_events::EventMeta::NONE,
                         },
-                        meta: crate::engine::thread_events::EventMeta::NONE,
-                    })
+                        "[AgenticLoop] Retrying (edit error)",
+                    )
                     .await;
                 "One or more edit_file calls failed because old_string was not found — the file content has changed since you last read it. The error message above contains the file's current content. Use THAT content (not your earlier context) to construct the correct old_string for your next edit_file call."
             } else if had_errors {
-                let _ = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::Retrying {
-                            reason: "Retrying with different approach".to_string(),
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::Retrying {
+                                reason: "Retrying with different approach".to_string(),
+                            },
+                            meta: crate::engine::thread_events::EventMeta::NONE,
                         },
-                        meta: crate::engine::thread_events::EventMeta::NONE,
-                    })
+                        "[AgenticLoop] Retrying (tool error)",
+                    )
                     .await;
                 "Error occurred. Review the error messages above and try a different approach."
             } else {
@@ -989,25 +1256,7 @@ impl LucidosEngine {
                         &prompt.text[..prompt.text.floor_char_boundary(80)]
                     );
 
-                    // Use the client-provided event_id so the frontend can match the
-                    // SSE event back to its optimistic pending message.
-                    let mut inject_meta = meta.clone();
-                    inject_meta.event_id = prompt.event_id;
-
-                    // Carry mode/origin onto the persisted event so the chip
-                    // resolves to the actor (e.g. Agent for a child callback)
-                    // rather than the default "Lucidos Engine".
-                    let _ = self
-                        .event_bus
-                        .emit(crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::UserPromptInjected {
-                                text: prompt.text.clone(),
-                                mode: prompt.mode,
-                                origin: prompt.origin.clone(),
-                            },
-                            meta: inject_meta,
-                        })
+                    emit_user_prompt_injected_event(&self.event_bus, thread_id, &meta, &prompt)
                         .await;
 
                     let framed = match prompt.mode {
@@ -1077,7 +1326,7 @@ impl LucidosEngine {
                     }
                     if stripped > 0 {
                         log!(
-                            "Stripped {}KB of image data from context after first LLM call",
+                            "[AgentLoop] Stripped {}KB of image data from context after first LLM call",
                             stripped / 1024
                         );
                     }
@@ -1090,7 +1339,10 @@ impl LucidosEngine {
                         .update_image_description(origin_id, desc)
                         .await
                     {
-                        log!("Failed to update image description in event: {}", e);
+                        log!(
+                            "[AgentLoop] Failed to update image description in event: {}",
+                            e
+                        );
                     }
                 }
             }
@@ -1115,15 +1367,17 @@ impl LucidosEngine {
     ) -> Option<String> {
         if tool_name == tn::REFRESH_FILE {
             let path = tool_args["path"].as_str().unwrap_or("");
-            let _ = self
-                .event_bus
-                .emit(crate::engine::event_bus::BusEvent::Thread {
-                    thread_id,
-                    event: crate::engine::thread_events::ThreadEvent::RefreshFile {
-                        path: path.to_string(),
+            self.event_bus
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::Thread {
+                        thread_id,
+                        event: crate::engine::thread_events::ThreadEvent::RefreshFile {
+                            path: path.to_string(),
+                        },
+                        meta: crate::engine::thread_events::EventMeta::NONE,
                     },
-                    meta: crate::engine::thread_events::EventMeta::NONE,
-                })
+                    "[AgenticLoop] RefreshFile",
+                )
                 .await;
             Some(format!("File preview refreshed for {}", path))
         } else if tool_name == tn::CAPTURE_APP || tool_name == tn::REFRESH_APP {
@@ -1134,15 +1388,17 @@ impl LucidosEngine {
                 .to_string();
 
             if tool_name == tn::REFRESH_APP {
-                let _ = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::RefreshAppUI {
-                            app_id: app_id.clone(),
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::RefreshAppUI {
+                                app_id: app_id.clone(),
+                            },
+                            meta: crate::engine::thread_events::EventMeta::NONE,
                         },
-                        meta: crate::engine::thread_events::EventMeta::NONE,
-                    })
+                        "[AgenticLoop] RefreshAppUI (refresh_app tool)",
+                    )
                     .await;
             }
 
@@ -1165,16 +1421,18 @@ impl LucidosEngine {
                     captures.insert(request_id.clone(), tx);
                 }
 
-                let _ = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::CaptureAppUI {
-                            app_id: app_id.clone(),
-                            request_id: request_id.clone(),
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::CaptureAppUI {
+                                app_id: app_id.clone(),
+                                request_id: request_id.clone(),
+                            },
+                            meta: crate::engine::thread_events::EventMeta::NONE,
                         },
-                        meta: crate::engine::thread_events::EventMeta::NONE,
-                    })
+                        "[AgenticLoop] CaptureAppUI",
+                    )
                     .await;
 
                 Some(
@@ -1394,21 +1652,23 @@ impl LucidosEngine {
                     args_summary
                 };
 
-                let _ = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::McpConsentRequest {
-                            data: serde_json::json!({
-                                "request_id": consent_request_id,
-                                "server_name": server_name,
-                                "tool_name": mcp_tool_name,
-                                "arguments_summary": args_summary,
-                            })
-                            .to_string(),
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::McpConsentRequest {
+                                data: serde_json::json!({
+                                    "request_id": consent_request_id,
+                                    "server_name": server_name,
+                                    "tool_name": mcp_tool_name,
+                                    "arguments_summary": args_summary,
+                                })
+                                .to_string(),
+                            },
+                            meta: crate::engine::thread_events::EventMeta::NONE,
                         },
-                        meta: crate::engine::thread_events::EventMeta::NONE,
-                    })
+                        "[AgenticLoop] McpConsentRequest",
+                    )
                     .await;
 
                 match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
@@ -1454,7 +1714,6 @@ impl LucidosEngine {
         request_id: Uuid,
         extraction_ctx: &str,
         device_id: Option<&str>,
-        _intent_id: &str,
         cancel_token: &CancellationToken,
         thread_id: Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -1604,17 +1863,19 @@ impl LucidosEngine {
                 };
 
                 // Emit ToolResult via bus
-                let _ = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ToolResult {
-                            name: tc.name.clone(),
-                            result: crate::core::sanitize_for_jsonb(&result),
-                            images: vec![],
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ToolResult {
+                                name: tc.name.clone(),
+                                result: crate::core::sanitize_for_jsonb(&result),
+                                images: vec![],
+                            },
+                            meta: crate::engine::thread_events::EventMeta::NONE,
                         },
-                        meta: crate::engine::thread_events::EventMeta::NONE,
-                    })
+                        "[IntentLoop] ToolResult",
+                    )
                     .await;
 
                 result_blocks.push(ContentBlock::ToolResult {
@@ -1801,7 +2062,7 @@ mod should_flush_tests {
     #[test]
     fn accepts_ocr_description() {
         assert!(!is_bad_image_description(
-            "The image shows a document with the text: 'Møte med Kenneth, 14. mars kl 10:00-11:00'"
+            "The image shows a document with the text: 'Møte med Alex, 14. mars kl 10:00-11:00'"
         ));
     }
 }
@@ -1845,3 +2106,7 @@ mod intent_loop_tools_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "agentic_loop_tests.rs"]
+mod agentic_loop_db_tests;

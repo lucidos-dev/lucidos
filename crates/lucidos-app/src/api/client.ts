@@ -11,8 +11,9 @@ import type {
   TriggersListResponse,
   UploadResponse,
 } from './types';
-import type { AuthType, Notification, OAuthAccountInfo, PinnedAppEntry, App, TriggerRun } from '../store/types';
-import type { RepoDiff } from '../store/store';
+import type { AuthType, Notification, OAuthAccountInfo, PinnedAppEntry, App, TriggerRun, HistoricalTriggerInfo } from '../store/types';
+import type { RepoDiff, DiffFile } from '../store/store';
+import type { AnswerKind } from '../store/thread-events';
 import { lucidos } from '@lucidos/sdk';
 
 export const API_BASE = '';
@@ -140,17 +141,16 @@ export async function cancelChat(threadId?: string): Promise<void> {
   if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => res.statusText));
 }
 
-export async function interruptClaudeCode(threadId?: string): Promise<void> {
-  const params = new URLSearchParams();
-  if (threadId) params.set('thread_id', threadId);
-  const qs = params.toString();
-  const url = qs ? `${API}/claude-code/interrupt?${qs}` : `${API}/claude-code/interrupt`;
-  const res = await mutatingFetchIdempotent(url, { method: 'POST' });
-  if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => res.statusText));
-}
-
 export async function applyNow(threadId: string): Promise<void> {
   const res = await mutatingFetch(`${API}/claude-code/apply-now?thread_id=${encodeURIComponent(threadId)}`, { method: 'POST' });
+  await throwIfNotOk(res);
+}
+
+/** Resume an interrupted thread — chat/trigger threads route through
+ *  chat::rerun, CC threads through ContinueSignal. The dispatch is decided
+ *  server-side based on thread type. */
+export async function continueThread(threadId: string): Promise<void> {
+  const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/continue`, { method: 'POST' });
   await throwIfNotOk(res);
 }
 
@@ -196,9 +196,17 @@ export type CCModelValue = 'default' | 'sonnet' | 'sonnet[1m]' | 'claude-opus-4-
 /** Reasoning effort levels from CC_REASONING_EFFORT_OPTIONS in claude_code.rs */
 export type CCReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
-export async function fetchCCCommands(threadId?: string): Promise<CCCommandsResponse> {
-  const qs = threadId ? `?thread_id=${threadId}` : '';
-  return json<CCCommandsResponse>(`${API}/claude-code/commands${qs}`);
+export async function fetchCCCommands(
+  threadId?: string,
+  repoId?: string,
+): Promise<CCCommandsResponse> {
+  const params = new URLSearchParams();
+  if (threadId) params.set('thread_id', threadId);
+  // Pass empty string explicitly so the backend resolves to the default
+  // "Lucidos" repo rather than the legacy no-repo fallback.
+  if (repoId !== undefined) params.set('repo_id', repoId);
+  const qs = params.toString();
+  return json<CCCommandsResponse>(`${API}/claude-code/commands${qs ? `?${qs}` : ''}`);
 }
 
 export async function cancelClaudeCode(apply?: boolean, threadId?: string, discard?: boolean): Promise<void> {
@@ -208,8 +216,10 @@ export async function cancelClaudeCode(apply?: boolean, threadId?: string, disca
   if (threadId) params.set('thread_id', threadId);
   const qs = params.toString();
   const url = qs ? `${API}/claude-code/cancel?${qs}` : `${API}/claude-code/cancel`;
-  const res = await mutatingFetch(url, { method: 'POST' });
-  await throwIfNotOk(res);
+  // Idempotent + iOS PWA retry: HTTP/2 half-closed POSTs after backgrounding
+  // reject with TypeError("Load failed"), forcing the user to click again.
+  const res = await mutatingFetchIdempotent(url, { method: 'POST' });
+  if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => res.statusText));
 }
 
 export async function discardCCChanges(threadId: string): Promise<void> {
@@ -220,8 +230,6 @@ export async function discardCCChanges(threadId: string): Promise<void> {
   });
   if (!res.ok) throw new ApiError(res.status, await res.text());
 }
-
-import type { AnswerKind } from '../store/thread-events';
 
 /** Answer a CC AskUserQuestion. Backend emits UserQuestionAnswered then
  *  spawns CC --resume with a matching tool_result. Returns true on success;
@@ -330,7 +338,6 @@ export async function discardAllChanges(): Promise<{ discarded: number; failed: 
   return json(`${API}/changes/discard-all`, { method: 'POST' });
 }
 
-
 export async function revertChange(id: string): Promise<{ message: string }> {
   return json(`${API}/changes/${id}/revert`, { method: 'POST' });
 }
@@ -347,6 +354,19 @@ export async function getChangeById(changeId: string): Promise<Change> {
 
 export async function getChangeDiff(changeId: string): Promise<RepoDiff> {
   return json(`${API}/changes/${changeId}/diff`);
+}
+
+export interface ThreadCcDiff {
+  files: DiffFile[];
+  repo_root: string;
+  branch_name: string;
+  base_ref: string;
+}
+
+/** 3-dot diff of a CC worktree branch vs the repo's default remote branch.
+ *  Used for external-repo CC sessions that never produce a Lucidos `Change`. */
+export async function getThreadCcDiff(threadId: string): Promise<ThreadCcDiff> {
+  return json(`${API}/threads/${encodeURIComponent(threadId)}/cc-diff`);
 }
 
 export async function getChangeFileContent(changeId: string, path: string): Promise<string> {
@@ -576,14 +596,49 @@ export async function postAppCapture(
 }
 
 // --- MCP Consent ---
-export async function postMcpConsent(requestId: string, allowed: boolean): Promise<void> {
+/** Scope to remember when the user grants an "Always allow"-style click.
+ *  `narrow` / `broad` append to `~/.lucidos/cc-allowed-tools` and reach CC
+ *  via `--allowedTools` on every spawn (survives engine restart, but only
+ *  works for tools/paths CC respects). `session` is engine-side, in-memory,
+ *  scoped to one thread — works for *every* tool and path, including CC's
+ *  protected `.claude/` and `.git/` writes. Omit for one-shot Allow. */
+export type PersistScope = 'narrow' | 'broad' | 'session';
+
+export async function postMcpConsent(
+  requestId: string,
+  allowed: boolean,
+  persistScope?: PersistScope,
+): Promise<void> {
+  const body: Record<string, unknown> = { request_id: requestId, allowed };
+  if (persistScope) body.persist_scope = persistScope;
   const resp = await mutatingFetch(`${API}/mcp/consent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ request_id: requestId, allowed }),
+    body: JSON.stringify(body),
   });
   if (!resp.ok) {
     throw new ApiError(resp.status, `MCP consent POST failed for request ${requestId}`);
+  }
+}
+
+// --- CC allowed tools (~/.lucidos/cc-allowed-tools) ---
+export async function getCcAllowedTools(): Promise<string> {
+  const resp = await fetch(`${API}/cc-allowed-tools`);
+  if (!resp.ok) {
+    throw new ApiError(resp.status, 'GET cc-allowed-tools failed');
+  }
+  const json = (await resp.json()) as { contents: string };
+  return json.contents;
+}
+
+export async function putCcAllowedTools(contents: string): Promise<void> {
+  const resp = await mutatingFetch(`${API}/cc-allowed-tools`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents }),
+  });
+  if (!resp.ok) {
+    throw new ApiError(resp.status, 'PUT cc-allowed-tools failed');
   }
 }
 
@@ -635,6 +690,7 @@ export function createTrigger(body: {
   cron_expressions: string[];
   on_event?: string;
   condition?: Record<string, unknown>;
+  go_to_review?: boolean;
 }): Promise<ApiResult> {
   return lucidos.triggers.create(body) as Promise<ApiResult>;
 }
@@ -648,6 +704,7 @@ export function updateTrigger(
     paused?: boolean;
     on_event?: string | null;
     condition?: Record<string, unknown> | null;
+    go_to_review?: boolean;
   }
 ): Promise<ApiResult> {
   return lucidos.triggers.update(id, body) as Promise<ApiResult>;
@@ -657,6 +714,61 @@ export function deleteTriggerApi(
   id: string
 ): Promise<ApiResult> {
   return lucidos.triggers.delete(id) as Promise<ApiResult>;
+}
+
+// Bypasses the @lucidos/sdk delegation above — this is engine-internal
+// (powers the thread-filter dropdown), not part of the public app API.
+export function listHistoricalTriggers(): Promise<{ triggers: HistoricalTriggerInfo[] }> {
+  return json(`${API}/triggers/historical`);
+}
+
+// --- Compose state machine (threads-as-drafts) ---
+//
+// Compose drafts → POST /threads + PUT /threads/:id/compose; DELETE /threads/:id.
+// Followup drafts (compose payload on an active thread) → PUT /threads/:id/compose.
+// State-machine guard returns 410 on writes to discarded threads.
+// See `docs/plans/2026-05-03-threads-as-drafts-design.md`.
+
+/** Ensure a thread exists in `composing` state. Idempotent on the same
+ *  `{id, mode}` (POST /threads returns 200). 409 propagates — a different
+ *  mode (Composing) or wrong state (Active/Archived) is a real conflict the
+ *  caller must surface; swallowing it would silently overwrite the user's
+ *  mode toggle when two devices race the first keystroke. */
+export async function ensureThreadStarted(id: string, mode: string): Promise<void> {
+  const res = await mutatingFetchIdempotent(`${API_BASE}/api/v1/threads`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, mode }),
+  });
+  await throwIfNotOk(res);
+}
+
+export async function putComposeOnThread(
+  threadId: string,
+  text: string,
+  images: string[],
+  mode: string | null,
+): Promise<void> {
+  const res = await mutatingFetchIdempotent(
+    `${API_BASE}/api/v1/threads/${encodeURIComponent(threadId)}/compose`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, images, mode }),
+    },
+  );
+  await throwIfNotOk(res);
+}
+
+/** Discard a composing thread. 410 (already discarded) and 404 (never
+ *  existed) are the desired end-state — caller swallows. 409 (Active /
+ *  Archived) is a real conflict — caller surfaces. */
+export async function deleteThread(id: string): Promise<void> {
+  const res = await mutatingFetchIdempotent(
+    `${API_BASE}/api/v1/threads/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+  );
+  await throwIfNotOk(res);
 }
 
 // --- Search Everywhere ---
@@ -808,12 +920,14 @@ export async function getBackupKey(): Promise<BackupKeyResponse> {
   return json(`${API}/backup/key`);
 }
 
-export async function createBackup(provider: string): Promise<BackupEntry> {
-  return json(`${API}/backup`, {
+/** Returns when the backup is queued — completion arrives via SSE
+ *  (`BackupCompleted` / `BackupFailed`), not by awaiting this promise. */
+export async function createBackup(provider: string): Promise<void> {
+  await json(`${API}/backup`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ provider }),
-  }, 300000);
+  });
 }
 
 export async function listBackups(provider: string): Promise<BackupEntry[]> {
@@ -917,13 +1031,4 @@ export interface BrowseResult {
 export async function browseDirectories(path?: string): Promise<BrowseResult> {
   const params = path ? `?path=${encodeURIComponent(path)}` : '';
   return json(`${API}/browse-directories${params}`);
-}
-
-// --- Saved Contexts ---
-export async function saveContext(label: string, model: string | undefined, sections: Array<{ name: string; content: string; char_count: number }>): Promise<{ id: string }> {
-  return json(`${API}/saved-contexts`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ label, model, sections }),
-  });
 }

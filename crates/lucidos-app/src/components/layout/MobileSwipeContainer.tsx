@@ -286,7 +286,9 @@ export function MobileSwipeContainer() {
     const vv = window.visualViewport;
     if (!vv) return;
     let fullHeight = vv.height;
-    let lastSetHeight = fullHeight;
+    // -1 sentinel ensures the initial setHeight() call writes the CSS variable
+    // instead of being short-circuited by the equality guard inside setHeight.
+    let lastSetHeight = -1;
 
     // px, not rem: --app-height is a physical viewport measurement that must
     // NOT scale with --user-ui-scale. Using rem caused the app shell to exceed

@@ -1,4 +1,87 @@
 use super::*;
+use crate::core::store::types::Step;
+
+fn tool_step(name: &str, description: &str, success: bool) -> Step {
+    Step {
+        description: description.to_string(),
+        tool_name: Some(name.to_string()),
+        success,
+        context_tokens: None,
+        context_messages: None,
+        trimmed: None,
+    }
+}
+
+fn synthetic_step(description: &str) -> Step {
+    Step {
+        description: description.to_string(),
+        tool_name: None,
+        success: true,
+        context_tokens: None,
+        context_messages: None,
+        trimmed: None,
+    }
+}
+
+#[test]
+fn format_history_steps_empty_returns_none() {
+    assert!(format_history_steps(&[]).is_none());
+}
+
+#[test]
+fn format_history_steps_skips_thinking_and_memory() {
+    let steps = vec![
+        synthetic_step("Requesting"),
+        synthetic_step("Memory: 3 results"),
+    ];
+    assert!(
+        format_history_steps(&steps).is_none(),
+        "synthetic (no tool_name) steps must not appear in history"
+    );
+}
+
+#[test]
+fn format_history_steps_renders_tool_calls() {
+    let steps = vec![
+        tool_step(
+            "load_knowhow",
+            "Loading know-how 'ops/nightly-pipeline'...",
+            true,
+        ),
+        tool_step("emit_event", "Emitting BuildClean event...", true),
+    ];
+    let out = format_history_steps(&steps).unwrap();
+    assert!(out.starts_with(" [tools: "));
+    assert!(out.contains("Loading know-how 'ops/nightly-pipeline'"));
+    assert!(out.contains("Emitting BuildClean event"));
+    assert!(out.contains("[ok]"));
+    // No trailing "..." inherited from describe_tool's progress format
+    assert!(!out.contains("...["));
+}
+
+#[test]
+fn format_history_steps_marks_failures() {
+    let steps = vec![tool_step("load_knowhow", "Loading know-how 'oops'...", false)];
+    let out = format_history_steps(&steps).unwrap();
+    assert!(out.contains("[FAIL]"));
+    assert!(!out.contains("[ok]"));
+}
+
+#[test]
+fn format_history_steps_capped_at_2k() {
+    // 50 tool calls each with a long description should be truncated, not unbounded.
+    let steps: Vec<Step> = (0..50)
+        .map(|i| tool_step("read_file", &format!("Reading {}.rs...", "x".repeat(80 + i)), true))
+        .collect();
+    let out = format_history_steps(&steps).unwrap();
+    // Cap is 2KB on the joined inner string + a small prefix; allow some slack.
+    assert!(
+        out.len() <= 2_200,
+        "expected output to be capped, got {} bytes",
+        out.len()
+    );
+    assert!(out.contains("chars omitted"), "expected truncation marker");
+}
 
 #[test]
 fn short_message_unchanged() {

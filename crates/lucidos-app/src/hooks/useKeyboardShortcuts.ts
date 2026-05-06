@@ -1,5 +1,5 @@
 import { useEffect } from 'preact/hooks';
-import { createComposeDraft } from '../store/actions/drafts';
+import { unfocusThread } from '../store/actions/threads';
 import { focusPromptNow } from '../components/chat/promptFocus';
 import { searchEverywhereOpen } from '../store/store';
 import { toggleThreads } from '../store/actions/pane';
@@ -9,7 +9,7 @@ import { UI_SCALE_STEP } from '../store/actions/preferences';
 import { isMobile } from '../utils/viewport';
 
 function startNewThread() {
-  createComposeDraft();
+  unfocusThread();
   requestAnimationFrame(() => {
     focusPromptNow();
   });

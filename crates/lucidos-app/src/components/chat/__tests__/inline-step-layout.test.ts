@@ -38,4 +38,13 @@ describe('inline step layout (CSS regression)', () => {
     expect(block).toContain('overflow: hidden');
     expect(block).toContain('text-overflow: ellipsis');
   });
+
+  // Regression: short description (e.g. "Memory searched") was clipped to
+  // "Memory searc…" when the sibling detail was long, because both flex
+  // children shrank proportionally. Detail uses flex: 1 1 0 so it absorbs
+  // shrinkage first, leaving the description at its content width.
+  it('step-detail must use flex 1 1 0 to absorb shrinkage', () => {
+    const block = getBlock('.inline-step .step-detail');
+    expect(block).toContain('flex: 1 1 0');
+  });
 });

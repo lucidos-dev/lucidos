@@ -53,11 +53,9 @@ export function Toast() {
               <button class="action-btn" onClick={t.action.onClick}>{t.action.label}</button>
             </div>
           )}
-          {(t.type === 'error' || t.type === 'warning' || t.key || t.action || t.onClick) && (
-            <button class="icon-btn toast-close" onClick={() => dismissToast(t.key ?? t.id)} aria-label="Dismiss">
-              <CloseIcon />
-            </button>
-          )}
+          <button class="icon-btn toast-close" onClick={() => dismissToast(t.key ?? t.id)} aria-label="Dismiss">
+            <CloseIcon />
+          </button>
         </div>
       ))}
     </div>

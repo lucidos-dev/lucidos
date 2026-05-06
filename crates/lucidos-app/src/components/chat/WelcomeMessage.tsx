@@ -17,6 +17,18 @@ export function WelcomeMessage() {
           <li>"Remind me every morning at 8am to..."</li>
         </ul>
       </div>
+      <p class="disclaimer">
+        Provided as is under the{' '}
+        <a
+          href="https://github.com/lucidos-dev/lucidos/blob/main/LICENSE"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          MIT license
+        </a>
+        . No warranty, and no liability for actions performed or their
+        consequences.
+      </p>
     </div>
   );
 }

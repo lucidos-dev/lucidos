@@ -6,6 +6,8 @@ pub const READ_FILE: &str = "read_file";
 pub const WRITE_FILE: &str = "write_file";
 pub const EDIT_FILE: &str = "edit_file";
 pub const LIST_FILES: &str = "list_files";
+pub const GLOB_FILES: &str = "glob_files";
+pub const GREP_FILES: &str = "grep_files";
 pub const COPY_FILE: &str = "copy_file";
 pub const DELETE_FILE: &str = "delete_file";
 
@@ -28,6 +30,7 @@ pub const BROWSER_CLEAR_DATA: &str = "browser_clear_data";
 pub const WEB_SEARCH: &str = "web_search";
 pub const FETCH_NEWS: &str = "fetch_news";
 pub const HTTP_REQUEST: &str = "http_request";
+pub const PROXY_REQUEST: &str = "proxy_request";
 
 // Email
 pub const SEND_EMAIL: &str = "send_email";
@@ -61,8 +64,6 @@ pub const CONNECT_OAUTH_ACCOUNT: &str = "connect_oauth_account";
 pub const CREATE_APP: &str = "create_app";
 pub const LIST_APPS: &str = "list_apps";
 pub const EXECUTE_INTENT: &str = "execute_intent";
-pub const LIST_INTENTS: &str = "list_intents";
-pub const LIST_KNOWHOW: &str = "list_knowhow";
 pub const LOAD_KNOWHOW: &str = "load_knowhow";
 
 // App UI & file refresh (handled by handle_special_tool)
@@ -99,3 +100,9 @@ pub const REMOVE_MCP_SERVER: &str = "remove_mcp_server";
 
 // Repository management
 pub const MANAGE_REPOSITORIES: &str = "manage_repositories";
+
+// Plugins
+pub const INSTALL_PLUGIN: &str = "install_plugin";
+pub const CHECK_PLUGIN_UPDATES: &str = "check_plugin_updates";
+pub const UPDATE_PLUGIN: &str = "update_plugin";
+pub const UNINSTALL_PLUGIN: &str = "uninstall_plugin";

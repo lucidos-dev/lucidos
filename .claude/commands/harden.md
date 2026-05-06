@@ -1,4 +1,4 @@
-Harden the code: review changed code for reuse, quality, and efficiency, then fix any issues found. Check for bugs and CLAUDE.md compliance. Run this before finishing your session.
+Harden the code: review changed code for reuse, quality, and efficiency, then fix any issues found. Check for bugs and CLAUDE.md compliance, then run the test suites for what was touched (iterating from Phase 1 if anything fails). Run this before finishing your session.
 
 ## Phase 0: Check if Already Hardened
 
@@ -12,7 +12,20 @@ in `$PWD`. `FRESH` means HEAD still matches the SHA recorded by the last
 
 If the output is `ALREADY_HARDENED`, inform the user: "Already hardened — skipping." and stop. Do NOT re-run hardening.
 
+## Phase 0.5: Detect Docs-Only Diff
+
+Run `git diff main...HEAD --name-only`. If every changed file ends in `.md` or `.txt`, the diff is **docs-only**. In docs-only mode:
+
+- Skip Phase 1 (`/simplify` looks for code-shaped issues that don't apply to prose).
+- Skip Phase 2 Agent 1 (no code logic to bug-check).
+- Phase 2 Agents 2 and 3 (compliance, regression), Phase 3, Phase 4, Phase 5 still run.
+- Phase 4.5 already auto-skips for docs-only via its test-selection table.
+
+Do NOT extend this fast path to "string-only" or "comment-only" `.rs` edits. Strings can carry format args, escape sequences, regexes, or be parsed at runtime — any `.rs` change keeps the full cycle.
+
 ## Phase 1: Run /simplify
+
+**Docs-only fast path:** if Phase 0.5 flagged this diff as docs-only, skip this phase entirely and proceed to Phase 2.
 
 Invoke the `/simplify` skill using the Skill tool. This reviews the branch diff for code reuse, quality, and efficiency issues and auto-fixes them.
 
@@ -23,6 +36,8 @@ Wait for simplify to complete. If it made changes, commit them before proceeding
 Run `git diff main...HEAD` to get the current diff (including any simplify fixes). Also run `git diff main...HEAD --name-only` to get the list of changed files. Launch three agents in parallel:
 
 ### Agent 1: Bug Detection
+
+**Docs-only fast path:** if Phase 0.5 flagged this diff as docs-only, skip this agent (Agents 2 and 3 still run).
 
 Scan the diff for bugs and incorrect logic. Tag each finding with a severity:
 
@@ -67,6 +82,23 @@ Only issues confirmed by validation proceed to the report.
 
 - If **no validated issues**: report "No bugs or compliance issues found."
 - If **validated issues found**: list each issue grouped by severity (🔴 Bug, 🟡 Nit) with file, line, and description. Fix 🔴 bugs directly. Ask the user about 🟡 nits.
+
+Commit any fixes from this phase before proceeding to Phase 4.5.
+
+## Phase 4.5: Verify Tests Pass
+
+Run the test suites for the layers touched on this branch.
+
+Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-selection table:
+
+- `.rs`, `Cargo.toml`, `Cargo.lock`, `.sql` → `cargo check && cargo test -p lucidos-engine`
+- `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
+- CSS-only / docs-only → skip
+- Mixed → run both
+
+If everything passes, proceed to Phase 5.
+
+If anything fails: fix the failures (or the code that caused them), commit the fixes, and **return to Phase 1**. Fixes are new code that hasn't been reviewed by `/simplify` or the hardening agents — re-run the cycle on the updated diff. Iterate until tests pass on a fully-hardened diff.
 
 ## Phase 5: Create Marker
 

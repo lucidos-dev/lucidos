@@ -118,7 +118,7 @@ export function useTooltip() {
       currentTarget = target;
       showTimer = window.setTimeout(() => {
         if (currentTarget === target) position(target, e.clientX, e.clientY);
-      }, 800);
+      }, 300);
     }
 
     function onMove(e: MouseEvent) {

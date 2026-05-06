@@ -1,13 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { ConnectionStatus } from './ConnectionStatus';
-import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView, recoveryProgress } from '../../store/store';
+import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView, recoveryProgress, draftsViewActive } from '../../store/store';
 import { useHideOnScroll } from '../../hooks/useHideOnScroll';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
-import { ComposeIcon, SearchIcon, FilterIcon } from '../shared/icons';
+import { ComposeIcon, SearchIcon, FilterIcon, DraftsIcon } from '../shared/icons';
 import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { threadChannelFilter, ALL_CHANNELS } from '../../store/store';
-import { createComposeDraft } from '../../store/actions/drafts';
+import { unfocusThread } from '../../store/actions/threads';
 import { openUrl } from '../../store/actions/artifacts';
 import { navigateToPane, resolveSwipePane } from '../../store/actions/pane';
 import { MobileAppHeader } from './MobileAppHeader';
@@ -54,19 +54,29 @@ function ThreadsHeader() {
           </svg>
         </button>
       </div>
-      <span class="threads-header-title">Threads</span>
       <div style={{ position: 'relative' }}>
         <button
           ref={toggleRef}
           class={`icon-btn header-icon threads-header-btn${filterActive ? ' filter-active' : ''}`}
           onClick={() => setFilterOpen(!filterOpen)}
+          disabled={draftsViewActive.value}
           aria-label="Filter threads"
-          data-tooltip="Filter threads"
+          data-tooltip={draftsViewActive.value ? 'Filter unavailable in drafts view' : 'Filter threads'}
+          style={draftsViewActive.value ? 'pointer-events: auto; cursor: default;' : undefined}
         >
           <FilterIcon />
         </button>
-        {filterOpen && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
+        {filterOpen && !draftsViewActive.value && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
       </div>
+      <span class="threads-header-title">Threads</span>
+      <button
+        class={`icon-btn header-icon threads-header-btn${draftsViewActive.value ? ' drafts-active' : ''}`}
+        onClick={() => { draftsViewActive.value = !draftsViewActive.value; }}
+        aria-label="Toggle drafts view"
+        data-tooltip="Drafts"
+      >
+        <DraftsIcon />
+      </button>
       <button
         class="icon-btn header-icon threads-header-btn"
         {...openSearchHandlers}
@@ -216,7 +226,7 @@ export function AppHeader() {
                 <ThreadNav showTooltip />
                 <button
                   class="icon-btn header-icon"
-                  onClick={() => createComposeDraft()}
+                  onClick={() => unfocusThread()}
                   aria-label="New thread"
                   data-tooltip={tooltipWithShortcut('New thread', 'newThread')}
                 >
@@ -229,7 +239,7 @@ export function AppHeader() {
                 <ThreadNav showTooltip />
                 <button
                   class="icon-btn header-icon brand-compose-btn"
-                  onClick={() => createComposeDraft()}
+                  onClick={() => unfocusThread()}
                   aria-label="New thread"
                   data-tooltip={tooltipWithShortcut('New thread', 'newThread')}
                 >

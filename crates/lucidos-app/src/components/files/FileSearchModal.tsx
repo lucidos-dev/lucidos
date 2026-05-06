@@ -5,10 +5,9 @@ import {
   encodeRepoPath, panelOverlay, selectedLines, repoSelectedChangeId,
 } from '../../store/store';
 import { openFilePreview } from '../../store/actions/artifacts';
-import { navigateToPane } from '../../store/actions/pane';
+import { revealContentPane } from '../../store/actions/pane';
 import { pushNavState } from '../../store/actions/navigation';
 import { getEmojiForFile } from '../../utils/fileIcons';
-import { isMobile } from '../../utils/viewport';
 import {
   collectSearchResults, filterSearchResults, type FileSearchResult,
 } from './fileSearch';
@@ -60,9 +59,14 @@ export function FileSearchModal() {
     }
   }, [selectedIndex]);
 
-  // All signal reads happen unconditionally so the full DOM tree is always
-  // rendered. On close we only toggle a CSS class — zero DOM mutations.
-  // This prevents iOS Safari PWA compositor ghost pixels.
+  // Render an empty hidden shell when closed. The 4k+ child nodes (and their
+  // signal subscriptions) would otherwise re-layout on every visualViewport.resize
+  // (each iOS keyboard show/hide writes --app-height, which propagates through
+  // position:fixed; inset:0). Same pattern as SearchEverywhere.tsx.
+  if (!isOpen) {
+    return <div class="modal-overlay file-search-overlay file-search-closed" aria-hidden="true" />;
+  }
+
   const workspaceLoaded = artifacts.value.status === 'loaded';
   const anyLoaded = workspaceLoaded
     || repoFiles.value.status === 'loaded'
@@ -95,7 +99,7 @@ export function FileSearchModal() {
           type: 'file-preview',
           path: encodeRepoPath(repoId, result.changeStatus ? 'diff' : 'file', result.path, result.changeStatus ? repoSelectedChangeId.value ?? undefined : undefined),
         };
-        if (isMobile()) navigateToPane('content');
+        revealContentPane();
         pushNavState();
       }
     }
@@ -114,13 +118,13 @@ export function FileSearchModal() {
 
   return (
     <div
-      class={`modal-overlay file-search-overlay${isOpen ? '' : ' file-search-closed'}`}
-      onTouchEnd={isOpen ? (e: TouchEvent) => {
+      class="modal-overlay file-search-overlay"
+      onTouchEnd={(e: TouchEvent) => {
         if (e.target === e.currentTarget) { e.preventDefault(); close(); }
-      } : undefined}
-      onClick={isOpen ? (e: MouseEvent) => {
+      }}
+      onClick={(e: MouseEvent) => {
         if (e.target === e.currentTarget) close();
-      } : undefined}
+      }}
     >
       <div class="file-search-modal">
         {!anyLoaded ? (

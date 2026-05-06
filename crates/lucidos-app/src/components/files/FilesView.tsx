@@ -1,4 +1,3 @@
-import { useRef } from 'preact/hooks';
 import { artifacts, repositories, repoSource, workspaceName } from '../../store/store';
 import { expandAllFolders, collapseAllFolders, uploadFiles } from '../../store/actions/artifacts';
 import { loadRepositories } from '../../store/actions/chat';
@@ -8,6 +7,7 @@ import { FolderTree } from './FolderTree';
 import { RepoFilesView } from './RepoFilesView';
 import { ChangeSelector } from './ChangeSelector';
 import { Dropdown } from '../shared/Dropdown';
+import { HiddenFileInput } from '../shared/HiddenFileInput';
 import { loadedOr } from '../../store/types';
 
 export function FilesView() {
@@ -41,11 +41,6 @@ export function FilesView() {
 function WorkspaceFilesView() {
   const loadable = artifacts.value;
   const showLoading = useDelayedLoading(loadable);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const handleImportClick = () => {
-    fileInputRef.current?.click();
-  };
 
   const handleFileSelected = (e: Event) => {
     const input = e.target as HTMLInputElement;
@@ -72,7 +67,6 @@ function WorkspaceFilesView() {
 
   return (
     <div class="workspace-files-view" data-drop-zone="import">
-      <input type="file" multiple ref={fileInputRef} style="display:none" onChange={handleFileSelected} />
       <div class="files-toolbar">
         <span class="files-toolbar-actions">
           {hasArtifacts && (
@@ -81,7 +75,10 @@ function WorkspaceFilesView() {
               <button class="files-toolbar-btn" onClick={collapseAllFolders} data-tooltip="Collapse all folders">Collapse All</button>
             </>
           )}
-          <button class="files-toolbar-btn" onClick={handleImportClick}>Import</button>
+          <label class="files-toolbar-btn">
+            <HiddenFileInput multiple onChange={handleFileSelected} />
+            Import
+          </label>
         </span>
         <span class="files-hint">Drop here to import</span>
       </div>

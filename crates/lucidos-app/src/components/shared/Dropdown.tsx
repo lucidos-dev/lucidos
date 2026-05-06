@@ -27,6 +27,8 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
   const ref = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const draftRef = useRef(value);
   const lastCommittedRef = useRef(value);
   const selected = options.find((o) => o.value === value);
@@ -80,6 +82,12 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
     }
   }, [open, showFilter]);
 
+  useEffect(() => {
+    if (!open || focusedIndex < 0 || !menuRef.current) return;
+    const el = menuRef.current.querySelectorAll('.dropdown-option')[focusedIndex] as HTMLElement | undefined;
+    el?.scrollIntoView({ block: 'nearest' });
+  }, [focusedIndex, open]);
+
   const filtered = showFilter && filter
     ? options.filter(o => o.label.toLowerCase().includes(filter.toLowerCase()))
     : options;
@@ -88,6 +96,12 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
     setOpen(false);
     setFilter('');
     setFocusedIndex(-1);
+  }
+
+  function openDropdown() {
+    setOpen(true);
+    const currentIdx = options.findIndex((o) => o.value === value);
+    setFocusedIndex(currentIdx);
   }
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -99,18 +113,31 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
     }
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      setFocusedIndex(i => Math.min(i + 1, filtered.length - 1));
-      if (!open) setOpen(true);
+      if (!open) {
+        openDropdown();
+      } else {
+        setFocusedIndex(i => Math.min(i + 1, filtered.length - 1));
+      }
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      setFocusedIndex(i => Math.max(i - 1, 0));
-    } else if (e.key === 'Enter') {
+      if (!open) {
+        openDropdown();
+      } else {
+        setFocusedIndex(i => Math.max(i - 1, 0));
+      }
+    } else if (e.key === 'Enter' || (e.key === ' ' && !showFilter)) {
+      if (!open) {
+        e.preventDefault();
+        openDropdown();
+        return;
+      }
       e.preventDefault();
       if (focusedIndex >= 0 && focusedIndex < filtered.length) {
         const picked = filtered[focusedIndex].value;
         if (freeText) commit(picked); else onChange(picked);
         closeDropdown();
         inputRef.current?.blur();
+        buttonRef.current?.focus();
       } else if (freeText && draftRef.current.trim()) {
         commit();
         closeDropdown();
@@ -145,10 +172,15 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
         </div>
       ) : (
         <button
+          ref={buttonRef}
           type="button"
           class="dropdown-trigger"
           disabled={disabled}
-          onClick={() => !disabled && setOpen(!open)}
+          onClick={() => {
+            if (disabled) return;
+            if (open) closeDropdown(); else openDropdown();
+          }}
+          onKeyDown={handleKeyDown}
         >
           <span class="dropdown-sizer">
             <span class={!selected && placeholder ? 'dropdown-placeholder' : ''}>
@@ -162,7 +194,7 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
         </button>
       )}
       {open && (
-        <div class="dropdown-menu">
+        <div class="dropdown-menu" ref={menuRef}>
           {filterable && !freeText && (
             <input
               ref={filterRef}

@@ -76,9 +76,10 @@
     padding: 0.25rem;
 }
 
-/* Image paste preview strip (above textarea) */
 .prompt-input-container {
     width: 100%;
+    max-width: var(--content-max-width);
+    margin: 0 auto;
     position: relative;
 }
 
@@ -229,8 +230,15 @@
     position: relative;
 }
 
-.prompt-submit-btn {
+.prompt-actions-right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
     margin-left: auto;
+}
+
+.save-thread-btn {
+    padding-right: 1rem;
 }
 
 .changes-bulk-actions {
@@ -272,7 +280,7 @@
 }
 
 .cc-commands-btn-active {
-    color: var(--accent-orange);
+    color: var(--initiator-cc);
     animation: cc-connect-pulse 0.6s ease-out;
 }
 
@@ -427,7 +435,8 @@
     min-width: 8.75rem;
 }
 
-.image-attach-menu button {
+.image-attach-menu button,
+.image-attach-menu label {
     display: flex;
     align-items: center;
     gap: 0.5rem;
@@ -443,12 +452,14 @@
 }
 
 @media (hover: hover) {
-    .image-attach-menu button:hover {
+    .image-attach-menu button:hover,
+    .image-attach-menu label:hover {
         background: var(--bg-hover);
     }
 }
 
-.image-attach-menu button svg {
+.image-attach-menu button svg,
+.image-attach-menu label svg {
     color: var(--text-muted);
     flex-shrink: 0;
 }
@@ -531,6 +542,15 @@
 
 .thread-content.visible {
     display: block;
+}
+
+/* Constrain transcript children to the same width as the prompt below so
+   messages line up with it on wide screens. The scroll container itself
+   stays full-width to keep the scrollbar at the pane edge. */
+.thread-content > * {
+    max-width: var(--content-max-width);
+    margin-left: auto;
+    margin-right: auto;
 }
 
 /* Spinner is always visible — no opacity animation. iOS Safari drops CSS
@@ -670,57 +690,6 @@
     white-space: nowrap;
 }
 
-.exchange-stop-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 1.125rem;
-    height: 1.125rem;
-    padding: 0;
-    border-radius: 50%;
-    background: var(--bg-secondary);
-    border: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    opacity: 0.7;
-    line-height: 0;
-    position: relative;
-    transition: color var(--duration-fast), opacity var(--duration-fast), background-color var(--duration-fast);
-}
-
-.exchange-stop-btn::before {
-    --spinner-color: var(--text-secondary);
-    content: '';
-    position: absolute;
-    inset: 0;
-    border: var(--spinner-weight) solid var(--spinner-color);
-    border-top-color: transparent;
-    border-radius: 50%;
-    box-sizing: border-box;
-    animation: spin 1s linear infinite;
-}
-
-@media (prefers-reduced-motion: reduce) {
-    .exchange-stop-btn::before {
-        animation: none;
-        border-color: var(--spinner-color);
-    }
-}
-
-@media (hover: hover) {
-    .exchange-stop-btn:hover {
-        color: var(--accent-red);
-        opacity: 1;
-        background: color-mix(in srgb, var(--accent-red) 15%, var(--bg-secondary));
-    }
-
-    .exchange-stop-btn:hover::before {
-        --spinner-color: var(--accent-red);
-        border-color: var(--spinner-color);
-        animation-play-state: paused;
-    }
-}
-
 .exchange-status-label {
     display: flex;
     align-items: center;
@@ -847,15 +816,19 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 }
 
 .initiator-panel-user {
-    border-left: 0.1875rem solid var(--accent);
+    border-left: 0.1875rem solid var(--initiator-you);
 }
 
-.initiator-panel-system {
-    border-left: 0.1875rem solid var(--accent-yellow);
+.initiator-panel-lucidos {
+    border-left: 0.1875rem solid var(--initiator-agent);
 }
 
+/* Engine — shared accent for system + trigger + every change-lifecycle variant
+   (ChangeApplied/Failed/Discarded/Reverted always render with variant: 'system',
+   so .initiator-panel-system already covers them; no per-change border needed). */
+.initiator-panel-system,
 .initiator-panel-trigger {
-    border-left: 0.1875rem solid var(--accent-green);
+    border-left: 0.1875rem solid var(--initiator-engine);
 }
 
 .initiator-header {
@@ -870,8 +843,13 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     flex-wrap: wrap;
 }
 
-.initiator-panel-system .initiator-header {
-    background: color-mix(in srgb, var(--accent-yellow) 4%, var(--bg-secondary));
+.initiator-panel-system .initiator-header,
+.initiator-panel-trigger .initiator-header {
+    background: color-mix(in srgb, var(--initiator-engine) 4%, var(--bg-secondary));
+}
+
+.initiator-panel-lucidos .initiator-header {
+    background: color-mix(in srgb, var(--initiator-agent) 4%, var(--bg-secondary));
 }
 
 .initiator-header-clickable {
@@ -1009,7 +987,7 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 .response-executor-icon svg {
     width: var(--icon-size-sm);
     height: var(--icon-size-sm);
-    color: var(--accent-orange);
+    color: var(--initiator-cc);
 }
 
 .response-executor-label {
@@ -1033,7 +1011,8 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     color: var(--text-muted);
 }
 
-.response-panel-collapsed .response-header {
+.response-panel-collapsed .response-header,
+.response-panel-bodyless .response-header {
     border-bottom: none;
 }
 
@@ -1041,57 +1020,52 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     padding: 0.75rem 1rem;
 }
 
-.response-aborted-marker {
-    display: flex;
-    align-items: center;
-    gap: 0.375rem;
-    margin-top: 0.5rem;
-    padding: 0.375rem 0.625rem;
-    border-left: 0.1875rem solid var(--accent-yellow);
-    background: color-mix(in srgb, var(--accent-yellow) 8%, var(--bg-secondary));
-    font-size: 0.75rem;
+/* SessionRecovered engine note — collapsed by default, expands inline when
+   the user clicks the subline. Sits inside an initiator-panel body so it
+   inherits the panel's padding; we only style the disclosure summary and
+   the expanded preformatted block. */
+.resume-note {
+    margin-top: 0.25rem;
+    font-size: 0.8125rem;
     color: var(--text-secondary);
 }
 
-.response-aborted-icon {
-    color: var(--accent-yellow);
-    flex-shrink: 0;
+.resume-note > summary {
+    cursor: pointer;
+    user-select: none;
+    color: var(--text-secondary);
 }
 
-/* --- Change-lifecycle initiator-panel variants — apply / discard / revert / fail
-   render as system-variant initiator panels with status-specific left accent.
-   The label is the actor name (Lucidos Engine, You) so the status color goes on
-   the summary line ("Change applied") instead of the label. Tint sits on the
-   header so the body stays neutral against the page. */
-.initiator-panel-change-applied {
-    border-left: 0.1875rem solid var(--accent-green);
+.resume-note > summary:hover {
+    color: var(--text-primary);
 }
-.initiator-panel-change-applied .initiator-header {
-    background: color-mix(in srgb, var(--accent-green) 4%, var(--bg-secondary));
-}
-.initiator-panel-change-applied .initiator-summary { color: var(--accent-green); }
 
-.initiator-panel-change-failed {
-    border-left: 0.1875rem solid var(--accent-red);
+.resume-note-body {
+    margin: 0.375rem 0 0 0;
+    padding: 0.5rem 0.625rem;
+    border-left: 0.125rem solid var(--border-subtle, var(--border-color));
+    background: var(--bg-secondary);
+    white-space: pre-wrap;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: var(--text-secondary);
 }
-.initiator-panel-change-failed .initiator-header {
-    background: color-mix(in srgb, var(--accent-red) 6%, var(--bg-secondary));
-}
-.initiator-panel-change-failed .initiator-summary { color: var(--accent-red); }
 
-.initiator-panel-change-discarded,
-.initiator-panel-change-reverted {
-    border-left: 0.1875rem solid var(--text-muted);
-}
+/* Engine reason badges — every engine panel inherits the teal border + tinted
+   header from .initiator-panel-system; only the summary line color differs to
+   convey *why* the engine spoke (trigger fired, change applied/failed/...). */
+.initiator-panel-trigger          .initiator-summary { color: var(--reason-trigger); }
+.initiator-panel-change-applied   .initiator-summary { color: var(--reason-applied); }
+.initiator-panel-change-failed    .initiator-summary { color: var(--reason-failed); }
 .initiator-panel-change-discarded .initiator-summary,
-.initiator-panel-change-reverted .initiator-summary { color: var(--text-muted); }
+.initiator-panel-change-reverted  .initiator-summary { color: var(--reason-muted); }
 
 /* Action buttons (Diff/Revert) render in a footer at the bottom-right of the
    panel — keeps the timestamp alone in the header's top-right slot. */
 .initiator-footer {
     display: flex;
     justify-content: flex-end;
-    gap: 0.25rem;
+    gap: 0.5rem;
     padding: 0.5rem 0.875rem;
     border-top: 1px solid var(--border-color);
 }
@@ -1233,6 +1207,13 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     margin: 0.375rem 0;
 }
 
+.welcome-message .disclaimer {
+    margin: 1.5rem 0 0 0;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    line-height: 1.5;
+}
+
 /* Error state */
 .error {
     color: var(--accent-red);
@@ -1312,14 +1293,14 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     font-size: 0.75rem;
 }
 
-/* No surface treatment on the wrapper itself — the question reads as a
-   heading at the message body's indent, with the option cards as the only
-   nested surface. Avoids triple-nested boxes inside the response bubble. */
-.cc-question-card {
+/* CC question divider — body of an UserQuestionAsked initiator panel. The
+   surrounding .initiator-body provides padding/border/background, so the
+   body itself is just a vertical stack of the question text, options, and
+   (in answered state) the resolution block. */
+.cc-question-body {
     display: flex;
     flex-direction: column;
     gap: 0.75rem;
-    margin: 0.75rem 0;
 }
 
 .cc-question-text {
@@ -1391,26 +1372,92 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     font-style: italic;
 }
 
-.cc-question-card-pending {
-    opacity: 0.7;
+/* Static row replacement for an option once the question is resolved. Same
+   shape as .cc-question-option but without button affordances (no hover,
+   no cursor pointer, no transform on press). */
+.cc-question-option-static {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.25rem;
+    width: 100%;
+    padding: 0.75rem 0.875rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    text-align: left;
+    white-space: normal;
 }
 
-.cc-question-answer {
+/* Highlighted: the picked option in Selected answers — accent border + tint. */
+.cc-question-option-selected {
+    border-color: color-mix(in srgb, var(--accent) 50%, var(--border-color));
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary));
+}
+
+/* Dimmed: non-chosen options after resolution. Muted color, subdued surface. */
+.cc-question-option-dimmed {
+    opacity: 0.55;
+    color: var(--text-muted);
+}
+
+.cc-question-option-dimmed .cc-question-option-label {
+    text-decoration: line-through;
+    text-decoration-color: var(--text-muted);
+}
+
+/* FreeText resolution block — highlighted box echoing the selected-option
+   tint so the user's typed answer reads as the equivalent "picked" surface. */
+.cc-question-freetext {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--border-color));
+    border-radius: 0.375rem;
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-tertiary));
+}
+
+.cc-question-freetext-label {
+    font-size: 0.6875rem;
+    font-weight: 600;
     color: var(--text-secondary);
-    font-style: italic;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
 }
 
-/* CC permission prompt — Allow/Deny card rendered inline when CC asks
-   to edit a path outside cwd / under .claude/ or run a Bash command. */
-.cc-permission-card {
+.cc-question-freetext-text {
+    color: var(--text-primary);
+    line-height: 1.5;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+/* Small neutral pill marking a canceled question — uses the warning token
+   so it reads as "interrupted" rather than success or error. */
+.cc-question-canceled-badge {
+    display: inline-flex;
+    align-self: flex-start;
+    padding: 0.125rem 0.5rem;
+    border: 1px solid color-mix(in srgb, var(--accent-yellow) 40%, var(--border-color));
+    border-radius: 1rem;
+    background: color-mix(in srgb, var(--accent-yellow) 12%, transparent);
+    color: var(--accent-yellow);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+/* CC permission divider — body of a CodingAgentPermissionRequest initiator
+   panel. Like .cc-question-body, the .initiator-body wrapper provides chrome;
+   the body is just a vertical stack of the prompt text, action rows, and (in
+   answered state) the allowed/denied badge. */
+.cc-permission-body {
     display: flex;
     flex-direction: column;
     gap: 0.875rem;
-    margin: 0.75rem 0;
-    padding: 1rem 1.125rem;
-    border: 1px solid var(--border-color);
-    border-radius: 0.625rem;
-    background: var(--bg-secondary);
 }
 
 .cc-permission-text {
@@ -1427,20 +1474,69 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     justify-content: flex-end;
 }
 
-.cc-permission-card-answered {
-    border-color: color-mix(in srgb, var(--accent-green) 30%, var(--border-color));
-    background: color-mix(in srgb, var(--accent-green) 6%, var(--bg-secondary));
+.cc-permission-actions-secondary {
+    margin-top: -0.375rem;
 }
 
-.cc-permission-card-pending {
-    opacity: 0.7;
+.cc-permission-actions-secondary code {
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-size: 0.875em;
 }
 
-.cc-permission-answer {
-    color: var(--text-secondary);
-    font-style: italic;
+/* "Allowed" pill on a resolved permission divider — green to match the
+   accent-green confirm semantics used elsewhere (action-btn-confirm). */
+.cc-permission-allowed-badge {
+    display: inline-flex;
+    align-self: flex-start;
+    padding: 0.125rem 0.5rem;
+    border: 1px solid color-mix(in srgb, var(--accent-green) 40%, var(--border-color));
+    border-radius: 1rem;
+    background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+    color: var(--accent-green);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
 }
 
+/* "Denied: …" pill on a resolved permission divider — red to match the
+   accent-red danger semantics (action-btn-danger). May contain reason text,
+   so allow it to wrap rather than forcing a single line. */
+.cc-permission-denied-badge {
+    display: inline-flex;
+    align-self: flex-start;
+    max-width: 100%;
+    padding: 0.125rem 0.5rem;
+    border: 1px solid color-mix(in srgb, var(--accent-red) 40%, var(--border-color));
+    border-radius: 1rem;
+    background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+    color: var(--accent-red);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    word-break: break-word;
+}
+
+/* Tool-permissions settings section: full-width monospace textarea + action row */
+.cc-allowed-tools-editor {
+    width: 100%;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    padding: 0.625rem 0.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+.cc-allowed-tools-actions {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 0.625rem;
+}
 
 /* Copyable blocks — <copy>...</copy> rendered by renderMarkdown */
 .copyable-block {
@@ -1449,7 +1545,7 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
     border-radius: 0.25rem;
-    padding: 0.125rem 1.5rem 0.125rem 0.375rem;
+    padding: 0.125rem 0.375rem;
     color: var(--text-primary);
     -webkit-box-decoration-break: clone;
     box-decoration-break: clone;
@@ -1462,11 +1558,13 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     white-space: pre-wrap;
 }
 
+/* Inline-flow: absolute positioning inside a wrapping inline .copyable-block
+   would land the button mid-height of the wrapped lines. */
 .copy-btn {
-    position: absolute;
-    top: 50%;
-    right: 0.25rem;
-    transform: translateY(-50%);
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+    margin-left: 0.25rem;
     background: none;
     border: none;
     color: var(--text-muted);
@@ -1495,8 +1593,10 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 }
 
 .copyable-block-multi .copy-btn {
+    position: absolute;
     top: 0.375rem;
-    transform: none;
+    right: 0.25rem;
+    margin-left: 0;
 }
 
 /* Fenced code block copy button */
@@ -1523,9 +1623,10 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 
 /* Inherits base styles from .copy-btn — only positioning overrides here */
 .code-block-copy-btn {
+    position: absolute;
     top: 0.375rem;
     right: 0.375rem;
-    transform: none;
+    margin-left: 0;
     opacity: 0;
     transition: opacity var(--duration-fast) ease, color var(--duration-fast) ease;
     z-index: 1;

@@ -1306,11 +1306,12 @@ describe('scrollToBottom does not touch notAtTop (scroll listener owns it)', () 
 });
 
 // ---------------------------------------------------------------------------
-// Send button: must use composeHandlers to keep iOS keyboard open on submit.
-// Without this, tapping Send causes focusout → keyboard closes → race
-// condition between keyboard animation and scrollToBottom().
+// composeHandlers contract — used by mode toggles + attach-photo button to
+// keep the iOS keyboard open across the re-render those actions trigger.
+// Action buttons (Send / Discard draft / etc.) deliberately do NOT use this
+// helper — see installActionBtnBlurListener() in promptFocus.ts.
 // ---------------------------------------------------------------------------
-describe('Send button keeps keyboard open', () => {
+describe('composeHandlers focuses before action', () => {
   it('composeHandlers focuses prompt before action', () => {
     // Verify the composeHandlers contract: focusFn runs before action
     const order: string[] = [];

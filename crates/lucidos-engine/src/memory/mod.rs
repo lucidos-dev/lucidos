@@ -4,7 +4,7 @@ pub mod pgvector;
 pub mod provider;
 pub mod reembed;
 
-pub use extractor::{ExtractedFact, MemoryExtractor, QueryClassification};
+pub use extractor::{ExtractedFact, MemoryExtractor, QueryClassification, EXTRACTOR_VERSION};
 pub use fastembed::FastEmbedProvider;
 pub use pgvector::{MemoryEntry, MemorySource, MemoryStats, PgVectorIndex, SearchResult};
 pub use provider::EmbeddingProvider;

@@ -45,7 +45,8 @@ fn supported_extensions_display() -> String {
 pub enum TriggerRun {
     #[serde(rename = "intent", alias = "prompt")]
     Intent {
-        text: String,
+        #[serde(alias = "text")]
+        intent: String,
         #[serde(default)]
         knowhow: Vec<String>,
     },
@@ -65,6 +66,17 @@ pub struct TriggerConfig {
     pub condition: Option<Value>,
     pub paused: bool,
     pub last_run: Option<DateTime<Utc>>,
+    /// Directory name of the app that owns this trigger (e.g. `"trigger-workflow"`),
+    /// stamped onto `NotificationCreated.app_id` so the popover can deep-link to
+    /// the app. None for standalone triggers. For script triggers under
+    /// `apps/<X>/...` without an explicit value, `owning_app_id` derives `<X>`.
+    pub app_id: Option<String>,
+    /// When true, threads spawned by this trigger surface in REVIEW on
+    /// completion instead of going straight to HISTORY. Use for triggers
+    /// whose output the user is expected to read — daily summaries, alerts,
+    /// scheduled reports. Default false preserves the unattended-execution
+    /// behavior expected of most cron triggers.
+    pub go_to_review: bool,
 }
 
 impl TriggerConfig {
@@ -90,6 +102,14 @@ impl TriggerConfig {
         let condition = payload.get("condition").filter(|v| !v.is_null()).cloned();
 
         let paused = read_paused_field(payload).unwrap_or(false);
+        let app_id = payload
+            .get("app_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let go_to_review = payload
+            .get("go_to_review")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         Ok(TriggerConfig {
             id,
@@ -101,7 +121,23 @@ impl TriggerConfig {
             condition,
             paused,
             last_run: None,
+            app_id,
+            go_to_review,
         })
+    }
+
+    /// Directory name of the app that owns this trigger, used to stamp notifications.
+    /// Prefers the explicit `app_id` field; for script triggers without one, falls back
+    /// to the leading `apps/<dir>/` path segment so legacy app-scoped scripts still link
+    /// back to their app. Returns None when the trigger is genuinely standalone.
+    pub fn owning_app_id(&self) -> Option<String> {
+        if let Some(ref aid) = self.app_id {
+            return Some(aid.clone());
+        }
+        if let TriggerRun::Script { ref path } = self.run {
+            return derive_app_id_from_script_path(path);
+        }
+        None
     }
 
     /// Compute the next scheduled run time (UTC) from cron expressions and timezone.
@@ -178,7 +214,37 @@ impl TriggerConfig {
         if let Some(paused) = read_paused_field(payload) {
             self.paused = paused;
         }
+        // app_id update: explicit null clears, string sets, absent leaves as-is
+        if let Some(v) = payload.get("app_id") {
+            if v.is_null() {
+                self.app_id = None;
+            } else if let Some(s) = v.as_str() {
+                self.app_id = Some(s.to_string());
+            }
+        }
+        if let Some(v) = payload.get("go_to_review").and_then(|v| v.as_bool()) {
+            self.go_to_review = v;
+        }
     }
+}
+
+/// Extract the owning app directory from a script path, if it lives under `apps/<X>/`.
+/// Rejects path-traversal segments (`.`, `..`) and leading-dot dirs so a malformed
+/// path can't become a fake app id on the frontend popover.
+/// Examples:
+/// - `"apps/trigger-workflow/triggers/scripts/run.py"` → `Some("trigger-workflow")`
+/// - `"triggers/oura-import/scripts/run.py"` → `None`
+/// - `"apps/../foo/bar"` / `"apps/.git/x"` / `"apps//x"` → `None`
+pub(crate) fn derive_app_id_from_script_path(path: &str) -> Option<String> {
+    let mut parts = path.split('/');
+    if parts.next()? != "apps" {
+        return None;
+    }
+    let dir = parts.next()?;
+    if dir.is_empty() || dir.starts_with('.') {
+        return None;
+    }
+    Some(dir.to_string())
 }
 
 /// Read the paused state from an event payload.
@@ -311,14 +377,31 @@ mod tests {
     }
 
     #[test]
+    fn intent_variant_deserializes_legacy_text_alias() {
+        // On-disk TriggerCreated events from before the rename carry `text:`.
+        let val = json!({"type": "intent", "text": "legacy payload"});
+        let run: TriggerRun = serde_json::from_value(val).unwrap();
+        if let TriggerRun::Intent { intent, knowhow } = run {
+            assert_eq!(intent, "legacy payload");
+            assert!(knowhow.is_empty());
+        } else {
+            panic!("Expected Intent variant");
+        }
+    }
+
+    #[test]
     fn trigger_run_serde_roundtrip() {
         let prompt = TriggerRun::Intent {
-            text: "Do something".into(),
+            intent: "Do something".into(),
             knowhow: vec!["domain".into()],
         };
         let json = serde_json::to_value(&prompt).unwrap();
         assert_eq!(json["type"], "intent");
-        assert_eq!(json["text"], "Do something");
+        assert_eq!(json["intent"], "Do something");
+        assert!(
+            json.get("text").is_none(),
+            "serialized output must not contain the legacy `text` key"
+        );
 
         let back: TriggerRun = serde_json::from_value(json).unwrap();
         assert!(matches!(back, TriggerRun::Intent { .. }));
@@ -421,8 +504,8 @@ mod tests {
             run.is_ok(),
             "TriggerRun should deserialize without knowhow field"
         );
-        if let TriggerRun::Intent { text, knowhow } = run.unwrap() {
-            assert_eq!(text, "do something");
+        if let TriggerRun::Intent { intent, knowhow } = run.unwrap() {
+            assert_eq!(intent, "do something");
             assert!(knowhow.is_empty());
         } else {
             panic!("Expected Intent variant");
@@ -456,8 +539,8 @@ mod tests {
             "run": { "type": "prompt", "text": "new prompt" }
         }));
 
-        if let TriggerRun::Intent { text, knowhow } = &config.run {
-            assert_eq!(text, "new prompt");
+        if let TriggerRun::Intent { intent, knowhow } = &config.run {
+            assert_eq!(intent, "new prompt");
             assert!(knowhow.is_empty());
         } else {
             panic!("Expected Intent variant");
@@ -559,8 +642,8 @@ mod tests {
         assert_eq!(config.timezone, "Europe/Oslo");
         assert_eq!(config.on, Some("SomeEvent".to_string()));
         assert!(config.condition.is_some());
-        if let TriggerRun::Intent { text, knowhow } = &config.run {
-            assert_eq!(text, "original prompt");
+        if let TriggerRun::Intent { intent, knowhow } = &config.run {
+            assert_eq!(intent, "original prompt");
             assert_eq!(knowhow, &vec!["domain".to_string()]);
         } else {
             panic!("Expected Intent variant");
@@ -594,8 +677,8 @@ mod tests {
             "trigger_id": "test",
             "run": { "type": "intent", "text": "new prompt", "knowhow": ["kh1"] }
         }));
-        if let TriggerRun::Intent { text, knowhow } = &config.run {
-            assert_eq!(text, "new prompt");
+        if let TriggerRun::Intent { intent, knowhow } = &config.run {
+            assert_eq!(intent, "new prompt");
             assert_eq!(knowhow, &vec!["kh1".to_string()]);
         } else {
             panic!("Expected Intent variant");
@@ -682,6 +765,159 @@ mod tests {
         assert!(config.paused);
         config.apply_update(&json!({ "trigger_id": "t1", "enabled": true }));
         assert!(!config.paused);
+    }
+
+    #[test]
+    fn from_created_payload_reads_explicit_app_id() {
+        // Regression: notification popover's "open the app" button compares
+        // notification.app_id against app directory names. Triggers must be able
+        // to declare which app dir they belong to so the comparison can match.
+        let payload = json!({
+            "trigger_id": "uuid-abc-123", "name": "Smart CI Nightly",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "intent", "text": "x", "knowhow": [] },
+            "app_id": "trigger-workflow"
+        });
+        let config = TriggerConfig::from_created_payload(&payload).unwrap();
+        assert_eq!(config.app_id, Some("trigger-workflow".to_string()));
+        assert_eq!(config.owning_app_id(), Some("trigger-workflow".to_string()));
+    }
+
+    #[test]
+    fn from_created_payload_app_id_defaults_to_none() {
+        // Existing triggers (and standalone ones) have no app_id — must round-trip as None,
+        // never silently fall back to the trigger UUID.
+        let payload = json!({
+            "trigger_id": "uuid-abc-123", "name": "Standalone",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "intent", "text": "x", "knowhow": [] }
+        });
+        let config = TriggerConfig::from_created_payload(&payload).unwrap();
+        assert_eq!(config.app_id, None);
+        assert_eq!(
+            config.owning_app_id(),
+            None,
+            "intent trigger without explicit app_id must not invent one"
+        );
+    }
+
+    #[test]
+    fn owning_app_id_derives_from_apps_script_path() {
+        // Legacy app-scoped script triggers have no explicit app_id field but their
+        // path lives under `apps/<X>/...` — derive the app dir from there so the
+        // notification popover's link still resolves.
+        let payload = json!({
+            "trigger_id": "uuid-1", "name": "Some script",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "script", "path": "apps/trigger-workflow/triggers/scripts/nightly.py" }
+        });
+        let config = TriggerConfig::from_created_payload(&payload).unwrap();
+        assert_eq!(config.owning_app_id(), Some("trigger-workflow".to_string()));
+    }
+
+    #[test]
+    fn owning_app_id_none_for_standalone_script_path() {
+        // Scripts under `data/triggers/<dir>/...` are standalone — must not be
+        // misattributed to any app.
+        let payload = json!({
+            "trigger_id": "uuid-1", "name": "Oura import",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "script", "path": "triggers/oura-import/scripts/run.py" }
+        });
+        let config = TriggerConfig::from_created_payload(&payload).unwrap();
+        assert_eq!(config.owning_app_id(), None);
+    }
+
+    #[test]
+    fn explicit_app_id_overrides_derivation() {
+        // If a script trigger lives under apps/<X>/ but explicitly declares a
+        // different owning app (e.g. moved/legacy), the explicit field wins.
+        let payload = json!({
+            "trigger_id": "uuid-1", "name": "Cross-app",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "script", "path": "apps/old-app/triggers/scripts/run.py" },
+            "app_id": "new-app"
+        });
+        let config = TriggerConfig::from_created_payload(&payload).unwrap();
+        assert_eq!(config.owning_app_id(), Some("new-app".to_string()));
+    }
+
+    #[test]
+    fn apply_update_sets_app_id() {
+        let payload = json!({
+            "trigger_id": "t1", "name": "T",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "intent", "text": "x", "knowhow": [] }
+        });
+        let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+        assert_eq!(config.app_id, None);
+        config.apply_update(&json!({ "trigger_id": "t1", "app_id": "trigger-workflow" }));
+        assert_eq!(config.app_id, Some("trigger-workflow".to_string()));
+    }
+
+    #[test]
+    fn apply_update_clears_app_id_with_null() {
+        let payload = json!({
+            "trigger_id": "t1", "name": "T",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "intent", "text": "x", "knowhow": [] },
+            "app_id": "trigger-workflow"
+        });
+        let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+        assert_eq!(config.app_id, Some("trigger-workflow".to_string()));
+        config.apply_update(&json!({ "trigger_id": "t1", "app_id": null }));
+        assert_eq!(config.app_id, None);
+    }
+
+    #[test]
+    fn apply_update_absent_app_id_leaves_unchanged() {
+        let payload = json!({
+            "trigger_id": "t1", "name": "T",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "intent", "text": "x", "knowhow": [] },
+            "app_id": "trigger-workflow"
+        });
+        let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+        config.apply_update(&json!({ "trigger_id": "t1", "name": "Renamed" }));
+        assert_eq!(config.name, "Renamed");
+        assert_eq!(
+            config.app_id,
+            Some("trigger-workflow".to_string()),
+            "absent app_id field must not clobber existing"
+        );
+    }
+
+    #[test]
+    fn derive_app_id_from_apps_path() {
+        assert_eq!(
+            derive_app_id_from_script_path("apps/trigger-workflow/triggers/scripts/x.py"),
+            Some("trigger-workflow".to_string())
+        );
+        assert_eq!(
+            derive_app_id_from_script_path("apps/foo/scripts/y.sh"),
+            Some("foo".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_app_id_returns_none_for_non_apps_paths() {
+        assert_eq!(
+            derive_app_id_from_script_path("triggers/oura/scripts/run.py"),
+            None
+        );
+        assert_eq!(derive_app_id_from_script_path("scripts/legacy.py"), None);
+        assert_eq!(derive_app_id_from_script_path("apps/"), None);
+        assert_eq!(derive_app_id_from_script_path(""), None);
+    }
+
+    #[test]
+    fn derive_app_id_rejects_traversal_and_dotfile_dirs() {
+        // A malformed `apps/..` or `apps/.git` path must not become a fake app
+        // id on the frontend popover.
+        assert_eq!(derive_app_id_from_script_path("apps/../foo/bar"), None);
+        assert_eq!(derive_app_id_from_script_path("apps/./foo"), None);
+        assert_eq!(derive_app_id_from_script_path("apps/.git/x/y"), None);
+        assert_eq!(derive_app_id_from_script_path("apps//foo"), None);
     }
 
     #[test]

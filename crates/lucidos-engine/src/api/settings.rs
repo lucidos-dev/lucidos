@@ -1,6 +1,56 @@
 use super::*;
 
 use crate::core::{AuthType, CredentialStore, OAuthStore, PinnedAppStore, PreferenceStore};
+use crate::engine::claude_code::{read_allowed_tools_file, write_allowed_tools_file};
+
+#[derive(Serialize)]
+pub(super) struct CcAllowedToolsResponse {
+    contents: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct CcAllowedToolsRequest {
+    contents: String,
+}
+
+/// GET /api/cc-allowed-tools — return the raw contents of
+/// `~/.lucidos/cc-allowed-tools` so the settings UI can display them. Missing
+/// file returns the seeded header (mirrors `cc_allowed_tools` semantics).
+pub(super) async fn get_cc_allowed_tools(
+    State(state): State<AppState>,
+) -> Result<Json<CcAllowedToolsResponse>, (StatusCode, String)> {
+    let dir = state.engine.user_dir().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "User directory not configured".to_string(),
+    ))?;
+    let contents = read_allowed_tools_file(dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read cc-allowed-tools: {}", e),
+        )
+    })?;
+    Ok(Json(CcAllowedToolsResponse { contents }))
+}
+
+/// PUT /api/cc-allowed-tools — overwrite the file with the provided contents
+/// (atomic). Newly spawned CC subprocesses pick this up immediately; in-flight
+/// subprocesses keep their frozen `--allowedTools` flag until they restart.
+pub(super) async fn put_cc_allowed_tools(
+    State(state): State<AppState>,
+    Json(body): Json<CcAllowedToolsRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let dir = state.engine.user_dir().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "User directory not configured".to_string(),
+    ))?;
+    write_allowed_tools_file(dir, &body.contents).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write cc-allowed-tools: {}", e),
+        )
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 // ===== Credential Endpoints =====
 
@@ -235,7 +285,10 @@ pub(super) async fn set_preference(
     };
     match result {
         Ok(()) => {
-            let actor = super::actor::user_actor_resolved(&headers, &state.pool, request.device_id.as_deref(),
+            let actor = super::actor::user_actor_resolved(
+                &headers,
+                &state.pool,
+                request.device_id.as_deref(),
             )
             .await;
             state
@@ -369,7 +422,7 @@ pub(super) async fn list_devices(
     match crate::core::DeviceStore::list(&state.pool).await {
         Ok(devices) => Ok(Json(DevicesListResponse { devices })),
         Err(e) => {
-            log!("Failed to list devices: {}", e);
+            log!("[Settings] Failed to list devices: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),

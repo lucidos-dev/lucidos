@@ -7,7 +7,7 @@ Source of truth for how workspace content is organized. Referenced by both the e
 | Type | Purpose | Stability | Who maintains | Example |
 |------|---------|-----------|--------------|---------|
 | **Intent** | What the user wants, in their terms. Goals, conditions, desired outcomes. | Stable — changes when the user's needs change | User | "Find relevant jobs, store them, notify me of new ones and deadlines" |
-| **Knowhow** | How to achieve it, in technical terms. API details, data formats, quirks, workarounds. | Evolves — refined every time Lucidos learns something new | Lucidos | "Use `.company-logo img` selector, FINN CDN requires base64 conversion" |
+| **Knowhow** | How to achieve it, in technical terms. API details, data formats, quirks, workarounds. | Evolves — refined every time Lucidos learns something new | Lucidos | "Use `.product-card img` selector, vendor CDN requires base64 conversion" |
 | **Script** | Code invoked by intents or knowhow | Changes when tools or APIs change | Either | `download_images.py`, `validate_images.py` |
 
 ### Intent vs Knowhow
@@ -18,7 +18,7 @@ The intent describes **what the user wants** — written in user terms, like wha
 - Yes → it's an intent
 - No → it's knowhow
 
-Example: A job search intent says "find relevant jobs for me, store them, notify me if there are new ones or upcoming deadlines." The knowhow explains how FINN.no logos are extracted, how salary is estimated, what CORS workarounds are needed. When Lucidos discovers a new quirk, it updates the knowhow — the intent stays the same.
+Example: A product-watch intent says "find relevant listings for me, store them, notify me if there are new ones or upcoming deadlines." The knowhow explains how vendor logos are extracted, how prices are normalized, what CORS workarounds are needed. When Lucidos discovers a new quirk, it updates the knowhow — the intent stays the same.
 
 ### Frontmatter
 
@@ -27,9 +27,9 @@ Both intents and knowhow files use YAML frontmatter:
 **Intent frontmatter:**
 ```yaml
 ---
-name: Daily Job Check
+name: Daily Weather Check
 knowhow:
-  - finn-no
+  - weather-api
 ---
 ```
 - `name` (required): Human-readable name
@@ -53,7 +53,7 @@ When Lucidos discovers something new during execution (a quirk, a better approac
 
 **Everything lives with its consumer.** Intents, knowhow, and scripts are always scoped to the thing that uses them — an app, a trigger, or a knowhow domain.
 
-**Survivability test:** "Does this survive if I delete the app?" If yes, it belongs at the top level (e.g., Google Calendar sync). If it only makes sense in the context of the app (e.g., FINN job scoring), it belongs inside the app.
+**Survivability test:** "Does this survive if I delete the app?" If yes, it belongs at the top level (e.g., Google Calendar sync). If it only makes sense in the context of the app (e.g., a per-app scoring heuristic), it belongs inside the app.
 
 ## Directory Structure
 
@@ -61,7 +61,7 @@ When Lucidos discovers something new during execution (a quirk, a better approac
 data/
   artifacts/                ← User files (notes, imported data, projects) — git-tracked, NEVER auto-delete
     user_profile.md         ← Learned facts about the user
-    imported/<service>/     ← Files imported from APIs (e.g., oura/, finn-jobs/)
+    imported/<service>/     ← Files imported from APIs (e.g., oura/, weather/)
     projects/<name>/        ← Major project folders
     screenshots/            ← Captured screenshots
 
@@ -90,7 +90,7 @@ data/
 
 ## Rules
 
-- **File naming:** Never use generic names like `skill.md`, `knowhow.md`, or `intent.md`. Always name files by what they describe (e.g., `calendar-data-layout.md`, `finn-job-search.md`, `comfort-cloud-api.md`).
+- **File naming:** Never use generic names like `skill.md`, `knowhow.md`, or `intent.md`. Always name files by what they describe (e.g., `calendar-data-layout.md`, `weather-forecast.md`, `comfort-cloud-api.md`).
 - **Everything under `data/` (except `postgres/`) is git-tracked** — files persist and have version history.
 - **`.lucidos/`** is ephemeral (runtime cache, temp files). Can be rebuilt. Not under `data/`.
 - **Manifest vs knowhow:** `manifest.json` is for the user (UI display). Knowhow and intents are for the engine (LLM context). Don't put operational knowledge in manifests.
@@ -109,7 +109,7 @@ Data storage: pick artifacts (git) OR events (postgres), not both.
 
 ## Triggers
 
-Triggers are scheduled tasks that run on cron or in response to events. The **intent** lives in the `TriggerCreated` event payload (`run.text`) — there is no `intent.md` file. The intent references **knowhow** by ID (`run.knowhow: ["openai-api"]`), which IS on disk under `data/knowhow/<id>.md` and gets concatenated onto the intent at fire time. Optional **scripts** live alongside the trigger.
+Triggers are scheduled tasks that run on cron or in response to events. The **intent** lives in the `TriggerCreated` event payload (`run.intent`) — there is no `intent.md` file. The intent references **knowhow** by ID (`run.knowhow: ["openai-api"]`), which IS on disk under `data/knowhow/<id>.md` and gets concatenated onto the intent at fire time. Optional **scripts** live alongside the trigger.
 
 ### Intent vs Knowhow Split (the rule everyone gets wrong)
 
@@ -124,7 +124,7 @@ Test: would a non-technical person understand the intent? If no, knowhow has lea
 
 **Bad** (intent contains the recipe):
 ```
-run.text: "Check whether gpt-5.5 is available. GET https://api.openai.com/v1/models
+run.intent: "Check whether gpt-5.5 is available. GET https://api.openai.com/v1/models
 with Authorization: Bearer $OPENAI_API_KEY. Scan data[].id for any id starting
 with gpt-5.5. If found, send_notification + update_trigger to disable. If 401/403
 or network error, fall back to web_search for 'gpt-5.5 OpenAI API available'.
@@ -144,7 +144,7 @@ On 200, scan `data[].id` for the requested model prefix. On 401/403/network erro
 fall back to one `web_search` distinguishing API availability from ChatGPT-only rollout.
 ```
 ```
-run.text: "Notify me when an OpenAI model with id prefix gpt-5.5 becomes available
+run.intent: "Notify me when an OpenAI model with id prefix gpt-5.5 becomes available
 via the API. Once notified, disable this trigger."
 run.knowhow: ["openai-api-availability"]
 ```

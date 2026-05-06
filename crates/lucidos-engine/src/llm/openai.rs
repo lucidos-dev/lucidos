@@ -82,7 +82,7 @@ impl OpenAiProvider {
                                         "name": name,
                                         "arguments": serde_json::to_string(input)
                                             .unwrap_or_else(|e| {
-                                                crate::log!("Failed to serialize tool arguments: {}", e);
+                                                crate::log!("[OpenAI] Failed to serialize tool arguments: {}", e);
                                                 "{}".to_string()
                                             }),
                                     }
@@ -448,7 +448,10 @@ impl OpenAiProvider {
                                     "call_id": id,
                                     "name": name,
                                     "arguments": serde_json::to_string(tool_input)
-                                        .unwrap_or_else(|_| "{}".to_string()),
+                                        .unwrap_or_else(|e| {
+                                            log!("[OpenAI] Failed to serialize tool arguments for Responses API: {}", e);
+                                            "{}".to_string()
+                                        }),
                                 }));
                             }
                             ContentBlock::Image { .. } => {
@@ -854,7 +857,7 @@ impl OpenAiProvider {
                 } else {
                     serde_json::from_str(&tc.arguments_json).unwrap_or_else(|e| {
                         log!(
-                            "Failed to parse OpenAI tool arguments: {} (json: {})",
+                            "[OpenAI] Failed to parse OpenAI tool arguments: {} (json: {})",
                             e,
                             tc.arguments_json
                         );
@@ -872,6 +875,10 @@ impl OpenAiProvider {
         LlmResponse {
             content: final_content,
             tool_calls,
+            // TODO: capture finish_reason from streamed chunks
+            stop_reason: None,
+            output_tokens: None,
+            thinking_chars: None,
         }
     }
 }

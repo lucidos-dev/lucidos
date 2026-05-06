@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Return the persistent directory for CC worktrees: `<workspace>/.lucidos/worktrees/`.
 /// Creates the directory if it doesn't exist.
@@ -589,6 +591,94 @@ pub(super) async fn auto_commit_safe_files_if_dirty(repo_root: &Path) -> bool {
     true
 }
 
+/// Add a git worktree, bridging git-crypt's per-worktree key lookup to the
+/// parent's unlocked key (AGWA/git-crypt#97). Sequence: `worktree add
+/// --no-checkout`, symlink the key dir, `checkout HEAD`. Repos without
+/// git-crypt skip the symlink step.
+///
+/// `extra_args` follow the worktree path: `[branch]` to reuse, `["-b", name]`
+/// to create, optionally with a trailing base ref.
+pub(crate) async fn worktree_add(
+    repo_root: &Path,
+    wt_path: &Path,
+    extra_args: &[&str],
+) -> Result<std::process::Output, String> {
+    let wt_str = wt_path
+        .to_str()
+        .ok_or_else(|| format!("non-utf8 worktree path: {}", wt_path.display()))?;
+    let mut args: Vec<&str> = vec!["worktree", "add", "--no-checkout", wt_str];
+    args.extend_from_slice(extra_args);
+    let add_out = git_cmd(&args, repo_root).await?;
+    if !add_out.status.success() {
+        return Ok(add_out);
+    }
+    if let Err(e) = link_git_crypt_dir(wt_path).await {
+        log!(
+            "[Git] git-crypt key symlink for {} failed (encrypted files may not decrypt): {}",
+            wt_path.display(),
+            e
+        );
+    }
+    git_cmd(&["checkout", "HEAD", "--"], wt_path).await
+}
+
+async fn link_git_crypt_dir(wt_path: &Path) -> Result<(), String> {
+    let out = git_cmd(
+        &["rev-parse", "--absolute-git-dir", "--git-common-dir"],
+        wt_path,
+    )
+    .await?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    let git_dir = lines.next().ok_or("rev-parse: missing --absolute-git-dir")?;
+    let common_raw = lines.next().ok_or("rev-parse: missing --git-common-dir")?;
+
+    let git_dir = PathBuf::from(git_dir.trim());
+    let common_raw = common_raw.trim();
+    let common_dir = if Path::new(common_raw).is_absolute() {
+        PathBuf::from(common_raw)
+    } else {
+        wt_path.join(common_raw)
+    };
+
+    if git_dir == common_dir {
+        return Ok(());
+    }
+
+    let source = common_dir.join("git-crypt");
+    let target = git_dir.join("git-crypt");
+
+    if !source.exists() {
+        return Ok(());
+    }
+    if tokio::fs::symlink_metadata(&target).await.is_ok() {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        tokio::fs::symlink(&source, &target).await.map_err(|e| {
+            format!(
+                "symlink {} -> {}: {}",
+                target.display(),
+                source.display(),
+                e
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source, target);
+        Err("git-crypt symlink only supported on unix".to_string())
+    }
+}
+
 /// Run a git command with a 30-second timeout.
 /// Returns the command output on success, or an error string on timeout/failure.
 pub(crate) async fn git_cmd(args: &[&str], dir: &Path) -> Result<std::process::Output, String> {
@@ -682,17 +772,9 @@ pub(super) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
         Err(e) => log!("[ClaudeCode] Failed to run git fetch: {}", e),
     }
 
-    // Detect default branch: git symbolic-ref refs/remotes/origin/HEAD -> refs/remotes/origin/main
-    let remote_ref = match git_cmd(&["symbolic-ref", "refs/remotes/origin/HEAD"], repo_root).await {
-        Ok(o) if o.status.success() => {
-            let full_ref = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            // "refs/remotes/origin/main" -> "origin/main"
-            full_ref
-                .strip_prefix("refs/remotes/")
-                .unwrap_or(&full_ref)
-                .to_string()
-        }
-        _ => {
+    let remote_ref = match read_origin_head_ref(repo_root).await {
+        Some(branch) => format!("origin/{}", branch),
+        None => {
             log!("[ClaudeCode] Could not detect default branch, falling back to origin/main");
             "origin/main".to_string()
         }
@@ -843,14 +925,14 @@ pub(crate) async fn has_branch_commits(repo_root: &Path, branch_name: &str) -> b
         Ok(o) if o.status.success() => !o.stdout.is_empty(),
         Ok(o) => {
             log!(
-                "git log failed for branch {}: {}",
+                "[Git] git log failed for branch {}: {}",
                 branch_name,
                 String::from_utf8_lossy(&o.stderr).trim()
             );
             true
         }
         Err(e) => {
-            log!("git log failed for branch {}: {}", branch_name, e);
+            log!("[Git] git log failed for branch {}: {}", branch_name, e);
             true
         }
     }
@@ -900,6 +982,7 @@ pub(crate) async fn find_branch_merge_in_main(
 }
 
 /// Get the list of changed files between main and a branch (three-dot merge-base diff).
+/// Strips engine-injected paths — see `is_engine_injected_path` for rationale.
 pub(crate) async fn branch_changed_files(repo_root: &Path, branch_name: &str) -> Vec<String> {
     let base = default_local_branch(repo_root).await;
     let range = format!("{}...{}", base, branch_name);
@@ -908,6 +991,7 @@ pub(crate) async fn branch_changed_files(repo_root: &Path, branch_name: &str) ->
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
+                .filter(|l| !super::claude_code::is_engine_injected_path(l))
                 .map(|l| l.to_string())
                 .collect()
         })
@@ -935,9 +1019,31 @@ pub(crate) async fn proposal_files_for_branch(
     }
 }
 
-/// Detect the local default branch name (`main` or `master`).
-/// Checks which branch exists, preferring `main`. Returns `"main"` as fallback.
+/// Detect the local default branch name (e.g. `main`, `master`, `develop`, `trunk`).
+///
+/// External repos may use any default branch name. `origin/HEAD` is the
+/// authoritative source; the `main`/`master` heuristic is a fallback for
+/// repos without a remote (test fixtures, fresh init).
+///
+/// Result is cached per `repo_root` for `DEFAULT_BRANCH_CACHE_TTL` (60s) to
+/// keep the cleanup worker from forking 2 git subprocesses per worktree per
+/// tick; default-branch changes are rare enough that a 60s lag is invisible.
 pub(crate) async fn default_local_branch(repo_root: &Path) -> String {
+    let key = tokio::fs::canonicalize(repo_root)
+        .await
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    if let Some(cached) = lookup_default_branch_cache(&key) {
+        return cached;
+    }
+    let resolved = resolve_default_local_branch(repo_root).await;
+    insert_default_branch_cache(key, &resolved);
+    resolved
+}
+
+async fn resolve_default_local_branch(repo_root: &Path) -> String {
+    if let Some(branch) = origin_head_branch(repo_root).await {
+        return branch;
+    }
     for name in &["main", "master"] {
         if let Ok(o) = git_cmd(&["rev-parse", "--verify", name], repo_root).await {
             if o.status.success() {
@@ -946,6 +1052,53 @@ pub(crate) async fn default_local_branch(repo_root: &Path) -> String {
         }
     }
     "main".to_string()
+}
+
+const DEFAULT_BRANCH_CACHE_TTL: Duration = Duration::from_secs(60);
+
+fn default_branch_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, String)>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (Instant, String)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lookup_default_branch_cache(key: &Path) -> Option<String> {
+    let cache = default_branch_cache().lock().ok()?;
+    let (stamped, branch) = cache.get(key)?;
+    (stamped.elapsed() < DEFAULT_BRANCH_CACHE_TTL).then(|| branch.clone())
+}
+
+fn insert_default_branch_cache(key: PathBuf, branch: &str) {
+    if let Ok(mut cache) = default_branch_cache().lock() {
+        cache.insert(key, (Instant::now(), branch.to_string()));
+    }
+}
+
+/// Read `origin/HEAD` and return the local branch name (e.g. `"develop"`).
+/// Returns `None` if the remote ref is unset or doesn't have the expected
+/// `refs/remotes/origin/` prefix. Does NOT verify the local ref exists —
+/// callers that need that should check it themselves.
+async fn read_origin_head_ref(repo_root: &Path) -> Option<String> {
+    let o = git_cmd(&["symbolic-ref", "refs/remotes/origin/HEAD"], repo_root)
+        .await
+        .ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    let full_ref = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    full_ref
+        .strip_prefix("refs/remotes/origin/")
+        .map(str::to_string)
+}
+
+/// Resolve `origin/HEAD` to a local branch name (e.g. `develop`), verifying
+/// the local ref exists. Returns `None` if `origin/HEAD` is unset or the
+/// local ref is missing.
+async fn origin_head_branch(repo_root: &Path) -> Option<String> {
+    let branch = read_origin_head_ref(repo_root).await?;
+    let verify = git_cmd(&["rev-parse", "--verify", &branch], repo_root)
+        .await
+        .ok()?;
+    verify.status.success().then_some(branch)
 }
 
 /// Auto-commit uncommitted changes in a worktree with a generic message.
@@ -1057,6 +1210,108 @@ pub(crate) async fn recover_no_commits_branch(
         preview,
     )
     .into())
+}
+
+/// Append each path to the git exclude file that `wt_path` actually reads,
+/// idempotently. Existing entries (custom or previously-added paths) are
+/// preserved; lines already present are skipped. Best-effort: each step logs
+/// and continues on failure so partial success never blocks session start.
+///
+/// Uses `git rev-parse --git-path info/exclude` to locate the file. For a
+/// worktree, git resolves this to the COMMON `.git/info/exclude` (shared
+/// across all worktrees) — git silently ignores per-worktree info/exclude
+/// files, so writing there has no effect on `git status` / `check-ignore`.
+/// Verified empirically against git 2.x.
+pub(crate) async fn add_paths_to_worktree_exclude(wt_path: &Path, paths: &[&str]) {
+    use tokio::io::AsyncWriteExt;
+
+    if paths.is_empty() {
+        return;
+    }
+
+    let exclude_file = match git_cmd(&["rev-parse", "--git-path", "info/exclude"], wt_path).await {
+        Ok(out) if out.status.success() => {
+            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if raw.is_empty() {
+                log!(
+                    "[Git] git rev-parse returned empty info/exclude path in {}",
+                    wt_path.display()
+                );
+                return;
+            }
+            let p = PathBuf::from(&raw);
+            if p.is_absolute() {
+                p
+            } else {
+                wt_path.join(p)
+            }
+        }
+        Ok(out) => {
+            log!(
+                "[Git] git rev-parse --git-path info/exclude failed in {}: {}",
+                wt_path.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return;
+        }
+        Err(e) => {
+            log!("[Git] {}", e);
+            return;
+        }
+    };
+
+    if let Some(parent) = exclude_file.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            log!("[Git] Failed to create {}: {}", parent.display(), e);
+            return;
+        }
+    }
+
+    let existing = tokio::fs::read_to_string(&exclude_file)
+        .await
+        .unwrap_or_default();
+    let already: std::collections::HashSet<&str> =
+        existing.lines().map(|l| l.trim()).collect();
+
+    let to_add: Vec<&str> = paths
+        .iter()
+        .copied()
+        .filter(|p| !already.contains(p))
+        .collect();
+    if to_add.is_empty() {
+        return;
+    }
+
+    let mut payload = String::new();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        payload.push('\n');
+    }
+    for p in to_add {
+        payload.push_str(p);
+        payload.push('\n');
+    }
+
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude_file)
+        .await
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(payload.as_bytes()).await {
+                log!(
+                    "[Git] Failed to write {}: {}",
+                    exclude_file.display(),
+                    e
+                );
+            }
+        }
+        Err(e) => log!(
+            "[Git] Failed to open {}: {}",
+            exclude_file.display(),
+            e
+        ),
+    }
 }
 
 #[cfg(test)]

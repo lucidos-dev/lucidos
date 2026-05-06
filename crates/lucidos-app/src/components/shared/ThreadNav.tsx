@@ -1,13 +1,19 @@
 import { canGoBackThread, canGoForwardThread, threadNavBack, threadNavForward } from '../../store/actions/thread-navigation';
 import { BackIcon, ForwardIcon } from './icons';
 
-export function ThreadNav({ showTooltip }: { showTooltip?: boolean }) {
+interface Props {
+  showTooltip?: boolean;
+  keepCurrentPane?: boolean;
+}
+
+export function ThreadNav({ showTooltip, keepCurrentPane }: Props) {
+  const opts = keepCurrentPane ? { skipPaneNav: true } : undefined;
   return (
     <>
       <button
         class="icon-btn header-icon thread-nav-btn"
         disabled={!canGoBackThread.value}
-        onClick={threadNavBack}
+        onClick={() => threadNavBack(opts)}
         aria-label="Previous thread"
         {...(showTooltip ? { 'data-tooltip': 'Previous thread' } : {})}
       >
@@ -16,7 +22,7 @@ export function ThreadNav({ showTooltip }: { showTooltip?: boolean }) {
       <button
         class="icon-btn header-icon thread-nav-btn"
         disabled={!canGoForwardThread.value}
-        onClick={threadNavForward}
+        onClick={() => threadNavForward(opts)}
         aria-label="Next thread"
         {...(showTooltip ? { 'data-tooltip': 'Next thread' } : {})}
       >

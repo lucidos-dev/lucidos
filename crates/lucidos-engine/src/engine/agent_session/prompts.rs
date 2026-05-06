@@ -6,15 +6,47 @@ pub(super) fn workspace_preamble(workspace_name: &str) -> String {
     )
 }
 
-/// Process safety rule shared across all CC system prompts that can run bash commands.
-const PROCESS_SAFETY_RULE: &str = "\n\n\
-    PROCESS SAFETY: Multiple Lucidos workspaces run concurrently. NEVER use \
-    `pkill -f lucidos-engine`, `killall lucidos-engine`, or any broad process kill pattern — \
-    these kill ALL workspace engines, not just the one you intend (macOS pkill excludes \
-    ancestors, so the calling engine survives while silently killing every other workspace). \
-    To stop a specific workspace: `./scripts/stop.sh -w <workspace-path>`. \
-    To restart for e2e tests: `./scripts/web-dev.sh -w e2e-test -b` (handles its own cleanup). \
-    To kill a specific engine: `kill $(cat <workspace>/.lucidos/engine.pid)`.";
+/// Process-safety rule shared across CC system prompts that can run bash
+/// commands. The pkill prevention applies universally — broad `pkill` from
+/// any cwd kills every workspace's engine. The `./scripts/...` alternatives
+/// only resolve from the Lucidos source tree, so external-repo prompts pass
+/// `false` to omit them.
+fn process_safety_rule(include_lucidos_scripts: bool) -> String {
+    let scripts = if include_lucidos_scripts {
+        " To stop a specific workspace: `./scripts/stop.sh -w <workspace-path>`. \
+         To restart for e2e tests: `./scripts/web-dev.sh -w e2e-test -b` (handles its own cleanup)."
+    } else {
+        ""
+    };
+    format!(
+        "\n\n\
+         PROCESS SAFETY: Multiple Lucidos workspaces run concurrently. NEVER use \
+         `pkill -f lucidos-engine`, `killall lucidos-engine`, or any broad process kill pattern — \
+         these kill ALL workspace engines, not just the one you intend (macOS pkill excludes \
+         ancestors, so the calling engine survives while silently killing every other workspace).{scripts} \
+         To kill a specific engine: `kill $(cat <workspace>/.lucidos/engine.pid)`."
+    )
+}
+
+/// Override of CC's hardcoded "Creating pull requests" preamble for prompts that
+/// run inside the Lucidos repo. External-repo prompts must NOT include this —
+/// PRs are the right workflow there.
+const NO_PULL_REQUESTS_RULE: &str = "NO PULL REQUESTS: Lucidos is not a PR-based codebase. \
+    Never run `gh pr create`, never `git push` your branch, never tell the user to \
+    \"open a PR\" or \"submit a PR\". The engine is the merge mechanism: when the user clicks \
+    Apply, your branch lands on main and is pushed to the remote in one step. Override CC's \
+    default \"Creating pull requests\" guidance — it does not apply here.";
+
+/// Hardening reminder shared across all Lucidos-repo CC system prompts. The
+/// /harden skill itself runs the test suites and iterates on failure — keep
+/// this text in sync with `.claude/commands/harden.md` Phase 4.5.
+const HARDENING_RULE: &str = "HARDENING: Once your implementation is complete and committed, \
+    you MUST run `/harden`. No exceptions — even for docs-only, CSS-only, comment-only, or \
+    seemingly trivial changes. Do not rationalize skipping it (\"too small to harden\", \
+    \"nothing to test\", \"just a wording tweak\"). The skill itself decides what to check: \
+    it reviews the diff and runs the test suites for the layers you touched, auto-skipping \
+    phases when no relevant layers were touched. The harden marker only exists if you actually \
+    invoke `/harden` — without the marker, the user pays the wait when they click Apply.";
 
 /// Permission allowlist rule shared across all CC system prompts.
 /// Lucidos passes `--allowedTools` when spawning CC, which overrides settings.json
@@ -23,15 +55,25 @@ const PERMISSION_CONFIG_RULE: &str = "\n\n\
     PERMISSION CONFIG: Lucidos passes `--allowedTools` to your CC subprocess. This flag \
     OVERRIDES `~/.claude/settings.json` permission rules — adding a tool to settings.json's \
     `permissions.allow` has NO effect for sessions spawned by Lucidos, and the user will keep \
-    seeing the permission prompt. To grant a tool permission permanently, append it to \
+    seeing the permission prompt. \
+    Three ways to remember a granted permission, picked via the buttons on the prompt card: \
+    (1) `Always allow Tool(scope)` (narrow) and (2) `Always allow` (broad) append to \
     `~/.lucidos/cc-allowed-tools` (one entry per line, blank lines and `#` comments ignored). \
-    The file is read on each subprocess spawn — so the next CC session (or `claude_code` tool \
+    The file is read on each subprocess spawn — the next CC session (or `claude_code` tool \
     call) picks it up immediately, no engine restart needed. The currently-running subprocess \
-    keeps its frozen `--allowedTools` flag, but the user's in-session 'Allow' click already \
-    covers the rest of this session in-memory; the file edit prevents the prompt from recurring \
-    on future sessions. The compiled-in default lives at \
+    keeps its frozen `--allowedTools` flag, so a freshly-persisted entry only takes effect on \
+    the next session. The compiled-in default lives at \
     `crates/lucidos-engine/src/engine/claude_code.rs` (`DEFAULT_CC_ALLOWED_TOOLS`); editing it \
-    only helps fresh installs since existing users keep their seeded file.";
+    only helps fresh installs since existing users keep their seeded file. \
+    Bare `Edit`/`Write`/`NotebookEdit` cannot be persisted via the broad button — CC's \
+    `acceptEdits` mode routes them through `--permission-prompt-tool` for its protected paths \
+    (`.claude/`, `.git/`, which never auto-approve in any mode) and auto-approves them \
+    everywhere else, so a bare `Edit` line in `cc-allowed-tools` does nothing useful in either \
+    case. The UI hides the broad button for those tools. \
+    (3) `Allow <scope> for this thread` (session) records the pattern in the engine's \
+    in-memory per-thread allow set — the engine intercepts before CC's gate, so it works for \
+    every tool and every path including the CC-protected ones. Lost on engine restart, scoped \
+    to one thread.";
 
 /// Build the system prompt for Claude Code worktree sessions.
 /// Used by both user-initiated CC sessions and LLM-invoked `claude_code` tool calls.
@@ -50,8 +92,9 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          your worktree's source (Cargo resolves from `Cargo.toml` in cwd). \
          If you need to run e2e tests against your changes: build the engine in your worktree \
          (`cargo build -p lucidos-engine`), start the e2e workspace from your worktree \
-         (`./scripts/web-dev.sh -w e2e-test -b`), then run tests (`./scripts/e2e-browser.sh`). \
-         All three commands run from your worktree directory.\n\n\
+         (`./scripts/web-dev.sh -w e2e-test -b`), then run tests (`./scripts/e2e.sh` for full \
+         API + browser, or `./scripts/e2e-api.sh` / `./scripts/e2e-browser.sh` for one suite). \
+         All commands run from your worktree directory.\n\n\
          APPLY/RESTART: After your session ends, your commits sit as a pending change in the UI. \
          The user explicitly clicks Apply to merge your branch into main — nothing happens \
          automatically. If any Rust source files (.rs, Cargo.toml, Cargo.lock) or SQL migrations \
@@ -68,11 +111,9 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          Just commit directly with `git add <file>` + `git commit -m \"message\"`. \
          The engine pushes to remote after the user clicks Apply (which is what merges your \
          branch into main).\n\n\
-         HARDENING: Once your implementation is complete and committed, run `/harden`, then run \
-         the test suites for the layers you touched (`cargo test -p lucidos-engine` for Rust, \
-         `cd crates/lucidos-app && npm test` for TypeScript). If you skip this, the user pays \
-         the wait when they click Apply — please don't make them wait.\n\n\
-         SESSION SUMMARY: After hardening and tests pass, output a structured summary of what \
+         {no_pull_requests}\n\n\
+         {hardening}\n\n\
+         SESSION SUMMARY: After hardening completes, output a structured summary of what \
          was implemented in this session. List each change with its status (committed, applied, \
          pending). Include file names and brief descriptions. This is the last thing you output \
          before finishing.\n\n\
@@ -81,7 +122,9 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          Running `exit` in bash can crash the host application.{process_safety}{permission_config}",
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
-        process_safety = PROCESS_SAFETY_RULE,
+        no_pull_requests = NO_PULL_REQUESTS_RULE,
+        hardening = HARDENING_RULE,
+        process_safety = process_safety_rule(true),
         permission_config = PERMISSION_CONFIG_RULE,
     )
 }
@@ -99,12 +142,10 @@ pub(super) fn external_repo_system_prompt(
          The user's git credentials and CLI tools (gh, etc.) are available.\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Commit or discard anything unintentional.\n\n\
-         COMMANDS: Never use /cpa — it is for the main working tree only. \
-         Just commit directly with `git add <file>` + `git commit -m \"message\"`.\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or stop, \
          simply say goodbye and finish your response — the Lucidos engine manages your lifecycle. \
          Running `exit` in bash can crash the host application.{process_safety}{permission_config}",
-        process_safety = PROCESS_SAFETY_RULE,
+        process_safety = process_safety_rule(false),
         permission_config = PERMISSION_CONFIG_RULE,
     )
 }
@@ -123,12 +164,10 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          5. If the work is incomplete or broken, either finish it or revert the problematic parts\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Commit or discard anything unintentional.\n\n\
-         COMMANDS: Never use /cpa — it is for the main working tree only. \
-         Just commit directly with `git add <file>` + `git commit -m \"message\"`.\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}{permission_config}",
         branch = branch_name,
         repo = repo_name,
-        process_safety = PROCESS_SAFETY_RULE,
+        process_safety = process_safety_rule(false),
         permission_config = PERMISSION_CONFIG_RULE,
     )
 }
@@ -158,14 +197,14 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          Just commit directly with `git add <file>` + `git commit -m \"message\"`. \
          The engine pushes to remote after the user clicks Apply (which is what merges your \
          branch into main).\n\n\
-         HARDENING: Once your implementation is complete and committed, run `/harden`, then run \
-         the test suites for the layers you touched (`cargo test -p lucidos-engine` for Rust, \
-         `cd crates/lucidos-app && npm test` for TypeScript). If you skip this, the user pays \
-         the wait when they click Apply — please don't make them wait.\n\n\
+         {no_pull_requests}\n\n\
+         {hardening}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}{permission_config}",
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
-        process_safety = PROCESS_SAFETY_RULE,
+        no_pull_requests = NO_PULL_REQUESTS_RULE,
+        hardening = HARDENING_RULE,
+        process_safety = process_safety_rule(true),
         permission_config = PERMISSION_CONFIG_RULE,
     )
 }
@@ -217,4 +256,71 @@ pub(crate) fn build_merge_prompt(
         prompt.push_str(&format!("\n\nThe change being applied: {}", desc));
     }
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tokens that name Lucidos-only slash commands or Lucidos-source script
+    /// paths. None of these resolve from an external repo's cwd, so the
+    /// external-repo prompts must not mention them — CC would either hunt for
+    /// missing files or invoke unknown commands.
+    const LUCIDOS_ONLY_TOKENS: &[&str] = &[
+        "/harden",
+        "/cpa",
+        "./scripts/stop.sh",
+        "./scripts/web-dev.sh",
+        "./scripts/e2e",
+    ];
+
+    fn assert_no_lucidos_only_tokens(prompt: &str, label: &str) {
+        for token in LUCIDOS_ONLY_TOKENS {
+            assert!(
+                !prompt.contains(token),
+                "{label} must not mention `{token}` — it does not resolve in external repos",
+            );
+        }
+    }
+
+    #[test]
+    fn external_repo_prompt_omits_lucidos_only_tokens() {
+        let prompt = external_repo_system_prompt("Acme", "feature/x", "origin/main");
+        assert_no_lucidos_only_tokens(&prompt, "external_repo_system_prompt");
+        assert!(
+            prompt.contains("Acme"),
+            "must still name the repo so CC knows where it is",
+        );
+    }
+
+    #[test]
+    fn external_repo_recovery_prompt_omits_lucidos_only_tokens() {
+        let prompt = external_repo_recovery_system_prompt("Acme", "feature/x");
+        assert_no_lucidos_only_tokens(&prompt, "external_repo_recovery_system_prompt");
+    }
+
+    #[test]
+    fn external_prompts_keep_pkill_prevention() {
+        // Slimmer process-safety rule still has to ban broad pkill — that
+        // is the whole reason the rule exists; the script alternatives are
+        // just bonus info that doesn't apply outside the Lucidos source.
+        let prompt = external_repo_system_prompt("Acme", "feature/x", "origin/main");
+        assert!(
+            prompt.contains("pkill -f lucidos-engine"),
+            "external prompt must still warn against broad pkill",
+        );
+        assert!(
+            prompt.contains("kill $(cat <workspace>/.lucidos/engine.pid)"),
+            "external prompt must still tell CC how to kill a specific engine",
+        );
+    }
+
+    #[test]
+    fn lucidos_worktree_prompt_keeps_harden_and_cpa_guidance() {
+        // Don't accidentally strip these from the Lucidos-repo prompt while
+        // tightening the external one — `/harden` and `/cpa` are real here.
+        let prompt = worktree_system_prompt("feature/x", "dev");
+        assert!(prompt.contains("/harden"), "Lucidos prompt must keep /harden guidance");
+        assert!(prompt.contains("/cpa"), "Lucidos prompt must keep /cpa guidance");
+    }
 }

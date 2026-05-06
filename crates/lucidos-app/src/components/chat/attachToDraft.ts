@@ -1,10 +1,6 @@
-import { focusedThreadId, focusedDraftId, showToast } from '../../store/store';
-import { syncDraftEntry } from '../../store/actions/drafts';
+import { showToast } from '../../store/store';
 import { addPastedImage, type PastedImage } from './pastedImages';
-
-function activeDraftId(): string {
-  return focusedThreadId.value ?? focusedDraftId.value;
-}
+import { ensureFocusedComposeThread } from '../../store/actions/compose';
 
 function readImageAsBase64(file: File): Promise<PastedImage> {
   return new Promise((resolve, reject) => {
@@ -22,10 +18,9 @@ function readImageAsBase64(file: File): Promise<PastedImage> {
 }
 
 export async function attachImageToActiveDraft(file: File): Promise<void> {
-  const id = activeDraftId();
   const img = await readImageAsBase64(file);
+  const id = ensureFocusedComposeThread();
   addPastedImage(id, img);
-  syncDraftEntry(id);
 }
 
 export interface DroppedFileSplit {

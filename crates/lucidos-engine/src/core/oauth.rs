@@ -604,6 +604,40 @@ fn merge_scopes(existing: &str, requested: &str) -> String {
     all.join(" ")
 }
 
+/// Wait for an OAuth callback on the given listener, extract the authorization code.
+pub(crate) async fn wait_for_oauth_callback(
+    listener: tokio::net::TcpListener,
+) -> Result<String, BoxError> {
+    let (stream, _) = listener.accept().await?;
+    let mut buf = vec![0u8; 4096];
+    stream.readable().await?;
+    let n = stream.try_read(&mut buf)?;
+    let request = String::from_utf8_lossy(&buf[..n]);
+
+    // Parse the GET request line to extract the code parameter
+    let first_line = request.lines().next().unwrap_or("");
+    let path = first_line.split_whitespace().nth(1).unwrap_or("");
+    let code = path
+        .split('?')
+        .nth(1)
+        .and_then(|q| {
+            q.split('&')
+                .find(|p| p.starts_with("code="))
+                .map(|p| p.trim_start_matches("code=").to_string())
+        })
+        .ok_or("No authorization code in callback")?;
+
+    // Send a success response to the browser
+    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to Lucidos.</p></body></html>";
+    stream.writable().await?;
+    let _ = stream.try_write(response.as_bytes());
+
+    // URL-decode the code
+    let code = urlencoding::decode(&code)?.into_owned();
+
+    Ok(code)
+}
+
 /// Outcome of an OAuth token exchange: (email, display_name, scopes).
 pub type OAuthFlowResult = Result<(Option<String>, Option<String>, String), String>;
 
@@ -700,7 +734,7 @@ pub async fn prepare_oauth_flow(
             // Wait for callback (with 120s timeout)
             let code = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
-                crate::engine::tools::credentials::wait_for_oauth_callback(listener),
+                wait_for_oauth_callback(listener),
             )
             .await
             .map_err(|_| "OAuth authorization timed out after 120 seconds".to_string())?

@@ -16,6 +16,27 @@ const ANTHROPIC_BETA_1M_CONTEXT: &str = "context-1m-2025-08-07";
 /// gcloud tokens are project-scoped, so one cache serves all models.
 pub type TokenCache = Arc<std::sync::Mutex<Option<(String, std::time::Instant)>>>;
 
+/// Shared handle to the current Vertex AI region. Updated in place by the
+/// engine when `vertex_region` changes; provider clones read the new value
+/// on their next API call.
+pub type LocationHandle = Arc<std::sync::RwLock<String>>;
+
+/// Construct a `LocationHandle` from an initial region string.
+pub fn location_handle(initial: String) -> LocationHandle {
+    Arc::new(std::sync::RwLock::new(initial))
+}
+
+/// Snapshot the current region. Returns `"global"` if the lock is poisoned —
+/// poisoning means a writer panicked mid-update, which should never happen
+/// (writers only call `*guard = new`), but readers still shouldn't take down
+/// every LLM and image call if it does.
+pub fn read_location(handle: &LocationHandle) -> String {
+    handle.read().map(|g| g.clone()).unwrap_or_else(|e| {
+        crate::log!("[Vertex] location lock poisoned, falling back to global: {}", e);
+        "global".to_string()
+    })
+}
+
 pub fn vertex_host(location: &str) -> String {
     if location == "global" {
         "aiplatform.googleapis.com".to_string()
@@ -65,7 +86,7 @@ pub fn get_cached_access_token(
 #[derive(Clone)]
 pub struct VertexProvider {
     project_id: String,
-    location: String,
+    location: LocationHandle,
     model: String,
     client: reqwest::Client,
     /// Client without per-request timeout, used for Claude streaming where
@@ -77,17 +98,17 @@ pub struct VertexProvider {
 
 impl VertexProvider {
     pub fn new(project_id: String, location: String, model: String) -> Self {
-        Self::with_token_cache(
+        Self::with_location_handle(
             project_id,
-            location,
+            location_handle(location),
             model,
             Arc::new(std::sync::Mutex::new(None)),
         )
     }
 
-    pub fn with_token_cache(
+    pub fn with_location_handle(
         project_id: String,
-        location: String,
+        location: LocationHandle,
         model: String,
         token_cache: TokenCache,
     ) -> Self {
@@ -108,8 +129,9 @@ impl VertexProvider {
         }
     }
 
-    pub fn token_cache(&self) -> &TokenCache {
-        &self.token_cache
+    /// Snapshot the current region. URL builders call this per-request.
+    pub fn current_location(&self) -> String {
+        read_location(&self.location)
     }
 
     fn is_claude_model(model: &str) -> bool {
@@ -140,11 +162,12 @@ impl VertexProvider {
     }
 
     fn endpoint_for_model(&self, model: &str) -> String {
-        let host = vertex_host(&self.location);
+        let location = self.current_location();
+        let host = vertex_host(&location);
         if Self::is_claude_model(model) {
             format!(
                 "https://{}/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:streamRawPredict",
-                host, self.project_id, self.location, model
+                host, self.project_id, location, model
             )
         } else if model.starts_with("gemini-3") {
             format!(
@@ -154,7 +177,7 @@ impl VertexProvider {
         } else {
             format!(
                 "https://{}/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
-                host, self.project_id, self.location, model
+                host, self.project_id, location, model
             )
         }
     }
@@ -483,6 +506,7 @@ impl VertexProvider {
 
         // Accumulated content blocks by index
         let mut blocks: Vec<AccumulatedBlock> = Vec::new();
+        let mut turn_meta = TurnMeta::default();
 
         let chunk_timeout = Duration::from_secs(300);
 
@@ -510,7 +534,7 @@ impl VertexProvider {
                             _ => 0,
                         })
                         .sum();
-                    Self::process_sse_data(data_str, &mut blocks)?;
+                    Self::process_sse_data(data_str, &mut blocks, &mut turn_meta)?;
                     if let Some(cb) = on_token {
                         let new_text_len: usize = blocks
                             .iter()
@@ -538,6 +562,7 @@ impl VertexProvider {
         // Build LlmResponse from accumulated blocks
         let mut content = None;
         let mut tool_calls = Vec::new();
+        let mut thinking_chars: usize = 0;
 
         for block in blocks {
             match block {
@@ -565,20 +590,25 @@ impl VertexProvider {
                         arguments,
                     });
                 }
-                AccumulatedBlock::Thinking => {}
+                AccumulatedBlock::Thinking(t) => {
+                    thinking_chars = thinking_chars.saturating_add(t.len());
+                }
             }
         }
 
         Ok(LlmResponse {
             content,
             tool_calls,
+            stop_reason: turn_meta.stop_reason,
+            output_tokens: turn_meta.output_tokens,
+            thinking_chars: Some(thinking_chars),
         })
     }
 
-    /// Process a single SSE data line, updating accumulated blocks.
     fn process_sse_data(
         data_str: &str,
         blocks: &mut Vec<AccumulatedBlock>,
+        meta: &mut TurnMeta,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let data: serde_json::Value = serde_json::from_str(data_str)?;
         let event_type = data["type"].as_str().unwrap_or("");
@@ -589,9 +619,8 @@ impl VertexProvider {
                 let block = &data["content_block"];
                 let block_type = block["type"].as_str().unwrap_or("");
 
-                // Ensure blocks vec is large enough
                 while blocks.len() <= index {
-                    blocks.push(AccumulatedBlock::Thinking); // placeholder
+                    blocks.push(AccumulatedBlock::Thinking(String::new()));
                 }
 
                 blocks[index] = match block_type {
@@ -603,7 +632,10 @@ impl VertexProvider {
                         name: block["name"].as_str().unwrap_or("").to_string(),
                         json_parts: String::new(),
                     },
-                    _ => AccumulatedBlock::Thinking, // thinking, redacted_thinking, etc.
+                    "thinking" | "redacted_thinking" => AccumulatedBlock::Thinking(
+                        block["thinking"].as_str().unwrap_or("").to_string(),
+                    ),
+                    _ => AccumulatedBlock::Thinking(String::new()),
                 };
             }
             "content_block_delta" => {
@@ -628,8 +660,21 @@ impl VertexProvider {
                                 json_parts.push_str(j);
                             }
                         }
-                        _ => {} // thinking_delta, signature_delta — discard
+                        ("thinking_delta", AccumulatedBlock::Thinking(ref mut text)) => {
+                            if let Some(t) = delta["thinking"].as_str() {
+                                text.push_str(t);
+                            }
+                        }
+                        _ => {} // signature_delta, etc. — discard
                     }
+                }
+            }
+            "message_delta" => {
+                if let Some(sr) = data["delta"]["stop_reason"].as_str() {
+                    meta.stop_reason = Some(sr.to_string());
+                }
+                if let Some(ot) = data["usage"]["output_tokens"].as_u64() {
+                    meta.output_tokens = Some(ot as u32);
                 }
             }
             "error" => {
@@ -641,7 +686,7 @@ impl VertexProvider {
                     format!("Claude streaming error [{}]: {}", error_type, error_msg).into(),
                 );
             }
-            // message_start, content_block_stop, message_delta, message_stop, ping — ignore
+            // message_start, content_block_stop, message_stop, ping — ignore
             _ => {}
         }
 
@@ -816,14 +861,14 @@ impl VertexProvider {
             .await?;
 
         if !status.is_success() {
-            log!("Gemini API error ({}): {}", status, body);
+            log!("[Vertex] Gemini API error ({}): {}", status, body);
             return Err(format!("Gemini API error ({}): {}", status, body).into());
         }
 
         let parsed: VertexResponse = match serde_json::from_str(&body) {
             Ok(p) => p,
             Err(e) => {
-                log!("Failed to parse Gemini response: {}\nBody: {}", e, body);
+                log!("[Vertex] Failed to parse Gemini response: {}\nBody: {}", e, body);
                 return Err(format!("Failed to parse Gemini response: {}", e).into());
             }
         };
@@ -857,9 +902,13 @@ impl VertexProvider {
             cb(text);
         }
 
+        // TODO: capture Gemini finishReason + usage if empty completions surface here
         Ok(LlmResponse {
             content,
             tool_calls,
+            stop_reason: None,
+            output_tokens: None,
+            thinking_chars: None,
         })
     }
 }
@@ -910,7 +959,6 @@ struct ClaudeTool {
     input_schema: serde_json::Value,
 }
 
-/// Intermediate state for accumulating streamed content blocks.
 enum AccumulatedBlock {
     Text(String),
     ToolUse {
@@ -918,7 +966,17 @@ enum AccumulatedBlock {
         name: String,
         json_parts: String,
     },
-    Thinking,
+    /// Thinking content is internal — kept only so the empty-completion log
+    /// can report `thinking_chars` to distinguish "thought then gave up"
+    /// from "said nothing without thinking".
+    Thinking(String),
+}
+
+/// Per-turn metadata captured from Anthropic's `message_delta` SSE event.
+#[derive(Default)]
+struct TurnMeta {
+    stop_reason: Option<String>,
+    output_tokens: Option<u32>,
 }
 
 // ===== Gemini/Vertex request/response types =====
@@ -1312,6 +1370,38 @@ mod tests {
         assert_eq!(
             VertexProvider::parse_context_suffix("gemini-2.5-pro"),
             ("gemini-2.5-pro", false)
+        );
+    }
+
+    #[test]
+    fn endpoint_reflects_live_location_handle_updates() {
+        let handle = location_handle("europe-west1".into());
+        let provider = VertexProvider::with_location_handle(
+            "my-project".into(),
+            handle.clone(),
+            "claude-opus-4-6".into(),
+            Arc::new(std::sync::Mutex::new(None)),
+        );
+
+        let before = provider.endpoint_for_model("claude-opus-4-6");
+        assert!(
+            before.contains("europe-west1") && before.contains("/locations/europe-west1/"),
+            "initial URL must reflect handle's starting region, got: {}",
+            before
+        );
+
+        *handle.write().unwrap() = "us-central1".into();
+
+        let after = provider.endpoint_for_model("claude-opus-4-6");
+        assert!(
+            after.contains("us-central1") && after.contains("/locations/us-central1/"),
+            "URL must pick up updated handle without rebuilding the provider, got: {}",
+            after
+        );
+        assert!(
+            !after.contains("europe-west1"),
+            "URL must not still contain the old region, got: {}",
+            after
         );
     }
 }

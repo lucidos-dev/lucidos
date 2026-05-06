@@ -1,9 +1,11 @@
 use super::agent_session::change_description_fallback;
 use super::change_ops::branch_is_hardened;
-use super::claude_code::WORKTREE_WORKSPACE_MARKER;
+use super::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use super::git_ops::{
-    auto_commit_worktree, default_local_branch, describe_branch_changes, files_require_restart,
-    find_worktree_for_branch, git_cmd, main_worktree, proposal_files_for_branch, worktrees_dir,
+    add_paths_to_worktree_exclude, auto_commit_worktree, default_local_branch,
+    describe_branch_changes, files_require_restart, find_worktree_for_branch, git_cmd,
+    is_external_repo_path, main_worktree, proposal_files_for_branch, worktree_add,
+    worktrees_dir,
 };
 use super::thread_events::{EngineReason, EventChannel, MessageOrigin};
 use super::LucidosEngine;
@@ -24,6 +26,50 @@ pub const ENGINE_RESTART_INTERRUPT_REASON: &str = "engine_restart_interrupt";
 /// `SpawnTrigger::ContinueSignal` and starts the next CC turn.
 pub const USER_CLICKED_CONTINUE_REASON: &str = "user_clicked_continue";
 
+/// Tag stamped on `ContinueSignal.reason` when the user answers an
+/// `AskUserQuestion` after the CC subprocess has been torn down at idle.
+/// `notify()` is a no-op in that window, so this signal makes the spawn
+/// dispatcher boot a fresh `--resume` subprocess; the resumed CC re-runs
+/// the hook, which reads the persisted answer from the DB.
+pub const ANSWERED_AFTER_IDLE_REASON: &str = "answered_after_idle";
+
+/// Should the SpawnConsumer's `Continue` handler emit `SessionRecovered` for
+/// a `ContinueSignal` carrying this `reason`?
+///
+/// `SessionRecovered` opens a new "Resumed after engine restart" exchange in
+/// the timeline. That label is only honest when the continuation is in
+/// response to an actual mid-turn engine restart (i.e. the user clicked the
+/// Continue button). For `answered_after_idle` the user answered an
+/// `AskUserQuestion` after CC's subprocess was torn down at idle — the
+/// follow-up CC events should attach to the existing `UserQuestionAsked`
+/// exchange instead of being mislabeled as a recovery.
+///
+/// Default-deny on unknown / missing reasons: a future `ContinueSignal`
+/// reason must opt-in explicitly rather than inheriting a "Resumed after
+/// engine restart" boundary by accident.
+pub fn continue_should_open_resume_exchange(reason: Option<&str>) -> bool {
+    reason == Some(USER_CLICKED_CONTINUE_REASON)
+}
+
+/// User message the spawn consumer hands to `run_direct_agent` when actuating
+/// a `SpawnRequest::Continue`. **Must be non-empty.**
+///
+/// `claude --print --resume` reads stdin in stream-json mode and waits
+/// indefinitely for at least one input line before emitting its `system/init`
+/// event. The engine keeps the input channel open across the session lifetime,
+/// so EOF never arrives on its own — without an explicit input, CC parks
+/// forever, `events_rx.recv()` never resolves, and the thread sits "Running"
+/// until the next engine restart tears the subprocess down.
+///
+/// The string mirrors the placeholder CC itself injects on `--resume` of an
+/// unfinished tool_use (see `agent_session/run_session.rs` and
+/// `agent_session/reconstruct.rs`), so CC ingests it as a plain user turn and
+/// proceeds against the resumed conversation state. The richer recovery
+/// payload (system-prompt override, pending-merge context, etc.) will replace
+/// this call site later; until then this constant guarantees the non-empty
+/// stdin precondition.
+pub const CONTINUE_RESUME_USER_MESSAGE: &str = "Continue from where you left off.";
+
 /// Remove a stale worktree directory and delete its branch.
 /// Best-effort — failures are silently ignored since the worktree
 /// will just be skipped again on next restart.
@@ -34,59 +80,6 @@ async fn cleanup_stale_worktree(wt_path: &Path, branch_name: &str, repo_root: &P
     )
     .await;
     let _ = git_cmd(&["branch", "-D", branch_name], repo_root).await;
-}
-
-/// Add the workspace marker to the worktree's git exclude so it doesn't
-/// appear as an untracked file (important for external repos).
-/// Best-effort — failure is logged but not fatal.
-async fn write_marker_git_exclude(wt_path: &Path) {
-    let git_dir = wt_path.join(".git");
-    let exclude_dir = if tokio::fs::metadata(&git_dir)
-        .await
-        .map(|m| m.is_file())
-        .unwrap_or(false)
-    {
-        if let Ok(content) = tokio::fs::read_to_string(&git_dir).await {
-            content
-                .trim()
-                .strip_prefix("gitdir: ")
-                .map(|p| wt_path.join(p).join("info"))
-        } else {
-            None
-        }
-    } else {
-        Some(git_dir.join("info"))
-    };
-    if let Some(info_dir) = exclude_dir {
-        if let Err(e) = tokio::fs::create_dir_all(&info_dir).await {
-            log!("[Recovery] Failed to create git info dir: {}", e);
-            return;
-        }
-        let exclude_file = info_dir.join("exclude");
-        let already_excluded = tokio::fs::read_to_string(&exclude_file)
-            .await
-            .map(|c| c.lines().any(|l| l.trim() == WORKTREE_WORKSPACE_MARKER))
-            .unwrap_or(false);
-        if !already_excluded {
-            match tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&exclude_file)
-                .await
-            {
-                Ok(mut f) => {
-                    use tokio::io::AsyncWriteExt;
-                    if let Err(e) = f
-                        .write_all(format!("\n{}\n", WORKTREE_WORKSPACE_MARKER).as_bytes())
-                        .await
-                    {
-                        log!("[Recovery] Failed to write git exclude: {}", e);
-                    }
-                }
-                Err(e) => log!("[Recovery] Failed to open git exclude: {}", e),
-            }
-        }
-    }
 }
 
 impl LucidosEngine {
@@ -115,15 +108,14 @@ impl LucidosEngine {
         let base = default_local_branch(repo_root).await;
         let log_range = format!("{}..{}", base, branch_name);
         let description = describe_branch_changes(repo_root, &log_range, &fallback, None).await;
-        let request_id = Uuid::new_v4();
         let repo_root_str = repo_root.to_string_lossy();
         // Marker survives worktree removal (keyed by repo_root + branch_name),
-        // so recovery can read it after `safe_cleanup_worktree` deleted the worktree.
-        // Without this check, propose_change downgrades hardened=true → false and
-        // Apply re-runs `/harden` on already-hardened work.
+        // so this lookup works even when the cleanup worker has already removed
+        // the worktree under us. Without this check, propose_change downgrades
+        // hardened=true → false and Apply re-runs `/harden` on already-hardened
+        // work.
         let hardened = branch_is_hardened(self.pool(), self.changes(), repo_root, branch_name).await;
         self.propose_change(crate::engine::change_ops::ProposeChangeInput {
-            request_id,
             thread_id,
             branch_name,
             repo_root: &repo_root_str,
@@ -137,74 +129,17 @@ impl LucidosEngine {
         .await
     }
 
-    /// Safe worktree cleanup: before deleting, check if the branch has commits
-    /// ahead of main. If so, auto-propose a Change to prevent work loss.
-    /// For external repos, the branch is kept but no change is proposed — the
-    /// user manages push/PR workflows for external repos independently.
-    /// Returns true if cleanup proceeded (with or without proposal), false if
-    /// we couldn't save the work and skipped cleanup entirely.
-    async fn safe_cleanup_worktree(
-        self: &Arc<Self>,
-        wt_path: &Path,
-        branch_name: &str,
-        repo_root: &Path,
-        thread_id: Option<Uuid>,
-        is_external_repo: bool,
-    ) -> bool {
-        auto_commit_worktree(wt_path, "Claude Code changes (auto-committed on cleanup)").await;
-
-        if let Some(changed_files) = proposal_files_for_branch(repo_root, branch_name).await {
-            if is_external_repo {
-                log!("[Recovery] External repo branch {} has commits — keeping branch, no change proposed", branch_name);
-            } else {
-                let tid = thread_id.unwrap_or_else(Uuid::new_v4);
-                match self
-                    .propose_branch_changes(
-                        tid,
-                        branch_name,
-                        repo_root,
-                        &changed_files,
-                        Some(MessageOrigin::engine(EngineReason::OrphanRecovery)),
-                    )
-                    .await
-                {
-                    Ok(change_id) => {
-                        log!("[Recovery] SAFETY: Auto-proposed change {} for branch {} — branch has commits ahead of main that would have been deleted",
-                            change_id, branch_name);
-                    }
-                    Err(e) => {
-                        log!("[Recovery] SAFETY: Failed to auto-propose change for branch {} — SKIPPING cleanup to prevent work loss: {}",
-                            branch_name, e);
-                        return false;
-                    }
-                }
-            }
-            // Keep the branch — for Lucidos the proposed Change references it,
-            // for external repos the user manages it independently.
-            let _ = git_cmd(
-                &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
-                repo_root,
-            )
-            .await;
-            true
-        } else {
-            cleanup_stale_worktree(wt_path, branch_name, repo_root).await;
-            true
-        }
-    }
-
     /// Handle ending a stale waiting CC session (no live process) after engine restart.
     /// Looks up the branch from SessionStarted events, proposes changes, and cleans up.
     ///
     /// `actor` identifies who initiated the operation. HTTP-driven entry points
-    /// (Apply Now, Cancel-with-apply, Done) plumb the user's device through so
+    /// (Apply Now, Cancel-with-apply, Archive) plumb the user's device through so
     /// any resulting `ChangeApplied` / `ChangeApplyFailed` events stamp the
     /// real actor instead of falling back to the "Lucidos Engine" chip.
     /// Engine-internal restart-recovery callers pass `None`.
     pub(crate) async fn end_stale_waiting_session(
         self: &Arc<Self>,
         thread_id: Uuid,
-        auto_apply: bool,
         discard: bool,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -229,24 +164,6 @@ impl LucidosEngine {
             }
             Some(_) => {
                 // SessionStarted exists but branch is empty — stale CC session with no branch.
-                if auto_apply {
-                    self.event_bus
-                        .emit_or_log(
-                            crate::engine::event_bus::BusEvent::Thread {
-                                thread_id,
-                                event:
-                                    crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
-                                        change_id: String::new(),
-                                        error: "No branch found for session — nothing to apply"
-                                            .to_string(),
-                                        actor: actor.clone(),
-                                    },
-                                meta: crate::engine::thread_events::EventMeta::NONE,
-                            },
-                            "[Recovery] ChangeApplyFailed",
-                        )
-                        .await;
-                }
                 // Phase 4: Mark the orphaned session as idle (turn boundary)
                 // rather than terminating it. The thread stays alive — the user
                 // can still send a follow-up that re-spawns CC via --resume.
@@ -302,12 +219,15 @@ impl LucidosEngine {
 
         let mut proposed_change = false;
         if discard {
-            // User chose "Discard & End Session" — delete the branch, don't propose changes
+            // User explicitly chose "Discard & End Session" on a thread with no
+            // live CC subprocess. Plumb the user's actor through to the
+            // resulting ChangeDiscarded events so the chat chip reads "You"
+            // instead of falling back to the engine label.
             log!(
                 "[ClaudeCode] Discarding stale session changes (branch {})",
                 branch_name
             );
-            self.discard_pending_for_thread(thread_id).await;
+            self.discard_pending_for_thread(thread_id, actor.clone()).await;
             if let Err(e) = git_cmd(&["branch", "-D", &branch_name], &repo_root).await {
                 log!(
                     "[ClaudeCode] Failed to delete branch {}: {}",
@@ -397,67 +317,10 @@ impl LucidosEngine {
             )
             .await;
 
-        // Auto-apply path: every pending change on this branch must reach a
-        // terminal event (ChangeApplied / ChangeApplyFailed / ChangeDiscarded)
-        // before we return. Otherwise the UI's transient "Applying..." spinner
-        // — set when the user clicked Apply — has no event to react to and
-        // hangs forever, hiding the failure. Two failure modes were silent
-        // before this block was added:
-        //   (a) `apply_change` errored → only logged, no event.
-        //   (b) Branch already merged or deleted → `proposal_files == None`
-        //       so we never even tried to apply, and the row stayed pending.
-        if auto_apply {
-            let orphans: Vec<_> = self
-                .changes()
-                .list_pending()
-                .await
-                .into_iter()
-                .filter(|c| c.branch_name == branch_name)
-                .collect();
-
-            if proposed_change {
-                for change in &orphans {
-                    log!(
-                        "[ClaudeCode] Auto-applying stale session change: {}",
-                        change.id
-                    );
-                    if let Err(e) = self.apply_change(change.id, actor.clone()).await {
-                        log!(
-                            "[ClaudeCode] Auto-apply of stale session change {} failed: {}",
-                            change.id,
-                            e
-                        );
-                        self.emit_apply_failed(
-                            thread_id,
-                            change.id,
-                            &e.to_string(),
-                            actor.clone(),
-                        )
-                        .await;
-                    }
-                }
-            } else {
-                // Branch is gone or has no commits but pending rows exist.
-                // Each orphan needs a terminal event — discard succeeds → the
-                // generic "branch gone" reason; discard fails → that error
-                // reaches the user too (no silent log-and-continue).
-                for change in &orphans {
-                    let msg = match self.discard_change(change.id, actor.clone()).await {
-                        Ok(()) => "Branch already merged or removed — nothing to apply.".to_string(),
-                        Err(e) => {
-                            log!(
-                                "[ClaudeCode] Failed to discard orphan change {}: {}",
-                                change.id,
-                                e
-                            );
-                            format!("Failed to discard orphan change: {}", e)
-                        }
-                    };
-                    self.emit_apply_failed(thread_id, change.id, &msg, actor.clone())
-                        .await;
-                }
-            }
-        }
+        // No auto-apply / auto-discard tail: any pending change on the branch
+        // is left for the user to resolve from Review. The Apply Now flow
+        // (`apply_now`) chains its own POST /changes/<id>/apply once the
+        // proposal lands via SSE, so we don't need to fuse propose+apply here.
 
         self.broadcast_changes_updated().await;
 
@@ -499,7 +362,8 @@ impl LucidosEngine {
             .unwrap_or_else(|_| lucidos_repo_root.clone());
         let mut seen_repo_paths: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::from([lucidos_canonical]);
-        let mut repos_to_scan: Vec<(PathBuf, Option<String>)> = vec![(lucidos_repo_root, None)];
+        let mut repos_to_scan: Vec<(PathBuf, Option<String>)> =
+            vec![(lucidos_repo_root.clone(), None)];
         match crate::core::repositories::RepositoryStore::list(self.pool()).await {
             Ok(repos) => {
                 for repo in repos {
@@ -825,25 +689,8 @@ impl LucidosEngine {
                     let wt_id = Uuid::new_v4().as_simple().to_string();
                     let wt_path =
                         worktrees_dir(self.workspace_path()).join(format!("cc-{}", wt_id));
-                    let wt_str = wt_path.to_string_lossy();
 
-                    match git_cmd(
-                        &[
-                            "-c",
-                            "filter.git-crypt.smudge=",
-                            "-c",
-                            "filter.git-crypt.clean=",
-                            "-c",
-                            "filter.git-crypt.required=false",
-                            "worktree",
-                            "add",
-                            &wt_str,
-                            branch,
-                        ],
-                        &repo_root,
-                    )
-                    .await
-                    {
+                    match worktree_add(&repo_root, &wt_path, &[branch]).await {
                         Ok(o) if o.status.success() => {
                             let marker = wt_path.join(WORKTREE_WORKSPACE_MARKER);
                             let marker_content = if let Some(ref rid) = repo_id {
@@ -858,9 +705,10 @@ impl LucidosEngine {
                                     e
                                 );
                             }
-                            // Add marker to worktree's git exclude so external repos
-                            // don't see it as an untracked file.
-                            write_marker_git_exclude(&wt_path).await;
+                            // Add engine-injected paths to the worktree's git exclude
+                            // so external repos don't see them as untracked or
+                            // accidentally commit them.
+                            add_paths_to_worktree_exclude(&wt_path, WORKTREE_EXCLUDE_PATHS).await;
                             log!("[Recovery] Created fresh worktree for lost session: {} (branch {})", wt_path.display(), branch);
                             to_recover.push((wt_path, branch.clone(), repo_id, repo_root));
                         }
@@ -903,7 +751,6 @@ impl LucidosEngine {
 
         let mut recovering_threads: std::collections::HashSet<uuid::Uuid> =
             std::collections::HashSet::new();
-        let mut cleaned_up: usize = 0;
 
         for (wt_path, branch_name, marker_repo_id, repo_root) in to_recover {
             if pending_branches.contains(&branch_name) {
@@ -928,81 +775,20 @@ impl LucidosEngine {
                 );
                 continue;
             }
-            let is_external = marker_repo_id.is_some();
-            if idle_branches.contains(&branch_name) {
+            // Skip non-in-flight branches so applied/idle threads don't
+            // surface a misleading "Continue?" affordance. Pending change
+            // counts as in-flight — CC was awaiting Apply when the engine
+            // died.
+            let in_flight = !idle_branches.contains(&branch_name)
+                && !completed_change_branches.contains(&branch_name);
+            let has_pending_change = pending_branches.contains(&branch_name);
+            if !in_flight && !has_pending_change {
                 log!(
-                    "[Recovery] Cleaning up stale worktree {} — session was idle before restart",
-                    wt_path.display()
+                    "[Recovery] Skipping clean worktree {} — branch {} has no in-flight signal; cleanup worker will reclaim",
+                    wt_path.display(),
+                    branch_name
                 );
-                let tid = branch_to_thread.get(&branch_name).copied();
-                self.safe_cleanup_worktree(&wt_path, &branch_name, &repo_root, tid, is_external)
-                    .await;
-                cleaned_up += 1;
                 continue;
-            }
-            if completed_change_branches.contains(&branch_name) {
-                log!("[Recovery] Cleaning up stale worktree {} — change already applied/discarded for branch {}", wt_path.display(), branch_name);
-                let tid = branch_to_thread.get(&branch_name).copied();
-                self.safe_cleanup_worktree(&wt_path, &branch_name, &repo_root, tid, is_external)
-                    .await;
-                cleaned_up += 1;
-                continue;
-            }
-            if !branch_to_thread.contains_key(&branch_name)
-                && !actively_running_branches.contains(&branch_name)
-            {
-                log!("[Recovery] Cleaning up stale worktree {} — no original thread found for branch {} (likely from a previous DB context)", wt_path.display(), branch_name);
-                self.safe_cleanup_worktree(&wt_path, &branch_name, &repo_root, None, is_external)
-                    .await;
-                cleaned_up += 1;
-                continue;
-            }
-            // Git-level check: if the branch has no commits ahead of main and no
-            // uncommitted changes, it may be already fully merged. This catches
-            // sessions the SQL idle_branches query misses — e.g., when an
-            // Apply-time hardening session emitted SessionStarted after
-            // CodingAgentIdled (making the SQL think it's non-idle), but the
-            // branch was actually done.
-            //
-            // EXCEPTION: if the session was actively running (last lifecycle event
-            // is SessionStarted, not CodingAgentIdled/SessionEnded), it MUST be
-            // resumed even with no git changes — it was killed before producing
-            // any output.
-            let branch_has_changes = {
-                let has_commits = match git_cmd(&["log", "main..HEAD", "--oneline"], &wt_path).await
-                {
-                    Ok(o) if o.status.success() => {
-                        let stdout = String::from_utf8_lossy(&o.stdout);
-                        !stdout.trim().is_empty()
-                    }
-                    _ => true, // If git fails, assume there are changes (safer)
-                };
-                let has_uncommitted = match git_cmd(&["status", "--porcelain"], &wt_path).await {
-                    Ok(o) if o.status.success() => {
-                        let stdout = String::from_utf8_lossy(&o.stdout);
-                        !stdout.trim().is_empty()
-                    }
-                    _ => true,
-                };
-                has_commits || has_uncommitted
-            };
-            if !branch_has_changes {
-                if actively_running_branches.contains(&branch_name) {
-                    log!("[Recovery] Resuming worktree {} — branch {} has no git changes but session was actively running", wt_path.display(), branch_name);
-                } else {
-                    log!("[Recovery] Cleaning up stale worktree {} — branch {} already merged to main (no diff)", wt_path.display(), branch_name);
-                    let tid = branch_to_thread.get(&branch_name).copied();
-                    self.safe_cleanup_worktree(
-                        &wt_path,
-                        &branch_name,
-                        &repo_root,
-                        tid,
-                        is_external,
-                    )
-                    .await;
-                    cleaned_up += 1;
-                    continue;
-                }
             }
             // Find the original thread for this branch — reuse it instead of
             // creating a new recovery thread.
@@ -1029,7 +815,6 @@ impl LucidosEngine {
             if !recovering_threads.insert(thread_id) {
                 log!("[Recovery] Skipping duplicate recovery for thread {} (branch {}) — already recovering", thread_id, branch_name);
                 cleanup_stale_worktree(&wt_path, &branch_name, &repo_root).await;
-                cleaned_up += 1;
                 continue;
             }
 
@@ -1059,7 +844,7 @@ impl LucidosEngine {
                 }
             };
 
-            let is_external_repo = marker_repo_id.is_some();
+            let is_external_repo = is_external_repo_path(&repo_root, &lucidos_repo_root);
             // Phase 5.3: do NOT auto-spawn CC for mid-turn-crashed sessions.
             // Surface the interruption as a synthetic CodingAgentIdled with
             // `reason = engine_restart_interrupt` so the UI can render a
@@ -1067,7 +852,9 @@ impl LucidosEngine {
             // /api/threads/<id>/continue, which emits ContinueSignal — the
             // spawn dispatcher then re-enters CC via `--resume` against the
             // recorded `cc_session_id`. The worktree stays on disk: the
-            // dispatcher resolves it on next spawn.
+            // dispatcher resolves it on next spawn, and the cleanup worker's
+            // Tier 0 won't reclaim it until the thread reaches a terminal
+            // idle state with no pending change.
             log!("[Recovery] Surfacing interrupted CC session for user-driven continue: {} (branch {}, thread {}{}, cc_session: {})",
                 wt_path.display(), branch_name, thread_id,
                 marker_repo_id.as_ref().map(|r| format!(", repo {}", r)).unwrap_or_default(),
@@ -1085,6 +872,65 @@ impl LucidosEngine {
                 channel: Some(EventChannel::CodingAgent),
                 ..crate::engine::thread_events::EventMeta::NONE
             };
+            // Emit the boundary `ResponseAborted` FIRST so the UI shows the
+            // "Response interrupted" panel above the synthetic Idled. The
+            // dispatcher classifies on `CodingAgentIdled.reason`, so order
+            // doesn't affect spawn decisions.
+            //
+            // Idempotency: `/api/restart` pre-emits a `ResponseAborted{actor:
+            // device}` for in-flight CC threads BEFORE shutdown so the
+            // post-restart timeline reads "You restarted". If that event
+            // exists newer than the latest start, skip our emit — emitting
+            // again would double-render the AbortPanel and overwrite the
+            // device attribution with `engine`.
+            let abort_already_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                    SELECT 1 FROM events WHERE aggregate_id = $1 \
+                      AND event_type = 'ResponseAborted' \
+                      AND sequence > COALESCE( \
+                          (SELECT MAX(sequence) FROM events WHERE aggregate_id = $1 \
+                             AND event_type IN ('MessageReceived','CodingAgentUserMessageSent','TriggerStarted')), 0))",
+            )
+            .bind(thread_id.to_string())
+            .fetch_one(self.pool())
+            .await
+            .unwrap_or(false);
+
+            if !abort_already_exists {
+                let originating_event_id =
+                    crate::engine::agent_session::latest_originating_event_id(
+                        self.pool(),
+                        thread_id,
+                        &["MessageReceived", "CodingAgentUserMessageSent", "TriggerStarted"],
+                    )
+                    .await;
+                let abort_meta = crate::engine::thread_events::EventMeta {
+                    channel: Some(EventChannel::CodingAgent),
+                    request_event_id: originating_event_id,
+                    // The host system killed the previous CC turn (engine
+                    // crashed mid-turn / OS killed the process). The recovery
+                    // path is just marking it. Engine-deliberate work uses
+                    // `Engine{...}` instead.
+                    actor: Some(MessageOrigin::system()),
+                    ..crate::engine::thread_events::EventMeta::NONE
+                };
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ResponseAborted {
+                                text: String::new(),
+                                images: vec![],
+                                model: None,
+                                reasoning_effort: None,
+                            },
+                            meta: abort_meta,
+                        },
+                        "[Recovery] ResponseAborted (engine_restart_interrupt)",
+                    )
+                    .await;
+            }
+
             self.event_bus
                 .emit_or_log(
                     crate::engine::event_bus::BusEvent::Thread {
@@ -1111,13 +957,8 @@ impl LucidosEngine {
                 .await;
         }
 
-        if cleaned_up > 0 {
-            log!("[Recovery] Cleaned up {} stale worktrees", cleaned_up);
-        }
-
         recovering_threads.into_iter().collect()
     }
-
 }
 
 /// Re-emit `CodingAgentPermissionResolved` for every persisted
@@ -1189,6 +1030,26 @@ pub async fn recover_orphan_cc_permission_requests(
 mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
+
+    use crate::engine::git_ops::is_external_repo_path;
+
+    /// Regression: recovery must classify the workspace's own Lucidos worktree
+    /// as internal, even when the marker file contains a `repo_id` for it.
+    /// Pre-fix, the recovery sweep keyed on `marker_repo_id.is_some()` and
+    /// skipped `propose_branch_changes` for crashed CC sessions, leaving real
+    /// commits with `cc_has_changes=false`.
+    #[test]
+    fn lucidos_repo_worktree_is_not_external() {
+        let lucidos = PathBuf::from("/Users/me/IdeaProjects/lucidos");
+        assert!(!is_external_repo_path(&lucidos, &lucidos));
+    }
+
+    #[test]
+    fn external_repo_worktree_is_external() {
+        let lucidos = PathBuf::from("/Users/me/IdeaProjects/lucidos");
+        let external = PathBuf::from("/Users/me/IdeaProjects/some-other-repo");
+        assert!(is_external_repo_path(&external, &lucidos));
+    }
 
     /// Groups branch sets used to filter recovery candidates.
     #[derive(Default)]
@@ -2069,6 +1930,32 @@ mod tests {
         }
     }
 
+    /// `continue_should_open_resume_exchange` gates the SpawnConsumer's
+    /// "Resumed after engine restart" emit. Only the user-clicked-continue
+    /// path qualifies — `answered_after_idle` resumes inside an existing
+    /// `UserQuestionAsked` exchange and would mislabel as a recovery.
+    #[test]
+    fn continue_resume_exchange_gate_only_opens_for_user_clicked_continue() {
+        use super::{
+            continue_should_open_resume_exchange, ANSWERED_AFTER_IDLE_REASON,
+            USER_CLICKED_CONTINUE_REASON,
+        };
+        assert!(continue_should_open_resume_exchange(Some(
+            USER_CLICKED_CONTINUE_REASON
+        )));
+        assert!(!continue_should_open_resume_exchange(Some(
+            ANSWERED_AFTER_IDLE_REASON
+        )));
+        assert!(
+            !continue_should_open_resume_exchange(None),
+            "missing reason must default-deny — only known recovery reasons open the exchange"
+        );
+        assert!(
+            !continue_should_open_resume_exchange(Some("future_reason_not_yet_handled")),
+            "unknown reasons must default-deny so a future ContinueSignal source can't accidentally inherit the recovery boundary"
+        );
+    }
+
     /// Most idles carry no reason — make sure that case still round-trips
     /// without leaking a `"reason": null` into the wire payload (the
     /// `skip_serializing_if = "Option::is_none"` attribute owns this).
@@ -2246,5 +2133,34 @@ mod integration_tests {
         handle.abort();
         pool.close().await;
         teardown_test_db(&db_name).await;
+    }
+
+    /// Regression: the spawn consumer's Continue path must hand CC a non-empty
+    /// `user_message`. `claude --print --resume` parks indefinitely on stdin
+    /// when no input is sent (verified empirically against claude 2.1.123),
+    /// the engine's `events_rx` never resolves, and the thread sits "Running"
+    /// forever — the second-stage zombie observed on thread `ca025588-...`.
+    ///
+    /// Two assertions:
+    ///   1. The constant itself stays non-empty (and non-whitespace).
+    ///   2. The consumer in `engine/mod.rs` actually references the constant —
+    ///      catches a regression where a future edit reverts to a literal `""`
+    ///      while the constant stays defined elsewhere.
+    #[test]
+    fn spawn_consumer_continue_must_send_non_empty_user_message() {
+        use super::CONTINUE_RESUME_USER_MESSAGE;
+
+        assert!(
+            !CONTINUE_RESUME_USER_MESSAGE.trim().is_empty(),
+            "CONTINUE_RESUME_USER_MESSAGE is empty — CC --print --resume would hang on stdin and zombie the thread"
+        );
+
+        let mod_rs = include_str!("mod.rs");
+        assert!(
+            mod_rs.contains("CONTINUE_RESUME_USER_MESSAGE"),
+            "engine/mod.rs no longer references CONTINUE_RESUME_USER_MESSAGE — \
+             the SpawnConsumer's Continue path may have reverted to passing a \
+             literal user_message and risks the empty-stdin zombie regression"
+        );
     }
 }

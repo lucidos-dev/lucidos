@@ -13,7 +13,6 @@ import {
 } from '../../api/client';
 import { openApp } from '../../store/actions/apps';
 import { resetViewDedup, loadNotifications } from '../../store/actions/notifications';
-import { escapeHtml } from '../../utils/escapeHtml';
 import { formatNotificationDate } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
@@ -21,6 +20,7 @@ import { loadedOr } from '../../store/types';
 import { ModalOverlay } from '../shared/ModalOverlay';
 import { ChevronLeftIcon, ChevronRightIcon, CloseIcon } from '../shared/icons';
 import { errorDetail } from '../../utils/errorDetail';
+import { resolveLinkedApp } from './resolveLinkedApp';
 
 export function NotificationsModal() {
   const isOpen = notificationsModalOpen.value;
@@ -66,18 +66,15 @@ export function NotificationsModal() {
     }
   }
 
+  const linked = resolveLinkedApp(detail.app_id, appsList.value);
   const apps = loadedOr(appsList.value, []);
-  const linkedAppId = detail.app_id;
-  const titleStripped = detail.title.replace(/^[^\p{L}\p{N}]+/u, '');
-  const linkedApp = (linkedAppId ? apps.find((s) => s.id === linkedAppId) : null)
-    ?? apps.find((s) => s.name === detail.title || s.name === titleStripped);
   const content = linkifyPaths(renderMarkdown(detail.message), [], apps);
   const dateStr = formatNotificationDate(new Date(detail.created_at));
 
   function handleOpenApp() {
-    if (!linkedApp) return;
+    if (linked.kind !== 'linked') return;
     close();
-    openApp(linkedApp);
+    openApp(linked.app);
   }
 
   function handleBodyClick(e: MouseEvent) {
@@ -90,6 +87,8 @@ export function NotificationsModal() {
     if (app) {
       close();
       openApp(app);
+    } else {
+      showToast(`Unknown app: ${appId ?? '(missing id)'}`, 'error');
     }
   }
 
@@ -114,11 +113,11 @@ export function NotificationsModal() {
             <ChevronRightIcon />
           </button>
           <span class="notifications-modal-title">
-            <span class="trigger-icon">{linkedApp?.icon || '\u{1F4CB}'}</span>
-            {linkedApp ? (
-              <a class="accent-link" onClick={handleOpenApp}>{escapeHtml(detail.title)}</a>
+            <span class="trigger-icon">{linked.kind === 'linked' && linked.app.icon ? linked.app.icon : '\u{1F4CB}'}</span>
+            {linked.kind === 'linked' ? (
+              <a class="accent-link" onClick={handleOpenApp}>{detail.title}</a>
             ) : (
-              escapeHtml(detail.title)
+              detail.title
             )}
           </span>
           <button class="icon-btn" onClick={close} aria-label="Close">
@@ -131,11 +130,16 @@ export function NotificationsModal() {
           onClick={handleBodyClick}
           dangerouslySetInnerHTML={{ __html: content }}
         />
-        {linkedApp && (
+        {linked.kind === 'linked' && (
           <div class="notification-detail-actions">
             <button class="action-btn" onClick={handleOpenApp}>
-              Open {linkedApp.name}
+              Open {linked.app.name}
             </button>
+          </div>
+        )}
+        {linked.kind === 'unknown' && (
+          <div class="notification-detail-actions">
+            <span class="error-text">Unknown app: {linked.appId}</span>
           </div>
         )}
       </div>

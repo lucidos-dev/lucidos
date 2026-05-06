@@ -45,4 +45,51 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     expect(url.pathname).toBe('/api/preferences');
     expect(url.searchParams.get('device_id')).toBeNull();
   });
+
+  it('keeps inline --bg-primary in sync with the resolved theme', async () => {
+    // The sdk-prefs.js inline FOUC seeds --bg-primary on first paint from
+    // localStorage. applyPreferences runs later (after the SDK loads) and
+    // must update the inline value to match the SSE-resolved theme so the
+    // body's `var(--bg-primary, ...)` paints the right color even though
+    // inline styles win over the stylesheet cascade.
+    const inlineProps: Record<string, string> = { '--bg-primary': '#0d1117' };
+    const realStyle = (document as any).documentElement.style;
+    (document as any).documentElement.style = {
+      setProperty: (k: string, v: string) => { inlineProps[k] = v; },
+      getPropertyValue: (k: string) => inlineProps[k] ?? '',
+      removeProperty: (k: string) => { delete inlineProps[k]; },
+      background: '',
+    };
+
+    try {
+      // beforeEach mocks fetch to return theme=light.
+      await lucidos.ui.applyPreferences();
+    } finally {
+      (document as any).documentElement.style = realStyle;
+    }
+
+    expect(inlineProps['--bg-primary']).toBe('#ffffff');
+  });
+
+  it('sets inline html.style.background so the iframe paints with a bg before sdk-iframe.css loads', async () => {
+    // See packages/lucidos-sdk/src/ui.ts for why — iOS PWA cold-restart flash.
+    const inlineProps: Record<string, string> = {};
+    const realStyle = (document as any).documentElement.style;
+    const styleMock: any = {
+      setProperty: (k: string, v: string) => { inlineProps[k] = v; },
+      getPropertyValue: (k: string) => inlineProps[k] ?? '',
+      removeProperty: (k: string) => { delete inlineProps[k]; },
+      background: '',
+    };
+    (document as any).documentElement.style = styleMock;
+
+    try {
+      // beforeEach mocks fetch to return theme=light.
+      await lucidos.ui.applyPreferences();
+    } finally {
+      (document as any).documentElement.style = realStyle;
+    }
+
+    expect(styleMock.background).toBe('#ffffff');
+  });
 });

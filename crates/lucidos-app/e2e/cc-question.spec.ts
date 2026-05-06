@@ -8,16 +8,19 @@ import { randomUUID } from 'crypto';
  *
  * We inject a synthetic UserQuestionAsked event directly into the DB for a
  * CC thread (mirroring what the engine would do after intercepting CC's
- * AskUserQuestion tool_use). The browser must:
- *   - Render a QuestionCard with the question text + clickable options.
+ * AskUserQuestion tool_use). UserQuestionAsked starts its OWN exchange — the
+ * QuestionBody renders as the body of an initiator panel ("You" chip),
+ * NOT inline in the prior CC response panel. The browser must:
+ *   - Render a divider initiator panel containing the question + options.
  *   - Persist a UserQuestionAnswered event after the user clicks an option.
- *   - Show the resolved "Answered: <label>" view.
+ *   - Flip the SAME panel in place to its answered state (selected option
+ *     highlighted, others dimmed) — no new panel materializes for the click.
  *
  * Spawning a real CC subprocess that emits AskUserQuestion is out of scope
  * for browser e2e — the parser-level wiring is covered by Rust unit tests.
  */
 test.describe('CC AskUserQuestion — interactive answer flow', () => {
-  test('clicking an option resolves the question card', async ({ page }) => {
+  test('clicking an option flips the divider initiator panel in place', async ({ page }) => {
     await assertHealthy(page);
 
     const suffix = randomUUID().slice(0, 8);
@@ -40,7 +43,7 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
     }).replace(/'/g, "''");
 
     psql([
-      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_pinned, has_response, status, section, is_cc, active_children_count) VALUES ('${threadId}', 'CC Question E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'waiting_for_user_answer', 'unread', true, 0)`,
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count) VALUES ('${threadId}', 'CC Question E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${msgEventId}', 'MessageReceived', '{"text":"start","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${sessionStartedId}', 'SessionStarted', '{"session_id":"sess-e2e"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${questionEventId}', 'UserQuestionAsked', '${payload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
@@ -56,17 +59,26 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await row.click();
       await ensureOnThreadPane(page);
 
-      // QuestionCard renders the question + options. Both SplitLayout (desktop)
-      // and MobileSwipeContainer (mobile) render simultaneously, so we scope
-      // to the visible copy — `.first()` would otherwise pick the hidden one.
-      const card = page.locator(`.cc-question-card[data-tool-use-id="${toolUseId}"]:visible`).first();
-      await expect(card).toBeVisible({ timeout: 10_000 });
-      await expect(card).toContainText(`Pick option ${suffix}`);
-      await expect(card).toContainText(`Yes ${suffix}`);
-      await expect(card).toContainText(`No ${suffix}`);
+      // The QuestionBody lives inside the initiator panel of the divider
+      // exchange. Both SplitLayout (desktop) and MobileSwipeContainer (mobile)
+      // render simultaneously, so we scope to the visible copy — `.first()`
+      // would otherwise pick the hidden one. We locate the panel by its
+      // unique question text, not by `data-tool-use-id`, because the answered
+      // body drops the data attribute when it flips to its resolved render.
+      const panel = page
+        .locator(`.initiator-panel-user:visible:has(.cc-question-text:has-text("Pick option ${suffix}"))`)
+        .first();
+      await expect(panel).toBeVisible({ timeout: 10_000 });
+      // Chip on the divider reads "You" — the actor (device-owner who answers).
+      await expect(panel.locator('.initiator-label')).toHaveText('You');
+      // Pending body carries `data-tool-use-id` and exposes the option buttons.
+      const pendingBody = panel.locator(`.initiator-body .cc-question-body[data-tool-use-id="${toolUseId}"]`).first();
+      await expect(pendingBody).toBeVisible();
+      await expect(pendingBody).toContainText(`Yes ${suffix}`);
+      await expect(pendingBody).toContainText(`No ${suffix}`);
 
       // Click the second option.
-      await card.locator('.cc-question-option').nth(1).click();
+      await pendingBody.locator('.cc-question-option').nth(1).click();
 
       // The DB should have a UserQuestionAnswered for this tool_use_id.
       await expect.poll(
@@ -74,10 +86,162 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
         { intervals: [400], timeout: 10_000 },
       ).toBe('1');
 
-      // Card flips to answered state. Same dual-render caveat as above.
-      const answered = page.locator('.cc-question-card-answered:visible').first();
+      // The SAME panel flips in place to its answered state. We re-locate the
+      // answered body inside the same panel (matched by question text) so we
+      // prove no new initiator panel materialized for the click.
+      const answered = panel.locator('.initiator-body .cc-question-body-answered').first();
       await expect(answered).toBeVisible({ timeout: 10_000 });
-      await expect(answered).toContainText(`Answered: No ${suffix}`);
+      // The picked option is highlighted; the other is dimmed.
+      const selectedOption = answered.locator('.cc-question-option-selected');
+      await expect(selectedOption).toHaveCount(1);
+      await expect(selectedOption).toContainText(`No ${suffix}`);
+      await expect(answered.locator('.cc-question-option-dimmed')).toHaveCount(1);
+
+      // Exactly one divider initiator panel for this question — flipping
+      // happens in-place, no duplicate panel materialized.
+      await expect(
+        page.locator(`.initiator-panel-user:visible:has(.cc-question-text:has-text("Pick option ${suffix}"))`),
+      ).toHaveCount(1);
+    } finally {
+      psql([
+        `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
+        `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
+      ].join(';\n'));
+    }
+  });
+
+  test('multi-pause CC turn renders one divider initiator panel per question', async ({ page }) => {
+    await assertHealthy(page);
+
+    const suffix = randomUUID().slice(0, 8);
+    const threadId = randomUUID();
+    const tool1 = `tu1-e2e-${suffix}`;
+    const tool2 = `tu2-e2e-${suffix}`;
+    const base = Date.now();
+    const stamp = (offsetMs: number) => new Date(base + offsetMs).toISOString();
+
+    const payload1 = JSON.stringify({
+      tool_use_id: tool1,
+      cc_session_id: 'sess-multi-e2e',
+      question: `First question ${suffix}`,
+      options: [{ id: 'opt-0', label: `A ${suffix}` }],
+    }).replace(/'/g, "''");
+    const payload2 = JSON.stringify({
+      tool_use_id: tool2,
+      cc_session_id: 'sess-multi-e2e',
+      question: `Second question ${suffix}`,
+      options: [{ id: 'opt-0', label: `B ${suffix}` }],
+    }).replace(/'/g, "''");
+    const answer1 = JSON.stringify({
+      tool_use_id: tool1,
+      answer: { kind: 'Selected', option_id: 'opt-0' },
+    }).replace(/'/g, "''");
+
+    // Two separate UserQuestionAsked events in the same CC turn (MP1) — each
+    // should be its own divider panel, not coalesced.
+    psql([
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count) VALUES ('${threadId}', 'CC Multi Question E2E ${suffix}', 'claude_code', '${stamp(0)}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"do stuff","channel":"claude_code"}'::jsonb, '${stamp(0)}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'SessionStarted', '{"session_id":"sess-multi-e2e"}'::jsonb, '${stamp(10)}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'UserQuestionAsked', '${payload1}'::jsonb, '${stamp(20)}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'UserQuestionAnswered', '${answer1}'::jsonb, '${stamp(30)}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'UserQuestionAsked', '${payload2}'::jsonb, '${stamp(40)}', 'thread', '${threadId}', '${threadId}')`,
+    ].join(';\n'));
+
+    try {
+      await navigateToApp(page);
+      await openThreadDrawer(page);
+
+      const row = page.locator(`.thread-row:has-text("CC Multi Question E2E ${suffix}")`).first();
+      await expect(row).toBeVisible({ timeout: 10_000 });
+      await row.click();
+      await ensureOnThreadPane(page);
+
+      // Each question gets its own divider initiator panel. We locate by the
+      // unique question text rather than `data-tool-use-id`, because the
+      // answered body strips the data attribute when it flips state.
+      const panel1 = page
+        .locator(`.initiator-panel-user:visible:has(.cc-question-text:has-text("First question ${suffix}"))`)
+        .first();
+      const panel2 = page
+        .locator(`.initiator-panel-user:visible:has(.cc-question-text:has-text("Second question ${suffix}"))`)
+        .first();
+      await expect(panel1).toBeVisible({ timeout: 10_000 });
+      await expect(panel2).toBeVisible({ timeout: 10_000 });
+
+      // Panel 1 already has its answer applied (Selected → answered body).
+      await expect(panel1.locator('.initiator-body .cc-question-body-answered')).toBeVisible();
+      // Panel 2 is still pending — the pending body carries `data-tool-use-id`
+      // and the clickable option button is present.
+      await expect(panel2.locator('.initiator-body .cc-question-body-answered')).toHaveCount(0);
+      await expect(panel2.locator(`.cc-question-body[data-tool-use-id="${tool2}"]`)).toBeVisible();
+      await expect(panel2.locator('.cc-question-option')).toHaveCount(1);
+    } finally {
+      psql([
+        `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
+        `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
+      ].join(';\n'));
+    }
+  });
+
+  test('canceled answer dims options and shows the Canceled badge', async ({ page }) => {
+    await assertHealthy(page);
+
+    const suffix = randomUUID().slice(0, 8);
+    const threadId = randomUUID();
+    const toolUseId = `tu-cancel-e2e-${suffix}`;
+    const base = Date.now();
+    const stamp = (offsetMs: number) => new Date(base + offsetMs).toISOString();
+
+    const payload = JSON.stringify({
+      tool_use_id: toolUseId,
+      cc_session_id: 'sess-cancel-e2e',
+      question: `Cancel question ${suffix}`,
+      options: [
+        { id: 'opt-0', label: `Yes ${suffix}` },
+        { id: 'opt-1', label: `No ${suffix}` },
+      ],
+    }).replace(/'/g, "''");
+    const answer = JSON.stringify({
+      tool_use_id: toolUseId,
+      answer: { kind: 'Canceled' },
+    }).replace(/'/g, "''");
+
+    // Seed a question + a Canceled answer (the engine writes this when the
+    // user hits Stop while CC is paused on AskUserQuestion). `has_response,
+    // true` keeps the row visible in the drawer — `get_recent_threads` filters
+    // out idle threads with no response, so the seed must claim a response.
+    psql([
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count) VALUES ('${threadId}', 'CC Cancel Question E2E ${suffix}', 'claude_code', '${stamp(0)}', 1, false, true, 'idle', 'inbox', true, 0)`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"start","channel":"claude_code"}'::jsonb, '${stamp(0)}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'SessionStarted', '{"session_id":"sess-cancel-e2e"}'::jsonb, '${stamp(10)}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'UserQuestionAsked', '${payload}'::jsonb, '${stamp(20)}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'UserQuestionAnswered', '${answer}'::jsonb, '${stamp(30)}', 'thread', '${threadId}', '${threadId}')`,
+    ].join(';\n'));
+
+    try {
+      await navigateToApp(page);
+      await openThreadDrawer(page);
+
+      const row = page.locator(`.thread-row:has-text("CC Cancel Question E2E ${suffix}")`).first();
+      await expect(row).toBeVisible({ timeout: 10_000 });
+      await row.click();
+      await ensureOnThreadPane(page);
+
+      // Locate by question text — the answered body has no `data-tool-use-id`.
+      const panel = page
+        .locator(`.initiator-panel-user:visible:has(.cc-question-text:has-text("Cancel question ${suffix}"))`)
+        .first();
+      await expect(panel).toBeVisible({ timeout: 10_000 });
+
+      const answered = panel.locator('.initiator-body .cc-question-body-answered').first();
+      await expect(answered).toBeVisible();
+      // All options dimmed; nothing selected.
+      await expect(answered.locator('.cc-question-option-selected')).toHaveCount(0);
+      await expect(answered.locator('.cc-question-option-dimmed')).toHaveCount(2);
+      // Canceled badge is the explicit signal — assert via class, not text,
+      // so the assertion survives copy edits.
+      await expect(answered.locator('.cc-question-canceled-badge')).toBeVisible();
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,

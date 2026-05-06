@@ -10,9 +10,12 @@ pub(crate) mod image;
 mod import;
 mod mcp;
 mod memory;
+mod plugins;
 mod preferences;
+mod proxy;
 mod python;
 pub(crate) mod scheduler;
+pub(crate) mod search;
 mod web;
 
 use super::LucidosEngine;
@@ -36,9 +39,11 @@ impl LucidosEngine {
             | tn::WRITE_FILE
             | tn::EDIT_FILE
             | tn::LIST_FILES
+            | tn::GLOB_FILES
+            | tn::GREP_FILES
             | tn::COPY_FILE
             | tn::DELETE_FILE => self
-                .execute_file_tool(name, args, extraction_ctx)
+                .execute_file_tool(name, args)
                 .await
                 .unwrap_or_else(|e| format!("Error: {}", e)),
             tn::BROWSER_OPEN
@@ -65,6 +70,10 @@ impl LucidosEngine {
                 .execute_http_tool(args)
                 .await
                 .unwrap_or_else(|e| format!("Error: {}", e)),
+            tn::PROXY_REQUEST => self
+                .execute_proxy_tool(args)
+                .await
+                .unwrap_or_else(|e| format!("Error: {}", e)),
             tn::IMPORT_FILE | tn::GIT_CLONE => self
                 .execute_import_tool(name, args, extraction_ctx)
                 .await
@@ -74,11 +83,10 @@ impl LucidosEngine {
             | tn::UPDATE_TRIGGER
             | tn::DELETE_TRIGGER
             | tn::PAUSE_TRIGGER
-            | tn::RESUME_TRIGGER => {
-                self.execute_scheduler_tool(name, args)
-                    .await
-                    .unwrap_or_else(|e| format!("Error: {}", e))
-            }
+            | tn::RESUME_TRIGGER => self
+                .execute_scheduler_tool(name, args)
+                .await
+                .unwrap_or_else(|e| format!("Error: {}", e)),
             tn::SET_LANGUAGE | tn::SET_TIMEZONE | tn::ENABLE_PUSH_NOTIFICATIONS => self
                 .execute_preferences_tool(name, args, device_id)
                 .await
@@ -114,7 +122,7 @@ impl LucidosEngine {
                 .await
                 .unwrap_or_else(|e| format!("Error: {}", e)),
             tn::CORRECT_MEMORY => self
-                .execute_memory_tool(args, extraction_ctx)
+                .execute_memory_tool(args)
                 .await
                 .unwrap_or_else(|e| format!("Error: {}", e)),
             tn::GENERATE_IMAGE => self
@@ -131,6 +139,10 @@ impl LucidosEngine {
             tn::EMIT_EVENT => self.execute_emit_event(args).await,
             tn::QUERY_EVENTS => self.execute_query_events(args).await,
             tn::MANAGE_REPOSITORIES => self.execute_manage_repositories(args).await,
+            tn::INSTALL_PLUGIN
+            | tn::CHECK_PLUGIN_UPDATES
+            | tn::UPDATE_PLUGIN
+            | tn::UNINSTALL_PLUGIN => self.execute_plugin_tool(name, args).await,
             tn::SETUP_MCP_SERVER
             | tn::LIST_MCP_SERVERS
             | tn::START_MCP_SERVER
@@ -169,6 +181,7 @@ impl LucidosEngine {
                     },
                     meta: crate::engine::thread_events::EventMeta::NONE,
                 },
+                aggregate: None,
             });
 
         // Return contextual help so the LLM knows what the UI offers
@@ -212,11 +225,16 @@ impl LucidosEngine {
             _ => return "Error: message is required".to_string(),
         };
 
-        // Auto-attach trigger_id from scheduled task context (if running inside one)
-        let active_trigger = crate::scheduler::user_tasks::ACTIVE_TRIGGER_ID
-            .try_with(|s| s.clone())
-            .ok();
-        let app_id = active_trigger.as_deref();
+        // The notification popover compares `notification.app_id` against the
+        // apps list's `id` (the app dir). Only stamp it when the LLM explicitly
+        // passes one — never auto-stamp from the trigger's owning app, since
+        // most reminders/nudges/summaries shouldn't deep-link even when their
+        // trigger lives inside an app dir for organizational reasons.
+        let app_id: Option<String> = args
+            .get("app_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
 
         // When this trigger fired in response to a thread-scoped event (e.g.
         // `UserQuestionAsked`), the originating thread lives in a task-local
@@ -236,7 +254,7 @@ impl LucidosEngine {
                     title: title.to_string(),
                     message: message.to_string(),
                     task_id: None,
-                    app_id: app_id.map(|s| s.to_string()),
+                    app_id: app_id.clone(),
                 },
             ))
             .await
@@ -251,7 +269,7 @@ impl LucidosEngine {
             title,
             message,
             Some(notification_id),
-            app_id,
+            app_id.as_deref(),
             Some(link_thread),
         )
         .await;

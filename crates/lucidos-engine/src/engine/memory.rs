@@ -78,7 +78,7 @@ impl LucidosEngine {
 
     /// Build the full extraction context for a specific event: base profile/language
     /// PLUS the most recent prior messages from the same thread, so Gemini can resolve
-    /// pronouns and inherit entities (e.g. "the eye operation" → "pappa's eye operation").
+    /// pronouns and inherit entities (e.g. "the order" → "the customer's order").
     ///
     /// `current_event_id` is excluded so the event being extracted doesn't appear in
     /// its own prompt. Returns `None` only when profile, language, AND thread context
@@ -208,7 +208,7 @@ impl LucidosEngine {
     /// get re-extracted as memory entries during rebuild.
     const SKIP_ARTIFACT_PATHS: &[&str] = &["user_profile.md"];
 
-    fn should_skip_artifact_for_memory(path: &str) -> bool {
+    pub(crate) fn should_skip_artifact_for_memory(path: &str) -> bool {
         // Skip by exact path
         if Self::SKIP_ARTIFACT_PATHS.iter().any(|p| path.ends_with(p)) {
             return true;
@@ -219,6 +219,24 @@ impl LucidosEngine {
         } else {
             false
         }
+    }
+
+    /// Normalize an artifact path coming off the EventBus into the form expected
+    /// by `read_artifact` and `MemorySource::Artifact { path, .. }` — i.e. relative
+    /// to `data/artifacts/`.
+    ///
+    /// Sources of inconsistency this hides:
+    /// - `tools/files.rs`, `tools/import.rs`, `tools/email.rs` already strip the
+    ///   `artifacts/` prefix before emitting → path arrives bare ("notes.md").
+    /// - `tools/python.rs` walks staged files under `data/` and emits the
+    ///   data-relative path → for files under `data/artifacts/` the path arrives
+    ///   prefixed ("artifacts/output.csv"). For files under other data subdirs
+    ///   (apps/, knowhow/) the prefix is different and they are not artifacts at
+    ///   all — the caller's subsequent `read_artifact` will fail and the consumer
+    ///   silently skips, matching `walk_artifact_history` which only sees
+    ///   `data/artifacts/` paths.
+    pub(crate) fn canonicalize_artifact_path(path: &str) -> &str {
+        path.strip_prefix("artifacts/").unwrap_or(path)
     }
 
     /// Index an artifact's content into memory. Truncates to 4000 chars.
@@ -506,6 +524,7 @@ impl LucidosEngine {
                         embedding,
                         self.embedder.model_id(),
                         src_created_at,
+                        crate::memory::EXTRACTOR_VERSION,
                     )
                 })
                 .collect();
@@ -568,7 +587,7 @@ impl LucidosEngine {
         {
             Ok(response) => response.content,
             Err(e) => {
-                log!("Warning: Failed to generate summary for {}: {}", path, e);
+                log!("[Memory] Failed to generate summary for {}: {}", path, e);
                 None
             }
         }
@@ -747,15 +766,15 @@ If there is genuinely nothing new to add, respond with exactly: NO_CHANGES
                             .await
                         {
                             Ok(_) => {
-                                log!("User profile created ({} chars)", full_profile.len());
+                                log!("[Memory] User profile created ({} chars)", full_profile.len());
                                 *self.user_profile.write().await = full_profile;
                             }
                             Err(e) => {
-                                log!("Warning: Failed to save user profile: {}", e);
+                                log!("[Memory] Failed to save user profile: {}", e);
                             }
                         }
                     } else if trimmed == "NO_CHANGES" || trimmed.is_empty() {
-                        log!("User profile: no new information to add");
+                        log!("[Memory] User profile: no new information to add");
                     } else {
                         // Append additions to existing profile
                         let updated = format!("{}\n\n{}", existing_profile.trim_end(), trimmed);
@@ -766,21 +785,21 @@ If there is genuinely nothing new to add, respond with exactly: NO_CHANGES
                         {
                             Ok(_) => {
                                 log!(
-                                    "User profile updated: appended {} chars (total {} chars)",
+                                    "[Memory] User profile updated: appended {} chars (total {} chars)",
                                     trimmed.len(),
                                     updated.len()
                                 );
                                 *self.user_profile.write().await = updated;
                             }
                             Err(e) => {
-                                log!("Warning: Failed to save user profile: {}", e);
+                                log!("[Memory] Failed to save user profile: {}", e);
                             }
                         }
                     }
                 }
             }
             Err(e) => {
-                log!("Warning: Failed to generate user profile: {}", e);
+                log!("[Memory] Failed to generate user profile: {}", e);
             }
         }
     }
@@ -788,7 +807,17 @@ If there is genuinely nothing new to add, respond with exactly: NO_CHANGES
     /// Rebuild memory entries from event store and artifact history.
     /// When `force` is true, clears all entries first (full rebuild).
     /// When `force` is false, skips already-indexed items (resume/incremental).
-    pub async fn rebuild_memory(&self, force: bool, event_bus: Option<EventBus>) {
+    /// When `re_extract_stale` is true (and `force` is false), entries written
+    /// by an older `EXTRACTOR_VERSION` are deleted before the incremental walk
+    /// — the affected sources then look un-indexed to `sources_indexed` and
+    /// the normal flow re-extracts them with the current extractor. Ignored
+    /// when `force` is true (a full rebuild already starts from empty).
+    pub async fn rebuild_memory(
+        &self,
+        force: bool,
+        re_extract_stale: bool,
+        event_bus: Option<EventBus>,
+    ) {
         const CONCURRENCY: usize = 50;
 
         // Prevent concurrent rebuilds
@@ -817,13 +846,15 @@ If there is genuinely nothing new to add, respond with exactly: NO_CHANGES
                 };
                 let bus = bus.clone();
                 tokio::spawn(async move {
-                    let _ = bus
-                        .emit(BusEvent::System(SystemEvent::MemoryRebuildProgress {
+                    bus.emit_or_log(
+                        BusEvent::System(SystemEvent::MemoryRebuildProgress {
                             processed,
                             total,
                             percent: pct,
-                        }))
-                        .await;
+                        }),
+                        "[Memory] MemoryRebuildProgress",
+                    )
+                    .await;
                 });
             }
         };
@@ -838,6 +869,29 @@ If there is genuinely nothing new to add, respond with exactly: NO_CHANGES
                 }
                 Err(e) => {
                     log!(@Memory, "Failed to clear memory entries: {}", e);
+                    self.rebuilding_memory.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
+        } else if re_extract_stale {
+            log!(@Memory, "Starting INCREMENTAL memory rebuild (re_extract_stale=true)...");
+            match index
+                .delete_below_extractor_version(crate::memory::EXTRACTOR_VERSION)
+                .await
+            {
+                Ok(deleted) if deleted > 0 => {
+                    log!(
+                        @Memory,
+                        "Deleted {} stale entries (extractor_version < {}) — they will be re-extracted",
+                        deleted,
+                        crate::memory::EXTRACTOR_VERSION
+                    );
+                }
+                Ok(_) => {
+                    log!(@Memory, "No stale entries to re-extract");
+                }
+                Err(e) => {
+                    log!(@Memory, "Failed to delete stale entries: {}", e);
                     self.rebuilding_memory.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -1251,6 +1305,7 @@ If there is genuinely nothing new to add, respond with exactly: NO_CHANGES
                                             &embeddings[0],
                                             self.embedder.model_id(),
                                             event.created,
+                                            crate::memory::EXTRACTOR_VERSION,
                                         )
                                         .await
                                     {
@@ -1341,9 +1396,14 @@ If there is genuinely nothing new to add, respond with exactly: NO_CHANGES
             format!("{} file", extension.to_uppercase())
         };
 
-        // Index in memory
-        let import_ctx = self.extraction_context_base().await;
-        let indexed = if extension == "pdf" {
+        // Memory indexing for text files happens via memory_consumer (it
+        // subscribes to the ArtifactImported event already emitted by
+        // import_one_file). PDFs are the special case: the consumer can't
+        // read a binary PDF, but we just extracted text into a sidecar — so
+        // index from the sidecar here, keyed on the original PDF path so
+        // search results link back to the user-visible file.
+        if extension == "pdf" {
+            let import_ctx = self.extraction_context_base().await;
             let sidecar_path = format!("{}.txt", dest_relative);
             if let Ok(content) = self.artifact_manager.read_artifact(&sidecar_path) {
                 self.index_artifact_memory(
@@ -1354,40 +1414,21 @@ If there is genuinely nothing new to add, respond with exactly: NO_CHANGES
                     Some(&import_ctx),
                 )
                 .await;
-                true
             } else {
-                false
-            }
-        } else if !is_binary {
-            if let Ok(content) = self.artifact_manager.read_artifact(dest_relative) {
-                self.index_artifact_memory(
-                    dest_relative,
-                    &content,
-                    commit_sha,
+                // No sidecar means PDF text extraction failed earlier —
+                // fall back to the summary so search at least surfaces the file.
+                let fallback = format!("Imported PDF: {}\n{}", dest_relative, summary);
+                self.index_memory(
+                    MemorySource::Artifact {
+                        path: dest_relative.to_string(),
+                        commit: commit_sha.to_string(),
+                    },
+                    &fallback,
                     Utc::now(),
                     Some(&import_ctx),
                 )
                 .await;
-                true
-            } else {
-                false
             }
-        } else {
-            false
-        };
-        if !indexed {
-            // Fallback: index summary for binary/unreadable files
-            let fallback = format!("Imported file: {}\n{}", dest_relative, summary);
-            self.index_memory(
-                MemorySource::Artifact {
-                    path: dest_relative.to_string(),
-                    commit: commit_sha.to_string(),
-                },
-                &fallback,
-                Utc::now(),
-                Some(&import_ctx),
-            )
-            .await;
         }
         log!(@import_bg, "Background processing complete for {}", dest_relative);
     }
@@ -1443,6 +1484,46 @@ mod memory_source_tests {
         // Regular chat messages should still be indexed
         let regular = EventRow::new("MessageReceived", serde_json::json!({"text": "Hello"}));
         assert!(LucidosEngine::memory_content_for_event(&regular).is_some());
+    }
+
+    #[test]
+    fn canonicalize_artifact_path_strips_prefix() {
+        // python.rs emits data-relative paths — under artifacts/ they look like this.
+        assert_eq!(
+            LucidosEngine::canonicalize_artifact_path("artifacts/output.csv"),
+            "output.csv"
+        );
+        // Nested under artifacts/ also strips just the leading "artifacts/".
+        assert_eq!(
+            LucidosEngine::canonicalize_artifact_path("artifacts/subfolder/notes.md"),
+            "subfolder/notes.md"
+        );
+    }
+
+    #[test]
+    fn canonicalize_artifact_path_passes_through_already_canonical() {
+        // files.rs / import.rs / email.rs strip the prefix at the emit site, so
+        // the consumer must accept already-canonical paths unchanged.
+        assert_eq!(
+            LucidosEngine::canonicalize_artifact_path("notes.md"),
+            "notes.md"
+        );
+        assert_eq!(
+            LucidosEngine::canonicalize_artifact_path("email/2026-05/attachment.pdf"),
+            "email/2026-05/attachment.pdf"
+        );
+    }
+
+    #[test]
+    fn canonicalize_artifact_path_leaves_non_artifact_paths_alone() {
+        // A python tool writing under data/apps/ emits the data-relative path
+        // — the caller's read_artifact() will then look under data/artifacts/apps/
+        // and fail, which is the desired behavior (apps aren't memory-indexed,
+        // matching what walk_artifact_history reports).
+        assert_eq!(
+            LucidosEngine::canonicalize_artifact_path("apps/foo/bar.txt"),
+            "apps/foo/bar.txt"
+        );
     }
 }
 
@@ -1735,8 +1816,8 @@ mod jaccard_tests {
         // Adding 2+ words to a 7-word fact drops below dedup.
         // This means the 0.8 threshold is strict, which is conservative (fewer false dedup).
         let sim = jaccard_similarity(
-            "Works at Finn as a software engineer",
-            "Works at Finn as a software engineer in Oslo",
+            "Works at Acme as a software engineer",
+            "Works at Acme as a software engineer in Oslo",
         );
         assert!(
             sim > 0.7 && sim < 0.8,
@@ -1780,8 +1861,8 @@ mod jaccard_tests {
         // so the Jaccard stays above 0.8.
         // 11 words, 1 different: 10/12 ≈ 0.833
         let sim = jaccard_similarity(
-            "Kenneth completed the migration of the Lucidos backend to PostgreSQL successfully",
-            "Kenneth completed the migration of the Lucidos backend to PostgreSQL yesterday",
+            "Alex completed the migration of the Lucidos backend to PostgreSQL successfully",
+            "Alex completed the migration of the Lucidos backend to PostgreSQL yesterday",
         );
         assert!(
             sim > 0.8,
@@ -1808,7 +1889,7 @@ mod jaccard_tests {
     fn similar_structure_different_entities_survives() {
         // Same sentence structure, different entities
         let sim = jaccard_similarity(
-            "Had a meeting with Kenneth about the migration plan",
+            "Had a meeting with Alex about the migration plan",
             "Had a meeting with Sarah about the deployment strategy",
         );
         assert!(

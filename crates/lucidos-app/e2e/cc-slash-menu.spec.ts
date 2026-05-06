@@ -56,7 +56,7 @@ test.describe('CC slash command menu', () => {
     await navigateToApp(page);
     await newThread(page);
 
-    // In Manifest mode — no CC button
+    // In Lucidos mode — no CC button
     expect(await hasVisibleElement(page, '.cc-commands-btn')).toBe(false);
 
     // Toggle to Claude mode — CC button appears
@@ -141,7 +141,7 @@ test.describe('CC slash command menu', () => {
     await sendMessage(page, `Say exactly: "hello ${msg}" and nothing else. Do not create any files.`);
 
     // Wait for session to finish and idle
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
     await ensureOnThreadPane(page);
 
     // Now type "/" in the existing CC thread — should open command menu

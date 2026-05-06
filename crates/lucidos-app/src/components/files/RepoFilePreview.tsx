@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { useEffect, useCallback, useMemo } from 'preact/hooks';
+import type { DiffFile } from '../../store/store';
 import { selectedLines, repoDiff, repoPending, filePreviewSource, popupImageSrc, repoSelectedChangeId } from '../../store/store';
 import { getRepoFileContent } from '../../api/client';
 import { loadChangeContextById } from '../../store/actions/repositories';
@@ -7,7 +8,8 @@ import { escapeHtml } from '../../utils/escapeHtml';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { renderCsvTable } from '../../utils/csv';
 import { RENDERABLE_EXTS } from './FilePreviewInline';
-import { isMobile } from '../../utils/viewport';
+import { isMobile, viewportIsMobile } from '../../utils/viewport';
+import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { DiffView } from './DiffView';
 import { RenderedDiff } from './RenderedDiff';
 
@@ -18,29 +20,65 @@ interface Props {
   /** When the overlay was restored from nav history after a reload, repoDiff
    *  is empty — this is the change to fetch to repopulate it. */
   changeId?: string;
+  /** Skip mounting in the inactive dual-rendered layout — otherwise both
+   *  SplitLayout and MobileSwipeContainer copies fetch and decode the file. */
+  layout: 'desktop' | 'mobile';
 }
 
-export function RepoFilePreview({ repoId, mode, path, changeId }: Props) {
+/** Decide whether to render a markdown diff via RenderedDiff (vs raw DiffView).
+ *  RenderedDiff needs to fetch the post-change file body, which requires either
+ *  a Lucidos `Change` row (changeId → /api/changes/:id/file) or a CC worktree
+ *  branch on a registered repo (branchRef → /api/repositories/:id/file?ref=).
+ *  External-repo CC sessions only ever have the branchRef path. */
+export function shouldRenderMarkdownDiff(opts: {
+  ext: string;
+  fileStatus: DiffFile['status'];
+  activeChangeId: string | null;
+  branchRef: string | null;
+  filePreviewSourceOn: boolean;
+}): boolean {
+  if (opts.filePreviewSourceOn) return false;
+  if (opts.ext !== 'md') return false;
+  if (opts.fileStatus === 'deleted') return false;
+  return !!opts.activeChangeId || !!opts.branchRef;
+}
+
+export function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {
+  const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
+
   // After a reload, the panel overlay re-hydrates from nav history but the
   // repoDiff/repoSelectedChangeId backing state does not. If the URL carries
   // the change ID and the runtime state is stale, refetch the change context.
+  // Gated on isActiveLayout so the inactive dual-rendered copy doesn't fire
+  // a duplicate fetch in the same tick.
   useEffect(() => {
+    if (!isActiveLayout) return;
     if (mode !== 'diff' || !changeId) return;
     if (repoSelectedChangeId.value === changeId && repoDiff.value.status === 'loaded') return;
     loadChangeContextById(changeId);
-  }, [mode, changeId]);
+  }, [mode, changeId, isActiveLayout]);
+
+  if (!isActiveLayout) return null;
 
   if (mode === 'diff') {
     const diff = repoDiff.value;
-    if (diff.status === 'failed') return <div class="empty-state" style="color:var(--accent-red)">Failed to load diff: {diff.error}</div>;
+    if (diff.status === 'failed') return <div class="empty-state error-text">Failed to load diff: {diff.error}</div>;
     if (diff.status !== 'loaded') return <div class="loading-spinner" />;
     const file = diff.data.files.find(f => f.path === path);
     if (!file) return <div class="empty-state">File not found in diff</div>;
 
     const ext = path.split('.').pop()?.toLowerCase() || '';
     const activeChangeId = changeId ?? repoSelectedChangeId.value;
-    const wantRendered = !filePreviewSource.value && ext === 'md' && activeChangeId && file.status !== 'deleted';
-    if (wantRendered) return <RenderedDiff file={file} changeId={activeChangeId} />;
+    const branchRef = repoPending.value?.branch_name ?? null;
+    if (shouldRenderMarkdownDiff({
+      ext,
+      fileStatus: file.status,
+      activeChangeId,
+      branchRef,
+      filePreviewSourceOn: filePreviewSource.value,
+    })) {
+      return <RenderedDiff file={file} changeId={activeChangeId} repoId={repoId} gitRef={branchRef} />;
+    }
     return <DiffView file={file} />;
   }
 
@@ -48,17 +86,11 @@ export function RepoFilePreview({ repoId, mode, path, changeId }: Props) {
 }
 
 function RepoFileContent({ repoId, path }: { repoId: string; path: string }) {
-  const [content, setContent] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const gitRef = repoPending.value?.branch_name;
-
-  useEffect(() => {
-    setContent(null);
-    setError(null);
-    getRepoFileContent(repoId, path, gitRef ?? undefined)
-      .then(setContent)
-      .catch(e => setError(e.message));
-  }, [repoId, path, gitRef]);
+  const { loadable, showLoading } = useLoadableFetch<string>(
+    () => getRepoFileContent(repoId, path, gitRef ?? undefined),
+    [repoId, path, gitRef],
+  );
 
   const handleLineClick = useCallback((lineNum: number, shiftKey: boolean) => {
     if (shiftKey && selectedLines.value) {
@@ -72,6 +104,7 @@ function RepoFileContent({ repoId, path }: { repoId: string; path: string }) {
   }, []);
 
   const ext = path.split('.').pop()?.toLowerCase() || '';
+  const content = loadable.status === 'loaded' ? loadable.data : null;
   const renderPreview = content !== null && !filePreviewSource.value && RENDERABLE_EXTS.includes(ext);
   const isCode = CODE_EXTS.includes(ext);
 
@@ -92,8 +125,8 @@ function RepoFileContent({ repoId, path }: { repoId: string; path: string }) {
     [content, ext, isCode],
   );
 
-  if (error) return <div class="empty-state" style="color:var(--accent-red)">Failed to load: {error}</div>;
-  if (content === null) return <div class="loading-spinner" />;
+  if (loadable.status === 'failed') return <div class="empty-state error-text">Failed to load: {loadable.error}</div>;
+  if (content === null) return showLoading ? <div class="loading-spinner" /> : null;
 
   if (renderPreview) {
     if (ext === 'md') return <div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;

@@ -47,7 +47,7 @@ test.describe('CC model pre-session selection', () => {
     const cmdData = await waitForActiveSession(page, sentThreadId!);
     expect(cmdData.current_model).toBe('haiku');
 
-    await waitForActionPanel(page, 'Done', 120_000);
+    await waitForActionPanel(page, 'Archive', 120_000);
 
     await waitAndClick(page, '.cc-commands-btn-active', undefined, 15_000);
     await waitAndClick(page, '.cc-control-item', 'Model');

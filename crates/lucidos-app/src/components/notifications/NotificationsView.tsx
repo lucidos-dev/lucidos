@@ -11,10 +11,11 @@ import {
   loadMoreNotifications,
   setNotificationsFilter,
 } from '../../store/actions/notifications';
-import { escapeHtml, stripHtml } from '../../utils/escapeHtml';
+import { stripHtml } from '../../utils/escapeHtml';
 import { formatTimeAgo, formatNotificationDate } from '../../utils/formatTime';
 import { loadedOr } from '../../store/types';
 import { renderMarkdown } from '../../utils/renderMarkdown';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 
 export function NotificationsView() {
   const listRef = useRef<HTMLDivElement>(null);
@@ -29,7 +30,7 @@ export function NotificationsView() {
 
   const loadable = notifications.value;
   const items = loadedOr(loadable, []);
-  const isLoading = loadable.status === 'loading';
+  const showLoading = useDelayedLoading(loadable);
   const filter = notificationsFilter.value;
   const hasMore = notificationsHasMore.value;
   const loadingMore = notificationsLoadingMore.value;
@@ -62,10 +63,10 @@ export function NotificationsView() {
           Mark all read
         </button>
       </div>
-      {isLoading ? (
-        <div class="loading-spinner" />
-      ) : loadable.status === 'failed' ? (
+      {loadable.status === 'failed' ? (
         <div class="empty-state error-text">Failed to load notifications: {loadable.error}</div>
+      ) : loadable.status !== 'loaded' ? (
+        showLoading ? <div class="loading-spinner" /> : null
       ) : items.length === 0 ? (
         <div class="empty-state">{emptyMessage}</div>
       ) : (
@@ -82,7 +83,7 @@ export function NotificationsView() {
               >
                 <div class="title notification-title">
                   <span class="trigger-icon">📋</span>
-                  {escapeHtml(n.title)}
+                  {n.title}
                 </div>
                 <div class="notification-summary">
                   {stripHtml(renderMarkdown(n.message))}

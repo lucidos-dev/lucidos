@@ -140,6 +140,7 @@ mod tests {
                 &old_vec,
                 "old-model",
                 Utc::now(),
+                crate::memory::EXTRACTOR_VERSION,
             )
             .await
             .unwrap();
@@ -155,6 +156,7 @@ mod tests {
                 &new_vec,
                 "new-model",
                 Utc::now(),
+                crate::memory::EXTRACTOR_VERSION,
             )
             .await
             .unwrap();
@@ -206,6 +208,7 @@ mod tests {
                 &vec![0.1f32; 384],
                 "old-model",
                 Utc::now(),
+                crate::memory::EXTRACTOR_VERSION,
             )
             .await
             .unwrap();

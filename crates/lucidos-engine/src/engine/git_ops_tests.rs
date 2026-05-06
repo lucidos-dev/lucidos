@@ -1025,6 +1025,63 @@ async fn worktree_creation_succeeds_for_repo_without_remote() {
     .await;
 }
 
+#[tokio::test]
+async fn worktree_add_works_without_git_crypt() {
+    let (_tmp, repo) = make_test_repo().await;
+    let wt_dir = tempfile::tempdir().unwrap();
+    let wt_path = wt_dir.path().join("wt");
+
+    let out = worktree_add(&repo, &wt_path, &["-b", "feature/test"])
+        .await
+        .expect("worktree_add returned Err");
+    assert!(
+        out.status.success(),
+        "checkout step failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(wt_path.join("init.txt").exists(), "init.txt not checked out");
+    assert!(wt_path.join(".git").exists(), "worktree .git missing");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worktree_add_links_git_crypt_dir_when_present() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let parent_gc = repo.join(".git/git-crypt");
+    tokio::fs::create_dir_all(&parent_gc).await.unwrap();
+    tokio::fs::write(parent_gc.join("keys"), b"stub").await.unwrap();
+
+    let wt_dir = tempfile::tempdir().unwrap();
+    let wt_path = wt_dir.path().join("wt");
+
+    let out = worktree_add(&repo, &wt_path, &["-b", "feature/test"])
+        .await
+        .expect("worktree_add returned Err");
+    assert!(
+        out.status.success(),
+        "checkout step failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let per_wt_git = git_cmd(&["rev-parse", "--absolute-git-dir"], &wt_path)
+        .await
+        .unwrap();
+    let per_wt_git =
+        std::path::PathBuf::from(String::from_utf8_lossy(&per_wt_git.stdout).trim().to_string());
+    let link = per_wt_git.join("git-crypt");
+    let meta = tokio::fs::symlink_metadata(&link)
+        .await
+        .expect("git-crypt symlink missing in per-worktree git dir");
+    assert!(meta.file_type().is_symlink(), "git-crypt entry is not a symlink");
+
+    // macOS resolves /var/folders/... → /private/var/folders/..., so
+    // read_link's raw output won't compare equal to the source path.
+    let resolved = std::fs::canonicalize(tokio::fs::read_link(&link).await.unwrap()).unwrap();
+    let expected = std::fs::canonicalize(&parent_gc).unwrap();
+    assert_eq!(resolved, expected, "symlink does not point at parent git-crypt");
+}
+
 /// A branch with commit + revert has zero net diff but non-zero commits.
 /// `branch_changed_files` must return empty (no actual changes),
 /// even though `has_branch_commits` returns true (commits exist).
@@ -1066,8 +1123,9 @@ async fn commit_plus_revert_branch_has_no_changed_files() {
 }
 
 /// Recovery must NOT propose a Change when the branch has commits but zero net
-/// diff. Without this gate, `safe_cleanup_worktree` creates a `changes` row with
-/// `file_count=0`, which renders Apply/Discard buttons that do nothing useful.
+/// diff. Without this gate, `propose_branch_changes` creates a `changes` row
+/// with `file_count=0`, which renders Apply/Discard buttons that do nothing
+/// useful.
 #[tokio::test]
 async fn proposal_files_for_branch_rejects_commit_plus_revert() {
     let (_tmp, repo) = make_test_repo().await;
@@ -1139,6 +1197,119 @@ fn files_have_client_update_ignores_non_frontend_files() {
     assert!(!files_have_client_update(&[]));
 }
 
+/// External repos with non-`main`/`master` default branches must be detected
+/// via `origin/HEAD`. Without this, Tier 0 cleanup would never fire on
+/// external-repo worktrees (defensive `has_branch_commits` returns true on
+/// `git rev-list main..branch` failure when `main` doesn't exist), and
+/// applied worktrees would linger until Tier 2 (30d).
+#[tokio::test]
+async fn default_local_branch_reads_origin_head_for_non_main_repos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().to_path_buf();
+
+    // Build a fake "remote" repo with `develop` as its default branch
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote = remote_tmp.path().to_path_buf();
+    let _ = git_cmd(&["init", "--bare", "-b", "develop"], &remote)
+        .await
+        .unwrap();
+
+    // Init local repo on `develop`, set up origin, commit, push so
+    // `origin/develop` exists, then `set-head -a` to populate `origin/HEAD`
+    let _ = git_cmd(&["init", "-b", "develop"], &repo).await.unwrap();
+    let _ = git_cmd(
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+        &repo,
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(repo.join("init.txt"), "x").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await.unwrap();
+    let _ = git_cmd(&["commit", "-m", "initial"], &repo).await.unwrap();
+    let _ = git_cmd(&["push", "-u", "origin", "develop"], &repo)
+        .await
+        .unwrap();
+    let o = git_cmd(&["remote", "set-head", "origin", "-a"], &repo)
+        .await
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "remote set-head -a failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    assert_eq!(
+        default_local_branch(&repo).await,
+        "develop",
+        "default_local_branch must follow origin/HEAD, not assume main/master"
+    );
+}
+
+/// Repos without a configured `origin/HEAD` (test fixtures, fresh clones
+/// before push, etc.) must still resolve to `main` via the heuristic
+/// fallback. This locks in backwards compatibility with the previous
+/// implementation.
+#[tokio::test]
+async fn default_local_branch_falls_back_to_main_without_origin() {
+    let (_tmp, repo) = make_test_repo().await;
+    assert_eq!(default_local_branch(&repo).await, "main");
+}
+
+/// The cache must actually return cached values within its TTL — proven by
+/// renaming the underlying branch between calls and asserting the second
+/// call returns the original (cached) name, not the live one. Without the
+/// cache, the second call would re-resolve and return `"renamed-main"`.
+#[tokio::test]
+async fn default_local_branch_returns_cached_value_within_ttl() {
+    let (_tmp, repo) = make_test_repo().await;
+    assert_eq!(default_local_branch(&repo).await, "main");
+
+    let o = git_cmd(&["branch", "-m", "main", "renamed-main"], &repo)
+        .await
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "branch rename failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    assert_eq!(
+        default_local_branch(&repo).await,
+        "main",
+        "second call within TTL must return cached value, not re-resolve"
+    );
+}
+
+/// The cache must key on `repo_root` so two different repos don't share
+/// each other's cached values. Regression guard for a future
+/// "simplification" that drops the path key.
+#[tokio::test]
+async fn default_local_branch_cache_separates_per_repo_root() {
+    let (_tmp_main, repo_main) = make_test_repo().await;
+
+    let tmp_master = tempfile::tempdir().unwrap();
+    let repo_master = tmp_master.path().to_path_buf();
+    let _ = git_cmd(&["init"], &repo_master).await.unwrap();
+    let _ = git_cmd(&["checkout", "-b", "master"], &repo_master)
+        .await
+        .unwrap();
+    tokio::fs::write(repo_master.join("init.txt"), "x")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo_master).await.unwrap();
+    let _ = git_cmd(&["commit", "-m", "initial"], &repo_master)
+        .await
+        .unwrap();
+
+    assert_eq!(default_local_branch(&repo_main).await, "main");
+    assert_eq!(default_local_branch(&repo_master).await, "master");
+    assert_eq!(
+        default_local_branch(&repo_main).await,
+        "main",
+        "main repo cache must not be polluted by master repo lookup"
+    );
+}
+
 #[test]
 fn files_have_client_update_mixed_files() {
     // If any frontend file is present, returns true
@@ -1163,7 +1334,7 @@ fn files_require_restart_detects_rust_and_migrations() {
 #[test]
 fn files_require_restart_ignores_tests_and_docs() {
     assert!(!files_require_restart(&[
-        "crates/lucidos-engine/tests/api_e2e.rs".into()
+        "crates/lucidos-e2e/tests/api.rs".into()
     ]));
     assert!(!files_require_restart(&["README.md".into()]));
     assert!(!files_require_restart(&[
@@ -1394,3 +1565,234 @@ async fn find_worktree_for_branch_returns_none_when_branch_not_checked_out() {
     assert!(found.is_none(), "missing branch must not match");
 }
 
+/// Read git's effective info/exclude file for a repo or worktree, as resolved
+/// by git itself (`git rev-parse --git-path info/exclude`). Worktrees share
+/// the common .git/info/exclude — git silently ignores per-worktree copies.
+async fn read_exclude_file(wt_path: &std::path::Path) -> String {
+    let out = git_cmd(&["rev-parse", "--git-path", "info/exclude"], wt_path)
+        .await
+        .unwrap();
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let path = if std::path::Path::new(&raw).is_absolute() {
+        std::path::PathBuf::from(raw)
+    } else {
+        wt_path.join(raw)
+    };
+    tokio::fs::read_to_string(path).await.unwrap_or_default()
+}
+
+#[tokio::test]
+async fn add_paths_to_worktree_exclude_writes_each_path_to_empty_file() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    add_paths_to_worktree_exclude(&repo, &[".lucidos-workspace", ".claude/skills/lucidos-cli/"])
+        .await;
+
+    let body = read_exclude_file(&repo).await;
+    let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+    assert!(lines.contains(&".lucidos-workspace"), "missing marker: {body}");
+    assert!(
+        lines.contains(&".claude/skills/lucidos-cli/"),
+        "missing skill dir: {body}"
+    );
+}
+
+#[tokio::test]
+async fn add_paths_to_worktree_exclude_preserves_existing_entries() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let exclude = repo.join(".git/info/exclude");
+    tokio::fs::create_dir_all(exclude.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&exclude, "# pre-existing\nuser-custom-glob\n")
+        .await
+        .unwrap();
+
+    add_paths_to_worktree_exclude(&repo, &[".lucidos-workspace"]).await;
+
+    let body = tokio::fs::read_to_string(&exclude).await.unwrap();
+    assert!(
+        body.contains("# pre-existing"),
+        "pre-existing comment lost: {body}"
+    );
+    assert!(
+        body.contains("user-custom-glob"),
+        "pre-existing glob lost: {body}"
+    );
+    assert!(
+        body.lines().any(|l| l.trim() == ".lucidos-workspace"),
+        "marker not appended: {body}"
+    );
+}
+
+#[tokio::test]
+async fn add_paths_to_worktree_exclude_is_idempotent() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let paths = &[".lucidos-workspace", ".claude/skills/lucidos-cli/"];
+    add_paths_to_worktree_exclude(&repo, paths).await;
+    add_paths_to_worktree_exclude(&repo, paths).await;
+    add_paths_to_worktree_exclude(&repo, paths).await;
+
+    let body = read_exclude_file(&repo).await;
+    let marker_count = body
+        .lines()
+        .filter(|l| l.trim() == ".lucidos-workspace")
+        .count();
+    let skill_count = body
+        .lines()
+        .filter(|l| l.trim() == ".claude/skills/lucidos-cli/")
+        .count();
+    assert_eq!(marker_count, 1, "marker duplicated: {body}");
+    assert_eq!(skill_count, 1, "skill dir duplicated: {body}");
+}
+
+/// Regression test for the fact that git silently ignores per-worktree
+/// `info/exclude` files — exclude entries must land in the COMMON
+/// .git/info/exclude or `git status` won't honor them. This test exercises
+/// git's actual behavior, not just the file the helper writes to.
+#[tokio::test]
+async fn add_paths_to_worktree_exclude_makes_git_status_honor_paths_in_worktree() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let wt = _tmp.path().join("wt");
+    let _ = git_cmd(
+        &[
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "-b",
+            "claude-code/test-branch",
+        ],
+        &repo,
+    )
+    .await;
+
+    let git_marker = wt.join(".git");
+    assert!(
+        tokio::fs::metadata(&git_marker)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false),
+        "expected worktree .git to be a gitlink file"
+    );
+
+    tokio::fs::write(wt.join(".lucidos-workspace"), "marker")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(wt.join(".claude/skills/lucidos-cli"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        wt.join(".claude/skills/lucidos-cli/SKILL.md"),
+        "skill content",
+    )
+    .await
+    .unwrap();
+
+    let status_before =
+        String::from_utf8_lossy(&git_cmd(&["status", "--porcelain"], &wt).await.unwrap().stdout)
+            .into_owned();
+    assert!(
+        status_before.contains(".lucidos-workspace"),
+        "test setup: marker should be untracked before exclude write: {status_before}"
+    );
+
+    add_paths_to_worktree_exclude(&wt, &[".lucidos-workspace", ".claude/skills/lucidos-cli/"])
+        .await;
+
+    let body = read_exclude_file(&wt).await;
+    assert!(
+        body.lines().any(|l| l.trim() == ".lucidos-workspace"),
+        "marker missing in resolved exclude file: {body}"
+    );
+    assert!(
+        body.lines()
+            .any(|l| l.trim() == ".claude/skills/lucidos-cli/"),
+        "skill dir missing in resolved exclude file: {body}"
+    );
+
+    let status_after =
+        String::from_utf8_lossy(&git_cmd(&["status", "--porcelain"], &wt).await.unwrap().stdout)
+            .into_owned();
+    assert!(
+        !status_after.contains(".lucidos-workspace"),
+        "marker still untracked after exclude write — git is not honoring our exclude entries: {status_after}"
+    );
+    assert!(
+        !status_after.contains(".claude/skills"),
+        "skill dir still untracked after exclude write — git is not honoring our exclude entries: {status_after}"
+    );
+}
+
+#[tokio::test]
+async fn add_paths_to_worktree_exclude_appends_only_missing_paths() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    add_paths_to_worktree_exclude(&repo, &[".lucidos-workspace"]).await;
+    add_paths_to_worktree_exclude(
+        &repo,
+        &[".lucidos-workspace", ".claude/skills/lucidos-cli/"],
+    )
+    .await;
+
+    let body = read_exclude_file(&repo).await;
+    let marker_count = body
+        .lines()
+        .filter(|l| l.trim() == ".lucidos-workspace")
+        .count();
+    let skill_count = body
+        .lines()
+        .filter(|l| l.trim() == ".claude/skills/lucidos-cli/")
+        .count();
+    assert_eq!(marker_count, 1, "marker duplicated: {body}");
+    assert_eq!(skill_count, 1, "skill dir missing or duplicated: {body}");
+}
+
+/// `.lucidos/bin/lucidos` is a symlink the engine drops into every worktree
+/// so spawned scripts can invoke the CLI. External repos don't have `.lucidos/`
+/// in their `.gitignore`, so without filtering the symlink ends up in
+/// auto-commits and renders as a fake "diff" in change proposals. Filter at
+/// the `branch_changed_files` boundary so already-committed instances also
+/// disappear from the change list.
+#[tokio::test]
+async fn branch_changed_files_filters_lucidos_runtime_paths() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    // Branch with a real change AND every engine-injected path committed:
+    // `.lucidos-workspace` (marker), `.lucidos/bin/lucidos` (CLI symlink),
+    // and `.claude/skills/lucidos-cli/SKILL.md` (skill).
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await.unwrap();
+    tokio::fs::write(repo.join("real.txt"), "real change")
+        .await
+        .unwrap();
+    tokio::fs::write(repo.join(".lucidos-workspace"), "ws-marker")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(repo.join(".lucidos/bin")).await.unwrap();
+    tokio::fs::write(repo.join(".lucidos/bin/lucidos"), "")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(repo.join(".claude/skills/lucidos-cli"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        repo.join(".claude/skills/lucidos-cli/SKILL.md"),
+        "skill body",
+    )
+    .await
+    .unwrap();
+    let _ = git_cmd(&["add", "-A"], &repo).await.unwrap();
+    let _ = git_cmd(&["commit", "-m", "Claude Code changes"], &repo)
+        .await
+        .unwrap();
+
+    let files = branch_changed_files(&repo, "feature").await;
+    assert_eq!(
+        files,
+        vec!["real.txt".to_string()],
+        "all engine-injected paths must be filtered from branch_changed_files, got: {:?}",
+        files
+    );
+}

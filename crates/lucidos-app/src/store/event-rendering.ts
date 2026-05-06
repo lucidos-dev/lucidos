@@ -4,15 +4,18 @@
  */
 import type { ResponseEvent } from './types';
 
+/** True when `e` is a text event whose markdown is non-empty after trimming. */
+export function isMeaningfulText(e: ResponseEvent): boolean {
+  return e.type === 'text' && e.md.trim().length > 0;
+}
+
 /** Determine which toggles (More/Less, Show/Hide steps) to show for an exchange. */
 export function getEventToggleState(events: ResponseEvent[]): {
   showMoreToggle: boolean;
   showStepsToggle: boolean;
 } {
   const hasSteps = events.some(e => e.type === 'step');
-  const meaningfulTextCount = events.filter(
-    e => e.type === 'text' && (e as { md: string }).md.trim().length > 0
-  ).length;
+  const meaningfulTextCount = events.filter(isMeaningfulText).length;
   const showMoreToggle = hasSteps && meaningfulTextCount >= 2;
   const showStepsToggle = hasSteps;
   return { showMoreToggle, showStepsToggle };
@@ -27,7 +30,7 @@ export function getCollapsedVisibleEvents(events: ResponseEvent[]): {
 } {
   let lastTextIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
-    if (events[i].type === 'text' && (events[i] as { md: string }).md.trim().length > 0) {
+    if (isMeaningfulText(events[i])) {
       lastTextIdx = i;
       break;
     }
@@ -41,9 +44,7 @@ export function getCollapsedVisibleEvents(events: ResponseEvent[]): {
   } else {
     visibleEvents = events;
   }
-  const needsFallback = !visibleEvents.some(
-    e => e.type === 'text' && (e as { md: string }).md.trim()
-  );
+  const needsFallback = !visibleEvents.some(isMeaningfulText);
   return { visibleEvents, needsFallback };
 }
 

@@ -422,7 +422,6 @@ pub(super) async fn restore_app_version(
 ) -> Response {
     let app_id = query.id;
     let commit_hash = query.commit;
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     if !is_valid_id(&app_id) {
         return (StatusCode::BAD_REQUEST, "Invalid app ID").into_response();
@@ -430,6 +429,7 @@ pub(super) async fn restore_app_version(
     if super::is_dangerous_git_ref(&commit_hash) {
         return (StatusCode::BAD_REQUEST, "Invalid commit hash").into_response();
     }
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     let git_tree_path = format!("data/apps/{}", app_id);
     let app_dir = state.workspace_path.join("data/apps").join(&app_id);
@@ -489,7 +489,7 @@ pub(super) async fn restore_app_version(
                         .emit(BusEvent::System(SystemEvent::AppUpdated {
                             app_id: app_id.clone(),
                             name: None,
-                            actor: actor.clone(),
+                            actor,
                         }))
                         .await
                     {

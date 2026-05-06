@@ -89,4 +89,29 @@ mod tests {
             "error must name the missing path; got: {msg}"
         );
     }
+
+    /// Bind-mounting PGDATA on macOS pushes every WAL fsync through Docker
+    /// Desktop's virtiofs, which throttles host writes and crashes the VM
+    /// under sustained e2e load (34 GB dirtied in 4 hours, see thread
+    /// 50724c03 — `com.apple.Virtualization.VirtualMachine` diagnostic at
+    /// 22:44, DB pool timeouts at 05:50, force restart at 07:18). Switching
+    /// to a Docker named volume keeps fsyncs inside the VM's ext4.
+    #[test]
+    fn dev_postgres_uses_named_volume_not_bind_mount() {
+        let repo = repo_root().expect("repo root");
+        let yml = std::fs::read_to_string(repo.join("docker-compose.dev.yml"))
+            .expect("docker-compose.dev.yml must exist");
+
+        assert!(
+            yml.contains("- lucidos-pg-data:/var/lib/postgresql/data"),
+            "Postgres PGDATA must be a named volume, not a host bind mount.\n\
+             Expected line: '- lucidos-pg-data:/var/lib/postgresql/data'\n\
+             Got docker-compose.dev.yml:\n{yml}"
+        );
+        assert!(
+            !yml.contains("/data/postgres:/var/lib/postgresql/data"),
+            "Legacy host bind-mount entry must be removed.\n\
+             Got docker-compose.dev.yml:\n{yml}"
+        );
+    }
 }

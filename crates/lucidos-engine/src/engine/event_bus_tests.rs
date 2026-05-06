@@ -58,6 +58,7 @@ fn emitted_event_carries_sequence_and_type() {
             },
             meta: EventMeta::NONE,
         },
+        aggregate: None,
     };
     assert_eq!(emitted.seq, Some(42));
     assert!(matches!(emitted.typed, BusEvent::Thread { .. }));
@@ -74,6 +75,7 @@ fn transient_events_have_no_sequence() {
             event: ThreadEvent::TextStreaming { text: "hi".into() },
             meta: EventMeta::NONE,
         },
+        aggregate: None,
     };
     assert_eq!(emitted.seq, None);
 }
@@ -93,6 +95,7 @@ fn broadcast_channel_works() {
             },
             meta: EventMeta::NONE,
         },
+        aggregate: None,
     };
 
     let _ = tx.send(emitted);
@@ -161,6 +164,7 @@ fn thread_event_sse_json_has_seq_and_event_id() {
             },
             meta: EventMeta::NONE,
         },
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -203,6 +207,7 @@ fn thread_event_sse_json_includes_meta_channel() {
                 ..Default::default()
             },
         },
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -236,6 +241,7 @@ fn thread_event_sse_json_omits_channel_when_none() {
             },
             meta: EventMeta::NONE,
         },
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -258,6 +264,7 @@ fn thread_event_sse_json_has_created() {
             event: ThreadEvent::TextStreamed { text: "hi".into() },
             meta: EventMeta::NONE,
         },
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -284,6 +291,7 @@ fn transient_event_sse_json_has_no_seq() {
             },
             meta: EventMeta::NONE,
         },
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -309,6 +317,7 @@ fn system_notification_created_matches_server_event_shape() {
             task_id: None,
             app_id: None,
         }),
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -329,6 +338,7 @@ fn system_preferences_changed_matches_server_event_shape() {
             value: Some("Europe/Oslo".into()),
             actor: None,
         }),
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -349,6 +359,7 @@ fn system_changes_updated_matches_server_event_shape() {
             total_pending: 0,
             restart_required: false,
         }),
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -368,6 +379,7 @@ fn system_memory_rebuild_progress_matches_server_event_shape() {
             total: 100,
             percent: 50,
         }),
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -386,11 +398,71 @@ fn system_backup_progress_matches_server_event_shape() {
             progress: 3,
             total: 10,
         }),
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
     assert_eq!(json["type"], "BackupProgress");
     assert_eq!(json["data"]["phase"], "uploading");
+}
+
+#[test]
+fn system_backup_completed_matches_server_event_shape() {
+    let emitted = EmittedEvent {
+        event_id: Uuid::new_v4(),
+        seq: None,
+        created: Utc::now(),
+        typed: BusEvent::System(SystemEvent::BackupCompleted {
+            filename: "lucidos-backup-personal-20260504-090000.enc".into(),
+            size_bytes: 927_401_289,
+        }),
+        aggregate: None,
+    };
+
+    let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
+    assert_eq!(json["type"], "BackupCompleted");
+    assert_eq!(
+        json["data"]["filename"],
+        "lucidos-backup-personal-20260504-090000.enc"
+    );
+    assert_eq!(json["data"]["size_bytes"], 927_401_289u64);
+
+    let event = SystemEvent::BackupCompleted {
+        filename: "f".into(),
+        size_bytes: 1,
+    };
+    assert!(
+        !event.is_persisted(),
+        "BackupCompleted is ephemeral — audit lives in engine log"
+    );
+    assert_eq!(event.aggregate(), "ops");
+}
+
+#[test]
+fn system_backup_failed_matches_server_event_shape() {
+    let emitted = EmittedEvent {
+        event_id: Uuid::new_v4(),
+        seq: None,
+        created: Utc::now(),
+        typed: BusEvent::System(SystemEvent::BackupFailed {
+            error: "Token refresh failed (invalid_grant)".into(),
+        }),
+        aggregate: None,
+    };
+
+    let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
+    assert_eq!(json["type"], "BackupFailed");
+    assert_eq!(
+        json["data"]["error"],
+        "Token refresh failed (invalid_grant)"
+    );
+
+    let event = SystemEvent::BackupFailed { error: "x".into() };
+    assert!(
+        !event.is_persisted(),
+        "BackupFailed is ephemeral — failure notification persists separately"
+    );
+    assert_eq!(event.aggregate(), "ops");
 }
 
 /// Regression test: domain events emitted via `lucidos.events.emit()` must
@@ -411,6 +483,7 @@ fn domain_event_sse_json_uses_inner_event_type() {
             depth: 0,
             transient: false,
         }),
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -474,6 +547,13 @@ fn reserved_type_names_match_event_type() {
             phase: "p".into(),
             progress: 0,
             total: 0,
+        },
+        BackupCompleted {
+            filename: "lucidos-backup-x-20260504-090000.enc".into(),
+            size_bytes: 100,
+        },
+        BackupFailed {
+            error: "boom".into(),
         },
         RecoveryProgress {
             completed: 0,
@@ -624,6 +704,7 @@ fn notification_created_skips_none_fields_in_sse() {
             task_id: None,
             app_id: None,
         }),
+        aggregate: None,
     };
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
     assert!(
@@ -894,6 +975,7 @@ fn transient_domain_event_sse_json_uses_inner_event_type() {
             depth: 0,
             transient: true,
         }),
+        aggregate: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -962,6 +1044,7 @@ fn coding_agent_idled_is_last_event_after_change_proposed() {
                 event: event.clone(),
                 meta: EventMeta::NONE,
             },
+            aggregate: None,
         });
     }
 
@@ -1038,6 +1121,20 @@ async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uui
     .unwrap();
 
     (parent_id, child_id)
+}
+
+async fn emit_cc_session_started(bus: &EventBus, child_id: Uuid) {
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::SessionStarted {
+            session_id: "test-session".into(),
+            branch: "claude-code/test".into(),
+            repo_id: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
 }
 
 async fn assert_active_children(pool: &PgPool, parent_id: Uuid, expected: i32, msg: &str) {
@@ -1181,6 +1278,15 @@ async fn test_fan_out_parent_callback() {
         assert!(
             cb.callback_text.contains("completed"),
             "callback_text should contain 'completed', got: {}",
+            cb.callback_text
+        );
+        // Regression: orchestrators were stopping when a child's result said
+        // "session can finish". The wrapper must explicitly tell the parent
+        // that such phrases scope to the child only.
+        assert!(
+            cb.callback_text.contains("session can finish")
+                && cb.callback_text.contains("child subprocess"),
+            "callback_text must clarify that 'session can finish' refers to the child only, got: {}",
             cb.callback_text
         );
     }
@@ -1735,11 +1841,11 @@ async fn test_session_started_does_not_update_last_activity() {
     teardown_test_db(&db_name).await;
 }
 
-/// Phase 4: SessionEnded is terminal-only. Every reason (Shutdown, Panic,
-/// Closed, plus the LegacyNonTerminal catch-all for old DB rows) must
-/// transition the thread to a terminal status with `has_response = TRUE`.
-/// The legacy `StaleResume` carve-out is gone — the dispatcher (Phase 5) owns
-/// the retry path; SessionEnded is no longer issued mid-turn.
+/// SessionEnded is mostly terminal: Shutdown, Panic, Closed, plus the
+/// LegacyNonTerminal catch-all for old DB rows must transition the thread to a
+/// terminal status with `has_response = TRUE`. The one exception is
+/// StaleResume — see `test_session_ended_stale_resume_keeps_status_running`
+/// for that case.
 #[tokio::test]
 async fn test_session_ended_transitions_to_terminal_status() {
     let (pool, db_name) = setup_test_db().await;
@@ -1800,6 +1906,107 @@ async fn test_session_ended_transitions_to_terminal_status() {
     assert_eq!(
         status, "idle",
         "SessionEnded {{ Panic }} must transition to terminal idle status"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression for "Drafts always in Drafts" report (2026-05-01): a CC follow-up
+/// triggered a stale resume and the user saw a transient "Aborted" exchange
+/// before the engine's internal retry produced a fresh `SessionStarted`.
+///
+/// Stale resume happens when CC's `--resume <sid>` returns an empty Result —
+/// the prior session expired. `run_session` emits
+/// `SessionEnded { StaleResume }` so restart-recovery's auto-detect resolver
+/// doesn't try to use the dead sid; the chat handler then retries the user's
+/// message against a fresh session within the same request.
+///
+/// During that retry window the thread MUST stay `running`. If the projection
+/// flips to `idle`, the frontend's `threadIdle && !isComplete && hasSteps`
+/// stale-exchange guard fires and the user sees "Aborted" until the retry's
+/// `SessionStarted` lands seconds later.
+#[tokio::test]
+async fn test_session_ended_stale_resume_keeps_status_running() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "include the ios suite too".into(),
+            images: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::CodingAgent),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            session_id: "stale-sid".into(),
+            branch: "claude-code/stale".into(),
+            repo_id: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::CodingAgent),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "running");
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionEnded {
+            reason: SessionEndReason::StaleResume,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::CodingAgent),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let (status, has_response): (String, bool) =
+        sqlx::query_as("SELECT status, has_response FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "running",
+        "SessionEnded {{ StaleResume }} must NOT flip status to terminal — \
+         the chat handler is mid-retry against a fresh session and the frontend \
+         would render the transient 'idle' as 'Aborted'"
+    );
+    assert!(
+        !has_response,
+        "SessionEnded {{ StaleResume }} must NOT set has_response — the user's \
+         message hasn't actually been answered yet; the retry is still in flight"
     );
 
     pool.close().await;
@@ -2112,13 +2319,13 @@ async fn test_active_children_count_on_child_spawn() {
     .await;
 
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(parent_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        section, "default",
+        section, "archived",
         "parent section stays default; Ongoing is display-only"
     );
 
@@ -2201,17 +2408,7 @@ async fn test_cc_child_session_ended_without_idle_decrements_parent() {
     assert_active_children(&pool, parent_id, 1, "parent should have 1 active child").await;
 
     // CC session starts then is canceled immediately — no CodingAgentIdled emitted
-    bus.emit(BusEvent::Thread {
-        thread_id: child_id,
-        event: ThreadEvent::SessionStarted {
-            session_id: "test-session".into(),
-            branch: "claude-code/test".into(),
-            repo_id: None,
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    emit_cc_session_started(&bus, child_id).await;
 
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
@@ -2251,6 +2448,197 @@ async fn test_cc_child_session_ended_without_idle_decrements_parent() {
     teardown_test_db(&db_name).await;
 }
 
+/// Regression: when a CC sub-thread is canceled by the user before it ever
+/// emits CodingAgentIdled and without a follow-up SessionEnded (the typical
+/// shape: ResponseCanceled fires from the cancellation path, the session sits
+/// archived without ever being resumed), the parent's `active_children_count`
+/// must still be decremented — otherwise the parent stays "Active" forever.
+#[tokio::test]
+async fn test_cc_child_canceled_without_session_ended_decrements_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::CodingAgent).await;
+    emit_cc_session_started(&bus, child_id).await;
+    assert_active_children(&pool, parent_id, 1, "parent should have 1 active child").await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::ResponseCanceled {
+            text: "".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    assert_active_children(
+        &pool,
+        parent_id,
+        0,
+        "parent active_children_count must be 0 after CC child canceled without \
+         SessionEnded — otherwise the parent stays Active forever",
+    )
+    .await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Symmetric to the cancel case: a CC sub-thread aborted (engine-driven) without
+/// ever emitting CodingAgentIdled or SessionEnded must still decrement the parent.
+#[tokio::test]
+async fn test_cc_child_aborted_without_session_ended_decrements_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::CodingAgent).await;
+    emit_cc_session_started(&bus, child_id).await;
+    assert_active_children(&pool, parent_id, 1, "parent should have 1 active child").await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::ResponseAborted {
+            text: "".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    assert_active_children(
+        &pool,
+        parent_id,
+        0,
+        "parent active_children_count must be 0 after CC child aborted without SessionEnded",
+    )
+    .await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// If a CC sub-thread is canceled and a later CodingAgentIdled lands (e.g. a
+/// background Claude tick that fires after the cancel persisted), the parent
+/// must NOT be double-decremented. The cancel decrements once and marks the
+/// callback as sent; the late idle is a no-op.
+#[tokio::test]
+async fn test_cc_child_idle_after_cancel_does_not_double_decrement() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::CodingAgent).await;
+    emit_cc_session_started(&bus, child_id).await;
+    assert_active_children(&pool, parent_id, 1, "parent should have 1 active child").await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::ResponseCanceled {
+            text: "".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    assert_active_children(&pool, parent_id, 0, "decremented after cancel").await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::CodingAgentIdled {
+            has_changes: false,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: None,
+            agent: crate::runtime::AgentKind::ClaudeCode,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    assert_active_children(
+        &pool,
+        parent_id,
+        0,
+        "late CodingAgentIdled after cancel must not double-decrement (the cancel \
+         already decremented; the late idle must be suppressed by callback-sent guard)",
+    )
+    .await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression: a CC sub-thread that hits a stale resume must NOT decrement its
+/// parent's `active_children_count` or fire a completion callback. The chat
+/// handler is mid-retry against a fresh session — the real CodingAgentIdled
+/// (with results) lands seconds later, and decrementing now would orphan it
+/// (the second decrement clamps at 0; the second callback is suppressed by
+/// `parent_callback_sent`).
+#[tokio::test]
+async fn test_cc_child_stale_resume_does_not_decrement_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::CodingAgent).await;
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::SessionStarted {
+            session_id: "stale-sid".into(),
+            branch: "claude-code/stale".into(),
+            repo_id: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    assert_active_children(&pool, parent_id, 1, "parent should have 1 active child").await;
+
+    // Stale resume: SessionEnded { StaleResume } fires, then the chat handler
+    // retries with a fresh session.
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::SessionEnded {
+            reason: SessionEndReason::StaleResume,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    assert_active_children(
+        &pool,
+        parent_id,
+        1,
+        "StaleResume is mid-retry — parent's active_children_count must stay 1",
+    )
+    .await;
+
+    let mut callbacks = vec![];
+    while let Ok(cb) = callback_rx.try_recv() {
+        callbacks.push(cb);
+    }
+    assert!(
+        callbacks.is_empty(),
+        "StaleResume must not fire a parent callback — the retry hasn't produced \
+         a result yet, so the parent would be told the child finished with no work"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 #[tokio::test]
 async fn test_chat_parent_stays_default_on_child_spawn() {
     let (pool, db_name) = setup_test_db().await;
@@ -2283,14 +2671,14 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
     .await
     .unwrap();
 
-    // Verify parent starts with section = 'default'
+    // Verify parent starts with section = 'archived'
     let status: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(parent_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(status, "default", "chat parent should start as 'default'");
+    assert_eq!(status, "archived", "chat parent should start as 'archived'");
 
     // Spawn child thread with parent_thread_id
     bus.emit(BusEvent::Thread {
@@ -2316,17 +2704,17 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
     .await
     .unwrap();
 
-    // Chat parents stay 'default' — they show as Ongoing via deriveThreadStatus
+    // Chat parents stay 'archived' — they show as Ongoing via deriveThreadStatus
     // (has active children).
     let status: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(parent_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        status, "default",
-        "chat parent should stay 'default' after child spawn"
+        status, "archived",
+        "chat parent should stay 'archived' after child spawn"
     );
 
     pool.close().await;
@@ -2334,7 +2722,7 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
 }
 
 #[tokio::test]
-async fn test_section_unread_on_child_complete() {
+async fn test_section_inbox_on_child_complete() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -2389,19 +2777,19 @@ async fn test_section_unread_on_child_complete() {
     .await
     .unwrap();
 
-    // Chat parent stays 'default' (not 'waiting') — contract rejects waiting for Chat
+    // Chat parent stays 'archived' (not 'waiting') — contract rejects waiting for Chat
     let status: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(parent_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        status, "default",
+        status, "archived",
         "chat parent stays default while child runs"
     );
 
-    // Child completes — notify_parent_if_child marks parent as 'unread'
+    // Child completes — notify_parent_if_child marks parent as 'inbox'
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::ResponseGenerated {
@@ -2415,16 +2803,16 @@ async fn test_section_unread_on_child_complete() {
     .await
     .unwrap();
 
-    // Verify parent is now 'unread' (child completion marks parent unread via callback)
+    // Verify parent is now 'inbox' (child completion surfaces parent to inbox via callback)
     let status: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(parent_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        status, "unread",
-        "parent should be 'unread' after child completes"
+        status, "inbox",
+        "parent should be 'inbox' after child completes"
     );
 
     pool.close().await;
@@ -2462,7 +2850,7 @@ async fn test_section_marked_read() {
     .await
     .unwrap();
 
-    // Complete it — chat threads become 'unread' on ResponseGenerated
+    // Complete it — chat threads become 'inbox' on ResponseGenerated
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseGenerated {
@@ -2477,34 +2865,31 @@ async fn test_section_marked_read() {
     .unwrap();
 
     let status: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(
-        status, "unread",
-        "thread should be 'unread' after completion"
-    );
+    assert_eq!(status, "inbox", "thread should be 'inbox' after completion");
 
-    // Mark as read
+    // Archive the thread
     bus.emit(BusEvent::Thread {
         thread_id,
-        event: ThreadEvent::ThreadMarkedRead,
+        event: ThreadEvent::ThreadArchived,
         meta: EventMeta::NONE,
     })
     .await
     .unwrap();
 
     let status: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        status, "default",
-        "should be 'default' after marking as read"
+        status, "archived",
+        "should be 'archived' after ThreadArchived"
     );
 
     pool.close().await;
@@ -2527,6 +2912,7 @@ async fn trigger_threads_skip_review() {
             prompt: None,
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
+            go_to_review: false,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -2536,7 +2922,7 @@ async fn trigger_threads_skip_review() {
     .await
     .unwrap();
 
-    // Complete it — scheduled tasks should NOT go to 'unread' (no user watching)
+    // Complete it — scheduled tasks should NOT go to 'inbox' (no user watching)
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseGenerated {
@@ -2551,14 +2937,72 @@ async fn trigger_threads_skip_review() {
     .unwrap();
 
     let status: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        status, "default",
-        "scheduled task should stay 'default', not appear in review"
+        status, "archived",
+        "scheduled task should stay 'archived', not appear in review"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn trigger_with_go_to_review_surfaces_first_response_in_review() {
+    // Triggers opted into REVIEW (e.g. daily summaries the user is meant to read)
+    // override the unattended-execution skip so even the first automated
+    // ResponseGenerated lands in REVIEW, not HISTORY.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::TriggerStarted {
+            trigger_id: "t-review".into(),
+            trigger_name: Some("daily summary".into()),
+            prompt: None,
+            invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
+            origin: None,
+            go_to_review: true,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Trigger),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "Here is your summary.".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let (archive_state, flag): (String, bool) = sqlx::query_as(
+        "SELECT archive_state, trigger_go_to_review FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(flag, "trigger_go_to_review must be persisted on the row");
+    assert_eq!(
+        archive_state, "inbox",
+        "trigger with go_to_review=true must surface in REVIEW on first response"
     );
 
     pool.close().await;
@@ -2581,6 +3025,7 @@ async fn trigger_followup_response_goes_to_review() {
             prompt: None,
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
+            go_to_review: false,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -2605,13 +3050,13 @@ async fn trigger_followup_response_goes_to_review() {
     .unwrap();
 
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        section, "default",
+        section, "archived",
         "initial scheduled task response should stay in history"
     );
 
@@ -2636,7 +3081,7 @@ async fn trigger_followup_response_goes_to_review() {
     .await
     .unwrap();
 
-    // Step 4: LLM responds to the followup — should go to review (unread)
+    // Step 4: LLM responds to the followup — should go to review (inbox)
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseGenerated {
@@ -2651,13 +3096,13 @@ async fn trigger_followup_response_goes_to_review() {
     .unwrap();
 
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        section, "unread",
+        section, "inbox",
         "followup response on scheduled task thread should go to review"
     );
 
@@ -2710,6 +3155,7 @@ fn message_received_destructures_parent_thread_id() {
             event: event.clone(),
             meta: EventMeta::NONE,
         },
+        aggregate: None,
     };
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
     assert_eq!(
@@ -2740,6 +3186,7 @@ fn message_received_destructures_parent_thread_id() {
             event: event_no_parent,
             meta: EventMeta::NONE,
         },
+        aggregate: None,
     };
     let json2: serde_json::Value = serde_json::from_str(&emitted_no_parent.to_sse_json()).unwrap();
     assert!(json2["data"]["event"].get("parent_thread_id").is_none()
@@ -3002,7 +3449,7 @@ async fn test_recursion_guard_children_limit_per_parent_not_global() {
 }
 
 #[tokio::test]
-async fn response_aborted_marks_chat_thread_unread() {
+async fn response_aborted_surfaces_chat_thread_to_inbox() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -3033,12 +3480,12 @@ async fn response_aborted_marks_chat_thread_unread() {
 
     // Verify starts as default
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(section, "default");
+    assert_eq!(section, "archived");
 
     // ResponseAborted (engine crash recovery)
     bus.emit(BusEvent::Thread {
@@ -3054,16 +3501,16 @@ async fn response_aborted_marks_chat_thread_unread() {
     .await
     .unwrap();
 
-    // Verify thread is now unread
+    // Verify thread is now in inbox
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        section, "unread",
-        "ResponseAborted should mark chat thread as unread"
+        section, "inbox",
+        "ResponseAborted should surface chat thread to inbox"
     );
 
     // Verify has_response is true
@@ -3163,10 +3610,11 @@ async fn trigger_completed_sets_has_response_true() {
         thread_id,
         event: ThreadEvent::TriggerStarted {
             trigger_id: "t-1".into(),
-            trigger_name: Some("finn-jobb".into()),
+            trigger_name: Some("job-tracker".into()),
             prompt: Some("Check jobs".into()),
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
+            go_to_review: false,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -3192,7 +3640,7 @@ async fn trigger_completed_sets_has_response_true() {
         thread_id,
         event: ThreadEvent::TriggerCompleted {
             trigger_id: "t-1".into(),
-            trigger_name: Some("finn-jobb".into()),
+            trigger_name: Some("job-tracker".into()),
             result_summary: Some("Found 3 jobs".into()),
         },
         meta: EventMeta::NONE,
@@ -3902,11 +4350,11 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
     teardown_test_db(&db_name).await;
 }
 
-/// After ChangeApplied, the thread stays 'unread' so the Done button appears.
-/// CC flags are cleared, so resolveActions returns ['done'] instead of ['apply','discard'].
-/// A subsequent CodingAgentIdled(no changes) is idempotent — section stays 'unread'.
+/// After ChangeApplied, the thread stays 'inbox' so the Archive button appears.
+/// CC flags are cleared, so resolveActions returns ['archive'] instead of ['apply','discard'].
+/// A subsequent CodingAgentIdled(no changes) is idempotent — section stays 'inbox'.
 #[tokio::test]
-async fn change_applied_stays_unread_shows_done() {
+async fn change_applied_keeps_inbox_shows_archive() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -3914,14 +4362,14 @@ async fn change_applied_stays_unread_shows_done() {
     start_cc_session(&bus, thread_id, "claude-code/fix").await;
     emit_cc_idle(&bus, thread_id, true, None).await;
 
-    // After CodingAgentIdled(has_changes=true), section should be 'unread'
+    // After CodingAgentIdled(has_changes=true), section should be 'inbox'
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(section, "unread", "CodingAgentIdled with changes → unread");
+    assert_eq!(section, "inbox", "CodingAgentIdled with changes → inbox");
 
     // Propose and apply a change
     bus.emit(BusEvent::Thread {
@@ -3962,16 +4410,16 @@ async fn change_applied_stays_unread_shows_done() {
     .await
     .unwrap();
 
-    // ChangeApplied does NOT change section — thread stays 'unread' for Done button
+    // ChangeApplied does NOT change section — thread stays 'inbox' for Archive button
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        section, "unread",
-        "ChangeApplied must NOT clear unread — Done button needs to appear"
+        section, "inbox",
+        "ChangeApplied must NOT clear inbox — Archive button needs to appear"
     );
 
     // CC flags should be cleared (ClearAll)
@@ -3983,28 +4431,28 @@ async fn change_applied_stays_unread_shows_done() {
             .unwrap();
     assert!(!cc_has_changes, "ChangeApplied must clear cc_has_changes");
 
-    // A subsequent CodingAgentIdled(no changes) keeps section as 'unread' (idempotent)
+    // A subsequent CodingAgentIdled(no changes) keeps section as 'inbox' (idempotent)
     emit_cc_idle(&bus, thread_id, false, Some("sid-1")).await;
 
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        section, "unread",
-        "CodingAgentIdled(no changes) keeps section unread"
+        section, "inbox",
+        "CodingAgentIdled(no changes) keeps section inbox"
     );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// ChangeDiscarded also keeps the thread unread so Done button appears.
-/// Mirror of change_applied_stays_unread_shows_done for the discard path.
+/// ChangeDiscarded also keeps the thread in inbox so Archive button appears.
+/// Mirror of change_applied_keeps_inbox_shows_archive for the discard path.
 #[tokio::test]
-async fn change_discarded_stays_unread_shows_done() {
+async fn change_discarded_keeps_inbox_shows_archive() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -4044,15 +4492,16 @@ async fn change_discarded_stays_unread_shows_done() {
     .await
     .unwrap();
 
-    let (section, cc_has_changes): (String, bool) =
-        sqlx::query_as("SELECT section, cc_has_changes FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (section, cc_has_changes): (String, bool) = sqlx::query_as(
+        "SELECT archive_state, cc_has_changes FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        section, "unread",
-        "ChangeDiscarded must NOT clear unread — Done button needs to appear"
+        section, "inbox",
+        "ChangeDiscarded must NOT clear inbox — Archive button needs to appear"
     );
     assert!(!cc_has_changes, "ChangeDiscarded must clear cc_has_changes");
 
@@ -4060,9 +4509,9 @@ async fn change_discarded_stays_unread_shows_done() {
     teardown_test_db(&db_name).await;
 }
 
-/// Full Apply → Done flow: Apply keeps thread unread, Dismiss moves to default (HISTORY).
+/// Full Apply → Archive flow: Apply keeps thread in inbox, Archive moves to archived (HISTORY).
 #[tokio::test]
-async fn apply_then_dismiss_moves_to_history() {
+async fn apply_then_archive_moves_to_history() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -4110,32 +4559,32 @@ async fn apply_then_dismiss_moves_to_history() {
     .unwrap();
 
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        section, "unread",
-        "After Apply: stays unread for Done button"
+        section, "inbox",
+        "After Apply: stays in inbox for Archive button"
     );
 
-    // Done (dismiss)
+    // Archive
     bus.emit(BusEvent::Thread {
         thread_id,
-        event: ThreadEvent::ThreadDismissed,
+        event: ThreadEvent::ThreadArchived,
         meta: EventMeta::NONE,
     })
     .await
     .unwrap();
 
     let (section, status): (String, String) =
-        sqlx::query_as("SELECT section, status FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_as("SELECT archive_state, status FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(section, "default", "After Done: moved to HISTORY");
+    assert_eq!(section, "archived", "After Done: moved to HISTORY");
     assert_eq!(status, "idle", "After Done: status is idle");
 
     pool.close().await;
@@ -4389,10 +4838,10 @@ async fn startup_resets_orphaned_waiting_threads_without_changes() {
     teardown_test_db(&db_name).await;
 }
 
-/// ThreadDismissed must clear all CC flags and set status to idle.
-/// Previously ThreadDismissed was a no-op, leaving dismissed threads stuck in waiting.
+/// ThreadArchived must clear all CC flags and set status to idle.
+/// Previously ThreadArchived was a no-op, leaving archived threads stuck in waiting.
 #[tokio::test]
-async fn thread_dismissed_clears_cc_flags_and_goes_idle() {
+async fn thread_archived_clears_cc_flags_and_goes_idle() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -4426,7 +4875,7 @@ async fn thread_dismissed_clears_cc_flags_and_goes_idle() {
 
     bus.emit(BusEvent::Thread {
         thread_id,
-        event: ThreadEvent::ThreadDismissed,
+        event: ThreadEvent::ThreadArchived,
         meta: EventMeta::NONE,
     })
     .await
@@ -4446,27 +4895,27 @@ async fn thread_dismissed_clears_cc_flags_and_goes_idle() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(status, "idle", "ThreadDismissed must set idle");
-    assert!(!has_changes, "ThreadDismissed must clear cc_has_changes");
+    assert_eq!(status, "idle", "ThreadArchived must set idle");
+    assert!(!has_changes, "ThreadArchived must clear cc_has_changes");
     assert!(
         !requires_restart,
-        "ThreadDismissed must clear cc_requires_restart"
+        "ThreadArchived must clear cc_requires_restart"
     );
     assert!(
         !is_external,
-        "ThreadDismissed must clear cc_is_external_repo"
+        "ThreadArchived must clear cc_is_external_repo"
     );
-    assert!(!applying, "ThreadDismissed must clear cc_applying");
+    assert!(!applying, "ThreadArchived must clear cc_applying");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// Done click invariant: ThreadDismissed must emit LAST, after any trailing
+/// Archive click invariant: ThreadArchived must emit LAST, after any trailing
 /// CodingAgentIdled from CC cleanup, or the lifecycle side effect re-marks the
-/// thread unread and the dismiss is silently undone.
+/// thread to inbox and the archive is silently undone.
 #[tokio::test]
-async fn cc_idled_then_dismissed_ends_in_default_section() {
+async fn cc_idled_then_archived_ends_in_default_section() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -4474,42 +4923,45 @@ async fn cc_idled_then_dismissed_ends_in_default_section() {
     start_cc_session(&bus, thread_id, "claude-code/dismiss-order").await;
     emit_cc_idle(&bus, thread_id, false, None).await;
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(section, "unread", "CodingAgentIdled must mark CC thread unread");
+    assert_eq!(
+        section, "inbox",
+        "CodingAgentIdled must surface CC thread to inbox"
+    );
 
     emit_cc_idle(&bus, thread_id, false, None).await;
     bus.emit(BusEvent::Thread {
         thread_id,
-        event: ThreadEvent::ThreadDismissed,
+        event: ThreadEvent::ThreadArchived,
         meta: EventMeta::NONE,
     })
     .await
     .unwrap();
 
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        section, "default",
-        "ThreadDismissed emitted LAST must leave section=default — Done click would otherwise be silently undone by trailing CodingAgentIdled"
+        section, "archived",
+        "ThreadArchived emitted LAST must leave section=default — Archive click would otherwise be silently undone by trailing CodingAgentIdled"
     );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// Bug-pinning counter-test: if this ever asserts `default` instead of `unread`,
-/// the lifecycle stopped re-marking on CodingAgentIdled and dismiss_thread can
+/// Bug-pinning counter-test: if this ever asserts `archived` instead of `inbox`,
+/// the lifecycle stopped re-marking on CodingAgentIdled and archive_thread can
 /// drop its ordering hack.
 #[tokio::test]
-async fn dismissed_then_cc_idled_undoes_dismissal() {
+async fn archived_then_cc_idled_undoes_archive() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -4519,7 +4971,7 @@ async fn dismissed_then_cc_idled_undoes_dismissal() {
 
     bus.emit(BusEvent::Thread {
         thread_id,
-        event: ThreadEvent::ThreadDismissed,
+        event: ThreadEvent::ThreadArchived,
         meta: EventMeta::NONE,
     })
     .await
@@ -4527,15 +4979,118 @@ async fn dismissed_then_cc_idled_undoes_dismissal() {
     emit_cc_idle(&bus, thread_id, false, None).await;
 
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        section, "unread",
-        "trailing CodingAgentIdled re-marks the thread unread — this is why dismiss_thread must end CC FIRST"
+        section, "inbox",
+        "trailing CodingAgentIdled re-surfaces the thread to inbox — this is why archive_thread must end CC FIRST"
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Bug-pinning counter-test for the ResponseCanceled variant of the same race:
+/// archive_thread calls cancel_agent (signal-based, async) then emits
+/// ThreadArchived. The cancel surfaces a ResponseCanceled AFTER ThreadArchived,
+/// whose section transition flips section back to 'inbox' — so the user
+/// clicks Archive, sees navigation, but the thread reappears in REVIEW.
+/// archive_thread must wait for the cancel-fallout terminal event to settle
+/// before emitting ThreadArchived.
+#[tokio::test]
+async fn archived_then_response_canceled_undoes_archive() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    start_cc_session(&bus, thread_id, "claude-code/cancel-race").await;
+    emit_cc_idle(&bus, thread_id, true, None).await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadArchived,
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseCanceled {
+            text: String::new(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let section: String =
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        section, "inbox",
+        "trailing ResponseCanceled re-surfaces the thread to inbox — archive_thread must await the cancel before emitting ThreadArchived"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Persisted thread events broadcast on the bus carry the post-event projection
+/// snapshot in `EmittedEvent.aggregate`. Frontend uses this to update
+/// `thread.meta` directly instead of looking up SECTION_TRANSITIONS / STATUS_TRANSITIONS.
+/// Read-your-write semantics: the snapshot reflects the state AFTER this event's
+/// projection update, fetched inside the same transaction as the INSERT.
+#[tokio::test]
+async fn sse_thread_event_carries_aggregate() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let mut rx = bus.subscribe();
+
+    start_cc_session(&bus, thread_id, "claude-code/agg-test").await;
+
+    // Drain the start events so we observe only the cancel.
+    while rx.try_recv().is_ok() {}
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseCanceled {
+            text: String::new(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let evt = rx.recv().await.expect("ResponseCanceled broadcast");
+    let agg = evt
+        .aggregate
+        .as_ref()
+        .expect("aggregate must be present on persisted thread events");
+    assert_eq!(agg.section, "inbox", "ResponseCanceled puts CC thread in inbox");
+    assert_eq!(agg.status, "idle", "after cancel, status returns to idle");
+    assert_eq!(agg.thread_id, thread_id.to_string());
+
+    // Verify SSE JSON serialization carries the aggregate too.
+    let sse = evt.to_sse_json();
+    let v: serde_json::Value = serde_json::from_str(&sse).unwrap();
+    assert_eq!(v["data"]["aggregate"]["section"], "inbox");
+    assert_eq!(v["data"]["aggregate"]["status"], "idle");
+    // Aggregate must NOT carry compose fields (live drafts have their own cadence).
+    assert!(v["data"]["aggregate"].get("composeText").is_none());
+    assert!(v["data"]["aggregate"].get("composeImages").is_none());
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -4606,7 +5161,7 @@ async fn external_repo_idle_with_changes_never_shows_apply_discard() {
 
     // The key invariant: no ChangeProposed event should exist for external repos.
     // The runtime skips propose_change, so no changes row is created.
-    // Without a pending change, resolve_actions returns [Done], not [Apply, Discard].
+    // Without a pending change, resolve_actions returns [Archive], not [Apply, Discard].
     let change_proposed_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = 'ChangeProposed'",
     )
@@ -4774,7 +5329,7 @@ async fn change_applied_persists_device_actor_in_payload() {
 
     let device = MessageOrigin::Device {
         device_id: "dev-actor-test".into(),
-        label: "Kenneth's MacBook".into(),
+        label: "Test MacBook".into(),
     };
 
     bus.emit(BusEvent::Thread {
@@ -4821,7 +5376,7 @@ async fn change_applied_persists_device_actor_in_payload() {
     );
     assert_eq!(
         actor_json.get("label").and_then(|v| v.as_str()),
-        Some("Kenneth's MacBook"),
+        Some("Test MacBook"),
         "actor.label must round-trip so the chip renders the user's device name, \
          got: {actor_json:?}"
     );
@@ -4968,6 +5523,7 @@ async fn initiator_system_trigger() {
             prompt: None,
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
+            go_to_review: false,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -5006,6 +5562,7 @@ async fn initiator_inherited_system_to_cc_child() {
             prompt: None,
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
+            go_to_review: false,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -5188,6 +5745,7 @@ async fn initiator_preserved_on_session_started_upsert() {
             prompt: None,
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
+            go_to_review: false,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -5388,23 +5946,23 @@ async fn cc_idle_no_changes_from_default_goes_to_review() {
     emit_cc_idle(&bus, thread_id, false, Some("sid-1")).await;
 
     let (section, status): (String, String) =
-        sqlx::query_as("SELECT section, status FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_as("SELECT archive_state, status FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(section, "unread",
-            "CodingAgentIdled(no changes) from Default must set section to unread (REVIEW), not stay default (HISTORY)");
+    assert_eq!(section, "inbox",
+            "CodingAgentIdled(no changes) from Archived must set section to inbox (REVIEW), not stay archived (HISTORY)");
     assert_eq!(status, "idle");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// Housekeeping: CodingAgentIdled(has_changes=false) when section is already 'unread'
+/// Housekeeping: CodingAgentIdled(has_changes=false) when section is already 'inbox'
 /// (after apply/discard) must not change section — it's already in REVIEW.
 #[tokio::test]
-async fn cc_idle_no_changes_from_unread_stays_unread() {
+async fn cc_idle_no_changes_from_inbox_stays_inbox() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -5412,7 +5970,7 @@ async fn cc_idle_no_changes_from_unread_stays_unread() {
     start_cc_session(&bus, thread_id, "claude-code/fix").await;
     emit_cc_idle(&bus, thread_id, true, None).await;
 
-    // Apply the change — section stays 'unread' for Done button
+    // Apply the change — section stays 'inbox' for Archive button
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
@@ -5450,18 +6008,18 @@ async fn cc_idle_no_changes_from_unread_stays_unread() {
     .await
     .unwrap();
 
-    // Housekeeping idle — section already 'unread', must stay 'unread'
+    // Housekeeping idle — section already 'inbox', must stay 'inbox'
     emit_cc_idle(&bus, thread_id, false, Some("sid-1")).await;
 
     let section: String =
-        sqlx::query_scalar("SELECT section FROM thread_summaries WHERE thread_id = $1")
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        section, "unread",
-        "Housekeeping CodingAgentIdled(no changes) must keep section unread"
+        section, "inbox",
+        "Housekeeping CodingAgentIdled(no changes) must keep section inbox"
     );
 
     pool.close().await;
@@ -5469,9 +6027,9 @@ async fn cc_idle_no_changes_from_unread_stays_unread() {
 }
 
 /// When a parent chat thread has active CC children and ResponseGenerated fires,
-/// a ChildrenCountChanged event must be broadcast AFTER the ThreadMarkedUnread
-/// side effect. This ensures the frontend updates both section and children count
-/// atomically, preventing a transient REVIEW state (should be WAITING).
+/// the broadcast aggregate must carry both the section transition (to inbox) and
+/// the children count, so the frontend updates both atomically — preventing a
+/// transient REVIEW state (should be WAITING).
 #[tokio::test]
 async fn response_generated_on_parent_with_children_broadcasts_children_count() {
     let (pool, db_name) = setup_test_db().await;
@@ -5534,7 +6092,7 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
     // Subscribe to capture events AFTER children are spawned
     let mut rx = bus.subscribe();
 
-    // Parent finishes responding → ResponseGenerated → ThreadMarkedUnread side effect
+    // Parent finishes responding → ResponseGenerated → section transitions to inbox
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::ResponseGenerated {
@@ -5548,50 +6106,32 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
     .await
     .unwrap();
 
-    // Collect all events emitted for the parent thread
-    let mut parent_events: Vec<String> = Vec::new();
-    let mut saw_marked_unread = false;
-    let mut saw_children_count_after_unread = false;
-
-    // Drain all available events (emit is synchronous relative to this test)
+    // ResponseGenerated's aggregate snapshot carries section AND
+    // active_children_count in one envelope — no follow-up section-change
+    // event or ChildrenCountChanged broadcast is needed for the frontend to
+    // render consistent state.
+    let mut response_generated_aggregate: Option<crate::core::store::ThreadAggregate> = None;
     while let Ok(emitted) = rx.try_recv() {
         if let BusEvent::Thread {
             thread_id, event, ..
         } = &emitted.typed
         {
-            if *thread_id == parent_id {
-                let event_type = event.event_type().to_string();
-                if event_type == "ThreadMarkedUnread" {
-                    saw_marked_unread = true;
-                }
-                if event_type == "ChildrenCountChanged" && saw_marked_unread {
-                    if let ThreadEvent::ChildrenCountChanged { active, total } = event {
-                        assert_eq!(
-                            *active, 2,
-                            "ChildrenCountChanged must reflect 2 active children"
-                        );
-                        assert_eq!(
-                            *total, 2,
-                            "ChildrenCountChanged must reflect 2 total children"
-                        );
-                    }
-                    saw_children_count_after_unread = true;
-                }
-                parent_events.push(event_type);
+            if *thread_id == parent_id && event.event_type() == "ResponseGenerated" {
+                response_generated_aggregate = emitted.aggregate.clone();
             }
         }
     }
-
-    assert!(
-        saw_marked_unread,
-        "ThreadMarkedUnread must be emitted as side effect of ResponseGenerated on chat thread"
+    let agg = response_generated_aggregate
+        .expect("ResponseGenerated must be broadcast with aggregate");
+    assert_eq!(
+        agg.section, "inbox",
+        "aggregate carries the new section='inbox' (no separate section-change event needed)"
     );
-    assert!(
-        saw_children_count_after_unread,
-        "ChildrenCountChanged must be broadcast AFTER ThreadMarkedUnread to ensure \
-             frontend has consistent section + children data. Got events: {:?}",
-        parent_events,
+    assert_eq!(
+        agg.active_children_count, 2,
+        "aggregate carries active_children_count=2 (replaces the legacy ChildrenCountChanged re-broadcast)"
     );
+    assert_eq!(agg.total_children_count, 2, "aggregate carries total_children_count=2");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -5632,6 +6172,7 @@ async fn thread_focused_sse_json_uses_typed_envelope() {
             thread_id: thread,
             device_id: "dev-1".into(),
         }),
+        aggregate: None,
     };
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
     assert_eq!(json["type"], "ThreadFocused");
@@ -5762,6 +6303,530 @@ async fn emit_thread_unfocused_removes_projection_row() {
         devices.is_empty(),
         "ThreadUnfocused should remove the projection row"
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// CC may emit a `Result` mid-session — e.g. when the model invokes a Skill
+/// tool that triggers another model turn — making the engine emit
+/// `CodingAgentIdled` before CC is actually done. The next `CodingAgentToolCalled`
+/// (or text/result) proves CC is still working, so the projection must bump
+/// status back to `running` to keep the thread out of REVIEW while work
+/// continues. Without this, the thread shows in REVIEW with a stale "idle"
+/// status while the agent is mid-tool-call.
+#[tokio::test]
+async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    // Seed: MessageReceived → SessionStarted → CodingAgentIdled.
+    // After Idled, status is 'idle' (no changes).
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "fix the bug".into(),
+            images: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::CodingAgent),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            session_id: "sess-1".into(),
+            branch: "claude-code/branch".into(),
+            repo_id: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::CodingAgent),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentIdled {
+            has_changes: false,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: Some("sess-1".into()),
+            agent: crate::runtime::AgentKind::ClaudeCode,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::CodingAgent),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "idle", "post-Idled status should be idle");
+
+    // Now: CC continues with a tool call (e.g. it invoked Skill and the
+    // skill content triggers another model turn). The engine never emitted
+    // a new MessageReceived/PromptSent — this is internal CC continuation.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentToolCalled {
+            name: "Bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+            description: String::new(),
+            agent: crate::runtime::AgentKind::ClaudeCode,
+            tool_use_id: String::new(),
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::CodingAgent),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "running",
+        "CC activity event after premature Idled must bump status back to 'running' \
+         so the thread leaves REVIEW while work continues"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Same recovery for `CodingAgentTextStreamed` arriving after Idled —
+/// CC's response text streaming proves work is in progress.
+#[tokio::test]
+async fn test_cc_text_streamed_after_idled_bumps_status_back_to_running() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "do work".into(),
+            images: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::CodingAgent),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentIdled {
+            has_changes: false,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: Some("sess-1".into()),
+            agent: crate::runtime::AgentKind::ClaudeCode,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::CodingAgent),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentTextStreamed {
+            text: "still working...".into(),
+            agent: crate::runtime::AgentKind::ClaudeCode,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::CodingAgent),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "running");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// `events_pkey` is the structural reason the agentic loop's old inject
+/// path silently dropped `UserPromptInjected` events: a row already
+/// existed with the same id (the optimistic `MessageReceived`). Locking
+/// this in here so a future schema change that relaxes the constraint
+/// doesn't quietly resurrect that bug.
+#[tokio::test]
+async fn emit_with_existing_event_id_fails_with_pkey_violation() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let dup_id = Uuid::new_v4();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "first".into(),
+            images: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            event_id: Some(dup_id),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("first emit ok");
+
+    let result = bus
+        .emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::UserPromptInjected {
+                text: "second".into(),
+                mode: ActorMode::Human,
+                origin: None,
+                injected_message_id: None,
+            },
+            meta: EventMeta {
+                event_id: Some(dup_id),
+                ..EventMeta::NONE
+            },
+        })
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!("second emit with same id must fail (events_pkey violation)"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("duplicate key") || msg.contains("events_pkey"),
+        "error must mention the pkey violation: {}",
+        msg
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A trigger firing represents prior activity, so the row must land as
+/// `Active`. Relying on the column default to reach `Active` means a future
+/// default change silently re-introduces phantom drafts.
+#[tokio::test]
+async fn trigger_started_creates_active_thread_not_composing() {
+    use crate::engine::thread_state::ThreadState;
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::TriggerStarted {
+            trigger_id: "t-active".into(),
+            trigger_name: Some("nightly".into()),
+            prompt: Some("Run nightly".into()),
+            invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
+            origin: None,
+            go_to_review: false,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Trigger),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ThreadState::Active.as_str());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// `Discarded` is terminal — a stale or replayed `TriggerStarted` against a
+/// discarded thread must not resurrect it. The sibling MessageReceived and
+/// SessionStarted ON CONFLICT branches gate on the same invariant.
+#[tokio::test]
+async fn trigger_started_does_not_resurrect_discarded_thread() {
+    use crate::engine::thread_state::ThreadState;
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadStarted {
+            mode: "lucidos".into(),
+            actor: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadDiscarded { actor: None },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::TriggerStarted {
+            trigger_id: "t-stale".into(),
+            trigger_name: Some("nightly".into()),
+            prompt: Some("Run nightly".into()),
+            invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
+            origin: None,
+            go_to_review: false,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Trigger),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ThreadState::Discarded.as_str());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A row in `thread_summaries` represents a thread with prior activity; only
+/// `ThreadStarted` creates a draft and sets state explicitly. The default
+/// must therefore be `Active` so any insert path that forgets to specify
+/// state can't conjure a phantom draft.
+#[tokio::test]
+async fn thread_summaries_state_column_defaults_to_active() {
+    use crate::engine::thread_state::ThreadState;
+    let (pool, db_name) = setup_test_db().await;
+    let thread_id = Uuid::new_v4();
+
+    sqlx::query("INSERT INTO thread_summaries (thread_id) VALUES ($1)")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ThreadState::Active.as_str());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A composing thread that auto-archives without ever being sent must still
+/// surface its intended channel — otherwise the drawer renders it as
+/// "Lucidos" even when the user toggled CC. Source mirrors compose_mode for
+/// composing threads; later send events overwrite if they disagree.
+#[tokio::test]
+async fn thread_started_with_claude_code_mode_sets_source_to_claude_code() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadStarted {
+            mode: "claude_code".into(),
+            actor: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let (source, compose_mode): (String, Option<String>) =
+        sqlx::query_as("SELECT source, compose_mode FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(compose_mode.as_deref(), Some("claude_code"));
+    assert_eq!(source, "claude_code");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Lucidos mode maps to `source = 'chat'` so the drawer pill matches the
+/// table-default behaviour and the existing CASE branches in MessageReceived
+/// (which key off `source = 'chat'` to detect "no prior assertion").
+#[tokio::test]
+async fn thread_started_with_lucidos_mode_sets_source_to_chat() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadStarted {
+            mode: "lucidos".into(),
+            actor: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let source: String =
+        sqlx::query_scalar("SELECT source FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(source, "chat");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression: `register_thread_queued`'s 60s eviction used to leak a
+/// `ResponseCanceled` (no actor) onto the evicted thread because the
+/// downstream cancel arms read `is_shutdown=false` and defaulted to
+/// "user-driven cancel" semantics. The frontend then rendered "Canceled"
+/// next to the affected exchange — misleading users into thinking they
+/// pressed Stop. The fix emits `ResponseAborted` with `actor=System`
+/// directly from the eviction path; this test pins the actor and event
+/// type the frontend needs to render "Aborted" instead.
+#[tokio::test]
+async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+
+    // Anchor the request: a chat MessageReceived stamps a row in events
+    // that latest_originating_event_id can find.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "first message".into(),
+            images: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            event_id: Some(request_id),
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    // Empty agent_sessions — chat thread, no CC session involved.
+    let agent_sessions = tokio::sync::Mutex::new(std::collections::HashMap::new());
+
+    crate::engine::emit_stuck_thread_eviction_abort(&bus, &pool, &agent_sessions, thread_id).await;
+
+    let (event_type, actor_kind, req_id, status): (String, Option<String>, Option<String>, String) =
+        sqlx::query_as(
+            "SELECT e.event_type, e.payload->'actor'->>'kind', \
+                e.payload->>'request_event_id', ts.status \
+             FROM events e JOIN thread_summaries ts ON ts.thread_id = e.aggregate_id::uuid \
+             WHERE e.aggregate_id = $1 AND e.event_type IN \
+                ('ResponseAborted','ResponseCanceled','ResponseFailed','ResponseGenerated') \
+             ORDER BY e.sequence DESC LIMIT 1",
+        )
+        .bind(thread_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("a terminal event must be persisted by the eviction");
+
+    assert_eq!(event_type, "ResponseAborted");
+    assert_eq!(actor_kind.as_deref(), Some("system"));
+    assert_eq!(req_id.as_deref(), Some(request_id.to_string().as_str()));
+    // 'failed' (not 'idle') so the UI shows the error indicator — eviction is
+    // a hard failure, not a clean dismissal.
+    assert_eq!(status, "failed");
 
     pool.close().await;
     teardown_test_db(&db_name).await;

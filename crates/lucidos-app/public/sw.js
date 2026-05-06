@@ -41,6 +41,16 @@ async function fetchWithRetry(request) {
   }
 }
 
+// iOS doesn't reliably pass notification.data — fall back to the tag, which
+// is set to the notification id at show time (the default tag means no id
+// was set, e.g. a non-Lucidos push or a malformed payload).
+const DEFAULT_NOTIFICATION_TAG = 'lucidos-notification';
+function resolveNotificationId(notification) {
+  const tag = notification.tag;
+  return notification.data?.notification_id
+    || (tag && tag !== DEFAULT_NOTIFICATION_TAG ? tag : null);
+}
+
 self.addEventListener('push', (event) => {
   let data = { title: 'Lucidos', body: 'New notification' };
   try {
@@ -55,12 +65,11 @@ self.addEventListener('push', (event) => {
         body: data.body,
         icon: '/favicon.svg',
         badge: '/favicon.svg',
-        tag: data.notification_id || 'lucidos-notification',
+        tag: data.notification_id || DEFAULT_NOTIFICATION_TAG,
         renotify: true,
         data: {
           notification_id: data.notification_id,
           app_id: data.app_id,
-          thread_id: data.thread_id,
         },
       }),
       // Store the notification ID on the backend immediately — fallback for iOS
@@ -76,15 +85,26 @@ self.addEventListener('push', (event) => {
   );
 });
 
+// Clear the pending push fallback when the user dismisses — without this,
+// /api/notification-pushed (60s window) fires the next time the app gains
+// focus and auto-opens the modal for a notification the user just dismissed.
+self.addEventListener('notificationclose', (event) => {
+  const notificationId = resolveNotificationId(event.notification);
+  if (!notificationId) return;
+  event.waitUntil(
+    fetch(`${self.location.origin}/api/notification-dismissed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notification_id: notificationId }),
+    }).catch(() => {})
+  );
+});
+
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
 
-  // iOS doesn't reliably pass notification.data — fall back to tag
-  const tag = event.notification.tag;
-  const notificationId = event.notification.data?.notification_id
-    || (tag && tag !== 'lucidos-notification' ? tag : null);
+  const notificationId = resolveNotificationId(event.notification);
   const appId = event.notification.data?.app_id || null;
-  const threadId = event.notification.data?.thread_id || null;
 
   event.waitUntil((async () => {
     // POST to backend — most reliable cross-platform mechanism.
@@ -111,13 +131,12 @@ self.addEventListener('notificationclick', (event) => {
 
       // postMessage for instant delivery when page is active (Chrome).
       // No navigate() — it causes page reload and Chrome's "site updated" toast.
-      if (notificationId || threadId) {
+      if (notificationId) {
         try {
           (focused || appClient).postMessage({
             type: 'open-notification',
             id: notificationId,
             app_id: appId,
-            thread_id: threadId,
           });
         } catch {}
       }
@@ -129,7 +148,6 @@ self.addEventListener('notificationclick', (event) => {
     const params = new URLSearchParams();
     if (notificationId) params.set('notification', notificationId);
     if (appId) params.set('app', appId);
-    if (threadId) params.set('thread', threadId);
     const qs = params.toString();
     const targetUrl = qs ? `${base}/?${qs}` : `${base}/`;
     return clients.openWindow(targetUrl);

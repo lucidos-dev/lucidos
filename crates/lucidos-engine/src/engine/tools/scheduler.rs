@@ -122,15 +122,15 @@ impl LucidosEngine {
                 let run: TriggerRun = match args.get("run") {
                     Some(run_val) if !run_val.is_null() => {
                         serde_json::from_value(run_val.clone())
-                            .map_err(|e| format!("Invalid 'run' field: {}. Expected {{ type: 'intent', text: '...', knowhow: [] }} or {{ type: 'script', path: '...' }}", e))?
+                            .map_err(|e| format!("Invalid 'run' field: {}. Expected {{ type: 'intent', intent: '...', knowhow: [] }} or {{ type: 'script', path: '...' }}", e))?
                     }
                     _ => {
                         // Backward compat: accept prompt_text as a shorthand
                         let prompt_text = args.get("prompt_text").and_then(|v| v.as_str()).unwrap_or("");
                         if prompt_text.is_empty() {
-                            return Ok("Error: 'run' is required. Use { type: 'intent', text: '...', knowhow: [] } or { type: 'script', path: '...' }".to_string());
+                            return Ok("Error: 'run' is required. Use { type: 'intent', intent: '...', knowhow: [] } or { type: 'script', path: '...' }".to_string());
                         }
-                        TriggerRun::Intent { text: prompt_text.to_string(), knowhow: vec![] }
+                        TriggerRun::Intent { intent: prompt_text.to_string(), knowhow: vec![] }
                     }
                 };
 
@@ -156,6 +156,23 @@ impl LucidosEngine {
                 if let Some(ref cond) = condition {
                     event_payload["condition"] = cond.clone();
                 }
+                // Owning app dir (e.g. "trigger-workflow"); stamped onto notifications
+                // emitted from this trigger so the popover can deep-link to the app.
+                if let Some(aid) = args
+                    .get("app_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    event_payload["app_id"] = serde_json::json!(aid);
+                }
+                if args
+                    .get("go_to_review")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    event_payload["go_to_review"] = serde_json::json!(true);
+                }
 
                 self.event_bus
                     .emit(BusEvent::System(SystemEvent::TriggerCreated {
@@ -167,9 +184,9 @@ impl LucidosEngine {
 
                 let trigger_desc = trigger_description(&cron_display, on_event.as_deref());
                 let run_desc = match &run {
-                    TriggerRun::Intent { text, .. } => {
-                        let end = text.floor_char_boundary(50);
-                        format!("intent '{}'", &text[..end])
+                    TriggerRun::Intent { intent, .. } => {
+                        let end = intent.floor_char_boundary(50);
+                        format!("intent '{}'", &intent[..end])
                     }
                     TriggerRun::Script { path } => format!("script '{}'", path),
                 };
@@ -196,14 +213,14 @@ impl LucidosEngine {
                             .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                             .unwrap_or_else(|| "never".to_string());
                         let run_info = match &config.run {
-                            TriggerRun::Intent { text, knowhow } => {
+                            TriggerRun::Intent { intent, knowhow } => {
                                 let kh = if knowhow.is_empty() {
                                     String::new()
                                 } else {
                                     format!(" [knowhow: {}]", knowhow.join(", "))
                                 };
-                                let end = text.floor_char_boundary(60);
-                                format!("intent: {}{}", &text[..end], kh)
+                                let end = intent.floor_char_boundary(60);
+                                format!("intent: {}{}", &intent[..end], kh)
                             }
                             TriggerRun::Script { path } => format!("script: {}", path),
                         };
@@ -279,6 +296,19 @@ impl LucidosEngine {
                     None
                 };
                 let new_paused: Option<bool> = args.get("paused").and_then(|v| v.as_bool());
+                // app_id: Some(None) = explicit null = clear; Some(Some(s)) = set; None = absent
+                let new_app_id: Option<Option<String>> = if args.get("app_id").is_some() {
+                    Some(
+                        args["app_id"]
+                            .as_str()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
+                    )
+                } else {
+                    None
+                };
+                let new_go_to_review: Option<bool> =
+                    args.get("go_to_review").and_then(|v| v.as_bool());
 
                 if new_name.is_none()
                     && new_run.is_none()
@@ -286,6 +316,8 @@ impl LucidosEngine {
                     && new_on_event.is_none()
                     && new_condition.is_none()
                     && new_paused.is_none()
+                    && new_app_id.is_none()
+                    && new_go_to_review.is_none()
                 {
                     return Ok(
                         "Error: At least one field besides trigger_id must be provided".to_string(),
@@ -331,6 +363,14 @@ impl LucidosEngine {
                 if let Some(paused) = new_paused {
                     update_payload["paused"] = serde_json::json!(paused);
                     updated_fields.push("paused");
+                }
+                if let Some(ref aid) = new_app_id {
+                    update_payload["app_id"] = serde_json::json!(aid);
+                    updated_fields.push("app_id");
+                }
+                if let Some(v) = new_go_to_review {
+                    update_payload["go_to_review"] = serde_json::json!(v);
+                    updated_fields.push("go_to_review");
                 }
 
                 // Ensure trigger still has at least one firing mechanism

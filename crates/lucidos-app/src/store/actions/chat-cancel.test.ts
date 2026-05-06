@@ -1,12 +1,12 @@
 /**
- * The cancel/interrupt action wrappers must return false on failure so the
- * caller can roll back the optimistic `canceling` UI flag — otherwise iOS PWA
- * users see "Failed to interrupt: Load failed", the stop button vanishes
- * (because `canceling` stayed true), and they can't retry without reloading.
+ * The cancel action wrapper must return false on failure so the caller
+ * (handleCancelExchange) can roll back the optimistic `cancelingThreadIds`
+ * flag — otherwise iOS PWA users see "Failed to cancel: Load failed", the
+ * Cancel button stays disabled, and they can't retry without reloading.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import { cancelCurrentExchange, interruptCurrentExchange } from './chat';
+import { cancelCurrentExchange } from './chat';
 import { focusedThreadId, threadMap } from '../store';
 import type { ThreadMeta, ThreadState } from '../thread-events';
 
@@ -19,10 +19,9 @@ function makeThread(channel: ThreadMeta['channel']): ThreadState {
       title: '',
       channel,
       initiator: 'user',
-      pinned: false,
+      saved: false,
       createdAt: '',
       updatedAt: '',
-      unread: false,
       status: 'idle',
       ccHasChanges: false,
       ccRequiresRestart: false,
@@ -30,9 +29,10 @@ function makeThread(channel: ThreadMeta['channel']): ThreadState {
       ccApplying: false,
       lastRevivedAt: '',
       messageCount: 0,
-      section: 'default',
+      section: 'archived',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
+      state: 'active',
     },
     events: new Map(),
     streamingBuffer: '',
@@ -49,7 +49,7 @@ function setThread(channel: ThreadMeta['channel']) {
   threadMap.value = map;
 }
 
-describe('cancelCurrentExchange / interruptCurrentExchange return value', () => {
+describe('cancelCurrentExchange return value', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -86,33 +86,6 @@ describe('cancelCurrentExchange / interruptCurrentExchange return value', () => 
       .mockRejectedValueOnce(new TypeError('Load failed'))
       .mockResolvedValueOnce(new Response(null, { status: 200 }));
     const ok = await cancelCurrentExchange();
-    expect(ok).toBe(true);
-    expect(mockFetch).toHaveBeenCalledTimes(2);
-  });
-
-  it('interruptCurrentExchange returns true when interrupt API succeeds', async () => {
-    setThread('claude_code');
-    mockFetch.mockResolvedValueOnce(new Response(null, { status: 200 }));
-    const ok = await interruptCurrentExchange();
-    expect(ok).toBe(true);
-  });
-
-  it('interruptCurrentExchange returns false when both retries fail', async () => {
-    setThread('claude_code');
-    mockFetch
-      .mockRejectedValueOnce(new TypeError('Load failed'))
-      .mockRejectedValueOnce(new TypeError('Load failed'));
-    const ok = await interruptCurrentExchange();
-    expect(ok).toBe(false);
-    expect(mockFetch).toHaveBeenCalledTimes(2);
-  });
-
-  it('interruptCurrentExchange returns true when retry succeeds (the iOS PWA case)', async () => {
-    setThread('claude_code');
-    mockFetch
-      .mockRejectedValueOnce(new TypeError('Load failed'))
-      .mockResolvedValueOnce(new Response(null, { status: 200 }));
-    const ok = await interruptCurrentExchange();
     expect(ok).toBe(true);
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });

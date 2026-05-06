@@ -9,7 +9,7 @@ Top-level guidance for Claude Code. Detailed conventions live in `.claude/rules/
 
 ## Workspace Rules
 
-- **Personal workspace** (`~/workspaces/personal`) is the user's live data. NEVER touch it — no restart, rebuild, API request, or process kill. Only exception: user explicitly says "restart the personal workspace" (confirm first). Use `~/workspaces/dev` for development.
+- **Personal workspace** (`~/workspaces/personal`) is the user's live data. **Reads are fine** — `psql` SELECT, file/log reads, GET API calls, doc updates against personal data are all OK and often necessary for debugging. **Mutations are NOT** — never restart, rebuild, kill the engine, write/delete files in the workspace, or send state-changing API requests (POST/PUT/DELETE). Only exception: user explicitly says "restart the personal workspace" (confirm first). Use `~/workspaces/dev` for development.
 - **Confirm before mutating.** State-changing actions require user confirmation unless part of an agreed plan. Read-only (GET, file/log reads, `git status`/`log`/`diff`) is always fine.
 - **Browser**: headed Chrome, window `osascript -e 'tell application "Google Chrome" to set bounds of front window to {3840, 200, 5120, 2357}'`, zoom `document.body.style.zoom = '125%'`. Default workspace ports: read `~/workspaces/dev/.lucidos/ports`, navigate to `https://localhost:$VITE_PORT`.
 
@@ -36,12 +36,12 @@ Multiple CC sessions share the host process namespace, so `pgrep -f "cargo test 
 - **Contract tests are sacred.** If you change `thread_lifecycle.rs`, regenerate: `cargo test -p lucidos-engine generate_typescript_file -- --ignored && cargo test -p lucidos-engine generate_cross_validation_fixture_file -- --ignored`. Never hand-edit `src/generated/`.
 - **Zero warnings, errors, failing tests.** "Pre-existing" is never an excuse — if you see it, you own it.
 - **Test selection by what changed:**
-  - Rust (`.rs`, `Cargo.toml`, `Cargo.lock`, `.sql`) → `cargo check` + `cargo test -p lucidos-engine` (api_e2e tests are `#[ignore]`d — run separately via `./scripts/e2e-api.sh` if you touch HTTP API surface)
+  - Rust (`.rs`, `Cargo.toml`, `Cargo.lock`, `.sql`) → `cargo check` + `cargo test -p lucidos-engine`. If you touched the HTTP API surface, also run `./scripts/e2e-api.sh` (lives in the `lucidos-e2e` crate, runs against a booted e2e workspace).
   - TypeScript (`.ts`, `.tsx`) → `npx tsc --noEmit` + `cd crates/lucidos-app && npm test`
   - CSS-only / docs-only → no tests
   - Mixed Rust + TS → run both
-- **Test locations** — Rust unit: inline `#[cfg(test)]`. TS unit: `*.test.ts` next to source. Browser e2e: `crates/lucidos-app/e2e/*.spec.ts` (`./scripts/e2e-browser.sh`). API e2e: `crates/lucidos-engine/tests/` (`./scripts/e2e-api.sh`). Contract tests: `crates/lucidos-app/src/generated/`. See `testing.md`.
-- **Hardening enforced at Apply time.** CC is asked to run `/harden` + the relevant test suites after implementation; the engine doesn't auto-trigger at idle. If the harden marker is missing when the user clicks Apply, Apply runs `/harden` + tests synchronously then proceeds. Marker existence (Fresh or Stale) means CC has hardened the branch at least once and is trusted — follow-up commits don't re-trigger.
+- **Test locations** — Rust unit: inline `#[cfg(test)]`. TS unit: `*.test.ts` next to source. Browser e2e: `crates/lucidos-app/e2e/*.spec.ts` (`./scripts/e2e-browser.sh`). API e2e: `crates/lucidos-e2e/tests/` (`./scripts/e2e-api.sh`). Contract tests: `crates/lucidos-app/src/generated/`. See `testing.md`.
+- **Hardening enforced at Apply time.** CC MUST run `/harden` after implementation — no exceptions, even for docs-only, CSS-only, or comment-only changes. The skill itself decides what to test (auto-skipping phases when no relevant layers were touched) and iterates from Phase 1 if anything fails. The engine doesn't auto-trigger at idle. If the marker is missing when the user clicks Apply, Apply runs `/harden` synchronously then proceeds — making the user wait. Marker existence (Fresh or Stale) means CC has hardened the branch at least once and is trusted; follow-up commits don't re-trigger.
 - **Ruthless refactoring + DRY + no dead code.** Fix unclear names, dead branches, copy-paste when you touch a file. Delete unused — don't comment out or `_`-prefix.
 - **No provider-specific instructions in code.** Use `web_search` for provider details.
 - **Conventional commits**: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`.
@@ -89,7 +89,7 @@ See `docs/taxonomy.md` for the full content taxonomy. Key points:
 - **Survivability test**: "Does this survive if I delete the app?" → top-level. "Only makes sense for this app?" → inside the app.
 - Never use generic names like `app.md` or `knowhow.md` — name by what they describe.
 - **Manifest** = user-facing UI. **Knowhow / intents** = engine-facing LLM context.
-- **Triggers — keep procedure out of intent.** A trigger's `run.text` is the intent — a sentence the user would say ("notify me when X happens"). Every imperative verb about *how* (hit, parse, scan, fall back, retry, emit) belongs in a knowhow file, referenced by ID in `run.knowhow: [...]`. The HTTP API takes one big text field and won't stop you from dumping the recipe in — that's the trap. See `docs/taxonomy.md` § Triggers for the worked example.
+- **Triggers — keep procedure out of intent.** A trigger's `run.intent` is what the user would say ("notify me when X happens"). Every imperative verb about *how* (hit, parse, scan, fall back, retry, emit) belongs in a knowhow file, referenced by ID in `run.knowhow: [...]`. The HTTP API takes one big string and won't stop you from dumping the recipe in — that's the trap. See `docs/taxonomy.md` § Triggers for the worked example.
 
 ## One-Click Install
 
@@ -98,3 +98,24 @@ Self-contained desktop app — no terminal, Docker, or dev tools required (macOS
 ## Maintaining This File
 
 When a new convention or architectural decision is established, update this file or the appropriate `.claude/rules/` file in the same session.
+
+## Maintaining workspace-audit
+
+`system-knowhow/workspace-audit.md` is the recipe Lucidos uses to audit a workspace for drift against current conventions. It deliberately **references** the other system-knowhow files instead of restating their rules — so when you change one of those files, the audit may need to follow.
+
+If your change touches `system-knowhow/best-practices.md`, `system-knowhow/js-sdk.md`, `system-knowhow/lucidos-cli.md`, `system-knowhow/cross-workspace-threads.md`, `system-knowhow/intent-registry.md`, `docs/taxonomy.md`, or the engine system prompt's taxonomy / trigger section, open `system-knowhow/workspace-audit.md` and check that:
+
+- The reference table still names the right files and what they own.
+- Any check that names a section heading or filename in those sources still resolves.
+- New rules warrant a new check (or expansion of an existing check).
+- Removed / renamed rules don't leave dangling checks.
+
+## Maintaining workspace-learning
+
+`system-knowhow/workspace-learning.md` is the sibling recipe that looks at runtime *events* and proposes improvements to the workspace's apps, triggers, knowhow, and scripts. Where audit checks compliance against today's rules, learning surfaces the cases where today's rules might be wrong. Both produce a report under `data/artifacts/` and emit a completion event; neither edits anything.
+
+The learning recipe queries event types by name. If you rename, retire, or add an event type that signals friction (failures, aborts, circuit-breaker trips, trigger errors, repeated user corrections), open `system-knowhow/workspace-learning.md` and check that:
+
+- The event names listed under "What to walk" still exist and still mean the same thing.
+- New friction signals warrant a new pattern category.
+- The completion event name (`WorkspaceLearningCompleted`) still matches what the recipe emits.

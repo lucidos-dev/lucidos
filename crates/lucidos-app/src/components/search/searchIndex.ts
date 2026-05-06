@@ -3,7 +3,7 @@ import type { SearchResultItem } from '../../api/client';
 
 type Subview = Exclude<SettingsSubview, 'main'>;
 
-export interface SettingsSearchEntry {
+interface SettingsSearchEntry {
   /** Unique result id; also used as the recents key. */
   id: string;
   /** Label as it appears in the UI — single source of truth (no Rust ↔ UI drift). */
@@ -22,7 +22,7 @@ export interface SettingsSearchEntry {
  *
  * Keep this list in sync with the labels rendered in SettingsView.tsx and BackupSection.tsx.
  */
-export const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
+const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Top-level subviews
   { id: 'models', label: 'Models', subview: 'models', path: 'Settings' },
   { id: 'appearance', label: 'Appearance', subview: 'appearance', path: 'Settings' },
