@@ -121,7 +121,7 @@ describe('actorInitiator (mode-driven)', () => {
   });
   it('api with mode=agent → Lucidos Agent', () => {
     expect(actorInitiator({ kind: 'api', mode: 'agent' }))
-      .toEqual({ icon: '🤖', label: 'Lucidos Agent' });
+      .toEqual({ icon: '✨', label: 'Lucidos Agent' });
   });
   it('api with mode=engine → Lucidos Engine', () => {
     expect(actorInitiator({ kind: 'api', mode: 'engine' }))
@@ -133,7 +133,7 @@ describe('actorInitiator (mode-driven)', () => {
   });
   it('workspace with mode=agent → Lucidos Agent', () => {
     expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'agent' }))
-      .toEqual({ icon: '🤖', label: 'Lucidos Agent' });
+      .toEqual({ icon: '✨', label: 'Lucidos Agent' });
   });
   it('workspace with mode=engine → Lucidos Engine', () => {
     expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'engine' }))
@@ -141,7 +141,7 @@ describe('actorInitiator (mode-driven)', () => {
   });
   it('parent_thread (default mode=agent) → Lucidos Agent', () => {
     expect(actorInitiator({ kind: 'thread_link', thread_id: 't' }))
-      .toEqual({ icon: '🤖', label: 'Lucidos Agent' });
+      .toEqual({ icon: '✨', label: 'Lucidos Agent' });
   });
   it('parent_thread with mode=engine → Lucidos Engine', () => {
     expect(actorInitiator({ kind: 'thread_link', thread_id: 't', mode: 'engine' }))

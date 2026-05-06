@@ -69,12 +69,20 @@ export function blurPromptInputIfFocused(): void {
  *  `.action-btn` tap. Idempotent — safe to call from module init. Action
  *  buttons (Send / Discard draft / Apply / Archive / Cancel / Discard / Diff
  *  / Continue / Revert) never want the mobile keyboard to remain up or to
- *  surface via implicit focus retention. */
+ *  surface via implicit focus retention.
+ *
+ *  Listen on `click` (bubble phase) — NOT `pointerdown`. Blurring on
+ *  pointerdown triggers iOS Safari's animated keyboard dismissal mid-tap;
+ *  the visual viewport shifts and the button moves out from under the
+ *  finger before the synthesized click can dispatch, dropping the click
+ *  entirely. The user then has to tap a second time to actually trigger
+ *  the action. Listening on click lets the button's own handler dispatch
+ *  first — the keyboard dismisses cleanly afterward. */
 let actionBtnBlurInstalled = false;
 export function installActionBtnBlurListener(): void {
   if (actionBtnBlurInstalled) return;
   actionBtnBlurInstalled = true;
-  document.addEventListener('pointerdown', (e) => {
+  document.addEventListener('click', (e) => {
     const target = e.target as HTMLElement | null;
     if (!target?.closest('.action-btn')) return;
     blurPromptInputIfFocused();

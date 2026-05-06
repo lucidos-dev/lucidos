@@ -1,16 +1,10 @@
 # Changelog
 
-## v0.9.2 — 2026-05-06
-
-### Added
-- **Plugin install setup hints**: `install_plugin` now surfaces optional `setup` text from the plugin manifest, so users see post-install instructions inline.
-- **Diff split-view single-step nav**: Clicking files in the diff split-view records a single history entry instead of stacking one per click.
+## v0.9.3 — 2026-05-06
 
 ### Fixed
-- **Repo selector for new CC threads**: The repo dropdown was silently ignored for new CC sessions — they always landed on the default Lucidos repo. Drafts and freshly composed threads now correctly bind the selected repo at compose-promotion time.
-
-### Docs
-- README mentions direct API calls as an alternative to scheduled syncs.
+- Lucidos Agent icon: swapped 🤖 robot for ✨ sparkles in initiator and executor chips
+- Mobile send: action button now blurs on click instead of pointerdown, so the keyboard no longer eats the tap
 ## v0.7.1 — 2026-04-27
 
 ### Highlights

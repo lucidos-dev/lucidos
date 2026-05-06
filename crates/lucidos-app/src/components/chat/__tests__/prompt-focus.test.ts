@@ -246,7 +246,29 @@ describe('blurPromptInputIfFocused', () => {
 });
 
 describe('installActionBtnBlurListener', () => {
-  it('blurs prompt on .action-btn pointerdown, ignores other targets', async () => {
+  // Listening on `pointerdown` triggers iOS Safari's animated keyboard
+  // dismissal before the synthesized click fires — the layout shift moves
+  // the button up and the click can be dropped, so the user has to tap
+  // a second time. The listener must run on `click` so the button's own
+  // handler dispatches first and the keyboard dismisses cleanly afterward.
+  it('registers on click (not pointerdown) so the click dispatches before keyboard dismissal', async () => {
+    vi.resetModules();
+    const { installActionBtnBlurListener: install } = await import('../promptFocus');
+
+    const registered: string[] = [];
+    (globalThis as any).document = {
+      ...document,
+      activeElement: null,
+      addEventListener: vi.fn((evt: string) => { registered.push(evt); }),
+    };
+
+    install();
+
+    expect(registered).toContain('click');
+    expect(registered).not.toContain('pointerdown');
+  });
+
+  it('blurs prompt on .action-btn click, ignores other targets', async () => {
     // Re-import a fresh module so the module-scoped install flag is reset —
     // this test exercises the install plumbing, not just the captured closure.
     vi.resetModules();
@@ -258,7 +280,7 @@ describe('installActionBtnBlurListener', () => {
       ...document,
       activeElement: promptEl,
       addEventListener: vi.fn((evt: string, handler: (e: any) => void) => {
-        if (evt === 'pointerdown') captured = handler;
+        if (evt === 'click') captured = handler;
       }),
     };
 

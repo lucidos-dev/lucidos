@@ -64,7 +64,7 @@ export const LUCIDOS_AGENT_LABEL = 'Lucidos Agent';
 /** Icon paired with `LUCIDOS_AGENT_LABEL` — used by both the initiator chip
  *  (who started the work) and the executor chip (who produced the response).
  *  Single source so the two panels stay in sync. */
-export const LUCIDOS_AGENT_ICON = '🤖';
+export const LUCIDOS_AGENT_ICON = '✨';
 
 /** Derive the ActorMode from a MessageOrigin. Mirrors the Rust
  *  `MessageOrigin::mode()` impl: device is intrinsic Human, engine and system
