@@ -1,5 +1,74 @@
 # Changelog
 
+## v0.9.0 — 2026-05-06
+
+### Added — Plugins
+- **Plugin system v1** — install / update / uninstall workspace bundles (apps, knowhow, triggers, scripts) from GitHub tree URLs, plain git URLs, or local `.lucidos-plugin` archives
+- Manifest schema, semver-aware updates, conflict detection on overwrite
+- v1 guide-only uninstall (emits PluginUninstalled, lists files, no auto-delete)
+- `browser-learning` shipped as the first reference plugin
+- Authoring docs: `system-knowhow/building-a-plugin`
+- Event triggers can ship in plugins; cron triggers cannot (install-time UX guidance)
+
+### Added — Section reorganization & navigation
+- Restructured panels: Files / Apps / Triggers / Settings / Changes / Notifications
+- Dedicated **pending Changes** panel with per-change apply/discard + Review routing
+- **Drafts** section in thread drawer; drafts in back/forward stack; nav restores cursor entry
+- Browser-style back/forward navigation in panel header
+- `cognos.navigate()` API for app iframe navigation; `'thread'` as a nav target
+- File search modal in Files panel (with keyboard nav)
+- `.slides` file preview in file preview panel
+- `t` shortcut toggles threads panel; Cmd+↑ dismisses UI scale panel
+- Edge swipe zones for pane navigation over iframes
+- Arrow-key nav in thread drawer and CC Commands dropdown
+- Grid icon to jump to ContentPane from mobile thread view
+- Connect Account card in OAuth section of Accounts settings
+- Aborted banner panel; DisplaySection::Waiting for threads with active children
+- Diff button on WaitingBanner for quick change preview
+- Header divider; CognOS brand merged into panel title when collapsed
+- Code review gate for worktree-to-main merges
+
+### Added — Engine / runtime
+- **Generic API proxy** for HTTPS-iframe apps (auth + path-traversal hardening) — now the preferred way to call external APIs
+- **Gzip-compressed SSE event stream** (honors `q=0` in Accept-Encoding)
+- **ThreadAggregate snapshots** on persisted thread events; frontend consumes from SSE with lookup fallback
+- Mid-flight injection split into separate exchange at UPI boundary
+- CC compose-view skills scoped to selected repo
+- Toasts get close X; robot icon for Lucidos Agent
+
+### Changed
+- Trigger fire prompt split into system addendum + user header (cache prefix sharing)
+- Fanout: parent-update consolidated into one round-trip
+- SSE encoder: no per-event String allocations
+- MAX_FACTS cap dropped 60 → 25
+- README rewrites: companion framing, intent + automation, no-build-step, autonomy clause
+- Knowhow: API proxy as preferred external-API path; lucidos CLI output streams (`--include` is stdout, `--fail` to stderr)
+- `building-a-trigger` knowhow: always confirm review-vs-history surface
+
+### Fixed
+- **Archive**: only cancel live CC subprocess; wait for cancel-fallout terminal event before ThreadArchived; double-click bug; ResponseCanceled's ThreadMarkedUnread side effect
+- **Compose**: pendingComposePuts lifecycle; focus/nav release on peer ThreadDiscarded; in-flight keystrokes preserved across loadAllThreads; whitespace-only treated as empty; mark-pending at schedule time; cursor preserved on same-thread re-syncs; suppress SSE clear when MessageReceived/ThreadDiscarded came from this device
+- **Chat**: Continued-below panel hidden for empty/Thinking-only events and 'interrupted' status; lazy-fetch Change for old applied IDs; ChangeBody loading state; clearer unsave dialog copy; widened Saved button; trailing thread metadata no longer flips absorbed-UPI to 'aborted'
+- **Prompt**: iOS PWA photo picker selection attaches to draft; restored 0.7.2 file input pattern; hidden file input wrapped in `<label>`; visually-hidden shared class; action buttons no longer raise mobile keyboard; restore composeHandlers on wide-path photo button
+- **CC**: route tool result via tool_use_id; suppress SessionRecovered for answered_after_idle; don't treat error result as stale resume; ResponseFailed on mid-stream API error
+- **Engine / orchestrator**: emit Aborted (not Canceled) on stuck-thread eviction; preserve tool-call memory across parent-callback resumes; stale-resume guard requires `cc_error.is_none()`; event-bus decrements parent active_children_count when CC child canceled/aborted; harden propagates initiator parse error
+- **Memory**: artifact-indexing gaps closed; opt-in re-extract for stale entries
+- **Backup**: exclude `data/postgres.*/` archives from tar; clear backupProgress on SSE reconnect
+- **Theme**: drop matchMedia 'change' listener (iOS PWA flash root cause)
+- **Diff**: filter all engine-injected paths from user-facing diffs
+- **`edit_file`**: support quoted keys + JSONPath root in `json_path`
+- **Apps**: don't auto-open when files are touched
+- **Drafts**: never render composing rows with no text and no images
+- **Thread-nav**: Back from compose mode restores cursor entry; clear nav entry when startCompose POST fails
+- **Thread-title**: ellipsis when truncating preview at 40 chars
+- **Repo**: always flash loading in loadRepoFiles
+- **Exchange-status**: empty non-last chat exchange reads as 'done'
+- **e2e**: kill orphan iOS Simulator before runs; gate VM pkill on CoreSimulatorService
+- Project-wide harden pass
+
+### Removed
+- `ThreadMarkedRead` / `ThreadMarkedUnread` events + unread field
+- `docs/issues.md` (migrated to workspace tracker)
 ## v0.7.2 — 2026-05-04
 
 Bugfixes.
