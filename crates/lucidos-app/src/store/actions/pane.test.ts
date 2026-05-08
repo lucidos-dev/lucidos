@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mobileView, threadDrawerOpen, MOBILE_VIEWS, PANE_INDEX, type MobileView } from '../store';
+import { mobileView, threadDrawerOpen, MOBILE_VIEWS, PANE_INDEX, setMobileView, getInitialMobileView, type MobileView } from '../store';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { navigateToPane, checkPaneConsistency, toggleThreads } from './pane';
 
@@ -178,6 +178,46 @@ describe('toggleThreads', () => {
     threadDrawerOpen.value = true;
     toggleThreads();
     expect(threadDrawerOpen.value).toBe(false);
+  });
+});
+
+// iOS PWA cold-start: when iOS kills the PWA after the user opened an app and
+// never swiped back, the next launch must land on the thread pane — sessionStorage
+// dies with the process, and any pre-fix localStorage value must not leak in.
+describe('mobileView session-only persistence', () => {
+  beforeEach(() => {
+    sessionStorage.removeItem('lucidos-mobile-view');
+    localStorage.removeItem('lucidos-mobile-view');
+    resetState();
+  });
+
+  it('cold start with stale localStorage="content" still defaults to thread', () => {
+    // Simulate the bug scenario: an old build wrote `content` to localStorage,
+    // sessionStorage is empty (process was killed). The user must land on thread.
+    localStorage.setItem('lucidos-mobile-view', 'content');
+    expect(getInitialMobileView()).toBe('thread');
+  });
+
+  it('defaults to thread when sessionStorage is empty', () => {
+    expect(getInitialMobileView()).toBe('thread');
+  });
+
+  it('falls back to thread for an invalid sessionStorage value', () => {
+    sessionStorage.setItem('lucidos-mobile-view', 'bogus');
+    expect(getInitialMobileView()).toBe('thread');
+  });
+
+  it('round-trips through sessionStorage', () => {
+    for (const view of MOBILE_VIEWS) {
+      sessionStorage.setItem('lucidos-mobile-view', view);
+      expect(getInitialMobileView()).toBe(view);
+    }
+  });
+
+  it('setMobileView writes to sessionStorage, not localStorage', () => {
+    setMobileView('content');
+    expect(sessionStorage.getItem('lucidos-mobile-view')).toBe('content');
+    expect(localStorage.getItem('lucidos-mobile-view')).toBeNull();
   });
 });
 

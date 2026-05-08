@@ -70,6 +70,22 @@ impl EventStore {
                         trimmed,
                     });
                 }
+                "ContextTokensMeasured" => {
+                    if let Some(input_tokens) = event
+                        .payload
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                    {
+                        if let Some(step) = current_steps
+                            .iter_mut()
+                            .rev()
+                            .find(|s| s.description == "Requesting")
+                        {
+                            step.context_tokens = Some(input_tokens);
+                        }
+                    }
+                }
                 "MemorySearched" => {
                     let has_results = event
                         .payload

@@ -382,8 +382,13 @@ pub enum ThreadEvent {
     // Chat
     MessageReceived {
         text: String,
+        /// Content-addressed sha256 hashes of user-attached image blobs.
+        /// Bytes live exactly once under `data/blobs/<hh>/<hash>.<ext>`;
+        /// the LLM call resolves hashes to bytes at send time. Old DB rows
+        /// migrate from `images: [{base64, mime_type}, ...]` via the
+        /// startup migration in `core::image_migration`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        images: Vec<Value>,
+        user_image_hashes: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,6 +435,12 @@ pub enum ThreadEvent {
         context_messages: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trimmed: Option<bool>,
+    },
+    /// Real prompt-token count from the LLM provider's `usage`. Emitted after
+    /// the response arrives — overrides the chars/4 estimate carried by the
+    /// preceding `Thinking` event so the UI shows the true cost.
+    ContextTokensMeasured {
+        input_tokens: u32,
     },
     MemorySearched {
         #[serde(default)]
@@ -661,6 +672,22 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A user attached an image to this thread's compose draft. Emitted by
+    /// POST /api/v1/threads/:id/blobs after the bytes are content-addressed
+    /// to disk under `data/blobs/<hh>/<hash>.<ext>`. The `hash` is the sole
+    /// identity used by every downstream consumer (compose payload, message
+    /// payload, LLM call); `mime` and `byte_size` are convenience fields so
+    /// SSE subscribers can render the upload entry without fetching the
+    /// blob. Same blob attached to two threads = two events, one per thread
+    /// (the disk write is a no-op the second time, but the per-thread fact
+    /// stays distinct).
+    ImageUploaded {
+        hash: String,
+        mime: String,
+        byte_size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     TriggerStarted {
         #[serde(alias = "task_id")]
         trigger_id: String,
@@ -734,6 +761,15 @@ pub enum ThreadEvent {
         /// Per-commit emits stamp this; aggregate recovery emits leave it false.
         #[serde(default, skip_serializing_if = "is_false")]
         hardened: bool,
+        /// `true` when the proposing CC turn ended in `ResponseFailed`
+        /// (mid-stream API drop, panic) — the worktree contents are whatever
+        /// CC happened to dirty before the failure, not a deliberate
+        /// completion. The frontend reads this to confirm before Apply so
+        /// the user knows they're landing partial work. Per-commit emits
+        /// always stamp `false` (the failure determination only happens at
+        /// the aggregate emit fired after the terminal event).
+        #[serde(default, skip_serializing_if = "is_false")]
+        incomplete: bool,
         // Legacy fields — kept for backward compat with old DB rows
         #[serde(default, skip_serializing_if = "is_empty_str")]
         path: String,
@@ -1030,6 +1066,7 @@ impl ThreadEvent {
             Self::MessageReceived { .. } => "MessageReceived",
             Self::TextStreamed { .. } => "TextStreamed",
             Self::Thinking { .. } => "Thinking",
+            Self::ContextTokensMeasured { .. } => "ContextTokensMeasured",
             Self::MemorySearched { .. } => "MemorySearched",
             Self::ToolCalled { .. } => "ToolCalled",
             Self::ToolResult { .. } => "ToolResult",
@@ -1055,6 +1092,7 @@ impl ThreadEvent {
             Self::ThreadArchived => "ThreadArchived",
             Self::ThreadStarted { .. } => "ThreadStarted",
             Self::ThreadDiscarded { .. } => "ThreadDiscarded",
+            Self::ImageUploaded { .. } => "ImageUploaded",
             Self::TriggerStarted { .. } => "TriggerStarted",
             Self::TriggerCompleted { .. } => "TriggerCompleted",
             Self::ChangeProposed { .. } => "ChangeProposed",
@@ -1398,7 +1436,7 @@ mod tests {
             (
                 ThreadEvent::MessageReceived {
                     text: "hi".into(),
-                    images: vec![],
+                    user_image_hashes: vec![],
                     device_id: None,
                     device: None,
                     image_description: None,
@@ -1592,6 +1630,7 @@ mod tests {
                     branch_name: String::new(),
                     repo_root: String::new(),
                     hardened: false,
+                    incomplete: false,
                     path: String::new(),
                     diff: String::new(),
                 },
@@ -2003,10 +2042,10 @@ mod tests {
     }
 
     #[test]
-    fn message_received_with_images() {
+    fn message_received_with_image_hashes() {
         let event = ThreadEvent::MessageReceived {
             text: "look at this".into(),
-            images: vec![json!({"base64": "abc", "mime_type": "image/png"})],
+            user_image_hashes: vec!["abcd1234".into(), "ef567890".into()],
             device_id: Some("phone-1".into()),
             device: Some("Test iPhone".into()),
             image_description: Some("a cat".into()),
@@ -2019,7 +2058,13 @@ mod tests {
         };
         let payload = event.to_payload(&EventMeta::NONE);
         assert_eq!(payload["text"], "look at this");
-        assert_eq!(payload["images"][0]["base64"], "abc");
+        // Hashes are stored as a flat string array — no inline base64 anywhere.
+        assert_eq!(payload["user_image_hashes"][0], "abcd1234");
+        assert_eq!(payload["user_image_hashes"][1], "ef567890");
+        assert!(
+            payload.get("images").is_none(),
+            "legacy `images` field must not appear in the new shape"
+        );
         assert_eq!(payload["device_id"], "phone-1");
         assert_eq!(payload["image_description"], "a cat");
     }
@@ -2028,7 +2073,7 @@ mod tests {
     fn message_received_without_optional_fields() {
         let event = ThreadEvent::MessageReceived {
             text: "hello".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -2043,8 +2088,8 @@ mod tests {
         assert_eq!(payload["text"], "hello");
         // Optional fields should be absent
         assert!(
-            payload.get("images").is_none(),
-            "empty images should be skipped"
+            payload.get("user_image_hashes").is_none(),
+            "empty user_image_hashes should be skipped"
         );
         assert!(
             payload.get("device_id").is_none(),
@@ -2122,6 +2167,7 @@ mod tests {
             branch_name: String::new(),
             repo_root: String::new(),
             hardened: false,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         };
@@ -2129,9 +2175,16 @@ mod tests {
         assert_eq!(payload["change_id"], "c-1");
         assert_eq!(payload["description"], "Fix the bug");
         assert_eq!(payload["requires_restart"], true);
-        // Legacy fields should be absent (empty → skipped)
+        // Legacy fields should be absent (empty → skipped); `incomplete: false`
+        // is the default and must also be skipped so legacy DB rows decode
+        // without a wire-shape diff.
         assert!(payload.get("path").is_none());
         assert!(payload.get("diff").is_none());
+        assert!(
+            payload.get("incomplete").is_none(),
+            "incomplete=false (the common case) must skip serialization to keep \
+             new event payloads byte-compatible with pre-field DB rows"
+        );
     }
 
     #[test]
@@ -2212,7 +2265,7 @@ mod tests {
     fn indexable_text_returns_content_for_chat_events() {
         let msg = ThreadEvent::MessageReceived {
             text: "hello".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -2519,6 +2572,7 @@ mod tests {
             branch_name: String::new(),
             repo_root: String::new(),
             hardened: false,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         };
@@ -2556,6 +2610,7 @@ mod tests {
             branch_name: String::new(),
             repo_root: String::new(),
             hardened: false,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         };
@@ -2662,5 +2717,57 @@ mod tests {
             ThreadEvent::MessageReceived { mode, .. } => assert_eq!(mode, ActorMode::Human),
             other => panic!("expected MessageReceived, got {:?}", other),
         }
+    }
+
+    /// ImageUploaded is a per-thread audit fact emitted by POST /threads/:id/blobs.
+    /// The hash uniquely identifies the blob bytes (sha256 hex, 64 chars). The
+    /// mime + byte_size are convenience fields so consumers can render the
+    /// upload entry without a HEAD on the blob endpoint. Past-tense, persisted.
+    #[test]
+    fn image_uploaded_serializes_with_all_fields() {
+        let event = ThreadEvent::ImageUploaded {
+            hash: "a".repeat(64),
+            mime: "image/png".to_string(),
+            byte_size: 4096,
+            actor: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "ImageUploaded");
+        assert_eq!(json["hash"], "a".repeat(64));
+        assert_eq!(json["mime"], "image/png");
+        assert_eq!(json["byte_size"], 4096);
+        // actor: None must skip-serialize so the wire shape matches the
+        // pattern used by ThreadStarted / ThreadDiscarded — frontend treats
+        // missing actor as "unknown", not as a literal null.
+        assert!(json.get("actor").is_none());
+    }
+
+    /// ImageUploaded is reported by `event_type()` so the projection / SSE
+    /// dispatcher can route by name without matching on the variant. The
+    /// name must match the PascalCase variant exactly (used in JSONB queries).
+    #[test]
+    fn image_uploaded_event_type_is_pascal_case_name() {
+        let event = ThreadEvent::ImageUploaded {
+            hash: "b".repeat(64),
+            mime: "image/jpeg".to_string(),
+            byte_size: 1,
+            actor: None,
+        };
+        assert_eq!(event.event_type(), "ImageUploaded");
+    }
+
+    /// ImageUploaded is past-tense and represents a durable fact (the user
+    /// attached this image). `is_persisted()` must agree so the EventBus
+    /// writes a row to the events table — without persistence the audit
+    /// trail and migration story collapse.
+    #[test]
+    fn image_uploaded_is_persisted() {
+        let event = ThreadEvent::ImageUploaded {
+            hash: "c".repeat(64),
+            mime: "image/webp".to_string(),
+            byte_size: 1,
+            actor: None,
+        };
+        assert!(event.is_persisted());
     }
 }

@@ -1,8 +1,35 @@
 use super::super::LucidosEngine;
+use crate::core::knowhow::{format_missing_knowhow_message, missing_knowhow_ids};
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::llm::tool_names as tn;
 use crate::triggers::TriggerRun;
 use std::str::FromStr;
+
+/// Same shape as the HTTP layer's check — see [`crate::api::triggers`].
+/// Returns an LLM-facing error string when any knowhow id is missing so the
+/// model gets feedback on the same turn instead of silently shipping a
+/// trigger that won't load its knowhow at fire time.
+fn validate_intent_knowhow_for_tool(engine: &LucidosEngine, run: &TriggerRun) -> Option<String> {
+    let TriggerRun::Intent { knowhow, .. } = run else {
+        return None;
+    };
+    if knowhow.is_empty() {
+        return None;
+    }
+    let missing = missing_knowhow_ids(
+        &engine.knowhow_dirs(),
+        engine.system_knowhow_dir(),
+        knowhow,
+    );
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Error: {} Use list_files or read_file to find the right id.",
+            format_missing_knowhow_message(&missing)
+        ))
+    }
+}
 
 /// Hard guard: scheduling tools (`create_trigger`, `update_trigger`,
 /// `delete_trigger`, `pause_trigger`, `resume_trigger`) called from inside a
@@ -134,6 +161,10 @@ impl LucidosEngine {
                     }
                 };
 
+                if let Some(err) = validate_intent_knowhow_for_tool(self, &run) {
+                    return Ok(err);
+                }
+
                 // Check if timezone is set - required for triggers
                 let tz_val = self.user_timezone.read().await.clone();
                 if tz_val.is_empty() {
@@ -264,6 +295,11 @@ impl LucidosEngine {
                         .map_err(|e| format!("Invalid 'run' field: {}. Expected {{ type: 'intent', text: '...', knowhow: [] }} or {{ type: 'script', path: '...' }}", e))?),
                     None => None,
                 };
+                if let Some(ref run) = new_run {
+                    if let Some(err) = validate_intent_knowhow_for_tool(self, run) {
+                        return Ok(err);
+                    }
+                }
                 // Parse on_event once — reused for payload and validation
                 let new_on_event: Option<Option<String>> = if args.get("on_event").is_some() {
                     Some(

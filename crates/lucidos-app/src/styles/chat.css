@@ -84,9 +84,6 @@
 }
 
 .url-context-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.375rem;
     padding: 0.25rem 0.625rem;
     margin-bottom: 0.375rem;
     background: color-mix(in srgb, var(--accent) 15%, transparent);
@@ -94,8 +91,11 @@
     border-radius: 1rem;
     font-size: 0.75rem;
     color: var(--text-secondary);
-    max-width: 100%;
     cursor: default;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    max-width: 100%;
 }
 .url-context-pill svg {
     flex-shrink: 0;
@@ -139,8 +139,8 @@
     width: 1.5rem;
     height: 1.5rem;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.15);
-    border: 1px solid rgba(255, 255, 255, 0.25);
+    background: rgba(0, 0, 0, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.5);
     color: #fff;
     padding: 0;
     cursor: pointer;
@@ -224,6 +224,10 @@
     display: flex;
     align-items: center;
     padding: 0 0.75rem 0.25rem 0.5rem;
+    /* Anchor for absolutely-positioned fade-out children. The row width is
+     * stable across cluster reflows, unlike .prompt-actions-right (which has
+     * margin-left:auto and shifts when its leftmost child leaves flow). */
+    position: relative;
 }
 
 .image-attach-anchor {
@@ -852,15 +856,22 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     background: color-mix(in srgb, var(--initiator-agent) 4%, var(--bg-secondary));
 }
 
-.initiator-header-clickable {
+/* Shared with .response-header-clickable below — both are panel headers that
+   collapse the panel when clicked. Hover-out is delayed so brief cursor exits
+   caused by the collapse-driven layout shift don't flash the base color back
+   in before the cursor re-enters. */
+.initiator-header-clickable,
+.response-header-clickable {
     cursor: pointer;
     user-select: none;
-    transition: background var(--duration-fast) ease;
+    transition: background var(--duration-normal) ease 80ms;
 }
 
 @media (hover: hover) {
-    .initiator-header-clickable:hover {
+    .initiator-header-clickable:hover,
+    .response-header-clickable:hover {
         background: color-mix(in srgb, var(--bg-secondary) 85%, var(--accent));
+        transition-delay: 0s;
     }
 }
 
@@ -962,18 +973,6 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     font-size: 0.75rem;
     color: var(--text-secondary);
     flex-wrap: wrap;
-}
-
-.response-header-clickable {
-    cursor: pointer;
-    user-select: none;
-    transition: background var(--duration-fast) ease;
-}
-
-@media (hover: hover) {
-    .response-header-clickable:hover {
-        background: color-mix(in srgb, var(--bg-secondary) 85%, var(--accent));
-    }
 }
 
 .response-executor-icon {
@@ -1599,7 +1598,40 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     margin-left: 0;
 }
 
-/* Fenced code block copy button */
+@media (max-width: 768px) {
+    .copyable-block-multi .copy-btn,
+    .code-block-copy-btn {
+        padding: 0.25rem;
+    }
+
+    .copyable-block-multi .copy-btn svg,
+    .code-block-copy-btn svg {
+        width: var(--icon-size-md);
+        height: var(--icon-size-md);
+    }
+
+    /* Tap-area extender via ::before — same pattern as .action-btn::before
+       in mobile.css. Sibling .copyable-block-multi .copy-btn already has
+       position: absolute, so only .code-block-copy-btn needs the anchor. */
+    .code-block-copy-btn {
+        position: relative;
+    }
+
+    .copyable-block-multi .copy-btn::before,
+    .code-block-copy-btn::before {
+        content: '';
+        position: absolute;
+        inset: -0.375rem -0.25rem;
+    }
+
+    .code-block-wrapper pre {
+        padding-top: 2.25rem;
+    }
+}
+
+/* Fenced code block. Lang label + copy button live in one .code-block-header
+   overlay row — single absolute element rather than two absolute siblings of
+   <pre>, so positioning has one source of truth. */
 .code-block-wrapper {
     position: relative;
 }
@@ -1609,33 +1641,48 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     padding-top: 1.75rem;
 }
 
-.code-block-lang {
+/* Click-through overlay — header itself doesn't intercept taps so the user
+   can still select code under it. The button child re-enables its own. */
+.code-block-header {
     position: absolute;
     top: 0.375rem;
     left: 0.625rem;
+    right: 0.375rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    pointer-events: none;
+    z-index: 2;
+}
+
+.code-block-header > * {
+    pointer-events: auto;
+}
+
+.code-block-lang {
     font-size: 0.6875rem;
     color: var(--text-muted);
     -webkit-user-select: none;
     user-select: none;
     pointer-events: none;
-    z-index: 1;
 }
 
-/* Inherits base styles from .copy-btn — only positioning overrides here */
+/* Load-bearing for code blocks without a language fence: with no lang
+   sibling, the lone button would otherwise sit at flex-start (left). */
 .code-block-copy-btn {
-    position: absolute;
-    top: 0.375rem;
-    right: 0.375rem;
-    margin-left: 0;
+    margin-left: auto;
+}
+
+/* JS-detected, not CSS @media: (hover)/(pointer) media queries are unreliable
+   across iOS Safari standalone, iPadOS with trackpad, and hybrid touch laptops,
+   and width-based queries can't tell a narrow desktop window from a touch
+   device. See main.tsx — body.is-touch is set on touch devices. */
+body:not(.is-touch) .code-block-copy-btn {
     opacity: 0;
-    transition: opacity var(--duration-fast) ease, color var(--duration-fast) ease;
-    z-index: 1;
+    transition: opacity var(--duration-fast) ease;
 }
 
-.code-block-wrapper:hover .code-block-copy-btn {
-    opacity: 1;
-}
-
-.code-block-copy-btn.copy-btn-copied {
+body:not(.is-touch) .code-block-wrapper:hover .code-block-copy-btn,
+body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
     opacity: 1;
 }

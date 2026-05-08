@@ -22,6 +22,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   MessageReceived: 'start',
   TextStreamed: 'activity',
   Thinking: 'activity',
+  ContextTokensMeasured: 'metadata',
   MemorySearched: 'activity',
   ToolCalled: 'activity',
   ToolResult: 'activity',
@@ -47,6 +48,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ThreadArchived: 'terminal',
   ThreadStarted: 'metadata',
   ThreadDiscarded: 'metadata',
+  ImageUploaded: 'metadata',
   TriggerStarted: 'start',
   TriggerCompleted: 'terminal',
   ChangeProposed: 'action_required',
@@ -138,9 +140,11 @@ export function resolveActions(
   status: ThreadStatus,
   storedSection: ArchiveState,
   hasPendingChanges: boolean,
+  isSaved: boolean,
 ): Action[] {
   if (status === 'running' || status === 'waiting_for_user_answer') return [];
   if (hasPendingChanges && threadType === 'claude_code') return ['discard', 'apply'];
+  if (isSaved) return [];
   if (storedSection !== 'inbox') return [];
   return ['archive'];
 }

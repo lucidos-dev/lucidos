@@ -320,6 +320,33 @@ fn parse_result_success_with_subtype_has_no_error() {
     }
 }
 
+/// CC sometimes emits `is_error: true` with `subtype: "success"` and no
+/// `errors[]` (observed when an upstream API drop happens after CC has
+/// streamed an "API Error: Unable to connect" message and decided the
+/// conversation succeeded structurally). The previous parser fell back to the
+/// `subtype` string, surfacing the literal text "success" as the error in
+/// `ResponseFailed.error` — which renders to the user as
+/// `[ERROR] **Error:** success`. Filter "success" out of the subtype fallback
+/// so the user sees something honest instead.
+#[test]
+fn parse_result_is_error_with_success_subtype_does_not_surface_success() {
+    let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"","duration_ms":100}"#;
+    let events = parse_line(line);
+    match &events[0] {
+        AgentEvent::Result { error, .. } => {
+            let err = error
+                .as_deref()
+                .expect("is_error: true must produce Some(error)");
+            assert_ne!(
+                err, "success",
+                "`success` is the no-error sentinel — surfacing it as the failure \
+                 reason renders to the user as `[ERROR] **Error:** success`"
+            );
+        }
+        other => panic!("Expected Result, got {:?}", other),
+    }
+}
+
 #[test]
 fn parse_empty_line() {
     assert!(parse_line("").is_empty());
@@ -617,6 +644,7 @@ fn test_spawn_args<'a>(
         reasoning_effort: None,
         thread_id,
         spawning_event_id: None,
+        repo_name: None,
     }
 }
 
@@ -636,6 +664,27 @@ fn test_spawn_args_with_event<'a>(
         reasoning_effort: None,
         thread_id,
         spawning_event_id,
+        repo_name: None,
+    }
+}
+
+fn test_spawn_args_with_repo<'a>(
+    worktree: &'a Path,
+    workspace: &'a Path,
+    thread_id: uuid::Uuid,
+    repo_name: Option<&'a str>,
+) -> SpawnArgs<'a> {
+    SpawnArgs {
+        worktree_path: worktree,
+        workspace_path: workspace,
+        allowed_tools: None,
+        system_prompt: None,
+        resume_session_id: None,
+        model: None,
+        reasoning_effort: None,
+        thread_id,
+        spawning_event_id: None,
+        repo_name,
     }
 }
 
@@ -667,7 +716,7 @@ fn build_command_sets_lucidos_workspace_env() {
 
 #[test]
 fn build_command_sets_lucidos_event_id_when_spawning_event_id_set() {
-    // The CC subprocess needs `LUCIDOS_EVENT_ID` so the `lucidos send-thread`
+    // The CC subprocess needs `LUCIDOS_EVENT_ID` so the `lucidos spawn-thread`
     // CLI can default `--caller-event-id` for cross-workspace POSTs without
     // the user having to thread the value through every invocation.
     let thread_id = uuid::Uuid::new_v4();
@@ -696,6 +745,40 @@ fn build_command_omits_lucidos_event_id_when_spawning_event_id_none() {
     assert!(
         env.get(std::ffi::OsStr::new("LUCIDOS_EVENT_ID")).is_none(),
         "LUCIDOS_EVENT_ID must be unset when no spawning_event_id"
+    );
+}
+
+#[test]
+fn build_command_sets_lucidos_repo_when_repo_name_set() {
+    // The CC subprocess needs `LUCIDOS_REPO` so the `lucidos spawn-thread`
+    // CLI defaults `--repo` to the calling thread's repo, keeping CC
+    // sidequests in the same repo as their caller in workspaces hosting
+    // worktrees from multiple repos.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let cmd = build_command(
+        &test_spawn_args_with_repo(p, p, thread_id, Some("user-acquisition")),
+        None,
+    );
+    let env = collect_envs(&cmd);
+    let value = env
+        .get(std::ffi::OsStr::new("LUCIDOS_REPO"))
+        .expect("LUCIDOS_REPO must be set when repo_name is provided");
+    assert_eq!(value, std::ffi::OsStr::new("user-acquisition"));
+}
+
+#[test]
+fn build_command_omits_lucidos_repo_when_repo_name_none() {
+    // Engine-internal spawns that don't know their repo (very early startup)
+    // must leave the env var unset so the CLI falls back to the workspace
+    // default repo rather than stamping a stale or fabricated name.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let cmd = build_command(&test_spawn_args_with_repo(p, p, thread_id, None), None);
+    let env = collect_envs(&cmd);
+    assert!(
+        env.get(std::ffi::OsStr::new("LUCIDOS_REPO")).is_none(),
+        "LUCIDOS_REPO must be unset when no repo_name"
     );
 }
 

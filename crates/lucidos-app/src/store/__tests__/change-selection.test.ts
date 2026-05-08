@@ -43,6 +43,7 @@ const mockChange: Change = {
   pre_merge_sha: null,
   post_merge_sha: null,
   commits: [],
+  incomplete: false,
 };
 
 const mockAppliedChange: Change = {

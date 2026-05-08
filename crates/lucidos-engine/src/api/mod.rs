@@ -3,6 +3,7 @@ mod app_ui;
 mod apps;
 mod artifacts;
 pub(crate) mod backup;
+mod blobs;
 mod changes;
 mod chat;
 mod claude_code;
@@ -11,9 +12,11 @@ mod disk_usage;
 mod history;
 mod images;
 pub(crate) mod internal;
+mod knowhow;
 mod mcp;
 mod memory;
 mod notifications;
+mod plugins;
 mod presence;
 pub(crate) mod proxy;
 mod repositories;
@@ -185,39 +188,6 @@ const MAX_IMAGE_BASE64_BYTES: usize = 4_500_000;
 /// Larger images waste tokens without improving understanding.
 const MAX_IMAGE_DIMENSION: u32 = 2048;
 
-/// Apply EXIF orientation to a decoded image. JPEG files from phone cameras
-/// store pixels in the sensor's native orientation (usually landscape) and use
-/// an EXIF tag to indicate how to rotate for correct display. Browsers handle
-/// this automatically, but `image::load_from_memory()` ignores EXIF — so we
-/// must rotate the pixels ourselves before re-encoding.
-fn apply_exif_orientation(raw: &[u8], img: image::DynamicImage) -> image::DynamicImage {
-    let mut cursor = std::io::Cursor::new(raw);
-    let exif = match exif::Reader::new().read_from_container(&mut cursor) {
-        Ok(exif) => exif,
-        Err(_) => return img,
-    };
-
-    let orientation = match exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY) {
-        Some(field) => match field.value.get_uint(0) {
-            Some(v) => v,
-            None => return img,
-        },
-        None => return img,
-    };
-
-    match orientation {
-        1 => img,
-        2 => img.fliph(),
-        3 => img.rotate180(),
-        4 => img.flipv(),
-        5 => img.rotate90().fliph(),
-        6 => img.rotate90(),
-        7 => img.rotate270().fliph(),
-        8 => img.rotate270(),
-        _ => img,
-    }
-}
-
 impl ChatImage {
     /// Always compress images for LLM consumption: re-encode as JPEG (quality 85)
     /// and cap dimensions at `MAX_IMAGE_DIMENSION`. This reduces token usage and
@@ -242,7 +212,7 @@ impl ChatImage {
             }
         };
 
-        let img = apply_exif_orientation(&raw, img);
+        let img = crate::core::blobs::apply_exif_orientation(&raw, img);
 
         let (orig_w, orig_h) = img.dimensions();
         let orig_base64_len = self.base64.len();
@@ -336,6 +306,13 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub images: Option<Vec<ChatImage>>,
+    /// Forward-compat: when set, the handler resolves each hash against the
+    /// workspace blob store and uses those bytes for the LLM call. Frontends
+    /// that have already uploaded their images via `POST /threads/:id/blobs`
+    /// can send hash refs only — keeping this body small even on cellular.
+    /// Mutually exclusive with `images`.
+    #[serde(default)]
+    pub image_hashes: Option<Vec<String>>,
     #[serde(default)]
     pub device_id: Option<String>,
     #[serde(default)]
@@ -375,7 +352,7 @@ pub struct ChatRequest {
     pub caller_thread_id: Option<String>,
     /// Cross-workspace origin: UUID of the event in the calling workspace
     /// that triggered this POST (e.g. the `ToolCalled` event for a
-    /// `lucidos send-thread` invocation). Allowed only when `caller_workspace`
+    /// `lucidos spawn-thread` invocation). Allowed only when `caller_workspace`
     /// is set. Often `None` from CC subprocesses, which lack access to their
     /// own tool-call event id.
     #[serde(default)]
@@ -673,7 +650,11 @@ struct GitVersion {
 /// Skips noisy endpoints (health checks, SSE streams, dev proxy) to keep logs readable.
 async fn request_logger(req: axum::extract::Request, next: Next) -> Response {
     let uri_path = req.uri().path();
-    if uri_path == "/api/health" || uri_path == "/api/events" || !uri_path.starts_with("/api/") {
+    let should_log = match uri_path {
+        "/api/health" | "/api/events" => false,
+        p => p.starts_with("/api/") || p.starts_with("/app/"),
+    };
+    if !should_log {
         return next.run(req).await;
     }
 
@@ -722,8 +703,9 @@ pub fn create_router(
     // Serve static files from data/ tree — single mount covers all subdirectories
     let serve_data = ServeDir::new(workspace_path.join(crate::core::DATA_DIR));
 
-    // Clone state for SDK v1 routes (api_routes consumes state below)
+    // Clone state for SDK v1 routes and app UI routes (api_routes consumes state below)
     let v1_state = state.clone();
+    let app_ui_state = state.clone();
 
     // API routes under /api/*
     // Convention: query params for identifiers, path segments only for file paths
@@ -830,6 +812,7 @@ pub fn create_router(
             "/triggers/historical",
             get(triggers::list_historical_triggers),
         )
+        .route("/knowhow", get(knowhow::list_knowhow))
         // Preferences endpoints
         .route(
             "/preferences",
@@ -895,12 +878,6 @@ pub fn create_router(
             "/app/:app_id/source",
             get(apps::read_app_source).put(apps::write_app_source),
         )
-        .route("/app/:app_id/", get(apps::serve_app_ui))
-        .route(
-            "/app/:app_id/artifacts/*path",
-            get(apps::serve_app_artifact),
-        )
-        .route("/app/:app_id/*path", get(apps::serve_app_file))
         .route("/app/versions", get(apps::get_app_versions))
         .route("/app/restore", post(apps::restore_app_version))
         // Email endpoints
@@ -1026,12 +1003,26 @@ pub fn create_router(
         .route("/threads", post(threads_compose::post_thread))
         .route("/threads/:id", delete(threads_compose::delete_thread))
         .route("/threads/:id/compose", put(threads_compose::put_compose))
+        .route("/threads/:id/blobs", post(blobs::post_blob))
+        .route("/blobs/:hash", get(blobs::get_blob))
+        .route("/blobs/:hash/preview", get(blobs::get_blob_preview))
+        .route(
+            "/plugins/upload-archive",
+            post(plugins::upload_archive)
+                .layer(DefaultBodyLimit::max(plugins::MAX_ARCHIVE_BYTES)),
+        )
         // Generic API proxy — forwards to a backend configured in
         // `data/config/apis.json`. Two routes so callers can hit
         // `/proxy/sonos` (no trailing path) as well as `/proxy/sonos/play/2`.
         .route("/proxy/:name", any(proxy::proxy_handler_root))
         .route("/proxy/:name/", any(proxy::proxy_handler_root))
         .route("/proxy/:name/*path", any(proxy::proxy_handler))
+        // Sibling route (not /proxy/:name/_credentials) to avoid colliding
+        // with the *path wildcard above.
+        .route(
+            "/proxy-credentials/:name",
+            get(proxy::proxy_credentials_handler),
+        )
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .route(
             "/data/*path",
@@ -1041,9 +1032,19 @@ pub fn create_router(
         )
         .with_state(v1_state);
 
+    // App UI routes under /app/* — file serving must be path-shaped (relative
+    // URLs in app HTML resolve against the document path), so this lives at
+    // the top level rather than under /api/.
+    let app_ui_routes = Router::new()
+        .route("/:app_id/", get(apps::serve_app_ui))
+        .route("/:app_id/artifacts/*path", get(apps::serve_app_artifact))
+        .route("/:app_id/*path", get(apps::serve_app_file))
+        .with_state(app_ui_state);
+
     let router = Router::new()
         .nest("/api/v1", api_v1_routes)
         .nest("/api", api_routes)
+        .nest("/app", app_ui_routes)
         .nest_service("/data", serve_data);
 
     // In dev mode, reverse-proxy unmatched requests to Vite so the browser

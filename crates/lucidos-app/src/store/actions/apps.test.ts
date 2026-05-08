@@ -8,7 +8,7 @@ const mockListAppsApi = vi.fn().mockResolvedValue([]);
 vi.mock('../../api/client', () => ({
   postAppCapture: (...args: unknown[]) => mockPostAppCapture(...args),
   listAppsApi: (...args: unknown[]) => mockListAppsApi(...args),
-  appUrl: vi.fn((id: string) => `/api/app/${id}/`),
+  appUrl: vi.fn((id: string) => `/app/${id}/`),
 }));
 
 vi.mock('./navigation', () => ({

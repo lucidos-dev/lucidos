@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::core::plugins::{
     self, compare_versions, detect_conflicts, is_git_url, validate_archive_entry_path,
     validate_tree, PlannedFile, PluginManifest, UpdateDecision, ValidationError,
+    PLUGIN_ARCHIVE_EXT,
 };
 use crate::core::DATA_DIR;
 use crate::engine::event_bus::{BusEvent, EventBusEmitter, SystemEvent};
@@ -59,7 +60,7 @@ fn detect_source(s: &str) -> Result<Source, String> {
         });
     }
 
-    if trimmed.ends_with(".lucidos-plugin") {
+    if trimmed.ends_with(PLUGIN_ARCHIVE_EXT) {
         let path = PathBuf::from(trimmed);
         if path.is_file() {
             return Ok(Source::Archive(path));

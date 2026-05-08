@@ -70,10 +70,6 @@ function importanceDotClass(importance: number): string {
   return 'low';
 }
 
-function formatTimestamp(ts: string): string {
-  return formatTimeAgo(new Date(ts));
-}
-
 function MemoryEntryRow({ entry }: { entry: MemoryEntryInfo }) {
   const [expanded, setExpanded] = useState(false);
   const [sourceData, setSourceData] = useState<Loadable<MemorySourceResponse>>({ status: 'not-loaded' });
@@ -114,7 +110,7 @@ function MemoryEntryRow({ entry }: { entry: MemoryEntryInfo }) {
             {entry.source.type === 'event' ? 'Event' : 'Artifact'}
           </span>
           <span data-tooltip={formatDateTime(new Date(entry.src_created_at))}>
-            {formatTimestamp(entry.src_created_at)}
+            {formatTimeAgo(new Date(entry.src_created_at))}
           </span>
         </div>
 

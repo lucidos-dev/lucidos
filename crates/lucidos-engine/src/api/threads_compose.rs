@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::api::actor::user_actor_resolved;
 use crate::api::AppState;
+use crate::core::blobs::write_blob_from_base64;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::thread_state::ThreadState;
@@ -31,11 +32,25 @@ pub(super) struct PostThreadBody {
     pub mode: String,
 }
 
+/// Legacy compose-image payload (`[{base64, mime_type}, ...]`). Mime is
+/// re-sniffed server-side from the bytes so this struct only needs the
+/// base64; the user-supplied mime_type is intentionally dropped.
+#[derive(Debug, Deserialize)]
+pub(super) struct LegacyComposeImage {
+    pub base64: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct PutComposeBody {
     pub text: String,
+    /// `null` (absent) preserves existing draft images via SQL COALESCE;
+    /// `[]` clears; `[hash, …]` replaces.
     #[serde(default)]
-    pub images: Vec<JsonValue>,
+    pub image_hashes: Option<Vec<String>>,
+    /// Compat shim for legacy frontends still posting inline base64.
+    /// Mutually exclusive with `image_hashes`.
+    #[serde(default)]
+    pub images: Option<Vec<LegacyComposeImage>>,
     /// `Some` only when the user is also toggling mode — rejected with 409 if
     /// the thread is no longer in `composing`. Absent on text-only updates.
     #[serde(default)]
@@ -165,14 +180,49 @@ pub(super) async fn put_compose(
             "compose_text exceeds 64 KiB cap",
         ));
     }
-    if body.images.len() > MAX_COMPOSE_IMAGES {
-        return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "too many compose images"));
-    }
     if let Some(ref m) = body.mode {
         validate_mode(m)?;
     }
 
-    let images_json = serde_json::to_value(&body.images).unwrap_or_else(|_| serde_json::json!([]));
+    // None = preserve (SQL COALESCE). `image_hashes` wins over legacy
+    // `images`; the latter is uploaded inline before the UPDATE.
+    let new_image_hashes: Option<Vec<String>> = if let Some(hashes) = body.image_hashes {
+        Some(hashes)
+    } else if let Some(legacy) = body.images {
+        if legacy.is_empty() {
+            Some(Vec::new())
+        } else {
+            crate::log!(
+                "[Compat] legacy image upload via PUT compose ({} images)",
+                legacy.len()
+            );
+            let mut hashes = Vec::with_capacity(legacy.len());
+            for img in legacy {
+                let blob = write_blob_from_base64(state.engine.workspace_path(), &img.base64)
+                    .map_err(|e| {
+                        let status = match e {
+                            crate::core::blobs::BlobError::BadEncoding(_) => StatusCode::BAD_REQUEST,
+                            _ => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        };
+                        err(status, &e.to_string())
+                    })?;
+                hashes.push(blob.hash);
+            }
+            Some(hashes)
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref h) = new_image_hashes {
+        if h.len() > MAX_COMPOSE_IMAGES {
+            return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "too many compose images"));
+        }
+    }
+
+    let images_bind: Option<JsonValue> = new_image_hashes
+        .as_ref()
+        .map(|h| serde_json::Value::Array(h.iter().cloned().map(JsonValue::String).collect()));
 
     // Mode toggle on a thread that's already past `composing` is a contract
     // violation — pre-check so we surface 409 before the UPDATE rejects it
@@ -181,10 +231,13 @@ pub(super) async fn put_compose(
     // being sent still renders with the correct channel pill. Send events
     // later overwrite source from the actual channel of the message. The
     // WHERE clause already gates mode-carrying writes to `state='composing'`.
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
+    //
+    // `compose_images` uses COALESCE($3, compose_images): NULL bind preserves
+    // the existing array, `[]` clears it.
+    let row: Option<(String, Option<String>, JsonValue)> = sqlx::query_as(
         "UPDATE thread_summaries
             SET compose_text = $2,
-                compose_images = $3,
+                compose_images = COALESCE($3, compose_images),
                 compose_mode = COALESCE($4, compose_mode),
                 source = CASE $4::text
                     WHEN 'claude_code' THEN 'claude_code'
@@ -194,17 +247,17 @@ pub(super) async fn put_compose(
           WHERE thread_id = $1
             AND state IN ('composing', 'active', 'archived')
             AND ($4::text IS NULL OR state = 'composing')
-         RETURNING state, compose_mode",
+         RETURNING state, compose_mode, compose_images",
     )
     .bind(id)
     .bind(&body.text)
-    .bind(&images_json)
+    .bind(images_bind.as_ref())
     .bind(body.mode.as_deref())
     .fetch_optional(state.engine.pool())
     .await
     .map_err(internal_err)?;
 
-    let (_state_str, resolved_mode) = match row {
+    let (_state_str, resolved_mode, post_compose_images) = match row {
         Some(r) => r,
         None => {
             // Cold path: UPDATE matched zero rows. Distinguish "no row" from
@@ -249,10 +302,21 @@ pub(super) async fn put_compose(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
+    // Reads back whatever COALESCE produced — new hashes on a touched
+    // write, the existing array on a preserve write.
+    let hashes_for_event: Vec<String> = post_compose_images
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let event = BusEvent::System(SystemEvent::ThreadComposeChanged {
         id,
         text: body.text,
-        images: images_json,
+        image_hashes: hashes_for_event,
         mode: resolved_mode,
         origin_device_id: device_id,
     });

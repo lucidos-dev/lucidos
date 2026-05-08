@@ -62,7 +62,7 @@ function ThreadsHeader() {
           disabled={draftsViewActive.value}
           aria-label="Filter threads"
           data-tooltip={draftsViewActive.value ? 'Filter unavailable in drafts view' : 'Filter threads'}
-          style={draftsViewActive.value ? 'pointer-events: auto; cursor: default;' : undefined}
+          style={draftsViewActive.value ? 'pointer-events: auto;' : undefined}
         >
           <FilterIcon />
         </button>
@@ -93,6 +93,11 @@ function isInteractive(el: HTMLElement): boolean {
   const tag = el.tagName;
   if (tag === 'BUTTON' || tag === 'A' || tag === 'INPUT' || tag === 'SELECT') return true;
   if (el.closest('button, a, input, select, .hamburger-panel, .thread-toggle')) return true;
+  // Visible children of brand-label open the control panel; the brand-label
+  // itself stretches with flex:1 to center them, so its empty space should
+  // still toggle full-width on dblclick like any other header gap.
+  const brandLabel = el.closest('[data-role="control-panel-toggle"]');
+  if (brandLabel && el !== brandLabel) return true;
   return false;
 }
 
@@ -249,8 +254,12 @@ export function AppHeader() {
               <span
                 class="pane-header-brand-label"
                 data-role="control-panel-toggle"
-                onClick={() => { controlPanelOpen.value = !controlPanelOpen.value; }}
-                style={{ cursor: 'pointer' }}
+                onClick={(e) => {
+                  // brand-label stretches with flex:1 to center its content;
+                  // ignore clicks on the empty space around the visible children.
+                  if (e.target === e.currentTarget) return;
+                  controlPanelOpen.value = !controlPanelOpen.value;
+                }}
               >
                 <span class="pane-header-title">lucidos</span>
                 {badgeCount > 0 && <span class="badge brand-badge" data-tooltip={controlPanelBadgeTooltip()}>{badgeCount}</span>}

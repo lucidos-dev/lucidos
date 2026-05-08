@@ -76,6 +76,12 @@ pub struct LlmResponse {
     pub stop_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
+    /// Real prompt-token count from the provider's `usage`. Sums uncached input,
+    /// cache-write, and cache-read tokens — the full size the model processed.
+    /// `None` for providers that don't report it. Lets the UI replace the
+    /// chars/4 estimate (which over-counts base64 image bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
     /// Total characters of thinking text. High value with empty content
     /// distinguishes "thought hard then gave up" from "said nothing".
     #[serde(default, skip_serializing_if = "Option::is_none")]

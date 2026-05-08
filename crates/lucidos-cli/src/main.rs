@@ -25,7 +25,7 @@ mod hardened;
 mod http;
 mod mcp_permission_server;
 mod proxy;
-mod send_thread;
+mod spawn_thread;
 mod workspace;
 
 use data::WriteSource;
@@ -91,8 +91,10 @@ enum Command {
     /// workspace. Defaults caller_* fields from $LUCIDOS_WORKSPACE,
     /// $LUCIDOS_THREAD_ID, $LUCIDOS_EVENT_ID. With `--parent`, emits
     /// parent_thread_id/spawning_event_id instead (same-workspace callback).
-    #[command(name = "send-thread")]
-    SendThread(SendThreadArgs),
+    /// `--repo <name>` defaults from $LUCIDOS_REPO so a CC subprocess inherits
+    /// the calling thread's repo without callers passing it explicitly.
+    #[command(name = "spawn-thread")]
+    SpawnThread(SpawnThreadArgs),
     /// Call a backend configured in `data/config/apis.json` through the
     /// engine's proxy (engine injects the configured auth header). Body to
     /// stdout; exit 0 by default even on 4xx/5xx. Use `--fail` to mirror
@@ -125,6 +127,15 @@ pub(crate) struct ProxyCliArgs {
     /// Exit non-zero on HTTP 4xx/5xx and suppress the body (`curl --fail`).
     #[arg(long = "fail")]
     pub(crate) fail: bool,
+    /// Fetch the credential bundle for a `credential_bundle`-typed proxy.
+    /// Prints the JSON map (`{"<service_name>": "<value>", ...}`) to stdout.
+    /// Cannot be combined with HTTP-shape flags (`-X`, `-d`, `-i`, `-H`,
+    /// `--fail`, `--data-stdin`).
+    #[arg(
+        long = "credentials",
+        conflicts_with_all = ["method", "data", "data_stdin", "include", "fail", "headers"],
+    )]
+    pub(crate) credentials: bool,
 }
 
 /// Wire-format actor mode accepted by `--mode`. Typed enum so clap rejects
@@ -147,7 +158,7 @@ impl CliMode {
 }
 
 #[derive(Args)]
-pub(crate) struct SendThreadArgs {
+pub(crate) struct SpawnThreadArgs {
     /// Target workspace name (e.g. "dev", "personal"). Resolved relative to
     /// $LUCIDOS_WORKSPACES_ROOT (or `~/workspaces` if unset). Pass an absolute
     /// path to bypass the root lookup.
@@ -168,6 +179,14 @@ pub(crate) struct SendThreadArgs {
     /// Chat model override.
     #[arg(long)]
     pub(crate) model: Option<String>,
+    /// Repo name (or UUID) the spawned worktree should be created from.
+    /// Defaults to `$LUCIDOS_REPO` (the engine sets it on every CC subprocess
+    /// to the calling thread's repo name) so a CC sidequest stays in the same
+    /// repo as its caller. Omit (and unset the env var) to fall back to the
+    /// target workspace's default repo. Pass an empty string to force the
+    /// workspace default even when the env var is set.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
     /// Override the upstream actor mode. Defaults to "agent".
     #[arg(long, value_enum, default_value_t = CliMode::Agent)]
     pub(crate) mode: CliMode,
@@ -358,8 +377,8 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             cc_stop_reminder::run()?;
             Ok(0)
         }
-        Command::SendThread(args) => {
-            send_thread::run(args)?;
+        Command::SpawnThread(args) => {
+            spawn_thread::run(args)?;
             Ok(0)
         }
         Command::Proxy(args) => {
@@ -381,6 +400,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     body,
                     include: args.include,
                     fail: args.fail,
+                    credentials: args.credentials,
                 },
             )
         }

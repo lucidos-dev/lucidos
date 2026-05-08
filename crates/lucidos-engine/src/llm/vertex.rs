@@ -12,6 +12,9 @@ use std::time::Duration;
 /// Beta header enabling 1M token context window for Claude models on Vertex AI.
 const ANTHROPIC_BETA_1M_CONTEXT: &str = "context-1m-2025-08-07";
 
+/// Per-chunk timeout for Claude SSE streams (seconds).
+const CLAUDE_STREAM_CHUNK_TIMEOUT_SECS: u64 = 300;
+
 /// Shared access token cache for all VertexProvider instances in the same project.
 /// gcloud tokens are project-scoped, so one cache serves all models.
 pub type TokenCache = Arc<std::sync::Mutex<Option<(String, std::time::Instant)>>>;
@@ -508,7 +511,7 @@ impl VertexProvider {
         let mut blocks: Vec<AccumulatedBlock> = Vec::new();
         let mut turn_meta = TurnMeta::default();
 
-        let chunk_timeout = Duration::from_secs(300);
+        let chunk_timeout = Duration::from_secs(CLAUDE_STREAM_CHUNK_TIMEOUT_SECS);
 
         loop {
             let chunk = match tokio::time::timeout(chunk_timeout, stream.next()).await {
@@ -601,6 +604,7 @@ impl VertexProvider {
             tool_calls,
             stop_reason: turn_meta.stop_reason,
             output_tokens: turn_meta.output_tokens,
+            input_tokens: turn_meta.input_tokens,
             thinking_chars: Some(thinking_chars),
         })
     }
@@ -669,6 +673,20 @@ impl VertexProvider {
                     }
                 }
             }
+            "message_start" => {
+                // Anthropic's first SSE event carries the exact input-token cost.
+                // Sum uncached + cache write + cache read — the user's "context
+                // size" is everything the model processed, not just the uncached
+                // remainder.
+                let usage = &data["message"]["usage"];
+                let input = usage["input_tokens"].as_u64().unwrap_or(0);
+                let cache_write = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                let total = input + cache_write + cache_read;
+                if total > 0 {
+                    meta.input_tokens = Some(total as u32);
+                }
+            }
             "message_delta" => {
                 if let Some(sr) = data["delta"]["stop_reason"].as_str() {
                     meta.stop_reason = Some(sr.to_string());
@@ -686,7 +704,7 @@ impl VertexProvider {
                     format!("Claude streaming error [{}]: {}", error_type, error_msg).into(),
                 );
             }
-            // message_start, content_block_stop, message_stop, ping — ignore
+            // content_block_stop, message_stop, ping — ignore
             _ => {}
         }
 
@@ -908,6 +926,7 @@ impl VertexProvider {
             tool_calls,
             stop_reason: None,
             output_tokens: None,
+            input_tokens: None,
             thinking_chars: None,
         })
     }
@@ -972,11 +991,15 @@ enum AccumulatedBlock {
     Thinking(String),
 }
 
-/// Per-turn metadata captured from Anthropic's `message_delta` SSE event.
+/// Per-turn metadata captured from Anthropic's streaming SSE events.
+/// `input_tokens` is the real prompt size (uncached + cache write + cache read)
+/// from `message_start`; `stop_reason` and `output_tokens` come from
+/// `message_delta`.
 #[derive(Default)]
 struct TurnMeta {
     stop_reason: Option<String>,
     output_tokens: Option<u32>,
+    input_tokens: Option<u32>,
 }
 
 // ===== Gemini/Vertex request/response types =====
@@ -1403,5 +1426,22 @@ mod tests {
             "URL must not still contain the old region, got: {}",
             after
         );
+    }
+
+    #[test]
+    fn process_sse_captures_input_tokens_from_message_start() {
+        // Anthropic streams `message_start` early in every response with the
+        // exact prompt-token cost. Capturing it lets the UI replace the
+        // chars/4 estimate (which over-counts base64 image bytes by orders
+        // of magnitude) with the real number.
+        let mut blocks = Vec::new();
+        let mut meta = TurnMeta::default();
+        let event = r#"{"type":"message_start","message":{"id":"msg_x","type":"message","role":"assistant","content":[],"model":"claude-opus-4-7","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4321,"cache_creation_input_tokens":1000,"cache_read_input_tokens":500,"output_tokens":1}}}"#;
+
+        VertexProvider::process_sse_data(event, &mut blocks, &mut meta).unwrap();
+
+        // Real prompt size = uncached input + cache writes + cache reads
+        // (everything the model actually processed). 4321 + 1000 + 500 = 5821.
+        assert_eq!(meta.input_tokens, Some(5821));
     }
 }

@@ -58,7 +58,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                         channel: Some("claude_code".to_string()),
                         steps: std::mem::take(&mut pending_steps),
                         images: std::mem::take(&mut pending_images),
-                        user_images: vec![],
+                        user_image_hashes: vec![],
                         image_description: None,
                         completed: Some(false),
                         canceled: false,
@@ -92,7 +92,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                         channel: None,
                         steps: std::mem::take(&mut pending_steps),
                         images: std::mem::take(&mut pending_images),
-                        user_images: vec![],
+                        user_image_hashes: vec![],
                         image_description: None,
                         completed: Some(false),
                         canceled: false,
@@ -115,20 +115,19 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     .unwrap_or("")
                     .to_string();
 
-                let user_images: Vec<UserImagePayload> = event
+                // Hashes are written by the API layer (or backfilled by the
+                // startup migration). Old DB rows whose payload still carries
+                // the legacy `images: [{base64, mime_type}, ...]` shape have
+                // been rewritten to `user_image_hashes` before HTTP binds —
+                // see `core::image_migration`. Reading from `images` is
+                // therefore a dead fallback and intentionally not implemented.
+                let user_image_hashes: Vec<String> = event
                     .payload
-                    .get("images")
+                    .get("user_image_hashes")
                     .and_then(|v| v.as_array())
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(|img| {
-                                let b64 = img.get("base64")?.as_str()?;
-                                let mime = img.get("mime_type")?.as_str()?;
-                                Some(UserImagePayload {
-                                    base64: b64.to_string(),
-                                    mime_type: mime.to_string(),
-                                })
-                            })
+                            .filter_map(|h| h.as_str().map(str::to_string))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -159,7 +158,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     channel,
                     steps: vec![],
                     images: vec![],
-                    user_images,
+                    user_image_hashes,
                     image_description,
                     completed: None,
                     canceled: false,
@@ -200,6 +199,30 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     context_messages,
                     trimmed,
                 });
+            }
+            "ContextTokensMeasured" => {
+                // Skip if no prior Thinking step (events out of order).
+                if let Some(input_tokens) = event
+                    .payload
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                {
+                    if let Some(step) = pending_steps
+                        .iter_mut()
+                        .rev()
+                        .find(|s| s.description == "Requesting")
+                    {
+                        step.context_tokens = Some(input_tokens);
+                    }
+                    if let Some(ResponseEvent::Step { context_tokens, .. }) = pending_events
+                        .iter_mut()
+                        .rev()
+                        .find(|e| matches!(e, ResponseEvent::Step { description, .. } if description == "Requesting"))
+                    {
+                        *context_tokens = Some(input_tokens);
+                    }
+                }
             }
             "MemorySearched" => {
                 let has_results = event
@@ -517,7 +540,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     channel,
                     steps: std::mem::take(&mut pending_steps),
                     images,
-                    user_images: vec![],
+                    user_image_hashes: vec![],
                     image_description: None,
                     completed: Some(true),
                     canceled: is_canceled,
@@ -564,7 +587,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     channel: None,
                     steps: std::mem::take(&mut pending_steps),
                     images: vec![],
-                    user_images: vec![],
+                    user_image_hashes: vec![],
                     image_description: None,
                     completed: Some(true),
                     canceled: false,
@@ -605,7 +628,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     channel,
                     steps: vec![],
                     images: vec![],
-                    user_images: vec![],
+                    user_image_hashes: vec![],
                     image_description: None,
                     completed: None,
                     canceled: false,
@@ -697,7 +720,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
             channel,
             steps: std::mem::take(&mut pending_steps),
             images: std::mem::take(&mut pending_images),
-            user_images: vec![],
+            user_image_hashes: vec![],
             image_description: None,
             completed: None,
             canceled: false,

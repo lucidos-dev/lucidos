@@ -1,6 +1,7 @@
 use super::actor::build_message_origin;
 use super::*;
 use crate::engine::thread_events::ActorMode;
+use crate::engine::thread_state::ThreadState;
 
 /// Convert API request contexts into engine file context string.
 fn resolve_file_ctx(
@@ -225,7 +226,7 @@ pub(super) struct ChatSubmitResponse {
 pub(super) async fn chat_submit(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<ChatRequest>,
+    Json(mut request): Json<ChatRequest>,
 ) -> Result<Json<ChatSubmitResponse>, StatusCode> {
     // Capture frontend origin from the browser Origin header so the LLM
     // system prompt can show the user-facing Lucidos URL. Skip cross-workspace
@@ -308,7 +309,26 @@ pub(super) async fn chat_submit(
         request.repo_file_context.as_ref(),
     );
     let url_ctx = request.url_context;
-    let chat_images = request.images.map(super::compress_images);
+    // Resolve `image_hashes` to ChatImage by reading + base64-encoding the
+    // blobs once per send. Mutually exclusive with `images`; the latter
+    // (legacy base64 body) is still accepted and runs through the same
+    // compression pipeline. After Phase 4 ships, every frontend send takes
+    // the hash path and the legacy body becomes dead.
+    let chat_images = if let Some(hashes) = request.image_hashes.take() {
+        let mut resolved = Vec::with_capacity(hashes.len());
+        for hash in &hashes {
+            match crate::core::blobs::read_blob_as_base64(state.engine.workspace_path(), hash) {
+                Some((data, mime_type)) => resolved.push(ChatImage { base64: data, mime_type }),
+                None => log!(
+                    "[Chat] image_hashes: blob {} missing on disk, dropping from message",
+                    hash
+                ),
+            }
+        }
+        Some(resolved)
+    } else {
+        request.images.take().map(super::compress_images)
+    };
     let use_claude_code = request.use_claude_code;
     let cc_model = request.cc_model;
     let event_id = request.event_id;
@@ -316,16 +336,45 @@ pub(super) async fn chat_submit(
     // starting a fresh thread / unscoped change (CLAUDE.md "no silent defaults").
     let thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
     let conflict_change_id = parse_optional_uuid(request.conflict_change_id.as_deref())?;
-    let repo_id = request.repo_id;
+    // `repo_id` accepts either a UUID or a registered repo name (the
+    // `lucidos spawn-thread --repo <name>` CLI sends names). UUIDs pass
+    // through unchanged — they match `cc_repo_id` storage in
+    // `thread_summaries` directly, and downstream code already handles
+    // unknown UUIDs (the tests seeding random UUIDs depend on that). Names
+    // resolve to the registered UUID; an unknown name surfaces as a clean
+    // 400 here instead of a 500 from deep inside worktree creation.
+    let repo_id = match request.repo_id.as_deref() {
+        Some(s) if !s.is_empty() && Uuid::parse_str(s).is_err() => {
+            match crate::core::repositories::RepositoryStore::get_by_name(state.engine.pool(), s).await {
+                Ok(Some(repo)) => Some(repo.id.to_string()),
+                Ok(None) => {
+                    log!("[Chat] Unknown repo name '{}' in chat_submit", s);
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                Err(e) => {
+                    log!("[Chat] Failed to look up repo '{}': {}", s, e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        }
+        _ => request.repo_id,
+    };
 
     // Lock thread to its first (mode, repo). Switching either mid-thread
     // makes the executor card and commands menu disagree (different repo's
     // skills, branch can't follow across repos). Frontend should already
     // disable the selectors for existing threads — this is the backend
     // backstop. See `validate_thread_continuity`.
+    //
+    // Skip the lock for `state='composing'`: a draft's `source` reflects the
+    // last compose-mode toggle (the PUT compose CASE writes 'chat' or
+    // 'claude_code' to it). Toggling back across modes before the first send
+    // races the debounced PUT; reading the lagged source as authoritative
+    // here surfaces as a 409 ("Thread is locked to X mode") on Send. The
+    // lock only applies once the thread has actually been sent.
     if let Some(tid) = thread_id {
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT source, cc_repo_id FROM thread_summaries WHERE thread_id = $1",
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT state, source, cc_repo_id FROM thread_summaries WHERE thread_id = $1",
         )
         .bind(tid)
         .fetch_optional(state.engine.pool())
@@ -334,15 +383,21 @@ pub(super) async fn chat_submit(
             log!("[Chat] thread_summaries lookup failed for {}: {}", tid, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        if let Some((source, existing_repo)) = row {
-            if let Err((sc, msg)) = validate_thread_continuity(
-                Some(&source),
-                existing_repo.as_deref(),
-                use_claude_code,
-                repo_id.as_deref(),
-            ) {
-                log!("[Chat] Reject follow-up on thread {}: {}", tid, msg);
-                return Err(sc);
+        if let Some((state_str, source, existing_repo)) = row {
+            let existing_state = ThreadState::from_db_str(&state_str).map_err(|e| {
+                log!("[Chat] thread_summaries.state for {} invalid: {}", tid, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            if !existing_state.can_change_mode() {
+                if let Err((sc, msg)) = validate_thread_continuity(
+                    Some(&source),
+                    existing_repo.as_deref(),
+                    use_claude_code,
+                    repo_id.as_deref(),
+                ) {
+                    log!("[Chat] Reject follow-up on thread {}: {}", tid, msg);
+                    return Err(sc);
+                }
             }
         }
     }
@@ -623,6 +678,7 @@ mod tests {
             repo_file_context: None,
             reasoning_effort: None,
             images: None,
+            image_hashes: None,
             device_id: None,
             use_claude_code: None,
             cc_model: None,

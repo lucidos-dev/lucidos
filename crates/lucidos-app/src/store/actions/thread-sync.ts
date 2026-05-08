@@ -314,7 +314,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       // payload — ThreadComposeChanged will follow with text/images shortly.
       setDraft(threadId, {
         text: '',
-        images: [],
+        image_hashes: [],
         mode: startedMode === 'claude_code' ? 'claude_code' : 'lucidos',
       });
     }
@@ -611,7 +611,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       const modeRaw = data.mode as string | undefined;
       applyRemoteCompose(id, {
         text: (data.text as string) ?? '',
-        images: Array.isArray(data.images) ? data.images as string[] : [],
+        image_hashes: Array.isArray(data.image_hashes) ? data.image_hashes as string[] : [],
         mode: modeRaw === 'claude_code' ? 'claude_code' : modeRaw === 'lucidos' ? 'lucidos' : null,
       });
       break;

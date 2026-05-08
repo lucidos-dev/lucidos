@@ -90,25 +90,10 @@ impl LucidosEngine {
                     });
                 }
 
-                // Try top-level knowhow first, then app-scoped (app_id/knowhow_id)
+                // load_with_fallback handles local → shared → app-scoped
+                // (`<app_id>/<rest>` → apps/<app_id>/knowhow/<rest>.md).
                 let kh_dirs = self.knowhow_dirs();
-                let kh =
-                    crate::core::KnowhowStore::load_with_fallback(&kh_dirs, id).or_else(|| {
-                        // App-scoped: "app_id/knowhow_id" → apps/app_id/knowhow/knowhow_id.md
-                        let (app_id, kh_id) = id.split_once('/')?;
-                        if app_id.contains("..")
-                            || app_id.starts_with('/')
-                            || app_id.starts_with('\\')
-                        {
-                            return None;
-                        }
-                        let app_kh_dir = self
-                            .workspace_path
-                            .join(crate::core::APPS_DIR)
-                            .join(app_id)
-                            .join("knowhow");
-                        crate::core::KnowhowStore::load(&app_kh_dir, kh_id)
-                    });
+                let kh = crate::core::KnowhowStore::load_with_fallback(&kh_dirs, id);
                 match kh {
                     Some(kh) => Ok(kh.format_section()),
                     None => Ok(format!("Know-how '{}' not found. Use the know-how list in the system prompt to see available IDs.", id)),

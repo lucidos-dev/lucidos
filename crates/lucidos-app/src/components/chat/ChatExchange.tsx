@@ -11,7 +11,7 @@ import {
   LUCIDOS_AGENT_LABEL,
   actorInitiator,
   exchangeUserMessage,
-  exchangeUserImages,
+  exchangeUserImageHashes,
   exchangeTimestamp,
   exchangeResponseTimestamp,
   exchangeResponseText,
@@ -29,8 +29,9 @@ import {
   resumeEngineNote,
 } from '../../store/thread-events';
 import type { Change } from '../../api/client';
-import { continueThread } from '../../api/client';
-import { artifacts, appsList, popupImageSrc, stepsExpanded, detailsExpanded, threadMap, findChangeById, lazyChanges, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel, showToast, cancelingThreadIds } from '../../store/store';
+import { continueThread, blobPreviewUrl } from '../../api/client';
+import { getSessionBlobUrlForHash } from './pastedImages';
+import { artifacts, appsList, openImagePopupFromThread, stepsExpanded, detailsExpanded, threadMap, findChangeById, lazyChanges, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel, showToast, cancelingThreadIds } from '../../store/store';
 import { ClaudeIcon } from '../shared/icons';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openApp } from '../../store/actions/apps';
@@ -79,7 +80,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
   const apps = loadedOr(appsList.value, NO_APPS);
 
   const userMessage = exchangeUserMessage(exchange);
-  const userImages = exchangeUserImages(exchange);
+  const userImageHashes = exchangeUserImageHashes(exchange);
   const timestamp = exchangeTimestamp(exchange);
   const responseTextRaw = exchangeResponseText(exchange);
   const threadMeta = threadMap.value.get(threadId)?.meta;
@@ -113,7 +114,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
     if (imgTarget) {
       e.preventDefault();
       const src = imgTarget.dataset.fullSrc || imgTarget.src;
-      if (src) popupImageSrc.value = src;
+      if (src) openImagePopupFromThread(src, imgTarget);
       return;
     }
 
@@ -233,8 +234,8 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
   );
 
   const initiator = useMemo(
-    () => describeInitiator(exchange, userMessageHtml, userImages, threadId),
-    [exchange, userMessageHtml, userImages, threadId],
+    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId),
+    [exchange, userMessageHtml, userImageHashes, threadId],
   );
   const canCollapseInitiator = !!initiator.summary || !!initiator.details;
   const isInitiatorCollapsed = canCollapseInitiator
@@ -422,7 +423,7 @@ function engineInitiator(summary: string, details?: ComponentChildren): Initiato
 export function describeInitiator(
   exchange: Exchange,
   userMessageHtml: string,
-  userImages: { base64: string; mimeType: string }[],
+  userImageHashes: string[],
   threadId: string,
 ): InitiatorDescriptor {
   const ev = exchange.userEvent;
@@ -493,8 +494,8 @@ export function describeInitiator(
         details: <MarkdownBlock html={userMessageHtml} />,
       };
     case 'MessageReceived': {
-      const details = userMessageHtml || userImages.length > 0
-        ? <UserMessageBody html={userMessageHtml} images={userImages} />
+      const details = userMessageHtml || userImageHashes.length > 0
+        ? <UserMessageBody html={userMessageHtml} imageHashes={userImageHashes} />
         : undefined;
       if (ev.origin?.kind === 'api' || modeToInitiator(ev.mode) === 'system') {
         return { variant: actorVariant(ev.origin), summary, details, ...actorInitiator(ev.origin) };
@@ -573,21 +574,21 @@ function FileList({ files }: { files: string[] }) {
   );
 }
 
-function UserMessageBody({ html, images }: { html: string; images: { base64: string; mimeType: string }[] }) {
+function UserMessageBody({ html, imageHashes }: { html: string; imageHashes: string[] }) {
   return (
     <>
       {html && <div class="markdown-content" dangerouslySetInnerHTML={{ __html: html }} />}
-      {images.length > 0 && (
+      {imageHashes.length > 0 && (
         <div class="user-images">
-          {images.map((img, i) => {
-            const src = `data:${img.mimeType};base64,${img.base64}`;
+          {imageHashes.map((hash, i) => {
+            const src = getSessionBlobUrlForHash(hash) ?? blobPreviewUrl(hash);
             return (
               <img
-                key={i}
+                key={hash + ':' + i}
                 src={src}
                 class="user-image-thumb"
                 alt=""
-                onClick={() => { popupImageSrc.value = src; }}
+                onClick={(e) => openImagePopupFromThread(e.currentTarget.src, e.currentTarget)}
               />
             );
           })}

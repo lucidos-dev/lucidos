@@ -170,6 +170,101 @@ describe('reload recovery — bump ccSessionVersion for focused CC thread', () =
 });
 
 // ---------------------------------------------------------------------------
+// loadCommands catch — transient transport errors (iOS PWA wake)
+// ---------------------------------------------------------------------------
+
+/**
+ * Mirrors the catch handler in CCControlMenu.loadCommands. The decision must
+ * not depend on threadId — iOS PWA HTTP/2 connections go stale after
+ * backgrounding and the first wake fetch fails for both compose and thread
+ * view. A previous version only retried when threadId was set, so compose
+ * view fired a "Failed to load CC commands" toast immediately on every wake.
+ */
+function shouldRetryFetchCommandsError(
+  retryCount: number,
+  maxRetries: number,
+  _threadId: string | undefined,
+): boolean {
+  return retryCount < maxRetries;
+}
+
+describe('loadCommands catch — retries network failures regardless of view', () => {
+  const MAX = 10;
+
+  it('retries thread view within budget', () => {
+    expect(shouldRetryFetchCommandsError(0, MAX, 'thread-id')).toBe(true);
+    expect(shouldRetryFetchCommandsError(9, MAX, 'thread-id')).toBe(true);
+  });
+
+  it('retries compose view within budget (iOS PWA wake regression)', () => {
+    expect(shouldRetryFetchCommandsError(0, MAX, undefined)).toBe(true);
+    expect(shouldRetryFetchCommandsError(9, MAX, undefined)).toBe(true);
+  });
+
+  it('shows toast after retry budget for both views', () => {
+    expect(shouldRetryFetchCommandsError(MAX, MAX, 'thread-id')).toBe(false);
+    expect(shouldRetryFetchCommandsError(MAX, MAX, undefined)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadCommands gates on engineRestarting — restart can take longer than the
+// retry budget (Rust recompile + boot can run 30-90s), and other loaders
+// (loadAllThreads, loadThreadEvents, refreshThreadEvents, connectThreadEvents)
+// already follow this convention. Without the gate, "Failed to load CC
+// commands" fires every time the user applies a Rust change.
+// ---------------------------------------------------------------------------
+
+/** Mirrors the early return in loadCommands. */
+function shouldFetchCCCommands(engineRestarting: boolean): boolean {
+  return !engineRestarting;
+}
+
+describe('loadCommands skips during engine restart', () => {
+  it('skips fetch while engine is restarting (suppresses toast)', () => {
+    expect(shouldFetchCCCommands(true)).toBe(false);
+  });
+
+  it('fetches when engine is not restarting', () => {
+    expect(shouldFetchCCCommands(false)).toBe(true);
+  });
+});
+
+/** Mirrors the engineRestarting useSignalEffect that re-triggers loadCommands
+ *  after a restart completes. Compose view (no threadId) only — focused CC
+ *  threads are already covered by ccSessionVersion bump in loadAllThreads,
+ *  and triggering both would cause a redundant fetch (×2 with dual layouts). */
+function shouldRefetchOnRestartTransition(
+  prev: boolean,
+  current: boolean,
+  threadId: string | undefined,
+): boolean {
+  return prev && !current && !threadId;
+}
+
+describe('loadCommands re-fetches when engine restart completes', () => {
+  it('re-fetches compose view on transition restarting → not restarting', () => {
+    expect(shouldRefetchOnRestartTransition(true, false, undefined)).toBe(true);
+  });
+
+  it('does NOT re-fetch focused CC thread (covered by ccSessionVersion bump)', () => {
+    expect(shouldRefetchOnRestartTransition(true, false, 'thread-id')).toBe(false);
+  });
+
+  it('does not re-fetch on idle (false → false)', () => {
+    expect(shouldRefetchOnRestartTransition(false, false, undefined)).toBe(false);
+  });
+
+  it('does not re-fetch on restart starting (false → true)', () => {
+    expect(shouldRefetchOnRestartTransition(false, true, undefined)).toBe(false);
+  });
+
+  it('does not re-fetch while still restarting (true → true)', () => {
+    expect(shouldRefetchOnRestartTransition(true, true, undefined)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Retry logic for empty commands
 // ---------------------------------------------------------------------------
 

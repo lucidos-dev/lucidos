@@ -1,9 +1,8 @@
-import { threadMap, focusedThreadId, applyingNowThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, changes, showConfirm, effectiveThreadStatus } from '../../store/store';
+import { threadMap, focusedThreadId, applyingNowThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, changes, showConfirm, effectiveThreadStatus, isMidTurn } from '../../store/store';
 import { getCCWaitingInfo } from '../../store/thread-events';
 import { resolveActions, type Action } from '../../generated/thread-lifecycle';
 import { endClaudeCodeAndApply, handleDiscardCCChanges } from '../../store/actions/chat-claude-code';
 import { handleArchiveThread } from '../../store/actions/threads';
-import { handleCancelExchange } from '../../store/actions/chat';
 import { viewChangeDiff, viewThreadCcDiff } from '../../store/actions/repositories';
 import type { Change } from '../../api/client';
 
@@ -14,7 +13,13 @@ export type WaitingState =
   | { type: 'applying' }
   | { type: 'discarding' }
   | { type: 'canceling'; threadId: string; isCanceling: boolean }
-  | { type: 'actions'; actions: Action[]; threadId: string; isArchiving: boolean; requiresRestart: boolean; pendingChange: Change | null; externalCcDiffAvailable: boolean };
+  | { type: 'actions'; actions: Action[]; threadId: string; isArchiving: boolean; requiresRestart: boolean; incomplete: boolean; pendingChange: Change | null; externalCcDiffAvailable: boolean };
+
+/** WaitingBanner renders Apply / Discard / Archive / Diff buttons. The
+ *  'canceling' variant is owned by PromptInput's morphable Send→Cancel
+ *  button (so the swap can animate the same DOM node) and must never be
+ *  passed here — narrow it out at the call site. */
+export type BannerState = Exclude<WaitingState, { type: 'canceling' }>;
 
 export function getWaitingState(): WaitingState | null {
   const focused = focusedThreadId.value;
@@ -36,7 +41,7 @@ export function getWaitingState(): WaitingState | null {
   // changes so the banner doesn't flash away mid-archive.
   const isArchiving = archivingThreadIds.value.has(focused);
   if (isArchiving) {
-    return { type: 'actions', actions: ARCHIVE_ACTIONS, threadId: focused, isArchiving: true, requiresRestart: false, pendingChange: null, externalCcDiffAvailable: false };
+    return { type: 'actions', actions: ARCHIVE_ACTIONS, threadId: focused, isArchiving: true, requiresRestart: false, incomplete: false, pendingChange: null, externalCcDiffAvailable: false };
   }
 
   const status = effectiveThreadStatus(thread);
@@ -44,7 +49,7 @@ export function getWaitingState(): WaitingState | null {
   // Mid-turn states get Cancel. Must come before resolveActions, which returns
   // [] for both and would otherwise drop us into the "no banner" branch.
   // Excludes 'waiting' (CC has changes — needs Apply/Discard, not Cancel).
-  if (status === 'running' || status === 'waiting_for_user_answer') {
+  if (isMidTurn(status)) {
     // ccApplying = MergeConflictDetected fired and the apply task is driving
     // the CC session through a merge. The 'running' status reflects that
     // engine-pushed merge prompt, not a user turn. Cancel here would only
@@ -70,7 +75,7 @@ export function getWaitingState(): WaitingState | null {
     c => c.thread_id === focused && c.status === 'pending' && c.file_count > 0,
   ) ?? null;
   const hasPendingChanges = !!pendingChange || (ccInfo?.hasChanges ?? false);
-  let actions = resolveActions(threadType, status, thread.meta.section, hasPendingChanges);
+  let actions = resolveActions(threadType, status, thread.meta.section, hasPendingChanges, thread.meta.saved);
   if (actions.length === 0) return null;
 
   let requiresRestart = false;
@@ -87,15 +92,21 @@ export function getWaitingState(): WaitingState | null {
     }
   }
 
-  // External-repo CC sessions never produce a `Change` row but the user still
-  // wants to see what CC changed in the worktree branch. Surface a Diff button
-  // whenever CC has reported changes in such a session.
-  const externalCcDiffAvailable = !!ccInfo?.isExternalRepo && (ccInfo?.hasChanges ?? false);
+  // External-repo CC sessions never produce a `Change` row, and ccHasChanges
+  // can drift to false while the worktree branch is still ahead of main. The
+  // Diff button compares branch vs main on demand, so always offer it here.
+  const externalCcDiffAvailable =
+    threadType === 'claude_code' && thread.meta.ccIsExternalRepo;
 
-  return { type: 'actions', actions, threadId: focused, isArchiving: false, requiresRestart, pendingChange, externalCcDiffAvailable };
+  // Surface partial-work warnings for changes proposed from a CC turn that
+  // ended in `ResponseFailed` (mid-stream API drop, etc.). The Apply button
+  // confirms before landing so the user can't accidentally merge half a turn.
+  const incomplete = pendingChange?.incomplete ?? false;
+
+  return { type: 'actions', actions, threadId: focused, isArchiving: false, requiresRestart, incomplete, pendingChange, externalCcDiffAvailable };
 }
 
-export function WaitingBanner({ state }: { state: WaitingState }) {
+export function WaitingBanner({ state }: { state: BannerState }) {
   if (state.type === 'applying') {
     return (
       <div class="thread-action-buttons">
@@ -112,17 +123,6 @@ export function WaitingBanner({ state }: { state: WaitingState }) {
     );
   }
 
-  if (state.type === 'canceling') {
-    return (
-      <div class="thread-action-buttons">
-        <button class="action-btn action-btn-danger" disabled={state.isCanceling}
-          onClick={() => handleCancelExchange(state.threadId)}>
-          {state.isCanceling ? 'Cancel...' : 'Cancel'}
-        </button>
-      </div>
-    );
-  }
-
   return (
     <div class="thread-action-buttons">
       {state.pendingChange && (
@@ -131,12 +131,12 @@ export function WaitingBanner({ state }: { state: WaitingState }) {
       {!state.pendingChange && state.externalCcDiffAvailable && (
         <button class="action-btn" onClick={() => viewThreadCcDiff(state.threadId)}>Diff</button>
       )}
-      {state.actions.map(action => renderActionButton(action, state.threadId, state.isArchiving, state.requiresRestart))}
+      {state.actions.map(action => renderActionButton(action, state.threadId, state.isArchiving, state.requiresRestart, state.incomplete))}
     </div>
   );
 }
 
-function renderActionButton(action: Action, threadId: string, isArchiving: boolean, requiresRestart = false) {
+function renderActionButton(action: Action, threadId: string, isArchiving: boolean, requiresRestart = false, incomplete = false) {
   switch (action) {
     case 'archive':
       return (
@@ -145,14 +145,32 @@ function renderActionButton(action: Action, threadId: string, isArchiving: boole
           {isArchiving ? 'Archive...' : 'Archive'}
         </button>
       );
-    case 'apply':
+    case 'apply': {
+      // Tooltip prefers the partial-work warning (more critical) over the
+      // restart hint when both apply.
+      const tooltip = incomplete
+        ? 'This change was proposed by a turn that ended in failure. The worktree contents may be partial work. You will be asked to confirm.'
+        : requiresRestart
+          ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart'
+          : undefined;
+      const onClick = async () => {
+        if (incomplete) {
+          const ok = await showConfirm(
+            'This change was proposed by a turn that ended in failure (e.g. mid-stream API drop). The worktree contents may be incomplete. Apply anyway?',
+            'Apply',
+          );
+          if (!ok) return;
+        }
+        endClaudeCodeAndApply(threadId);
+      };
       return (
         <button class="action-btn action-btn-confirm"
-          data-tooltip={requiresRestart ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart' : undefined}
-          onClick={() => endClaudeCodeAndApply(threadId)}>
+          data-tooltip={tooltip}
+          onClick={onClick}>
           {requiresRestart ? 'Apply & Restart' : 'Apply'}
         </button>
       );
+    }
     case 'discard':
       return (
         <button class="action-btn action-btn-danger"

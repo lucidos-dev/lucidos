@@ -36,6 +36,26 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
     if (!editing) autoResizeTextarea(displayRef.current);
   }, [title, editing]);
 
+  // Container width changes (drawer toggle, divider drag, window resize) don't
+  // fire the [title, editing] effect — without this observer, scrollHeight set
+  // at a narrow width (where the title wrapped to multiple lines) stays pinned
+  // as inline style.height after the container widens, ballooning the header
+  // until rename or reload. Width-only guard ignores the height churn from our
+  // own style.height writes, which would otherwise cause a feedback loop.
+  useEffect(() => {
+    const el = displayRef.current;
+    if (!el || editing) return;
+    let lastWidth = el.clientWidth;
+    const observer = new ResizeObserver(() => {
+      const newWidth = el.clientWidth;
+      if (newWidth === lastWidth) return;
+      lastWidth = newWidth;
+      autoResizeTextarea(el);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [editing]);
+
   // The overlay input keeps DOM focus after save/escape, so onFocus won't
   // re-fire on the next click — blur explicitly so editing can be re-entered
   // without clicking elsewhere first.

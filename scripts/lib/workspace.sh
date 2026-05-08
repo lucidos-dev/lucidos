@@ -651,10 +651,12 @@ start_engine() {
     ENGINE_PID=$!
     echo $ENGINE_PID > "$ENGINE_PIDFILE"
 
-    # Wait for engine to be ready
+    # Wait for engine to be ready. Cold boot does pgvector init, migrations,
+    # memory index load, and embedding model warmup — which can push past 30s
+    # on a fresh workspace or a slow disk. Give it 90s before declaring failure.
     echo -n "Waiting for engine"
     local engine_ready=""
-    for i in {1..30}; do
+    for i in {1..90}; do
         if ! kill -0 $ENGINE_PID 2>/dev/null; then
             echo ""
             echo "ERROR: Engine crashed on startup. Check logs:"
@@ -673,7 +675,7 @@ start_engine() {
 
     if [ -z "$engine_ready" ]; then
         echo ""
-        echo "ERROR: Engine failed to start within 30 seconds. Check logs:"
+        echo "ERROR: Engine failed to start within 90 seconds. Check logs:"
         tail -20 "$ENGINE_LOG"
         exit 1
     fi

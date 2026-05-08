@@ -291,19 +291,20 @@ export async function waitForActionPanel(page: Page, buttonText: string, timeout
   return page.locator('.thread-action-buttons:visible').first();
 }
 
-/** Wait for CC to finish working (status clears or action panel appears) */
+/** Resolve only on the LAST visible status label leaving Working/Requesting.
+ *  Earlier turns may still show idle Done/Diff panels mid-stream of a later
+ *  turn, so a "any panel exists" check would return early. */
 export async function waitForCCToFinish(page: Page, timeout = 120_000): Promise<void> {
   await page.waitForFunction(() => {
     const labels = document.querySelectorAll('.exchange-status-label');
-    const hasWorking = Array.from(labels).some(el => {
+    const visible = Array.from(labels).filter(el => {
       const rect = el.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return false;
-      const text = el.textContent ?? '';
-      return text.includes('Working') || text.includes('Requesting');
+      return rect.width > 0 && rect.height > 0;
     });
-    if (!hasWorking) return true;
-    const panels = document.querySelectorAll('.thread-action-buttons');
-    return panels.length > 0;
+    if (visible.length === 0) return true;
+    const last = visible[visible.length - 1];
+    const text = last.textContent ?? '';
+    return !(text.includes('Working') || text.includes('Requesting'));
   }, undefined, { timeout });
 }
 

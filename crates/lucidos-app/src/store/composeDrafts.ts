@@ -1,23 +1,16 @@
-/** Per-thread compose drafts (text, images, mode), kept OUT of `threadMap`.
- *
- *  Drafts mutate per keystroke; threadMap holds thread lifecycle data that
- *  every chat-rendering component subscribes to. Co-locating the two meant
- *  every keystroke fired threadMap, re-rendered every ChatExchange, and
- *  re-ran `marked.parse` per exchange (lag scaled with thread length). This
- *  module isolates draft mutation to its own signal so threadMap stays still
- *  while the user types — only PromptInput / ThreadDrawer / threadTitle
- *  subscribe here, and none of them parse markdown.
- *
- *  Cross-device sync is unchanged: `compose.ts` debounces a PUT to the server
- *  and applies remote `ThreadComposeChanged` SSE through `applyRemoteCompose`.
- *  Both write here instead of into `ThreadMeta`. */
+/** Per-thread compose drafts (text, image hashes, mode), kept OUT of
+ *  `threadMap` so per-keystroke writes don't re-render every component
+ *  subscribed to threadMap. Cross-device sync goes through `compose.ts`
+ *  (debounced PUT + SSE-driven `applyRemoteCompose`); both write here
+ *  instead of into `ThreadMeta`. */
 
 import { signal } from '@preact/signals';
 import type { ComposeChannelMode } from './thread-events';
 
 export interface ComposeDraft {
   text: string;
-  images: string[];
+  /** Sha256 hashes of blobs uploaded via `POST /threads/:id/blobs`. */
+  image_hashes: string[];
   /** Mutable channel pick while state='composing'. Locked once the thread
    *  goes active — readers should fall back to thread.meta.channel by then. */
   mode: ComposeChannelMode;
@@ -27,7 +20,7 @@ export interface ComposeDraft {
  *  that read-then-iterate can't accidentally write to the shared default. */
 export const EMPTY_DRAFT: ComposeDraft = Object.freeze({
   text: '',
-  images: [],
+  image_hashes: [],
   mode: null,
 }) as ComposeDraft;
 
@@ -41,7 +34,7 @@ export function getDraft(threadId: string | null | undefined): ComposeDraft {
 /** True when the draft has neither typed text nor attached images. Mode is
  *  ignored — a fresh composing thread has a mode pick but no content yet. */
 export function draftIsEmpty(draft: ComposeDraft): boolean {
-  return draft.text.trim().length === 0 && draft.images.length === 0;
+  return draft.text.trim().length === 0 && draft.image_hashes.length === 0;
 }
 
 /** Patch a draft. Undefined fields preserve the prior value, so callers can
@@ -50,7 +43,7 @@ export function patchDraft(threadId: string, patch: Partial<ComposeDraft>): void
   const prev = composeDrafts.value.get(threadId) ?? EMPTY_DRAFT;
   const next: ComposeDraft = {
     text: patch.text ?? prev.text,
-    images: patch.images ?? prev.images,
+    image_hashes: patch.image_hashes ?? prev.image_hashes,
     mode: patch.mode !== undefined ? patch.mode : prev.mode,
   };
   const map = new Map(composeDrafts.value);

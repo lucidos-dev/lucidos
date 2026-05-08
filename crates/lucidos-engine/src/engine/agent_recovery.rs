@@ -1,4 +1,5 @@
 use super::agent_session::change_description_fallback;
+use super::agent_session::resume::deterministic_worktree_path;
 use super::change_ops::branch_is_hardened;
 use super::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use super::git_ops::{
@@ -125,6 +126,11 @@ impl LucidosEngine {
             channel: EventChannel::CodingAgent,
             hardened,
             origin,
+            // Engine-driven recovery has no information about whether the
+            // pre-restart turn ended cleanly; the per-turn idle path is the
+            // only place where failure status is known. Keep `false` here so
+            // recovered changes don't spuriously trigger the apply warning.
+            incomplete: false,
         })
         .await
     }
@@ -686,9 +692,26 @@ impl LucidosEngine {
                     // fail with "already checked out" for a deleted directory.
                     let _ = git_cmd(&["worktree", "prune"], &repo_root).await;
 
-                    let wt_id = Uuid::new_v4().as_simple().to_string();
-                    let wt_path =
-                        worktrees_dir(self.workspace_path()).join(format!("cc-{}", wt_id));
+                    let wt_path = lost_session_worktree_path(
+                        self.workspace_path(),
+                        branch_to_thread.get(branch).copied(),
+                    );
+                    // The deterministic `thread-<short>` path collides with any
+                    // partial-setup leftover (worktree_add succeeded but marker
+                    // write crashed, etc.) — the worktree scan would have skipped
+                    // it as not-discovered, but `git worktree add` refuses to
+                    // create into an existing dir. Clear it before retrying. The
+                    // random `cc-<uuid>` branch can't collide, but the cost is
+                    // identical and keeps the call site uniform.
+                    if matches!(tokio::fs::try_exists(&wt_path).await, Ok(true)) {
+                        if let Err(e) = tokio::fs::remove_dir_all(&wt_path).await {
+                            log!(
+                                "[Recovery] Failed to clear stale worktree dir {}: {}",
+                                wt_path.display(),
+                                e
+                            );
+                        }
+                    }
 
                     match worktree_add(&repo_root, &wt_path, &[branch]).await {
                         Ok(o) if o.status.success() => {
@@ -1026,12 +1049,62 @@ pub async fn recover_orphan_cc_permission_requests(
     }
 }
 
+/// CC keys its session JSONL by CWD, so a resumed subprocess must boot in the
+/// same path its prior turn used. Reuse the thread's deterministic path when
+/// we have a mapping; fall back to `cc-<random>` only for orphan branches with
+/// no thread to resume against.
+fn lost_session_worktree_path(
+    workspace_path: &Path,
+    branch_thread_id: Option<Uuid>,
+) -> PathBuf {
+    match branch_thread_id {
+        Some(thread_id) => deterministic_worktree_path(workspace_path, thread_id),
+        None => {
+            let wt_id = Uuid::new_v4().as_simple().to_string();
+            worktrees_dir(workspace_path).join(format!("cc-{}", wt_id))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use crate::engine::git_ops::is_external_repo_path;
+    use crate::engine::agent_session::resume::deterministic_worktree_path;
+    use crate::engine::git_ops::{is_external_repo_path, worktrees_dir};
+
+    #[test]
+    fn lost_session_path_uses_deterministic_path_when_thread_mapped() {
+        let workspace = PathBuf::from("/tmp/ws");
+        let thread_id = uuid::Uuid::new_v4();
+        let path = super::lost_session_worktree_path(&workspace, Some(thread_id));
+        assert_eq!(path, deterministic_worktree_path(&workspace, thread_id));
+    }
+
+    #[test]
+    fn lost_session_path_falls_back_to_cc_random_when_unmapped() {
+        let workspace = PathBuf::from("/tmp/ws");
+        let path = super::lost_session_worktree_path(&workspace, None);
+        let parent = path
+            .parent()
+            .expect("path has a parent (the worktrees dir)");
+        assert_eq!(parent, worktrees_dir(&workspace));
+        let name = path
+            .file_name()
+            .expect("path has a file name")
+            .to_string_lossy();
+        assert!(
+            name.starts_with("cc-"),
+            "unmapped branches keep the legacy random name; got {}",
+            name
+        );
+        assert!(
+            !name.starts_with("thread-"),
+            "must NOT use the deterministic thread- prefix without a real thread id; got {}",
+            name
+        );
+    }
 
     /// Regression: recovery must classify the workspace's own Lucidos worktree
     /// as internal, even when the marker file contains a `repo_id` for it.

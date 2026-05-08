@@ -133,7 +133,7 @@ impl LucidosEngine {
                 .execute_save_thread_image(args, thread_id)
                 .await
                 .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::NAVIGATE_UI => self.execute_navigate_ui(args, thread_id),
+            tn::NAVIGATE_UI => self.execute_navigate_ui(args, thread_id).await,
             tn::SEND_NOTIFICATION => self.execute_send_notification(args, thread_id).await,
             tn::READ_NOTIFICATIONS => self.execute_read_notifications(args).await,
             tn::EMIT_EVENT => self.execute_emit_event(args).await,
@@ -162,27 +162,24 @@ impl LucidosEngine {
         }
     }
 
-    fn execute_navigate_ui(&self, args: &serde_json::Value, thread_id: uuid::Uuid) -> String {
+    async fn execute_navigate_ui(&self, args: &serde_json::Value, thread_id: uuid::Uuid) -> String {
         let target = match args.get("target").and_then(|v| v.as_str()) {
             Some(t) if !t.is_empty() => t,
             _ => return "Error: target is required".to_string(),
         };
-        let _ = self
+        if let Err(e) = self
             .event_bus
-            .sender()
-            .send(crate::engine::event_bus::EmittedEvent {
-                event_id: uuid::Uuid::new_v4(),
-                seq: None,
-                created: chrono::Utc::now(),
-                typed: crate::engine::event_bus::BusEvent::Thread {
-                    thread_id,
-                    event: crate::engine::thread_events::ThreadEvent::NavigationRequested {
-                        payload: serde_json::to_string(args).unwrap_or_default(),
-                    },
-                    meta: crate::engine::thread_events::EventMeta::NONE,
+            .emit(crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::NavigationRequested {
+                    payload: serde_json::to_string(args).unwrap_or_default(),
                 },
-                aggregate: None,
-            });
+                meta: crate::engine::thread_events::EventMeta::NONE,
+            })
+            .await
+        {
+            return format!("Error: failed to emit NavigationRequested: {}", e);
+        }
 
         // Return contextual help so the LLM knows what the UI offers
         let settings_view = args.get("settings_view").and_then(|v| v.as_str());

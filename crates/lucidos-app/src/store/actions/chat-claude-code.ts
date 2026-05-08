@@ -110,6 +110,10 @@ export async function answerCCQuestion(
   toolUseId: string,
   answer: AnswerKind,
 ): Promise<boolean> {
+  // Pin to bottom before the QuestionCard re-renders from option buttons to
+  // its answered (height-shrunk) form — otherwise ResizeObserver flips
+  // scrolledUp=true and the streaming continuation never auto-scrolls.
+  scrollToBottom();
   try {
     return await apiAnswerCCQuestion(threadId, toolUseId, answer);
   } catch (err) {

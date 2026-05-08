@@ -9,19 +9,19 @@ import {
 
 describe('parseAppId', () => {
   it('extracts app id from canonical app path', () => {
-    expect(parseAppId('/api/app/habit-tracker/')).toBe('habit-tracker');
+    expect(parseAppId('/app/habit-tracker/')).toBe('habit-tracker');
   });
 
   it('extracts app id when path has subroutes', () => {
-    expect(parseAppId('/api/app/habit-tracker/index.html')).toBe('habit-tracker');
+    expect(parseAppId('/app/habit-tracker/index.html')).toBe('habit-tracker');
   });
 
   it('extracts app id when path has nested subroutes', () => {
-    expect(parseAppId('/api/app/habit-tracker/foo/bar')).toBe('habit-tracker');
+    expect(parseAppId('/app/habit-tracker/foo/bar')).toBe('habit-tracker');
   });
 
   it('decodes percent-encoded segments', () => {
-    expect(parseAppId('/api/app/my%20app/')).toBe('my app');
+    expect(parseAppId('/app/my%20app/')).toBe('my app');
   });
 
   it('returns null for non-app paths', () => {
@@ -33,7 +33,11 @@ describe('parseAppId', () => {
   });
 
   it('returns null when app id segment is empty', () => {
-    expect(parseAppId('/api/app//')).toBeNull();
+    expect(parseAppId('/app//')).toBeNull();
+  });
+
+  it('returns null for legacy /api/app/ prefix (route was relocated)', () => {
+    expect(parseAppId('/api/app/habit-tracker/')).toBeNull();
   });
 });
 
@@ -88,7 +92,7 @@ describe('installScrollMemory', () => {
   beforeEach(() => {
     sessionStorage.clear();
     Object.defineProperty(window, 'location', {
-      value: { pathname: '/api/app/habit-tracker/', hash: '' },
+      value: { pathname: '/app/habit-tracker/', hash: '' },
       writable: true,
       configurable: true,
     });
@@ -128,7 +132,7 @@ describe('installScrollMemory', () => {
   it('does not restore when location.hash is present (anchor wins)', () => {
     sessionStorage.setItem('lucidos-scroll-app-habit-tracker', '500');
     Object.defineProperty(window, 'location', {
-      value: { pathname: '/api/app/habit-tracker/', hash: '#section-2' },
+      value: { pathname: '/app/habit-tracker/', hash: '#section-2' },
       writable: true,
       configurable: true,
     });

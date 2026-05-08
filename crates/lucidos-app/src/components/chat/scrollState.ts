@@ -1,8 +1,12 @@
 import { signal } from '@preact/signals';
 
 /** Shared scroll-position signals for the chat area.
- *  Only one of CreateThreadView / ThreadView is mounted at a time (conditional render),
- *  so a single signal is correct — it tracks whichever is currently visible.
+ *  ThreadView and CreateThreadView are mounted twice each (desktop SplitLayout
+ *  + mobile MobileSwipeContainer), so writers MUST gate on isElementVisible(el)
+ *  before mutating these signals — see makeScrollObservers below. The hidden
+ *  duplicate's element has 0×0 dimensions and would otherwise overwrite the
+ *  visible instance's correct values (e.g. clearing notAtTop because the hidden
+ *  el reports isScrollable=false).
  *
  *  Two thresholds, two purposes:
  *  - `scrolledUp` uses an 80px stickiness window: while inside it, content
@@ -147,6 +151,13 @@ export function scrollToBottom() {
   // Re-resolves target each frame in case the visible element changed.
   const loop = () => {
     if (_resizeMode !== 'scroll') {
+      // The loop clears awayFromBottom every iteration, so a final-frame
+      // content grow without an onScroll/onResize would leave the chevron
+      // stuck hidden. Reconcile against actual position on exit.
+      const el = resolveTarget();
+      if (el && el.scrollTop + el.clientHeight < el.scrollHeight - 2) {
+        awayFromBottom.value = true;
+      }
       _scrollTimer = null;
       return;
     }
@@ -161,4 +172,86 @@ export function scrollToBottom() {
   _scrollTimer = setTimeout(loop, 16);
 
   extendSuppression();
+}
+
+/** Build the scroll- and resize-event handlers for a single .thread-content
+ *  element. The visibility gate at the top of each handler is required by the
+ *  dual-mounting contract documented at the top of this file. */
+export function makeScrollObservers(el: HTMLElement) {
+  function isAtBottom() {
+    return el.scrollTop + el.clientHeight >= el.scrollHeight - 80;
+  }
+  // Tighter threshold for the chevron — flips on the first pixel of
+  // scroll-up. The 2px slack absorbs subpixel rounding (mobile zoom,
+  // device-pixel snapping) without making the chevron look stuck.
+  function isVisuallyAtBottom() {
+    return el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
+  }
+  function isAtTop() {
+    return el.scrollTop <= 80;
+  }
+  function isScrollable() {
+    return el.scrollHeight > el.clientHeight + 10;
+  }
+  function syncNotAtTop() {
+    notAtTop.value = isScrollable() && !isAtTop();
+  }
+  // Scroll events: can both set and clear scrolledUp (user gesture or
+  // programmatic scrollTop assignment — both produce real scroll events).
+  // Skip during suppression ('scroll' mode) — scroll events in this window
+  // are from programmatic scrollToBottom() or header scroll compensation
+  // (useHideOnScroll adjusts scrollTop on focusin/focusout), not user intent.
+  // Without this guard, iOS keyboard dismiss causes: focusout → scrollTop
+  // compensation → scroll event → scrolledUp=true → viewport resize handler
+  // skips scrollToBottom() → user loses bottom-pinned state.
+  //
+  // awayFromBottom is updated unconditionally on scroll — programmatic
+  // scrolls leave the container at the bottom, so the check returns false
+  // and the chevron hides naturally without a special-case branch.
+  // (Content growth that doesn't fire a scroll event is handled by
+  // useEffect snapping back to bottom; see onResize for the shrink case.)
+  function onScroll() {
+    if (!isElementVisible(el)) return;
+    syncNotAtTop();
+    awayFromBottom.value = !isVisuallyAtBottom();
+    if (getResizeMode() === 'scroll') return; // only scrolledUp is suppressed
+    scrolledUp.value = !isAtBottom();
+  }
+  // Resize events: behavior depends on resize mode set by scrollToBottom().
+  //
+  // 'scroll' mode: content is rendering after a scrollToBottom() call —
+  //   actively scroll to bottom on each resize and extend the suppression
+  //   window. This keeps us pinned to the bottom as content progressively
+  //   renders (especially important on mobile where rendering is slow).
+  //
+  // 'ignore' mode (normal): can only *escalate* scrolledUp to true.
+  //   Must NEVER clear scrolledUp — otherwise a layout change (textarea shrink
+  //   after submit, idle banner removal) can falsely reset scrolledUp and
+  //   trigger unwanted auto-scroll.
+  function onResize() {
+    if (!isElementVisible(el)) return;
+    // Sync on resize too — if content shrinks below the viewport,
+    // clear the chevron even if no scroll event fires.
+    syncNotAtTop();
+    if (getResizeMode() === 'scroll') {
+      el.scrollTop = el.scrollHeight;
+      extendSuppression();
+      return;
+    }
+    // Gate on the 80px window (see top of file) so streaming tokens don't
+    // trip the chevron before useEffect snaps back. Larger growth (panel
+    // expand, multi-line code block) crosses the window and the chevron
+    // appears immediately, even though no scroll event fired.
+    if (!isAtBottom()) {
+      scrolledUp.value = true;
+      awayFromBottom.value = true;
+    }
+    // Clear path: if content shrinks so the user is now visually at the
+    // bottom (idle banner removed, step collapsed), hide the chevron
+    // without waiting for a scroll event.
+    if (awayFromBottom.value && isVisuallyAtBottom()) {
+      awayFromBottom.value = false;
+    }
+  }
+  return { onScroll, onResize };
 }

@@ -1,15 +1,16 @@
 import { useRef, useEffect, useState } from 'preact/hooks';
 import { signal } from '@preact/signals';
-import { pendingChatMessage, showToast, inputMode, popupImageSrc, focusedThreadId, threadMap, repositories, selectedRepoId, panelUrl, panelTitle, showConfirm, cancelingThreadIds, effectiveThreadStatus } from '../../store/store';
-import { sendMessage, loadRepositories } from '../../store/actions/chat';
-import { handleSaveThread, handleUnsaveThread } from '../../store/actions/threads';
+import { pendingChatMessage, showToast, inputMode, openImagePopup, focusedThreadId, threadMap, repositories, selectedRepoId, panelUrl, panelTitle, cancelingThreadIds, effectiveThreadStatus, getThreadDisplaySection, isMidTurn } from '../../store/store';
+import { sendMessage, loadRepositories, handleCancelExchange } from '../../store/actions/chat';
+import { handleSaveThread, handleUnsaveThread, handleArchiveThread } from '../../store/actions/threads';
+import type { DisplaySection } from '../../generated/thread-lifecycle';
 import { updateCompose, discardCompose, sendCompose, sendFollowup, ensureFocusedComposeThread, type ComposeMode } from '../../store/actions/compose';
 import { getDraft } from '../../store/composeDrafts';
 import { scrollToBottom, scrolledUp } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon } from '../shared/icons';
 import { Dropdown } from '../shared/Dropdown';
 import { CCControlMenu, ccMenuOpenRequest } from './CCControlMenu';
-import { WaitingBanner, getWaitingState } from './WaitingBanner';
+import { WaitingBanner, getWaitingState, type BannerState } from './WaitingBanner';
 import { focusIfNeeded, composeHandlers, isComposeFocusedHere } from './promptFocus';
 import { syncTextareaValue, shouldSkipSyncWhileEditing } from './promptValueSync';
 import { effectiveSendMode } from './promptToggleMode';
@@ -17,12 +18,19 @@ import { resizeTextarea, useFontMetricsResize } from './promptResize';
 import { isMobile } from '../../utils/viewport';
 import { errorDetail } from '../../utils/errorDetail';
 import { extractPasteUrl, escapeMarkdownLinkText } from '../../utils/extractPasteUrl';
-import { pastedImagesForCurrentThread, getPastedImages, removePastedImage } from './pastedImages';
+import { attachedImagesForCurrentThread, getAttachedImages, removeAttachedImage } from './pastedImages';
+import { getPendingUploads, hasInFlightUploads, removePendingUpload, pendingUploads } from '../../store/pendingUploads';
 import { attachImageToActiveDraft } from './attachToDraft';
 import { computeCaptureGeometry, readDeviceAngle } from './cameraGeometry';
 
 const attachMenuOpen = signal(false);
 const cameraOpen = signal(false);
+/** Thread IDs where Send was just clicked but the thread hasn't reached
+ *  running/waiting_for_user_answer yet. Drives the optimistic Send→Cancel
+ *  morph so the action slot doesn't flash empty during the request gap.
+ *  Cleared when the thread becomes cancellable (via the effect below) or
+ *  on send failure (via the catch handler in submit). Only consumed here. */
+const submittingThreadIds = signal<Set<string>>(new Set());
 
 function addImageFile(file: File) {
   attachImageToActiveDraft(file).catch((err) => {
@@ -93,31 +101,111 @@ function CameraCapture() {
   );
 }
 
-// Saved threads must always offer Unsave — once a saved thread auto-archives,
-// canArchive flips to false, which would otherwise strand the user in the
-// saved section with no exit. Save (the unsaved → save action) stays gated
-// on canArchive so it doesn't appear in non-actionable states.
-export function shouldShowSaveButton(isSaved: boolean, canArchive: boolean): boolean {
-  return isSaved || canArchive;
+// Pending uploads count as content: while a pasted/picked image is still
+// uploading, treat the prompt as actively composing so the section buttons
+// (Save/Archive) and waiting banner yield to Send + Discard. Without this,
+// the Save chip briefly appears in place of Send during the upload window
+// for any thread in the review section.
+export function composeHasContent(
+  hasText: boolean,
+  attachedImagesCount: number,
+  pendingUploadsCount: number,
+): boolean {
+  return hasText || attachedImagesCount > 0 || pendingUploadsCount > 0;
 }
 
-function SaveThreadButton({ threadId }: { threadId: string }) {
-  const saved = threadMap.value.get(threadId)?.meta.saved ?? false;
-  const onClick = async () => {
-    if (saved) {
-      // Unsave is a deliberate gesture — confirm so a stray click doesn't
-      // drop a saved thread out of its parking spot.
-      if (await showConfirm('Remove this thread from the Saved section?', 'Remove')) {
-        handleUnsaveThread(threadId);
-      }
-    } else {
-      handleSaveThread(threadId);
-    }
-  };
-  const cls = `action-btn save-thread-btn${saved ? '' : ' action-btn-confirm'}`;
+// The button is always rendered EXCEPT in 'hidden' mode so Send↔Cancel keeps
+// its color morph without a DOM swap; the leave path snap-unmounts like the
+// sibling section buttons — no fade-out, no position:absolute jump.
+//   send        — visible, blue, click=submit
+//   cancel      — visible, red,  click=cancel exchange
+//   canceling   — visible, red,  disabled, label "Cancel..."
+//   placeholder — invisible (visibility:hidden, takes space) to keep row height
+//   hidden      — not rendered; banner or section buttons own the slot
+export type MorphMode = 'send' | 'cancel' | 'canceling' | 'placeholder' | 'hidden';
+
+export function computeMorphMode(args: {
+  hasContent: boolean;
+  cancelTargetId: string | null;
+  isCanceling: boolean;
+  hasBannerOrSectionButtons: boolean;
+}): MorphMode {
+  if (args.hasContent) return 'send';
+  if (args.cancelTargetId !== null) return args.isCanceling ? 'canceling' : 'cancel';
+  if (args.hasBannerOrSectionButtons) return 'hidden';
+  return 'placeholder';
+}
+
+// Archive on Review threads is rendered by WaitingBanner (via resolveActions);
+// this fills in the rest. Render = WaitingBanner ∪ getPromptSectionButtons.
+//
+// Saved threads always carry the unsave toggle ("✓ Saved") so the user can
+// drop the thread back to regular flow at any time. Archive sits next to it
+// only when idle and not active — Send/Cancel takes the slot otherwise.
+//
+// Active = mid-turn OR has active children. While active, the action area
+// collapses to a single save/unsave indicator: saved wins over active in
+// display_section, so a non-saved active thread lands in `active` (Save) and
+// a saved one in `saved` (✓ Saved). The review/archive arms here only matter
+// for the rare race where status flips before display_section recomputes.
+//
+// Pending Apply wins over everything (even active): WaitingBanner owns
+// Discard + Apply, and a saved+pending thread can't be distinguished from
+// unsaved+pending by section alone — suppress all section buttons.
+//
+// Composing (hasContent): Send/Discard owns the action slot. Saved keeps its
+// unsave toggle so the user can drop a Saved draft without sending first.
+export function getPromptSectionButtons(
+  section: DisplaySection,
+  isActive: boolean,
+  hasPendingChanges: boolean,
+  hasContent: boolean,
+): Array<'save' | 'archive' | 'unsave'> {
+  if (hasPendingChanges) return [];
+  if (hasContent) return section === 'saved' ? ['unsave'] : [];
+  switch (section) {
+    case 'review': return isActive ? [] : ['save'];
+    case 'archive': return isActive ? [] : ['save'];
+    case 'saved': return isActive ? ['unsave'] : ['unsave', 'archive'];
+    case 'active': return ['save'];
+  }
+}
+
+function SavePromptButton({ threadId }: { threadId: string }) {
   return (
-    <button class={cls} onClick={onClick} aria-label={saved ? 'Unsave thread' : 'Save thread'}>
-      {saved ? '✓ Saved' : 'Save'}
+    <button
+      class="action-btn action-btn-confirm save-thread-btn"
+      onClick={() => handleSaveThread(threadId)}
+      aria-label="Save thread"
+    >
+      Save
+    </button>
+  );
+}
+
+function ArchiveSavedPromptButton({ threadId }: { threadId: string }) {
+  return (
+    <button
+      class="action-btn"
+      onClick={() => handleArchiveThread(threadId)}
+      aria-label="Archive thread"
+    >
+      Archive
+    </button>
+  );
+}
+
+// Mid-turn replacement for Archive in the Saved section. Click confirms then
+// drops the thread out of Saved without canceling — once it idles it routes
+// to Active → Review like any other running thread.
+function UnsaveSavedPromptButton({ threadId }: { threadId: string }) {
+  return (
+    <button
+      class="action-btn action-btn-confirm save-thread-btn"
+      onClick={() => handleUnsaveThread(threadId)}
+      aria-label="Remove thread from Saved section"
+    >
+      ✓ Saved
     </button>
   );
 }
@@ -201,31 +289,46 @@ export function PromptInput() {
     if (!el) return;
     const msg = el.value.trim();
     const threadId = focusedThreadId.value;
-    const currentImages = threadId ? getPastedImages(threadId) : [];
+    const currentImages = threadId ? getAttachedImages(threadId) : [];
     if (!msg && currentImages.length === 0) return;
+    const thread = threadId ? threadMap.value.get(threadId) : undefined;
     el.value = '';
     el.style.height = 'auto';
     scrollToBottom();
     if (isMobile()) el.blur();
 
-    const thread = threadId ? threadMap.value.get(threadId) : undefined;
     const useClaudeCode = effectiveSendMode(thread) === 'claude_code';
 
+    const imageHashes = currentImages.length > 0 ? currentImages.map((i) => i.hash) : undefined;
+    let sendPromise: Promise<void>;
     if (threadId && thread?.meta.state === 'composing') {
       // Composing thread: send through compose so server transitions
       // state→active and clears compose fields atomically.
-      sendCompose(threadId, { useClaudeCode }).catch((error) => {
-        showToast('Failed to send message: ' + errorDetail(error), 'error');
-      });
-      return;
+      sendPromise = sendCompose(threadId, { useClaudeCode });
+    } else if (threadId) {
+      sendPromise = sendFollowup(threadId, msg, imageHashes, { useClaudeCode: useClaudeCode || undefined });
+    } else {
+      sendPromise = sendMessage(msg, imageHashes, { useClaudeCode: useClaudeCode || undefined });
     }
 
-    // Active thread follow-up (or no thread at all → backend will create one).
-    const images = currentImages.length > 0 ? [...currentImages] : undefined;
-    const sendPromise = threadId
-      ? sendFollowup(threadId, msg, images, { useClaudeCode: useClaudeCode || undefined })
-      : sendMessage(msg, images, { useClaudeCode: useClaudeCode || undefined });
+    // For first-message sends `threadId` is null at submit-entry, but
+    // sendMessage's synchronous prefix runs setFocusedThread before
+    // returning the promise — so focusedThreadId.value is now the new id.
+    // Prefer the captured threadId (avoids any focus-shift surprise) and
+    // fall back to focusedThreadId.value only for raw new sends.
+    const submittedId = threadId ?? focusedThreadId.value;
+    if (submittedId) {
+      const next = new Set(submittingThreadIds.value);
+      next.add(submittedId);
+      submittingThreadIds.value = next;
+    }
+
     sendPromise.catch((error) => {
+      if (submittedId) {
+        const next = new Set(submittingThreadIds.value);
+        next.delete(submittedId);
+        submittingThreadIds.value = next;
+      }
       showToast('Failed to send message: ' + errorDetail(error), 'error');
     });
   }
@@ -244,7 +347,7 @@ export function PromptInput() {
       // active — use archive instead"). Compose fields are persisted
       // server-side for active threads too (cross-device draft sync), so
       // emptying them flows through updateCompose.
-      updateCompose(id, { text: '', images: [] });
+      updateCompose(id, { text: '', image_hashes: [] });
     } else {
       void discardCompose(id);
     }
@@ -312,10 +415,10 @@ export function PromptInput() {
     input.value = ''; // Reset so same file can be selected again
   }
 
-  function removeImage(index: number) {
+  function removeImage(index: number): void {
     const id = focusedThreadId.value;
     if (!id) return;
-    removePastedImage(id, index);
+    removeAttachedImage(id, index);
   }
 
   /** Mode toggle. For a focused composing thread, persist the choice on the
@@ -351,8 +454,13 @@ export function PromptInput() {
   const togglesFading = !showToggles && fading;
 
   const isNarrow = typeof window !== 'undefined' && window.innerWidth <= 600;
-  const images = pastedImagesForCurrentThread.value;
-  const hasContent = hasText || images.length > 0;
+  const images = attachedImagesForCurrentThread.value;
+  // Subscribe so the strip re-renders when uploads settle.
+  void pendingUploads.value;
+  const focusedTid = focusedThreadId.value;
+  const pending = focusedTid ? getPendingUploads(focusedTid) : [];
+  const uploadsBlocking = focusedTid ? hasInFlightUploads(focusedTid) : false;
+  const hasContent = composeHasContent(hasText, images.length, pending.length);
   // CC doesn't use browser context — hide the pill when it won't be sent
   const toggleMode = effectiveSendMode(focusedThread);
   const willUseClaudeCode = toggleMode === 'claude_code';
@@ -360,7 +468,41 @@ export function PromptInput() {
   const showCCCommands = willUseClaudeCode;
 
   const waitingState = getWaitingState();
-  const canArchive = waitingState?.type === 'actions' && waitingState.actions.includes('archive');
+
+  // Send/Cancel/placeholder all share ONE always-rendered <button> at the
+  // same JSX position so Preact never unmounts/remounts it — the existing
+  // color transition on .action-btn animates the blue→red morph instead of
+  // a hard swap. Cancel takes over when the thread has a cancel target —
+  // either the real cancellable status from getWaitingState, or the
+  // optimistic submitting flag (which bridges the click → SSE gap). Other
+  // waitingState types (apply/discard/archive/actions) still flow through
+  // WaitingBanner.
+  const cancelTargetId =
+    waitingState?.type === 'canceling' ? waitingState.threadId
+    : (focusedTid && submittingThreadIds.value.has(focusedTid)) ? focusedTid
+    : null;
+  const isCanceling = cancelTargetId !== null && cancelingThreadIds.value.has(cancelTargetId);
+  const bannerState: BannerState | null =
+    !hasContent && waitingState && waitingState.type !== 'canceling'
+      ? waitingState
+      : null;
+
+  const sectionButtons =
+    tid && focusedThread
+      ? getPromptSectionButtons(
+          getThreadDisplaySection(focusedThread),
+          isMidTurn(effectiveThreadStatus(focusedThread)) || focusedThread.meta.activeChildrenCount > 0,
+          focusedThread.meta.ccHasChanges,
+          hasContent,
+        )
+      : [];
+
+  const morphMode = computeMorphMode({
+    hasContent,
+    cancelTargetId,
+    isCanceling,
+    hasBannerOrSectionButtons: !!bannerState || sectionButtons.length > 0,
+  });
 
   // Clear the optimistic canceling flag once the thread leaves the cancellable
   // states ('running' or 'waiting_for_user_answer'). The set survives component
@@ -375,26 +517,57 @@ export function PromptInput() {
     if (!focused || !cancelingThreadIds.value.has(focused)) return;
     const thread = threadMap.value.get(focused);
     if (!thread) return;
-    const status = effectiveThreadStatus(thread);
-    if (status !== 'running' && status !== 'waiting_for_user_answer') {
+    if (!isMidTurn(effectiveThreadStatus(thread))) {
       const next = new Set(cancelingThreadIds.value);
       next.delete(focused);
       cancelingThreadIds.value = next;
     }
-  }, [focusedThreadId.value, threadMap.value, cancelingThreadIds.value]);
+    // cancelingThreadIds.value intentionally omitted from deps — the effect
+    // writes to it, and it only needs to fire when status changes (carried by
+    // threadMap). Including it would cause an extra no-op run after each clear.
+  }, [focusedThreadId.value, threadMap.value]);
+
+  // Mirror effect for the optimistic submitting flag: clear it once the
+  // thread reaches a cancellable status. From that point on, the real
+  // waitingState='canceling' drives the same morph button — the optimistic
+  // flag has done its job (covered the click → SSE gap).
+  useEffect(() => {
+    const focused = focusedThreadId.value;
+    if (!focused || !submittingThreadIds.value.has(focused)) return;
+    const thread = threadMap.value.get(focused);
+    if (!thread) return;
+    if (isMidTurn(effectiveThreadStatus(thread))) {
+      const next = new Set(submittingThreadIds.value);
+      next.delete(focused);
+      submittingThreadIds.value = next;
+    }
+    // See cancelingThreadIds effect above for why submittingThreadIds.value
+    // is intentionally omitted from deps.
+  }, [focusedThreadId.value, threadMap.value]);
 
   return (
     <div class="prompt-input-container">
-      {images.length > 0 && (
+      {(images.length > 0 || pending.length > 0) && (
         <div key="images" class="image-preview-strip">
           {images.map((img, i) => (
-            <div class="image-preview-item" key={i}>
+            <div class="image-preview-item" key={`hash-${img.hash}`}>
               <img
-                src={`data:${img.mimeType};base64,${img.base64}`}
+                src={img.previewUrl}
                 class="image-preview-thumb"
-                onClick={() => { popupImageSrc.value = `data:${img.mimeType};base64,${img.base64}`; }}
+                onClick={() => openImagePopup(img.previewUrl)}
               />
               <button class="icon-btn image-preview-remove" onClick={() => removeImage(i)} aria-label="Remove" data-tooltip="Remove"><CloseIcon /></button>
+            </div>
+          ))}
+          {pending.map((p) => (
+            <div class={`image-preview-item image-preview-pending image-preview-pending-${p.status}`} key={`pending-${p.localId}`}>
+              <img src={p.previewUrl} class="image-preview-thumb" />
+              <button
+                class="icon-btn image-preview-remove"
+                onClick={() => focusedTid && removePendingUpload(focusedTid, p.localId)}
+                aria-label={p.status === 'failed' ? 'Remove failed upload' : 'Cancel upload'}
+                data-tooltip={p.status === 'failed' ? 'Remove' : 'Cancel'}
+              ><CloseIcon /></button>
             </div>
           ))}
         </div>
@@ -543,18 +716,42 @@ export function PromptInput() {
                 Discard draft
               </button>
             )}
-            {focusedThreadId.value && !hasContent && shouldShowSaveButton(focusedThread?.meta.saved ?? false, canArchive) && <SaveThreadButton threadId={focusedThreadId.value} />}
-            {!hasContent && waitingState
-              ? <WaitingBanner state={waitingState} />
-              : (
-                <button
-                  class={`action-btn${hasContent ? '' : ' invisible'}`}
-                  onClick={submit}
-                  aria-label="Send message"
-                >
-                  Send
-                </button>
-              )}
+            {tid && sectionButtons.map(name => {
+              switch (name) {
+                case 'save': return <SavePromptButton key="save" threadId={tid} />;
+                case 'unsave': return <UnsaveSavedPromptButton key="unsave" threadId={tid} />;
+                case 'archive': return <ArchiveSavedPromptButton key="archive" threadId={tid} />;
+              }
+            })}
+            {bannerState && <WaitingBanner state={bannerState} />}
+            {morphMode !== 'hidden' && (
+              <button
+                key="send-cancel-morph"
+                class={
+                  'action-btn send-cancel-morph'
+                  + (morphMode === 'cancel' || morphMode === 'canceling' ? ' action-btn-danger' : '')
+                  + (morphMode === 'placeholder' ? ' morph-placeholder' : '')
+                }
+                onClick={
+                  morphMode === 'send' ? submit
+                  : morphMode === 'cancel' ? () => handleCancelExchange(cancelTargetId!)
+                  : undefined
+                }
+                aria-label={morphMode === 'cancel' || morphMode === 'canceling' ? 'Cancel' : 'Send message'}
+                aria-hidden={morphMode === 'placeholder' ? 'true' : undefined}
+                tabIndex={morphMode === 'send' || morphMode === 'cancel' ? undefined : -1}
+                disabled={
+                  morphMode === 'send' ? uploadsBlocking
+                  : morphMode === 'cancel' ? false
+                  : true
+                }
+                data-tooltip={morphMode === 'send' && uploadsBlocking ? 'Waiting for image upload…' : undefined}
+              >
+                {morphMode === 'canceling' ? 'Cancel...'
+                  : morphMode === 'cancel' ? 'Cancel'
+                  : 'Send'}
+              </button>
+            )}
           </div>
         </div>
       </div>

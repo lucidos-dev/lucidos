@@ -32,7 +32,8 @@ Use these — never hardcode the raw values:
 | `--z-sticky` | `200` | Sticky headers, drawer overlays |
 | `--z-drawer` | `300` | Side drawers |
 | `--z-modal` | `2000` | Modal overlays |
-| `--z-toast` | `2100` | Toast notifications |
+| `--z-control-panel` | `2200` | Floating header items (brand, route panel, collapsed thread actions) |
+| `--z-toast` | `2400` | Toast notifications (must sit above `.restart-overlay` at `--z-control-panel + 100`) |
 | `--z-tooltip` | `10000` | Tooltips |
 
 Raw z-index values 1-10 are fine for local stacking contexts within a component. Anything higher must use a token.
@@ -44,6 +45,7 @@ Raw z-index values 1-10 are fine for local stacking contexts within a component.
 | `--duration-fast` | `0.15s` | Hover feedback, small toggles |
 | `--duration-normal` | `0.2s` | State changes, color transitions |
 | `--duration-slow` | `0.3s` | Layout animations, slide-ins |
+| `--duration-emphasis` | `0.5s` | Deliberate state-change cues users must register (rare — reach for normal/slow first) |
 
 ### Icon Sizes
 

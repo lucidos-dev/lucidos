@@ -34,7 +34,6 @@ import {
   focusThread,
   unfocusThread,
   handleSaveThread,
-  handleUnsaveThread,
   handleArchiveThread,
 } from './threads';
 import { scrolledUp, notAtTop, getResizeMode } from '../../components/chat/scrollState';
@@ -50,7 +49,6 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
   fetchThreadMessages: vi.fn(),
   saveThread: vi.fn().mockResolvedValue(undefined),
-  unsaveThread: vi.fn().mockResolvedValue(undefined),
   archiveThread: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -95,7 +93,7 @@ function makeThreadState(id: string, overrides: MakeThreadOverrides = {}): Threa
   if (composeText !== undefined || composeImages !== undefined || composeMode !== undefined) {
     setDraft(id, {
       text: composeText ?? '',
-      images: composeImages ?? [],
+      image_hashes: composeImages ?? [],
       mode: composeMode ?? null,
     });
   }
@@ -362,7 +360,7 @@ describe('focusedThreadId persistence', () => {
 });
 
 // ---------------------------------------------------------------------------
-// handleSaveThread / handleUnsaveThread
+// handleSaveThread
 // ---------------------------------------------------------------------------
 
 describe('handleSaveThread', () => {
@@ -374,18 +372,6 @@ describe('handleSaveThread', () => {
     await handleSaveThread('t1');
 
     expect(threadMap.value.get('t1')!.meta.saved).toBe(true);
-  });
-});
-
-describe('handleUnsaveThread', () => {
-  it('sets saved to false in threadMap', async () => {
-    const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', { meta: { id: 't1', title: 'Thread t1', channel: 'chat', saved: true, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 } }));
-    threadMap.value = map;
-
-    await handleUnsaveThread('t1');
-
-    expect(threadMap.value.get('t1')!.meta.saved).toBe(false);
   });
 });
 
@@ -724,7 +710,7 @@ describe('loadAllThreads — compose preservation', () => {
 
     await loadAllThreads();
 
-    expect(getDraft('t1').images).toEqual(['local-img-base64']);
+    expect(getDraft('t1').image_hashes).toEqual(['local-img-base64']);
     unfocusPrompt();
   });
 
@@ -777,14 +763,14 @@ describe('loadAllThreads — compose preservation', () => {
     unfocusPrompt(); // PHPicker took focus away from the textarea
 
     // User just attached an image — optimistic update committed, PUT debounced
-    updateCompose('t1', { images: ['attached-img-base64'] });
+    updateCompose('t1', { image_hashes: ['attached-img-base64'] });
 
     // Server's last persisted state is still empty (PUT hasn't been sent yet)
     mockComposeApiResponse('t1', '', []);
 
     try {
       await loadAllThreads();
-      expect(getDraft('t1').images).toEqual(['attached-img-base64']);
+      expect(getDraft('t1').image_hashes).toEqual(['attached-img-base64']);
     } finally {
       // Clean up the entries the real updateCompose put there. The 250ms timer
       // it also scheduled will still fire after this test, but pushNow's
@@ -850,7 +836,7 @@ describe('loadAllThreads — compose preservation', () => {
       const loadPromise = loadAllThreads();
 
       // User attaches an image. updateCompose: optimistic + pending mark + 250ms timer.
-      updateCompose('t1', { images: ['attached-img-base64'] });
+      updateCompose('t1', { image_hashes: ['attached-img-base64'] });
       expect(pendingComposePuts.has('t1')).toBe(true);
 
       // Wait for the 250ms debounce + pushNow's await to drain. After this,
@@ -863,7 +849,7 @@ describe('loadAllThreads — compose preservation', () => {
       await loadPromise;
 
       // Bug: stale loadAllThreads overwrites composeImages with []. Preview disappears.
-      expect(getDraft('t1').images).toEqual(['attached-img-base64']);
+      expect(getDraft('t1').image_hashes).toEqual(['attached-img-base64']);
     } finally {
       // updateCompose stamps composeEditedAt; clear so the next test using 't1'
       // sees a clean slate (the 'cross-device sync still works' test would

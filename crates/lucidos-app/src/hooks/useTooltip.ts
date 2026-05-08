@@ -1,6 +1,24 @@
 import { useEffect } from 'preact/hooks';
 import { clampToViewportX } from '../utils/dom';
 
+/** Pure decision: is the tooltip text redundant against what the user already
+ *  sees? When the tooltip just repeats the element's visible text and that
+ *  text is fully visible (not CSS-truncated), there's nothing to add — the
+ *  global system suppresses it. Truncated text keeps the tooltip so mobile
+ *  tap-to-reveal still works for long titles, file names, etc. */
+export function isRedundantTooltip(visibleText: string, tooltipText: string, isTruncated: boolean): boolean {
+  if (isTruncated) return false;
+  return tooltipText.trim().toLowerCase() === visibleText.trim().toLowerCase();
+}
+
+function shouldSuppress(target: HTMLElement): boolean {
+  const text = target.getAttribute('data-tooltip');
+  if (!text) return false;
+  const visible = target.textContent || '';
+  const truncated = target.scrollWidth > target.clientWidth || target.scrollHeight > target.clientHeight;
+  return isRedundantTooltip(visible, text, truncated);
+}
+
 /**
  * Global tooltip system using event delegation.
  * Replaces CSS ::after tooltips to support mouse-centered positioning
@@ -117,7 +135,11 @@ export function useTooltip() {
       hide();
       currentTarget = target;
       showTimer = window.setTimeout(() => {
-        if (currentTarget === target) position(target, e.clientX, e.clientY);
+        if (currentTarget !== target) return;
+        // Clear currentTarget when suppressing so a later mouseout doesn't
+        // try to hide() a tooltip we never showed.
+        if (shouldSuppress(target)) { currentTarget = null; return; }
+        position(target, e.clientX, e.clientY);
       }, 300);
     }
 
@@ -147,6 +169,7 @@ export function useTooltip() {
       // Elements with data-tooltip-tap opt into tap-to-show on touch devices
       const target = findTarget(e.target);
       if (target?.hasAttribute('data-tooltip-tap')) {
+        if (shouldSuppress(target)) return;
         const touch = e.touches[0];
         currentTarget = target;
         position(target, touch.clientX, touch.clientY);

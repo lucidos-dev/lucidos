@@ -78,7 +78,7 @@ describe('input mode toggle visibility', () => {
 let nextId = 0;
 function makeComposingThread(composeMode: ComposeChannelMode, channel: ThreadMeta['channel'] = 'chat') {
   const id = `tcm-${++nextId}`;
-  setDraft(id, { text: '', images: [], mode: composeMode });
+  setDraft(id, { text: '', image_hashes: [], mode: composeMode });
   return { meta: { id, state: 'composing' as const, channel } };
 }
 

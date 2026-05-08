@@ -25,6 +25,11 @@ pub struct Change {
     pub post_merge_sha: Option<String>,
     pub thread_title: Option<String>,
     pub commits: Vec<String>,
+    /// `true` when the originating CC turn ended in `ResponseFailed` —
+    /// the worktree state reflects partial work, not a deliberate
+    /// completion. The frontend reads this to surface a confirm-before-Apply
+    /// warning so the user knows they're about to land partial changes.
+    pub incomplete: bool,
 }
 
 /// One thread's contribution to the current restart-required toast: the
@@ -131,6 +136,7 @@ mod tests {
             post_merge_sha: None,
             thread_title: None,
             commits: vec![],
+            incomplete: false,
         }
     }
 

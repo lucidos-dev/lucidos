@@ -15,6 +15,10 @@ import './styles/mobile.css';
 import './styles/drawer.css';
 import './store/effects';
 
+if ('ontouchstart' in window || navigator.maxTouchPoints > 0) {
+  document.body.classList.add('is-touch');
+}
+
 installActionBtnBlurListener();
 
 render(<App />, document.getElementById('app')!);

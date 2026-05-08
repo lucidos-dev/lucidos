@@ -1,8 +1,31 @@
 use super::*;
 
+use crate::core::knowhow::{format_missing_knowhow_message, missing_knowhow_ids};
 use crate::core::PreferenceStore;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::triggers::{validate_script_extension, TriggerConfig, TriggerRun};
+
+/// Reject when an intent trigger references knowhow ids that don't resolve to a
+/// file. Without this, a typo or missing subdirectory prefix silently strips the
+/// knowhow at run time and the LLM never sees its instructions.
+fn validate_intent_knowhow(state: &AppState, run: &TriggerRun) -> Result<(), String> {
+    let TriggerRun::Intent { knowhow, .. } = run else {
+        return Ok(());
+    };
+    if knowhow.is_empty() {
+        return Ok(());
+    }
+    let missing = missing_knowhow_ids(
+        &state.engine.knowhow_dirs(),
+        state.engine.system_knowhow_dir(),
+        knowhow,
+    );
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format_missing_knowhow_message(&missing))
+    }
+}
 
 #[derive(Serialize)]
 pub struct TriggerInfo {
@@ -206,6 +229,11 @@ pub(super) async fn create_trigger(
         }
     }
 
+    // Validate referenced knowhow ids resolve to files
+    if let Err(e) = validate_intent_knowhow(&state, &run) {
+        return ApiResult::err(e);
+    }
+
     // Validate: at least one of cron or on_event must be provided
     let has_cron = !request.cron_expressions.is_empty();
     let on_event = request
@@ -313,12 +341,16 @@ pub(super) async fn update_trigger(
     // Validate run field if changing
     if let Some(ref run_val) = request.run {
         match serde_json::from_value::<TriggerRun>(run_val.clone()) {
-            Ok(TriggerRun::Script { ref path }) => {
-                if let Err(e) = validate_script_extension(path) {
+            Ok(parsed_run) => {
+                if let TriggerRun::Script { ref path } = parsed_run {
+                    if let Err(e) = validate_script_extension(path) {
+                        return ApiResult::err(e);
+                    }
+                }
+                if let Err(e) = validate_intent_knowhow(&state, &parsed_run) {
                     return ApiResult::err(e);
                 }
             }
-            Ok(_) => {}
             Err(_) => return ApiResult::err("Invalid 'run' field"),
         }
     }

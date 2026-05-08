@@ -135,8 +135,13 @@ fn all_scenarios_pass() {
                 } else {
                     ThreadStatus::Idle
                 };
-                let actions =
-                    resolve_actions(thread_type, status, current_section, has_pending_changes);
+                let actions = resolve_actions(
+                    thread_type,
+                    status,
+                    current_section,
+                    has_pending_changes,
+                    false,
+                );
                 let action_strs: Vec<String> = actions
                     .iter()
                     .map(|a| match a {

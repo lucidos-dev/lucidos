@@ -127,6 +127,10 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "ThreadSaved" | "ThreadUnsaved" => EventClass::Metadata,
         // Compose lifecycle — orthogonal to the section/status machinery.
         "ThreadStarted" | "ThreadDiscarded" => EventClass::Metadata,
+        // ImageUploaded — passive bookkeeping for content-addressed blob
+        // uploads. Doesn't change thread status or surface section. The
+        // SSE broadcast lets peer devices prefetch; no display impact.
+        "ImageUploaded" => EventClass::Metadata,
         // Start
         "MessageReceived" | "TriggerStarted" => EventClass::Start,
         "CodingAgentUserMessageSent" | "UserPromptInjected" => EventClass::Start,
@@ -137,6 +141,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "MergeConflictDetected" | "MissingHardeningDetected" => EventClass::Start,
         // Activity
         "TextStreamed" | "Thinking" | "MemorySearched" => EventClass::Activity,
+        "ContextTokensMeasured" => EventClass::Metadata,
         "ToolCalled" | "ToolResult" => EventClass::Activity,
         "CodingAgentTextStreamed" | "CodingAgentToolCalled" | "CodingAgentToolResult" => {
             EventClass::Activity
@@ -186,6 +191,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "MessageReceived",
         "TextStreamed",
         "Thinking",
+        "ContextTokensMeasured",
         "MemorySearched",
         "ToolCalled",
         "ToolResult",
@@ -211,6 +217,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ThreadArchived",
         "ThreadStarted",
         "ThreadDiscarded",
+        "ImageUploaded",
         "TriggerStarted",
         "TriggerCompleted",
         "ChangeProposed",
@@ -367,6 +374,7 @@ pub fn resolve_transition(
         "MessageReceived"
         | "TextStreamed"
         | "Thinking"
+        | "ContextTokensMeasured"
         | "MemorySearched"
         | "ToolCalled"
         | "ToolResult"
@@ -388,6 +396,10 @@ pub fn resolve_transition(
         // Compose lifecycle — orthogonal to section/status machinery.
         | "ThreadStarted"
         | "ThreadDiscarded"
+        // ImageUploaded — passive audit event for content-addressed blob
+        // uploads. Same orthogonality as ThreadStarted/Discarded: no
+        // section change, no status change, just a record of the attach.
+        | "ImageUploaded"
         // WorktreeCleaned is a passive bookkeeping event emitted by the
         // background cleanup worker (Phase 10.2). It must NOT bump the thread
         // out of HISTORY or change status — that's the whole point of cleanup
@@ -453,6 +465,7 @@ pub fn resolve_actions(
     status: ThreadStatus,
     stored_section: ArchiveState,
     has_pending_changes: bool,
+    is_saved: bool,
 ) -> Vec<Action> {
     // Mid-turn: nothing to dismiss; QuestionCard owns the input. Apply/Discard
     // would commit incomplete work, so this branch must run BEFORE the
@@ -468,6 +481,10 @@ pub fn resolve_actions(
     // buttons.
     if has_pending_changes && thread_type == ThreadType::CodingAgent {
         return vec![Action::Discard, Action::Apply];
+    }
+    // Saved threads render Archive via PromptInput.getPromptSectionButtons.
+    if is_saved {
+        return vec![];
     }
     if stored_section != ArchiveState::Inbox {
         return vec![];

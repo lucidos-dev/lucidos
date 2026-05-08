@@ -73,8 +73,12 @@ export function unfocusThread(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Save/unsave
+// Save / Unsave
 // ---------------------------------------------------------------------------
+// Save is offered on Review/Archive sections at idle. Unsave is offered on
+// the Saved section mid-turn — the only way to drop a running thread out of
+// Saved without canceling it. Confirm before unsave so a stray click doesn't
+// cost the parking spot.
 
 function updateThreadMeta(threadId: string, patch: Partial<{ saved: boolean }>): void {
   const map = new Map(threadMap.value);
@@ -85,25 +89,34 @@ function updateThreadMeta(threadId: string, patch: Partial<{ saved: boolean }>):
   }
 }
 
-async function toggleSave(threadId: string, saved: boolean): Promise<void> {
+export async function handleSaveThread(threadId: string): Promise<void> {
   const thread = threadMap.value.get(threadId);
-  if (!thread || thread.meta.saved === saved) return;
+  if (!thread || thread.meta.saved) return;
 
-  updateThreadMeta(threadId, { saved });
+  updateThreadMeta(threadId, { saved: true });
   try {
-    await (saved ? saveThread : unsaveThread)(threadId);
+    await saveThread(threadId);
   } catch (e) {
-    updateThreadMeta(threadId, { saved: !saved });
-    showToast(`Failed to ${saved ? 'save' : 'unsave'} thread: ${errorDetail(e)}`, 'error');
+    updateThreadMeta(threadId, { saved: false });
+    showToast(`Failed to save thread: ${errorDetail(e)}`, 'error');
   }
 }
 
-export function handleSaveThread(threadId: string): Promise<void> {
-  return toggleSave(threadId, true);
-}
+export async function handleUnsaveThread(threadId: string): Promise<void> {
+  const thread = threadMap.value.get(threadId);
+  if (!thread || !thread.meta.saved) return;
 
-export function handleUnsaveThread(threadId: string): Promise<void> {
-  return toggleSave(threadId, false);
+  if (!await showConfirm('Remove this thread from the Saved section?', 'Remove')) {
+    return;
+  }
+
+  updateThreadMeta(threadId, { saved: false });
+  try {
+    await unsaveThread(threadId);
+  } catch (e) {
+    updateThreadMeta(threadId, { saved: true });
+    showToast(`Failed to unsave thread: ${errorDetail(e)}`, 'error');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,21 +138,14 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
   if (archivingThreadIds.value.has(threadId)) return;
   if (discardingCCThreadIds.value.has(threadId)) return; // Can't archive while discarding
 
-  // Archiving a saved thread is destructive of intent: it both unsaves (the
-  // user's "I'll manage this manually" gesture) and sends the thread to
-  // long-term storage. Confirm before doing both at once.
+  // Archive is the only exit from Saved — confirm before dropping the row out
+  // of its parking spot. The ThreadArchived projection clears is_saved.
   const thread = threadMap.value.get(threadId);
   if (thread?.meta.saved) {
     if (!await showConfirm(
-      'Remove this thread from the Saved section and archive it?',
+      'Are you sure you want to move this thread to the archive?',
       'Archive',
     )) {
-      return;
-    }
-    try {
-      await unsaveThread(threadId);
-    } catch (e) {
-      showToast(`Failed to unsave thread: ${errorDetail(e)}`, 'error');
       return;
     }
   }

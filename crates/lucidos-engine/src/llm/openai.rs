@@ -875,9 +875,10 @@ impl OpenAiProvider {
         LlmResponse {
             content: final_content,
             tool_calls,
-            // TODO: capture finish_reason from streamed chunks
+            // TODO: capture finish_reason and usage from streamed chunks
             stop_reason: None,
             output_tokens: None,
+            input_tokens: None,
             thinking_chars: None,
         }
     }

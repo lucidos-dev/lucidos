@@ -9,7 +9,7 @@ fn bus_event_variants_are_constructable() {
         thread_id: Uuid::new_v4(),
         event: ThreadEvent::MessageReceived {
             text: "hello".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -151,7 +151,7 @@ fn thread_event_sse_json_has_seq_and_event_id() {
             thread_id: tid,
             event: ThreadEvent::MessageReceived {
                 text: "hello".into(),
-                images: vec![],
+                user_image_hashes: vec![],
                 device_id: None,
                 device: None,
                 image_description: None,
@@ -191,7 +191,7 @@ fn thread_event_sse_json_includes_meta_channel() {
             thread_id: tid,
             event: ThreadEvent::MessageReceived {
                 text: "fix bug".into(),
-                images: vec![],
+                user_image_hashes: vec![],
                 device_id: None,
                 device: None,
                 image_description: None,
@@ -228,7 +228,7 @@ fn thread_event_sse_json_omits_channel_when_none() {
             thread_id: tid,
             event: ThreadEvent::MessageReceived {
                 text: "hello".into(),
-                images: vec![],
+                user_image_hashes: vec![],
                 device_id: None,
                 device: None,
                 image_description: None,
@@ -1019,6 +1019,7 @@ fn coding_agent_idled_is_last_event_after_change_proposed() {
             branch_name: String::new(),
             repo_root: String::new(),
             hardened: false,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -1078,7 +1079,7 @@ async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uui
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
             text: "do something".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -1101,7 +1102,7 @@ async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uui
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
             text: "child task".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -1161,7 +1162,7 @@ async fn test_fan_out_parent_callback() {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
             text: "do three things".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -1186,7 +1187,7 @@ async fn test_fan_out_parent_callback() {
             thread_id: cid,
             event: ThreadEvent::MessageReceived {
                 text: format!("task {}", i + 1),
-                images: vec![],
+                user_image_hashes: vec![],
                 device_id: None,
                 device: None,
                 image_description: None,
@@ -1321,7 +1322,7 @@ async fn test_fan_out_chat_children_all_report_back() {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
             text: "research crypto sectors".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -1346,7 +1347,7 @@ async fn test_fan_out_chat_children_all_report_back() {
             thread_id: cid,
             event: ThreadEvent::MessageReceived {
                 text: format!("research sector {}", i + 1),
-                images: vec![],
+                user_image_hashes: vec![],
                 device_id: None,
                 device: None,
                 image_description: None,
@@ -1438,7 +1439,7 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
             text: "research something".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -1462,7 +1463,7 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
             text: "do subtask".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -1558,7 +1559,7 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
             text: "research something".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -1582,7 +1583,7 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
             text: "do subtask".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -1702,7 +1703,7 @@ async fn test_session_started_updates_source_in_projection() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "fix something".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -1779,7 +1780,7 @@ async fn test_session_started_does_not_update_last_activity() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "fix it".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -1857,7 +1858,7 @@ async fn test_session_ended_transitions_to_terminal_status() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "fix it".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -1937,7 +1938,7 @@ async fn test_session_ended_stale_resume_keeps_status_running() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "include the ios suite too".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -2028,7 +2029,7 @@ async fn test_permission_request_transitions_status_to_waiting_for_user_answer()
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "edit my skill".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -2141,7 +2142,7 @@ async fn test_session_started_stores_repo_id() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "analyze this repo".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -2231,7 +2232,7 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
             text: "parent task".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -2255,7 +2256,7 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
             text: "child task".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -2652,7 +2653,7 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
             text: "do something".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -2685,7 +2686,7 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
             text: "child task".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -2734,7 +2735,7 @@ async fn test_section_inbox_on_child_complete() {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
             text: "parent task".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -2758,7 +2759,7 @@ async fn test_section_inbox_on_child_complete() {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
             text: "child task".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -2831,7 +2832,7 @@ async fn test_section_marked_read() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "hello".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -3065,7 +3066,7 @@ async fn trigger_followup_response_goes_to_review() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "Can you elaborate on the report?".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -3120,7 +3121,7 @@ fn message_received_destructures_parent_thread_id() {
 
     let event = ThreadEvent::MessageReceived {
         text: "fan-out message".into(),
-        images: vec![],
+        user_image_hashes: vec![],
         device_id: None,
         device: None,
         image_description: None,
@@ -3166,7 +3167,7 @@ fn message_received_destructures_parent_thread_id() {
     // Verify None parent_thread_id doesn't appear in SSE JSON
     let event_no_parent = ThreadEvent::MessageReceived {
         text: "follow-up".into(),
-        images: vec![],
+        user_image_hashes: vec![],
         device_id: None,
         device: None,
         image_description: None,
@@ -3202,7 +3203,7 @@ async fn emit_thread_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uui
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: text.into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -3459,7 +3460,7 @@ async fn response_aborted_surfaces_chat_thread_to_inbox() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "fix the bug".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -3540,7 +3541,7 @@ async fn response_canceled_sets_has_response_true() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "fix the bug".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -3758,7 +3759,7 @@ async fn test_valid_request_event_id_accepted() {
             thread_id,
             event: ThreadEvent::MessageReceived {
                 text: "fix this".into(),
-                images: vec![],
+                user_image_hashes: vec![],
                 device_id: None,
                 device: None,
                 image_description: None,
@@ -3837,7 +3838,7 @@ async fn test_automated_prompt_creates_valid_origin() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "initial".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -3934,7 +3935,7 @@ async fn empty_coding_agent_prompt_sent_does_not_flip_status_to_running() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "do the thing".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -4099,7 +4100,7 @@ async fn cc_follow_up_after_exit_resumes_via_db() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "follow-up message".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -4295,6 +4296,7 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
             branch_name: String::new(),
             repo_root: String::new(),
             hardened: false,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -4384,6 +4386,7 @@ async fn change_applied_keeps_inbox_shows_archive() {
             branch_name: String::new(),
             repo_root: String::new(),
             hardened: false,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -4472,6 +4475,7 @@ async fn change_discarded_keeps_inbox_shows_archive() {
             branch_name: String::new(),
             repo_root: String::new(),
             hardened: false,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -4531,6 +4535,7 @@ async fn apply_then_archive_moves_to_history() {
             branch_name: String::new(),
             repo_root: String::new(),
             hardened: false,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -4911,6 +4916,56 @@ async fn thread_archived_clears_cc_flags_and_goes_idle() {
     teardown_test_db(&db_name).await;
 }
 
+#[tokio::test]
+async fn thread_archived_clears_is_saved() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    start_cc_session(&bus, thread_id, "claude-code/feat").await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadSaved,
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let saved: bool = sqlx::query_scalar(
+        "SELECT is_saved FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(saved, "ThreadSaved must set is_saved=true");
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadArchived,
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let (saved, state): (bool, String) = sqlx::query_as(
+        "SELECT is_saved, state FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !saved,
+        "ThreadArchived must clear is_saved so the row leaves the Saved section"
+    );
+    assert_eq!(state, "archived", "ThreadArchived must set state='archived'");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Archive click invariant: ThreadArchived must emit LAST, after any trailing
 /// CodingAgentIdled from CC cleanup, or the lifecycle side effect re-marks the
 /// thread to inbox and the archive is silently undone.
@@ -5224,6 +5279,7 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
                 branch_name: String::new(),
                 repo_root: String::new(),
                 hardened: false,
+                incomplete: false,
                 path: String::new(),
                 diff: String::new(),
             },
@@ -5477,7 +5533,7 @@ async fn initiator_user_chat() {
         thread_id: tid,
         event: ThreadEvent::MessageReceived {
             text: "hello".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -5577,7 +5633,7 @@ async fn initiator_inherited_system_to_cc_child() {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
             text: "run e2e tests".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -5628,7 +5684,7 @@ async fn initiator_inherited_user_to_cc_child() {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
             text: "help me".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -5652,7 +5708,7 @@ async fn initiator_inherited_user_to_cc_child() {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
             text: "fix the bug".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -5697,7 +5753,7 @@ async fn initiator_from_message_source_field() {
         thread_id: tid,
         event: ThreadEvent::MessageReceived {
             text: "system message".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -5760,7 +5816,7 @@ async fn initiator_preserved_on_session_started_upsert() {
         thread_id: cc_thread_id,
         event: ThreadEvent::MessageReceived {
             text: "run tests".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -5824,7 +5880,7 @@ async fn spawning_event_id_persists_for_system_spawn() {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
             text: "spawn a child".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -5847,7 +5903,7 @@ async fn spawning_event_id_persists_for_system_spawn() {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
             text: "do work".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -5983,6 +6039,7 @@ async fn cc_idle_no_changes_from_inbox_stays_inbox() {
             branch_name: String::new(),
             repo_root: String::new(),
             hardened: false,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -6041,7 +6098,7 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
             text: "dispatch work".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -6067,7 +6124,7 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
             thread_id: child_id,
             event: ThreadEvent::MessageReceived {
                 text: format!("child task {}", i),
-                images: vec![],
+                user_image_hashes: vec![],
                 device_id: None,
                 device: None,
                 image_description: None,
@@ -6327,7 +6384,7 @@ async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "fix the bug".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -6437,7 +6494,7 @@ async fn test_cc_text_streamed_after_idled_bumps_status_back_to_running() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "do work".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -6518,7 +6575,7 @@ async fn emit_with_existing_event_id_fails_with_pkey_violation() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "first".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,
@@ -6760,6 +6817,81 @@ async fn thread_started_with_lucidos_mode_sets_source_to_chat() {
     teardown_test_db(&db_name).await;
 }
 
+/// Regression for the "Failed to send message: 409" toast on a draft whose
+/// stale `source` no longer matches the actual send. A composing thread that
+/// toggled mode to CC and back to Lucidos lands in `thread_summaries` with
+/// `source='claude_code'` (PUT compose CASE writes it). When the user clicks
+/// Send the chat handler now (correctly) skips the continuity check for
+/// composing threads — but the projection still has to overwrite the lagged
+/// source, otherwise the thread renders as Claude Code in the drawer pill
+/// despite having been sent via Lucidos.
+#[tokio::test]
+async fn message_received_overrides_stale_compose_source_on_composing_to_active() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    // Draft toggled CC at some point — source now claims claude_code.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadStarted {
+            mode: "claude_code".into(),
+            actor: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let pre_source: String =
+        sqlx::query_scalar("SELECT source FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pre_source, "claude_code", "draft source seeded as claude_code");
+
+    // User toggled back to Lucidos and sent — MessageReceived arrives on the
+    // chat channel. The projection must overwrite the stale source.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "send via lucidos".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let (state, source): (String, String) =
+        sqlx::query_as("SELECT state, source FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "active");
+    assert_eq!(
+        source, "chat",
+        "composing → active must adopt the actual send's channel, got {source}"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Regression: `register_thread_queued`'s 60s eviction used to leak a
 /// `ResponseCanceled` (no actor) onto the evicted thread because the
 /// downstream cancel arms read `is_shutdown=false` and defaulted to
@@ -6782,7 +6914,7 @@ async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             text: "first message".into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,

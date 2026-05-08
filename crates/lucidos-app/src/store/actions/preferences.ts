@@ -4,6 +4,7 @@ import { getPreferences, setPreference } from '../../api/client';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
 import { MODELS, REASONING_LEVELS, clampReasoningEffort, DEFAULT_CHAT_MODEL } from '../models';
+import { isIOS } from '../../utils/platform';
 
 export type Theme = 'light' | 'dark' | 'system';
 export type FontFamily = 'monospace' | 'system' | 'inter' | 'jetbrains-mono' | 'ibm-plex-mono';
@@ -30,12 +31,13 @@ const GOOGLE_FONT_URLS: Partial<Record<FontFamily, string>> = {
 
 const loadedFonts = new Set<string>();
 
-// Seeded from currentTheme() so loadPreferences can skip the no-op applyTheme
-// when the stored value is unchanged. We deliberately do NOT install a
-// matchMedia 'change' listener for system mode: iOS WKWebView fires those
-// events with the wrong value at random moments, briefly flipping the page.
-// system mode resolves once per page load (FOUC + initial applyTheme).
+let systemThemeQuery: MediaQueryList | null = null;
+// Seeded so loadPreferences can skip a no-op applyTheme when unchanged.
 let lastAppliedTheme: Theme = currentTheme();
+// Module-init install: loadPreferences skips applyTheme when the stored
+// theme already matches lastAppliedTheme, so without this call a user with
+// `system` set would never get the OS-change listener attached.
+syncSystemThemeListener(lastAppliedTheme);
 
 // --- Generic helpers ---
 
@@ -139,7 +141,26 @@ export function applyTheme(theme: Theme): void {
 
   document.documentElement.style.colorScheme = resolved;
 
+  syncSystemThemeListener(theme);
   lastAppliedTheme = theme;
+}
+
+// iOS WKWebView fires prefers-color-scheme change events with wrong values
+// at random moments (telemetry-confirmed: 24+ flashes in one session), so the
+// listener is skipped there and `system` mode resolves once per page load.
+function syncSystemThemeListener(theme: Theme): void {
+  if (systemThemeQuery) {
+    systemThemeQuery.removeEventListener('change', onSystemThemeChange);
+    systemThemeQuery = null;
+  }
+  if (theme === 'system' && !isIOS()) {
+    systemThemeQuery = window.matchMedia('(prefers-color-scheme: light)');
+    systemThemeQuery.addEventListener('change', onSystemThemeChange);
+  }
+}
+
+function onSystemThemeChange(): void {
+  applyTheme('system');
 }
 
 export function currentTheme(): Theme {

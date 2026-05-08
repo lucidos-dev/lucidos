@@ -11,7 +11,13 @@ use crate::memory::{cosine_similarity, EmbeddingProvider};
 pub const SYSTEM_KNOWHOW_PREFIX: &str = "system-knowhow/";
 
 /// Bundles the user-curated knowhow search directories.
-/// Priority (highest wins): local > shared.
+/// Priority (highest wins): local > shared > apps.
+///
+/// `apps` is the workspace's `data/apps/` root. App-scoped knowhow ids of the
+/// form `<app_id>/<rest>` resolve to `<apps>/<app_id>/knowhow/<rest>.md` as the
+/// last fallback — bare-id local + shared still win when both exist. The
+/// engine surfaces app-scoped ids in the system prompt's Know-how list, so
+/// validators and loaders that work with `KnowhowDirs` must accept them.
 ///
 /// Engine-shipped reference knowhow lives in `<repo>/system-knowhow/` and is
 /// loaded separately via [`crate::core::SystemKnowhowStore`] — it cannot be
@@ -19,6 +25,7 @@ pub const SYSTEM_KNOWHOW_PREFIX: &str = "system-knowhow/";
 pub struct KnowhowDirs {
     pub shared: Option<PathBuf>,
     pub local: PathBuf,
+    pub apps: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,50 +246,154 @@ impl KnowhowStore {
     }
 
     /// Load full content for a specific know-how file.
-    /// Priority (highest wins): local > shared.
+    /// Priority (highest wins): local > shared > app-scoped.
+    /// App-scoped: an id of the form `<app_id>/<rest>` falls back to
+    /// `<apps>/<app_id>/knowhow/<rest>.md` — only consulted if the bare id
+    /// matched neither local nor shared, so a top-level file with the same
+    /// id-shape always wins.
     pub fn load_with_fallback(dirs: &KnowhowDirs, id: &str) -> Option<Knowhow> {
-        Self::load(&dirs.local, id).or_else(|| {
-            dirs.shared
-                .as_deref()
-                .and_then(|shared| Self::load(shared, id))
-        })
+        Self::load(&dirs.local, id)
+            .or_else(|| {
+                dirs.shared
+                    .as_deref()
+                    .and_then(|shared| Self::load(shared, id))
+            })
+            .or_else(|| {
+                let path = app_scoped_knowhow_path(dirs.apps.as_deref()?, id)?;
+                read_knowhow_file(&path, id)
+            })
     }
 
     /// Load full content for a specific know-how file.
     /// The id may contain forward slashes for files in subdirectories (e.g., "lucidos/cross-workspace").
     pub fn load(knowhow_dir: &Path, id: &str) -> Option<Knowhow> {
-        // Validate: no path traversal
-        if id.contains("..") || id.starts_with('/') || id.starts_with('\\') {
+        if !is_safe_id(id) {
             log!("[Knowhow] Invalid id (path traversal): {}", id);
             return None;
         }
         let path = knowhow_dir.join(format!("{}.md", id));
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) => {
-                log!("[Knowhow] Failed to read {}: {}", path.display(), e);
-                return None;
-            }
-        };
-
-        let (name, description, content) = match parse_frontmatter(&text) {
-            Some(parsed) => parsed,
-            None => {
-                log!(
-                    "[Knowhow] Missing or invalid frontmatter in {}",
-                    path.display()
-                );
-                return None;
-            }
-        };
-
-        Some(Knowhow {
-            id: id.to_string(),
-            name,
-            description,
-            content,
-        })
+        read_knowhow_file(&path, id)
     }
+}
+
+/// Read+parse a single knowhow file at `path` and stamp `id` onto the result.
+/// Used by both the dir+id path ([`KnowhowStore::load`]) and the app-scoped
+/// fallback that resolves to a fully built path with a different id-shape.
+fn read_knowhow_file(path: &Path, id: &str) -> Option<Knowhow> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            log!("[Knowhow] Failed to read {}: {}", path.display(), e);
+            return None;
+        }
+    };
+    let (name, description, content) = match parse_frontmatter(&text) {
+        Some(parsed) => parsed,
+        None => {
+            log!(
+                "[Knowhow] Missing or invalid frontmatter in {}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    Some(Knowhow {
+        id: id.to_string(),
+        name,
+        description,
+        content,
+    })
+}
+
+/// Format the user-facing error for a "knowhow id doesn't resolve" failure.
+/// Shared between the HTTP trigger handler and the LLM `create_trigger` /
+/// `update_trigger` tool so the wording stays in lockstep across surfaces.
+pub fn format_missing_knowhow_message(missing: &[String]) -> String {
+    format!(
+        "Knowhow not found: {}. IDs are paths under data/knowhow/ (or system-knowhow/) without .md \
+         — include subdirectories (e.g. lucidos-ops/nightly-pipeline-trigger).",
+        missing.join(", ")
+    )
+}
+
+/// Returns the subset of `ids` that do NOT resolve to an existing knowhow
+/// file. An empty Vec means every id resolves. Resolution mirrors
+/// [`load_knowhow_sections_merged`]: `system-knowhow/X` looks in `system_dir`,
+/// bare ids fall back local → shared, then `<app>/<rest>` ids fall back to
+/// the workspace's `apps/<app>/knowhow/<rest>.md`.
+///
+/// Order is preserved so callers can show users the offending ids verbatim.
+/// Existence-only — never reads file bodies — so it's cheap on the trigger
+/// fire path and the LLM tool turn.
+pub fn missing_knowhow_ids(
+    dirs: &KnowhowDirs,
+    system_dir: Option<&Path>,
+    ids: &[String],
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for id in ids {
+        if !id_resolves(dirs, system_dir, id) {
+            missing.push(id.clone());
+        }
+    }
+    missing
+}
+
+/// Same path-traversal guard as [`KnowhowStore::load`]; ids that fail this
+/// can never resolve to a real file regardless of which dir we look in.
+fn is_safe_id(id: &str) -> bool {
+    !id.contains("..") && !id.starts_with('/') && !id.starts_with('\\')
+}
+
+/// Resolve `<app_id>/<rest>` to `<apps>/<app_id>/knowhow/<rest>.md`. Returns
+/// `None` for ids that aren't app-scoped (no `/`), have empty segments, or
+/// fail [`is_safe_id`]. Existence is NOT checked — callers do that.
+fn app_scoped_knowhow_path(apps_dir: &Path, id: &str) -> Option<PathBuf> {
+    if !is_safe_id(id) {
+        return None;
+    }
+    let (app_id, rest) = id.split_once('/')?;
+    // `rest` must also pass the path-traversal guard: an absolute or
+    // backslash-prefixed `rest` would let `Path::join` replace the apps_dir
+    // prefix and escape to the filesystem root (e.g. `foo//bar` splits to
+    // ("foo", "/bar"), and `apps_dir.join("/bar.md")` becomes `/bar.md`).
+    if app_id.is_empty() || rest.is_empty() || !is_safe_id(rest) {
+        return None;
+    }
+    Some(
+        apps_dir
+            .join(app_id)
+            .join("knowhow")
+            .join(format!("{}.md", rest)),
+    )
+}
+
+fn id_resolves(dirs: &KnowhowDirs, system_dir: Option<&Path>, id: &str) -> bool {
+    if !is_safe_id(id) {
+        return false;
+    }
+    if let Some(sys_id) = id.strip_prefix(SYSTEM_KNOWHOW_PREFIX) {
+        return system_dir
+            .map(|dir| dir.join(format!("{}.md", sys_id)).is_file())
+            .unwrap_or(false);
+    }
+    let filename = format!("{}.md", id);
+    if dirs.local.join(&filename).is_file() {
+        return true;
+    }
+    if dirs
+        .shared
+        .as_deref()
+        .map(|s| s.join(&filename).is_file())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    dirs.apps
+        .as_deref()
+        .and_then(|apps| app_scoped_knowhow_path(apps, id))
+        .map(|p| p.is_file())
+        .unwrap_or(false)
 }
 
 /// Load referenced know-how for LLM context.
@@ -735,6 +846,19 @@ mod tests {
         KnowhowDirs {
             shared: shared.map(|p| p.to_path_buf()),
             local: local.to_path_buf(),
+            apps: None,
+        }
+    }
+
+    fn dirs_with_apps(
+        shared: Option<&std::path::Path>,
+        local: &std::path::Path,
+        apps: &std::path::Path,
+    ) -> KnowhowDirs {
+        KnowhowDirs {
+            shared: shared.map(|p| p.to_path_buf()),
+            local: local.to_path_buf(),
+            apps: Some(apps.to_path_buf()),
         }
     }
 
@@ -949,5 +1073,262 @@ mod tests {
         let ids = vec!["system-knowhow/anything".to_string()];
         let sections = load_knowhow_sections_merged(&dirs(None, &local), None, &ids);
         assert_eq!(sections, "", "missing system_dir should drop system ids silently");
+    }
+
+    // --- missing_knowhow_ids ---
+
+    #[test]
+    fn missing_knowhow_ids_returns_empty_when_all_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        let system = tmp.path().join("system");
+        write_knowhow_file(&local.join("nested").join("foo.md"), "Foo", "Body.");
+        write_knowhow_file(&system.join("guide.md"), "Guide", "Sys body.");
+
+        let ids = vec![
+            "nested/foo".to_string(),
+            "system-knowhow/guide".to_string(),
+        ];
+        let missing = missing_knowhow_ids(&dirs(None, &local), Some(&system), &ids);
+        assert!(missing.is_empty(), "all ids should resolve, got: {:?}", missing);
+    }
+
+    #[test]
+    fn missing_knowhow_ids_flags_bare_id_in_subdirectory() {
+        // The reported bug: a knowhow at `lucidos-ops/nightly-pipeline-trigger.md`
+        // is referenced as `nightly-pipeline-trigger` (bare). The validator must
+        // catch this so the trigger save fails instead of 404ing later.
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        write_knowhow_file(
+            &local.join("lucidos-ops").join("nightly-pipeline-trigger.md"),
+            "Nightly",
+            "Body.",
+        );
+
+        let ids = vec!["nightly-pipeline-trigger".to_string()];
+        let missing = missing_knowhow_ids(&dirs(None, &local), None, &ids);
+        assert_eq!(missing, vec!["nightly-pipeline-trigger".to_string()]);
+    }
+
+    #[test]
+    fn missing_knowhow_ids_flags_missing_system_knowhow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        let system = tmp.path().join("system");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+
+        let ids = vec!["system-knowhow/does-not-exist".to_string()];
+        let missing = missing_knowhow_ids(&dirs(None, &local), Some(&system), &ids);
+        assert_eq!(missing, vec!["system-knowhow/does-not-exist".to_string()]);
+    }
+
+    #[test]
+    fn missing_knowhow_ids_preserves_input_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        write_knowhow_file(&local.join("real.md"), "Real", "Body.");
+
+        let ids = vec![
+            "ghost-1".to_string(),
+            "real".to_string(),
+            "ghost-2".to_string(),
+        ];
+        let missing = missing_knowhow_ids(&dirs(None, &local), None, &ids);
+        assert_eq!(missing, vec!["ghost-1".to_string(), "ghost-2".to_string()]);
+    }
+
+    #[test]
+    fn missing_knowhow_ids_falls_back_to_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        write_knowhow_file(&shared.join("only-shared.md"), "Only Shared", "Body.");
+
+        let ids = vec!["only-shared".to_string()];
+        let missing = missing_knowhow_ids(&dirs(Some(&shared), &local), None, &ids);
+        assert!(missing.is_empty(), "shared fallback should resolve, got: {:?}", missing);
+    }
+
+    // --- App-scoped knowhow resolution ---
+    //
+    // The reported bug: triggers reference knowhow ids of the form `<app>/<rest>`
+    // (e.g. `finn-jobs/finn-search-workflow`) which the engine surfaces in the
+    // system prompt's Know-how list. The validator and trigger fire path must
+    // resolve these against `<workspace>/data/apps/<app>/knowhow/<rest>.md` —
+    // not just the top-level local/shared dirs — or the trigger save fails and
+    // pre-existing rows error at fire time.
+
+    #[test]
+    fn missing_knowhow_ids_resolves_app_scoped_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let apps = tmp.path().join("apps");
+        write_knowhow_file(
+            &apps.join("finn-jobs").join("knowhow").join("finn-search-workflow.md"),
+            "Finn search workflow",
+            "How to search Finn.",
+        );
+
+        let ids = vec!["finn-jobs/finn-search-workflow".to_string()];
+        let missing = missing_knowhow_ids(&dirs_with_apps(None, &local, &apps), None, &ids);
+        assert!(
+            missing.is_empty(),
+            "app-scoped id should resolve, got: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn missing_knowhow_ids_flags_unknown_app_scoped_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let apps = tmp.path().join("apps");
+        std::fs::create_dir_all(&apps).unwrap();
+
+        let ids = vec!["finn-jobs/does-not-exist".to_string()];
+        let missing = missing_knowhow_ids(&dirs_with_apps(None, &local, &apps), None, &ids);
+        assert_eq!(missing, vec!["finn-jobs/does-not-exist".to_string()]);
+    }
+
+    #[test]
+    fn load_knowhow_sections_merged_loads_app_scoped_knowhow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let apps = tmp.path().join("apps");
+        write_knowhow_file(
+            &apps.join("morning-log").join("knowhow").join("morning-log-data.md"),
+            "Morning log data",
+            "Data layout for morning log.",
+        );
+
+        let ids = vec!["morning-log/morning-log-data".to_string()];
+        let sections = load_knowhow_sections_merged(
+            &dirs_with_apps(None, &local, &apps),
+            None,
+            &ids,
+        );
+        assert!(
+            !sections.is_empty(),
+            "app-scoped section should be loaded, got empty"
+        );
+        assert!(
+            sections.contains("Morning log data"),
+            "section should reference the file's name, got: {}",
+            sections
+        );
+        assert!(
+            sections.contains("Data layout for morning log."),
+            "section should include body, got: {}",
+            sections
+        );
+    }
+
+    #[test]
+    fn load_with_fallback_loads_app_scoped_knowhow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let apps = tmp.path().join("apps");
+        write_knowhow_file(
+            &apps.join("foo").join("knowhow").join("bar.md"),
+            "Foo Bar",
+            "Body.",
+        );
+
+        let kh =
+            KnowhowStore::load_with_fallback(&dirs_with_apps(None, &local, &apps), "foo/bar")
+                .expect("app-scoped id should load");
+        assert_eq!(kh.name, "Foo Bar");
+    }
+
+    #[test]
+    fn load_with_fallback_prefers_local_over_app_scoped() {
+        // If a top-level knowhow file shares the same id-shape as an app-scoped
+        // one (e.g. local has `foo/bar.md`, apps also has `foo/knowhow/bar.md`),
+        // the bare-id local match wins per the documented lookup order.
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        let apps = tmp.path().join("apps");
+        write_knowhow_file(&local.join("foo").join("bar.md"), "Local Foo Bar", "Local.");
+        write_knowhow_file(
+            &apps.join("foo").join("knowhow").join("bar.md"),
+            "App Foo Bar",
+            "App.",
+        );
+
+        let kh =
+            KnowhowStore::load_with_fallback(&dirs_with_apps(None, &local, &apps), "foo/bar")
+                .expect("should load");
+        assert_eq!(kh.name, "Local Foo Bar", "local must win over app-scoped");
+    }
+
+    #[test]
+    fn id_resolves_rejects_traversal_in_app_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let apps = tmp.path().join("apps");
+        // Even if the file existed, the path-traversal guard must reject `..`.
+        write_knowhow_file(
+            &apps.join("foo").join("knowhow").join("bar.md"),
+            "Foo Bar",
+            "Body.",
+        );
+
+        let ids = vec!["../escape/bar".to_string()];
+        let missing = missing_knowhow_ids(&dirs_with_apps(None, &local, &apps), None, &ids);
+        assert_eq!(missing, vec!["../escape/bar".to_string()]);
+    }
+
+    // app_scoped_knowhow_path is the security boundary — an absolute or
+    // backslash-prefixed `rest` segment would let `Path::join("/etc/passwd.md")`
+    // replace the apps_dir prefix and escape to the filesystem root. The
+    // outer is_safe_id only sees the full id (which doesn't start with `/`),
+    // so the splitter has to re-validate `rest`.
+
+    #[test]
+    fn app_scoped_path_rejects_double_slash_escape() {
+        // `foo//bar` splits to ("foo", "/bar"); `/bar.md` is absolute on Unix.
+        let apps = std::path::PathBuf::from("/tmp/lucidos-test/apps");
+        assert!(
+            app_scoped_knowhow_path(&apps, "foo//bar").is_none(),
+            "double-slash id must not produce a path",
+        );
+    }
+
+    #[test]
+    fn app_scoped_path_rejects_backslash_escape() {
+        let apps = std::path::PathBuf::from("/tmp/lucidos-test/apps");
+        assert!(
+            app_scoped_knowhow_path(&apps, "foo/\\escape").is_none(),
+            "backslash-prefixed rest must not produce a path",
+        );
+    }
+
+    #[test]
+    fn app_scoped_path_rejects_traversal_in_rest() {
+        // Caught by the outer is_safe_id (`..` anywhere), but assert the
+        // contract directly so a future refactor doesn't lose this behavior.
+        let apps = std::path::PathBuf::from("/tmp/lucidos-test/apps");
+        assert!(app_scoped_knowhow_path(&apps, "foo/../bar").is_none());
+    }
+
+    #[test]
+    fn app_scoped_path_builds_well_formed_path_for_safe_id() {
+        let apps = std::path::PathBuf::from("/ws/data/apps");
+        let p = app_scoped_knowhow_path(&apps, "finn-jobs/finn-search-workflow")
+            .expect("safe id should produce a path");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from(
+                "/ws/data/apps/finn-jobs/knowhow/finn-search-workflow.md"
+            )
+        );
     }
 }

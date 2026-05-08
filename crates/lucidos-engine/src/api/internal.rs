@@ -321,13 +321,19 @@ pub(super) async fn commit_made(
     // Validate the thread exists. Don't trust the hook's payload — a stray
     // hook from a deleted worktree should not be able to inject events into
     // arbitrary threads.
-    let exists: bool = sqlx::query_scalar::<_, bool>(
+    let exists: bool = match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
     )
     .bind(thread_id)
     .fetch_one(state.engine.pool())
     .await
-    .unwrap_or(false);
+    {
+        Ok(b) => b,
+        Err(e) => {
+            crate::log!("[Internal] commit-made thread lookup failed: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response();
+        }
+    };
     if !exists {
         return (StatusCode::NOT_FOUND, "Unknown thread_id").into_response();
     }
@@ -448,6 +454,7 @@ async fn emit_change_proposed_for_commit(
                     // aggregate row (same change_id) when computing.
                     repo_root: String::new(),
                     hardened: false,
+                    incomplete: false,
                     path: String::new(),
                     diff: String::new(),
                 },
@@ -550,6 +557,7 @@ pub(super) async fn seed_change_for_test(
                 branch_name: body.branch_name,
                 repo_root: body.repo_root,
                 hardened: body.hardened,
+                incomplete: false,
                 path: String::new(),
                 diff: String::new(),
             },

@@ -19,7 +19,7 @@ use uuid::Uuid;
 fn message_received(text: &str) -> ThreadEvent {
     ThreadEvent::MessageReceived {
         text: text.to_string(),
-        images: vec![],
+        user_image_hashes: vec![],
         device_id: None,
         device: None,
         image_description: None,

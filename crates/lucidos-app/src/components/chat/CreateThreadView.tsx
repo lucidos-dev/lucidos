@@ -9,7 +9,7 @@ import {
   focusedThreadId,
   threadMap,
 } from '../../store/store';
-import { scrolledUp, awayFromBottom, notAtTop, getResizeMode, extendSuppression, setActiveScrollElement, getActiveScrollElement, isElementVisible } from './scrollState';
+import { scrolledUp, awayFromBottom, notAtTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
@@ -152,81 +152,23 @@ export function useAutoScroll(ref: preact.RefObject<HTMLDivElement>, deps: unkno
 
     if (!el) return;
 
-    function isAtBottom() {
-      return el!.scrollTop + el!.clientHeight >= el!.scrollHeight - 80;
-    }
-    // Tighter threshold for the chevron — flips on the first pixel of
-    // scroll-up. The 2px slack absorbs subpixel rounding (mobile zoom,
-    // device-pixel snapping) without making the chevron look stuck.
-    function isVisuallyAtBottom() {
-      return el!.scrollTop + el!.clientHeight >= el!.scrollHeight - 2;
-    }
-    function isAtTop() {
-      return el!.scrollTop <= 80;
-    }
-    function isScrollable() {
-      return el!.scrollHeight > el!.clientHeight + 10;
-    }
-    function syncNotAtTop() {
-      notAtTop.value = isScrollable() && !isAtTop();
-    }
-    // Scroll events: can both set and clear scrolledUp (user gesture or
-    // programmatic scrollTop assignment — both produce real scroll events).
-    // Skip during suppression ('scroll' mode) — scroll events in this window
-    // are from programmatic scrollToBottom() or header scroll compensation
-    // (useHideOnScroll adjusts scrollTop on focusin/focusout), not user intent.
-    // Without this guard, iOS keyboard dismiss causes: focusout → scrollTop
-    // compensation → scroll event → scrolledUp=true → viewport resize handler
-    // skips scrollToBottom() → user loses bottom-pinned state.
-    //
-    // awayFromBottom is updated unconditionally on scroll — programmatic
-    // scrolls leave the container at the bottom, so the check returns false
-    // and the chevron hides naturally without a special-case branch.
-    // (Content growth that doesn't fire a scroll event is handled by
-    // useEffect snapping back to bottom; see onResize for the shrink case.)
-    function onScroll() {
-      syncNotAtTop();
-      awayFromBottom.value = !isVisuallyAtBottom();
-      if (getResizeMode() === 'scroll') return; // only scrolledUp is suppressed
-      scrolledUp.value = !isAtBottom();
-    }
-    // Resize events: behavior depends on resize mode set by scrollToBottom().
-    //
-    // 'scroll' mode: content is rendering after a scrollToBottom() call —
-    //   actively scroll to bottom on each resize and extend the suppression
-    //   window. This keeps us pinned to the bottom as content progressively
-    //   renders (especially important on mobile where rendering is slow).
-    //
-    // 'ignore' mode (normal): can only *escalate* scrolledUp to true.
-    //   Must NEVER clear scrolledUp — otherwise a layout change (textarea shrink
-    //   after submit, idle banner removal) can falsely reset scrolledUp and
-    //   trigger unwanted auto-scroll.
-    function onResize() {
-      // Sync on resize too — if content shrinks below the viewport,
-      // clear the chevron even if no scroll event fires.
-      syncNotAtTop();
-      if (getResizeMode() === 'scroll') {
-        el!.scrollTop = el!.scrollHeight;
-        extendSuppression();
-        return;
-      }
-      if (!isAtBottom()) {
-        scrolledUp.value = true;
-      }
-      // awayFromBottom is clear-only on resize: if content shrinks so the
-      // user is now visually at the bottom (e.g. idle banner removed, step
-      // collapsed), hide the chevron without waiting for a scroll event.
-      // We never escalate here — content growth during streaming would
-      // briefly trip isVisuallyAtBottom() to false before useEffect snaps
-      // back to bottom, causing a one-frame flicker.
-      if (awayFromBottom.value && isVisuallyAtBottom()) {
-        awayFromBottom.value = false;
-      }
-    }
+    const { onScroll, onResize } = makeScrollObservers(el);
 
     el.addEventListener('scroll', onScroll, { passive: true });
     const ro = new ResizeObserver(onResize);
     ro.observe(el);
+    // The container is position:absolute inset:0 (chat.css), so its own box
+    // never resizes when children grow — observing it alone misses in-thread
+    // size changes (panel header expand/collapse). Observe each child too,
+    // and re-observe on childList changes so new exchanges join in.
+    function observeChildren() {
+      for (const child of Array.from(el!.children)) {
+        ro.observe(child);
+      }
+    }
+    const mo = new MutationObserver(observeChildren);
+    mo.observe(el, { childList: true });
+    observeChildren();
 
     // Register as the active scroll target so scrollToBottom() targets
     // the correct element (not a hidden desktop duplicate on mobile).
@@ -239,6 +181,7 @@ export function useAutoScroll(ref: preact.RefObject<HTMLDivElement>, deps: unkno
       cleanup: () => {
         el.removeEventListener('scroll', onScroll);
         ro.disconnect();
+        mo.disconnect();
         // Only clear if we're still the active element (another instance
         // may have already registered itself during component transitions).
         if (getActiveScrollElement() === el) {

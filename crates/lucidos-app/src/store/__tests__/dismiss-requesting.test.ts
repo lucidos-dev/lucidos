@@ -25,7 +25,6 @@ import { getWaitingState } from '../../components/chat/WaitingBanner';
 vi.mock('../../api/threads', () => ({
   archiveThread: vi.fn().mockResolvedValue(undefined),
   saveThread: vi.fn(),
-  unsaveThread: vi.fn(),
 }));
 
 vi.mock('../actions/thread-loading', () => ({
@@ -257,6 +256,23 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
       expect(state!.actions).not.toContain('apply');
     }
   });
+
+  it('exposes Diff for external repo even when ccHasChanges is false', () => {
+    // ccHasChanges can drift to false while the branch is still ahead of main;
+    // for external-repo CC threads the Diff button must show regardless.
+    const thread = makeCCThread('t1', 'idle', 'inbox');
+    thread.meta.ccHasChanges = false;
+    thread.meta.ccIsExternalRepo = true;
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('actions');
+    if (state!.type === 'actions') {
+      expect(state!.externalCcDiffAvailable).toBe(true);
+    }
+  });
 });
 
 describe('Pending change with file_count=0 must not show Apply/Discard', () => {
@@ -288,6 +304,7 @@ describe('Pending change with file_count=0 must not show Apply/Discard', () => {
       pre_merge_sha: null,
       post_merge_sha: null,
       commits: [],
+      incomplete: false,
     }];
 
     const state = getWaitingState();
@@ -323,6 +340,7 @@ describe('Pending change with file_count=0 must not show Apply/Discard', () => {
       pre_merge_sha: null,
       post_merge_sha: null,
       commits: [],
+      incomplete: false,
     }];
 
     const state = getWaitingState();
@@ -367,6 +385,7 @@ describe('Apply & Restart label sources requires_restart from pending change', (
       pre_merge_sha: null,
       post_merge_sha: null,
       commits: [],
+      incomplete: false,
     }];
 
     const state = getWaitingState();

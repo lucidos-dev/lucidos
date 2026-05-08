@@ -531,12 +531,11 @@ impl LucidosEngine {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let artifact_manager = ArtifactManager::new(workspace_path.clone())?;
 
-        // Ensure .gitignore exists for ephemeral directories
-        let gitignore_path = workspace_path.join(".gitignore");
-        if !gitignore_path.exists() {
-            if let Err(e) = std::fs::write(&gitignore_path, ".lucidos/\ndata/postgres/\n") {
-                log!("[Startup] Failed to write workspace .gitignore: {}", e);
-            }
+        // Ensure .gitignore contains every engine-managed entry. Idempotent:
+        // creates the file on first boot, appends new entries (e.g. data/blobs/)
+        // on existing workspaces, no-ops once everything is already in place.
+        if let Err(e) = crate::core::ensure_workspace_gitignore_entries(&workspace_path) {
+            log!("[Startup] Failed to ensure workspace .gitignore entries: {}", e);
         }
 
         // Migrate legacy prompts/ directories to intents/ (idempotent)
@@ -565,6 +564,26 @@ impl LucidosEngine {
 
         let event_store = EventStore::new(pool.clone());
         event_store.init_schema().await?;
+
+        // One-shot, idempotent: convert legacy base64 image payloads
+        // (MessageReceived.user_images, thread_summaries.compose_images) to
+        // content-addressed blobs under data/blobs/ + hash-array fields.
+        // Synchronous before HTTP bind so readers never see a mixed shape.
+        // Re-runs are no-ops once the gate query matches zero rows.
+        match crate::core::image_migration::migrate_legacy_image_payloads(
+            &pool,
+            &workspace_path,
+        )
+        .await
+        {
+            Ok((events, drafts)) if events > 0 || drafts > 0 => log!(
+                "[ImageMigration] migrated {} event(s) and {} draft(s) to content-addressed blobs",
+                events,
+                drafts
+            ),
+            Ok(_) => {}
+            Err(e) => log!("[ImageMigration] failed: {}", e),
+        }
 
         // One-shot, idempotent: the SQL backfill in migration
         // 20260429214800 only read `payload->>'trigger_id'` and missed legacy
@@ -961,12 +980,15 @@ impl LucidosEngine {
         self.system_knowhow_dir.as_deref()
     }
 
-    /// Bundle the user-curated knowhow search directories (shared + local).
+    /// Bundle the user-curated knowhow search directories (shared + local + apps).
+    /// `apps` enables app-scoped id resolution (`<app_id>/<rest>` →
+    /// `data/apps/<app_id>/knowhow/<rest>.md`) for the validator and loader.
     /// System knowhow is loaded separately via [`crate::core::SystemKnowhowStore`].
     pub fn knowhow_dirs(&self) -> crate::core::knowhow::KnowhowDirs {
         crate::core::knowhow::KnowhowDirs {
             shared: self.shared_knowhow_dir(),
             local: self.workspace_path.join(crate::core::KNOWHOW_DIR),
+            apps: Some(self.workspace_path.join(crate::core::APPS_DIR)),
         }
     }
 
@@ -1317,15 +1339,15 @@ impl LucidosEngine {
             let bus = self.event_bus.clone();
             let tid = thread_id.to_string();
             tokio::spawn(async move {
-                let (first_msg, image_desc) = match event_store.get_thread_first_message(&tid).await
-                {
-                    Ok(Some((msg, desc))) if !msg.is_empty() => (msg, desc),
-                    Ok(_) => return,
-                    Err(e) => {
-                        log!("[Thread] Failed to get first message for title: {}", e);
-                        return;
-                    }
-                };
+                let (first_msg, image_desc, image_count) =
+                    match event_store.get_thread_first_message(&tid).await {
+                        Ok(Some((msg, desc, count))) => (msg, desc, count),
+                        Ok(None) => return,
+                        Err(e) => {
+                            log!("[Thread] Failed to get first message for title: {}", e);
+                            return;
+                        }
+                    };
 
                 chat::emit_generated_title(
                     &bus,
@@ -1334,6 +1356,7 @@ impl LucidosEngine {
                     &first_msg,
                     image_desc.as_deref(),
                     None,
+                    image_count,
                 )
                 .await;
             });

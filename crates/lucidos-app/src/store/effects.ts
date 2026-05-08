@@ -1,5 +1,5 @@
 import { effect } from '@preact/signals';
-import { pageTitle, unreadCount, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, inputMode, threadDrawerOpen, selectedRepoId, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, repoSelectedChangeId, SELECTED_CHANGE_KEY } from './store';
+import { pageTitle, unreadCount, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, inputMode, threadDrawerOpen, selectedRepoId, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, repoSelectedChangeId, SELECTED_CHANGE_KEY, MOBILE_VIEW_KEY } from './store';
 
 // Sync page title with unread count
 effect(() => {
@@ -14,6 +14,9 @@ effect(() => {
 // Clean up stale localStorage keys — model/effort are now per-thread, not persisted
 localStorage.removeItem('lucidos-model');
 localStorage.removeItem('lucidos-reasoning-effort');
+// mobile-view moved from localStorage to sessionStorage so a cold PWA launch
+// doesn't strand the user on a pane they last viewed days ago.
+localStorage.removeItem(MOBILE_VIEW_KEY);
 
 // Persist animation speed
 effect(() => {

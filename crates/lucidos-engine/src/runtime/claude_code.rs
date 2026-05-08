@@ -243,12 +243,18 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                     .filter(|s| !s.is_empty());
                 // Fall back to the subtype label (e.g. "error_max_turns") when
                 // CC omits `errors` so ResponseFailed still has a non-empty
-                // user-facing reason string.
+                // user-facing reason string. Skip "success" — CC sometimes
+                // emits `is_error: true` with `subtype: "success"` (observed
+                // on upstream API drops after the conversation has streamed
+                // an `API Error: …` text). Using it would render as
+                // `[ERROR] **Error:** success` in the timeline.
                 Some(joined.unwrap_or_else(|| {
-                    val.get("subtype")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error")
-                        .to_string()
+                    let subtype = val.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+                    if subtype.is_empty() || subtype == "success" {
+                        "Unknown error".to_string()
+                    } else {
+                        subtype.to_string()
+                    }
                 }))
             } else {
                 None
@@ -517,10 +523,17 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     // Read by spawn-thread skill; see ChatRequest::parent_thread_id.
     cmd.env("LUCIDOS_THREAD_ID", args.thread_id.to_string());
     cmd.env("LUCIDOS_WORKSPACE", args.workspace_path);
-    // Read by `lucidos send-thread` CLI to default `--caller-event-id` so
+    // Read by `lucidos spawn-thread` CLI to default `--caller-event-id` so
     // cross-workspace POSTs from a CC subprocess carry the originating event.
     if let Some(event_id) = args.spawning_event_id {
         cmd.env("LUCIDOS_EVENT_ID", event_id.to_string());
+    }
+    // Read by `lucidos spawn-thread` CLI to default `--repo` so a CC sidequest
+    // is created in the same repo as its caller (otherwise the engine would
+    // fall back to the workspace's default repo, breaking sidequests for
+    // workspaces hosting multiple repos).
+    if let Some(repo_name) = args.repo_name {
+        cmd.env("LUCIDOS_REPO", repo_name);
     }
     // The engine permission handler now waits indefinitely for the user
     // (matching `AskUserQuestion`'s "stay idle" behavior). CC has TWO

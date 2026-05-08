@@ -27,7 +27,7 @@ function detectSlashPrefix(
 let nextId = 0;
 const cc = (composeMode: ComposeChannelMode, channel: ThreadMeta['channel']) => {
   const id = `cc-${++nextId}`;
-  setDraft(id, { text: '', images: [], mode: composeMode });
+  setDraft(id, { text: '', image_hashes: [], mode: composeMode });
   return { meta: { id, state: 'composing' as const, channel } };
 };
 const active = (channel: ThreadMeta['channel']) => ({

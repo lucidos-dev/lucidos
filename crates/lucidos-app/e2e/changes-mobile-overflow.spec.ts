@@ -17,7 +17,7 @@ test.describe('Changes panel — long thread title on mobile', () => {
     try {
       await page.addInitScript(() => {
         localStorage.setItem('lucidos-active-menu-item', 'changes');
-        localStorage.setItem('lucidos-mobile-view', 'content');
+        sessionStorage.setItem('lucidos-mobile-view', 'content');
       });
       await page.goto('/');
 

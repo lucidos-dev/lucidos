@@ -35,6 +35,9 @@ async fn chat_stream_returns_event_id() {
 #[tokio::test]
 async fn chat_stream_with_thread_id() {
     let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
     let url = format!("{}/api/chat/stream", base_url());
     let marker = unique_marker("api-thread");
 
@@ -57,28 +60,11 @@ async fn chat_stream_with_thread_id() {
         "First message should return event_id"
     );
 
-    // Wait for the response to complete
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-
-    // Look up what thread was created by checking the threads API
-    let threads_url = format!("{}/api/threads", base_url());
-    let threads: serde_json::Value = client
-        .get(&threads_url)
-        .send()
-        .await
-        .expect("Threads request failed")
-        .json()
-        .await
-        .expect("Invalid JSON");
-
-    // Should have at least one thread in history
-    let history = threads["history"]
-        .as_array()
-        .expect("history should be array");
-    assert!(!history.is_empty(), "Should have at least one thread");
-
-    // Get the most recent thread
-    let thread_id = history[0]["thread_id"].as_str().unwrap();
+    // Resolve the thread by marker — `history[0]` would race with parallel
+    // tests whose threads can sort ahead and yield a 409 when their (mode,
+    // repo) doesn't match this follow-up.
+    let row = poll_thread_summary_by_marker(&pool, &marker, 15).await;
+    let thread_id = row.thread_id.to_string();
 
     // Send a follow-up to the same thread
     let body2 = serde_json::json!({
@@ -215,6 +201,34 @@ async fn invalid_parent_thread_id_returns_400() {
     );
 }
 
+/// `repo_id` accepts a UUID or a registered repo name (the
+/// `lucidos spawn-thread --repo <name>` CLI sends names). An unknown repo
+/// must surface a clean 400 at the API boundary, not a 500 from deep inside
+/// the engine when worktree creation fails. This is the chat-side mirror of
+/// the existing repo-switch lock check.
+#[tokio::test]
+async fn chat_stream_rejects_unknown_repo() {
+    let client = http_client();
+    let url = format!("{}/api/chat/stream", base_url());
+    let body = serde_json::json!({
+        "message": "test",
+        "mode": "human",
+        "use_claude_code": true,
+        "repo_id": "definitely-not-a-real-repo-name-for-e2e",
+    });
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("Request failed");
+    assert_eq!(
+        resp.status(),
+        400,
+        "unknown repo must return 400, not 500 or silent fallback"
+    );
+}
+
 /// `mode` is mandatory — requests omitting it must be rejected (not silently
 /// defaulted to human) so the spawn-thread skill and other callers cannot
 /// accidentally produce mislabeled threads.
@@ -243,6 +257,10 @@ async fn missing_mode_returns_400() {
 /// card and the commands menu disagreed (e.g. menu showed Lucidos skills
 /// while the session ran on User Acquisition). The chat handler must reject
 /// follow-ups that try to flip mode or repo.
+///
+/// `state='active'` here is the operative bit: the lock only kicks in once
+/// the thread has actually been sent. Drafts (`state='composing'`) intentionally
+/// permit mode toggling — see `chat_stream_allows_mode_switch_on_composing_thread`.
 #[tokio::test]
 async fn chat_stream_rejects_mode_switch_on_existing_thread() {
     let client = http_client();
@@ -251,11 +269,14 @@ async fn chat_stream_rejects_mode_switch_on_existing_thread() {
         .expect("connect e2e db");
 
     let thread_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO thread_summaries (thread_id, source) VALUES ($1, 'chat')")
-        .bind(thread_id)
-        .execute(&pool)
-        .await
-        .expect("seed chat thread");
+    sqlx::query(
+        "INSERT INTO thread_summaries (thread_id, source, state) \
+         VALUES ($1, 'chat', 'active')",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("seed chat thread");
 
     let resp = client
         .post(format!("{}/api/chat/stream", base_url()))
@@ -284,6 +305,60 @@ async fn chat_stream_rejects_mode_switch_on_existing_thread() {
         .ok();
 }
 
+/// Regression: a draft can have its `source` column set to `'claude_code'`
+/// from a prior compose-mode toggle (the PUT compose CASE writes it). When
+/// the user toggles back to Lucidos and clicks Send before the debounced PUT
+/// lands, the chat request arrives with `use_claude_code=false` and the
+/// row's stale source surfaces as a 409 ("Thread is locked to Claude Code
+/// mode; cannot switch to Lucidos") — even though no message has ever been
+/// sent on the thread.
+///
+/// The mode lock must only apply to threads that have actually been sent
+/// (`state='active'`). Composing threads are still drafts; the user is
+/// allowed to change their mind right up to the moment of send.
+#[tokio::test]
+async fn chat_stream_allows_mode_switch_on_composing_thread() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect e2e db");
+
+    let thread_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO thread_summaries (thread_id, source, state, compose_mode) \
+         VALUES ($1, 'claude_code', 'composing', 'claude_code')",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("seed composing thread with stale CC source");
+
+    let resp = client
+        .post(format!("{}/api/chat/stream", base_url()))
+        .json(&serde_json::json!({
+            "message": "I changed my mind, send via Lucidos",
+            "mode": "human",
+            "thread_id": thread_id.to_string(),
+            // No use_claude_code → Lucidos, despite source='claude_code'
+        }))
+        .send()
+        .await
+        .expect("send composing thread");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "composing thread must accept mode switch, got {}",
+        resp.status(),
+    );
+
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
 /// Companion to the mode-switch test: a CC thread bound to repo A must
 /// reject a follow-up requesting repo B (the menu would otherwise collapse
 /// to whichever repo's `changes` row is most recent and disagree with the
@@ -299,8 +374,8 @@ async fn chat_stream_rejects_repo_switch_on_existing_cc_thread() {
     let repo_b = Uuid::new_v4().to_string();
     let thread_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO thread_summaries (thread_id, source, cc_repo_id) \
-         VALUES ($1, 'claude_code', $2)",
+        "INSERT INTO thread_summaries (thread_id, source, cc_repo_id, state) \
+         VALUES ($1, 'claude_code', $2, 'active')",
     )
     .bind(thread_id)
     .bind(&repo_a)

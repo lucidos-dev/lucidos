@@ -6,7 +6,7 @@ import { describe, it, expect } from 'vitest';
 import {
   handleEvent,
   groupIntoExchanges,
-  exchangeUserImages,
+  exchangeUserImageHashes,
   exchangeUserMessage,
   exchangeUserChannel,
   exchangeUserSource,
@@ -2126,17 +2126,14 @@ describe('No duplicate events', () => {
 // Flow: Image rendering
 // ---------------------------------------------------------------------------
 describe('Flow: Image rendering', () => {
-  it('extracts user images from MessageReceived event', () => {
+  it('extracts user image hashes from MessageReceived event', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
       {
         type: 'MessageReceived',
         text: 'Look at this',
-        images: [
-          { base64: 'abc123', mime_type: 'image/png' },
-          { base64: 'def456', mime_type: 'image/jpeg' },
-        ],
+        user_image_hashes: ['hash-abc', 'hash-def'],
       },
       { type: 'TextStreamed', text: 'I see two images.' },
       { type: 'ResponseGenerated' },
@@ -2145,10 +2142,8 @@ describe('Flow: Image rendering', () => {
     const exchanges = groupIntoExchanges(map.get(id)!.events);
     expect(exchanges).toHaveLength(1);
 
-    const images = exchangeUserImages(exchanges[0]);
-    expect(images).toHaveLength(2);
-    expect(images[0]).toEqual({ base64: 'abc123', mimeType: 'image/png' });
-    expect(images[1]).toEqual({ base64: 'def456', mimeType: 'image/jpeg' });
+    const hashes = exchangeUserImageHashes(exchanges[0]);
+    expect(hashes).toEqual(['hash-abc', 'hash-def']);
   });
 
   it('returns empty array when no images', () => {
@@ -2160,7 +2155,7 @@ describe('Flow: Image rendering', () => {
     ]);
 
     const exchanges = groupIntoExchanges(map.get(id)!.events);
-    const images = exchangeUserImages(exchanges[0]);
+    const images = exchangeUserImageHashes(exchanges[0]);
     expect(images).toHaveLength(0);
   });
 });
@@ -2179,47 +2174,41 @@ describe('Bug: CC follow-up images not rendered', () => {
       { type: 'CodingAgentIdled' },
     ]);
 
-    // Simulate pending follow-up WITH images
-    const pendingImages = [
-      { base64: 'img1data', mime_type: 'image/png' },
-      { base64: 'img2data', mime_type: 'image/jpeg' },
-    ];
+    // Simulate pending follow-up WITH image hashes (the wire shape post Phase 3b)
+    const pendingHashes = ['sha256-of-img1', 'sha256-of-img2'];
     map.get(id)!.pendingUserMessages.push({
       text: 'here is the screenshot',
       eventId: 'ev-1',
       created: '2026-01-01T00:00:00Z',
-      images: pendingImages,
+      image_hashes: pendingHashes,
     });
 
-    // Verify images are stored in the pending message data structure
+    // Verify hashes are stored in the pending message data structure
     const pending = map.get(id)!.pendingUserMessages[0];
-    expect(pending.images).toHaveLength(2);
-    expect(pending.images![0]).toEqual({ base64: 'img1data', mime_type: 'image/png' });
+    expect(pending.image_hashes).toHaveLength(2);
+    expect(pending.image_hashes![0]).toBe('sha256-of-img1');
   });
 
-  it('CC follow-up MessageReceived event includes images from SSE', () => {
+  it('CC follow-up MessageReceived event includes image hashes from SSE', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'fix the bug' },
       { type: 'SessionStarted', session_id: 's1' },
       { type: 'CodingAgentTextStreamed', text: 'Done.' },
       { type: 'CodingAgentIdled' },
-      // Follow-up with images
+      // Follow-up with image hashes (post-Phase-3b event payload shape)
       {
         type: 'MessageReceived',
         text: 'here is the screenshot',
-        images: [
-          { base64: 'img1data', mime_type: 'image/png' },
-        ],
+        user_image_hashes: ['sha256-of-img1'],
       },
     ]);
 
     const exchanges = groupIntoExchanges(map.get(id)!.events);
     // The follow-up should be a separate exchange
     const followUp = exchanges[exchanges.length - 1];
-    const images = exchangeUserImages(followUp);
-    expect(images).toHaveLength(1);
-    expect(images[0]).toEqual({ base64: 'img1data', mimeType: 'image/png' });
+    const hashes = exchangeUserImageHashes(followUp);
+    expect(hashes).toEqual(['sha256-of-img1']);
   });
 });
 

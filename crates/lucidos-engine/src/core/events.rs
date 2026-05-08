@@ -28,20 +28,28 @@ impl EventRow {
     }
 }
 
-/// A single image found while walking thread events.
-pub struct ThreadImage<'a> {
-    /// 1-based sequential index across the thread.
+/// Default mime for generated images stored inline in event payloads.
+/// User images live in the blob store and use their sniffed mime instead.
+pub const GENERATED_IMAGE_MIME: &str = "image/jpeg";
+
+/// Metadata-only entry yielded by `walk_thread_images_meta`. Cheap — no
+/// blob bytes are read.
+pub struct ThreadImageMeta {
     pub index: usize,
-    /// "user" (from MessageReceived) or "generated" (from ToolResult/ResponseGenerated/ResponseCanceled/ResponseAborted).
     pub source: &'static str,
-    /// Base64 image data. For user images this is from `images[].base64`; for generated it's a plain string.
-    pub base64: &'a str,
-    /// MIME type (from user images) or default "image/jpeg" for generated.
-    pub mime_type: &'a str,
+    pub mime_type: String,
 }
 
-/// Trait for event types that have event_type and payload fields.
-/// Implemented by both `EventRow` and `ThreadEventRow`.
+/// A single image found while walking thread events. The `base64` field is
+/// only populated by the bytes-reading walker (`walk_thread_images`); the
+/// `walk_thread_images_meta` API endpoint uses `ThreadImageMeta` instead.
+pub struct ThreadImage {
+    pub index: usize,
+    pub source: &'static str,
+    pub base64: String,
+    pub mime_type: String,
+}
+
 pub trait HasEventPayload {
     fn event_type(&self) -> &str;
     fn payload(&self) -> &serde_json::Value;
@@ -56,51 +64,97 @@ impl HasEventPayload for EventRow {
     }
 }
 
-/// Walk thread events and yield all images in sequential order.
-/// Used by API image endpoints and tool image resolution.
-pub fn walk_thread_images<E: HasEventPayload>(events: &[E]) -> Vec<ThreadImage<'_>> {
-    let mut images = Vec::new();
-    let mut index: usize = 0;
-
-    for event in events {
+/// Iterate (index, source, mime, blob_hash_or_inline_base64) for every
+/// image in the thread. The MessageReceived branch yields the hash; the
+/// generated branches yield the inline base64. Shared between the two
+/// public walkers below so the indexing rule lives in one place.
+fn walk_thread_image_refs<E: HasEventPayload>(
+    events: &[E],
+) -> impl Iterator<Item = (&'static str, ImageRef<'_>)> + '_ {
+    events.iter().flat_map(|event| {
+        let payload = event.payload();
         match event.event_type() {
-            "MessageReceived" => {
-                if let Some(imgs) = event.payload().get("images").and_then(|v| v.as_array()) {
-                    for img in imgs {
-                        index += 1;
-                        let b64 = img.get("base64").and_then(|v| v.as_str()).unwrap_or("");
-                        let mime = img
-                            .get("mime_type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("image/jpeg");
-                        images.push(ThreadImage {
-                            index,
-                            source: "user",
-                            base64: b64,
-                            mime_type: mime,
-                        });
-                    }
-                }
-            }
-            "ToolResult" | "ResponseGenerated" | "ResponseCanceled" | "ResponseAborted" => {
-                if let Some(imgs) = event.payload().get("images").and_then(|v| v.as_array()) {
-                    for img_val in imgs {
-                        if let Some(b64) = img_val.as_str() {
-                            index += 1;
-                            images.push(ThreadImage {
-                                index,
-                                source: "generated",
-                                base64: b64,
-                                mime_type: "image/jpeg",
-                            });
-                        }
-                    }
-                }
-            }
-            _ => {}
+            "MessageReceived" => payload
+                .get("user_image_hashes")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|h| ("user", ImageRef::BlobHash(h)))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            "ToolResult" | "ResponseGenerated" | "ResponseCanceled" | "ResponseAborted" => payload
+                .get("images")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|b64| ("generated", ImageRef::InlineBase64(b64)))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
         }
-    }
+    })
+}
 
+enum ImageRef<'a> {
+    BlobHash(&'a str),
+    InlineBase64(&'a str),
+}
+
+/// Metadata-only walk for endpoints that just need (index, source, mime).
+/// One `metadata` syscall per user image, zero reads. Missing blobs still
+/// occupy an index — the index matches `walk_thread_images` and the
+/// thread:N numbering used by `chat/process.rs::msg_image_starts`. The
+/// API serves a 404 for the missing entry.
+pub fn walk_thread_images_meta<E: HasEventPayload>(
+    workspace: &std::path::Path,
+    events: &[E],
+) -> Vec<ThreadImageMeta> {
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    for (source, image_ref) in walk_thread_image_refs(events) {
+        let mime_type = match image_ref {
+            ImageRef::BlobHash(hash) => crate::core::blobs::resolve_blob(workspace, hash)
+                .map(|b| b.mime)
+                .unwrap_or_else(|| GENERATED_IMAGE_MIME.to_string()),
+            ImageRef::InlineBase64(_) => GENERATED_IMAGE_MIME.to_string(),
+        };
+        index += 1;
+        out.push(ThreadImageMeta { index, source, mime_type });
+    }
+    out
+}
+
+/// Bytes-loading walk for tool resolution and thread-image GET. Missing
+/// blobs yield an entry with empty base64 + the placeholder mime so the
+/// index matches `walk_thread_images_meta` and `msg_image_starts`. A
+/// callable `thread:N` whose blob is gone reaches the LLM as zero bytes
+/// rather than collapsing the numbering and pointing at the wrong image.
+pub fn walk_thread_images<E: HasEventPayload>(
+    workspace: &std::path::Path,
+    events: &[E],
+) -> Vec<ThreadImage> {
+    let mut images = Vec::new();
+    let mut index = 0usize;
+    for (source, image_ref) in walk_thread_image_refs(events) {
+        let (base64, mime_type) = match image_ref {
+            ImageRef::BlobHash(hash) => {
+                crate::core::blobs::read_blob_as_base64(workspace, hash).unwrap_or_else(|| {
+                    crate::log!(
+                        "[walk_thread_images] Blob {} missing or unreadable, yielding empty entry",
+                        hash
+                    );
+                    (String::new(), GENERATED_IMAGE_MIME.to_string())
+                })
+            }
+            ImageRef::InlineBase64(b64) => (b64.to_string(), GENERATED_IMAGE_MIME.to_string()),
+        };
+        index += 1;
+        images.push(ThreadImage { index, source, base64, mime_type });
+    }
     images
 }
 

@@ -12,7 +12,10 @@ const renderer = new marked.Renderer();
 renderer.code = ({ text, lang, escaped }: Tokens.Code) => {
   const langLabel = lang ? `<span class="code-block-lang">${escapeHtmlAttr(lang)}</span>` : '';
   const body = escaped ? text : escapeHtmlAttr(text);
-  return `<div class="code-block-wrapper">${langLabel}<button type="button" class="copy-btn code-block-copy-btn" aria-label="Copy code">${COPY_ICON}</button><pre><code>${body}</code></pre></div>`;
+  // Lang label + copy button share one .code-block-header overlay — see
+  // chat.css `.code-block-header` for why this structure (not two absolute
+  // siblings of <pre>).
+  return `<div class="code-block-wrapper"><div class="code-block-header">${langLabel}<button type="button" class="copy-btn code-block-copy-btn" aria-label="Copy code">${COPY_ICON}</button></div><pre><code>${body}</code></pre></div>`;
 };
 
 marked.setOptions({

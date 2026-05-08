@@ -334,9 +334,8 @@ impl LucidosEngine {
 
         let verbose = !self.rebuilding_memory.load(Ordering::SeqCst);
 
-        // Extract facts via Gemini Flash with retry, falling back to a single raw-content fact.
-        // For artifacts, skip fallback — if the LLM couldn't extract facts, the content
-        // probably doesn't contain any (e.g., CSV exports, data files).
+        // For artifacts, skip fallback when extraction returns nothing — content
+        // probably has no facts (e.g., CSV exports, data files).
         let is_artifact = matches!(source, MemorySource::Artifact { .. });
         let mut used_fallback = false;
         let memory_model =

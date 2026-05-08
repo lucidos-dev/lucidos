@@ -1,6 +1,9 @@
 import { EVENT_CLASSIFICATION, LAST_ACTIVITY_EVENTS, SESSION_END_REASONS } from '../generated/thread-lifecycle';
 import type { EventChannel, SessionEndReason } from '../generated/thread-lifecycle';
 import { MODELS, REASONING_LEVELS } from './models';
+import type { ExchangeStatus } from './exchange-status';
+import { mergeAdjacentTextEvents, isMeaningfulText } from './event-rendering';
+import type { Step, ResponseEvent } from './types';
 
 /** Who started a thread: user-initiated or system-initiated (e.g. scheduled task). */
 export type ThreadInitiator = 'user' | 'system';
@@ -110,9 +113,10 @@ export function responseAbortedSummary(actor: MessageOrigin | undefined): string
 // Persisted thread events — stored in DB, appear in snapshots.
 // Optional fields (`?`) allow older DB rows (before the field was added) to deserialize safely.
 export type ThreadEvent =
-  | { type: 'MessageReceived'; text: string; channel?: EventChannel; images?: unknown[]; device_id?: string; device?: string; image_description?: string; mode?: ActorMode; model?: string; reasoning_effort?: string; parent_thread_id?: string; spawning_event_id?: string; origin?: MessageOrigin }
+  | { type: 'MessageReceived'; text: string; channel?: EventChannel; user_image_hashes?: string[]; device_id?: string; device?: string; image_description?: string; mode?: ActorMode; model?: string; reasoning_effort?: string; parent_thread_id?: string; spawning_event_id?: string; origin?: MessageOrigin }
   | { type: 'TextStreamed'; text: string }
   | { type: 'Thinking'; text: string; context_tokens?: number; context_messages?: number; trimmed?: boolean }
+  | { type: 'ContextTokensMeasured'; input_tokens: number }
   | { type: 'MemorySearched'; results?: number; queries?: string[] }
   | { type: 'ToolCalled'; name: string; args: unknown; description?: string }
   | { type: 'ToolResult'; name: string; result: string; images?: string[] }
@@ -145,7 +149,7 @@ export type ThreadEvent =
   | { type: 'ThreadDiscarded'; actor?: MessageOrigin; discarded_at?: string }
   | { type: 'TriggerStarted'; trigger_id: string; trigger_name?: string; prompt?: string; invocation?: TriggerInvocation; origin?: MessageOrigin }
   | { type: 'TriggerCompleted'; trigger_id: string; trigger_name?: string; result_summary?: string }
-  | { type: 'ChangeProposed'; change_id?: string; description?: string; files?: string[]; requires_restart?: boolean; path?: string; diff?: string; origin?: MessageOrigin; commit_sha?: string }
+  | { type: 'ChangeProposed'; change_id?: string; description?: string; files?: string[]; requires_restart?: boolean; path?: string; diff?: string; origin?: MessageOrigin; commit_sha?: string; incomplete?: boolean }
   | { type: 'ChangeApplied'; change_id?: string; requires_restart?: boolean; client_update?: boolean; commits?: string[]; thread_title?: string; actor?: MessageOrigin; path?: string }
   | { type: 'ChangeDiscarded'; change_id?: string; actor?: MessageOrigin; path?: string }
   | { type: 'ChangeReverted'; change_id?: string; actor?: MessageOrigin; path?: string }
@@ -293,9 +297,7 @@ export type ThreadMeta = {
   updatedAt: string;
   /** Thread status computed by the backend: 'idle', 'running', or 'waiting'. */
   status: ThreadStatus;
-  /** Exchange count from the API (message_count). Used for drawer display
-   *  before events are lazy-loaded. Once eventsLoaded is true, the real
-   *  count from the events map takes precedence. */
+  /** Server-computed exchange count (MESSAGE_COUNT_EVENTS in thread_lifecycle.rs). */
   messageCount: number;
   /** Section from backend DB projection — used as initial section before events load. */
   section: ThreadSection;
@@ -353,7 +355,7 @@ export type ThreadState = {
   /** Optimistic user messages shown before real SSE events arrive.
    *  Each entry is removed when its corresponding MessageReceived event arrives
    *  from SSE, matched by the client-generated event_id UUID. */
-  pendingUserMessages: Array<{ text: string; eventId: string; created: string; images?: Array<{ base64: string; mime_type: string }> }>;
+  pendingUserMessages: Array<{ text: string; eventId: string; created: string; image_hashes?: string[] }>;
 };
 
 export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'failed';
@@ -517,13 +519,7 @@ export function findPermissionResolution(exchange: Exchange, requestId: string):
 
 // ---------------------------------------------------------------------------
 // Exchange-level derived data — standalone functions on Exchange.
-// These extract rendering data from an Exchange's events.
-// Used directly by components and tests.
 // ---------------------------------------------------------------------------
-
-import type { ExchangeStatus } from './exchange-status';
-import { mergeAdjacentTextEvents, isMeaningfulText } from './event-rendering';
-import type { Step, ResponseEvent } from './types';
 
 /** Derive the user message text from an exchange. */
 export function exchangeUserMessage(exchange: Exchange): string {
@@ -612,16 +608,15 @@ export interface UserImage {
   mimeType: string;
 }
 
-/** Extract user-pasted images from the exchange's MessageReceived event. */
-export function exchangeUserImages(exchange: Exchange): UserImage[] {
+/** Extract user-pasted image hashes from the exchange's MessageReceived event.
+ *  Post-Phase-3b the event payload carries `user_image_hashes: string[]` only;
+ *  the bytes live in the content-addressed blob store and are loaded by the
+ *  renderer via `<img src="/api/v1/blobs/<hash>">`. */
+export function exchangeUserImageHashes(exchange: Exchange): string[] {
   if (exchange.userEvent.type !== 'MessageReceived') return [];
-  const raw = (exchange.userEvent as { images?: unknown[] }).images;
+  const raw = (exchange.userEvent as { user_image_hashes?: unknown }).user_image_hashes;
   if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((img): img is { base64: string; mime_type: string } =>
-      typeof img === 'object' && img !== null && 'base64' in img && 'mime_type' in img
-    )
-    .map(img => ({ base64: img.base64, mimeType: img.mime_type }));
+  return raw.filter((h): h is string => typeof h === 'string');
 }
 
 /** Extract a field from the response completion event or CodingAgentSettingsChanged fallback.
@@ -908,6 +903,16 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
         });
         break;
       }
+      case 'ContextTokensMeasured': {
+        const measured = event as { input_tokens: number };
+        for (let i = steps.length - 1; i >= 0; i--) {
+          if (steps[i].description === 'Thinking') {
+            steps[i].context_tokens = measured.input_tokens;
+            break;
+          }
+        }
+        break;
+      }
       case 'ToolCalled': {
         const e = event as { name: string; args: unknown; description?: string };
         steps.push({ description: e.description || describeEngineTool(e.name, e.args), success: null });
@@ -963,7 +968,7 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
 
 /** Count images in an exchange (user-pasted + generated) for thread:N offset computation. */
 export function exchangeImageCount(exchange: Exchange): number {
-  let count = exchangeUserImages(exchange).length;
+  let count = exchangeUserImageHashes(exchange).length;
   for (const { event } of exchange.steps) {
     if (event.type === 'ToolResult') {
       const imgs = (event as { images?: string[] }).images;
@@ -1000,7 +1005,7 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
   const events: ResponseEvent[] = [];
   const hasCCContent = exchangeHasCCContent(exchange);
   // Count images across the thread for thread:N numbering — starts after user images in this exchange
-  let imageCounter = imageOffset + exchangeUserImages(exchange).length;
+  let imageCounter = imageOffset + exchangeUserImageHashes(exchange).length;
   let isComplete = false;
 
   for (const { event } of exchange.steps) {
@@ -1022,6 +1027,17 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
           context_messages: ctx.context_messages,
           trimmed: ctx.trimmed,
         });
+        break;
+      }
+      case 'ContextTokensMeasured': {
+        const measured = event as { input_tokens: number };
+        for (let i = events.length - 1; i >= 0; i--) {
+          const e = events[i];
+          if (e.type === 'step' && e.description === 'Thinking') {
+            e.context_tokens = measured.input_tokens;
+            break;
+          }
+        }
         break;
       }
       case 'ToolCalled': {
@@ -1458,7 +1474,7 @@ export function computeExchanges(thread: ThreadState): Exchange[] {
       text: pending.text,
       channel: thread.meta.channel,
       ...(isCC ? { created: pending.created } : { _displayCreated: pending.created }),
-      ...(pending.images?.length ? { images: pending.images } : {}),
+      ...(pending.image_hashes?.length ? { user_image_hashes: pending.image_hashes } : {}),
     } as StoredEvent);
   }
   return groupIntoExchanges(augmented);

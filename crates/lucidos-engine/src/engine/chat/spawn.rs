@@ -60,7 +60,8 @@ impl LucidosEngine {
             }
 
             if let Some(provider) = title_provider {
-                emit_generated_title(&bus, &provider, child_thread_id, &msg, None, None).await;
+                // Spawned child threads carry no images on their first prompt.
+                emit_generated_title(&bus, &provider, child_thread_id, &msg, None, None, 0).await;
             }
         });
 

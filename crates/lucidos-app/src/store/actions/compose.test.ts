@@ -51,7 +51,7 @@ function makeThread(overrides: MakeThreadOpts = {}): ThreadState {
   if (composeText !== undefined || composeImages !== undefined || composeMode !== undefined) {
     setDraft(id, {
       text: composeText ?? '',
-      images: composeImages ?? [],
+      image_hashes: composeImages ?? [],
       mode: composeMode ?? null,
     });
   }
@@ -116,7 +116,7 @@ describe('sendFollowup clears the active-thread draft', () => {
     await sendFollowup('t-1', 'my answer', undefined, {});
     const draft = getDraft('t-1');
     expect(draft.text).toBe('');
-    expect(draft.images).toEqual([]);
+    expect(draft.image_hashes).toEqual([]);
   });
 
   it('clears the draft optimistically — before sendMessage resolves', async () => {
@@ -129,7 +129,7 @@ describe('sendFollowup clears the active-thread draft', () => {
     // textarea's useEffect doesn't re-render the typed text as a Draft.
     const draft = getDraft('t-1');
     expect(draft.text).toBe('');
-    expect(draft.images).toEqual([]);
+    expect(draft.image_hashes).toEqual([]);
 
     resolveSend!(new Response(null, { status: 200 }));
     await sendPromise;
@@ -211,7 +211,7 @@ describe('updateCompose discards empty composing drafts', () => {
     map.set('t-1', makeThread({ state: 'composing', composeText: '', composeImages: ['iVBORfake'] }));
     threadMap.value = map;
 
-    updateCompose('t-1', { images: [] });
+    updateCompose('t-1', { image_hashes: [] });
 
     expect(threadMap.value.get('t-1')!.meta.state).toBe('discarded');
   });
@@ -422,7 +422,7 @@ describe('compose mutations leave updatedAt alone', () => {
   it('applyRemoteCompose does not bump updatedAt', () => {
     applyRemoteCompose('t-1', {
       text: 'from peer device',
-      images: [],
+      image_hashes: [],
       mode: null,
     });
     expect(threadMap.value.get('t-1')!.meta.updatedAt).toBe('2026-05-01T00:00:00.000Z');
@@ -463,7 +463,7 @@ describe('updateCompose does not mutate threadMap (perf isolation)', () => {
 
   it('applyRemoteCompose (peer SSE) also leaves threadMap untouched', () => {
     const before = threadMap.value;
-    applyRemoteCompose('t-1', { text: 'from peer', images: [], mode: null });
+    applyRemoteCompose('t-1', { text: 'from peer', image_hashes: [], mode: null });
     expect(threadMap.value).toBe(before);
   });
 });

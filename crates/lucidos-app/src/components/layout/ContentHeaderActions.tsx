@@ -50,8 +50,11 @@ export function ContentHeaderActions() {
 
     // Exit native fullscreen
     if (doc.fullscreenElement || doc.webkitFullscreenElement) {
-      if (typeof doc.exitFullscreen === 'function') (doc.exitFullscreen as () => Promise<void>)();
-      else if (typeof doc.webkitExitFullscreen === 'function') (doc.webkitExitFullscreen as () => void)();
+      if (typeof doc.exitFullscreen === 'function') {
+        (doc.exitFullscreen as () => Promise<void>)().catch(() => { /* user is exiting; failure is benign */ });
+      } else if (typeof doc.webkitExitFullscreen === 'function') {
+        (doc.webkitExitFullscreen as () => void)();
+      }
       return;
     }
 
@@ -95,7 +98,7 @@ export function ContentHeaderActions() {
       // Override .icon-btn:disabled { pointer-events: none } so the tooltip
       // (which relies on hover events) can still explain why the button is off.
       return (
-        <button class="icon-btn header-icon" disabled aria-label={disabledTooltip} data-tooltip={disabledTooltip} style="pointer-events: auto; cursor: default;">
+        <button class="icon-btn header-icon" disabled aria-label={disabledTooltip} data-tooltip={disabledTooltip} style="pointer-events: auto;">
           <ReloadIcon />
         </button>
       );

@@ -26,7 +26,7 @@ use super::events::{
     describe_images, emit_routing_failure, format_relative_age, make_message_received,
 };
 use super::images::{
-    build_user_content_with_images, filter_recent_history_images, image_recency_cutoff,
+    build_user_content_with_images, filter_recent_history_image_hashes, image_recency_cutoff,
     save_images_to_tmp, MAX_HISTORY_IMAGE_MESSAGES,
 };
 use super::recursion_guard::MAX_THREAD_DEPTH;
@@ -413,6 +413,7 @@ impl LucidosEngine {
                     .emit(crate::engine::event_bus::BusEvent::Thread {
                         thread_id,
                         event: make_message_received(
+                            &self.workspace_path,
                             user_message,
                             user_images,
                             device_id,
@@ -513,6 +514,7 @@ impl LucidosEngine {
                     .emit(crate::engine::event_bus::BusEvent::Thread {
                         thread_id,
                         event: make_message_received(
+                            &self.workspace_path,
                             user_message,
                             user_images,
                             device_id,
@@ -640,6 +642,7 @@ impl LucidosEngine {
                     };
                     (
                         make_message_received(
+                            &self.workspace_path,
                             user_message,
                             user_images,
                             device_id,
@@ -730,6 +733,7 @@ impl LucidosEngine {
                     .unwrap_or_default();
                 let provider = extractor.provider_for_model(&title_model);
                 let msg = user_message.to_string();
+                let attached_images = user_images.map_or(0, |i| i.len());
                 let bus = self.event_bus.clone();
                 let tid_str = thread_id_str.clone();
                 tokio::spawn(async move {
@@ -741,7 +745,7 @@ impl LucidosEngine {
                                 .await
                                 .ok()
                                 .flatten()
-                                .and_then(|(_, desc)| desc);
+                                .and_then(|(_, desc, _)| desc);
                             emit_generated_title(
                                 &bus,
                                 &provider,
@@ -749,6 +753,7 @@ impl LucidosEngine {
                                 &msg,
                                 image_desc.as_deref(),
                                 None,
+                                attached_images,
                             )
                             .await;
                         }
@@ -958,7 +963,7 @@ impl LucidosEngine {
         // For follow-ups, load only the thread's messages to avoid cross-thread leakage.
         // If >HISTORY_COMPRESS_THRESHOLD messages, older messages are summarized via Flash
         // and only the last HISTORY_RECENT_MESSAGES are included verbatim.
-        let (mut history_context, conversation_summary, history_images) = if !is_trigger {
+        let (mut history_context, conversation_summary, history_image_hashes) = if !is_trigger {
             // Follow-ups: scope to thread; new threads: load global recent messages
             let messages_result = if !is_new_thread {
                 self.event_store.get_thread_messages(&thread_id_str).await
@@ -982,12 +987,11 @@ impl LucidosEngine {
 
                     // New threads pull history from multiple recent threads — their
                     // images are irrelevant (and can consume hundreds of thousands of tokens).
-                    let prior_images: Vec<Vec<crate::core::store::UserImagePayload>> =
-                        if is_new_thread {
-                            vec![]
-                        } else {
-                            filter_recent_history_images(&all_prior, MAX_HISTORY_IMAGE_MESSAGES)
-                        };
+                    let prior_image_hashes: Vec<Vec<String>> = if is_new_thread {
+                        vec![]
+                    } else {
+                        filter_recent_history_image_hashes(&all_prior, MAX_HISTORY_IMAGE_MESSAGES)
+                    };
 
                     // Per-message flag: is this message's image data included in the
                     // LLM context? Used by format_history_msg to annotate dropped
@@ -1001,7 +1005,7 @@ impl LucidosEngine {
                                 if m.role == "user" {
                                     let included = !is_new_thread
                                         && user_idx >= cutoff
-                                        && !m.user_images.is_empty();
+                                        && !m.user_image_hashes.is_empty();
                                     user_idx += 1;
                                     included
                                 } else {
@@ -1021,7 +1025,7 @@ impl LucidosEngine {
                         for m in all_prior.iter() {
                             starts.push(idx);
                             if m.role == "user" {
-                                idx += m.user_images.len();
+                                idx += m.user_image_hashes.len();
                             } else {
                                 idx += m.images.len();
                             }
@@ -1046,7 +1050,7 @@ impl LucidosEngine {
                         };
                         let content = format_history_content(&m.content, &m.role, is_verbatim);
                         // Determine image kind: user-attached (with staleness tracking) or generated
-                        let (label, n, stale_note) = if !m.user_images.is_empty() {
+                        let (label, n, stale_note) = if !m.user_image_hashes.is_empty() {
                             let included =
                                 image_data_included.get(msg_idx).copied().unwrap_or(false);
                             let stale = if !included {
@@ -1054,7 +1058,7 @@ impl LucidosEngine {
                             } else {
                                 ""
                             };
-                            ("attached", m.user_images.len(), stale)
+                            ("attached", m.user_image_hashes.len(), stale)
                         } else if !m.images.is_empty() {
                             ("generated", m.images.len(), "")
                         } else {
@@ -1117,7 +1121,7 @@ impl LucidosEngine {
                     };
 
                     if all_prior.is_empty() {
-                        (String::new(), user_message.to_string(), prior_images)
+                        (String::new(), user_message.to_string(), prior_image_hashes)
                     } else if all_prior.len() <= HISTORY_COMPRESS_THRESHOLD {
                         // Short conversation — include all messages with tiered truncation
                         let turns = format_tiered(&all_prior, 0);
@@ -1135,7 +1139,7 @@ impl LucidosEngine {
                         summary.push_str(" | ");
                         summary.push_str(user_message);
                         let summary: String = summary.chars().take(500).collect();
-                        (history, summary, prior_images)
+                        (history, summary, prior_image_hashes)
                     } else {
                         // Long conversation — summarize older messages, keep recent with tiered truncation
                         let split_point = all_prior.len().saturating_sub(HISTORY_RECENT_MESSAGES);
@@ -1179,7 +1183,7 @@ impl LucidosEngine {
                         summary.push_str(" | ");
                         summary.push_str(user_message);
                         let summary: String = summary.chars().take(500).collect();
-                        (history, summary, prior_images)
+                        (history, summary, prior_image_hashes)
                     }
                 }
                 Err(_) => (String::new(), user_message.to_string(), vec![]),
@@ -1415,12 +1419,12 @@ Three content types — scoped inside apps, knowhow domains, or triggers:
 - Intent = what the user wants, described in their terms. A high-level workflow: goals, conditions, desired outcomes. Written by the user, changes only when the user's needs change. Think of it as what you'd tell a competent assistant — not technical how-to, but the desired outcome and order.
   MUST include YAML frontmatter with:
     - `name`: Human-readable name for the intent
-    - `knowhow`: List of knowhow IDs to load when executing this intent (optional)
+    - `knowhow`: List of knowhow IDs to load when executing this intent (optional). An ID is the file's path under data/knowhow/ WITHOUT the .md suffix INCLUDING any subdirectory: data/knowhow/weather/api.md → 'weather/api', NOT 'api'. Engine-shipped reference docs use the 'system-knowhow/' prefix.
   Example:
     ---
     name: Daily Weather Check
     knowhow:
-      - weather-api
+      - weather/api
     ---
     Check the forecast for the upcoming day...
 
@@ -2156,8 +2160,12 @@ URL: {}\n\
             // ContextAssembled was internal-only — dropped.
         }
 
-        let user_content =
-            build_user_content_with_images(user_message_text, &history_images, user_images);
+        let user_content = build_user_content_with_images(
+            user_message_text,
+            &self.workspace_path,
+            &history_image_hashes,
+            user_images,
+        );
 
         let mut messages = vec![Message {
             role: "user".to_string(),

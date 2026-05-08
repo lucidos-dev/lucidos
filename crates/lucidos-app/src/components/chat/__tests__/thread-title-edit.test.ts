@@ -53,6 +53,16 @@ describe('ThreadTitleEditor — dual-element split', () => {
   it('uses .select() for the input', () => {
     expect(source).toMatch(/inputRef\.current\??\.select\(\)/);
   });
+
+  it('observes the display textarea size to re-fit on container width changes', () => {
+    // The display textarea wraps based on its parent's width. autoResizeTextarea
+    // running only on [title, editing] dep changes leaves style.height pinned
+    // to a wrapped-narrow measurement after the container widens (drawer
+    // toggle, divider drag, window resize) — the header balloons until rename
+    // or reload. A ResizeObserver re-runs the resize on width-only changes.
+    expect(source).toMatch(/new ResizeObserver\(/);
+    expect(source).toMatch(/observer\.observe\(el\)/);
+  });
 });
 
 describe('MobileSwipeContainer — keyboard-active does not trap title editor', () => {

@@ -55,3 +55,9 @@ mod client_log_test;
 
 #[path = "api_support/proxy_test.rs"]
 mod proxy_test;
+
+#[path = "api_support/blobs_test.rs"]
+mod blobs_test;
+
+#[path = "api_support/image_migration_test.rs"]
+mod image_migration_test;

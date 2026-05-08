@@ -45,12 +45,12 @@ export function shouldRevealThread(threadId: string | null | undefined, animatin
     return true;
 }
 
-/** Mark a thread as revealed (call after animation starts). Exported for testing. */
+/** Mark a thread as revealed (call after animation starts). */
 export function commitReveal(threadId: string) {
     lastRevealedThread = threadId;
 }
 
-/** Reset reveal tracking (called on unmount so re-entering the same thread animates). Exported for testing. */
+/** Reset reveal tracking (called on unmount so re-entering the same thread animates). */
 export function resetRevealTracking() {
     lastRevealedThread = null;
 }

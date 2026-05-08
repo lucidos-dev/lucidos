@@ -23,11 +23,13 @@ import {
   userMessageBody,
   REAL_THREAD_NAV,
 } from './helpers';
+import { clearAllThreads } from './db-helpers';
 
 test.describe('Mobile thread content rendering', () => {
   test.use({ viewport: { width: 375, height: 812 } });
 
   test.beforeEach(async ({ page }) => {
+    clearAllThreads();
     await assertHealthy(page);
   });
 

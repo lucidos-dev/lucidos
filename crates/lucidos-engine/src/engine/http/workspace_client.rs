@@ -23,7 +23,7 @@ pub struct WorkspaceCallCtx {
     /// Thread in the calling workspace that initiated this call.
     pub source_thread_id: Option<Uuid>,
     /// Event in the calling workspace that initiated this call (e.g. the
-    /// `ToolCalled` event for a cross-workspace `lucidos send-thread`).
+    /// `ToolCalled` event for a cross-workspace `lucidos spawn-thread`).
     pub source_event_id: Option<Uuid>,
     /// Upstream actor mode (Human/Agent/Engine). Becomes the `mode` field on
     /// the receiving `MessageOrigin::Workspace`.

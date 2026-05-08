@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const CONTENT_DIRS: [&str; 4] = ["apps", "knowhow", "triggers", "scripts"];
 
+/// File extension marking a plugin archive (renamed zip). Lowercase — callers
+/// that match on filenames should compare against `to_ascii_lowercase()`.
+pub const PLUGIN_ARCHIVE_EXT: &str = ".lucidos-plugin";
+
 /// Parsed `manifest.toml` after validation. Fields beyond v1 are kept on the
 /// raw `serde_json::Value` so they round-trip into the event payload.
 #[derive(Debug, Clone, PartialEq)]

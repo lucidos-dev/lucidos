@@ -53,9 +53,11 @@ export function Toast() {
               <button class="action-btn" onClick={t.action.onClick}>{t.action.label}</button>
             </div>
           )}
-          <button class="icon-btn toast-close" onClick={() => dismissToast(t.key ?? t.id)} aria-label="Dismiss">
-            <CloseIcon />
-          </button>
+          {t.dismissable !== false && (
+            <button class="icon-btn toast-close" onClick={() => dismissToast(t.key ?? t.id)} aria-label="Dismiss">
+              <CloseIcon />
+            </button>
+          )}
         </div>
       ))}
     </div>

@@ -90,12 +90,12 @@ export function useStartup(): void {
       if (connected) {
         connectThreadEvents();
       }
-    });
+    }).catch(() => { /* checkConnection swallows internally; satisfy fail-fast rule */ });
     refreshUnreadCount();
     loadPreferences().then(() => {
       // Notifications must load after preferences so the persisted filter is applied
       if (activeMenuItem.value === 'notifications') loadNotifications();
-    });
+    }).catch(() => { /* loadPreferences sets Loadable failed internally — UI shows the error */ });
     loadPinnedApps();
     loadAllThreads().catch(() => {
       // Retry after 3s — covers transient network failures on initial load.
@@ -310,7 +310,7 @@ export function useStartup(): void {
         } catch {
           // Source iframe may have unloaded — drop the reply silently.
         }
-      });
+      }).catch(() => { /* showConfirm rejection — drop, modal already closed */ });
     }
     window.addEventListener('message', onAppFrameMessage);
 

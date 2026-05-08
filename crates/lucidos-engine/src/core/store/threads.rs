@@ -670,11 +670,12 @@ impl EventStore {
     }
 
     /// Get the content of the first user message in a thread (for title generation).
-    /// Returns (text, image_description) for the first user message in a thread.
+    /// Returns (text, image_description, image_count) for the first user message in a thread.
     pub async fn get_thread_first_message(
         &self,
         thread_id: &str,
-    ) -> Result<Option<(String, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<(String, Option<String>, usize)>, Box<dyn std::error::Error + Send + Sync>>
+    {
         let thread_uuid = uuid::Uuid::parse_str(thread_id)?;
         let row = sqlx::query_as::<_, (serde_json::Value,)>(
             r#"
@@ -699,7 +700,11 @@ impl EventStore {
                 .get("image_description")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            Some((text.to_string(), image_desc))
+            let image_count = payload
+                .get("user_image_hashes")
+                .and_then(|v| v.as_array())
+                .map_or(0, |a| a.len());
+            Some((text.to_string(), image_desc, image_count))
         }))
     }
 

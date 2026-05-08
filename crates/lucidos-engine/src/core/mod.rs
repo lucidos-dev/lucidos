@@ -1,7 +1,9 @@
 pub mod apps;
 pub mod artifacts;
 pub mod backup;
+pub mod blobs;
 pub mod changes;
+pub mod image_migration;
 pub mod changes_projection;
 pub mod credentials;
 pub mod devices;
@@ -127,6 +129,54 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
         }
     }
 }
+/// Engine-managed entries in every workspace's `.gitignore`. Workspaces
+/// auto-track their `data/` tree under git (artifacts), so anything the
+/// engine writes there that should NOT be versioned has to be listed here.
+///
+/// Order matters for diff stability: kept in the same order as historical
+/// values so existing files don't get rewritten on startup.
+const WORKSPACE_GITIGNORE_ENTRIES: &[&str] = &[
+    ".lucidos/",
+    "data/postgres/",
+    "data/blobs/",
+];
+
+/// Ensure the workspace `.gitignore` exists and contains every
+/// engine-managed entry from `WORKSPACE_GITIGNORE_ENTRIES`. Idempotent:
+/// pre-existing entries are left untouched (line-equality), missing
+/// entries are appended. Returns `true` when the file was created or
+/// updated — callers may use that as a signal to commit the change.
+pub fn ensure_workspace_gitignore_entries(
+    workspace: &std::path::Path,
+) -> std::io::Result<bool> {
+    let path = workspace.join(".gitignore");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let already: std::collections::HashSet<&str> =
+        existing.lines().map(str::trim).collect();
+    let missing: Vec<&str> = WORKSPACE_GITIGNORE_ENTRIES
+        .iter()
+        .copied()
+        .filter(|entry| !already.contains(entry))
+        .collect();
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    let mut next = existing.clone();
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    for entry in missing {
+        next.push_str(entry);
+        next.push('\n');
+    }
+    std::fs::write(&path, next)?;
+    Ok(true)
+}
+
 pub use events::EventRow;
 pub use mcp_servers::{McpServer, McpServerStore};
 pub use preferences::{
@@ -197,7 +247,7 @@ pub fn is_binary_extension(ext: &str) -> bool {
 }
 
 /// Parse YAML frontmatter from a markdown file.
-/// Extracts `name:` and a configurable list field (e.g., `knowhow:` or `domains:`).
+/// Extracts `name:` and a configurable list field (e.g., `knowhow:`).
 /// Returns (name, list_values, body) or None if no valid frontmatter.
 pub fn parse_md_frontmatter(text: &str, list_field: &str) -> Option<(String, Vec<String>, String)> {
     if !text.starts_with("---") {
@@ -1043,5 +1093,69 @@ mod tests {
         assert!(dir.join("data/triggers/only/only.md").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a fresh workspace (no .gitignore), the file is created with all
+    /// engine-managed entries — that's the first-boot path that has been
+    /// shipping for years. Helper preserves that exact behavior.
+    #[test]
+    fn ensure_workspace_gitignore_creates_file_with_all_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let changed =
+            ensure_workspace_gitignore_entries(dir.path()).expect("ensure ok");
+        assert!(changed, "fresh workspace must report changed=true");
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        for entry in WORKSPACE_GITIGNORE_ENTRIES {
+            assert!(
+                content.lines().any(|l| l.trim() == *entry),
+                "missing entry {entry:?} in: {content}"
+            );
+        }
+    }
+
+    /// The legacy two-line `.gitignore` (`.lucidos/\ndata/postgres/\n`) is
+    /// what every existing user's workspace looks like today. Adding a new
+    /// engine-managed entry like `data/blobs/` must self-heal: append the
+    /// missing line, leave the existing ones alone (no churn in git).
+    #[test]
+    fn ensure_workspace_gitignore_appends_missing_entry_to_legacy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".lucidos/\ndata/postgres/\n").unwrap();
+        let changed =
+            ensure_workspace_gitignore_entries(dir.path()).expect("ensure ok");
+        assert!(changed, "legacy file missing data/blobs/ must report changed=true");
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        // Legacy lines preserved verbatim — line equality matters for git diff stability.
+        assert!(content.starts_with(".lucidos/\ndata/postgres/\n"));
+        assert!(content.lines().any(|l| l.trim() == "data/blobs/"));
+    }
+
+    /// When every engine-managed entry is already present, the helper is a
+    /// pure no-op: returns `false`, doesn't rewrite the file. Without this
+    /// invariant every engine startup would re-touch the file and re-commit
+    /// it to the artifacts repo.
+    #[test]
+    fn ensure_workspace_gitignore_noop_when_all_entries_present() {
+        let dir = tempfile::tempdir().unwrap();
+        // Trailing-line variation + manually added user entries — must
+        // be preserved without mutation.
+        let original = ".lucidos/\ndata/postgres/\ndata/blobs/\nmy-secret.env\n";
+        std::fs::write(dir.path().join(".gitignore"), original).unwrap();
+        let changed =
+            ensure_workspace_gitignore_entries(dir.path()).expect("ensure ok");
+        assert!(!changed, "all entries present must report changed=false");
+        let after = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert_eq!(after, original, "file must not be rewritten when no-op");
+    }
+
+    /// Edge case: file exists but has no trailing newline. Appending must
+    /// add one before the new entry so the result stays parseable.
+    #[test]
+    fn ensure_workspace_gitignore_inserts_missing_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".lucidos/\ndata/postgres/").unwrap();
+        ensure_workspace_gitignore_entries(dir.path()).expect("ensure ok");
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains(".lucidos/\ndata/postgres/\ndata/blobs/\n"));
     }
 }

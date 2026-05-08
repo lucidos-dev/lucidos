@@ -31,4 +31,13 @@ describe('user-image-thumb tap opens popup', () => {
     expect(handlerMatch).not.toBeNull();
     expect(handlerMatch![0]).not.toContain('user-image-thumb');
   });
+
+  // The collector matches via `el.src` (absolute). `blobPreviewUrl` returns a
+  // relative path, so passing the closure value misses every match.
+  it('user-image-thumb passes e.currentTarget.src (absolute) to the collector, not the closure src (relative)', () => {
+    const match = source.match(/<img[\s\S]*?class="user-image-thumb"[\s\S]*?\/>/);
+    expect(match, 'user-image-thumb img element not found').not.toBeNull();
+    expect(match![0]).toMatch(/openImagePopupFromThread\(\s*e\.currentTarget\.src/);
+    expect(match![0]).not.toMatch(/openImagePopupFromThread\(\s*src\b/);
+  });
 });

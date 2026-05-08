@@ -32,21 +32,103 @@ pub struct ProxyConfig {
     pub auth: Option<ProxyAuth>,
 }
 
-/// Auth block — names a credential in the engine credential store and
-/// optionally overrides the header name (for `api_key`).
+/// Auth block — names credentials in the engine credential store and tells
+/// the proxy how to attach them to outgoing requests.
+///
+/// Serialized in `apis.json` with serde's `tag = "type"`, so each variant
+/// gets its own JSON shape:
+/// - `{"type": "bearer", "credential": "..."}`
+/// - `{"type": "api_key", "credential": "...", "header": "X-API-Key"}`
+/// - `{"type": "basic", "credential": "..."}`
+///
+/// Unknown `type` values are rejected at config-load time (typos in
+/// `apis.json` fail fast instead of silently producing 401s at request time).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProxyAuth {
-    /// Auth scheme. Serde's `snake_case` rename matches the JSON spelling
-    /// (`"bearer"`, `"api_key"`, `"basic"`) and rejects typos at config-load
-    /// time instead of failing silently at request time.
-    #[serde(rename = "type")]
-    pub auth_type: AuthType,
-    /// The `service_name` in the credential store.
-    pub credential: String,
-    /// Optional header name override (default `Authorization`). Useful for
-    /// `api_key` services that expect e.g. `X-API-Key`.
-    #[serde(default)]
-    pub header: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProxyAuth {
+    Bearer {
+        /// `service_name` in the credential store.
+        credential: String,
+    },
+    ApiKey {
+        credential: String,
+        /// Optional header name override (default `Authorization`). Useful
+        /// for services that expect e.g. `X-API-Key`.
+        #[serde(default)]
+        header: Option<String>,
+    },
+    Basic {
+        credential: String,
+    },
+    /// Inject the credential as a URL query parameter (e.g. Helius's
+    /// `?api-key=...` shape). The credential value is URL-encoded and
+    /// appended to the existing query string (or starts a new one).
+    QueryParam {
+        credential: String,
+        /// URL query parameter name to inject (e.g. `"api-key"` for Helius).
+        param_name: String,
+    },
+    /// Sign each request with HMAC over its query string. Used by exchanges
+    /// like Binance: an API key (`key_credential`) is sent in `key_header`,
+    /// and a secret (`secret_credential`) signs the canonical query string.
+    /// If `timestamp_param` is set, the current millis-since-epoch is added
+    /// to the query before signing (Binance algorithm).
+    HmacSigned {
+        /// `service_name` in the credential store; auth_value goes into
+        /// `key_header`.
+        key_credential: String,
+        /// `service_name` in the credential store; auth_value used as the
+        /// HMAC secret.
+        secret_credential: String,
+        /// Header name for the API key. Default `"X-API-KEY"`. Set to
+        /// `"X-MBX-APIKEY"` for Binance.
+        #[serde(default = "default_key_header")]
+        key_header: String,
+        algorithm: HmacAlgorithm,
+        signed_payload: HmacSignedPayload,
+        /// Query-string parameter name for the signature. Default
+        /// `"signature"`.
+        #[serde(default = "default_signature_param")]
+        signature_param: String,
+        /// If set, current millis-since-epoch is injected as this query
+        /// param BEFORE signing (Binance algorithm). Omit for APIs that
+        /// don't need timestamping.
+        #[serde(default)]
+        timestamp_param: Option<String>,
+    },
+    /// Return the named credentials' values to the caller as a JSON map,
+    /// for libraries (e.g. `pcomfortcloud`) that perform their own login
+    /// flow. Never injected into outgoing HTTP requests; only callable via
+    /// `GET /api/v1/proxy-credentials/<name>` (CLI: `lucidos proxy <name>
+    /// --credentials`). The `proxy_request` LLM tool refuses this mode so
+    /// raw credentials never reach the model.
+    CredentialBundle {
+        /// `service_name`s in the credential store. The bundle endpoint
+        /// returns a JSON object keyed by these names.
+        credentials: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacAlgorithm {
+    Sha256,
+    Sha512,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacSignedPayload {
+    /// Sign the request's query string (Binance shape).
+    QueryString,
+}
+
+fn default_signature_param() -> String {
+    "signature".to_string()
+}
+
+fn default_key_header() -> String {
+    "X-API-KEY".to_string()
 }
 
 pub type ProxyConfigMap = HashMap<String, ProxyConfig>;
@@ -76,8 +158,7 @@ pub fn load_proxy_config(workspace_path: &FsPath) -> Result<ProxyConfigMap, Stri
     }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
 }
 
 /// Hop-by-hop headers per RFC 7230 §6.1 — must not be forwarded.
@@ -177,13 +258,78 @@ pub fn build_target_url(base_url: &str, path: &str, query: Option<&str>) -> Stri
     }
 }
 
+/// Append `key=urlencoded(value)` to a URL's query string. Preserves any
+/// existing query and chooses `?` vs `&` accordingly.
+pub(crate) fn append_query_param(url: &str, key: &str, value: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{}{}{}={}", url, separator, key, urlencoding::encode(value),)
+}
+
+/// Compute HMAC over `data` with `secret` and return lowercase hex.
+pub(crate) fn compute_hmac_hex(algorithm: HmacAlgorithm, secret: &[u8], data: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::{Sha256, Sha512};
+    match algorithm {
+        HmacAlgorithm::Sha256 => {
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
+                .expect("HMAC-Sha256 accepts any key length");
+            mac.update(data);
+            hex_lower(&mac.finalize().into_bytes())
+        }
+        HmacAlgorithm::Sha512 => {
+            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(secret)
+                .expect("HMAC-Sha512 accepts any key length");
+            mac.update(data);
+            hex_lower(&mac.finalize().into_bytes())
+        }
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// Take an existing query string, optionally append `&<timestamp_param>=<now_ms>`,
+/// then compute HMAC over the result and append `&<signature_param>=<hex>`.
+/// Returns the final query string (no leading `?`).
+///
+/// `now_ms` is passed in so tests are deterministic. Production callers pass
+/// `chrono::Utc::now().timestamp_millis() as u64`.
+pub(crate) fn sign_query_string(
+    initial_query: &str,
+    secret: &[u8],
+    algorithm: HmacAlgorithm,
+    timestamp_param: Option<&str>,
+    signature_param: &str,
+    now_ms: u64,
+) -> String {
+    let mut query = initial_query.to_string();
+    if let Some(ts_param) = timestamp_param {
+        if !query.is_empty() {
+            query.push('&');
+        }
+        query.push_str(&format!("{}={}", ts_param, now_ms));
+    }
+    let sig = compute_hmac_hex(algorithm, secret, query.as_bytes());
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str(&format!("{}={}", signature_param, sig));
+    query
+}
+
 /// Resolve config name → ProxyConfig. Returns 404 if name not configured.
 pub(crate) async fn resolve_proxy_target(
     workspace_path: &FsPath,
     name: &str,
 ) -> Result<ProxyConfig, (StatusCode, String)> {
-    let configs = load_proxy_config(workspace_path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let configs =
+        load_proxy_config(workspace_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     configs.get(name).cloned().ok_or((
         StatusCode::NOT_FOUND,
         format!("proxy '{}' is not configured", name),
@@ -198,36 +344,220 @@ pub(crate) async fn resolve_credential(
     pool: &sqlx::PgPool,
     auth: &ProxyAuth,
 ) -> Result<Credential, (StatusCode, String)> {
-    match CredentialStore::get(pool, &auth.credential).await {
+    let name = match auth {
+        ProxyAuth::Bearer { credential }
+        | ProxyAuth::ApiKey { credential, .. }
+        | ProxyAuth::Basic { credential } => credential.as_str(),
+        ProxyAuth::QueryParam { .. }
+        | ProxyAuth::HmacSigned { .. }
+        | ProxyAuth::CredentialBundle { .. } => {
+            // These variants are dispatched directly inside `apply_auth` (or, for
+            // CredentialBundle, the dedicated handler) and never reach here.
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "resolve_credential called for an auth variant that does not use a single credential header".to_string(),
+            ));
+        }
+    };
+    fetch_required_credential(pool, name).await
+}
+
+/// Look up a single credential by service name, mapping missing/empty/db
+/// failures to the same `(StatusCode, String)` error shape every auth path
+/// uses. The single source of truth for "this credential must exist and be
+/// non-empty, or the proxy can't proceed".
+async fn fetch_required_credential(
+    pool: &sqlx::PgPool,
+    name: &str,
+) -> Result<Credential, (StatusCode, String)> {
+    match CredentialStore::get(pool, name).await {
         Ok(Some(c)) if c.auth_value.is_empty() => Err((
             StatusCode::BAD_GATEWAY,
-            format!(
-                "proxy auth credential '{}' has an empty value",
-                auth.credential
-            ),
+            format!("proxy auth credential '{}' has an empty value", name),
         )),
         Ok(Some(c)) => Ok(c),
         Ok(None) => Err((
             StatusCode::BAD_GATEWAY,
             format!(
                 "proxy auth refers to credential '{}' which is not in the store",
-                auth.credential
+                name
             ),
         )),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read credential '{}': {}", auth.credential, e),
+            format!("failed to read credential '{}': {}", name, e),
         )),
     }
+}
+
+/// Look up a single credential's `auth_value`. Same error shapes as
+/// `resolve_credential`, but for callers that only need the secret string.
+pub(crate) async fn lookup_credential_value(
+    pool: &sqlx::PgPool,
+    name: &str,
+) -> Result<String, (StatusCode, String)> {
+    fetch_required_credential(pool, name)
+        .await
+        .map(|c| c.auth_value)
+}
+
+/// Resolved pieces every auth-injection step needs at request build time —
+/// the final URL (with any query-param injection already applied), an
+/// optional header tuple to attach, and a redacted form of the URL safe
+/// for use in log lines (so credentials embedded in the query string don't
+/// leak via `[Proxy LLM] GET ... → ?api-key=SECRET`).
+pub struct ResolvedAuth {
+    pub url: String,
+    pub log_url: String,
+    pub header: Option<(HeaderName, HeaderValue)>,
+}
+
+/// Apply an auth config to a base URL+path+query, returning the final URL
+/// and optional auth header. Header-style auth (`Bearer`, `ApiKey`, `Basic`)
+/// leaves the URL alone and returns the header. URL-style auth (`QueryParam`)
+/// folds the credential into the URL and returns no header. The
+/// `credential_bundle` variant is request-time invalid (it's only callable
+/// via the dedicated `/api/v1/proxy-credentials/:name` endpoint) and returns
+/// 400 here.
+pub(crate) async fn apply_auth(
+    pool: &sqlx::PgPool,
+    auth: Option<&ProxyAuth>,
+    base_url: &str,
+    path: &str,
+    query: Option<&str>,
+) -> Result<ResolvedAuth, (StatusCode, String)> {
+    let url = build_target_url(base_url, path, query);
+    let Some(auth) = auth else {
+        return Ok(ResolvedAuth {
+            log_url: url.clone(),
+            url,
+            header: None,
+        });
+    };
+    match auth {
+        ProxyAuth::Bearer { .. } | ProxyAuth::ApiKey { .. } | ProxyAuth::Basic { .. } => {
+            let cred = resolve_credential(pool, auth).await?;
+            let header_override = match auth {
+                ProxyAuth::ApiKey { header, .. } => header.as_deref(),
+                _ => None,
+            };
+            let header = build_auth_header(cred.auth_type, &cred.auth_value, header_override);
+            Ok(ResolvedAuth {
+                log_url: url.clone(),
+                url,
+                header,
+            })
+        }
+        ProxyAuth::QueryParam {
+            credential,
+            param_name,
+        } => {
+            let value = lookup_credential_value(pool, credential).await?;
+            let url_with_cred = append_query_param(&url, param_name, &value);
+            // Logged URL replaces the credential value with `REDACTED` so it
+            // doesn't leak into engine logs or aggregations.
+            let log_url = append_query_param(&url, param_name, "REDACTED");
+            Ok(ResolvedAuth {
+                url: url_with_cred,
+                log_url,
+                header: None,
+            })
+        }
+        ProxyAuth::HmacSigned {
+            key_credential,
+            secret_credential,
+            key_header,
+            algorithm,
+            signed_payload: HmacSignedPayload::QueryString,
+            signature_param,
+            timestamp_param,
+        } => {
+            apply_hmac_signed(
+                pool,
+                base_url,
+                path,
+                query,
+                key_credential,
+                secret_credential,
+                key_header,
+                *algorithm,
+                signature_param,
+                timestamp_param.as_deref(),
+            )
+            .await
+        }
+        ProxyAuth::CredentialBundle { .. } => Err((
+            StatusCode::BAD_REQUEST,
+            "credential_bundle proxies do not inject HTTP auth; use GET /api/v1/proxy-credentials/<name>".to_string(),
+        )),
+    }
+}
+
+/// Sign the request's query string with HMAC and return the final URL plus
+/// the API-key header. Lifted out of `apply_auth`'s match so that arm reads
+/// as one dispatch instead of forty lines of inline logic.
+#[allow(clippy::too_many_arguments)]
+async fn apply_hmac_signed(
+    pool: &sqlx::PgPool,
+    base_url: &str,
+    path: &str,
+    query: Option<&str>,
+    key_credential: &str,
+    secret_credential: &str,
+    key_header: &str,
+    algorithm: HmacAlgorithm,
+    signature_param: &str,
+    timestamp_param: Option<&str>,
+) -> Result<ResolvedAuth, (StatusCode, String)> {
+    let key = lookup_credential_value(pool, key_credential).await?;
+    let secret = lookup_credential_value(pool, secret_credential).await?;
+    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    let signed_query = sign_query_string(
+        query.unwrap_or(""),
+        secret.as_bytes(),
+        algorithm,
+        timestamp_param,
+        signature_param,
+        now_ms,
+    );
+    let url = build_target_url(base_url, path, Some(&signed_query));
+    let header_name = HeaderName::from_bytes(key_header.as_bytes()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("invalid key_header '{}': {}", key_header, e),
+        )
+    })?;
+    let header_value = HeaderValue::from_str(&key).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "credential '{}' is not a valid HTTP header value: {}",
+                key_credential, e
+            ),
+        )
+    })?;
+    // Signature is the HMAC output (a hex digest) — knowing it reveals
+    // nothing about the secret, so it's safe to log alongside the URL.
+    Ok(ResolvedAuth {
+        log_url: url.clone(),
+        url,
+        header: Some((header_name, header_value)),
+    })
 }
 
 /// Forward a request to the configured upstream and return the upstream
 /// response (headers + body + status). Pure with respect to AppState: takes
 /// only the data it needs, so the integration tests can spin up a tiny axum
 /// server and exercise this directly.
+///
+/// `log_url` is what gets written to logs and error responses on failure;
+/// for `query_param` auth this MUST be a redacted form of `target_url`
+/// (otherwise the credential leaks through the logs and the upstream-error
+/// response body). For everything else, callers pass `target_url` for both.
 pub async fn forward_request(
     method: Method,
     target_url: &str,
+    log_url: &str,
     request_headers: HeaderMap,
     auth: Option<(HeaderName, HeaderValue)>,
     body: Bytes,
@@ -273,11 +603,24 @@ pub async fn forward_request(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(e) => {
-            log!("[Proxy] forward to {} failed: {:?}", target_url, e);
-            if e.is_timeout() {
-                (StatusCode::GATEWAY_TIMEOUT, format!("upstream timeout: {}", e)).into_response()
+            // `reqwest::Error`'s Display and Debug impls embed the request URL,
+            // which for `query_param` auth contains the credential. Strip it
+            // before logging or surfacing the error to the caller.
+            let is_timeout = e.is_timeout();
+            let safe_e = e.without_url();
+            log!("[Proxy] forward to {} failed: {}", log_url, safe_e);
+            if is_timeout {
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("upstream timeout: {}", safe_e),
+                )
+                    .into_response()
             } else {
-                (StatusCode::BAD_GATEWAY, format!("upstream error: {}", e)).into_response()
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("upstream error: {}", safe_e),
+                )
+                    .into_response()
             }
         }
     }
@@ -301,6 +644,57 @@ pub(super) async fn proxy_handler_root(
     proxy_handle_inner(state, name, String::new(), req).await
 }
 
+/// Pure logic for the credential-bundle endpoint — given a resolved config
+/// and a pool, produce the JSON map (or an HTTP error). Lifted out of the
+/// handler so the variant guard is testable without a full `AppState`.
+pub(crate) async fn build_credential_bundle(
+    pool: &sqlx::PgPool,
+    config: &ProxyConfig,
+    name: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, (StatusCode, String)> {
+    let credentials = match &config.auth {
+        Some(ProxyAuth::CredentialBundle { credentials }) => credentials,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("proxy '{}' is not configured as credential_bundle", name),
+            ));
+        }
+    };
+    let mut out = serde_json::Map::with_capacity(credentials.len());
+    for cred_name in credentials {
+        let value = lookup_credential_value(pool, cred_name).await?;
+        out.insert(cred_name.clone(), serde_json::Value::String(value));
+    }
+    Ok(out)
+}
+
+/// Axum handler: `GET /api/v1/proxy-credentials/:name`.
+///
+/// Returns a JSON object `{"<service_name>": "<auth_value>", ...}` for
+/// proxies configured with `auth.type == "credential_bundle"`. For other
+/// proxy types (or missing proxies), returns 4xx. The credential value
+/// never goes through the LLM path — this endpoint is only reachable
+/// directly (CLI, scripts).
+pub(super) async fn proxy_credentials_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Response {
+    let config = match resolve_proxy_target(&state.workspace_path, &name).await {
+        Ok(c) => c,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+    match build_credential_bundle(&state.pool, &config, &name).await {
+        Ok(map) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::Value::Object(map).to_string(),
+        )
+            .into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
 async fn proxy_handle_inner(
     state: AppState,
     name: String,
@@ -319,16 +713,6 @@ async fn proxy_handle_inner(
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
-    let auth_header = if let Some(auth) = &config.auth {
-        let cred = match resolve_credential(&state.pool, auth).await {
-            Ok(c) => c,
-            Err((status, msg)) => return (status, msg).into_response(),
-        };
-        build_auth_header(cred.auth_type, &cred.auth_value, auth.header.as_deref())
-    } else {
-        None
-    };
-
     let method = req.method().clone();
     let query = req.uri().query().map(|s| s.to_string());
     let headers = req.headers().clone();
@@ -339,8 +723,27 @@ async fn proxy_handle_inner(
         }
     };
 
-    let target_url = build_target_url(&config.base_url, &path, query.as_deref());
-    forward_request(method, &target_url, headers, auth_header, body).await
+    let resolved = match apply_auth(
+        &state.pool,
+        config.auth.as_ref(),
+        &config.base_url,
+        &path,
+        query.as_deref(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+    forward_request(
+        method,
+        &resolved.url,
+        &resolved.log_url,
+        headers,
+        resolved.header,
+        body,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -535,7 +938,11 @@ mod tests {
     #[test]
     fn build_url_includes_query_string() {
         assert_eq!(
-            build_target_url("http://api.example.com", "/v1/items", Some("limit=10&page=2")),
+            build_target_url(
+                "http://api.example.com",
+                "/v1/items",
+                Some("limit=10&page=2")
+            ),
             "http://api.example.com/v1/items?limit=10&page=2"
         );
     }
@@ -545,6 +952,136 @@ mod tests {
         assert_eq!(
             build_target_url("http://api.example.com", "/v1/items", Some("")),
             "http://api.example.com/v1/items"
+        );
+    }
+
+    // ---- Query-param appending --------------------------------------------
+
+    #[test]
+    fn append_query_param_to_url_with_no_existing_query() {
+        let url = append_query_param("https://api.example.com/v1/x", "api-key", "secret-123");
+        assert_eq!(url, "https://api.example.com/v1/x?api-key=secret-123");
+    }
+
+    #[test]
+    fn append_query_param_to_url_with_existing_query() {
+        let url = append_query_param(
+            "https://api.example.com/v1/x?limit=10&page=2",
+            "api-key",
+            "secret-123",
+        );
+        assert_eq!(
+            url,
+            "https://api.example.com/v1/x?limit=10&page=2&api-key=secret-123"
+        );
+    }
+
+    #[test]
+    fn append_query_param_url_encodes_value_with_special_chars() {
+        let url = append_query_param("https://x/y", "k", "a&b=c d");
+        assert_eq!(url, "https://x/y?k=a%26b%3Dc%20d");
+    }
+
+    #[test]
+    fn append_query_param_redacted_form_does_not_contain_credential() {
+        // Mirrors what apply_auth does for ProxyAuth::QueryParam to build
+        // log_url: same key, value replaced with REDACTED. Guards against
+        // the credential leaking into log lines.
+        let base = "https://api.example.com/v1/x";
+        let real = append_query_param(base, "api-key", "actual-secret-value");
+        let redacted = append_query_param(base, "api-key", "REDACTED");
+        assert!(real.contains("actual-secret-value"));
+        assert!(!redacted.contains("actual-secret-value"));
+        assert_eq!(redacted, "https://api.example.com/v1/x?api-key=REDACTED");
+    }
+
+    // ---- HMAC signing ------------------------------------------------------
+
+    #[test]
+    fn hmac_sha256_known_vector() {
+        // RFC 4231 test case 1: key = 0x0b * 20, data = "Hi There"
+        let key = [0x0bu8; 20];
+        let sig = compute_hmac_hex(HmacAlgorithm::Sha256, &key, b"Hi There");
+        assert_eq!(
+            sig,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn hmac_sha512_known_vector() {
+        // RFC 4231 test case 1
+        let key = [0x0bu8; 20];
+        let sig = compute_hmac_hex(HmacAlgorithm::Sha512, &key, b"Hi There");
+        assert_eq!(
+            sig,
+            "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"
+        );
+    }
+
+    #[test]
+    fn hmac_query_string_appends_timestamp_then_signature() {
+        let signed = sign_query_string(
+            "symbol=BTCUSDT&side=BUY",
+            b"secret",
+            HmacAlgorithm::Sha256,
+            Some("timestamp"),
+            "signature",
+            1_700_000_000_000,
+        );
+        assert!(
+            signed.starts_with("symbol=BTCUSDT&side=BUY&timestamp=1700000000000&signature="),
+            "got: {}",
+            signed
+        );
+        let sig_part = signed.rsplit("signature=").next().unwrap();
+        assert_eq!(sig_part.len(), 64, "sha256 hex should be 64 chars");
+    }
+
+    #[test]
+    fn hmac_query_string_skips_timestamp_when_unset() {
+        let signed = sign_query_string(
+            "a=1&b=2",
+            b"secret",
+            HmacAlgorithm::Sha256,
+            None,
+            "signature",
+            1_700_000_000_000,
+        );
+        assert!(signed.starts_with("a=1&b=2&signature="), "got: {}", signed);
+        assert!(!signed.contains("timestamp="));
+    }
+
+    #[test]
+    fn hmac_query_string_handles_empty_initial_query() {
+        let signed = sign_query_string(
+            "",
+            b"secret",
+            HmacAlgorithm::Sha256,
+            Some("timestamp"),
+            "signature",
+            1_700_000_000_000,
+        );
+        // No leading `&` when the initial query was empty.
+        assert!(
+            signed.starts_with("timestamp=1700000000000&signature="),
+            "got: {}",
+            signed
+        );
+    }
+
+    #[test]
+    fn hmac_signature_matches_binance_known_example() {
+        // Binance's published worked example (SIGNED endpoint test):
+        //   secret = "NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j"
+        //   query  = "symbol=LTCBTC&side=BUY&type=LIMIT&timeInForce=GTC&quantity=1&price=0.1&recvWindow=5000&timestamp=1499827319559"
+        //   sig    = "c8db56825ae71d6d79447849e617115f4a920fa2acdcab2b053c4b2838bd6b71"
+        let secret = b"NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j";
+        let query = "symbol=LTCBTC&side=BUY&type=LIMIT&timeInForce=GTC&quantity=1&price=0.1&recvWindow=5000&timestamp=1499827319559";
+        let sig = compute_hmac_hex(HmacAlgorithm::Sha256, secret, query.as_bytes());
+        assert_eq!(
+            sig,
+            "c8db56825ae71d6d79447849e617115f4a920fa2acdcab2b053c4b2838bd6b71"
         );
     }
 
@@ -594,10 +1131,10 @@ mod tests {
         .unwrap();
         let cfg = load_proxy_config(tmp.path()).unwrap();
         let comfort = cfg.get("comfort").unwrap();
-        let auth = comfort.auth.as_ref().unwrap();
-        assert_eq!(auth.auth_type, AuthType::Bearer);
-        assert_eq!(auth.credential, "comfort-cloud");
-        assert!(auth.header.is_none());
+        match comfort.auth.as_ref().unwrap() {
+            ProxyAuth::Bearer { credential } => assert_eq!(credential, "comfort-cloud"),
+            other => panic!("expected Bearer, got {:?}", other),
+        }
     }
 
     #[test]
@@ -617,6 +1154,198 @@ mod tests {
     }
 
     #[test]
+    fn load_config_parses_hmac_signed_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("data/config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("apis.json"),
+            r#"{"binance": {"base_url": "https://api.binance.com", "auth": {
+                "type": "hmac_signed",
+                "key_credential": "binance-key",
+                "secret_credential": "binance-secret",
+                "key_header": "X-MBX-APIKEY",
+                "algorithm": "sha256",
+                "signed_payload": "query_string",
+                "signature_param": "signature",
+                "timestamp_param": "timestamp"
+            }}}"#,
+        )
+        .unwrap();
+        let cfg = load_proxy_config(tmp.path()).unwrap();
+        match cfg.get("binance").unwrap().auth.as_ref().unwrap() {
+            ProxyAuth::HmacSigned {
+                key_credential,
+                secret_credential,
+                key_header,
+                algorithm,
+                signed_payload,
+                signature_param,
+                timestamp_param,
+            } => {
+                assert_eq!(key_credential, "binance-key");
+                assert_eq!(secret_credential, "binance-secret");
+                assert_eq!(key_header, "X-MBX-APIKEY");
+                assert_eq!(*algorithm, HmacAlgorithm::Sha256);
+                assert_eq!(*signed_payload, HmacSignedPayload::QueryString);
+                assert_eq!(signature_param, "signature");
+                assert_eq!(timestamp_param.as_deref(), Some("timestamp"));
+            }
+            other => panic!("expected HmacSigned, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_config_hmac_signed_uses_defaults_for_optional_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("data/config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("apis.json"),
+            r#"{"x": {"base_url": "https://x", "auth": {
+                "type": "hmac_signed",
+                "key_credential": "k",
+                "secret_credential": "s",
+                "algorithm": "sha512",
+                "signed_payload": "query_string"
+            }}}"#,
+        )
+        .unwrap();
+        let cfg = load_proxy_config(tmp.path()).unwrap();
+        match cfg.get("x").unwrap().auth.as_ref().unwrap() {
+            ProxyAuth::HmacSigned {
+                key_header,
+                algorithm,
+                signature_param,
+                timestamp_param,
+                ..
+            } => {
+                assert_eq!(key_header, "X-API-KEY");
+                assert_eq!(*algorithm, HmacAlgorithm::Sha512);
+                assert_eq!(signature_param, "signature");
+                assert!(timestamp_param.is_none());
+            }
+            other => panic!("expected HmacSigned, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_config_rejects_invalid_hmac_algorithm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("data/config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("apis.json"),
+            r#"{"x": {"base_url": "https://x", "auth": {
+                "type": "hmac_signed",
+                "key_credential": "k",
+                "secret_credential": "s",
+                "algorithm": "md5",
+                "signed_payload": "query_string"
+            }}}"#,
+        )
+        .unwrap();
+        assert!(load_proxy_config(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn load_config_parses_credential_bundle_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("data/config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("apis.json"),
+            r#"{"comfort_creds": {"base_url": "", "auth": {
+                "type": "credential_bundle",
+                "credentials": ["comfort_username", "comfort_password"]
+            }}}"#,
+        )
+        .unwrap();
+        let cfg = load_proxy_config(tmp.path()).unwrap();
+        match cfg.get("comfort_creds").unwrap().auth.as_ref().unwrap() {
+            ProxyAuth::CredentialBundle { credentials } => {
+                assert_eq!(
+                    credentials,
+                    &vec![
+                        "comfort_username".to_string(),
+                        "comfort_password".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected CredentialBundle, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_config_credential_bundle_allows_empty_base_url() {
+        // Bundle proxies don't make HTTP requests, so base_url is meaningless
+        // and the schema should still parse with an empty string.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("data/config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("apis.json"),
+            r#"{"x": {"base_url": "", "auth": {"type": "credential_bundle", "credentials": ["a"]}}}"#,
+        )
+        .unwrap();
+        assert!(load_proxy_config(tmp.path()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn build_credential_bundle_rejects_non_bundle_config() {
+        // Lazy pool — the helper short-circuits before touching the DB.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid").expect("lazy pool");
+        let config = ProxyConfig {
+            base_url: "https://x".to_string(),
+            auth: Some(ProxyAuth::Bearer {
+                credential: "x".to_string(),
+            }),
+        };
+        let err = build_credential_bundle(&pool, &config, "x")
+            .await
+            .expect_err("non-bundle config should error");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("credential_bundle"));
+    }
+
+    #[tokio::test]
+    async fn build_credential_bundle_rejects_unauthenticated_config() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid").expect("lazy pool");
+        let config = ProxyConfig {
+            base_url: "https://x".to_string(),
+            auth: None,
+        };
+        let err = build_credential_bundle(&pool, &config, "x")
+            .await
+            .expect_err("unauthenticated config should error");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn load_config_parses_query_param_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("data/config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("apis.json"),
+            r#"{"helius": {"base_url": "https://mainnet.helius-rpc.com", "auth":
+                {"type": "query_param", "credential": "helius-key", "param_name": "api-key"}}}"#,
+        )
+        .unwrap();
+        let cfg = load_proxy_config(tmp.path()).unwrap();
+        match cfg.get("helius").unwrap().auth.as_ref().unwrap() {
+            ProxyAuth::QueryParam {
+                credential,
+                param_name,
+            } => {
+                assert_eq!(credential, "helius-key");
+                assert_eq!(param_name, "api-key");
+            }
+            other => panic!("expected QueryParam, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn load_config_parses_header_override() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().join("data/config");
@@ -628,8 +1357,13 @@ mod tests {
         )
         .unwrap();
         let cfg = load_proxy_config(tmp.path()).unwrap();
-        let auth = cfg.get("foo").unwrap().auth.as_ref().unwrap();
-        assert_eq!(auth.header.as_deref(), Some("X-API-Key"));
+        match cfg.get("foo").unwrap().auth.as_ref().unwrap() {
+            ProxyAuth::ApiKey { credential, header } => {
+                assert_eq!(credential, "foo-key");
+                assert_eq!(header.as_deref(), Some("X-API-Key"));
+            }
+            other => panic!("expected ApiKey, got {:?}", other),
+        }
     }
 
     #[test]
@@ -654,6 +1388,7 @@ mod tests {
     struct UpstreamRecord {
         method: String,
         path: String,
+        query: String,
         body: Vec<u8>,
         headers: Vec<(String, String)>,
     }
@@ -670,6 +1405,7 @@ mod tests {
             async move {
                 let method = req.method().to_string();
                 let path = req.uri().path().to_string();
+                let query = req.uri().query().unwrap_or("").to_string();
                 let headers: Vec<(String, String)> = req
                     .headers()
                     .iter()
@@ -682,6 +1418,7 @@ mod tests {
                 *slot.lock().unwrap() = Some(UpstreamRecord {
                     method,
                     path,
+                    query,
                     body: req_body,
                     headers,
                 });
@@ -713,6 +1450,7 @@ mod tests {
         let url = format!("{}/path/sub", base);
         let resp = forward_request(
             method.clone(),
+            &url,
             &url,
             HeaderMap::new(),
             None,
@@ -761,7 +1499,7 @@ mod tests {
             ("Referer", "https://engine.local/"),
             ("X-Keep-Me", "yes"),
         ]);
-        let _ = forward_request(Method::GET, &url, headers, None, Bytes::new()).await;
+        let _ = forward_request(Method::GET, &url, &url, headers, None, Bytes::new()).await;
         let recorded = slot.lock().unwrap().clone().unwrap();
         let observed: Vec<&str> = recorded.headers.iter().map(|(n, _)| n.as_str()).collect();
         assert!(!observed.iter().any(|n| n.eq_ignore_ascii_case("cookie")));
@@ -778,7 +1516,7 @@ mod tests {
         let (base, slot) = spawn_recording_upstream(200, "ok").await;
         let url = format!("{}/x", base);
         let headers = hm(&[("Host", "engine.example.com")]);
-        let _ = forward_request(Method::GET, &url, headers, None, Bytes::new()).await;
+        let _ = forward_request(Method::GET, &url, &url, headers, None, Bytes::new()).await;
         let recorded = slot.lock().unwrap().clone().unwrap();
         let host = recorded
             .headers
@@ -796,7 +1534,7 @@ mod tests {
         let (base, slot) = spawn_recording_upstream(200, "ok").await;
         let url = format!("{}/x", base);
         let auth = build_auth_header(AuthType::Bearer, "tok-xyz", None);
-        let _ = forward_request(Method::GET, &url, HeaderMap::new(), auth, Bytes::new()).await;
+        let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), auth, Bytes::new()).await;
         let recorded = slot.lock().unwrap().clone().unwrap();
         let authz = recorded
             .headers
@@ -812,7 +1550,7 @@ mod tests {
         let (base, slot) = spawn_recording_upstream(200, "ok").await;
         let url = format!("{}/x", base);
         let auth = build_auth_header(AuthType::ApiKey, "secret-key", Some("X-API-Key"));
-        let _ = forward_request(Method::GET, &url, HeaderMap::new(), auth, Bytes::new()).await;
+        let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), auth, Bytes::new()).await;
         let recorded = slot.lock().unwrap().clone().unwrap();
         let key = recorded
             .headers
@@ -824,10 +1562,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwards_query_param_auth_to_upstream() {
+        let (base, slot) = spawn_recording_upstream(200, "ok").await;
+        let url = append_query_param(&format!("{}/v1/items", base), "api-key", "secret-123");
+        let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), None, Bytes::new()).await;
+        let recorded = slot.lock().unwrap().clone().unwrap();
+        assert_eq!(recorded.path, "/v1/items");
+        assert_eq!(recorded.query, "api-key=secret-123");
+    }
+
+    #[tokio::test]
+    async fn forwards_query_param_auth_preserves_existing_query() {
+        let (base, slot) = spawn_recording_upstream(200, "ok").await;
+        let url = append_query_param(
+            &format!("{}/v1/items?limit=10", base),
+            "api-key",
+            "secret-123",
+        );
+        let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), None, Bytes::new()).await;
+        let recorded = slot.lock().unwrap().clone().unwrap();
+        assert_eq!(recorded.query, "limit=10&api-key=secret-123");
+    }
+
+    #[tokio::test]
     async fn upstream_5xx_passes_through() {
         let (base, _slot) = spawn_recording_upstream(503, "down").await;
         let url = format!("{}/x", base);
-        let resp = forward_request(Method::GET, &url, HeaderMap::new(), None, Bytes::new()).await;
+        let resp = forward_request(Method::GET, &url, &url, HeaderMap::new(), None, Bytes::new()).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body_text(resp).await, "down");
     }
@@ -839,6 +1600,7 @@ mod tests {
         // with ECONNREFUSED. We pick port 1 (privileged, never bound by us).
         let resp = forward_request(
             Method::GET,
+            "http://127.0.0.1:1/nope",
             "http://127.0.0.1:1/nope",
             HeaderMap::new(),
             None,

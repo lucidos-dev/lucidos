@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'preact/hooks';
+import { useState, useEffect, useRef, useMemo } from 'preact/hooks';
 import { activeInlineForm, triggers, showToast } from '../../store/store';
 import {
   closeTriggerForm,
@@ -8,7 +8,7 @@ import { deriveTriggerType, toFailed } from '../../store/types';
 import type { TriggerInfo, TriggerRun, Loadable } from '../../store/types';
 import { describeCron, validateCron } from '../../utils/describeCron';
 import { Dropdown } from '../shared/Dropdown';
-import { fetchEventTypes } from '../../api/client';
+import { fetchEventTypes, fetchKnowhowEntries, knowhowPreviewPath, type KnowhowEntry } from '../../api/client';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { resizeTextarea, useFontMetricsResize } from '../chat/promptResize';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -16,15 +16,11 @@ import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 type TriggerFormType = 'schedule' | 'event' | 'both';
 type RunType = 'intent' | 'script';
 
-function knowhowPreviewPath(id: string): string {
-  if (id.startsWith('system-knowhow/')) return `${id}.md`;
-  return `knowhow/${id}.md`;
-}
-
 // Module-level cache: shared across all TriggerFormInner mounts (open/reopen
 // the form without refetching). Loadable so consumers see all 4 states.
 let cachedEventTypes: Loadable<string[]> = { status: 'not-loaded' };
 let inflightFetch: Promise<string[]> | null = null;
+let cachedKnowhow: Loadable<KnowhowEntry[]> = { status: 'not-loaded' };
 
 export function TriggerDetails() {
   const form = activeInlineForm.value;
@@ -64,6 +60,7 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
     existingRun?.type === 'intent' ? [...existingRun.knowhow] : []
   );
   const [knowhowInput, setKnowhowInput] = useState('');
+  const [knowhowEntriesLoadable, setKnowhowEntriesLoadable] = useState<Loadable<KnowhowEntry[]>>(cachedKnowhow);
   const [scriptPath, setScriptPath] = useState(
     existingRun?.type === 'script' ? existingRun.path : ''
   );
@@ -97,6 +94,38 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
   }, []);
 
   const knownEventTypes = eventTypesLoadable.status === 'loaded' ? eventTypesLoadable.data : [];
+
+  useEffect(() => {
+    if (cachedKnowhow.status === 'loaded') return;
+    setKnowhowEntriesLoadable({ status: 'loading' });
+    cachedKnowhow = { status: 'loading' };
+    fetchKnowhowEntries()
+      .then(entries => {
+        cachedKnowhow = { status: 'loaded', data: entries };
+        setKnowhowEntriesLoadable(cachedKnowhow);
+      })
+      .catch((e: unknown) => {
+        cachedKnowhow = toFailed(e);
+        setKnowhowEntriesLoadable(cachedKnowhow);
+      });
+  }, []);
+
+  const knownKnowhow = knowhowEntriesLoadable.status === 'loaded' ? knowhowEntriesLoadable.data : [];
+  const knownKnowhowIds = useMemo(() => new Set(knownKnowhow.map(k => k.id)), [knowhowEntriesLoadable]);
+  // Surface stale ids on existing triggers so the user can see the bad reference
+  // without having to click the link and 404. Only meaningful once the list loaded.
+  const invalidKnowhowIds = useMemo(
+    () => knowhowEntriesLoadable.status === 'loaded'
+      ? knowhowIds.filter(id => !knownKnowhowIds.has(id))
+      : [],
+    [knowhowIds, knownKnowhowIds, knowhowEntriesLoadable.status],
+  );
+  // Derived: live "this id won't validate" preview while typing.
+  const trimmedKnowhowInput = knowhowInput.trim();
+  const knowhowInputInvalid = trimmedKnowhowInput !== ''
+    && knowhowEntriesLoadable.status === 'loaded'
+    && !knownKnowhowIds.has(trimmedKnowhowInput)
+    && !knowhowIds.includes(trimmedKnowhowInput);
 
   const [conditionJson, setConditionJson] = useState(
     existingTask?.condition ? JSON.stringify(existingTask.condition, null, 2) : ''
@@ -146,6 +175,7 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
       setKnowhowInput('');
       return;
     }
+    if (knowhowInputInvalid) return; // inline error already shown
     setKnowhowIds([...knowhowIds, trimmed]);
     setKnowhowInput('');
   }
@@ -391,48 +421,76 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
 
                 {knowhowIds.length > 0 && (
                   <ul class="removable-list">
-                    {knowhowIds.map((id, i) => (
-                      <li key={id} class="removable-list-item">
-                        <button
-                          type="button"
-                          class="knowhow-id accent-link"
-                          onClick={() => openFilePreview(knowhowPreviewPath(id))}
-                          aria-label={`Open knowhow ${id}`}
-                        >
-                          {id}
-                        </button>
-                        <button
-                          type="button"
-                          class="action-btn action-btn-danger"
-                          onClick={() => removeKnowhow(i)}
-                          aria-label={`Remove knowhow ${id}`}
-                        >
-                          Remove
-                        </button>
-                      </li>
-                    ))}
+                    {knowhowIds.map((id, i) => {
+                      const isInvalid = invalidKnowhowIds.includes(id);
+                      return (
+                        <li key={id} class="removable-list-item">
+                          <button
+                            type="button"
+                            class={`knowhow-id accent-link${isInvalid ? ' invalid' : ''}`}
+                            onClick={() => openFilePreview(knowhowPreviewPath(id))}
+                            aria-label={`Open knowhow ${id}`}
+                            title={isInvalid ? 'No knowhow file matches this id' : undefined}
+                          >
+                            {id}{isInvalid ? ' (not found)' : ''}
+                          </button>
+                          <button
+                            type="button"
+                            class="action-btn action-btn-danger"
+                            onClick={() => removeKnowhow(i)}
+                            aria-label={`Remove knowhow ${id}`}
+                          >
+                            Remove
+                          </button>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
 
                 <div class="removable-input-row">
                   <input
                     type="text"
+                    list="trigger-knowhow-options"
                     value={knowhowInput}
                     onInput={(e) => setKnowhowInput((e.target as HTMLInputElement).value)}
                     onKeyDown={handleKnowhowKeyDown}
-                    placeholder="e.g. openai-api-availability"
+                    placeholder="e.g. lucidos-ops/release-process"
+                    class={knowhowInputInvalid ? 'input-error' : undefined}
                   />
                   <button
                     type="button"
                     class="action-btn"
                     onClick={addKnowhow}
+                    disabled={knowhowInputInvalid}
                   >
                     Add
                   </button>
                 </div>
+                {knownKnowhow.length > 0 && (
+                  <datalist id="trigger-knowhow-options">
+                    {knownKnowhow.map(k => (
+                      <option key={k.id} value={k.id}>{k.name}</option>
+                    ))}
+                  </datalist>
+                )}
+
+                {knowhowInputInvalid && (
+                  <div class="form-error">
+                    Unknown knowhow id '{trimmedKnowhowInput}'. Pick one from the suggestions — ids include subdirectories (e.g. lucidos-ops/release-process).
+                  </div>
+                )}
+                {knowhowEntriesLoadable.status === 'failed' && (
+                  <div class="form-error">Failed to load knowhow list: {knowhowEntriesLoadable.error}</div>
+                )}
+                {invalidKnowhowIds.length > 0 && (
+                  <div class="form-error">
+                    No knowhow file matches: {invalidKnowhowIds.join(', ')}. Save will be rejected until these are removed or fixed.
+                  </div>
+                )}
 
                 <div class="form-hint">
-                  ID of a markdown file under <code>data/knowhow/</code> (without <code>.md</code>). Use slashes for subdirectories. Prefix with <code>system-knowhow/</code> to reference engine-shipped reference docs (e.g. <code>system-knowhow/best-practices</code>).
+                  ID of a markdown file under <code>data/knowhow/</code> (without <code>.md</code>). Includes any subdirectory path (e.g. <code>lucidos-ops/release-process</code>, NOT <code>release-process</code>). Prefix with <code>system-knowhow/</code> to reference engine-shipped reference docs.
                 </div>
               </div>
             </>

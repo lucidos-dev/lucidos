@@ -8,7 +8,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::AppState;
-use crate::core::events::walk_thread_images;
+use crate::core::events::{walk_thread_images, walk_thread_images_meta};
 
 #[derive(Serialize)]
 pub struct ThreadImageInfo {
@@ -33,12 +33,14 @@ pub(super) async fn list_thread_images(
             )
         })?;
 
-    let images = walk_thread_images(&events)
-        .iter()
+    // Listing is metadata-only — skip the per-blob read+encode that the
+    // bytes-loading walker would do.
+    let images = walk_thread_images_meta(state.engine.workspace_path(), &events)
+        .into_iter()
         .map(|img| ThreadImageInfo {
             index: img.index,
             source: img.source,
-            mime_type: img.mime_type.to_string(),
+            mime_type: img.mime_type,
         })
         .collect();
 
@@ -68,7 +70,7 @@ pub(super) async fn get_thread_image(
             )
         })?;
 
-    let images = walk_thread_images(&events);
+    let images = walk_thread_images(state.engine.workspace_path(), &events);
     let total = images.len();
 
     let img = images
@@ -84,8 +86,17 @@ pub(super) async fn get_thread_image(
             )
         })?;
 
+    // Empty base64 means walk_thread_images couldn't read the blob
+    // (typically a partial backup-restore). The numbering slot exists so
+    // thread:N stays stable, but there are no bytes to serve.
+    if img.base64.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Image {} blob is missing on disk.", target_index),
+        ));
+    }
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(img.base64)
+        .decode(&img.base64)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -1,8 +1,10 @@
 import { test, expect } from '@playwright/test';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, openThreadDrawer, waitForVisibleInput, ensureOnThreadPane, userMessageBody, USER_MSG_SELECTOR, REAL_THREAD_NAV } from './helpers';
+import { clearAllThreads } from './db-helpers';
 
 test.describe('Page reload preserves state', () => {
   test.beforeEach(async ({ page }) => {
+    clearAllThreads();
     await assertHealthy(page);
   });
 

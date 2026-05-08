@@ -118,6 +118,16 @@ pub(super) fn classify_result(
     (Some(terminal), emit_idle)
 }
 
+/// True when the change being proposed at idle was produced by a `Failed`
+/// turn (CC streamed an API error and exited). Only `Failed` qualifies —
+/// `Canceled` is a deliberate user stop (apply may still make sense),
+/// `Aborted` is engine-side and the worktree is preserved for recovery.
+pub(super) fn change_is_incomplete_from_terminal(
+    terminal_kind: &Option<TerminalKind>,
+) -> bool {
+    matches!(terminal_kind, Some(TerminalKind::Failed { .. }))
+}
+
 /// True when an arriving `Result` is the "stale --resume" signal — CC echoed
 /// our forwarded user message back as an empty answer because the persisted
 /// session id no longer exists. The run-loop responds by killing the worktree
@@ -515,6 +525,29 @@ mod tests {
             Some(TerminalKind::Aborted),
             "shutdown during active work must emit Aborted"
         );
+    }
+
+    /// `Failed` terminal kind tags the resulting `ChangeProposed` so the apply
+    /// UI confirms before landing partial work. `Generated` / `Canceled` /
+    /// `Aborted` / `None` must NOT tag — `Canceled` is a deliberate user stop
+    /// where applying makes sense, `Aborted` is engine-side and the worktree
+    /// is preserved for recovery, `None` is silent-resume warmup with no
+    /// change to propose.
+    #[test]
+    fn change_is_incomplete_from_terminal_table() {
+        assert!(change_is_incomplete_from_terminal(&Some(TerminalKind::Failed {
+            error: "stream interrupted".into(),
+        })));
+        assert!(!change_is_incomplete_from_terminal(&Some(
+            TerminalKind::Generated
+        )));
+        assert!(!change_is_incomplete_from_terminal(&Some(
+            TerminalKind::Canceled
+        )));
+        assert!(!change_is_incomplete_from_terminal(&Some(
+            TerminalKind::Aborted
+        )));
+        assert!(!change_is_incomplete_from_terminal(&None));
     }
 
     /// Only "no text AND no images" counts as silent — image-only turns are

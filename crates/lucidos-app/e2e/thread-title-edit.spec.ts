@@ -52,6 +52,15 @@ async function getMobileTitleHeight(page: import('@playwright/test').Page): Prom
   });
 }
 
+/** Height (px) of the desktop thread-view-header title display textarea.
+ *  Returns 0 if not rendered. */
+async function getDesktopTitleHeight(page: import('@playwright/test').Page): Promise<number> {
+  return page.evaluate(() => {
+    const el = document.querySelector('.thread-view-header .thread-title-display') as HTMLTextAreaElement | null;
+    return el ? el.getBoundingClientRect().height : 0;
+  });
+}
+
 test.describe('Thread title editing — desktop', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
@@ -123,6 +132,73 @@ test.describe('Thread title editing — desktop', () => {
       return el?.tagName === 'INPUT' && el.classList.contains('thread-title-edit-input');
     });
     expect(isFocused).toBe(true);
+  });
+
+  test('display height re-fits when container widens after a wrapped narrow measurement', async ({ page }) => {
+    // Bug: autoResizeTextarea() only re-runs on [title, editing] dep changes.
+    // If the textarea was measured while the container was narrow (title wraps
+    // to multiple lines), the inline style.height stays pinned to the wrapped
+    // value when the container later widens — header balloons until the user
+    // renames or reloads. A ResizeObserver on the textarea catches container
+    // width changes (drawer toggle, divider drag, window resize) and re-fits.
+    await page.setViewportSize({ width: 1600, height: 800 });
+    await navigateToApp(page);
+
+    const msg = uniqueMessage('title-resize-stuck');
+    await sendMessage(page, `Say exactly: "${msg}"`);
+    await waitForResponse(page);
+    await waitForThreadTitle(page);
+
+    // Set a moderately long title — wraps at narrow widths, single-line at wide.
+    await clickVisibleElement(page, '.thread-title-display');
+    const input = await waitForTitleInput(page);
+    const longTitle = 'A thread title that wraps on narrow desktop but fits wide';
+    await input.fill(longTitle);
+    await input.press('Enter');
+    await page.waitForFunction((expected) => {
+      const els = document.querySelectorAll('.thread-title-display');
+      return Array.from(els).some(el => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && ((el as HTMLTextAreaElement).value ?? '').trim() === expected;
+      });
+    }, longTitle, { timeout: 10_000 });
+
+    // Capture the natural one-line height at wide width as the baseline.
+    const baselineHeight = await getDesktopTitleHeight(page);
+    expect(baselineHeight, 'baseline: title fits on one line at 1600px').toBeGreaterThan(0);
+
+    // Narrow the viewport — stay above 768px so the desktop layout (and the
+    // same .thread-view-header textarea element) remains visible.
+    await page.setViewportSize({ width: 800, height: 800 });
+
+    // Force autoResize to re-run at the narrow width via the editing→false
+    // transition (the [title, editing] effect calls autoResizeTextarea). The
+    // bug is otherwise latent until something else fires the effect.
+    await clickVisibleElement(page, '.thread-title-display');
+    await waitForTitleInput(page);
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() =>
+      document.querySelectorAll('.thread-title-edit.is-editing').length === 0,
+    );
+
+    const narrowHeight = await getDesktopTitleHeight(page);
+    // Sanity: at narrow desktop the long title wraps → notably taller than baseline.
+    expect(narrowHeight, 'sanity: title wrapped at narrow desktop').toBeGreaterThan(baselineHeight + 10);
+
+    // Widen the viewport. Without the fix, no autoResize trigger fires and
+    // style.height stays pinned to the narrow-width measurement.
+    await page.setViewportSize({ width: 1600, height: 800 });
+
+    // Allow ResizeObserver to fire and the layout to settle. Polls for the
+    // re-fit; falls through to the assertion if the timeout elapses.
+    await page.waitForFunction((baseline) => {
+      const el = document.querySelector('.thread-view-header .thread-title-display') as HTMLTextAreaElement | null;
+      return el ? el.getBoundingClientRect().height <= baseline + 1 : false;
+    }, baselineHeight, { timeout: 2000 }).catch(() => { /* fall through to assertion */ });
+
+    const wideHeight = await getDesktopTitleHeight(page);
+    expect(wideHeight, 'title should re-fit to baseline single-line height after widening')
+      .toBeLessThanOrEqual(baselineHeight + 1);
   });
 
   test('press Escape cancels editing without saving', async ({ page }) => {
@@ -297,9 +373,8 @@ test.describe('Thread title editing — mobile', () => {
     await waitForResponse(page);
     await waitForThreadTitle(page);
 
-    // Capture pre-edit height as the baseline for "natural" height.
-    const baselineHeight = await getMobileTitleHeight(page);
-    expect(baselineHeight).toBeGreaterThan(10);
+    // Sanity: pre-edit height is the natural rendered height (not collapsed).
+    expect(await getMobileTitleHeight(page)).toBeGreaterThan(10);
 
     await clickVisibleElement(page, '.thread-title-display');
     const input = await waitForTitleInput(page);
@@ -316,10 +391,12 @@ test.describe('Thread title editing — mobile', () => {
       });
     }, newTitle, { timeout: 10_000 });
 
-    // The bug: the display's height collapses to the border-only height
-    // (~2px). Assert the rendered height is at least most of the baseline.
+    // The bug: the display's height collapses to the border-only height (~2px).
+    // The new title is naturally shorter than the auto-generated baseline, so
+    // assert "did not collapse" (at least one line tall) rather than comparing
+    // against the baseline directly.
     const postSaveHeight = await getMobileTitleHeight(page);
-    expect(postSaveHeight).toBeGreaterThanOrEqual(baselineHeight - 1);
+    expect(postSaveHeight, 'title display must not collapse to border-only height').toBeGreaterThan(10);
   });
 
   test('title hides with header on scroll down', async ({ page }) => {

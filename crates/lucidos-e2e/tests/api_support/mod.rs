@@ -3,6 +3,45 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Minimal valid PNG (signature + IHDR start). Enough for the engine's
+/// magic-byte sniff to recognize image/png; not a real renderable image.
+pub fn png_bytes() -> Vec<u8> {
+    vec![
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00,
+    ]
+}
+
+/// Encode an in-memory JPEG of given dimensions — needed by tests that
+/// exercise the preview downscale path against a real-sized image, since
+/// `png_bytes()` produces a 1×1 image that's already below the preview cap.
+pub fn encoded_jpeg(width: u32, height: u32) -> Vec<u8> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::{ColorType, ImageEncoder};
+    let pixels = vec![128u8; (width * height * 3) as usize];
+    let mut buf: Vec<u8> = Vec::new();
+    JpegEncoder::new_with_quality(&mut buf, 70)
+        .write_image(&pixels, width, height, ColorType::Rgb8.into())
+        .expect("encode jpeg");
+    buf
+}
+
+pub fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{:02x}", b);
+        acc
+    })
+}
+
 fn read_api_port() -> u16 {
     let workspace = workspace_path();
     let ports_file = workspace.join(".lucidos/ports");

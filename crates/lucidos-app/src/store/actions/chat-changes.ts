@@ -10,7 +10,7 @@ import { focusThread } from './threads';
 import type { Change } from '../../api/client';
 import type { ToastAction } from '../types';
 
-const RESTART_TOAST_KEY = 'restart-required';
+export const RESTART_TOAST_KEY = 'restart-required';
 export const RESTART_LS_KEY = 'lucidos-restart-required';
 
 /** Timestamp (ms) when this page's JavaScript was loaded.
@@ -96,7 +96,8 @@ const RESTART_TOAST_MESSAGE = 'Engine restart required to apply changes.';
 /** Set restarting state, show info toast, and call the restart API. */
 export async function initiateEngineRestart(): Promise<void> {
   engineRestarting.value = true;
-  showToast('Restarting engine...', 'info', { key: RESTART_TOAST_KEY, spinning: true });
+  // dismissable: false — see ToastItem.dismissable.
+  showToast('Restarting engine...', 'info', { key: RESTART_TOAST_KEY, spinning: true, dismissable: false });
   try {
     await restartEngine();
   } catch (e) {

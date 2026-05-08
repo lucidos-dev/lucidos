@@ -1,7 +1,7 @@
 import type { ComponentChildren } from 'preact';
 import { useRef, useEffect, useCallback } from 'preact/hooks';
 import { signal } from '@preact/signals';
-import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, threadsLoaded, splitRatio, ThreadChannel, ALL_CHANNELS, effectiveThreadStatus, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, draftsViewActive } from '../../store/store';
+import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, threadsLoaded, splitRatio, ThreadChannel, ALL_CHANNELS, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, draftsViewActive } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
 import { loadOlderThreads, ensureThreadInMap } from '../../store/actions/thread-loading';
@@ -131,10 +131,7 @@ export function categorizeThreads(threads: ThreadState[]): ThreadSections {
         if (t.meta.state === 'composing' || t.meta.state === 'discarded') continue;
         const status = effectiveThreadStatus(t);
         out.statusMap.set(t.meta.id, status);
-        const stored = t.meta.section as ArchiveState;
-        const hasActiveChildren = t.meta.activeChildrenCount > 0;
-        const hasPendingChanges = t.meta.ccHasChanges;
-        const display = displaySection(stored, status, t.meta.saved, hasActiveChildren, hasPendingChanges);
+        const display = getThreadDisplaySection(t);
         switch (display) {
             case 'active': out.active.push(t); break;
             case 'review': out.review.push(t); break;
@@ -142,7 +139,7 @@ export function categorizeThreads(threads: ThreadState[]): ThreadSections {
             case 'archive': out.archive.push(t); break;
         }
         if (display === 'saved'
-            && displaySection(stored, status, false, hasActiveChildren, hasPendingChanges) === 'review') {
+            && displaySection(t.meta.section as ArchiveState, status, false, t.meta.activeChildrenCount > 0, t.meta.ccHasChanges) === 'review') {
             out.savedReviewCount++;
         }
     }
@@ -476,10 +473,6 @@ export function ThreadRow({ threadId, status, onAfterClick }: { threadId: string
     const thread = threadMap.value.get(threadId);
     if (!thread) return null;
     const { meta } = thread;
-    // Use API-provided message_count until events are loaded, then count from events
-    const exchangeCount = thread.eventsLoaded
-        ? [...thread.events.values()].filter(e => e.type === 'MessageReceived' || e.type === 'TriggerStarted').length
-        : meta.messageCount;
 
     return (
         <div data-flip-id={meta.id}>
@@ -489,7 +482,7 @@ export function ThreadRow({ threadId, status, onAfterClick }: { threadId: string
                 channel: meta.channel,
                 status,
                 timestamp: formatMessageTimestamp(meta.updatedAt),
-                exchangeCount,
+                exchangeCount: meta.messageCount,
                 totalChildren: meta.totalChildrenCount,
                 activeChildren: meta.activeChildrenCount,
                 ccHasChanges: meta.ccHasChanges,

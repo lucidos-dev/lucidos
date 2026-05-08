@@ -21,6 +21,7 @@ pub(crate) struct ProxyArgs {
     pub(crate) body: BodySource,
     pub(crate) include: bool,
     pub(crate) fail: bool,
+    pub(crate) credentials: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,9 @@ pub(crate) enum BodySource {
 }
 
 pub(crate) fn run(ws: &Workspace, args: ProxyArgs) -> Result<u8, BoxError> {
+    if args.credentials {
+        return run_credentials(ws, &args.name, &args.path);
+    }
     let body_bytes = read_body(&args.body)?;
     let url = build_request_url(&ws.base_url(), &args.name, &args.path)?;
     let method = parse_method(&args.method)?;
@@ -86,6 +90,41 @@ pub(crate) fn run(ws: &Workspace, args: ProxyArgs) -> Result<u8, BoxError> {
     Ok(0)
 }
 
+fn run_credentials(ws: &Workspace, name: &str, path: &str) -> Result<u8, BoxError> {
+    if !path.is_empty() {
+        return Err(format!(
+            "--credentials cannot be combined with a request path (got {:?})",
+            path
+        )
+        .into());
+    }
+    let url = build_credentials_url(&ws.base_url(), name)?;
+    let client = client()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("Failed to fetch credentials for {}: {}", name, e))?;
+    let status = resp.status();
+    let body = resp
+        .bytes()
+        .map_err(|e| format!("Failed to read response body: {}", e))?;
+    if status.is_client_error() || status.is_server_error() {
+        let body_text = String::from_utf8_lossy(&body);
+        let _ = writeln!(
+            io::stderr(),
+            "lucidos proxy: HTTP {} {} — {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or(""),
+            body_text.trim(),
+        );
+        return Ok(22);
+    }
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(&body)?;
+    Ok(0)
+}
+
 fn read_body(source: &BodySource) -> Result<Option<Vec<u8>>, BoxError> {
     match source {
         BodySource::None => Ok(None),
@@ -109,19 +148,7 @@ pub(crate) fn build_request_url(
     name: &str,
     path: &str,
 ) -> Result<String, BoxError> {
-    if name.is_empty() {
-        return Err("proxy name is empty".into());
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(format!(
-            "proxy name {:?} must contain only ASCII letters, digits, '-', or '_'",
-            name
-        )
-        .into());
-    }
+    validate_name(name)?;
     let normalized_path = if path.is_empty() {
         String::new()
     } else if path.starts_with('/') {
@@ -135,6 +162,34 @@ pub(crate) fn build_request_url(
         name,
         normalized_path
     ))
+}
+
+/// Build the engine URL for the credential-bundle endpoint:
+/// `<base>/api/v1/proxy-credentials/<name>`.
+pub(crate) fn build_credentials_url(base_url: &str, name: &str) -> Result<String, BoxError> {
+    validate_name(name)?;
+    Ok(format!(
+        "{}/api/v1/proxy-credentials/{}",
+        base_url.trim_end_matches('/'),
+        name,
+    ))
+}
+
+fn validate_name(name: &str) -> Result<(), BoxError> {
+    if name.is_empty() {
+        return Err("proxy name is empty".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "proxy name {:?} must contain only ASCII letters, digits, '-', or '_'",
+            name
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn parse_method(s: &str) -> Result<reqwest::Method, BoxError> {
@@ -214,7 +269,10 @@ mod tests {
     #[test]
     fn parse_headers_splits_on_first_colon() {
         let h = parse_headers(&["Authorization: Bearer abc:def".to_string()]).unwrap();
-        assert_eq!(h, vec![("Authorization".to_string(), "Bearer abc:def".to_string())]);
+        assert_eq!(
+            h,
+            vec![("Authorization".to_string(), "Bearer abc:def".to_string())]
+        );
     }
 
     #[test]
@@ -237,5 +295,36 @@ mod tests {
     fn parse_headers_accepts_empty_value() {
         let h = parse_headers(&["X-Empty:".to_string()]).unwrap();
         assert_eq!(h, vec![("X-Empty".to_string(), "".to_string())]);
+    }
+
+    #[test]
+    fn build_credentials_url_basic() {
+        let url = build_credentials_url("https://localhost:8443", "comfort_creds").unwrap();
+        assert_eq!(
+            url,
+            "https://localhost:8443/api/v1/proxy-credentials/comfort_creds"
+        );
+    }
+
+    #[test]
+    fn build_credentials_url_strips_trailing_slash_from_base() {
+        let url = build_credentials_url("https://localhost:8443/", "x").unwrap();
+        assert_eq!(url, "https://localhost:8443/api/v1/proxy-credentials/x");
+    }
+
+    #[test]
+    fn build_credentials_url_rejects_empty_name() {
+        assert!(build_credentials_url("https://x", "").is_err());
+    }
+
+    #[test]
+    fn build_credentials_url_rejects_slash_in_name() {
+        assert!(build_credentials_url("https://x", "foo/bar").is_err());
+    }
+
+    #[test]
+    fn build_credentials_url_accepts_dashes_and_underscores() {
+        let url = build_credentials_url("https://x", "my-creds_v2").unwrap();
+        assert_eq!(url, "https://x/api/v1/proxy-credentials/my-creds_v2");
     }
 }

@@ -9,17 +9,6 @@ import { errorDetail } from '../../utils/errorDetail';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatBytes } from '../../utils/formatBytes';
 
-/**
- * Per-row actions:
- *
- * - **Clean build artifacts** (Tier 1): strips `target/`, `node_modules/`,
- *   `.lucidos/cache/`. Always safe.
- * - **Remove worktree** (Tier 2 / Tier 3): removes the entire worktree dir
- *   and deletes the branch when fully merged. The Tier 2 endpoint refuses on
- *   dirty worktrees; in that case the UI re-prompts and falls back to Tier 3
- *   (force) after explicit confirmation.
- */
-
 interface WorktreeRow {
   thread_id: string;
   thread_title: string | null;

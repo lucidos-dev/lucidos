@@ -372,6 +372,9 @@ impl LucidosEngine {
                 // Apply-now propose is part of a live agent flow — origin is
                 // carried by the surrounding MessageReceived.
                 origin: None,
+                // Apply-now reaches this point only when the user clicked
+                // Apply on a clean idle — never from a failed turn.
+                incomplete: false,
             })
             .await?;
 

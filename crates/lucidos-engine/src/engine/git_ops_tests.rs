@@ -1501,6 +1501,80 @@ async fn recover_no_commits_branch_errors_when_worktree_clean_but_files_declared
     );
 }
 
+/// Branch had real commits that were already merged into main (e.g. via
+/// a sibling apply). The branch ref still exists but has no unique commits
+/// over main — `has_branch_commits` returns false. Since main already
+/// contains the work, treat as a no-op success rather than refusing with a
+/// "discard manually" error.
+#[tokio::test]
+async fn recover_no_commits_branch_already_applied_when_branch_merged_to_main() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let _ = git_cmd(&["checkout", "-b", "claude-code/feature"], &repo).await;
+    tokio::fs::write(repo.join("feature.rs"), "fn feature() {}")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add feature"], &repo).await;
+
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    let _ = git_cmd(
+        &[
+            "merge",
+            "--no-ff",
+            "claude-code/feature",
+            "-m",
+            "Merge branch 'claude-code/feature'",
+        ],
+        &repo,
+    )
+    .await;
+
+    assert!(
+        !has_branch_commits(&repo, "claude-code/feature").await,
+        "precondition: branch must have no unique commits over main"
+    );
+
+    let files = vec!["feature.rs".to_string()];
+    let result = recover_no_commits_branch(&repo, "claude-code/feature", &files).await;
+    assert_eq!(
+        result.unwrap(),
+        NoCommitsRecovery::AlreadyApplied,
+        "branch fully merged into main with referenced files in history must be a no-op"
+    );
+}
+
+/// Same as above but with a fast-forward merge — branch's tip becomes main's
+/// tip exactly (no merge commit). The work is still on main, so apply must
+/// no-op rather than error.
+#[tokio::test]
+async fn recover_no_commits_branch_already_applied_after_fast_forward() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let _ = git_cmd(&["checkout", "-b", "claude-code/ff-feature"], &repo).await;
+    tokio::fs::write(repo.join("ff.rs"), "fn ff() {}")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add ff feature"], &repo).await;
+
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    let _ = git_cmd(&["merge", "--ff-only", "claude-code/ff-feature"], &repo).await;
+
+    assert!(
+        !has_branch_commits(&repo, "claude-code/ff-feature").await,
+        "precondition: branch must have no unique commits over main"
+    );
+
+    let files = vec!["ff.rs".to_string()];
+    let result = recover_no_commits_branch(&repo, "claude-code/ff-feature", &files).await;
+    assert_eq!(
+        result.unwrap(),
+        NoCommitsRecovery::AlreadyApplied,
+        "fast-forward-merged branch with referenced files must be a no-op"
+    );
+}
+
 #[test]
 fn repo_at_different_path_is_external() {
     let dev = std::path::PathBuf::from("/Users/me/IdeaProjects/lucidos");

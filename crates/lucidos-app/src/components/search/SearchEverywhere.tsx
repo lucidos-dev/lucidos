@@ -135,7 +135,6 @@ function ResultRow({ item, index, selected, onSelect, onHover }: {
   onSelect: (item: SearchResultItem) => void;
   onHover: (index: number) => void;
 }) {
-  const display = { title: item.title, subtitle: item.subtitle };
   return (
     <button
       key={`${item.category}:${item.id}`}
@@ -148,8 +147,8 @@ function ResultRow({ item, index, selected, onSelect, onHover }: {
         <CategoryIcon category={item.category} />
       </span>
       <span class="search-everywhere-result-info">
-        <span class="search-everywhere-result-title">{display.title}</span>
-        {display.subtitle && <span class="search-everywhere-result-subtitle">{display.subtitle}</span>}
+        <span class="search-everywhere-result-title">{item.title}</span>
+        {item.subtitle && <span class="search-everywhere-result-subtitle">{item.subtitle}</span>}
       </span>
     </button>
   );

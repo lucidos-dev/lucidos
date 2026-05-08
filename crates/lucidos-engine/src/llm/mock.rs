@@ -58,6 +58,7 @@ impl LlmProvider for MockProvider {
             tool_calls: vec![],
             stop_reason: Some("end_turn".to_string()),
             output_tokens: None,
+            input_tokens: None,
             thinking_chars: None,
         })
     }

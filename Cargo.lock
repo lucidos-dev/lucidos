@@ -4170,10 +4170,13 @@ name = "lucidos-e2e"
 version = "0.1.0"
 dependencies = [
  "async-compression",
+ "base64 0.22.1",
  "futures",
+ "image",
  "lucidos-engine",
  "reqwest 0.12.28",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "tokio",
@@ -4202,6 +4205,7 @@ dependencies = [
  "futures",
  "git2",
  "glob",
+ "hmac",
  "image",
  "kamadak-exif",
  "lettre",

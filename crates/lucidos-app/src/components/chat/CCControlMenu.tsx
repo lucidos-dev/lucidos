@@ -1,7 +1,7 @@
 import { Fragment } from 'preact';
 import { useSignal, useSignalEffect, signal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
-import { showToast, ccSessionVersion, ccPendingModel, ccPendingReasoningEffort, selectedRepoId } from '../../store/store';
+import { showToast, ccSessionVersion, ccPendingModel, ccPendingReasoningEffort, selectedRepoId, engineRestarting } from '../../store/store';
 import { sendCCControl } from '../../store/actions/chat-claude-code';
 import { sendMessage } from '../../store/actions/chat';
 import { fetchCCCommands, type CCCommandDef, type CCCommandsResponse, type CCModelValue, type CCReasoningEffort } from '../../api/client';
@@ -72,6 +72,10 @@ export function CCControlMenu({ threadId }: Props) {
 
   function loadCommands() {
     clearRetryTimer();
+    // Restart can take 30-90s (Rust recompile + boot) — longer than the retry
+    // budget. Skip and let the engineRestarting useSignalEffect re-trigger us
+    // when the engine is back. Same convention as loadAllThreads etc.
+    if (engineRestarting.value) return;
     // Compose view (no thread) scopes commands to the user-selected repo so
     // skills from other repos never leak into the menu. selectedRepoId === ''
     // means "default Lucidos repo" — pass it through verbatim; the backend
@@ -111,8 +115,11 @@ export function CCControlMenu({ threadId }: Props) {
         }
       })
       .catch(() => {
-        // Network error — retry silently, keep existing cache
-        if (threadId && retryCountRef.current < MAX_EMPTY_RETRIES) {
+        // Retry both views: iOS PWA HTTP/2 connections go stale after
+        // backgrounding and the first wake fetch rejects with
+        // TypeError("Load failed"). The threadId guard in the empty-response
+        // branch above is about "no session to wait for" — a different concern.
+        if (retryCountRef.current < MAX_EMPTY_RETRIES) {
           retryCountRef.current++;
           retryTimerRef.current = window.setTimeout(loadCommands, RETRY_DELAY_MS);
         } else {
@@ -149,6 +156,22 @@ export function CCControlMenu({ threadId }: Props) {
   // useSignalEffect required — see comment below re: Preact signal optimization.
   useSignalEffect(() => {
     if (ccSessionVersion.value > 0) {
+      retryCountRef.current = 0;
+      loadCommands();
+    }
+  });
+
+  // Re-fetch compose-view commands when an engine restart completes. The
+  // in-flight loadCommands was gated out while engineRestarting was true; this
+  // transition is the cue to fire a fresh load. Focused-CC-thread instances
+  // skip this — runResumeSync runs loadAllThreads which bumps ccSessionVersion
+  // and the effect above already covers them.
+  const wasRestartingRef = useRef(false);
+  useSignalEffect(() => {
+    const restarting = engineRestarting.value;
+    const transitionedToReady = wasRestartingRef.current && !restarting;
+    wasRestartingRef.current = restarting;
+    if (transitionedToReady && !threadId) {
       retryCountRef.current = 0;
       loadCommands();
     }

@@ -162,7 +162,9 @@
     }
 }
 
-/* Toast notifications — positioned below header, centered in chat panel */
+/* Toast notifications — positioned below header, centered in chat panel.
+   --z-toast sits above .restart-overlay so the restart toast stays visible
+   when the dim overlay covers the header. */
 .toast-container {
     position: fixed;
     top: calc(2.75rem + 0.5rem + env(safe-area-inset-top, 0px));
@@ -220,11 +222,13 @@
 }
 
 /* The mini-spinner rotates via CSS transform, and at 45° its square
-   bounding box inflates by ~√2, briefly exceeding the body's height
-   and triggering the overflow scrollbar. Disable scroll when a spinner
-   is present — these toasts are always single-line. */
+   bounding box inflates by ~√2, briefly exceeding the body's height.
+   `overflow: hidden` would suppress the resulting scrollbar but also
+   clips the spinner's top edge; `overflow: visible` lets the small
+   excess bleed into the toast's 0.5rem top padding without a scrollbar.
+   These toasts are always single-line. */
 .toast-body:has(.mini-spinner) {
-    overflow: hidden;
+    overflow: visible;
 }
 
 .toast-icon {
@@ -462,40 +466,128 @@
 }
 
 /* Image popup for full-size viewing */
-/* Extends .modal-overlay — darker backdrop for image viewing */
+/* Extends .modal-overlay — darker backdrop for image viewing.
+   z-index above --z-control-panel so header buttons (which sit at 2200)
+   don't punch through the dim overlay. */
 .image-popup {
     background: rgba(0, 0, 0, 0.9);
     padding: 1.25rem;
     overflow: hidden;
     overscroll-behavior: contain;
+    z-index: calc(var(--z-control-panel) + 100);
 }
 
 .image-popup-content {
     position: relative;
-    max-width: 95vw;
-    max-height: 95vh;
+    width: 95vw;
+    height: 95vh;
     overflow: hidden;
 }
 
-.image-popup-content img {
-    max-width: 95vw;
-    max-height: 90vh;
+/* The strip holds every image side by side: each slide is positioned at
+   left: i*100% (set inline). The strip's transform = -index*W centres the
+   current slide. Because every <img> is mounted from the start at its own
+   slot, swiping just moves the strip — no src swaps, no decode race. */
+.image-popup-strip {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    will-change: transform;
+}
+
+.image-popup-slide {
+    position: absolute;
+    top: 0;
+    /* left set inline per slide */
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.image-popup-slide img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
     border-radius: 0.5rem;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
     user-select: none;
     -webkit-user-select: none;
     transform-origin: center;
     touch-action: none;
+    /* Pin to its own compositor layer so pinch-zoom transforms don't
+       repaint at native resolution every frame. iOS Safari is especially
+       sensitive — without this, pinch updates feel jerky because the
+       browser re-rasterizes the image bitmap on each scale change. The
+       JS path also uses translate3d() to force the GPU code path. */
+    will-change: transform;
+    -webkit-transform: translateZ(0);
+    transform: translateZ(0);
+    -webkit-backface-visibility: hidden;
+    backface-visibility: hidden;
 }
 
 .image-popup-close {
     position: absolute;
     top: -2.5rem;
     right: 0;
+    background: rgba(0, 0, 0, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    color: #fff;
+    border-radius: 50%;
 }
 
 .floating-mobile-close {
     display: none;
+}
+
+/* Prev/Next navigation buttons in the popup. Pinned to the viewport so
+   .image-popup-content's `overflow: hidden` (needed to clip pinch-zoomed
+   images) doesn't hide them. */
+.image-popup-nav {
+    position: fixed;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 3rem;
+    height: 3rem;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    color: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1;
+    transition: background var(--duration-fast);
+}
+
+.image-popup-nav-prev {
+    left: 1.5rem;
+}
+
+.image-popup-nav-next {
+    right: 1.5rem;
+}
+
+@media (hover: hover) {
+    .image-popup-nav:hover {
+        background: rgba(0, 0, 0, 0.85);
+    }
+}
+
+.image-popup-counter {
+    position: absolute;
+    bottom: -2rem;
+    left: 50%;
+    transform: translateX(-50%);
+    color: var(--text-on-accent);
+    font-size: 0.75rem;
+    background: rgba(0, 0, 0, 0.6);
+    padding: 0.1875rem 0.5rem;
+    border-radius: 0.625rem;
+    pointer-events: none;
 }
 
 @media (max-width: 600px) {
@@ -505,22 +597,13 @@
     }
 
     .image-popup-content {
-        max-width: 100vw;
-        max-height: 100vh;
-        width: 100%;
-        height: 100%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
+        width: 100vw;
+        height: 100vh;
     }
 
-    .image-popup-content img {
-        max-height: 100vh;
+    .image-popup-slide img {
         border-radius: 0;
         box-shadow: none;
-        width: 100%;
-        height: 100%;
-        object-fit: contain;
     }
 
     .image-popup-close {
@@ -537,8 +620,8 @@
         width: 3rem;
         height: 3rem;
         border-radius: 50%;
-        background: rgba(255, 255, 255, 0.15);
-        border: 1px solid rgba(255, 255, 255, 0.25);
+        background: rgba(0, 0, 0, 0.7);
+        border: 1px solid rgba(255, 255, 255, 0.5);
         color: #fff;
         cursor: pointer;
         z-index: 1;
@@ -547,5 +630,15 @@
     .floating-mobile-close svg {
         width: 1.25rem;
         height: 1.25rem;
+    }
+
+    /* Mobile relies on swipe for navigation — chevrons would steal thumb
+       real estate without adding anything. */
+    .image-popup-nav {
+        display: none;
+    }
+
+    .image-popup-counter {
+        bottom: max(0.75rem, calc(0.5rem + env(safe-area-inset-bottom, 0px)));
     }
 }

@@ -34,6 +34,13 @@ export interface ChatRequestBody {
     path: string;
     lines?: [number, number];
   };
+  /** Sha256 hashes of blobs already uploaded to `POST /threads/:id/blobs`.
+   *  The frontend's primary path; `images` (legacy base64) is kept on the
+   *  body schema for backward compatibility with older callers but the new
+   *  path uses `image_hashes` exclusively. */
+  image_hashes?: string[];
+  /** Legacy: inline base64 images. Kept for compat during the Phase 5
+   *  cleanup window; new code uses `image_hashes`. */
   images?: Array<{ base64: string; mime_type: string }>;
   use_claude_code?: boolean;
   cc_model?: string;

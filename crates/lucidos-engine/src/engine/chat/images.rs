@@ -1,3 +1,6 @@
+use base64::Engine as _;
+
+use crate::core::blobs::{ext_for_mime, resolve_blob, ResolvedBlob};
 use crate::llm::{ContentBlock, MessageContent};
 
 /// Maximum total base64 bytes for all images included in a single LLM call.
@@ -20,55 +23,72 @@ pub(super) fn image_recency_cutoff(
     user_count.saturating_sub(max_messages)
 }
 
-/// Filter prior messages to only include images from the most recent N user messages.
-/// In long threads, old screenshots can mislead the LLM into thinking they represent
-/// current state. By only keeping recent images, the model sees relevant visual context
-/// while stale images are referenced only as text annotations in the history.
-pub(super) fn filter_recent_history_images(
+/// Old screenshots in long threads mislead the LLM into thinking they
+/// represent current state — keep only the most recent N user messages'
+/// hashes; older messages still appear as text references.
+pub(super) fn filter_recent_history_image_hashes(
     all_prior: &[crate::core::store::SessionMessage],
     max_messages: usize,
-) -> Vec<Vec<crate::core::store::UserImagePayload>> {
+) -> Vec<Vec<String>> {
     let cutoff = image_recency_cutoff(all_prior, max_messages);
     all_prior
         .iter()
         .filter(|m| m.role == "user")
         .skip(cutoff)
-        .filter(|m| !m.user_images.is_empty())
-        .map(|m| m.user_images.clone())
+        .filter(|m| !m.user_image_hashes.is_empty())
+        .map(|m| m.user_image_hashes.clone())
         .collect()
 }
 
-/// Build the user message content, combining text with images from both history
-/// and the current message. Images are separated into history vs current groups
-/// with metadata so the LLM knows which images belong to the current message
-/// and which are from earlier in the conversation.
+/// Build the user message content. History hashes resolve to bytes via
+/// the blob store; current images come in already-decoded from the HTTP
+/// body. The hint text labels the two groups so the LLM can tell stale
+/// from current.
 pub(super) fn build_user_content_with_images(
     user_message_text: String,
-    history_images: &[Vec<crate::core::store::UserImagePayload>],
+    workspace: &std::path::Path,
+    history_image_hashes: &[Vec<String>],
     current_images: Option<&[crate::api::ChatImage]>,
 ) -> MessageContent {
     let mut history_blocks: Vec<ContentBlock> = Vec::new();
     let mut current_blocks: Vec<ContentBlock> = Vec::new();
     let mut total_image_bytes: usize = 0;
 
-    // Skip groups that would push us over the limit (don't break — later smaller groups may fit).
-    for imgs in history_images.iter() {
-        let group_size: usize = imgs.iter().map(|i| i.base64.len()).sum();
-        if total_image_bytes + group_size > MAX_TOTAL_IMAGE_BASE64 {
+    // Resolve every hash up front so the budget pre-check and the read pass
+    // share one set of `resolve_blob` calls — otherwise each hash pays the
+    // ~5-extension `metadata` syscall fan-out twice.
+    for hashes in history_image_hashes.iter() {
+        let resolved: Vec<ResolvedBlob> = hashes
+            .iter()
+            .filter_map(|h| resolve_blob(workspace, h))
+            .collect();
+        let group_b64_estimate = resolved
+            .iter()
+            .map(|b| b.byte_size as usize)
+            .sum::<usize>()
+            .saturating_mul(4)
+            / 3;
+        if total_image_bytes + group_b64_estimate > MAX_TOTAL_IMAGE_BASE64 {
             continue;
         }
 
-        for img in imgs {
-            total_image_bytes += img.base64.len();
+        for blob in resolved {
+            let Ok(bytes) = std::fs::read(&blob.path) else {
+                continue;
+            };
+            use base64::Engine as _;
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            total_image_bytes += data.len();
             history_blocks.push(ContentBlock::Image {
                 source_type: "base64".to_string(),
-                media_type: img.mime_type.clone(),
-                data: img.base64.clone(),
+                media_type: blob.mime,
+                data,
             });
         }
     }
 
-    // Then: images from the current message
+    // Then: images from the current message — already base64-decoded by the HTTP
+    // body decoder; just budget-check and push.
     if let Some(imgs) = current_images {
         for img in imgs {
             if total_image_bytes + img.base64.len() > MAX_TOTAL_IMAGE_BASE64 {
@@ -159,14 +179,13 @@ pub(super) fn build_user_content_with_images(
     MessageContent::Blocks(blocks)
 }
 
-/// Save user-attached images to .lucidos/tmp/images/ so the LLM can reference them by path.
-/// Returns a list of relative paths (e.g., ".lucidos/tmp/images/20260317-143052-0.jpg").
+/// Decode user-attached images to `.lucidos/tmp/images/` so CC's `Read`
+/// tool can reference them by path. Returns workspace-relative paths
+/// (e.g., `.lucidos/tmp/images/20260317-143052-0.jpg`).
 pub(super) fn save_images_to_tmp(
     workspace_path: &std::path::Path,
     images: &[crate::api::ChatImage],
 ) -> Vec<String> {
-    use base64::Engine as _;
-
     if images.is_empty() {
         return Vec::new();
     }
@@ -182,14 +201,7 @@ pub(super) fn save_images_to_tmp(
     let mut paths = Vec::new();
 
     for (i, img) in images.iter().enumerate() {
-        let ext = match img.mime_type.as_str() {
-            "image/png" => "png",
-            "image/gif" => "gif",
-            "image/webp" => "webp",
-            "image/svg+xml" => "svg",
-            "image/bmp" => "bmp",
-            _ => "jpg",
-        };
+        let ext = ext_for_mime(&img.mime_type).unwrap_or("jpg");
         let filename = format!("{}-{}.{}", timestamp, i, ext);
         let rel_path = format!(".lucidos/tmp/images/{}", filename);
         let full_path = workspace_path.join(&rel_path);

@@ -23,9 +23,7 @@ import {
 } from '../../store/thread-events';
 import { describeEngineReason } from '../../utils/engineEventExplainers';
 
-/** Exported for unit tests — see MessageRoutePanel.test.ts.
- *
- *  Takes the full Exchange so the divider-starter cases (UserQuestionAsked,
+/** Takes the full Exchange so the divider-starter cases (UserQuestionAsked,
  *  CodingAgentPermissionRequest) can walk the exchange's steps for the matching
  *  resolution event and read the device actor from there. */
 export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
@@ -65,9 +63,7 @@ export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
  *  (`CodingAgentThreadSpawned`, the skeleton path in `handleThreadEvent`)
  *  create the linked thread without metadata, so the cache stays undefined
  *  until the next 5s `loadAllThreads` poll — without this fallback the
- *  popover shows the linked thread's UUID for that window.
- *
- *  Exported for unit tests — see MessageRoutePanel.test.ts. */
+ *  popover shows the linked thread's UUID for that window. */
 export function resolveThreadLinkTitle(
   origin: Extract<MessageOrigin, { kind: 'thread_link' }>,
   cachedLinkedTitle: string | undefined,
@@ -80,9 +76,7 @@ export function resolveThreadLinkTitle(
   return origin.thread_id;
 }
 
-/** Exported for unit tests — see MessageRoutePanel.test.ts.
- *
- *  Branch + ccSessionId come from `SessionStarted` (or `SessionRecovered`), which fire
+/** Branch + ccSessionId come from `SessionStarted` (or `SessionRecovered`), which fire
  *  once per CC process spawn — not per user message. A follow-up exchange within an
  *  existing CC session has no SessionStarted in its own steps, so we walk the full thread
  *  up to this exchange's user event and track the most recent branch-defining event.
@@ -218,9 +212,7 @@ function renderOriginSection(
  *  reads "You" (the device-owner who answers); this row discloses who *asked*
  *  — Claude Code for question/permission prompts, Lucidos for credential and
  *  MCP-consent requests. Returns null for non-divider events (their initiator
- *  is implied by the channel/audit rows).
- *
- *  Exported for unit tests — see MessageRoutePanel.test.ts. */
+ *  is implied by the channel/audit rows). */
 export function renderInitiatorRow(userEvent: StoredEvent): preact.JSX.Element | null {
   const text = initiatorRowText(userEvent);
   if (!text) return null;

@@ -91,6 +91,22 @@ pub async fn execute_user_task(
         TriggerRun::Intent { intent, knowhow } => {
             let kh_dirs = engine.knowhow_dirs();
             let system_dir = engine.system_knowhow_dir();
+            // Refuse to run if any referenced knowhow is missing. Validation at
+            // create/update catches this for new triggers; this guard catches
+            // pre-existing rows whose knowhow file was renamed or deleted.
+            // Silently dropping it would let the trigger fire without context.
+            let missing = crate::core::knowhow::missing_knowhow_ids(&kh_dirs, system_dir, knowhow);
+            if !missing.is_empty() {
+                let title = format!("{}{}", config.name, ERROR_TITLE_SUFFIX);
+                let message = format!(
+                    "[trigger: {}] {}",
+                    config.id,
+                    crate::core::knowhow::format_missing_knowhow_message(&missing)
+                );
+                log!("[Scheduler] {}", message);
+                emit_failure_notification(&engine, pool, config, title, message.clone()).await;
+                return Err(message.into());
+            }
             let knowhow_context =
                 crate::core::knowhow::load_knowhow_sections_merged(&kh_dirs, system_dir, knowhow);
             let instructions = format!("{}{}", intent, knowhow_context);

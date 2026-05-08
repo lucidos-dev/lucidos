@@ -217,6 +217,10 @@ export interface ToastItem {
   action?: ToastAction;
   onClick?: () => void;
   spinning?: boolean;
+  /** false = suppress the close (X) button. Used for "Restarting engine…" so
+   *  the user can't dismiss the toast while the dim restart overlay is still
+   *  blocking the UI behind it. Defaults to true (close button shown). */
+  dismissable?: boolean;
 }
 
 // Credential request from SSE (engine needs credentials)

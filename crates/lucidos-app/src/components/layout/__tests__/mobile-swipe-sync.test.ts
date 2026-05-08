@@ -56,7 +56,8 @@ describe('SwipeTouch', () => {
     it('locks horizontal when dx >= dy', () => {
       const s = new SwipeTouch();
       s.start(100, 100);
-      expect(s.move(110, 103)).toBe(10); // dx=10, dy=3 → horizontal
+      // dx=10, dy=3 → horizontal lock; visible drag = dx − threshold (8)
+      expect(s.move(110, 103)).toBe(2);
       expect(s.isHorizontal).toBe(true);
     });
 
@@ -71,8 +72,9 @@ describe('SwipeTouch', () => {
       const s = new SwipeTouch();
       s.start(100, 100);
       s.move(110, 100); // lock horizontal
-      // Subsequent moves with more vertical component still return horizontal delta
-      expect(s.move(115, 120)).toBe(15);
+      // Subsequent moves with more vertical component still return the
+      // horizontal delta (minus the 8px lock threshold).
+      expect(s.move(115, 120)).toBe(7);
     });
 
     it('stays locked vertical after initial lock', () => {

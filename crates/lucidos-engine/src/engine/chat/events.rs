@@ -1,21 +1,26 @@
+use std::path::Path;
 use uuid::Uuid;
 
+use crate::core::blobs::write_blob_from_base64;
 use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
 
-/// Serialize user images to JSON values for event payloads.
-fn serialize_images(images: Option<&[crate::api::ChatImage]>) -> Vec<serde_json::Value> {
+/// Bad-base64 / unsupported-mime entries are dropped + logged; the event
+/// still emits with the surviving hashes, matching the migration's
+/// partial-failure policy.
+fn images_to_hashes(workspace: &Path, images: Option<&[crate::api::ChatImage]>) -> Vec<String> {
+    let Some(images) = images else {
+        return Vec::new();
+    };
     images
-        .map(|imgs| {
-            imgs.iter()
-                .map(|img| {
-                    serde_json::json!({
-                        "base64": &img.base64,
-                        "mime_type": &img.mime_type,
-                    })
-                })
-                .collect()
+        .iter()
+        .filter_map(|img| match write_blob_from_base64(workspace, &img.base64) {
+            Ok(blob) => Some(blob.hash),
+            Err(e) => {
+                crate::log!("[Image] make_message_received: blob write failed: {}", e);
+                None
+            }
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Build a MessageReceived thread event with standard fields.
@@ -32,6 +37,7 @@ fn serialize_images(images: Option<&[crate::api::ChatImage]>) -> Vec<serde_json:
 /// an explicit origin still produce a coherent `origin` field.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_message_received(
+    workspace: &Path,
     user_message: &str,
     user_images: Option<&[crate::api::ChatImage]>,
     device_id: Option<&str>,
@@ -53,6 +59,7 @@ pub(crate) fn make_message_received(
         )
     });
     make_message_received_with_origin(
+        workspace,
         user_message,
         user_images,
         device_id,
@@ -72,6 +79,7 @@ pub(crate) fn make_message_received(
 /// boundary can reject malformed requests instead of persisting impossible state.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn make_message_received_with_origin(
+    workspace: &Path,
     user_message: &str,
     user_images: Option<&[crate::api::ChatImage]>,
     device_id: Option<&str>,
@@ -88,7 +96,7 @@ pub(super) fn make_message_received_with_origin(
     }
     Ok(crate::engine::thread_events::ThreadEvent::MessageReceived {
         text: user_message.to_string(),
-        images: serialize_images(user_images),
+        user_image_hashes: images_to_hashes(workspace, user_images),
         device_id: device_id.map(|s| s.to_string()),
         device: device_name,
         image_description: None,
@@ -239,6 +247,7 @@ mod origin_invariants {
             label: "Chrome on Mac".into(),
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -260,6 +269,7 @@ mod origin_invariants {
             label: "Chrome on Mac".into(),
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -281,6 +291,7 @@ mod origin_invariants {
             mode: ActorMode::Human,
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -303,6 +314,7 @@ mod origin_invariants {
             mode: ActorMode::Agent,
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -328,6 +340,7 @@ mod origin_invariants {
             mode: ActorMode::Engine,
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -350,6 +363,7 @@ mod origin_invariants {
             mode: ActorMode::Agent,
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -374,6 +388,7 @@ mod origin_invariants {
             mode: ActorMode::Human,
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -398,6 +413,7 @@ mod origin_invariants {
             mode: ActorMode::Human,
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -425,6 +441,7 @@ mod origin_invariants {
             direction: ThreadDirection::Parent,
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -449,6 +466,7 @@ mod origin_invariants {
             direction: ThreadDirection::Parent,
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -472,6 +490,7 @@ mod origin_invariants {
             reason: crate::engine::thread_events::EngineReason::SessionRecovered,
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -492,6 +511,7 @@ mod origin_invariants {
             reason: crate::engine::thread_events::EngineReason::HardenRetrigger,
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -517,6 +537,7 @@ mod origin_invariants {
         let spawn_id = Some(Uuid::new_v4());
 
         let event = make_message_received(
+            std::path::Path::new(""),
             "do the thing",
             None,
             None,
@@ -565,6 +586,7 @@ mod origin_invariants {
             direction: ThreadDirection::Child,
         };
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "[Child thread completed] ...",
             None,
             None,
@@ -582,6 +604,7 @@ mod origin_invariants {
     #[test]
     fn no_origin_is_always_ok() {
         let res = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,
@@ -595,6 +618,7 @@ mod origin_invariants {
         );
         assert!(res.is_ok());
         let res2 = make_message_received_with_origin(
+            std::path::Path::new(""),
             "hi",
             None,
             None,

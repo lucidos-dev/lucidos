@@ -105,7 +105,7 @@ function addPendingMessage(
   threadId: string,
   message: string,
   eventId: string,
-  images?: Array<{ base64: string; mimeType: string }>,
+  imageHashes?: string[],
 ): void {
   const map = threadMap.value;
   const thread = map.get(threadId);
@@ -114,7 +114,7 @@ function addPendingMessage(
       text: message,
       eventId,
       created: new Date().toISOString(),
-      images: images?.map(img => ({ base64: img.base64, mime_type: img.mimeType })),
+      image_hashes: imageHashes,
     });
     scrollToBottom();
     threadMap.value = new Map(map);
@@ -182,7 +182,7 @@ function getActiveContext(): {
  */
 export async function sendMessage(
   message: string,
-  images?: Array<{ base64: string; mimeType: string }>,
+  imageHashes?: string[],
   options?: { useClaudeCode?: boolean },
 ): Promise<void> {
   threadsLoaded.value = true;
@@ -220,7 +220,6 @@ export async function sendMessage(
     return;
   }
 
-  // Update event-driven store
   setFocusedThread(threadId);
   if (isNewThread) pushThreadNavState({ type: 'thread', id: threadId });
 
@@ -229,7 +228,6 @@ export async function sendMessage(
   // otherwise be indistinguishable from an active follow-up further down.
   const threadBeforeSend = threadMap.value.get(threadId);
 
-  // Set optimistic pending message
   const map = threadMap.value;
   if (!map.has(threadId)) {
     map.set(threadId, makeOptimisticThreadState({
@@ -240,9 +238,8 @@ export async function sendMessage(
       eventsLoaded: true,
     }));
   }
-  addPendingMessage(threadId, message, eventId, images);
+  addPendingMessage(threadId, message, eventId, imageHashes);
 
-  // Build and submit request
   const ctx = getActiveContext();
   const body: ChatRequestBody = {
     message,
@@ -256,7 +253,7 @@ export async function sendMessage(
   if (ctx?.app_context) body.app_context = ctx.app_context;
   if (ctx?.file_context) body.file_context = ctx.file_context;
   if (ctx?.repo_file_context) body.repo_file_context = ctx.repo_file_context;
-  if (images?.length) body.images = images.map(img => ({ base64: img.base64, mime_type: img.mimeType }));
+  if (imageHashes?.length) body.image_hashes = imageHashes;
 
   // Drafts (state='composing') ARE threads in threadMap with focusedThreadId
   // set, so neither `threadMap.get` truthiness nor `focusedThreadId === null`

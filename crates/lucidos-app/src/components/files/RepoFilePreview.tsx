@@ -1,6 +1,6 @@
 import { useEffect, useCallback, useMemo } from 'preact/hooks';
 import type { DiffFile } from '../../store/store';
-import { selectedLines, repoDiff, repoPending, filePreviewSource, popupImageSrc, repoSelectedChangeId } from '../../store/store';
+import { selectedLines, repoDiff, repoPending, filePreviewSource, openImagePopup, repoSelectedChangeId } from '../../store/store';
 import { getRepoFileContent } from '../../api/client';
 import { loadChangeContextById } from '../../store/actions/repositories';
 import { highlightFileLines, CODE_EXTS } from '../../utils/syntaxHighlight';
@@ -10,6 +10,7 @@ import { renderCsvTable } from '../../utils/csv';
 import { RENDERABLE_EXTS } from './FilePreviewInline';
 import { isMobile, viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { DiffView } from './DiffView';
 import { RenderedDiff } from './RenderedDiff';
 import { ChangesFileList } from './RepoFilesView';
@@ -74,6 +75,7 @@ export function RepoFilePreviewWithSidebar(props: Props) {
 
 export function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
+  const showDiffLoading = useDelayedLoading(repoDiff.value);
 
   // After a reload, the panel overlay re-hydrates from nav history but the
   // repoDiff/repoSelectedChangeId backing state does not. If the URL carries
@@ -92,7 +94,7 @@ export function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props)
   if (mode === 'diff') {
     const diff = repoDiff.value;
     if (diff.status === 'failed') return <div class="empty-state error-text">Failed to load diff: {diff.error}</div>;
-    if (diff.status !== 'loaded') return <div class="loading-spinner" />;
+    if (diff.status !== 'loaded') return showDiffLoading ? <div class="loading-spinner" /> : null;
     const file = diff.data.files.find(f => f.path === path);
     if (!file) return <div class="empty-state">File not found in diff</div>;
 
@@ -161,7 +163,7 @@ function RepoFileContent({ repoId, path }: { repoId: string; path: string }) {
     if (ext === 'md') return <div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;
     if (ext === 'html' || ext === 'htm') return <iframe srcDoc={content} style="width:100%;height:100%;border:none;background:#fff;" />;
     if (ext === 'csv') return <div dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;
-    if (ext === 'svg') return <img src={renderedHtml!} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) popupImageSrc.value = renderedHtml!; }} />;
+    if (ext === 'svg') return <img src={renderedHtml!} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(renderedHtml!); }} />;
   }
 
   const sel = selectedLines.value;

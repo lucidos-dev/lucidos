@@ -280,7 +280,11 @@ pub enum SystemEvent {
     ThreadComposeChanged {
         id: Uuid,
         text: String,
-        images: serde_json::Value,
+        /// Content-addressed sha256 hashes of compose-draft image blobs.
+        /// Cross-device sync transmits ~80 bytes per attached image instead
+        /// of inflating each base64 payload over SSE on every keystroke.
+        #[serde(default)]
+        image_hashes: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1309,7 +1313,16 @@ impl EventBus {
                            last_revived_at = NOW(),
                            state = 'active',
                            first_message = COALESCE(thread_summaries.first_message, EXCLUDED.first_message),
-                           source = CASE WHEN thread_summaries.source = 'chat' THEN EXCLUDED.source ELSE thread_summaries.source END,
+                           -- composing → active: the actual send's channel wins
+                           -- (the lagged compose-mode source must not survive the
+                           -- transition). Active follow-ups already passed the
+                           -- continuity check, so 'chat' fall-through covers
+                           -- legacy rows missing an explicit assertion.
+                           source = CASE
+                               WHEN thread_summaries.state = 'composing' THEN EXCLUDED.source
+                               WHEN thread_summaries.source = 'chat' THEN EXCLUDED.source
+                               ELSE thread_summaries.source
+                           END,
                            compose_text = '',
                            compose_images = '[]'::jsonb,
                            compose_mode = NULL
@@ -1542,11 +1555,12 @@ impl EventBus {
             }
 
             ThreadEvent::ThreadArchived => {
-                // Archived — go idle and clear CC flags. The user explicitly
-                // archived this thread, so it should not remain in waiting.
+                // Clear is_saved so display priority doesn't keep the row in
+                // Saved (is_saved=true wins over state='archived').
                 sqlx::query(
                     "UPDATE thread_summaries SET status = 'idle', \
                      state = 'archived', \
+                     is_saved = FALSE, \
                      cc_has_changes = FALSE, cc_requires_restart = FALSE, \
                      cc_is_external_repo = FALSE, cc_applying = FALSE, \
                      active_children_count = 0, total_children_count = 0 \
@@ -1660,6 +1674,7 @@ impl EventBus {
                 branch_name,
                 repo_root,
                 hardened,
+                incomplete,
                 ..
             } => {
                 // CodingAgentIdled already set status='waiting' if the session idled;
@@ -1690,6 +1705,7 @@ impl EventBus {
                         files,
                         *requires_restart,
                         *hardened,
+                        *incomplete,
                     )
                     .await?;
                 }
@@ -1864,7 +1880,13 @@ impl EventBus {
             // Passive bookkeeping for the background cleanup worker
             // (Phase 10.2). Persisted to the events stream for audit /
             // debugging but produces no projection side effects.
-            | ThreadEvent::WorktreeCleaned { .. } => Vec::new(),
+            | ThreadEvent::WorktreeCleaned { .. }
+            // ImageUploaded is a per-thread audit fact for content-addressed
+            // blob uploads. Persisted for audit + cross-device prefetch hint
+            // via SSE; no projection side effects (no status change, no
+            // section transition, no last_activity bump).
+            | ThreadEvent::ImageUploaded { .. }
+            | ThreadEvent::ContextTokensMeasured { .. } => Vec::new(),
         };
 
         // Step 2: Validate and apply section transition via the lifecycle contract.

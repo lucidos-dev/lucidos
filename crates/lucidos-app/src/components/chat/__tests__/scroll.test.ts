@@ -17,7 +17,7 @@ if (typeof globalThis.queueMicrotask === 'undefined') {
   (globalThis as any).queueMicrotask = (cb: any) => { Promise.resolve().then(cb); };
 }
 
-import { scrolledUp, awayFromBottom, notAtTop, scrollToBottom, getResizeMode, extendSuppression, setActiveScrollElement, getActiveScrollElement } from '../scrollState';
+import { scrolledUp, awayFromBottom, notAtTop, scrollToBottom, getResizeMode, extendSuppression, setActiveScrollElement, getActiveScrollElement, makeScrollObservers } from '../scrollState';
 import { withScrollAnchor } from '../CreateThreadView';
 import { composeHandlers } from '../promptFocus';
 
@@ -166,14 +166,46 @@ describe('awayFromBottom detection', () => {
     expect(awayFromBottom.value).toBe(false);
   });
 
-  it('resize does NOT escalate awayFromBottom (avoids streaming-growth flicker)', () => {
-    awayFromBottom.value = false;
-    // Content grew from 1000 → 1100; user was at old bottom (scrollTop=500, clientHeight=500).
-    // 500+500 = 1000 < 1100-2 → not visually at bottom.
-    if (awayFromBottom.value && isVisuallyAtBottom(500, 500, 1100)) {
+  // Mirrors the resize handler: escalation is gated on the 80px stickiness
+  // window, not on isVisuallyAtBottom (2px). Streaming tokens grow content
+  // by ~20px each, well within the window — so this branch never trips
+  // mid-stream and there is no one-frame chevron flicker. Larger growths
+  // (panel expand, multi-line code block) cross the window and escalate.
+  function onResizeEscalation(scrollTop: number, clientHeight: number, scrollHeight: number) {
+    const isAtBottom = scrollTop + clientHeight >= scrollHeight - 80;
+    if (!isAtBottom) {
+      scrolledUp.value = true;
+      awayFromBottom.value = true;
+    }
+    if (awayFromBottom.value && isVisuallyAtBottom(scrollTop, clientHeight, scrollHeight)) {
       awayFromBottom.value = false;
     }
-    // No escalation — still false.
+  }
+
+  it('resize escalates awayFromBottom when growth exceeds the 80px stickiness window (panel expand)', () => {
+    // User was at the visual bottom of 1000px content. A panel expansion
+    // adds 500px below the user's anchor — scrollTop stays at 500, but
+    // scrollHeight is now 1500. User is 500px from the bottom, well past
+    // the 80px window: chevron must appear without waiting for a scroll.
+    onResizeEscalation(500, 500, 1500);
+    expect(scrolledUp.value).toBe(true);
+    expect(awayFromBottom.value).toBe(true);
+  });
+
+  it('resize does NOT escalate awayFromBottom for small streaming-growth (within 80px window)', () => {
+    // Content grew from 1000 → 1050 during streaming. User stays within
+    // the 80px stickiness window (50 < 80) — useEffect will snap back to
+    // bottom on the same frame, so escalating here would just flicker.
+    onResizeEscalation(500, 500, 1050);
+    expect(scrolledUp.value).toBe(false);
+    expect(awayFromBottom.value).toBe(false);
+  });
+
+  it('resize clears awayFromBottom when shrink leaves user visually at bottom', () => {
+    awayFromBottom.value = true;
+    // Content shrinks from 1100 → 600; user's scrollTop=100, clientHeight=500.
+    // 100+500 = 600 = scrollHeight → visually at bottom now.
+    onResizeEscalation(100, 500, 600);
     expect(awayFromBottom.value).toBe(false);
   });
 });
@@ -1233,6 +1265,44 @@ describe('scrollToBottom continuous rAF loop', () => {
       expect(scrolledUp.value).toBe(false);
     }
   });
+
+  it('reconciles awayFromBottom on loop exit when content grew past the last scroll', () => {
+    // Browser-accurate clamping is load-bearing: without it, `scrollTop =
+    // scrollHeight` leaves scrollTop higher than max and the post-grow
+    // off-bottom state is invisible to the reconciler.
+    const el = {
+      _scrollTop: 1500,
+      get scrollTop() { return this._scrollTop; },
+      set scrollTop(v: number) {
+        const max = Math.max(0, this.scrollHeight - this.clientHeight);
+        this._scrollTop = Math.min(v, max);
+      },
+      scrollHeight: 2000,
+      clientHeight: 500,
+      getBoundingClientRect: () => ({ width: 400, height: 600 }),
+    } as any;
+    setActiveScrollElement(el);
+
+    scrollToBottom();
+    expect(el.scrollTop).toBe(1500);
+    expect(awayFromBottom.value).toBe(false);
+
+    vi.advanceTimersByTime(480);
+    expect(el.scrollTop).toBe(1500);
+    expect(awayFromBottom.value).toBe(false);
+    expect(getResizeMode()).toBe('scroll');
+
+    // Grow content between the loop's last in-window iteration and exit.
+    // Real-world cause: a child whose container box stayed the same so RO
+    // didn't fire — the rAF loop was the only thing keeping us pinned.
+    vi.advanceTimersByTime(16);
+    el.scrollHeight = 2400;
+    vi.advanceTimersByTime(20);
+
+    expect(getResizeMode()).toBe('ignore');
+    expect(el.scrollTop).toBe(1500);
+    expect(awayFromBottom.value).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1352,5 +1422,102 @@ describe('composeHandlers focuses before action', () => {
     handlers.onClick();
 
     expect(actionCount).toBe(1); // action only ran once
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dual-mounting visibility gate: ThreadView/CreateThreadView render twice (one
+// in SplitLayout for desktop, one in MobileSwipeContainer for mobile). Both
+// instances attach scroll/resize listeners that share the same notAtTop /
+// awayFromBottom / scrolledUp signals. The hidden duplicate's element has 0×0
+// dimensions — its handlers see "not scrollable" and "at bottom" and would
+// clobber the visible instance's correct values. makeScrollObservers gates all
+// signal writes on isElementVisible(el) so only the visible copy can mutate.
+//
+// Bug repro: focus a long thread → expected scroll-to-top chevron is missing
+// because the hidden duplicate's syncNotAtTop fired last with notAtTop=false.
+// ---------------------------------------------------------------------------
+describe('makeScrollObservers — hidden duplicate must not override signals', () => {
+  function makeEl(opts: {
+    visible: boolean;
+    scrollTop?: number;
+    scrollHeight?: number;
+    clientHeight?: number;
+  }) {
+    const el: any = {
+      scrollTop: opts.scrollTop ?? 0,
+      scrollHeight: opts.scrollHeight ?? 0,
+      clientHeight: opts.clientHeight ?? 0,
+      // isElementVisible(): zero dimensions on the element itself short-circuit
+      // to false. Real hidden duplicates inherit display:none from an ancestor
+      // (.split-layout on mobile, .mobile-swipe-wrapper on desktop), which
+      // collapses the element's own getBoundingClientRect to 0×0.
+      getBoundingClientRect: () => opts.visible
+        ? { width: 400, height: 600 }
+        : { width: 0, height: 0 },
+      parentElement: null,
+    };
+    return el;
+  }
+
+  beforeEach(() => {
+    notAtTop.value = false;
+    awayFromBottom.value = false;
+    scrolledUp.value = false;
+  });
+
+  it('hidden el onResize does not clear notAtTop set by visible el', () => {
+    // Visible: long thread, scrolled to bottom — chevron should be visible.
+    const visible = makeEl({ visible: true, scrollTop: 4500, scrollHeight: 5200, clientHeight: 700 });
+    const hidden = makeEl({ visible: false });
+
+    const visibleObs = makeScrollObservers(visible);
+    const hiddenObs = makeScrollObservers(hidden);
+
+    visibleObs.onResize();
+    expect(notAtTop.value).toBe(true);
+
+    // Hidden duplicate's ResizeObserver fires (e.g., children render). Without
+    // the visibility gate it ran syncNotAtTop with isScrollable=false →
+    // notAtTop=false → chevron disappeared.
+    hiddenObs.onResize();
+    expect(notAtTop.value).toBe(true);
+  });
+
+  it('hidden el onScroll does not clear awayFromBottom set by visible el', () => {
+    const visible = makeEl({ visible: true, scrollTop: 100, scrollHeight: 5000, clientHeight: 700 });
+    const hidden = makeEl({ visible: false });
+
+    const visibleObs = makeScrollObservers(visible);
+    const hiddenObs = makeScrollObservers(hidden);
+
+    // User scrolled up in the visible thread → awayFromBottom should latch true.
+    visibleObs.onScroll();
+    expect(awayFromBottom.value).toBe(true);
+
+    // Hidden duplicate fires a stray scroll event (e.g., browser auto-clamps
+    // scrollTop on layout flip). Without the gate, awayFromBottom flips back
+    // to false because the hidden el reads as visually-at-bottom.
+    hiddenObs.onScroll();
+    expect(awayFromBottom.value).toBe(true);
+  });
+
+  it('visible el onResize sets notAtTop when scrolled away from top', () => {
+    const visible = makeEl({ visible: true, scrollTop: 4500, scrollHeight: 5200, clientHeight: 700 });
+    const visibleObs = makeScrollObservers(visible);
+
+    visibleObs.onResize();
+
+    expect(notAtTop.value).toBe(true);
+  });
+
+  it('visible el onResize clears notAtTop when at top', () => {
+    notAtTop.value = true;
+    const visible = makeEl({ visible: true, scrollTop: 0, scrollHeight: 5200, clientHeight: 700 });
+    const visibleObs = makeScrollObservers(visible);
+
+    visibleObs.onResize();
+
+    expect(notAtTop.value).toBe(false);
   });
 });

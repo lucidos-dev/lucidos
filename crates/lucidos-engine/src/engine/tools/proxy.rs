@@ -7,6 +7,28 @@ use crate::api::proxy as api_proxy;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 
+/// If the proxy is configured with `credential_bundle` auth, return the
+/// error string the LLM should see (asking it to switch to the script-side
+/// CLI). Otherwise `None`.
+pub(crate) fn refuse_credential_bundle_for_llm(
+    config: &api_proxy::ProxyConfig,
+    name: &str,
+) -> Option<String> {
+    if matches!(
+        config.auth,
+        Some(api_proxy::ProxyAuth::CredentialBundle { .. })
+    ) {
+        Some(format!(
+            "Error: proxy '{}' uses credential_bundle auth — this mode never returns raw \
+             credentials to the LLM. Run 'lucidos proxy {} --credentials' from a script \
+             (e.g. via run_python or run_bash) to get the bundle.",
+            name, name
+        ))
+    } else {
+        None
+    }
+}
+
 impl LucidosEngine {
     pub(crate) async fn execute_proxy_tool(
         &self,
@@ -32,21 +54,14 @@ impl LucidosEngine {
             Err(_) => return Ok(format!("Error: invalid HTTP method '{}'", method_str)),
         };
 
-        let config =
-            match api_proxy::resolve_proxy_target(&self.workspace_path, name).await {
-                Ok(c) => c,
-                Err((_, msg)) => return Ok(format!("Error: {}", msg)),
-            };
-
-        let auth_header = if let Some(auth) = &config.auth {
-            let cred = match api_proxy::resolve_credential(&self.pool, auth).await {
-                Ok(c) => c,
-                Err((_, msg)) => return Ok(format!("Error: {}", msg)),
-            };
-            api_proxy::build_auth_header(cred.auth_type, &cred.auth_value, auth.header.as_deref())
-        } else {
-            None
+        let config = match api_proxy::resolve_proxy_target(&self.workspace_path, name).await {
+            Ok(c) => c,
+            Err((_, msg)) => return Ok(format!("Error: {}", msg)),
         };
+
+        if let Some(msg) = refuse_credential_bundle_for_llm(&config, name) {
+            return Ok(msg);
+        }
 
         let mut headers = HeaderMap::new();
         if let Some(h) = args.get("headers").and_then(|v| v.as_object()) {
@@ -62,15 +77,33 @@ impl LucidosEngine {
             }
         }
 
-        let target_url = api_proxy::build_target_url(&config.base_url, path, None);
+        let resolved = match api_proxy::apply_auth(
+            &self.pool,
+            config.auth.as_ref(),
+            &config.base_url,
+            path,
+            None,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err((_, msg)) => return Ok(format!("Error: {}", msg)),
+        };
         log!(
             "[Proxy LLM] {} {} → {}",
             method.as_str(),
             name,
-            target_url
+            resolved.log_url
         );
-        let response =
-            api_proxy::forward_request(method, &target_url, headers, auth_header, body).await;
+        let response = api_proxy::forward_request(
+            method,
+            &resolved.url,
+            &resolved.log_url,
+            headers,
+            resolved.header,
+            body,
+        )
+        .await;
 
         let status = response.status();
         let body_bytes = match axum::body::to_bytes(response.into_body(), 100 * 1024 * 1024).await {
@@ -97,5 +130,46 @@ impl LucidosEngine {
                 body_text.chars().take(500).collect::<String>()
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::proxy::{ProxyAuth, ProxyConfig};
+
+    #[test]
+    fn refuses_credential_bundle_with_actionable_error() {
+        let config = ProxyConfig {
+            base_url: String::new(),
+            auth: Some(ProxyAuth::CredentialBundle {
+                credentials: vec!["a".to_string()],
+            }),
+        };
+        let msg = refuse_credential_bundle_for_llm(&config, "comfort_creds")
+            .expect("should refuse credential_bundle");
+        assert!(msg.contains("comfort_creds"), "msg: {}", msg);
+        assert!(msg.contains("--credentials"), "msg: {}", msg);
+        assert!(msg.contains("lucidos proxy"), "msg: {}", msg);
+    }
+
+    #[test]
+    fn allows_bearer_through() {
+        let config = ProxyConfig {
+            base_url: "https://x".to_string(),
+            auth: Some(ProxyAuth::Bearer {
+                credential: "x".to_string(),
+            }),
+        };
+        assert!(refuse_credential_bundle_for_llm(&config, "x").is_none());
+    }
+
+    #[test]
+    fn allows_unauthenticated_through() {
+        let config = ProxyConfig {
+            base_url: "https://x".to_string(),
+            auth: None,
+        };
+        assert!(refuse_credential_bundle_for_llm(&config, "x").is_none());
     }
 }

@@ -102,14 +102,24 @@ pub struct SpawnArgs<'a> {
     pub reasoning_effort: Option<&'a str>,
     pub thread_id: Uuid,
     /// Event in the *parent* thread that triggered this spawn. Forwarded as
-    /// `LUCIDOS_EVENT_ID` so subprocess tooling (e.g. `lucidos send-thread`)
+    /// `LUCIDOS_EVENT_ID` so subprocess tooling (e.g. `lucidos spawn-thread`)
     /// can stamp `caller_event_id` on outbound cross-workspace POSTs.
     ///
-    /// `None` ⇒ env var unset ⇒ `lucidos send-thread` omits `caller_event_id`
+    /// `None` ⇒ env var unset ⇒ `lucidos spawn-thread` omits `caller_event_id`
     /// from outbound POSTs. Use `None` for recovery, hardening, and other
     /// engine-internal spawns where no parent event exists; pass the
     /// originating event id otherwise.
     pub spawning_event_id: Option<Uuid>,
+    /// Name of the repository this CC session is running in (e.g.
+    /// `"user-acquisition"`, `"Lucidos"`). Forwarded as `LUCIDOS_REPO` so
+    /// `lucidos spawn-thread` defaults `--repo` to it — a CC sidequest stays
+    /// in the same repo as its caller without the model having to thread the
+    /// value through every invocation.
+    ///
+    /// `None` ⇒ env var unset ⇒ `lucidos spawn-thread` falls back to the
+    /// target workspace's default repo. Always pass the resolved repo name
+    /// when one is known; only legacy/early-startup callers should pass `None`.
+    pub repo_name: Option<&'a str>,
 }
 
 /// A spawned agent. The runtime owns the child process and an internal driver

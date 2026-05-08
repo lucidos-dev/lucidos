@@ -1163,6 +1163,36 @@ pub(crate) enum NoCommitsRecovery {
     /// The branch is genuinely empty AND the change has no declared files.
     /// Safe to mark the change applied as a no-op.
     LegitimateNoOp,
+    /// The branch had work, but main already contains it (sibling apply, fast-forward,
+    /// out-of-band merge, etc.). `git log main..branch` is empty AND main's history
+    /// contains commits touching the change's files. Safe to mark applied as a no-op.
+    AlreadyApplied,
+}
+
+/// Does main's history contain any commit touching at least one of `change_files`?
+///
+/// Used to distinguish "branch's work was already merged into main" (no-op) from
+/// "branch never produced any commits for the referenced files" (corruption).
+/// Files referenced by an applied change should always have a corresponding commit
+/// somewhere on main, even if the file was later deleted.
+async fn main_history_touches_files(repo_root: &Path, change_files: &[String]) -> bool {
+    if change_files.is_empty() {
+        return false;
+    }
+    let base = default_local_branch(repo_root).await;
+    let mut args: Vec<String> = vec![
+        "log".to_string(),
+        "--oneline".to_string(),
+        "-1".to_string(),
+        base,
+        "--".to_string(),
+    ];
+    args.extend(change_files.iter().cloned());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    git_cmd(&arg_refs, repo_root)
+        .await
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// When `has_branch_commits` returned false, decide what to do about it.
@@ -1174,9 +1204,12 @@ pub(crate) enum NoCommitsRecovery {
 ///   - Re-check whether the branch now has commits.
 ///   - If yes → `AutoCommitted` (caller proceeds with the normal merge).
 ///   - If still no commits AND `change_files` is empty → `LegitimateNoOp` (safe no-op).
-///   - If still no commits AND `change_files` is non-empty → `Err(...)` —
-///     this is a corrupted state where silently marking the change applied
-///     would discard work the user expects to be merged.
+///   - If still no commits AND main's history touches any of `change_files` →
+///     `AlreadyApplied` (the work landed on main via a sibling apply, fast-forward,
+///     or out-of-band merge — nothing to do).
+///   - Otherwise → `Err(...)` — branch is empty AND main has no commits touching the
+///     declared files. This is the genuinely-empty case (likely a never-committed
+///     draft); discarding the change is safe.
 ///
 /// The branch ref is NOT deleted by this function; the caller decides.
 pub(crate) async fn recover_no_commits_branch(
@@ -1196,15 +1229,18 @@ pub(crate) async fn recover_no_commits_branch(
         return Ok(NoCommitsRecovery::LegitimateNoOp);
     }
 
+    if main_history_touches_files(repo_root, change_files).await {
+        return Ok(NoCommitsRecovery::AlreadyApplied);
+    }
+
     let preview = if change_files.len() <= 3 {
         change_files.join(", ")
     } else {
         format!("{}, ...", change_files[..3].join(", "))
     };
     Err(format!(
-        "Branch '{}' has no commits but the change references {} file(s) ({}). \
-         The worktree was empty or the work was never committed. Refusing to silently \
-         mark the change applied — discard the change manually if the work is unrecoverable.",
+        "Branch '{}' has no commits and main has no history for the {} file(s) referenced \
+         by this change ({}). The work was likely never committed — discard the change to clear it.",
         branch_name,
         change_files.len(),
         preview,

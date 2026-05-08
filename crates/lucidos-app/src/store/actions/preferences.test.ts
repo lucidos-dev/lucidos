@@ -3,6 +3,11 @@ import { preferences } from '../store';
 import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences } from './preferences';
 import * as apiClient from '../../api/client';
 
+const platformMocks = vi.hoisted(() => ({ isIOS: false }));
+vi.mock('../../utils/platform', () => ({
+  isIOS: () => platformMocks.isIOS,
+}));
+
 describe('currentTheme — localStorage fallback', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -250,26 +255,48 @@ describe('loadPreferences — skip re-apply when theme unchanged (iOS matchMedia
   });
 });
 
-describe("applyTheme('system') — no matchMedia change listener", () => {
+describe("applyTheme('system') — matchMedia change listener gating", () => {
   let originalMatchMedia: typeof window.matchMedia;
-  let listenerInstalls: number;
+  let listeners: Array<(e: { matches: boolean }) => void>;
+  let mqLight: boolean;
 
   beforeEach(() => {
-    listenerInstalls = 0;
+    platformMocks.isIOS = false;
+    listeners = [];
+    mqLight = false;
     originalMatchMedia = window.matchMedia;
     (window as any).matchMedia = () => ({
-      matches: false,
-      addEventListener: () => { listenerInstalls++; },
-      removeEventListener: () => {},
+      get matches() { return mqLight; },
+      addEventListener: (_t: string, fn: (e: { matches: boolean }) => void) => {
+        listeners.push(fn);
+      },
+      removeEventListener: (_t: string, fn: (e: { matches: boolean }) => void) => {
+        const i = listeners.indexOf(fn);
+        if (i >= 0) listeners.splice(i, 1);
+      },
     });
   });
 
   afterEach(() => {
     (window as any).matchMedia = originalMatchMedia;
+    platformMocks.isIOS = false;
   });
 
-  it('does not subscribe to prefers-color-scheme change events', () => {
+  it('off iOS: subscribes to prefers-color-scheme change events and re-applies theme', () => {
     applyTheme('system');
-    expect(listenerInstalls).toBe(0);
+    expect(listeners).toHaveLength(1);
+
+    const setAttrSpy = vi.spyOn(document.documentElement, 'setAttribute');
+    mqLight = true;
+    for (const fn of listeners) fn({ matches: true });
+
+    const themeWrites = setAttrSpy.mock.calls.filter((c) => c[0] === 'data-theme');
+    expect(themeWrites.length).toBeGreaterThan(0);
+  });
+
+  it('on iOS: skips the listener entirely (WKWebView fires wrong values)', () => {
+    platformMocks.isIOS = true;
+    applyTheme('system');
+    expect(listeners).toHaveLength(0);
   });
 });

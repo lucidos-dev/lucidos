@@ -22,14 +22,19 @@ html {
     --z-sticky: 200;
     --z-drawer: 300;
     --z-modal: 2000;
-    --z-toast: 2100;
     --z-control-panel: 2200;
+    /* Toasts sit above --z-control-panel so they remain visible over the
+       header chrome (2200) and over .restart-overlay (--z-control-panel + 100). */
+    --z-toast: 2400;
     --z-tooltip: 10000;
 
     /* Transitions */
     --duration-fast: 0.15s;
     --duration-normal: 0.2s;
     --duration-slow: 0.3s;
+    /* For deliberate state-change cues that must register with the user
+     * (e.g. Send → Cancel morph). Reach for normal/slow first. */
+    --duration-emphasis: 0.5s;
 
     /* Layout */
     --divider-width: 0.1875rem;
@@ -131,15 +136,6 @@ html[data-theme="light"] {
     --syntax-function: #8250df;
     --emoji-icon-filter: grayscale(60%) brightness(0.95);
     --emoji-folder-filter: none;
-}
-
-[data-tooltip] {
-    cursor: help;
-}
-
-button[data-tooltip],
-[role="button"][data-tooltip] {
-    cursor: pointer;
 }
 
 button,
@@ -442,8 +438,10 @@ h4, h5, h6 { font-size: 0.8125rem; }
     color: var(--accent);
 }
 
+/* Use background-color longhand: iOS WebKit skips the transition when the
+ * source rule sets `background:` shorthand with a CSS custom property. */
 .action-btn {
-    background: var(--accent);
+    background-color: var(--accent);
     border: none;
     color: var(--text-on-accent);
     cursor: pointer;
@@ -459,7 +457,7 @@ h4, h5, h6 { font-size: 0.8125rem; }
 
 @media (hover: hover) {
     .action-btn:hover {
-        background: color-mix(in srgb, var(--accent) 80%, #fff);
+        background-color: color-mix(in srgb, var(--accent) 80%, #fff);
     }
 }
 
@@ -475,23 +473,44 @@ h4, h5, h6 { font-size: 0.8125rem; }
 }
 
 .action-btn-confirm {
-    background: var(--accent-green);
+    background-color: var(--accent-green);
 }
 
 @media (hover: hover) {
     .action-btn-confirm:hover {
-        background: color-mix(in srgb, var(--accent-green) 80%, #fff);
+        background-color: color-mix(in srgb, var(--accent-green) 80%, #fff);
     }
 }
 
 .action-btn-danger {
-    background: var(--accent-red);
+    background-color: var(--accent-red);
 }
 
 @media (hover: hover) {
     .action-btn-danger:hover {
-        background: color-mix(in srgb, var(--accent-red) 80%, #fff);
+        background-color: color-mix(in srgb, var(--accent-red) 80%, #fff);
     }
+}
+
+/* Send → Cancel morph button. Always rendered at the same JSX position
+ * across send/cancel/canceling/placeholder so Preact never unmounts the
+ * DOM node — class-driven mode changes let the .action-btn background-color
+ * transition above animate the blue→red morph. min-width fits "Cancel..."
+ * so the row doesn't jitter sideways when the label changes.
+ * morph-placeholder keeps the row height stable when nothing else fills
+ * the slot. The "hidden" mode is handled by not rendering the button at
+ * all — snap-unmount, like the sibling section buttons — so the leave
+ * path doesn't pop to the prompt frame edge. */
+.send-cancel-morph {
+    min-width: 5rem;
+    transition:
+        background-color var(--duration-emphasis),
+        color var(--duration-normal),
+        opacity var(--duration-normal);
+}
+.send-cancel-morph.morph-placeholder {
+    visibility: hidden;
+    pointer-events: none;
 }
 
 /* Accent link — subtle underline, full on hover. Resets button defaults so
@@ -973,12 +992,14 @@ h4, h5, h6 { font-size: 0.8125rem; }
 }
 
 /* Restart overlay — blocks interaction while engine restarts.
-   z-index between --z-modal (2000) and --z-toast (2100) so the toast
-   renders on top of the overlay with normal styling. */
+   z-index above --z-control-panel so the header (.pane-header-brand,
+   .collapsed-thread-actions, .message-route-panel all sit at 2200) is
+   covered by the dim overlay and its buttons aren't clickable through.
+   .toast-container sits a step higher so the restart toast stays visible. */
 .restart-overlay {
     position: fixed;
     inset: 0;
-    z-index: calc(var(--z-toast) - 1);
+    z-index: calc(var(--z-control-panel) + 100);
     background: rgba(0, 0, 0, 0.5);
     display: flex;
     align-items: center;

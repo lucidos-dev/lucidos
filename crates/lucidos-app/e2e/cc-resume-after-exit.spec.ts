@@ -6,6 +6,7 @@ import {
   waitForActionPanel, waitForCCToFinish, waitForCCToStart,
   countVisibleResponses,
 } from './helpers';
+import { clearAllThreads } from './db-helpers';
 
 /**
  * Reproduces the "stuck request after CC process exit" bug:
@@ -23,6 +24,7 @@ import {
  */
 test.describe('CC resume after process exit', () => {
   test.beforeEach(async ({ page }) => {
+    clearAllThreads();
     await assertHealthy(page);
   });
 
@@ -121,16 +123,8 @@ test.describe('CC resume after process exit', () => {
       page,
       'Remember the codeword: pineapple. Just acknowledge with one word. Do not create any files.',
     );
-    // Wait for any post-session action panel (Done OR Diff/Discard/Apply
-    // when CC produced a pending change) — confirms turn 1 fully streamed
-    // and the WaitingBanner is in a stable state.
-    await page.waitForFunction(() => {
-      const panels = document.querySelectorAll('.thread-action-buttons');
-      return Array.from(panels).some(el => {
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-      });
-    }, undefined, { timeout: 120_000 });
+    await waitForCCToStart(page, 60_000);
+    await waitForCCToFinish(page, 120_000);
 
     const firstResponseCount = await countVisibleResponses(page);
     expect(firstResponseCount).toBeGreaterThanOrEqual(1);

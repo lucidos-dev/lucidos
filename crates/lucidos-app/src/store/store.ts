@@ -21,8 +21,10 @@ import type { ThreadState, ThreadStatus, Exchange } from './thread-events';
 import { computeExchanges } from './thread-events';
 import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
-import type { EventChannel, ArchiveState } from '../generated/thread-lifecycle';
+import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import { resetContentScroll } from '../hooks/useScrollMemory';
+import type { Change, CCModelValue, CCReasoningEffort } from '../api/client';
+import { markSwUpdateDismissed } from '../hooks/sw-update';
 
 /** localStorage key holding the focused thread id across reloads. Focus is
  *  per-device, not worth round-tripping through the server. */
@@ -87,8 +89,6 @@ export function closeInlineForm(): void {
   if (form?.type === 'trigger') resetContentScroll('triggers');
   panelOverlay.value = null;
 }
-import type { Change, CCModelValue, CCReasoningEffort } from '../api/client';
-import { markSwUpdateDismissed } from '../hooks/sw-update';
 
 // --- Settings subview ---
 export type SettingsSubview = 'main' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'disk-usage' | 'tool-permissions';
@@ -109,10 +109,10 @@ export const SETTINGS_NAV_ITEMS: Array<{ key: Exclude<SettingsSubview, 'main'>; 
 ];
 
 // --- Active menu item ---
-const _savedMenuItem = localStorage.getItem('lucidos-active-menu-item');
+const savedMenuItem = localStorage.getItem('lucidos-active-menu-item');
 export const activeMenuItem = signal<MenuItem>(
-  _savedMenuItem && (MENU_ITEMS as readonly string[]).includes(_savedMenuItem)
-    ? (_savedMenuItem as MenuItem)
+  savedMenuItem && (MENU_ITEMS as readonly string[]).includes(savedMenuItem)
+    ? (savedMenuItem as MenuItem)
     : 'files'
 );
 
@@ -282,18 +282,30 @@ export function effectiveThreadStatus(thread: ThreadState): ThreadStatus {
   return thread.meta.status;
 }
 
+/** True for the cancellable statuses — a turn is in flight or paused on a
+ *  user question. The two states briefly transition through each other (via
+ *  UserQuestionAnswered) so almost every "mid-turn" check needs both. */
+export function isMidTurn(status: ThreadStatus): boolean {
+  return status === 'running' || status === 'waiting_for_user_answer';
+}
+
+export function getThreadDisplaySection(thread: ThreadState): DisplaySection {
+  return displaySection(
+    thread.meta.section as ArchiveState,
+    effectiveThreadStatus(thread),
+    thread.meta.saved,
+    thread.meta.activeChildrenCount > 0,
+    thread.meta.ccHasChanges,
+  );
+}
+
 /** All threads whose display section is 'review'. Section membership is a pure
  *  function of thread state — thread-attached drafts route to their natural
  *  section per the lifecycle contract, so no draft carve-out is needed. */
 export function getReviewThreads(): ThreadState[] {
   const result: ThreadState[] = [];
   for (const thread of threadMap.value.values()) {
-    const display = displaySection(
-      thread.meta.section as ArchiveState, effectiveThreadStatus(thread),
-      thread.meta.saved, thread.meta.activeChildrenCount > 0,
-      thread.meta.ccHasChanges,
-    );
-    if (display === 'review') result.push(thread);
+    if (getThreadDisplaySection(thread) === 'review') result.push(thread);
   }
   return result;
 }
@@ -348,13 +360,21 @@ export const MOBILE_VIEWS: MobileView[] = [...PANE_DEFS];
 export const PANE_INDEX: Record<MobileView, number> =
   Object.fromEntries(PANE_DEFS.map((v, i) => [v, i])) as Record<MobileView, number>;
 export const PANE_COUNT = PANE_DEFS.length;
-const savedMobileView = localStorage.getItem('lucidos-mobile-view') as MobileView | null;
-export const mobileView = signal<MobileView>(
-  savedMobileView && (MOBILE_VIEWS as string[]).includes(savedMobileView) ? savedMobileView : 'thread'
-);
+// Session-scoped so iOS killing the PWA returns the user to the default 'thread'
+// pane instead of stranding them wherever they happened to be (e.g. 'content'
+// after opening an app).
+export const MOBILE_VIEW_KEY = 'lucidos-mobile-view';
+
+export function getInitialMobileView(): MobileView {
+  const saved = sessionStorage.getItem(MOBILE_VIEW_KEY);
+  return saved && (MOBILE_VIEWS as string[]).includes(saved) ? (saved as MobileView) : 'thread';
+}
+
+export const mobileView = signal<MobileView>(getInitialMobileView());
+
 export function setMobileView(view: MobileView) {
   mobileView.value = view;
-  localStorage.setItem('lucidos-mobile-view', view);
+  sessionStorage.setItem(MOBILE_VIEW_KEY, view);
 }
 
 // --- Input Mode ---
@@ -675,19 +695,19 @@ export const toasts = signal<ToastItem[]>([]);
  *  Map entry would survive until the setTimeout fires. */
 const keyedDismissTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; onClick?: () => void; spinning?: boolean; autoDismissMs?: number }) {
-  const { key, action, onClick, spinning, autoDismissMs } = opts ?? {};
+export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; onClick?: () => void; spinning?: boolean; autoDismissMs?: number; dismissable?: boolean }) {
+  const { key, action, onClick, spinning, autoDismissMs, dismissable } = opts ?? {};
   // If a key is provided, update an existing toast with the same key instead of creating a new one
   if (key) {
     const existing = toasts.value.find((t) => t.key === key);
     if (existing) {
-      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, message, type, action, onClick, spinning } : t);
+      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, message, type, action, onClick, spinning, dismissable } : t);
       scheduleAutoDismiss(key, autoDismissMs);
       return;
     }
   }
   const id = ++toastIdCounter;
-  toasts.value = [...toasts.value, { id, message, type, key, action, onClick, spinning }];
+  toasts.value = [...toasts.value, { id, message, type, key, action, onClick, spinning, dismissable }];
   if (key) {
     scheduleAutoDismiss(key, autoDismissMs);
     return;
@@ -760,7 +780,34 @@ export function showConfirm(
 }
 
 // --- Image popup ---
-export const popupImageSrc = signal<string | null>(null);
+export interface ImagePopupState {
+  images: string[];
+  index: number;
+}
+
+export const popupImage = signal<ImagePopupState | null>(null);
+
+export function openImagePopup(src: string): void {
+  popupImage.value = { images: [src], index: 0 };
+}
+
+/** Open the popup with prev/next nav across every sibling thumbnail in the
+ *  same `.thread-content` as `clicked`. Degrades to single-image when no
+ *  siblings can be collected. */
+export function openImagePopupFromThread(src: string, clicked: Element | EventTarget | null): void {
+  const container = (clicked instanceof Element) ? clicked.closest('.thread-content') : null;
+  if (!container) { openImagePopup(src); return; }
+  const els = container.querySelectorAll<HTMLImageElement>('.image-thumbnail, .user-image-thumb');
+  const seen = new Set<string>();
+  const images: string[] = [];
+  els.forEach(el => {
+    const url = el.dataset.fullSrc || el.src;
+    if (url && !seen.has(url)) { seen.add(url); images.push(url); }
+  });
+  const index = images.indexOf(src);
+  if (index === -1) { openImagePopup(src); return; }
+  popupImage.value = { images, index };
+}
 
 // --- Message route panel (anchored popover for the route badge) ---
 type MessageRoutePanelSection = 'origin' | 'executor';

@@ -6,7 +6,6 @@ import { isTextInput } from '../../utils/dom';
 import { SwipeTouch } from '../../utils/swipe';
 import { scrolledUp, scrollToBottom } from '../chat/scrollState';
 
-// Re-export for backwards compatibility with tests
 export { SwipeTouch } from '../../utils/swipe';
 
 // Rubber band factor at edges (0 = no movement, 1 = full movement)

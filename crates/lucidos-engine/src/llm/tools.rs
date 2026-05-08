@@ -373,7 +373,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::PROXY_REQUEST.to_string(),
-            description: "Call a backend configured in `data/config/apis.json` through the engine proxy. Prefer this over `http_request` whenever the API has a proxy entry — the credential is resolved by the engine and never appears in the tool args, the tool transcript, or any logs. Returns the raw response body for 2xx; for non-2xx returns `HTTP Error N: ...`. The proxy `name` indexes into `apis.json`; `path` is appended to the configured `base_url`.".to_string(),
+            description: "Call a backend configured in `data/config/apis.json` through the engine proxy. Prefer this over `http_request` whenever the API has a proxy entry — the credential is resolved by the engine and never appears in the tool args, the tool transcript, or any logs. Returns the raw response body for 2xx; for non-2xx returns `HTTP Error N: ...`. The proxy `name` indexes into `apis.json`; `path` is appended to the configured `base_url`. This tool refuses proxies configured with `credential_bundle` auth — those are script-only (use `lucidos proxy <name> --credentials` from `run_python` or `run_bash`).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -529,7 +529,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     },
                     "run": {
                         "type": "object",
-                        "description": "What to execute. Either { type: 'intent', intent: '...', knowhow: ['domain1', 'system-knowhow/best-practices'] } for LLM intents (one sentence in the user's voice — keep procedure out, put it in knowhow; prefix engine-shipped reference docs with 'system-knowhow/'), or { type: 'script', path: 'name/run.py' } for scripts."
+                        "description": "What to execute. Either { type: 'intent', intent: '...', knowhow: ['lucidos-ops/release-process', 'system-knowhow/best-practices'] } for LLM intents (one sentence in the user's voice — keep procedure out, put it in knowhow), or { type: 'script', path: 'name/run.py' } for scripts. Knowhow ids are the path under data/knowhow/ WITHOUT the .md suffix INCLUDING any subdirectory (so data/knowhow/lucidos-ops/release-process.md → 'lucidos-ops/release-process', NOT 'release-process'). Prefix engine-shipped reference docs with 'system-knowhow/'. Verify with list_files data/knowhow/ before saving — the engine rejects unknown ids."
                     },
                     "cron": cron_schema(false),
                     "on_event": {
@@ -577,7 +577,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     },
                     "run": {
                         "type": "object",
-                        "description": "Change what to execute. { type: 'intent', intent: '...', knowhow: ['domain', 'system-knowhow/best-practices'] } (prefix engine-shipped reference docs with 'system-knowhow/') or { type: 'script', path: '...' }"
+                        "description": "Change what to execute. { type: 'intent', intent: '...', knowhow: ['lucidos-ops/release-process', 'system-knowhow/best-practices'] } or { type: 'script', path: '...' }. Knowhow ids are paths under data/knowhow/ without .md INCLUDING any subdirectory (data/knowhow/lucidos-ops/release-process.md → 'lucidos-ops/release-process'). Prefix engine-shipped reference docs with 'system-knowhow/'. Save fails if any id doesn't resolve."
                     },
                     "cron": cron_schema(true),
                     "on_event": {
@@ -1550,5 +1550,4 @@ mod tests {
             required_names
         );
     }
-
 }

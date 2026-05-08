@@ -23,7 +23,7 @@ function makeThread(opts: Partial<{
         state: opts.state ?? 'active',
     });
     if (opts.composeText !== undefined) {
-        setDraft('tid', { text: opts.composeText, images: [], mode: null });
+        setDraft('tid', { text: opts.composeText, image_hashes: [], mode: null });
     }
     if (opts.pendingText !== undefined) {
         t.pendingUserMessages.push({ text: opts.pendingText, eventId: 'p-1', created: new Date().toISOString() });

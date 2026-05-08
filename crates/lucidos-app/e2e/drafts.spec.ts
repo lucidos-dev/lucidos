@@ -1,6 +1,6 @@
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, isMobileViewport, REAL_THREAD_ROW } from './helpers';
-import { clearAllDrafts } from './db-helpers';
+import { clearAllThreads } from './db-helpers';
 
 /** Send a first message, then click Compose and type a draft. Returns the
  *  prompt-input locator, the original (active) thread id, and the new draft
@@ -34,9 +34,20 @@ async function startThreadThenCompose(
   return { promptInput, activeId, draftId };
 }
 
+/** Dual-layout-safe click of a thread-nav button. Both SplitLayout (desktop)
+ *  and MobileSwipeContainer render their copies simultaneously, so a bare
+ *  `:visible.first()` can resolve to the offscreen pane. */
+async function clickThreadNav(page: Page, ariaLabel: 'Previous thread' | 'Next thread'): Promise<void> {
+  const enabledSelector = `button[aria-label="${ariaLabel}"]:not([disabled])`;
+  await expect(page.locator(`${enabledSelector}:visible`).first()).toBeEnabled({ timeout: 5_000 });
+  if (!await clickVisibleElement(page, enabledSelector)) {
+    throw new Error(`${ariaLabel} button not visible`);
+  }
+}
+
 test.describe('Per-thread drafts', () => {
   test.beforeEach(async ({ page }) => {
-    clearAllDrafts();
+    clearAllThreads();
     await assertHealthy(page);
   });
 
@@ -142,14 +153,10 @@ test.describe('Per-thread drafts', () => {
   test('existing thread → New → type → Back lands on the existing thread, Forward returns to the draft', async ({ page }) => {
     const { promptInput, activeId, draftId } = await startThreadThenCompose(page, 'nav-draft', 'draft text');
 
-    const back = page.locator('button[aria-label="Previous thread"]:visible').first();
-    await expect(back).toBeEnabled({ timeout: 5_000 });
-    await back.click();
+    await clickThreadNav(page, 'Previous thread');
     await expect(promptInput).toHaveAttribute('data-thread-id', activeId, { timeout: 5_000 });
 
-    const forward = page.locator('button[aria-label="Next thread"]:visible').first();
-    await expect(forward).toBeEnabled({ timeout: 5_000 });
-    await forward.click();
+    await clickThreadNav(page, 'Next thread');
     await expect(promptInput).toHaveAttribute('data-thread-id', draftId, { timeout: 5_000 });
   });
 
@@ -205,7 +212,10 @@ test.describe('Per-thread drafts', () => {
     const input = await waitForVisibleInput(page);
     await input.fill('section draft');
 
+    // The drawer's New section only renders composing threads with content.
     await newThread(page);
+    const composeInput = await waitForVisibleInput(page);
+    await composeInput.fill('new compose with text');
 
     await openThreadDrawer(page);
     const newSection = page.locator('.list-section-title:visible', { hasText: 'New' });
@@ -227,9 +237,12 @@ test.describe('Per-thread drafts', () => {
     const newSection = page.locator('.list-section-title:visible', { hasText: 'New' });
 
     if (isMobileViewport(page)) {
-      // On mobile, the drawer is a separate pane — the focused thread's draft
-      // correctly appears in the Drafts section since the textarea isn't visible
-      await expect(newSection).toBeVisible({ timeout: 5_000 });
+      // Mobile hides the textarea from the threads pane, so a focused thread's
+      // follow-up draft only surfaces in the dedicated Drafts view.
+      const clicked = await clickVisibleElement(page, 'button[aria-label="Toggle drafts view"]');
+      if (!clicked) throw new Error('Toggle drafts view button not visible');
+      const draftsSection = page.locator('.list-section-title:visible', { hasText: 'Drafts' });
+      await expect(draftsSection).toBeVisible({ timeout: 5_000 });
     } else {
       // On desktop, the focused thread's draft is visible in the textarea,
       // so it should NOT appear in the Drafts section

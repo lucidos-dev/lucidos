@@ -269,6 +269,11 @@ export interface Change {
   pre_merge_sha: string | null;
   post_merge_sha: string | null;
   commits: string[];
+  /** True when the originating CC turn ended in `ResponseFailed` — the
+   * worktree state reflects partial work, not a deliberate completion.
+   * `WaitingBanner` reads this to confirm before Apply so the user knows
+   * they're about to land partial changes from a failed run. */
+  incomplete: boolean;
 }
 
 /** One thread's contribution to the current restart-required toast: derived
@@ -411,6 +416,28 @@ export function listArtifacts(): Promise<ArtifactsResponse> {
 
 export function uploadFile(file: File): Promise<UploadResponse> {
   return lucidos.data.upload(file) as Promise<UploadResponse>;
+}
+
+// --- Plugins ---
+export interface PluginArchiveUploadResponse {
+  path: string;
+  filename: string;
+  byte_size: number;
+}
+
+/** Upload a `.lucidos-plugin` archive to a per-request temp directory inside
+ *  the workspace. Returns the absolute filesystem path the LLM tool
+ *  `install_plugin` can consume. The chat layer then sends a message asking
+ *  the LLM to install from that path. */
+export async function uploadPluginArchive(file: File): Promise<PluginArchiveUploadResponse> {
+  const fd = new FormData();
+  fd.append('file', file, file.name);
+  const res = await mutatingFetch(`${API}/v1/plugins/upload-archive`, {
+    method: 'POST',
+    body: fd,
+  });
+  await throwIfNotOk(res);
+  return res.json();
 }
 
 // --- Notifications (SDK delegation) ---
@@ -557,7 +584,7 @@ export function appUrl(
   appId: string,
   commit?: string,
 ): string {
-  const base = `${API}/app/${encodeURIComponent(appId)}/`;
+  const base = `${API_BASE}/app/${encodeURIComponent(appId)}/`;
   return commit ? `${base}?commit=${encodeURIComponent(commit)}` : base;
 }
 
@@ -679,6 +706,33 @@ export function fetchEventTypes(): Promise<string[]> {
   return json(`${API}/events/types`);
 }
 
+// --- Knowhow ---
+export interface KnowhowEntry {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/** Process-wide cache for the knowhow list — multiple consumers (trigger form,
+ *  file-preview 404 hint) hit the same endpoint and don't need their own copy.
+ *  Holds the in-flight promise so concurrent first-callers share the request. */
+let knowhowEntriesCache: Promise<KnowhowEntry[]> | null = null;
+
+export function fetchKnowhowEntries(): Promise<KnowhowEntry[]> {
+  if (!knowhowEntriesCache) {
+    knowhowEntriesCache = json<{ knowhow: KnowhowEntry[] }>(`${API}/knowhow`)
+      .then(r => r.knowhow)
+      .catch(e => { knowhowEntriesCache = null; throw e; });
+  }
+  return knowhowEntriesCache;
+}
+
+/** `system-knowhow/` ids are already rooted (engine-shipped); bare ids root
+ *  under `data/knowhow/`. */
+export function knowhowPreviewPath(id: string): string {
+  return id.startsWith('system-knowhow/') ? `${id}.md` : `knowhow/${id}.md`;
+}
+
 // --- Triggers (SDK delegation) ---
 export function listTriggers(): Promise<TriggersListResponse> {
   return lucidos.triggers.list().then(triggers => ({ triggers })) as Promise<TriggersListResponse>;
@@ -743,10 +797,13 @@ export async function ensureThreadStarted(id: string, mode: string): Promise<voi
   await throwIfNotOk(res);
 }
 
+/** PUT /api/v1/threads/:id/compose. `image_hashes` semantics mirror the
+ *  SQL COALESCE on the backend: `null` preserves, `[]` clears, `[h,…]`
+ *  replaces. Hashes come from prior `uploadThreadBlob` calls. */
 export async function putComposeOnThread(
   threadId: string,
   text: string,
-  images: string[],
+  imageHashes: string[] | null,
   mode: string | null,
 ): Promise<void> {
   const res = await mutatingFetchIdempotent(
@@ -754,10 +811,51 @@ export async function putComposeOnThread(
     {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, images, mode }),
+      body: JSON.stringify({ text, image_hashes: imageHashes, mode }),
     },
   );
   await throwIfNotOk(res);
+}
+
+/** Response shape from `POST /api/v1/threads/:id/blobs`. */
+export interface BlobUploadResponse {
+  hash: string;
+  mime: string;
+  byte_size: number;
+}
+
+/** Upload an image and get its content-addressed sha256 hash. Idempotent
+ *  on the bytes (same upload twice = same hash, no extra disk write), so
+ *  retries are safe. */
+export async function uploadThreadBlob(
+  threadId: string,
+  file: File,
+): Promise<BlobUploadResponse> {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await mutatingFetchIdempotent(
+    `${API_BASE}/api/v1/threads/${encodeURIComponent(threadId)}/blobs`,
+    {
+      method: 'POST',
+      body: form,
+    },
+  );
+  await throwIfNotOk(res);
+  return (await res.json()) as BlobUploadResponse;
+}
+
+/** Browser-display URL for a content-addressed blob: a downscaled JPEG
+ *  (long edge ≤ 2048 px, quality 85). Use for `<img>` tags — the original
+ *  is multi-megapixel iPhone JPEG that iOS Safari/WebKit can't decode at
+ *  fullscreen size without exceeding its per-image memory budget (renders
+ *  fully black). Engine generates the preview on first request and caches
+ *  it under `.lucidos/blob-previews/`; same `Cache-Control: immutable,
+ *  max-age=1y` as the originals so once fetched the browser never
+ *  re-requests it. The original full-resolution bytes remain available at
+ *  `/api/v1/blobs/{hash}` (no frontend caller today; reserved for a
+ *  future "download original" affordance). */
+export function blobPreviewUrl(hash: string): string {
+  return `${API_BASE}/api/v1/blobs/${encodeURIComponent(hash)}/preview`;
 }
 
 /** Discard a composing thread. 410 (already discarded) and 404 (never

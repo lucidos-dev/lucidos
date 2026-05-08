@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { createIframeAppFixture } from './db-helpers';
+import { appPath, createIframeAppFixture } from './db-helpers';
 
 const APP_ID = 'e2e-sdk-select-test';
 let fixture: { cleanup: () => void };
@@ -68,7 +68,7 @@ start();
   });
 
   test('programmatic create + click selection + keyboard nav', async ({ page }) => {
-    await page.goto(`/api/app/${APP_ID}/`);
+    await page.goto(appPath(APP_ID));
     await expect(page.locator('#status')).toHaveText('ready');
 
     const root = page.locator('#programmatic .lucidos-select');
@@ -105,7 +105,7 @@ start();
   });
 
   test('enhanceSelects mirrors value back to native <select>', async ({ page }) => {
-    await page.goto(`/api/app/${APP_ID}/`);
+    await page.goto(appPath(APP_ID));
     await expect(page.locator('#status')).toHaveText('ready');
 
     const native = page.locator('#native-select');
@@ -124,7 +124,7 @@ start();
   });
 
   test('outside click closes the menu', async ({ page }) => {
-    await page.goto(`/api/app/${APP_ID}/`);
+    await page.goto(appPath(APP_ID));
     await expect(page.locator('#status')).toHaveText('ready');
 
     const root = page.locator('#programmatic .lucidos-select');

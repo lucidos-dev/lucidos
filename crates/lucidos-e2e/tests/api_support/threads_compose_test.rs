@@ -147,7 +147,7 @@ async fn put_compose_updates_text_images_and_mode() {
         .put(compose_url(&id))
         .json(&json!({
             "text": "hello world",
-            "images": ["img-1.png", "img-2.png"],
+            "image_hashes": ["hash-1", "hash-2"],
             "mode": "claude_code",
         }))
         .send()
@@ -157,8 +157,8 @@ async fn put_compose_updates_text_images_and_mode() {
 
     let (_state, text, images, mode) = fetch_compose_row(&pool, id).await;
     assert_eq!(text, "hello world");
-    assert_eq!(images[0], "img-1.png");
-    assert_eq!(images[1], "img-2.png");
+    assert_eq!(images[0], "hash-1");
+    assert_eq!(images[1], "hash-2");
     assert_eq!(mode.as_deref(), Some("claude_code"));
 }
 

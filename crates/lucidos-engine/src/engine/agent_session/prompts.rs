@@ -48,6 +48,19 @@ const HARDENING_RULE: &str = "HARDENING: Once your implementation is complete an
     phases when no relevant layers were touched. The harden marker only exists if you actually \
     invoke `/harden` — without the marker, the user pays the wait when they click Apply.";
 
+/// Encourage CC to ask via the structured `AskUserQuestion` tool — which the
+/// Lucidos UI renders as clickable buttons — instead of listing options in
+/// plaintext that the user has to retype. Applies to chat-style prompts only;
+/// hardening and merge-conflict sessions don't dialogue with the user.
+const ASK_USER_QUESTION_RULE: &str =
+    "ASKING USERS: When you need an answer from the user — a yes/no decision, picking \
+     between approaches, choosing from a small list — use the `AskUserQuestion` tool. \
+     The Lucidos UI renders its options as clickable buttons; options listed only in your \
+     message text force the user to type their reply instead of clicking. Default to \
+     `AskUserQuestion` for any question with 2-4 discrete answers, including the binary \
+     yes/no case. Reserve plaintext questions for genuinely open-ended ones (\"What name \
+     should I use for X?\") where pre-baked options would be guesses.";
+
 /// Permission allowlist rule shared across all CC system prompts.
 /// Lucidos passes `--allowedTools` when spawning CC, which overrides settings.json
 /// permission rules — so tool allowlist edits MUST go in `~/.lucidos/cc-allowed-tools`.
@@ -113,6 +126,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          branch into main).\n\n\
          {no_pull_requests}\n\n\
          {hardening}\n\n\
+         {ask_user_question}\n\n\
          SESSION SUMMARY: After hardening completes, output a structured summary of what \
          was implemented in this session. List each change with its status (committed, applied, \
          pending). Include file names and brief descriptions. This is the last thing you output \
@@ -124,6 +138,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
         branch = branch_name,
         no_pull_requests = NO_PULL_REQUESTS_RULE,
         hardening = HARDENING_RULE,
+        ask_user_question = ASK_USER_QUESTION_RULE,
         process_safety = process_safety_rule(true),
         permission_config = PERMISSION_CONFIG_RULE,
     )
@@ -142,9 +157,11 @@ pub(super) fn external_repo_system_prompt(
          The user's git credentials and CLI tools (gh, etc.) are available.\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Commit or discard anything unintentional.\n\n\
+         {ask_user_question}\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or stop, \
          simply say goodbye and finish your response — the Lucidos engine manages your lifecycle. \
          Running `exit` in bash can crash the host application.{process_safety}{permission_config}",
+        ask_user_question = ASK_USER_QUESTION_RULE,
         process_safety = process_safety_rule(false),
         permission_config = PERMISSION_CONFIG_RULE,
     )
@@ -164,9 +181,11 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          5. If the work is incomplete or broken, either finish it or revert the problematic parts\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Commit or discard anything unintentional.\n\n\
+         {ask_user_question}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}{permission_config}",
         branch = branch_name,
         repo = repo_name,
+        ask_user_question = ASK_USER_QUESTION_RULE,
         process_safety = process_safety_rule(false),
         permission_config = PERMISSION_CONFIG_RULE,
     )
@@ -199,11 +218,13 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          branch into main).\n\n\
          {no_pull_requests}\n\n\
          {hardening}\n\n\
+         {ask_user_question}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}{permission_config}",
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
         no_pull_requests = NO_PULL_REQUESTS_RULE,
         hardening = HARDENING_RULE,
+        ask_user_question = ASK_USER_QUESTION_RULE,
         process_safety = process_safety_rule(true),
         permission_config = PERMISSION_CONFIG_RULE,
     )
@@ -313,6 +334,34 @@ mod tests {
             prompt.contains("kill $(cat <workspace>/.lucidos/engine.pid)"),
             "external prompt must still tell CC how to kill a specific engine",
         );
+    }
+
+    #[test]
+    fn chat_style_prompts_nudge_use_of_ask_user_question() {
+        let cases: &[(&str, String)] = &[
+            (
+                "worktree_system_prompt",
+                worktree_system_prompt("feature/x", "dev"),
+            ),
+            (
+                "external_repo_system_prompt",
+                external_repo_system_prompt("Acme", "feature/x", "origin/main"),
+            ),
+            (
+                "recovery_system_prompt",
+                recovery_system_prompt("feature/x", "dev"),
+            ),
+            (
+                "external_repo_recovery_system_prompt",
+                external_repo_recovery_system_prompt("Acme", "feature/x"),
+            ),
+        ];
+        for (label, prompt) in cases {
+            assert!(
+                prompt.contains("AskUserQuestion"),
+                "{label} must nudge CC to use AskUserQuestion for choice-shaped questions",
+            );
+        }
     }
 
     #[test]

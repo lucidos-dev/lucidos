@@ -232,7 +232,7 @@ pub(super) async fn write_app_source(
     }
 }
 
-/// GET /api/app/:app_id/ - Serve app UI index.html.
+/// GET /app/:app_id/ - Serve app UI index.html.
 ///
 /// Apps are static. The engine rewrites HTML only when serving a historical
 /// version (`?commit=X`) — it appends the commit suffix to relative
@@ -290,7 +290,7 @@ pub(super) async fn serve_app_ui(
     }
 }
 
-/// GET /api/app/:app_id/*path - Serve app sub-files (CSS, JS, images, etc.)
+/// GET /app/:app_id/*path - Serve app sub-files (CSS, JS, images, etc.)
 pub(super) async fn serve_app_file(
     State(state): State<AppState>,
     Path((app_id, file_path)): Path<(String, String)>,
@@ -348,7 +348,7 @@ pub(super) async fn serve_app_file(
     }
 }
 
-/// GET /api/app/:app_id/artifacts/*path - Serve shared artifacts for app iframes.
+/// GET /app/:app_id/artifacts/*path - Serve shared artifacts for app iframes.
 /// Apps using relative paths like `../artifacts/...` resolve here.
 pub(super) async fn serve_app_artifact(
     State(state): State<AppState>,

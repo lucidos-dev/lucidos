@@ -1165,6 +1165,33 @@ describe('tool description from event', () => {
     expect(steps[0].description).toBe('Read main.rs');
   });
 
+  it('ContextTokensMeasured overwrites the previous Thinking step context_tokens in both projections', () => {
+    // chars/4 estimate is wildly wrong for image-heavy turns (counts base64
+    // bytes). The real input_tokens from the LLM provider arrives via a
+    // ContextTokensMeasured event right after the response — both projections
+    // (exchangeSteps for the secondary list, exchangeResponseEvents for the
+    // inline chip in the chat view) must overwrite the displayed token count.
+    const thread = makeThreadState();
+    const map = new Map([['t', thread]]);
+    handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'hi' } as ThreadEvent, '2026-04-09T10:00:00Z');
+    handleEvent(map, 't', 2, { type: 'Thinking', text: 'estimate', context_tokens: 1_374_000, context_messages: 1 } as ThreadEvent, '2026-04-09T10:00:01Z');
+    handleEvent(map, 't', 3, { type: 'ContextTokensMeasured', input_tokens: 23_500 } as ThreadEvent, '2026-04-09T10:00:02Z');
+    handleEvent(map, 't', 4, { type: 'ResponseGenerated' } as ThreadEvent, '2026-04-09T10:00:03Z');
+
+    const exchanges = groupIntoExchanges(map.get('t')!.events);
+
+    const steps = exchangeSteps(exchanges[0]) as { description: string; context_tokens?: number }[];
+    const stepThinking = steps.find((s) => s.description === 'Thinking');
+    expect(stepThinking?.context_tokens).toBe(23_500);
+
+    const inlineEvents = exchangeResponseEvents(exchanges[0]);
+    const inlineThinking = inlineEvents.find(
+      (e): e is Extract<typeof e, { type: 'step' }> =>
+        e.type === 'step' && e.description === 'Thinking',
+    );
+    expect(inlineThinking?.context_tokens).toBe(23_500);
+  });
+
   it('exchangeResponseEvents uses event description for CodingAgentToolCalled when present', () => {
     const thread = makeThreadState();
     thread.meta.channel = 'claude_code';

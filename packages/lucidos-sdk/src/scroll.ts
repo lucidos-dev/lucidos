@@ -15,7 +15,7 @@
 // from the DOM (parent unmounts) and on tab close. Reliable in iframes.
 
 const SCROLL_KEY_PREFIX = 'lucidos-scroll-app-';
-const APP_PATH_RE = /^\/api\/app\/([^/]+)/;
+const APP_PATH_RE = /^\/app\/([^/]+)/;
 const RESTORE_DEADLINE_MS = 3000;
 
 export function parseAppId(pathname: string): string | null {
@@ -51,7 +51,7 @@ export function isFullyRestorable(saved: number, scrollHeight: number, clientHei
  * Install scroll-memory for the current iframe. Call once on SDK load.
  * Returns a cleanup function that removes listeners.
  *
- * No-op when the document is not served from an `/api/app/<id>/` path
+ * No-op when the document is not served from an `/app/<id>/` path
  * (so the SDK loaded into a non-app context — e.g. standalone test harness —
  * silently does nothing).
  */

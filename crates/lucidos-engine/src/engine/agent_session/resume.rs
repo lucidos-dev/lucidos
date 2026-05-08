@@ -393,7 +393,7 @@ mod tests {
             thread_id,
             ThreadEvent::MessageReceived {
                 text: "go".into(),
-                images: vec![],
+                user_image_hashes: vec![],
                 device_id: None,
                 device: None,
                 image_description: None,
@@ -433,6 +433,7 @@ mod tests {
                 branch_name: branch.to_string(),
                 repo_root: "/tmp/repo".to_string(),
                 hardened: true,
+                incomplete: false,
                 path: String::new(),
                 diff: String::new(),
             },

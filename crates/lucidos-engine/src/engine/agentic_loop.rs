@@ -520,6 +520,23 @@ impl LucidosEngine {
                 }
             };
 
+            // None for providers that don't report `usage` (OpenAI, Gemini) —
+            // the chars/4 estimate stands.
+            if let Some(input_tokens) = response.input_tokens {
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ContextTokensMeasured {
+                                input_tokens,
+                            },
+                            meta: meta.clone(),
+                        },
+                        "[AgenticLoop] ContextTokensMeasured",
+                    )
+                    .await;
+            }
+
             // Final flush — send any remaining buffered text and persist remainder
             let (flush_text, remaining_to_persist) = {
                 let text = raw_buffer.lock().unwrap();
@@ -1520,7 +1537,7 @@ impl LucidosEngine {
                                 return Some(format!("Error: Failed to load thread events: {}", e))
                             }
                         };
-                        match crate::engine::tools::image::resolve_thread_image_refs(&events, &refs)
+                        match crate::engine::tools::image::resolve_thread_image_refs(&self.workspace_path, &events, &refs)
                         {
                             Ok(imgs) => Some(imgs),
                             Err(e) => return Some(format!("Error: {}", e)),
@@ -1586,6 +1603,7 @@ impl LucidosEngine {
                                 .emit(crate::engine::event_bus::BusEvent::Thread {
                                     thread_id: child_thread_id,
                                     event: crate::engine::chat::make_message_received(
+                                        &self.workspace_path,
                                         prompt,
                                         None,
                                         None,

@@ -280,7 +280,7 @@ mod tests {
     fn user_msg(text: &str) -> ThreadEvent {
         ThreadEvent::MessageReceived {
             text: text.into(),
-            images: vec![],
+            user_image_hashes: vec![],
             device_id: None,
             device: None,
             image_description: None,

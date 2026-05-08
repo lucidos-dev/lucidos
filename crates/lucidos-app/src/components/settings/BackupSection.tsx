@@ -64,10 +64,6 @@ function extractWorkspaceName(filename: string): string {
   return match ? match[1] : '';
 }
 
-function formatDate(iso: string): string {
-  return formatDateTime(new Date(iso));
-}
-
 function scheduleLabel(cron: string): string {
   const match = SCHEDULE_OPTIONS.find((o) => o.value === cron);
   return match ? match.label : cron;
@@ -465,7 +461,7 @@ export function BackupSection() {
                 <div class="list-row-info">
                   <div class="title">{b.filename}</div>
                   <div class="list-row-details">
-                    <span>{formatDate(b.created_at)}</span>
+                    <span>{formatDateTime(new Date(b.created_at))}</span>
                     {' \u00b7 '}
                     <span>{formatBytes(b.size_bytes)}</span>
                   </div>

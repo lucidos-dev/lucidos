@@ -40,8 +40,11 @@ export class SwipeTouch {
 
     if (this._direction === 'vertical') return null;
 
-    this._dx = dx;
-    return dx;
+    // Subtract the lock threshold so visible drag starts from 0 instead of
+    // jumping ±LOCK_THRESHOLD on the first frame after lock.
+    const adjusted = dx - Math.sign(dx) * LOCK_THRESHOLD;
+    this._dx = adjusted;
+    return adjusted;
   }
 
   /** End the touch. Returns the pane delta: -1 (prev), 0 (snap back), +1 (next).

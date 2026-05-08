@@ -2,7 +2,7 @@ import { useEffect } from 'preact/hooks';
 import { computed } from '@preact/signals';
 import {
   confirmState,
-  popupImageSrc,
+  popupImage,
   searchEverywhereOpen,
 } from '../store/store';
 import { drawerOpen } from '../components/layout/Drawer';
@@ -10,7 +10,7 @@ import { drawerOpen } from '../components/layout/Drawer';
 const anyOverlayOpen = computed(() =>
   confirmState.value.visible ||
   drawerOpen.value ||
-  !!popupImageSrc.value ||
+  !!popupImage.value ||
   searchEverywhereOpen.value
 );
 

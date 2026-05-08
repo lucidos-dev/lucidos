@@ -18,7 +18,7 @@ use crate::core::changes::{Change, RestartGroup};
 const SELECT_CHANGE: &str = "SELECT id, request_id, thread_id, branch_name, repo_root, description, \
      file_count, files, requires_restart, status, created_at, resolved_at, \
      merge_worktree_path, merge_temp_branch, hardened, pre_merge_sha, \
-     post_merge_sha, NULL::text AS thread_title, commits FROM changes";
+     post_merge_sha, NULL::text AS thread_title, commits, incomplete FROM changes";
 
 #[derive(Clone)]
 pub struct ChangesProjection {
@@ -55,6 +55,7 @@ impl ChangesProjection {
         files: &[String],
         requires_restart: bool,
         hardened: bool,
+        incomplete: bool,
     ) -> sqlx::Result<()> {
         let Some(id) = parse_change_id(change_id) else {
             return Ok(());
@@ -63,16 +64,19 @@ impl ChangesProjection {
         // (column is NOT NULL); COALESCE on update preserves the existing
         // description when the re-emit carries None — matches the in-memory
         // contract `if let Some(d) = description { existing.description = d }`.
+        // `incomplete` propagates verbatim on re-emit so a follow-up
+        // successful turn against the same branch clears a prior failure tag.
         sqlx::query(
             "INSERT INTO changes (id, request_id, thread_id, branch_name, repo_root, \
-             description, file_count, files, requires_restart, status, created_at, hardened) \
-             VALUES ($1, $2, $3, $4, $5, COALESCE($6, ''), $7, $8, $9, 'pending', NOW(), $10) \
+             description, file_count, files, requires_restart, status, created_at, hardened, incomplete) \
+             VALUES ($1, $2, $3, $4, $5, COALESCE($6, ''), $7, $8, $9, 'pending', NOW(), $10, $11) \
              ON CONFLICT (id) DO UPDATE SET \
                 description = COALESCE($6, changes.description), \
                 files = EXCLUDED.files, \
                 file_count = EXCLUDED.file_count, \
                 requires_restart = EXCLUDED.requires_restart, \
-                hardened = EXCLUDED.hardened",
+                hardened = EXCLUDED.hardened, \
+                incomplete = EXCLUDED.incomplete",
         )
         .bind(id)
         .bind(Uuid::nil())
@@ -84,6 +88,7 @@ impl ChangesProjection {
         .bind(files)
         .bind(requires_restart)
         .bind(hardened)
+        .bind(incomplete)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -570,6 +575,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     let files = str_array(&latest.1, "files");
     let mut hardened = bool_field(&latest.1, "hardened");
     let mut requires_restart = bool_field(&latest.1, "requires_restart");
+    let incomplete = bool_field(&latest.1, "incomplete");
 
     for r in &rows {
         if r.0 == "ChangeHardened" && r.3 > latest.3 {
@@ -627,8 +633,8 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
         "INSERT INTO changes (id, request_id, thread_id, branch_name, repo_root,
          description, file_count, files, requires_restart, status, created_at,
          resolved_at, hardened, commits, pre_merge_sha, post_merge_sha,
-         merge_worktree_path, merge_temp_branch)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+         merge_worktree_path, merge_temp_branch, incomplete)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(change_id)
@@ -649,6 +655,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     .bind(post_sha.as_deref())
     .bind(merge_worktree_path)
     .bind(merge_temp_branch)
+    .bind(incomplete)
     .execute(pool)
     .await?;
 
@@ -674,6 +681,7 @@ mod tests {
             branch_name: branch.to_string(),
             repo_root: repo_root.to_string(),
             hardened: true,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         }
@@ -690,6 +698,7 @@ mod tests {
             branch_name: branch.to_string(),
             repo_root: String::new(),
             hardened: false,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         }
@@ -833,6 +842,7 @@ mod tests {
                 branch_name: "branch-x".to_string(),
                 repo_root: "/repo".to_string(),
                 hardened: true,
+                incomplete: false,
                 path: String::new(),
                 diff: String::new(),
             },
@@ -846,6 +856,79 @@ mod tests {
             "description must survive a None re-emit"
         );
         assert_eq!(row.files, vec!["a.rs".to_string()], "files still overwritten");
+
+        teardown_test_db(&db).await;
+    }
+
+    /// `incomplete: true` from a `ChangeProposed` proposed by a CC turn that
+    /// ended in `ResponseFailed` must round-trip to the `changes.incomplete`
+    /// column so the apply UI can surface the confirm-before-Apply warning.
+    /// A subsequent re-emit with `incomplete: false` (e.g. a follow-up
+    /// successful turn against the same branch) must clear the flag — without
+    /// this the confirm dialog would shadow every Apply on a once-failed
+    /// branch even after the user retried successfully.
+    #[tokio::test]
+    async fn incomplete_flag_round_trips_and_clears_on_re_emit() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _cb_rx) = EventBus::new(pool.clone());
+        let thread = Uuid::new_v4();
+        let change_id = Uuid::new_v4();
+        start_cc_thread(&bus, thread).await;
+
+        // First emit: turn ended in ResponseFailed → incomplete=true.
+        emit(
+            &bus,
+            thread,
+            ThreadEvent::ChangeProposed {
+                change_id: change_id.to_string(),
+                description: Some("partial work from failed run".to_string()),
+                files: vec!["a.rs".to_string()],
+                requires_restart: false,
+                origin: None,
+                commit_sha: None,
+                branch_name: "branch-fail".to_string(),
+                repo_root: "/repo".to_string(),
+                hardened: false,
+                incomplete: true,
+                path: String::new(),
+                diff: String::new(),
+            },
+        )
+        .await;
+
+        let proj = ChangesProjection::new(pool.clone());
+        let row = proj.get_by_id(change_id).await.expect("row");
+        assert!(
+            row.incomplete,
+            "incomplete must round-trip to the projection column"
+        );
+
+        // Re-emit on the same branch with incomplete=false (successful follow-up).
+        emit(
+            &bus,
+            thread,
+            ThreadEvent::ChangeProposed {
+                change_id: change_id.to_string(),
+                description: Some("clean follow-up".to_string()),
+                files: vec!["a.rs".to_string()],
+                requires_restart: false,
+                origin: None,
+                commit_sha: None,
+                branch_name: "branch-fail".to_string(),
+                repo_root: "/repo".to_string(),
+                hardened: true,
+                incomplete: false,
+                path: String::new(),
+                diff: String::new(),
+            },
+        )
+        .await;
+
+        let row = proj.get_by_id(change_id).await.expect("row");
+        assert!(
+            !row.incomplete,
+            "successful re-emit must clear the prior failure tag"
+        );
 
         teardown_test_db(&db).await;
     }
@@ -872,6 +955,7 @@ mod tests {
                 branch_name: "branch-a".to_string(),
                 repo_root: "/repo".to_string(),
                 hardened: false,
+                incomplete: false,
                 path: String::new(),
                 diff: String::new(),
             },
@@ -999,6 +1083,7 @@ mod tests {
                 branch_name: "b".to_string(),
                 repo_root: "/r".to_string(),
                 hardened: false,
+                incomplete: false,
                 path: String::new(),
                 diff: String::new(),
             },
@@ -1434,6 +1519,7 @@ mod tests {
             branch_name: branch.into(),
             repo_root: repo_root.into(),
             hardened: true,
+            incomplete: false,
             path: String::new(),
             diff: String::new(),
         }
@@ -1702,6 +1788,7 @@ mod tests {
                 branch_name: "branch-l".to_string(),
                 repo_root: "/r".to_string(),
                 hardened: false,
+                incomplete: false,
                 path: String::new(),
                 diff: String::new(),
             },
@@ -1749,6 +1836,7 @@ mod tests {
                 branch_name: "branch-h2".to_string(),
                 repo_root: "/r".to_string(),
                 hardened: false,
+                incomplete: false,
                 path: String::new(),
                 diff: String::new(),
             },

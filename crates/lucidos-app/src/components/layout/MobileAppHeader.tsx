@@ -78,7 +78,7 @@ function MobileThreadsHeader() {
             disabled={draftsViewActive.value}
             aria-label="Filter threads"
             data-tooltip={draftsViewActive.value ? 'Filter unavailable in drafts view' : 'Filter threads'}
-            style={draftsViewActive.value ? 'pointer-events: auto; cursor: default;' : undefined}
+            style={draftsViewActive.value ? 'pointer-events: auto;' : undefined}
           >
             <FilterIcon />
           </button>
@@ -135,8 +135,10 @@ function MobileThreadHeader() {
           <span
             class="pane-header-brand-label"
             data-role="control-panel-toggle"
-            onClick={() => { controlPanelOpen.value = !controlPanelOpen.value; }}
-            style={{ cursor: 'pointer' }}
+            onClick={(e) => {
+              if (e.target === e.currentTarget) return;
+              controlPanelOpen.value = !controlPanelOpen.value;
+            }}
           >
             <span class="pane-header-title">lucidos</span>
             {badgeCount > 0 && <span class="badge brand-badge" data-tooltip={controlPanelBadgeTooltip()}>{badgeCount}</span>}

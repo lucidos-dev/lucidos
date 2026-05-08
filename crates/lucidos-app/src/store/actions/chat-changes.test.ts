@@ -33,6 +33,7 @@ function makeChange(id: string, overrides: Partial<Change> = {}): Change {
     pre_merge_sha: null,
     post_merge_sha: null,
     commits: [],
+    incomplete: false,
     ...overrides,
   };
 }

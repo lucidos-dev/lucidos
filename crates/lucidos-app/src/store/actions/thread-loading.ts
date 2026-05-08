@@ -57,15 +57,17 @@ function makeThreadState(info: ThreadInfo, saved: boolean, batch?: DraftBatch): 
  *  reads, and an empty entry would only inflate the Map for no reason. */
 function stageDraftFromApi(info: ThreadInfo, batch?: DraftBatch): void {
   const text = info.compose_text || '';
-  const images = info.compose_images || [];
+  // The backend column is still named `compose_images` (Phase 5 cleanup
+  // will rename it); post-migration the JSONB array contains hash strings.
+  const image_hashes = info.compose_images || [];
   const mode = info.compose_mode ?? null;
-  const isEmpty = text === '' && images.length === 0 && mode === null;
+  const isEmpty = text === '' && image_hashes.length === 0 && mode === null;
   if (batch) {
-    batch.set(info.thread_id, isEmpty ? null : { text, images, mode });
+    batch.set(info.thread_id, isEmpty ? null : { text, image_hashes, mode });
     return;
   }
   if (isEmpty) clearDraft(info.thread_id);
-  else setDraft(info.thread_id, { text, images, mode });
+  else setDraft(info.thread_id, { text, image_hashes, mode });
 }
 
 /** Insert or update a thread in the map from API metadata. Exported for testing.

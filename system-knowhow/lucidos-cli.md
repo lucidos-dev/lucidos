@@ -139,7 +139,16 @@ Call a backend configured in `data/config/apis.json` through the engine. The eng
 }
 ```
 
-`auth.type` is one of `bearer`, `api_key`, `basic`. `auth.credential` is the `service_name` already in the engine credential store (the same store `request_credential` writes to). Entries without `auth` forward unauthenticated — useful for local services like Sonos.
+`auth.type` selects how the engine attaches the credential to the outgoing request. Six modes are supported:
+
+- **`bearer`** — `Authorization: Bearer <auth_value>`. `{"type": "bearer", "credential": "<service_name>"}`
+- **`api_key`** — `<header>: <auth_value>` (default header `Authorization`). `{"type": "api_key", "credential": "<service_name>", "header": "X-API-Key"}`
+- **`basic`** — `Authorization: Basic <base64(auth_value)>`. The credential's `auth_value` should already be `user:password`. `{"type": "basic", "credential": "<service_name>"}`
+- **`query_param`** — appends `?<param_name>=<auth_value>` to the request URL. Used for APIs (e.g. Helius) that take the key as a query parameter. `{"type": "query_param", "credential": "<service_name>", "param_name": "api-key"}`
+- **`hmac_signed`** — signs each request with HMAC over the query string. Used for APIs (e.g. Binance) that require per-request signing. Optional `timestamp_param` injects the current millis-since-epoch as a query parameter before signing. Optional `key_header` (default `X-API-KEY`) carries the API key. `signature_param` (default `signature`) names the resulting signature parameter. `algorithm` is `sha256` or `sha512`. `signed_payload` is `query_string`. `{"type": "hmac_signed", "key_credential": "binance-key", "secret_credential": "binance-secret", "key_header": "X-MBX-APIKEY", "algorithm": "sha256", "signed_payload": "query_string", "signature_param": "signature", "timestamp_param": "timestamp"}`
+- **`credential_bundle`** — does NOT inject anything into outgoing HTTP. Exposes the credentials over a sibling endpoint, fetched with `lucidos proxy <name> --credentials` (see below). Used for libraries that perform their own login flow (e.g. `pcomfortcloud` for Panasonic heatpumps). `{"type": "credential_bundle", "credentials": ["comfort_username", "comfort_password"]}`
+
+`auth.credential` (singular variants) and `auth.credentials` / `auth.key_credential` / `auth.secret_credential` (multi-credential variants) reference `service_name`s already in the engine credential store (the same store `request_credential` writes to). Entries without an `auth` block forward unauthenticated — useful for local services like Sonos.
 
 #### Usage (curl-style ergonomics)
 
@@ -164,6 +173,27 @@ lucidos proxy sonos /zones --fail
 ```
 
 Output is the response body on **stdout**. With `--include`, the status line and headers are prepended to stdout (curl convention — single stream). With `--fail`, the body is suppressed and a one-line `lucidos proxy: HTTP <code>` summary is written to stderr instead. Transport errors (DNS failure, connection refused, …) print to stderr (`lucidos: ...`) and exit non-zero. Exit codes mirror curl: `0` on success (including 4xx/5xx by default), `22` when `--fail` and the response is 4xx/5xx, `1` on transport failure.
+
+#### Credential bundle retrieval (`--credentials`)
+
+For `credential_bundle` proxies, use `--credentials` instead of an HTTP path. The engine returns a JSON map keyed by the credential service names listed in the proxy config:
+
+```bash
+lucidos proxy comfort_creds --credentials
+# → {"comfort_username":"user@example.com","comfort_password":"…"}
+```
+
+Use this in scripts that hand the credentials to a library doing its own login (e.g. `pcomfortcloud` for Panasonic heatpumps):
+
+```python
+import json, subprocess
+bundle = json.loads(subprocess.check_output(
+    ["lucidos", "proxy", "comfort_creds", "--credentials"]
+))
+client = pcomfortcloud.Session(bundle["comfort_username"], bundle["comfort_password"])
+```
+
+`--credentials` cannot be combined with `-X`, `-d`, `-i`, `-H`, `--fail`, `--data-stdin`, or a request path. The `proxy_request` LLM tool refuses `credential_bundle` proxies — raw credentials never reach the model.
 
 #### When to use which
 

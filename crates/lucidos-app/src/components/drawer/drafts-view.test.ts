@@ -32,7 +32,7 @@ function makeThread(id: string, overrides: MakeThreadOpts = {}): ThreadState {
   if (composeText !== undefined || composeImages !== undefined || composeMode !== undefined) {
     setDraft(id, {
       text: composeText ?? '',
-      images: composeImages ?? [],
+      image_hashes: composeImages ?? [],
       mode: composeMode ?? null,
     });
   }

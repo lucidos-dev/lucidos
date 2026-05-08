@@ -20,15 +20,15 @@ export function getDbPort(): string {
   return cachedDbPort;
 }
 
-/** Wipe every composing thread and its compose payload so siblings of
- *  drafts.spec don't see each other's leftover compose state piled up in
- *  the New section. The DB resets between Playwright projects but not
- *  between tests in the same project. compose_images is NOT NULL with
- *  default '[]'::jsonb — clear it to the empty-array literal, not NULL. */
-export function clearAllDrafts(): void {
+/** Wipe drawer state between tests in the same Playwright project. The DB
+ *  resets only between projects, so survivors push the test's own row past
+ *  any `:visible.first()` locator. Deliberately does NOT truncate `events`:
+ *  that desyncs in-memory CC session state and stalls follow-on CC tests on
+ *  their commands fetch. */
+export function clearAllThreads(): void {
   psql([
-    "UPDATE thread_summaries SET state = 'discarded', compose_text = '', compose_images = '[]'::jsonb, compose_mode = NULL WHERE state = 'composing'",
-    "UPDATE thread_summaries SET compose_text = '', compose_images = '[]'::jsonb, compose_mode = NULL WHERE compose_text <> '' OR compose_images <> '[]'::jsonb OR compose_mode IS NOT NULL",
+    "TRUNCATE TABLE thread_summaries CASCADE",
+    "TRUNCATE TABLE notifications CASCADE",
   ].join(';\n'));
 }
 
@@ -92,10 +92,15 @@ export function cleanupFileFromMain(file: string, suffix: string): void {
   } catch { /* */ }
 }
 
+/** Engine-served URL prefix for an app's UI bundle. Single source of truth for specs. */
+export function appPath(id: string): string {
+  return `/app/${id}/`;
+}
+
 /**
  * Create an iframe app fixture under `data/apps/<id>/` and return a teardown
  * helper. Use from a Playwright spec's beforeAll/afterAll to test SDK
- * features that have to run inside an `/api/app/<id>/` iframe.
+ * features that have to run inside an `appPath(id)` iframe.
  */
 export function createIframeAppFixture(id: string, files: {
   html: string;

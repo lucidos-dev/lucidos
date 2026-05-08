@@ -3,12 +3,14 @@ use crate::api::ChatImage;
 use crate::core::events::{walk_thread_images, HasEventPayload};
 use crate::llm::image::ImageSize;
 use base64::Engine as _;
+use std::path::Path;
 
 pub(crate) fn resolve_thread_image_refs<E: HasEventPayload>(
+    workspace: &Path,
     events: &[E],
     refs: &[String],
 ) -> Result<Vec<ChatImage>, Box<dyn std::error::Error + Send + Sync>> {
-    let images = walk_thread_images(events);
+    let images = walk_thread_images(workspace, events);
     let total = images.len();
 
     let mut result = Vec::with_capacity(refs.len());
@@ -35,9 +37,21 @@ pub(crate) fn resolve_thread_image_refs<E: HasEventPayload>(
                 reference, total
             )
         })?;
+        // walk_thread_images yields empty base64 when the user-image blob
+        // is missing on disk (partial backup-restore). The numbering slot
+        // exists so downstream history annotations stay stable; we
+        // surface a clear error here instead of feeding empty bytes to
+        // the LLM API.
+        if img.base64.is_empty() {
+            return Err(format!(
+                "Thread image '{}' is referenced but its blob is missing on disk.",
+                reference
+            )
+            .into());
+        }
         result.push(ChatImage {
-            base64: img.base64.to_string(),
-            mime_type: img.mime_type.to_string(),
+            base64: img.base64.clone(),
+            mime_type: img.mime_type.clone(),
         });
     }
     Ok(result)
@@ -226,7 +240,7 @@ impl LucidosEngine {
                 .event_store
                 .get_thread_events(&thread_id.to_string())
                 .await?;
-            let images = crate::core::events::walk_thread_images(&events);
+            let images = crate::core::events::walk_thread_images(&self.workspace_path, &events);
             let total = images.len();
 
             let img = images
@@ -243,7 +257,7 @@ impl LucidosEngine {
                 return Err("Image missing base64 data".into());
             }
 
-            Ok(base64::engine::general_purpose::STANDARD.decode(img.base64)?)
+            Ok(base64::engine::general_purpose::STANDARD.decode(&img.base64)?)
         } else {
             // Artifact path — read from data/ directory
             if crate::api::is_path_traversal(reference) {
@@ -265,55 +279,80 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::blobs::write_blob;
     use crate::core::events::EventRow;
     use crate::llm::tool_names as tn;
     use crate::llm::tools::{get_default_tools, get_save_thread_image_tool};
+    use std::path::Path;
 
-    fn message_event_with_images(imgs: &[(&str, &str)]) -> EventRow {
-        EventRow::new(
+    /// Minimal valid PNG with a per-test discriminator byte so each call
+    /// produces a distinct content-addressed hash.
+    fn png_with_marker(marker: u8) -> Vec<u8> {
+        vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, // signature
+            0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R', // IHDR start
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, marker,
+        ]
+    }
+
+    /// Write `n` distinct image blobs into `workspace`, then return both the
+    /// hashes and a `MessageReceived` event whose payload references them
+    /// — mirrors the post-Phase-3b storage shape so the tests exercise the
+    /// real walk_thread_images + resolve_thread_image_refs path.
+    fn message_event_with_blobs(workspace: &Path, n: u8) -> (Vec<String>, EventRow) {
+        let hashes: Vec<String> = (0..n)
+            .map(|i| write_blob(workspace, &png_with_marker(i)).unwrap().hash)
+            .collect();
+        let event = EventRow::new(
             "MessageReceived",
             serde_json::json!({
                 "text": "hi",
-                "images": imgs.iter().map(|(b64, mime)| serde_json::json!({
-                    "base64": b64,
-                    "mime_type": mime,
-                })).collect::<Vec<_>>(),
+                "user_image_hashes": hashes,
             }),
-        )
+        );
+        (hashes, event)
     }
 
     #[test]
     fn resolve_thread_image_refs_returns_only_requested_indices() {
-        let events = vec![message_event_with_images(&[
-            ("AAA", "image/png"),
-            ("BBB", "image/jpeg"),
-            ("CCC", "image/png"),
-        ])];
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 3);
+        let events = vec![event];
 
-        let resolved =
-            resolve_thread_image_refs(&events, &["thread:1".to_string(), "thread:3".to_string()])
-                .unwrap();
+        let resolved = resolve_thread_image_refs(
+            tmp.path(),
+            &events,
+            &["thread:1".to_string(), "thread:3".to_string()],
+        )
+        .unwrap();
 
+        // The 1st and 3rd images are returned (not the 2nd). All blobs are
+        // PNGs (sniffed by magic bytes), so each comes back with mime image/png.
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].base64, "AAA");
         assert_eq!(resolved[0].mime_type, "image/png");
-        assert_eq!(resolved[1].base64, "CCC");
         assert_eq!(resolved[1].mime_type, "image/png");
+        // Different hashes → different bytes → different base64.
+        assert_ne!(resolved[0].base64, resolved[1].base64);
     }
 
     #[test]
     fn resolve_thread_image_refs_empty_input_returns_empty() {
-        let events = vec![message_event_with_images(&[("AAA", "image/png")])];
-        let resolved = resolve_thread_image_refs(&events, &[]).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 1);
+        let events = vec![event];
+        let resolved = resolve_thread_image_refs(tmp.path(), &events, &[]).unwrap();
         assert!(resolved.is_empty());
     }
 
     #[test]
     fn resolve_thread_image_refs_invalid_index_errors() {
-        let events = vec![message_event_with_images(&[("AAA", "image/png")])];
-        let err = resolve_thread_image_refs(&events, &["thread:5".to_string()])
-            .unwrap_err()
-            .to_string();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 1);
+        let events = vec![event];
+        let err =
+            resolve_thread_image_refs(tmp.path(), &events, &["thread:5".to_string()])
+                .unwrap_err()
+                .to_string();
         assert!(
             err.contains("thread:5") || err.contains("not found"),
             "error should mention missing index, got: {}",
@@ -323,10 +362,13 @@ mod tests {
 
     #[test]
     fn resolve_thread_image_refs_rejects_zero_index() {
-        let events = vec![message_event_with_images(&[("AAA", "image/png")])];
-        let err = resolve_thread_image_refs(&events, &["thread:0".to_string()])
-            .unwrap_err()
-            .to_string();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 1);
+        let events = vec![event];
+        let err =
+            resolve_thread_image_refs(tmp.path(), &events, &["thread:0".to_string()])
+                .unwrap_err()
+                .to_string();
         assert!(
             err.to_lowercase().contains("1 or greater") || err.contains("thread:0"),
             "error should reject zero, got: {}",
@@ -336,10 +378,16 @@ mod tests {
 
     #[test]
     fn resolve_thread_image_refs_rejects_unknown_format() {
-        let events = vec![message_event_with_images(&[("AAA", "image/png")])];
-        let err = resolve_thread_image_refs(&events, &["artifacts/foo.png".to_string()])
-            .unwrap_err()
-            .to_string();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 1);
+        let events = vec![event];
+        let err = resolve_thread_image_refs(
+            tmp.path(),
+            &events,
+            &["artifacts/foo.png".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("thread:"),
             "error should explain expected format, got: {}",

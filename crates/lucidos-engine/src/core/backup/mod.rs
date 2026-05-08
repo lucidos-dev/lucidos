@@ -976,6 +976,46 @@ mod tests {
         );
     }
 
+    /// `data/blobs/` holds content-addressed image bytes. Backups MUST
+    /// include them — they're the only copy of the bytes referenced by
+    /// every MessageReceived.user_image_hashes and ThreadComposeChanged.
+    /// A regression in the exclusion list would orphan every historical
+    /// image after restore, with no way to recover them.
+    #[test]
+    fn test_tar_and_compress_includes_data_blobs() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path();
+
+        // Realistic blob path — fan-out by leading two hex chars of the hash.
+        let hash = "ab".to_string() + &"c".repeat(62);
+        let blob_dir = ws.join("data/blobs").join(&hash[..2]);
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        let blob_path = blob_dir.join(format!("{hash}.png"));
+        std::fs::write(&blob_path, b"\x89PNG fake bytes for test").unwrap();
+
+        let sql_dump = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
+
+        let output = tempfile::NamedTempFile::new().unwrap();
+        tar_and_compress(ws, sql_dump.path(), output.path(), None).unwrap();
+
+        let file = std::fs::File::open(output.path()).unwrap();
+        let decoder = zstd::Decoder::new(file).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let found_paths: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        let expected = format!("data/blobs/{}/{}.png", &hash[..2], hash);
+        assert!(
+            found_paths.contains(&expected),
+            "archive must contain {expected}, got: {found_paths:?}"
+        );
+    }
+
     #[test]
     fn test_tar_and_compress_excludes_postgres_migrated_archives() {
         // `scripts/lib/workspace.sh` archives the old PGDATA as

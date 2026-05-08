@@ -190,7 +190,7 @@ describe('sendCompose carries dropdown repo through to chat body (real flow)', (
     const draftId = 'draft-thread';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
-    setDraft(draftId, { text: 'fix it', images: [], mode: 'claude_code' });
+    setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
     selectedRepoId.value = 'external-repo-uuid';
 
     await sendCompose(draftId, { useClaudeCode: true });
@@ -204,7 +204,7 @@ describe('sendCompose carries dropdown repo through to chat body (real flow)', (
     const draftId = 'draft-chat';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'chat' });
-    setDraft(draftId, { text: 'hi', images: [], mode: null });
+    setDraft(draftId, { text: 'hi', image_hashes: [], mode: null });
     selectedRepoId.value = 'external-repo-uuid';
 
     await sendCompose(draftId, { useClaudeCode: false });
@@ -222,7 +222,7 @@ describe('sendCompose carries dropdown repo through to chat body (real flow)', (
     const draftId = 'rollback-draft';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code', repoId: 'stale-repo-uuid' });
-    setDraft(draftId, { text: 'retry', images: [], mode: 'claude_code' });
+    setDraft(draftId, { text: 'retry', image_hashes: [], mode: 'claude_code' });
     selectedRepoId.value = '';
 
     await sendCompose(draftId, { useClaudeCode: true });

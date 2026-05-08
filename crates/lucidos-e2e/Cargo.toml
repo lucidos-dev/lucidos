@@ -11,11 +11,14 @@ path = "src/lib.rs"
 [dev-dependencies]
 lucidos-engine = { path = "../lucidos-engine" }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
+image = "0.25"

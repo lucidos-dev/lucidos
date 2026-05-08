@@ -99,10 +99,6 @@ function parseUserAgent(ua: string | null): string {
   return `${browser} on ${os}`;
 }
 
-function formatLastSeen(timestamp: string): string {
-  return formatTimeAgo(new Date(timestamp));
-}
-
 function DeviceRow({ device, editingId, setEditingId }: {
   device: DeviceInfo;
   editingId: string | null;
@@ -174,7 +170,7 @@ function DeviceRow({ device, editingId, setEditingId }: {
           <span>{parseUserAgent(device.user_agent)}</span>
           {' \u00b7 '}
           <span data-tooltip={formatDateTime(new Date(device.last_seen_at))}>
-            {formatLastSeen(device.last_seen_at)}
+            {formatTimeAgo(new Date(device.last_seen_at))}
           </span>
         </div>
       </div>

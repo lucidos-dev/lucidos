@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { createIframeAppFixture, psql } from './db-helpers';
+import { appPath, createIframeAppFixture, psql } from './db-helpers';
 
 // Verifies that an app iframe receives live theme updates via the SDK's
 // `lucidos.ui.watchPreferences()` SSE subscription.
@@ -72,7 +72,7 @@ waitForLucidos();
 <body>
 <iframe
   id="app-frame"
-  src="/api/app/${APP_ID}/"
+  src="${appPath(APP_ID)}"
   sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals allow-popups-to-escape-sandbox"
   style="width:600px;height:400px;border:0"></iframe>
 <script>
@@ -291,7 +291,7 @@ test.describe('SDK iframe theme — opt-in only', () => {
 <html>
 <head><meta charset="UTF-8"></head>
 <body>
-<iframe id="app-frame" src="/api/app/${NO_OPT_IN_APP_ID}/"
+<iframe id="app-frame" src="${appPath(NO_OPT_IN_APP_ID)}"
   sandbox="allow-scripts allow-same-origin"
   style="width:600px;height:400px;border:0"></iframe>
 </body>
@@ -306,7 +306,7 @@ test.describe('SDK iframe theme — opt-in only', () => {
 
     // And the engine must NOT have rewritten the served HTML to include
     // the prefs script or theme stylesheet on this app's behalf.
-    const res = await request.get(`/api/app/${NO_OPT_IN_APP_ID}/`);
+    const res = await request.get(appPath(NO_OPT_IN_APP_ID));
     const html = await res.text();
     expect(html).not.toContain('/api/v1/sdk-prefs.js');
     expect(html).not.toContain('/api/v1/sdk-iframe.css');

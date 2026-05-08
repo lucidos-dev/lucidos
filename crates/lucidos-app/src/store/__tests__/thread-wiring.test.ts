@@ -598,7 +598,7 @@ describe('Focused thread preserved across reload', () => {
     map.set(id, makeThread({
       meta: { ...makeThread().meta, id, state: 'composing' },
     }));
-    setDraft(id, { text: 'half-typed', images: [], mode: 'claude_code' });
+    setDraft(id, { text: 'half-typed', image_hashes: [], mode: 'claude_code' });
 
     // Subsequent loadAllThreads / resync brings authoritative state from API
     upsertThread(map, {
@@ -664,41 +664,6 @@ describe('CC follow-up in same thread', () => {
       e.type === 'ResponseGenerated' && (e as any).text?.includes('started a new')
     );
     expect(redirects).toHaveLength(0);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Exchange count for drawer
-// ---------------------------------------------------------------------------
-describe('Exchange count for drawer', () => {
-  it('counts MessageReceived and TriggerStarted as exchanges', () => {
-    const thread = makeThread();
-    const map = new Map([['t1', thread]]);
-
-    handleEventWithAgg(map, 't1', 100, { type: 'MessageReceived', text: 'q1' }, TS);
-    handleEventWithAgg(map, 't1', 101, { type: 'ResponseGenerated' }, TS);
-    handleEventWithAgg(map, 't1', 102, { type: 'MessageReceived', text: 'q2' }, TS);
-    handleEventWithAgg(map, 't1', 103, { type: 'ResponseGenerated' }, TS);
-    handleEventWithAgg(map, 't1', 104, { type: 'TriggerStarted', trigger_id: 't1' }, TS);
-    handleEventWithAgg(map, 't1', 105, { type: 'ResponseGenerated' }, TS);
-
-    const count = [...thread.events.values()].filter(
-      e => e.type === 'MessageReceived' || e.type === 'TriggerStarted'
-    ).length;
-    expect(count).toBe(3);
-  });
-
-  it('counts SessionRecovered as an exchange', () => {
-    const thread = makeThread();
-    const map = new Map([['t1', thread]]);
-
-    handleEventWithAgg(map, 't1', 100, { type: 'SessionRecovered', branch: 'claude-code/20260318' }, TS);
-    handleEventWithAgg(map, 't1', 101, { type: 'SessionStarted', session_id: 'cc-1' }, TS);
-    handleEventWithAgg(map, 't1', 102, { type: 'ResponseGenerated' }, TS);
-
-    const exchanges = groupIntoExchanges(thread.events);
-    expect(exchanges).toHaveLength(1);
-    expect(exchanges[0].userEvent.type).toBe('SessionRecovered');
   });
 });
 

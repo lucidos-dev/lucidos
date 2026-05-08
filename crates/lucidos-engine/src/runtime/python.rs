@@ -133,7 +133,6 @@ impl PythonRuntime {
         let workspace = self.workspace_str_escaped();
         format!(
             "import builtins as _builtins, os as _os, tempfile as _tempfile\n\
-             _original_open = _builtins.open\n\
              def _sandboxed_open(file, mode='r', *args, _allowed=(\n\
              \x20   _os.path.realpath('{workspace}'),\n\
              \x20   _os.path.realpath(_tempfile.gettempdir()),\n\
@@ -144,7 +143,7 @@ impl PythonRuntime {
              \x20           raise PermissionError('Sandbox: cannot write outside workspace: ' + str(file) + '. Use the run_claude tool to edit source code.')\n\
              \x20   return _orig(file, mode, *args, **kwargs)\n\
              _builtins.open = _sandboxed_open\n\
-             del _sandboxed_open, _original_open\n",
+             del _sandboxed_open\n",
             workspace = workspace,
         )
     }
@@ -163,7 +162,6 @@ impl PythonRuntime {
              _workspace = _os.path.realpath('{workspace}')\n\
              _staging = _os.path.realpath('{staging}')\n\
              _data_dir = _os.path.join(_workspace, 'data')\n\
-             _original_open = _builtins.open\n\
              def _sandboxed_open(file, mode='r', *args, _orig=_builtins.open, **kwargs):\n\
              \x20   if not isinstance(file, (str, bytes, _os.PathLike)):\n\
              \x20       return _orig(file, mode, *args, **kwargs)\n\
@@ -185,7 +183,7 @@ impl PythonRuntime {
              \x20           return _orig(staged, mode, *args, **kwargs)\n\
              \x20   return _orig(file, mode, *args, **kwargs)\n\
              _builtins.open = _sandboxed_open\n\
-             del _sandboxed_open, _original_open\n",
+             del _sandboxed_open\n",
             workspace = workspace,
             staging = staging,
         )

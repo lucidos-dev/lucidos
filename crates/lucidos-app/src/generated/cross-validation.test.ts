@@ -14,7 +14,7 @@ import fixture from './cross-validation-fixture.json';
 
 interface ResolveActionsCase {
   fn: 'resolveActions';
-  args: [string, string, string, boolean];
+  args: [string, string, string, boolean, boolean];
   expected: string[];
 }
 
@@ -38,13 +38,13 @@ describe('Cross-validation: generated TS matches Rust', () => {
     const resolveActionsCases = cases.filter((c): c is ResolveActionsCase => c.fn === 'resolveActions');
 
     it(`has exhaustive coverage (${resolveActionsCases.length} cases)`, () => {
-      // 2 thread types × 5 statuses × 2 sections × 2 pending = 40
-      expect(resolveActionsCases.length).toBe(40);
+      // 2 thread types × 5 statuses × 2 sections × 2 pending × 2 saved = 80
+      expect(resolveActionsCases.length).toBe(80);
     });
 
     for (const tc of resolveActionsCases) {
-      const [threadType, status, section, pending] = tc.args;
-      const label = `(${threadType}, ${status}, ${section}, pending=${pending})`;
+      const [threadType, status, section, pending, saved] = tc.args;
+      const label = `(${threadType}, ${status}, ${section}, pending=${pending}, saved=${saved})`;
 
       it(`${label} → [${tc.expected.join(', ')}]`, () => {
         const result = resolveActions(
@@ -52,6 +52,7 @@ describe('Cross-validation: generated TS matches Rust', () => {
           status as ThreadStatus,
           section as ArchiveState,
           pending,
+          saved,
         );
         expect(result).toEqual(tc.expected as Action[]);
       });

@@ -20,9 +20,9 @@ use uuid::Uuid;
 
 use super::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use super::lifecycle::{
-    classify_result, classify_session_end_action, is_silent_resume, is_stale_resume_signal,
-    reset_per_turn_flags, should_auto_end_on_idle, should_exit_subprocess_on_idle,
-    should_propose_change_at_idle, SessionEndAction, TerminalKind,
+    change_is_incomplete_from_terminal, classify_result, classify_session_end_action,
+    is_silent_resume, is_stale_resume_signal, reset_per_turn_flags, should_auto_end_on_idle,
+    should_exit_subprocess_on_idle, should_propose_change_at_idle, SessionEndAction, TerminalKind,
 };
 use super::node_modules_setup::has_install_marker;
 use super::runtime_helpers::{safety_net_outcome, SafetyNetOutcome};
@@ -196,18 +196,26 @@ impl LucidosEngine {
             .await?
         };
 
-        let (repo_id, repo_root, is_external_repo, external_repo_name) = if let Some(repo) = repo {
-            let path = PathBuf::from(&repo.path);
-            if !path.exists() {
-                return Err(format!("Repository path does not exist: {}", repo.path).into());
-            }
-            let is_external = is_external_repo_path(&path, &dev_root);
-            let name = if is_external { Some(repo.name) } else { None };
-            (Some(repo.id.to_string()), path, is_external, name)
-        } else {
-            // No default registered (very early startup) and no explicit id.
-            (None, dev_root, false, None)
-        };
+        let (repo_id, repo_root, is_external_repo, external_repo_name, repo_name) =
+            if let Some(repo) = repo {
+                let path = PathBuf::from(&repo.path);
+                if !path.exists() {
+                    return Err(format!("Repository path does not exist: {}", repo.path).into());
+                }
+                let is_external = is_external_repo_path(&path, &dev_root);
+                let repo_name = repo.name.clone();
+                let external_repo_name = if is_external { Some(repo.name) } else { None };
+                (
+                    Some(repo.id.to_string()),
+                    path,
+                    is_external,
+                    external_repo_name,
+                    Some(repo_name),
+                )
+            } else {
+                // No default registered (very early startup) and no explicit id.
+                (None, dev_root, false, None, None)
+            };
 
         let workspace_name = self.workspace_name();
         let last_idle_sha =
@@ -715,6 +723,7 @@ impl LucidosEngine {
                 reasoning_effort: cc_reasoning_effort.as_deref(),
                 thread_id,
                 spawning_event_id,
+                repo_name: repo_name.as_deref(),
             },
             agent_cancel.clone(),
         )
@@ -1268,6 +1277,9 @@ impl LucidosEngine {
                                             is_shutdown,
                                             cc_error,
                                         );
+                                        // Captured before the `if let Some(kind)` below moves out.
+                                        let from_failure =
+                                            change_is_incomplete_from_terminal(&terminal_kind);
                                         if let Some(kind) = terminal_kind {
                                             if kind == TerminalKind::Aborted {
                                                 // Reset on next user follow-up.
@@ -1433,6 +1445,11 @@ impl LucidosEngine {
                                                     // recovery paths stamp Engine origin
                                                     // via propose_branch_changes.
                                                     origin: None,
+                                                    // Tag the change so the apply UI can
+                                                    // confirm before landing partial work
+                                                    // when the turn ended in ResponseFailed
+                                                    // (mid-stream API drop, etc.).
+                                                    incomplete: from_failure,
                                                 }).await {
                                                     Ok(_) => {
                                                         // Track for the ProcessResult returned via the
@@ -1973,6 +1990,11 @@ impl LucidosEngine {
                                 // Live agent proposal at session end — origin is
                                 // carried by the surrounding MessageReceived.
                                 origin: None,
+                                // Session-end cleanup runs after the terminal
+                                // event already landed; the per-turn idle path
+                                // owns the failure tag, so this fallback path
+                                // never originates `incomplete`.
+                                incomplete: false,
                             })
                             .await
                         {

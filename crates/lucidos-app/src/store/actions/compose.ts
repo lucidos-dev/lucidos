@@ -22,15 +22,15 @@ import { makeOptimisticThreadState, type ThreadMeta } from '../thread-events';
 import { clearDraft, composeDrafts, draftIsEmpty, getDraft, patchDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { ApiError, ensureThreadStarted, putComposeOnThread, deleteThread } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
-import { inferMimeFromBase64, type PastedImage } from '../../utils/inferMimeFromBase64';
 import { sendMessage } from './chat';
+import { markHashesAsSent } from '../../components/chat/pastedImages';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
 
 export type ComposeMode = 'lucidos' | 'claude_code';
 
 interface ComposePatch {
   text?: string;
-  images?: string[];
+  image_hashes?: string[];
   mode?: ComposeMode;
 }
 
@@ -97,10 +97,10 @@ export function updateCompose(threadId: string, patch: ComposePatch): void {
  *  entry; empty payloads clear the entry instead of inflating the Map. */
 export function applyRemoteCompose(
   threadId: string,
-  fields: { text: string; images: string[]; mode: ComposeMode | null },
+  fields: { text: string; image_hashes: string[]; mode: ComposeMode | null },
 ): void {
   if (!threadMap.value.has(threadId)) return;
-  if (fields.text === '' && fields.images.length === 0 && fields.mode === null) {
+  if (fields.text === '' && fields.image_hashes.length === 0 && fields.mode === null) {
     clearDraft(threadId);
     return;
   }
@@ -138,6 +138,17 @@ function schedulePush(threadId: string): void {
   pendingTimers.set(threadId, t);
 }
 
+/** When the next push has the same array as the last one we synced, send
+ *  `null` so the server's COALESCE preserves and skips the SSE re-broadcast. */
+const lastSyncedImageHashes = new Map<string, string[]>();
+
+function imageHashesUnchanged(threadId: string, current: string[]): boolean {
+  const prev = lastSyncedImageHashes.get(threadId);
+  if (!prev) return false;
+  if (prev.length !== current.length) return false;
+  return prev.every((h, i) => h === current[i]);
+}
+
 async function pushNow(threadId: string): Promise<void> {
   const thread = threadMap.value.get(threadId);
   if (!thread) {
@@ -145,15 +156,22 @@ async function pushNow(threadId: string): Promise<void> {
     return;
   }
   const draft = getDraft(threadId);
+  // null = preserve via COALESCE (avoids the SSE re-broadcast).
+  const wireHashes: string[] | null = imageHashesUnchanged(threadId, draft.image_hashes)
+    ? null
+    : [...draft.image_hashes];
   try {
     await putComposeOnThread(
       threadId,
       draft.text,
-      draft.images,
+      wireHashes,
       // Mode is only meaningful for composing threads — once active, the
       // channel field is authoritative and the server rejects mode changes.
       thread.meta.state === 'composing' ? draft.mode : null,
     );
+    if (wireHashes !== null) {
+      lastSyncedImageHashes.set(threadId, wireHashes);
+    }
   } finally {
     pendingComposePuts.delete(threadId);
   }
@@ -187,7 +205,7 @@ export async function startComposeIfNeeded(threadId: string, mode: ComposeMode):
     status: 'idle',
   }));
   threadMap.value = next;
-  setDraft(threadId, { text: '', images: [], mode });
+  setDraft(threadId, { text: '', image_hashes: [], mode });
   try {
     await ensureThreadStarted(threadId, mode);
   } catch (err) {
@@ -204,6 +222,20 @@ function rollbackOptimistic(threadId: string): void {
   clearDraft(threadId);
 }
 
+/** In-flight POST /threads promises keyed by thread id. Callers that need
+ *  the row to exist server-side before issuing their own request (image
+ *  blob upload — only attach path that fires synchronously, no debounce
+ *  to hide the race) consult this via `awaitThreadStarted`. */
+const pendingThreadStarts = new Map<string, Promise<void>>();
+
+/** Resolve once the in-flight `POST /threads` for this id has settled.
+ *  No-op (resolves immediately) if no start is in flight — covers both the
+ *  already-active thread case and any later race-free caller. */
+export async function awaitThreadStarted(threadId: string): Promise<void> {
+  const p = pendingThreadStarts.get(threadId);
+  if (p) await p;
+}
+
 /** Lazy-create a thread id when the user starts composing without a thread
  *  focused. The id is allocated client-side; `startComposeIfNeeded` POSTs the
  *  row server-side. Toast on POST failure — local optimism gets rolled back
@@ -217,13 +249,23 @@ export function ensureFocusedComposeThread(): string {
   // loadThreadEvents, and (on mobile) navigateToPane, none of which the
   // draft path wants.
   pushThreadNavState({ type: 'thread', id });
-  startComposeIfNeeded(id, currentComposeMode()).catch((err) => {
-    // Mirror rollbackOptimistic's threadMap drop in nav so Forward can't later
-    // restore an id whose threadMap entry no longer exists.
-    removeThreadNavEntries(id);
-    if (focusedThreadId.value === id) setFocusedThread(null);
-    showToast(`Failed to start compose: ${errorDetail(err)}`, 'error');
-  });
+  const startPromise = startComposeIfNeeded(id, currentComposeMode());
+  pendingThreadStarts.set(id, startPromise);
+  startPromise
+    .catch((err) => {
+      // Mirror rollbackOptimistic's threadMap drop in nav so Forward can't later
+      // restore an id whose threadMap entry no longer exists.
+      removeThreadNavEntries(id);
+      if (focusedThreadId.value === id) setFocusedThread(null);
+      showToast(`Failed to start compose: ${errorDetail(err)}`, 'error');
+    })
+    .finally(() => {
+      // Only clear if we still own the slot — a fresh ensureFocusedComposeThread
+      // for the same id (rare but possible after rollback + reuse) wins.
+      if (pendingThreadStarts.get(id) === startPromise) {
+        pendingThreadStarts.delete(id);
+      }
+    });
   return id;
 }
 
@@ -240,6 +282,7 @@ export async function discardCompose(threadId: string): Promise<void> {
   const restoreDraft = snapshotDraft(threadId);
   mutateThreadMeta(threadId, { state: 'discarded' });
   clearDraft(threadId);
+  lastSyncedImageHashes.delete(threadId);
   // Pair with the push in ensureFocusedComposeThread — Back/Forward must not
   // restore a discarded thread whose events would 404.
   removeThreadNavEntries(threadId);
@@ -257,7 +300,7 @@ export async function discardCompose(threadId: string): Promise<void> {
  *  the rollback path doesn't seed an empty draft on a thread that had none. */
 function snapshotDraft(threadId: string): ComposeDraft | undefined {
   const draft = composeDrafts.value.get(threadId);
-  return draft && { ...draft, images: [...draft.images] };
+  return draft && { ...draft, image_hashes: [...draft.image_hashes] };
 }
 
 function isAlreadyGone(err: unknown): boolean {
@@ -274,22 +317,24 @@ export async function sendCompose(threadId: string, opts: { useClaudeCode?: bool
   if (!thread) return;
   const draft = getDraft(threadId);
   const text = draft.text;
-  const wireImages = draft.images;
+  const wireHashes = draft.image_hashes;
   const mode = draft.mode;
-  if (!text.trim() && wireImages.length === 0) return;
-  const images = wireImages.length > 0
-    ? wireImages.map((base64) => ({ base64, mimeType: inferMimeFromBase64(base64) }))
-    : undefined;
+  if (!text.trim() && wireHashes.length === 0) return;
 
   cancelPendingPush(threadId);
   // Bind here so sendMessage doesn't have to detect first-send vs follow-up
   // (see frontend.md "Drafts Are Threads"). selectedRepoId may drift afterward.
   const boundRepoId = opts.useClaudeCode && selectedRepoId.value ? selectedRepoId.value : undefined;
   mutateThreadMeta(threadId, { state: 'active', repoId: boundRepoId });
+  // Must run before the draft clear — see `markHashesAsSent`.
+  if (wireHashes.length > 0) markHashesAsSent(wireHashes);
   clearDraft(threadId);
+  lastSyncedImageHashes.delete(threadId);
   setFocusedThread(threadId);
   try {
-    await sendMessage(text, images, { useClaudeCode: opts.useClaudeCode });
+    await sendMessage(text, wireHashes.length > 0 ? wireHashes : undefined, {
+      useClaudeCode: opts.useClaudeCode,
+    });
   } catch (err) {
     // Roll back state. Restore text/images only if the user hasn't started
     // typing into the now-empty textarea — overwriting fresh keystrokes
@@ -298,7 +343,7 @@ export async function sendCompose(threadId: string, opts: { useClaudeCode?: bool
     const current = getDraft(threadId);
     const restore: Partial<ComposeDraft> = {};
     if (current.text === '') restore.text = text;
-    if (current.images.length === 0) restore.images = wireImages;
+    if (current.image_hashes.length === 0) restore.image_hashes = wireHashes;
     if (current.mode === null) restore.mode = mode;
     if (Object.keys(restore).length > 0) patchDraft(threadId, restore);
     throw err;
@@ -314,11 +359,14 @@ export async function sendCompose(threadId: string, opts: { useClaudeCode?: bool
 export async function sendFollowup(
   threadId: string,
   text: string,
-  images?: PastedImage[],
+  imageHashes?: string[],
   opts?: { useClaudeCode?: boolean },
 ): Promise<void> {
-  updateCompose(threadId, { text: '', images: [] });
-  await sendMessage(text, images, opts);
+  // Must run before the draft clear — see `markHashesAsSent`.
+  if (imageHashes?.length) markHashesAsSent(imageHashes);
+  updateCompose(threadId, { text: '', image_hashes: [] });
+  lastSyncedImageHashes.delete(threadId);
+  await sendMessage(text, imageHashes, opts);
 }
 
 /** Tab-close-safe flush. Each pending PUT goes out with `keepalive: true` so
@@ -337,9 +385,10 @@ function flushAllPending(): void {
     const thread = threadMap.value.get(threadId);
     if (!thread) continue;
     const draft = getDraft(threadId);
+    // Always emit the full array on tab close — hashes are tiny.
     const body = JSON.stringify({
       text: draft.text,
-      images: draft.images,
+      image_hashes: draft.image_hashes,
       mode: thread.meta.state === 'composing' ? draft.mode : null,
     });
     if (body.length > 64 * 1024) {

@@ -156,7 +156,8 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
             const status = thread.meta.status;
             const storedSection = (step.expected.stored_section || 'archived') as ArchiveState;
             const threadType = scenario.thread_type as ThreadType;
-            const actions = resolveActions(threadType, status, storedSection, hasPendingChanges);
+            const isSaved = step.expected.is_saved || false;
+            const actions = resolveActions(threadType, status, storedSection, hasPendingChanges, isSaved);
             expect(actions, `step ${i} (${step.emit}): actions`).toEqual(step.expected.expected_actions);
           }
         }

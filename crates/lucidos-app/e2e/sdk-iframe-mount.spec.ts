@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { createIframeAppFixture } from './db-helpers';
+import { appPath, createIframeAppFixture } from './db-helpers';
 
 // Verifies that opening an app via the deep-link flow mounts exactly one
 // iframe and triggers exactly one fetch of /api/v1/sdk-prefs.js *from the
@@ -73,7 +73,7 @@ test.describe('App iframe mount — single fetch on open', () => {
     // Settle window so any late mount-time fetches land before we assert.
     await page.waitForTimeout(500);
 
-    const iframeFetches = Array.from(fetchesByFrame.entries()).filter(([url]) => url.includes(`/api/app/${APP_ID}/`));
+    const iframeFetches = Array.from(fetchesByFrame.entries()).filter(([url]) => url.includes(appPath(APP_ID)));
     const total = iframeFetches.reduce((acc, [, n]) => acc + n, 0);
     expect(
       total,

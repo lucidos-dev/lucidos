@@ -870,6 +870,12 @@
     min-width: 0;
 }
 
+/* Pointer cursor only on the visible children (text, badge, dot), not on the
+   empty centering space the brand-label reserves with flex:1. */
+.pane-header-brand-label > * {
+    cursor: pointer;
+}
+
 .pane-header-brand .pane-header-title {
     font-size: 0.875rem;
     min-width: 0;

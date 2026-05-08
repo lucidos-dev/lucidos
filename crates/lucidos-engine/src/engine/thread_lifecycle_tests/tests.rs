@@ -44,24 +44,26 @@ fn generate_cross_validation_fixture() -> String {
 
     let mut cases = Vec::new();
 
-    // resolveActions: 2 types × 3 statuses × 2 sections × 2 pending = 24 cases
+    // resolveActions: 2 types × 5 statuses × 2 sections × 2 pending × 2 saved = 80 cases
     for (tt_str, tt) in &thread_types {
         for (st_str, st) in &statuses {
             for (sec_str, sec) in &sections {
                 for &pending in &bools {
-                    let actions: Vec<&str> = resolve_actions(*tt, *st, *sec, pending)
-                        .iter()
-                        .map(|a| match a {
-                            Action::Archive => "archive",
-                            Action::Apply => "apply",
-                            Action::Discard => "discard",
-                        })
-                        .collect();
-                    cases.push(format!(
-                            r#"    {{ "fn": "resolveActions", "args": [{:?}, {:?}, {:?}, {}], "expected": [{}] }}"#,
-                            tt_str, st_str, sec_str, pending,
-                            actions.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>().join(", ")
-                        ));
+                    for &saved in &bools {
+                        let actions: Vec<&str> = resolve_actions(*tt, *st, *sec, pending, saved)
+                            .iter()
+                            .map(|a| match a {
+                                Action::Archive => "archive",
+                                Action::Apply => "apply",
+                                Action::Discard => "discard",
+                            })
+                            .collect();
+                        cases.push(format!(
+                                r#"    {{ "fn": "resolveActions", "args": [{:?}, {:?}, {:?}, {}, {}], "expected": [{}] }}"#,
+                                tt_str, st_str, sec_str, pending, saved,
+                                actions.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>().join(", ")
+                            ));
+                    }
                 }
             }
         }
@@ -186,9 +188,11 @@ fn generate_typescript() -> String {
     out.push_str("  status: ThreadStatus,\n");
     out.push_str("  storedSection: ArchiveState,\n");
     out.push_str("  hasPendingChanges: boolean,\n");
+    out.push_str("  isSaved: boolean,\n");
     out.push_str("): Action[] {\n");
     out.push_str("  if (status === 'running' || status === 'waiting_for_user_answer') return [];\n");
     out.push_str("  if (hasPendingChanges && threadType === 'claude_code') return ['discard', 'apply'];\n");
+    out.push_str("  if (isSaved) return [];\n");
     out.push_str("  if (storedSection !== 'inbox') return [];\n");
     out.push_str("  return ['archive'];\n");
     out.push_str("}\n");
@@ -661,6 +665,7 @@ fn chat_inbox_idle_shows_archive() {
         ThreadStatus::Idle,
         ArchiveState::Inbox,
         false,
+        false,
     );
     assert_eq!(actions, vec![Action::Archive]);
 }
@@ -671,6 +676,7 @@ fn chat_default_shows_no_actions() {
         ThreadType::Chat,
         ThreadStatus::Idle,
         ArchiveState::Archived,
+        false,
         false,
     );
     assert!(actions.is_empty());
@@ -683,6 +689,7 @@ fn chat_running_shows_no_actions() {
         ThreadStatus::Running,
         ArchiveState::Inbox,
         false,
+        false,
     );
     assert!(actions.is_empty());
 }
@@ -694,6 +701,7 @@ fn cc_inbox_with_changes_shows_apply_discard() {
         ThreadStatus::Waiting,
         ArchiveState::Inbox,
         true,
+        false,
     );
     assert_eq!(actions, vec![Action::Discard, Action::Apply]);
 }
@@ -704,6 +712,7 @@ fn cc_inbox_no_changes_shows_archive() {
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,
         ArchiveState::Inbox,
+        false,
         false,
     );
     assert_eq!(actions, vec![Action::Archive]);
@@ -718,6 +727,7 @@ fn external_repo_cc_no_pending_change_shows_archive() {
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,
         ArchiveState::Inbox,
+        false,
         false,
     );
     assert_eq!(
@@ -734,6 +744,7 @@ fn cc_archived_no_changes_shows_no_actions() {
         ThreadStatus::Idle,
         ArchiveState::Archived,
         false,
+        false,
     );
     assert!(actions.is_empty());
 }
@@ -748,6 +759,47 @@ fn cc_archived_with_pending_changes_shows_apply_discard() {
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,
         ArchiveState::Archived,
+        true,
+        false,
+    );
+    assert_eq!(actions, vec![Action::Discard, Action::Apply]);
+}
+
+#[test]
+fn saved_inbox_no_changes_shows_no_actions() {
+    // Bug repro: a saved CC thread with no pending changes used to return
+    // [Archive] here AND have an Archive button rendered by the prompt
+    // section, producing two Archive buttons in the prompt row. Saved threads
+    // route Archive through PromptInput's getPromptSectionButtons; this
+    // function must stay quiet to avoid the duplicate.
+    let actions = resolve_actions(
+        ThreadType::CodingAgent,
+        ThreadStatus::Idle,
+        ArchiveState::Inbox,
+        false,
+        true,
+    );
+    assert!(actions.is_empty());
+
+    let actions = resolve_actions(
+        ThreadType::Chat,
+        ThreadStatus::Idle,
+        ArchiveState::Inbox,
+        false,
+        true,
+    );
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn saved_cc_with_pending_changes_still_shows_apply_discard() {
+    // Pending changes outrank the saved-suppression: the user must resolve
+    // the change before any Archive logic kicks in.
+    let actions = resolve_actions(
+        ThreadType::CodingAgent,
+        ThreadStatus::Waiting,
+        ArchiveState::Inbox,
+        true,
         true,
     );
     assert_eq!(actions, vec![Action::Discard, Action::Apply]);
@@ -793,6 +845,7 @@ fn cc_running_shows_no_actions() {
         ThreadStatus::Running,
         ArchiveState::Inbox,
         true,
+        false,
     );
     assert!(actions.is_empty());
 }
@@ -930,6 +983,7 @@ fn waiting_for_user_answer_returns_no_actions() {
                 ThreadStatus::WaitingForUserAnswer,
                 section,
                 has_changes,
+                false,
             );
             assert!(
                 actions.is_empty(),

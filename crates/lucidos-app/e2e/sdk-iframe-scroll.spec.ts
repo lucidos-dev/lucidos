@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { createIframeAppFixture } from './db-helpers';
+import { appPath, createIframeAppFixture } from './db-helpers';
 
 // Verifies that the SDK preserves an app's scrollY across iframe unmount/remount.
 // The parent destroys/recreates the iframe element on every app switch
@@ -14,7 +14,7 @@ let fixture: { cleanup: () => void };
 // exercises the real iframe environment.
 const iframeHtml = (appId: string) => `<!DOCTYPE html>
 <html><body>
-<iframe id="app-frame" src="/api/app/${appId}/"
+<iframe id="app-frame" src="${appPath(appId)}"
   sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals allow-popups-to-escape-sandbox"
   style="width:600px;height:400px;border:0"></iframe>
 </body></html>`;

@@ -1158,6 +1158,7 @@ impl LucidosEngine {
             .emit(crate::engine::event_bus::BusEvent::Thread {
                 thread_id: cc_thread_id,
                 event: crate::engine::chat::make_message_received(
+                    &self.workspace_path,
                     &prompt,
                     user_images.as_deref(),
                     device_id.as_deref(),
@@ -1204,6 +1205,7 @@ impl LucidosEngine {
                 let msg = prompt.clone();
                 let bus = self.event_bus.clone();
                 tokio::spawn(async move {
+                    // CC prompts arrive as text; image attachments don't flow this path.
                     super::chat::emit_generated_title(
                         &bus,
                         &provider,
@@ -1211,6 +1213,7 @@ impl LucidosEngine {
                         &msg,
                         None,
                         None,
+                        0,
                     )
                     .await;
                 });
@@ -1388,7 +1391,7 @@ mod tests {
             thread_id,
             event: ThreadEvent::MessageReceived {
                 text: "do the thing".into(),
-                images: vec![],
+                user_image_hashes: vec![],
                 device_id: None,
                 device: None,
                 image_description: None,

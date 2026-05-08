@@ -114,7 +114,7 @@ Don't claim "I'll delete it after it runs" without doing one of the above — se
 2. **`list_triggers` first** to check whether an existing trigger should be updated instead of creating a new one.
 3. **Decide cron vs. on_event** before writing the trigger.
 4. **Write `run.intent` as the user would say it.**
-5. **Reference any procedure-laden knowhow in `run.knowhow`.** If the knowhow doesn't exist yet, create it first (see `building-knowhow.md`).
+5. **Reference any procedure-laden knowhow in `run.knowhow`.** If the knowhow doesn't exist yet, create it first (see `building-knowhow.md`). A knowhow id is the file's path under `data/knowhow/` (or under the engine-shipped `system-knowhow/`) WITHOUT the `.md` suffix and INCLUDING any subdirectory: `data/knowhow/lucidos-ops/release-process.md` → `lucidos-ops/release-process`, NOT `release-process`. The engine rejects unknown ids — `create_trigger` and `update_trigger` fail with "Knowhow not found" before saving, and any pre-existing trigger whose knowhow file disappears now aborts at fire time with a notification instead of running without context.
 
 ## Common mistakes to avoid
 
@@ -122,6 +122,7 @@ Don't claim "I'll delete it after it runs" without doing one of the above — se
 - **Recipe-in-text.** Putting procedure into `run.intent` instead of knowhow. See "The most important rule" above.
 - **Cron when on_event fits.** Polling burns runs and adds latency. If an event exists, prefer it.
 - **Forgetting the knowhow reference.** The trigger runs without it, but the LLM has to re-derive the procedure every time and gets it slightly different each run.
+- **Bare knowhow id when the file is in a subdirectory.** Writing `knowhow: ['nightly-pipeline-trigger']` when the file is at `data/knowhow/lucidos-ops/nightly-pipeline-trigger.md` — the correct id is `lucidos-ops/nightly-pipeline-trigger`. Both `create_trigger` and `update_trigger` reject unknown ids; if you're unsure, run `list_files data/knowhow/` first.
 - **Knowhow that recommends raw `curl`/`fetch` for an API the workspace already proxies.** When the recipe instructs the LLM to shell out with `curl -H "Authorization: Bearer $CRED_..."` (or the `requests`/`fetch` equivalent), the credential leaks into argv and tool transcripts. The right path is the `proxy_request` LLM tool against an entry in `data/config/apis.json` — see `system-knowhow/building-knowhow.md` § "Calling external APIs from a recipe".
 - **Notifying on every tick.** A trigger that always notifies trains the user to ignore notifications.
 - **Two live triggers with the same name.** Filter pickers and notification deep-links can't tell them apart. If you need two, name them differently.

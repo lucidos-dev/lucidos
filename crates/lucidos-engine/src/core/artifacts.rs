@@ -88,20 +88,22 @@ impl ArtifactManager {
             }
         };
 
-        // Ensure .gitignore exists — create and commit it if missing
-        let gitignore_path = workspace_path.join(".gitignore");
-        if !gitignore_path.exists() {
-            let content = ".lucidos/\ndata/postgres/\n";
-            if let Err(e) = fs::write(&gitignore_path, content) {
-                log!("[Artifacts] Failed to write .gitignore: {}", e);
-            } else {
+        // Ensure .gitignore exists and contains all engine-managed entries.
+        // Idempotent across boots — appends new entries when the engine adds
+        // them (e.g. data/blobs/) without rewriting historical lines. When
+        // the file is newly created or modified, also commit it to the
+        // artifacts repo so the workspace's git history records the change.
+        match super::ensure_workspace_gitignore_entries(&workspace_path) {
+            Ok(true) => {
                 let mut index = repo.index()?;
                 index.add_path(Path::new(".gitignore"))?;
                 index.write()?;
-                if let Err(e) = super::commit_index(&repo, "chore: add .gitignore") {
+                if let Err(e) = super::commit_index(&repo, "chore: update .gitignore") {
                     log!("[Artifacts] Failed to commit .gitignore: {}", e);
                 }
             }
+            Ok(false) => {}
+            Err(e) => log!("[Artifacts] Failed to ensure .gitignore entries: {}", e),
         }
 
         Ok(Self {
