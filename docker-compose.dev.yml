@@ -1,0 +1,33 @@
+# Development mode: PostgreSQL with pgvector in Docker, engine runs natively on macOS
+#
+# PGDATA lives on a Docker named volume (`lucidos-pg-data-<workspace-hash>`),
+# not a host bind mount. Bind-mounting PGDATA on macOS routes every WAL fsync
+# through Docker Desktop's virtiofs, which throttles host writes and can crash
+# the VM under sustained load (see crates/lucidos-engine/src/paths.rs ::
+# dev_postgres_uses_named_volume_not_bind_mount). The named volume keeps
+# fsyncs inside the VM's ext4. The `lucidos.workspace` label lets status.sh
+# discover which workspace each container belongs to without a host path.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: lucidos-pg-${LUCIDOS_PG_NAME:-default}
+    ports:
+      - "${LUCIDOS_PG_PORT:-5432}:5432"
+    volumes:
+      - lucidos-pg-data:/var/lib/postgresql/data
+    labels:
+      - "lucidos.workspace=${LUCIDOS_WORKSPACE:-./workspace}"
+    environment:
+      - POSTGRES_USER=lucidos
+      - POSTGRES_PASSWORD=lucidos
+      - POSTGRES_DB=lucidos
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lucidos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: "no"
+
+volumes:
+  lucidos-pg-data:
+    name: lucidos-pg-data-${LUCIDOS_PG_NAME:-default}

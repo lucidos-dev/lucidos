@@ -1,0 +1,353 @@
+//! Regression tests for the agentic loop's terminator-emission and
+//! injection-event-id contracts. Both bugs surfaced together when a
+//! personal-workspace thread silently went zombie after hitting the
+//! per-turn iteration cap (no terminator → UI stuck on "running"),
+//! and every follow-up the user typed collided with the original
+//! `MessageReceived` row on `events_pkey` because the optimistic
+//! client UUID was reused as the persisted `UserPromptInjected` id.
+
+use super::{
+    emit_iteration_cap_response_generated, emit_user_prompt_injected_event,
+    ensure_terminator_emitted, MAX_ITERATIONS,
+};
+use super::super::event_bus::{BusEvent, EventBus};
+use super::super::thread_events::{ActorMode, EventMeta, ThreadEvent};
+use super::super::InjectedPrompt;
+use crate::test_support::{setup_test_db, teardown_test_db};
+use uuid::Uuid;
+
+fn message_received(text: &str) -> ThreadEvent {
+    ThreadEvent::MessageReceived {
+        text: text.to_string(),
+        user_image_hashes: vec![],
+        device_id: None,
+        device: None,
+        image_description: None,
+        parent_thread_id: None,
+        spawning_event_id: None,
+        mode: ActorMode::Human,
+        model: None,
+        reasoning_effort: None,
+        origin: None,
+    }
+}
+
+/// Persist a MessageReceived row with the given client-provided event_id and
+/// return the canonical EventMeta used by all events that belong to that
+/// request (matches what `run_agentic_loop` builds from `origin_id`).
+async fn anchor_request(
+    bus: &EventBus,
+    thread_id: Uuid,
+    client_event_id: Uuid,
+    text: &str,
+) -> EventMeta {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: message_received(text),
+        meta: EventMeta {
+            event_id: Some(client_event_id),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("MessageReceived must persist");
+    EventMeta {
+        request_event_id: Some(client_event_id),
+        ..EventMeta::NONE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Iteration-cap terminator
+// ---------------------------------------------------------------------------
+
+/// Regression: hitting the per-turn iteration cap used to `return Ok(...)`
+/// silently — no `ResponseGenerated`/`ResponseFailed`/`ResponseAborted` ever
+/// hit the events table, so the frontend treated the thread as still
+/// running. This test asserts the cap path emits a `ResponseGenerated`
+/// terminator carrying the engine-limit sentinel string.
+#[tokio::test]
+async fn iteration_cap_emits_response_generated_terminator() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let origin_id = Uuid::new_v4();
+    let meta = anchor_request(&bus, thread_id, origin_id, "long task").await;
+
+    let msg = emit_iteration_cap_response_generated(&bus, thread_id, &meta, vec![], None, None)
+        .await;
+
+    assert!(
+        msg.contains("[ENGINE-LIMIT]"),
+        "engine-limit sentinel must be present in the returned text: {}",
+        msg
+    );
+    assert!(
+        msg.contains(&MAX_ITERATIONS.to_string()),
+        "the user-facing message must name the cap"
+    );
+
+    let (count, request_link): (i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(payload->>'request_event_id') \
+         FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ResponseGenerated'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+
+    assert_eq!(
+        count, 1,
+        "iteration cap must emit exactly one ResponseGenerated"
+    );
+    assert_eq!(
+        request_link.as_deref(),
+        Some(origin_id.to_string().as_str()),
+        "the terminator must carry request_event_id linking back to the originating MessageReceived"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+// ---------------------------------------------------------------------------
+// UserPromptInjected event_id collision
+// ---------------------------------------------------------------------------
+
+/// Regression: the inject path used to write `inject_meta.event_id =
+/// prompt.event_id`, reusing the client-provided UUID that
+/// `chat::process` had already persisted as `MessageReceived.id`. The
+/// emit silently failed under `emit_or_log`, the loop kept going, the UI
+/// never got the SSE — and worse, the event was lost forever. This test
+/// drives the inject helper directly and asserts the persisted UPI row
+/// gets a fresh id (different from the prompt's optimistic id) and the
+/// emit succeeds.
+#[tokio::test]
+async fn user_prompt_injected_does_not_collide_with_optimistic_id() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let client_event_id = Uuid::new_v4();
+    let base_meta = anchor_request(&bus, thread_id, client_event_id, "follow-up").await;
+
+    let prompt = InjectedPrompt {
+        text: "actually do it differently".to_string(),
+        // Identical to the MessageReceived row's id — exactly the production
+        // shape that triggered the duplicate-key crash.
+        event_id: Some(client_event_id),
+        mode: ActorMode::Human,
+        spawning_event_id: None,
+        images: None,
+        origin: None,
+    };
+
+    emit_user_prompt_injected_event(&bus, thread_id, &base_meta, &prompt).await;
+
+    let upi_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("UserPromptInjected must persist (no duplicate-key error)");
+
+    assert_ne!(
+        upi_id, client_event_id,
+        "UserPromptInjected must get a fresh id, not the optimistic MessageReceived id"
+    );
+
+    let request_link: Option<String> = sqlx::query_scalar(
+        "SELECT payload->>'request_event_id' FROM events WHERE id = $1",
+    )
+    .bind(upi_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert_eq!(
+        request_link.as_deref(),
+        Some(client_event_id.to_string().as_str()),
+        "request_event_id must still link UPI back to the originating request"
+    );
+
+    // injected_message_id carries the MessageReceived id forward so the
+    // renderer can collapse the duplicate "Auto-prompt sent" panel into the
+    // existing user message.
+    let injected_link: Option<String> = sqlx::query_scalar(
+        "SELECT payload->>'injected_message_id' FROM events WHERE id = $1",
+    )
+    .bind(upi_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert_eq!(
+        injected_link.as_deref(),
+        Some(client_event_id.to_string().as_str()),
+        "injected_message_id must point at the paired MessageReceived",
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+// ---------------------------------------------------------------------------
+// Defensive post-loop guard
+// ---------------------------------------------------------------------------
+
+/// If a future bug causes the loop to return without emitting a terminator
+/// (the iteration-cap path was the most recent example, but any new branch
+/// could regress), the post-loop guard must catch it and emit
+/// `ResponseAborted` so the UI doesn't get stuck. This test sets up a
+/// request with activity but no terminator, calls the guard, and asserts
+/// `ResponseAborted` lands.
+#[tokio::test]
+async fn ensure_terminator_emitted_recovers_silent_exit() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let origin_id = Uuid::new_v4();
+    let meta = anchor_request(&bus, thread_id, origin_id, "do work").await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ToolResult {
+            name: "edit_file".into(),
+            result: "ok".into(),
+            images: vec![],
+        },
+        meta: meta.clone(),
+    })
+    .await
+    .expect("activity emit ok");
+
+    ensure_terminator_emitted(&bus, &pool, thread_id, origin_id, None).await;
+
+    let (count, request_link): (i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(payload->>'request_event_id') \
+         FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ResponseAborted'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+
+    assert_eq!(
+        count, 1,
+        "guard must emit a ResponseAborted when the loop returned without one"
+    );
+    assert_eq!(
+        request_link.as_deref(),
+        Some(origin_id.to_string().as_str()),
+        "the defensive abort must carry request_event_id back to the originating MessageReceived"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// Inverse: if a terminator already exists for the request, the guard must
+/// NOT double-emit. A spurious second terminator would create phantom
+/// "Aborted" exchanges in the UI on every successful loop completion.
+#[tokio::test]
+async fn ensure_terminator_emitted_is_idempotent_when_terminator_exists() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let origin_id = Uuid::new_v4();
+    let meta = anchor_request(&bus, thread_id, origin_id, "do work").await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "all done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: meta.clone(),
+    })
+    .await
+    .expect("ResponseGenerated emit ok");
+
+    ensure_terminator_emitted(&bus, &pool, thread_id, origin_id, None).await;
+
+    let aborted_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ResponseAborted'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert_eq!(
+        aborted_count, 0,
+        "guard must be a no-op when a terminator was already emitted"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The guard's terminator-detection key is `request_event_id`, not just
+/// "any terminator on the thread". A previous exchange's
+/// `ResponseGenerated` must not satisfy the check for a later exchange
+/// that died silently — otherwise the guard would never fire on
+/// long-running threads (which is exactly the personal-workspace shape).
+#[tokio::test]
+async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+
+    // Earlier exchange — completed cleanly.
+    let earlier_origin = Uuid::new_v4();
+    let earlier_meta = anchor_request(&bus, thread_id, earlier_origin, "first turn").await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "first answer".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: earlier_meta,
+    })
+    .await
+    .expect("earlier terminator");
+
+    // Current exchange — silently exited.
+    let current_origin = Uuid::new_v4();
+    let current_meta = anchor_request(&bus, thread_id, current_origin, "second turn").await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ToolResult {
+            name: "edit_file".into(),
+            result: "ok".into(),
+            images: vec![],
+        },
+        meta: current_meta.clone(),
+    })
+    .await
+    .expect("activity emit ok");
+
+    ensure_terminator_emitted(&bus, &pool, thread_id, current_origin, None).await;
+
+    let aborted_link: Option<String> = sqlx::query_scalar(
+        "SELECT payload->>'request_event_id' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ResponseAborted'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_optional(&pool)
+    .await
+    .expect("query");
+    assert_eq!(
+        aborted_link.as_deref(),
+        Some(current_origin.to_string().as_str()),
+        "guard must emit a ResponseAborted for the current request, ignoring earlier completed exchanges"
+    );
+
+    teardown_test_db(&db_name).await;
+}

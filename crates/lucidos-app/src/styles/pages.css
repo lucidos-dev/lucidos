@@ -1,0 +1,313 @@
+/* File preview styles (used by FilePreviewInline) */
+
+/* highlight.js syntax theme — maps to --syntax-* CSS variables */
+.hljs-keyword,
+.hljs-literal { color: var(--syntax-keyword); }
+
+.hljs-built_in,
+.hljs-title.class_,
+.hljs-type { color: var(--syntax-type); }
+
+.hljs-title.function_,
+.hljs-title.invoke__ { color: var(--syntax-function); }
+
+.hljs-title { color: var(--syntax-key); }
+
+.hljs-attr,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-property,
+.hljs-selector-id { color: var(--syntax-key); }
+
+.hljs-string,
+.hljs-symbol,
+.hljs-regexp { color: var(--syntax-string); }
+
+.hljs-number { color: var(--syntax-number); }
+
+.hljs-comment,
+.hljs-doctag { color: var(--syntax-comment); font-style: italic; }
+
+.hljs-meta,
+.hljs-meta .hljs-keyword { color: var(--syntax-control); }
+
+.hljs-operator,
+.hljs-punctuation { color: var(--text-secondary); }
+
+.hljs-tag,
+.hljs-name,
+.hljs-selector-tag { color: var(--syntax-keyword); }
+
+.hljs-selector-class,
+.hljs-selector-pseudo { color: var(--syntax-type); }
+
+.hljs-section { color: var(--syntax-function); font-weight: 600; }
+
+.hljs-addition { color: var(--accent-green); }
+.hljs-deletion { color: var(--accent-red); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }
+
+/* CSV table */
+.csv-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.75rem;
+}
+
+.csv-table th,
+.csv-table td {
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    border: 1px solid var(--border-color);
+}
+
+.csv-table th {
+    background: var(--bg-tertiary);
+    color: var(--accent);
+    font-weight: 600;
+}
+
+@media (hover: hover) {
+    .csv-table tr:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.file-preview-content .markdown-content {
+    font-size: 0.8125rem;
+    line-height: 1.4;
+    color: var(--text-primary);
+}
+
+.markdown-content h1:first-child,
+.markdown-content h2:first-child,
+.markdown-content h3:first-child {
+    margin-top: 0;
+}
+
+.markdown-content p {
+    margin: 0 0 0.5rem 0;
+}
+
+.markdown-content ul {
+    margin: 0.5rem 0;
+    padding-left: 0;
+    list-style: none;
+}
+
+.markdown-content li {
+    margin: 0.125rem 0;
+}
+
+.markdown-content ul li {
+    padding-left: 1.25rem;
+    position: relative;
+}
+
+.markdown-content ul li::before {
+    content: '•';
+    position: absolute;
+    left: 0.375rem;
+    color: var(--text-muted);
+}
+
+.markdown-content ol {
+    margin: 0.5rem 0;
+    padding-left: 1.5rem;
+}
+
+.markdown-content code {
+    background: var(--bg-tertiary);
+    padding: 0.125rem 0.375rem;
+    border-radius: 0.1875rem;
+    font-size: 0.75rem;
+    color: var(--accent);
+}
+
+.markdown-content .code-block {
+    background: var(--bg-tertiary);
+    padding: 0.75rem;
+    border-radius: 0.375rem;
+    margin: 0.75rem 0;
+    overflow-x: auto;
+}
+
+.markdown-content .code-block code {
+    background: none;
+    padding: 0;
+    color: var(--text-primary);
+}
+
+.markdown-content hr {
+    border: none;
+    border-top: 1px solid var(--border-color);
+    margin: 1.25rem 0;
+}
+
+.markdown-content a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+@media (hover: hover) {
+    .markdown-content a:hover {
+        text-decoration: underline;
+    }
+}
+
+.markdown-content strong {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.markdown-content em {
+    font-style: italic;
+}
+
+/* ===== Credentials Panel ===== */
+
+.settings-panel {
+    padding: 0.75rem;
+}
+
+
+/* ===== Inline Form (panel pane forms) ===== */
+
+.inline-form {
+    padding: 1rem;
+    overflow-y: auto;
+    height: 100%;
+}
+
+
+.credential-instructions {
+    margin: 0 0 0.75rem 0;
+    padding: 0.625rem 0.875rem;
+    border-left: 0.1875rem solid var(--accent);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 0.9em;
+    /* Engine emits multi-line prompts (numbered steps) — preserve newlines. */
+    white-space: pre-wrap;
+}
+
+.form-group {
+    margin-bottom: 1rem;
+}
+
+.form-group label {
+    display: block;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.375rem;
+}
+
+.form-group input {
+    width: 100%;
+    padding: 0.625rem 0.75rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: 0.8125rem;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.form-group input:focus {
+    border-color: var(--accent);
+}
+
+.form-group .dropdown {
+    width: 100%;
+}
+
+.form-group label.form-checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    cursor: pointer;
+    margin-bottom: 0;
+}
+
+.form-group .form-checkbox-row input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+    cursor: pointer;
+}
+
+.form-group .dropdown-trigger {
+    width: 100%;
+    padding: 0.625rem 0.75rem;
+    font-size: 0.8125rem;
+}
+
+.form-group .dropdown-menu {
+    width: 100%;
+}
+
+.form-group .dropdown-option {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8125rem;
+}
+
+.form-group input::placeholder {
+    color: var(--text-muted);
+}
+
+.form-group input:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.form-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 1.25rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border-color);
+}
+
+.form-actions .btn-cancel {
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    padding: 0.375rem 0.75rem;
+    color: var(--text-secondary);
+    font-family: var(--font-ui);
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+@media (hover: hover) {
+    .form-actions .btn-cancel:hover {
+        color: var(--text-primary);
+        border-color: var(--text-secondary);
+    }
+}
+
+.form-actions .btn-save {
+    background: var(--accent);
+    border: none;
+    border-radius: 0.25rem;
+    padding: 0.375rem 0.75rem;
+    color: var(--text-on-accent);
+    font-family: var(--font-ui);
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+@media (hover: hover) {
+    .form-actions .btn-save:hover {
+        background: var(--accent-light);
+    }
+}

@@ -1,0 +1,15 @@
+services:
+  lucidos:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mount local workspace - artifacts and data persist on host
+      - ${LUCIDOS_WORKSPACE:-./workspace}:/workspace
+      # Mount GCP credentials from host
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/workspace/.lucidos/credentials.json:ro
+    environment:
+      - VERTEX_PROJECT_ID=${VERTEX_PROJECT_ID}
+      - VERTEX_REGION=${VERTEX_REGION:-europe-west1}
+      - GOOGLE_APPLICATION_CREDENTIALS=/workspace/.lucidos/credentials.json
+    restart: unless-stopped

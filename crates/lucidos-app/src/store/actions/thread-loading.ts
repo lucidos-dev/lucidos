@@ -1,0 +1,461 @@
+import { threadMap, focusedThreadId, showToast, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, ALL_CHANNELS, type ThreadChannel, threadChannelFilter, selectedTriggerIds, selectedRepoIds, ccSessionVersion, engineRestarting } from '../store';
+import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
+import { applyDraftBatch, setDraft, clearDraft, type ComposeDraft } from '../composeDrafts';
+import { fetchThreads, fetchThreadEvents, fetchOlderThreads } from '../../api/threads';
+import type { ThreadInfo, ThreadEventRow } from '../../api/threads';
+import { errorDetail } from '../../utils/errorDetail';
+import { isComposeFocusedHere } from '../../components/chat/promptFocus';
+import { pendingComposePuts, composeEditedAt } from './compose';
+
+/** Buffer for batched compose draft writes during loadAllThreads — hundreds
+ *  of threads through the upsertThread loop should land in one signal write,
+ *  not N. `null` means clear the entry. Caller flushes via `applyDraftBatch`. */
+type DraftBatch = Map<string, ComposeDraft | null>;
+
+function makeThreadState(info: ThreadInfo, saved: boolean, batch?: DraftBatch): ThreadState {
+  stageDraftFromApi(info, batch);
+  return {
+    meta: {
+      id: info.thread_id,
+      title: info.title || PENDING_TITLE_PLACEHOLDER,
+      channel: info.channel as ThreadMeta['channel'],
+      initiator: info.initiator,
+      saved,
+      createdAt: info.created_at || new Date().toISOString(),
+      updatedAt: info.last_activity || info.created_at || new Date().toISOString(),
+      status: (info.status as ThreadStatus) || 'idle',
+      messageCount: info.message_count || 0,
+      section: (info.section as ThreadMeta['section']) || 'archived',
+      activeChildrenCount: info.active_children_count || 0,
+      totalChildrenCount: info.total_children_count || 0,
+      ccHasChanges: info.cc_has_changes || false,
+      ccRequiresRestart: info.cc_requires_restart || false,
+      ccIsExternalRepo: info.cc_is_external_repo || false,
+      ccApplying: info.cc_applying || false,
+      lastRevivedAt: info.last_revived_at || '',
+      parentThreadId: info.parent_thread_id || undefined,
+      parentThreadTitle: info.parent_thread_title || undefined,
+      triggerId: info.trigger_id || undefined,
+      triggerName: info.trigger_name || undefined,
+      repoId: info.cc_repo_id || undefined,
+      repoName: info.cc_repo_name || undefined,
+      state: info.state,
+    },
+    events: new Map(),
+    streamingBuffer: '',
+    eventsLoaded: false,
+    eventsLoadFailed: false,
+    lastDbSeq: 0,
+    pendingUserMessages: [],
+  };
+}
+
+/** Stage a draft write from API metadata. Pushes into `batch` when provided
+ *  (loadAllThreads' single-flush path); otherwise writes the signal directly
+ *  (single-thread upserts from search/link bootstrapping). Empty server-side
+ *  drafts clear the entry instead of populating it — `EMPTY_DRAFT` covers
+ *  reads, and an empty entry would only inflate the Map for no reason. */
+function stageDraftFromApi(info: ThreadInfo, batch?: DraftBatch): void {
+  const text = info.compose_text || '';
+  // The backend column is still named `compose_images` (Phase 5 cleanup
+  // will rename it); post-migration the JSONB array contains hash strings.
+  const image_hashes = info.compose_images || [];
+  const mode = info.compose_mode ?? null;
+  const isEmpty = text === '' && image_hashes.length === 0 && mode === null;
+  if (batch) {
+    batch.set(info.thread_id, isEmpty ? null : { text, image_hashes, mode });
+    return;
+  }
+  if (isEmpty) clearDraft(info.thread_id);
+  else setDraft(info.thread_id, { text, image_hashes, mode });
+}
+
+/** Insert or update a thread in the map from API metadata. Exported for testing.
+ *
+ *  `requestStartedAt` (Date.now() ms) is the moment the originating GET went
+ *  out. The compose-fields overwrite is skipped if a local edit happened
+ *  AT OR AFTER the request started — without this, a slow GET issued before
+ *  the user's photo attach but whose response lands AFTER pushNow's PUT
+ *  clears `pendingComposePuts` silently overwrites the optimistic image with
+ *  the server's pre-PUT snapshot. Default `Number.MAX_SAFE_INTEGER` is the
+ *  "infinitely fresh" sentinel for synthetic callers (tests, code paths that
+ *  don't gate on a real GET) so the staleness check is always false. */
+export function upsertThread(
+  map: Map<string, ThreadState>,
+  info: ThreadInfo,
+  saved: boolean,
+  requestStartedAt: number = Number.MAX_SAFE_INTEGER,
+  draftBatch?: DraftBatch,
+): void {
+  if (!map.has(info.thread_id)) {
+    map.set(info.thread_id, makeThreadState(info, saved, draftBatch));
+  } else {
+    const existing = map.get(info.thread_id)!;
+    if (saved) existing.meta.saved = true;
+    if (info.title && info.title !== PENDING_TITLE_PLACEHOLDER && !generatedTitleIds.has(info.thread_id)) existing.meta.title = info.title;
+    if (info.created_at) existing.meta.createdAt = info.created_at;
+    const apiTime = info.last_activity || info.created_at;
+    if (apiTime && apiTime > existing.meta.updatedAt) existing.meta.updatedAt = apiTime;
+    if (info.channel) existing.meta.channel = info.channel as ThreadMeta['channel'];
+    if (info.initiator) existing.meta.initiator = info.initiator;
+    // Update status from API — the backend is authoritative.
+    if (info.status) existing.meta.status = info.status as ThreadStatus;
+    if (info.message_count) existing.meta.messageCount = info.message_count;
+    if (info.section) existing.meta.section = info.section as ThreadMeta['section'];
+    existing.meta.activeChildrenCount = info.active_children_count || 0;
+    existing.meta.totalChildrenCount = info.total_children_count || 0;
+    // Update CC state fields from API
+    existing.meta.ccHasChanges = info.cc_has_changes || false;
+    existing.meta.ccRequiresRestart = info.cc_requires_restart || false;
+    existing.meta.ccIsExternalRepo = info.cc_is_external_repo || false;
+    existing.meta.ccApplying = info.cc_applying || false;
+    if (info.last_revived_at) existing.meta.lastRevivedAt = info.last_revived_at;
+    if (info.parent_thread_id) existing.meta.parentThreadId = info.parent_thread_id;
+    if (info.parent_thread_title) existing.meta.parentThreadTitle = info.parent_thread_title;
+    if (info.trigger_id) existing.meta.triggerId = info.trigger_id;
+    if (info.trigger_name) existing.meta.triggerName = info.trigger_name;
+    if (info.cc_repo_id) existing.meta.repoId = info.cc_repo_id;
+    if (info.cc_repo_name) existing.meta.repoName = info.cc_repo_name;
+    // Refresh compose state from API. Without this, an SSE skeleton stuck at
+    // state='composing' (because MessageReceived was dropped) stays invisible
+    // forever — categorizeThreads skips composing rows, so the thread never
+    // surfaces in any drawer section even after the projection moved on.
+    //
+    // Skip the compose fields under three conditions:
+    //   1. User is mid-edit on this thread's textarea (focus + matching id).
+    //   2. A debounced/in-flight PUT covers the value the API would clobber.
+    //   3. A local edit happened AFTER this GET went out — its response is
+    //      stale wrt compose by definition. Without this, picker dismissal +
+    //      slow loadAllThreads + fast PUT races to overwrite the optimistic
+    //      image (preview appears, then disappears).
+    existing.meta.state = info.state;
+    const isFocusedThread = info.thread_id === focusedThreadId.value;
+    const userIsTypingHere = isFocusedThread && isComposeFocusedHere(info.thread_id);
+    // `>=` because both timestamps come from Date.now() (1ms resolution) — a
+    // request fired in the same millisecond as the edit can race ahead of the
+    // edit's PUT and would otherwise pass the guard.
+    const editedSinceRequest = (composeEditedAt.get(info.thread_id) ?? 0) >= requestStartedAt;
+    if (!userIsTypingHere && !pendingComposePuts.has(info.thread_id) && !editedSinceRequest) {
+      stageDraftFromApi(info, draftBatch);
+    }
+  }
+}
+
+/** Prevents duplicate concurrent loadAllThreads calls (e.g. 5s health poll + resume). */
+let loadingAll = false;
+
+/** Load thread list metadata, then lazy-load events by priority. */
+export async function loadAllThreads(): Promise<void> {
+  if (loadingAll || engineRestarting.value) return;
+  loadingAll = true;
+
+  try {
+    await loadAllThreadsInner();
+  } finally {
+    loadingAll = false;
+  }
+}
+
+async function loadAllThreadsInner(): Promise<void> {
+  const focused = focusedThreadId.value;
+
+  // Capture BEFORE the GET fires so a local edit that happens between this
+  // line and the response landing reliably wins (composeEditedAt > requestAt).
+  const requestStartedAt = Date.now();
+  const response = await fetchThreads(focused || undefined);
+
+  const map = threadMap.value;
+  const activeSet = new Set(response.active);
+  const draftBatch: DraftBatch = new Map();
+
+  // Build/update thread states from metadata
+  for (const info of response.saved) {
+    upsertThread(map, info, true, requestStartedAt, draftBatch);
+  }
+  for (const info of [...response.active_threads, ...response.history, ...response.composing]) {
+    upsertThread(map, info, false, requestStartedAt, draftBatch);
+  }
+  // Focused thread may be too old for recent list, not saved, not active
+  if (response.focused_thread) {
+    upsertThread(map, response.focused_thread, false, requestStartedAt, draftBatch);
+  }
+
+  applyDraftBatch(draftBatch);
+  threadMap.value = new Map(map);
+  threadsLoaded.value = true;
+
+  // Load events for focused, active, and saved threads; others load lazily
+  // on focus. Saved threads are always few and need events for correct
+  // drawer status (e.g. waiting CC threads after engine restart).
+  const loads: Promise<void>[] = [];
+  if (focused) loads.push(loadThreadEvents(focused));
+  for (const t of map.values()) {
+    if (t.meta.id !== focused && (activeSet.has(t.meta.id) || t.meta.saved)) {
+      loads.push(loadThreadEvents(t.meta.id));
+    }
+  }
+  if (loads.length > 0) await Promise.all(loads);
+
+  // Bump so CCControlMenu re-fetches commands after reload (SSE doesn't replay).
+  if (focused) {
+    const focusedThread = map.get(focused);
+    if (focusedThread?.meta.channel === 'claude_code') {
+      ccSessionVersion.value++;
+    }
+  }
+}
+
+/** Ensure a thread exists in threadMap, bootstrapping from metadata if needed, then load its events. */
+export async function ensureThreadInMap(info: ThreadInfo): Promise<void> {
+  const map = threadMap.value;
+  if (!map.has(info.thread_id)) {
+    upsertThread(map, info, false);
+    threadMap.value = new Map(map);
+  }
+  await loadThreadEvents(info.thread_id);
+}
+
+/** Fetch a thread's metadata by ID and add it to the map.
+ *
+ *  Used by thread-link clicks (and any other flow that knows only the ID,
+ *  not the metadata) so the link works even when the thread is too old to be
+ *  in the loaded thread list — e.g. an archived thread beyond the per-source
+ *  History window. Returns true if the thread is now in the map, false if
+ *  the API has no record of this ID. Network/HTTP failures propagate so the
+ *  caller can surface the real error instead of a generic "not found". */
+export async function ensureThreadByIdInMap(threadId: string): Promise<boolean> {
+  if (threadMap.value.has(threadId)) return true;
+  const requestStartedAt = Date.now();
+  const response = await fetchThreads(threadId);
+  // The backend returns the focused thread separately when it isn't already
+  // in saved/active/history. When it IS already there, we still need to
+  // pluck it out of those lists.
+  const info =
+    response.focused_thread
+    ?? response.saved.find(t => t.thread_id === threadId)
+    ?? response.active_threads.find(t => t.thread_id === threadId)
+    ?? response.history.find(t => t.thread_id === threadId);
+  if (!info) return false;
+  const isSaved = response.saved.some(t => t.thread_id === threadId);
+  const map = threadMap.value;
+  upsertThread(map, info, isSaved, requestStartedAt);
+  threadMap.value = new Map(map);
+  return true;
+}
+
+/** Tracks threads with an in-flight load to prevent duplicate concurrent fetches. */
+const loadingThreads = new Set<string>();
+
+/** Tracks threads that have already been force-retried by the watchdog.
+ *  Prevents infinite retry loops on persistent failures.
+ *  Cleared on resume so threads can be retried after iOS suspend/resume. */
+const forcedRetries = new Set<string>();
+
+/** Clear forced-retry tracking so the watchdog can retry threads again.
+ *  Called on iOS PWA resume — stale retry caps prevent recovery after
+ *  suspend/resume cycles where transient failures may have cleared.
+ *  Also clears loadingThreads — on iOS, setTimeout timers can be paused
+ *  or cleared during suspension, causing in-flight fetches to hang forever
+ *  and permanently block those threads from loading. */
+export function clearForcedRetries(): void {
+  forcedRetries.clear();
+  loadingThreads.clear();
+}
+
+/** Force-retry event loading for a stuck thread. Used by the watchdog in
+ *  ThreadView when a thread has no content for >2 seconds.
+ *  - Skips if this thread was already force-retried (prevents infinite loop)
+ *  - Clears loadingThreads for this thread — the watchdog fires BECAUSE
+ *    loading is stuck, so the in-flight fetch is likely hung (iOS suspension
+ *    can pause setTimeout timers, leaving fetch Promises unresolved forever).
+ *    A duplicate fetch is safe: applyEventRows is idempotent (checks lastDbSeq).
+ *  - Resets eventsLoaded so loadThreadEvents doesn't early-return */
+export function forceRetryThreadEvents(threadId: string): void {
+  if (forcedRetries.has(threadId)) return;
+  forcedRetries.add(threadId);
+  loadingThreads.delete(threadId);
+  const thread = threadMap.value.get(threadId);
+  if (thread) {
+    thread.eventsLoaded = false;
+    thread.eventsLoadFailed = false;
+  }
+  loadThreadEvents(threadId);
+}
+
+/** Load events for a single thread from the snapshot endpoint.
+ *  Retries up to 2 times with exponential backoff on failure. */
+export async function loadThreadEvents(threadId: string): Promise<void> {
+  if (engineRestarting.value) return;
+  const thread = threadMap.value.get(threadId);
+  if (!thread || thread.eventsLoaded) return;
+  if (loadingThreads.has(threadId)) return;
+  loadingThreads.add(threadId);
+
+  // Clear any prior failure so the UI shows the loading state again
+  if (thread.eventsLoadFailed) {
+    thread.eventsLoadFailed = false;
+    threadMap.value = new Map(threadMap.value);
+  }
+
+  const MAX_RETRIES = 2;
+  const BASE_DELAY = 1000;
+
+  try {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const snapshot = await fetchThreadEvents(threadId);
+        // Re-read from current map — the map reference may have changed
+        // during the async fetch (other threads loaded/updated).
+        const current = threadMap.value.get(threadId);
+        if (!current) return;
+        applyEventRows(threadMap.value, threadId, current, snapshot.events, snapshot.currentAggregate);
+        current.eventsLoaded = true;
+        threadMap.value = new Map(threadMap.value);
+        return;
+      } catch (err) {
+        if (attempt < MAX_RETRIES) {
+          // Retry all errors including timeouts — iOS Safari PWA can cause
+          // transient AbortErrors during suspend/resume that succeed on retry.
+          await new Promise(r => setTimeout(r, BASE_DELAY * (attempt + 1)));
+        } else {
+          if (engineRestarting.value) return;
+          console.warn(`[ThreadLoading] Failed to load events for ${threadId} after ${MAX_RETRIES + 1} attempts:`, err);
+          const title = threadMap.value.get(threadId)?.meta.title || threadId.slice(0, 8);
+          showToast(`Failed to load thread events for "${title}": ${errorDetail(err)}`, 'error');
+          const current = threadMap.value.get(threadId);
+          if (current) {
+            current.eventsLoadFailed = true;
+            threadMap.value = new Map(threadMap.value);
+          }
+          return;
+        }
+      }
+    }
+  } finally {
+    loadingThreads.delete(threadId);
+  }
+}
+
+/** Fetch only new events since the thread's last DB-loaded sequence and append them. */
+export async function refreshThreadEvents(threadId: string): Promise<void> {
+  if (engineRestarting.value) return;
+  const map = threadMap.value;
+  const thread = map.get(threadId);
+  if (!thread || !thread.eventsLoaded) return;
+
+  try {
+    const snapshot = await fetchThreadEvents(threadId, thread.lastDbSeq || undefined);
+    // Always apply currentAggregate even when no new events arrived — the
+    // snapshot may have advanced (e.g. status flipped) since the last refresh.
+    if (snapshot.events.length > 0 || snapshot.currentAggregate) {
+      applyEventRows(map, threadId, thread, snapshot.events, snapshot.currentAggregate);
+      threadMap.value = new Map(threadMap.value);
+    }
+  } catch (err) {
+    if (engineRestarting.value) return;
+    console.warn(`[ThreadLoading] Failed to refresh events for ${threadId}:`, err);
+    const title = threadMap.value.get(threadId)?.meta.title || threadId.slice(0, 8);
+    showToast(`Failed to refresh thread events for "${title}": ${errorDetail(err)}`, 'error');
+  }
+}
+
+/** Load older threads for infinite scroll. Self-guards against concurrent calls.
+ *  Passes channel + trigger-id filters to the API so pagination targets only
+ *  matching threads. */
+export async function loadOlderThreads(): Promise<void> {
+  if (threadLoadingMore.value || !threadHasMore.value) return;
+  // Empty filter = nothing visible by intent; never fetch.
+  if (threadChannelFilter.value.size === 0) {
+    threadHasMore.value = false;
+    return;
+  }
+  threadLoadingMore.value = true;
+
+  try {
+    const map = threadMap.value;
+    const filter = threadChannelFilter.value;
+    const isFiltered = filter.size < ALL_CHANNELS.length;
+    const sources = isFiltered ? [...filter] : undefined;
+    const triggerIdSet = selectedTriggerIds.value;
+    const triggerIds = triggerIdSet.size > 0 ? [...triggerIdSet] : undefined;
+    const repoIdSet = selectedRepoIds.value;
+    const repoIds = repoIdSet.size > 0 ? [...repoIdSet] : undefined;
+
+    let oldestTime: string | null = null;
+    for (const t of map.values()) {
+      if (t.meta.saved) continue;
+      if (isFiltered && !filter.has(t.meta.channel as ThreadChannel)) continue;
+      if (triggerIds && t.meta.channel === 'trigger'
+          && (t.meta.triggerId == null || !triggerIdSet.has(t.meta.triggerId))) continue;
+      if (repoIds && t.meta.channel === 'claude_code'
+          && (t.meta.repoId == null || !repoIdSet.has(t.meta.repoId))) continue;
+      if (!oldestTime || t.meta.updatedAt < oldestTime) oldestTime = t.meta.updatedAt;
+    }
+
+    // Empty filter result on loaded threads — fall back to now() so the server
+    // can find matches in history. Without this, a freshly-applied filter
+    // permanently halts with "no more" even though matches exist on disk.
+    if (!oldestTime) {
+      if (!isFiltered && !triggerIds && !repoIds) {
+        threadHasMore.value = false;
+        return;
+      }
+      oldestTime = new Date().toISOString();
+    }
+
+    const response = await fetchOlderThreads(oldestTime, 15, sources, triggerIds, repoIds);
+    if (response.threads.length === 0) {
+      threadHasMore.value = false;
+      return;
+    }
+
+    let added = 0;
+    for (const info of response.threads) {
+      if (!map.has(info.thread_id)) {
+        upsertThread(map, info, false);
+        added++;
+      }
+    }
+
+    // If server returned results but all were duplicates, treat as exhausted
+    // to prevent infinite fetch loops with the same cursor.
+    if (added === 0) {
+      threadHasMore.value = false;
+      return;
+    }
+
+    threadHasMore.value = response.has_more;
+    threadMap.value = new Map(map);
+  } catch (err) {
+    showToast(`Failed to load more threads: ${errorDetail(err)}`, 'error');
+  } finally {
+    threadLoadingMore.value = false;
+  }
+}
+
+function applyEventRows(
+  map: Map<string, ThreadState>,
+  threadId: string,
+  thread: ThreadState,
+  rows: ThreadEventRow[],
+  currentAggregate: ThreadAggregate | null,
+): void {
+  for (const row of rows) {
+    const event = { type: row.event_type, ...row.payload } as ThreadEvent;
+    handleEvent(map, threadId, row.sequence, event, row.created, row.event_id);
+    if (row.sequence > thread.lastDbSeq) thread.lastDbSeq = row.sequence;
+
+    if ((row.event_type === 'ThreadTitleGenerated' || row.event_type === 'ThreadTitleRenamed') && row.payload.title) {
+      thread.meta.title = row.payload.title as string;
+      generatedTitleIds.add(threadId);
+    }
+    if (isChannelDefiningEvent(row.event_type) && row.payload.channel) {
+      thread.meta.channel = row.payload.channel as ThreadMeta['channel'];
+    }
+  }
+  // Backend snapshot is the source of truth for meta — overlay last so any
+  // per-event mutations during replay don't leak through to thread.meta.
+  if (currentAggregate) {
+    applyAggregateToMeta(thread.meta, currentAggregate);
+  }
+}

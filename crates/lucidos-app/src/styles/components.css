@@ -1,0 +1,644 @@
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 0.5rem;
+    height: 0.5rem;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border-color);
+    border-radius: 0.25rem;
+}
+
+::-webkit-scrollbar-corner {
+    background: var(--bg-primary);
+}
+
+@media (hover: hover) {
+    ::-webkit-scrollbar-thumb:hover {
+        background: var(--text-muted);
+    }
+}
+
+/* Confirm dialog */
+.confirm-dialog {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    padding: 1.25rem 1.5rem;
+    max-width: 27.5rem;
+    width: 90%;
+    /* Cap height so the dialog never spills past the viewport;
+       the details list scrolls inside. `--app-height` is set by
+       MobileSwipeContainer so iOS Safari shrinks correctly when the
+       keyboard opens (raw `100vh` does not). */
+    max-height: calc(var(--app-height, 100dvh) - 4rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    display: flex;
+    flex-direction: column;
+    box-shadow: var(--shadow-md);
+}
+
+.confirm-title {
+    color: var(--text-primary);
+    font-size: 1rem;
+    font-weight: 600;
+    margin: 0 0 0.75rem;
+}
+
+.confirm-message {
+    color: var(--text-primary);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    margin-bottom: 1.25rem;
+}
+
+.toast-bullets {
+    list-style: disc;
+    padding-left: 1.25rem;
+    color: var(--text-secondary);
+}
+
+.toast-bullets li {
+    margin-bottom: 0.125rem;
+}
+
+.confirm-details {
+    margin: 0 0 1.25rem;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    min-height: 0;
+}
+
+.confirm-details-intro {
+    margin: 0 0 0.75rem;
+}
+
+.confirm-details-group {
+    margin-bottom: 0.75rem;
+}
+
+.confirm-details-group:last-child {
+    margin-bottom: 0;
+}
+
+.confirm-details-header {
+    color: var(--text-primary);
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+}
+
+.confirm-details-list {
+    list-style: disc;
+    padding-left: 1.25rem;
+    margin: 0;
+}
+
+.confirm-details-list li {
+    margin-bottom: 0.125rem;
+}
+
+.confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+}
+
+.confirm-actions-right {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.confirm-btn-extra {
+    margin-right: auto;
+}
+
+.confirm-btn {
+    padding: 0.375rem 0.75rem;
+    border-radius: 0.25rem;
+    border: none;
+    font-size: 0.75rem;
+    font-family: var(--font-ui);
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.confirm-btn-cancel {
+    background: none;
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+}
+
+@media (hover: hover) {
+    .confirm-btn-cancel:hover {
+        color: var(--text-primary);
+        border-color: var(--text-secondary);
+    }
+}
+
+.confirm-btn-ok {
+    background: var(--accent-red);
+    color: var(--text-on-accent);
+}
+
+.confirm-btn-ok-default {
+    background: var(--accent);
+    color: var(--text-on-accent);
+}
+
+@media (hover: hover) {
+    .confirm-btn-ok:hover {
+        background: color-mix(in srgb, var(--accent-red) 80%, #fff);
+    }
+
+    .confirm-btn-ok-default:hover {
+        background: color-mix(in srgb, var(--accent) 80%, #fff);
+    }
+}
+
+/* Toast notifications — positioned below header, centered in chat panel.
+   --z-toast sits above .restart-overlay so the restart toast stays visible
+   when the dim overlay covers the header. */
+.toast-container {
+    position: fixed;
+    top: calc(2.75rem + 0.5rem + env(safe-area-inset-top, 0px));
+    left: 0;
+    right: 0;
+    z-index: var(--z-toast);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    pointer-events: none;
+}
+
+/* Desktop: center toasts within the chat panel area */
+@media (min-width: 769px) {
+    .toast-container {
+        left: max(2.75rem, calc(var(--co) + var(--ddo)));
+        right: calc(100% - var(--divider-x));
+    }
+
+}
+
+.toast {
+    background: var(--bg-secondary);
+    border: 0.125rem solid var(--border-color);
+    border-radius: 0.375rem;
+    padding: 0.5rem 0.875rem;
+    min-height: 2.5rem;
+    /* Cap height so a long message can't grow past the viewport;
+       the body scrolls inside. `--app-height` keeps iOS Safari honest
+       when the keyboard pushes the visual viewport up. */
+    max-height: calc(var(--app-height, 100dvh) - 6rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    width: calc(100% - 2rem);
+    max-width: 30rem;
+    box-shadow: var(--shadow-sm);
+    pointer-events: auto;
+    animation: toast-in 0.2s ease;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    position: relative;
+    padding-right: 2rem;
+    overflow: hidden;
+}
+
+.toast-body {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    min-height: 0;
+}
+
+/* The mini-spinner rotates via CSS transform, and at 45° its square
+   bounding box inflates by ~√2, briefly exceeding the body's height.
+   `overflow: hidden` would suppress the resulting scrollbar but also
+   clips the spinner's top edge; `overflow: visible` lets the small
+   excess bleed into the toast's 0.5rem top padding without a scrollbar.
+   These toasts are always single-line. */
+.toast-body:has(.mini-spinner) {
+    overflow: visible;
+}
+
+.toast-icon {
+    width: 1.125rem;
+    height: 1.125rem;
+    flex-shrink: 0;
+}
+
+.toast-message {
+    flex: 1;
+    min-width: 0;
+}
+
+.toast-clickable {
+    cursor: pointer;
+    text-decoration: none;
+}
+
+@media (hover: hover) {
+    .toast-clickable:hover {
+        text-decoration: underline;
+        text-decoration-color: currentColor;
+        text-underline-offset: 0.125rem;
+    }
+}
+
+.toast-bullets {
+    margin: 0.25rem 0 0;
+    font-size: 0.75rem;
+    line-height: 1.4;
+}
+
+.toast-section {
+    margin-top: 0.5rem;
+}
+
+.toast-section-title {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.toast-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+}
+
+.toast-close {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.375rem;
+    margin: 0;
+}
+
+.toast-close svg {
+    width: 0.875rem;
+    height: 0.875rem;
+}
+
+.toast-success .toast-icon { color: var(--accent-green); }
+.toast-info .toast-icon { color: var(--accent); }
+.toast-warning .toast-icon { color: var(--accent-yellow); }
+.toast-error .toast-icon { color: var(--accent-red); }
+
+.mini-spinner.toast-icon {
+    width: 1rem;
+    height: 1rem;
+    --spinner-color: var(--accent);
+}
+
+@keyframes toast-in {
+    from { opacity: 0; transform: translateY(-0.5rem); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes modal-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+/* Contextual drop highlights — applied to the element with data-drop-zone
+ * by the document-level dispatcher (DropZone.tsx). The matched element gets
+ * either drag-over-attach (composer/thread) or drag-over-import (files panel),
+ * and an inset dashed overlay fills it. The "attach" zone uses green to echo
+ * the send action; "import" uses the standard accent blue. */
+[data-drop-zone].drag-over-attach,
+[data-drop-zone].drag-over-import {
+    position: relative;
+}
+
+[data-drop-zone].drag-over-attach::after,
+[data-drop-zone].drag-over-import::after {
+    content: '';
+    position: absolute;
+    inset: 0.5rem;
+    border-radius: 0.5rem;
+    pointer-events: none;
+    z-index: 1000;
+}
+
+[data-drop-zone].drag-over-attach::after {
+    background: rgba(63, 185, 80, 0.08);
+    border: 0.1875rem dashed var(--accent-green);
+}
+
+[data-drop-zone].drag-over-import::after {
+    background: rgba(88, 166, 255, 0.1);
+    border: 0.1875rem dashed var(--accent);
+}
+
+[data-drop-zone].drag-over-attach::before,
+[data-drop-zone].drag-over-import::before {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    padding: 1rem 1.75rem;
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-lg);
+    font-size: 1rem;
+    font-weight: 500;
+    pointer-events: none;
+    z-index: 1001;
+    white-space: nowrap;
+}
+
+[data-drop-zone].drag-over-attach::before {
+    content: 'Attach to message';
+}
+
+[data-drop-zone].drag-over-import::before {
+    content: 'Drop files to import';
+}
+
+/* Folder tree navigation */
+.folder-tree {
+    font-size: 0.8125rem;
+    margin-top: 0;
+}
+
+.folder-item {
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.folder-header {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.375rem 0.5rem;
+    cursor: pointer;
+    border-radius: 0.25rem;
+    transition: background-color 0.15s;
+}
+
+@media (hover: hover) {
+    .folder-header:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.folder-arrow {
+    font-size: 0.625rem;
+    color: var(--text-muted);
+    width: 0.75rem;
+}
+
+.folder-icon {
+    font-size: 0.875rem;
+    filter: var(--emoji-folder-filter);
+}
+
+.folder-name {
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.folder-count {
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+}
+
+.folder-contents {
+    margin-left: 0;
+}
+
+.file-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3125rem 0.5rem;
+    cursor: pointer;
+    border-radius: 0.25rem;
+    transition: background-color 0.15s;
+}
+
+@media (hover: hover) {
+    .file-item:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.file-icon {
+    font-size: 0.875rem;
+    filter: var(--emoji-icon-filter);
+}
+
+.file-name {
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Image thumbnails - clickable to show full size */
+.image-thumbnail {
+    max-width: 18.75rem;
+    max-height: 12.5rem;
+    border-radius: 0.5rem;
+    border: 1px solid var(--border-color);
+    cursor: pointer;
+    transition: all 0.2s;
+    object-fit: cover;
+}
+
+@media (hover: hover) {
+    .image-thumbnail:hover {
+        border-color: var(--accent);
+        box-shadow: var(--shadow-sm);
+        transform: scale(1.02);
+    }
+}
+
+/* Image popup for full-size viewing */
+/* Extends .modal-overlay — darker backdrop for image viewing.
+   z-index above --z-control-panel so header buttons (which sit at 2200)
+   don't punch through the dim overlay. */
+.image-popup {
+    background: rgba(0, 0, 0, 0.9);
+    padding: 1.25rem;
+    overflow: hidden;
+    overscroll-behavior: contain;
+    z-index: calc(var(--z-control-panel) + 100);
+}
+
+.image-popup-content {
+    position: relative;
+    width: 95vw;
+    height: 95vh;
+    overflow: hidden;
+}
+
+/* The strip holds every image side by side: each slide is positioned at
+   left: i*100% (set inline). The strip's transform = -index*W centres the
+   current slide. Because every <img> is mounted from the start at its own
+   slot, swiping just moves the strip — no src swaps, no decode race. */
+.image-popup-strip {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    will-change: transform;
+}
+
+.image-popup-slide {
+    position: absolute;
+    top: 0;
+    /* left set inline per slide */
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.image-popup-slide img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    border-radius: 0.5rem;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    user-select: none;
+    -webkit-user-select: none;
+    transform-origin: center;
+    touch-action: none;
+    /* Pin to its own compositor layer so pinch-zoom transforms don't
+       repaint at native resolution every frame. iOS Safari is especially
+       sensitive — without this, pinch updates feel jerky because the
+       browser re-rasterizes the image bitmap on each scale change. The
+       JS path also uses translate3d() to force the GPU code path. */
+    will-change: transform;
+    -webkit-transform: translateZ(0);
+    transform: translateZ(0);
+    -webkit-backface-visibility: hidden;
+    backface-visibility: hidden;
+}
+
+.image-popup-close {
+    position: absolute;
+    top: -2.5rem;
+    right: 0;
+    background: rgba(0, 0, 0, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    color: #fff;
+    border-radius: 50%;
+}
+
+.floating-mobile-close {
+    display: none;
+}
+
+/* Prev/Next navigation buttons in the popup. Pinned to the viewport so
+   .image-popup-content's `overflow: hidden` (needed to clip pinch-zoomed
+   images) doesn't hide them. */
+.image-popup-nav {
+    position: fixed;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 3rem;
+    height: 3rem;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    color: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1;
+    transition: background var(--duration-fast);
+}
+
+.image-popup-nav-prev {
+    left: 1.5rem;
+}
+
+.image-popup-nav-next {
+    right: 1.5rem;
+}
+
+@media (hover: hover) {
+    .image-popup-nav:hover {
+        background: rgba(0, 0, 0, 0.85);
+    }
+}
+
+.image-popup-counter {
+    position: absolute;
+    bottom: -2rem;
+    left: 50%;
+    transform: translateX(-50%);
+    color: var(--text-on-accent);
+    font-size: 0.75rem;
+    background: rgba(0, 0, 0, 0.6);
+    padding: 0.1875rem 0.5rem;
+    border-radius: 0.625rem;
+    pointer-events: none;
+}
+
+@media (max-width: 600px) {
+    .image-popup {
+        padding: 0;
+        background: #000;
+    }
+
+    .image-popup-content {
+        width: 100vw;
+        height: 100vh;
+    }
+
+    .image-popup-slide img {
+        border-radius: 0;
+        box-shadow: none;
+    }
+
+    .image-popup-close {
+        display: none;
+    }
+
+    .floating-mobile-close {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: fixed;
+        top: max(3.5rem, calc(0.75rem + env(safe-area-inset-top, 0px)));
+        right: 0.75rem;
+        width: 3rem;
+        height: 3rem;
+        border-radius: 50%;
+        background: rgba(0, 0, 0, 0.7);
+        border: 1px solid rgba(255, 255, 255, 0.5);
+        color: #fff;
+        cursor: pointer;
+        z-index: 1;
+    }
+
+    .floating-mobile-close svg {
+        width: 1.25rem;
+        height: 1.25rem;
+    }
+
+    /* Mobile relies on swipe for navigation — chevrons would steal thumb
+       real estate without adding anything. */
+    .image-popup-nav {
+        display: none;
+    }
+
+    .image-popup-counter {
+        bottom: max(0.75rem, calc(0.5rem + env(safe-area-inset-bottom, 0px)));
+    }
+}

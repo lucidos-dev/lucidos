@@ -1,0 +1,7 @@
+[alias]
+lint = "clippy --all-targets -- -D warnings"
+
+[build]
+rustc-wrapper = "sccache"
+# Uncomment to enable warnings as errors for CI
+# rustflags = ["-D", "warnings"]

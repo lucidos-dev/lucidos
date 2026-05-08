@@ -1,0 +1,23 @@
+/* Notifications bell */
+.notifications-bell {
+    position: relative;
+}
+
+.badge {
+    position: absolute;
+    top: 0.125rem;
+    right: 0.125rem;
+    background: var(--accent-red);
+    color: white;
+    font-size: 0.5625rem;
+    font-weight: bold;
+    border-radius: 0.5625rem;
+    min-width: 0.875rem;
+    min-height: 0.875rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 0.1875rem;
+    line-height: 0.875rem;
+    box-sizing: border-box;
+}

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en" translate="no" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-visual">
+    <meta name="google" content="notranslate">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Lucidos">
+    <meta name="theme-color" content="#0d1117">
+    <title>Lucidos</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+    <link rel="manifest" href="/manifest.json">
+    <!--
+      iOS PWA splash screens. Without exact-resolution apple-touch-startup-image
+      tags, iOS shows a white screen with the app title during WKWebView cold
+      restart (e.g. memory eviction on resume). Solid-#0d1117 PNGs make that
+      transition dark instead of white. Portrait-only — landscape PWA is rare
+      and iOS has a long-standing bug where it stretches portrait into landscape
+      anyway. Each PNG is ~700B (1-color palette).
+    -->
+    <link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/splash/splash-750x1334.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/splash/splash-828x1792.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 360px) and (device-height: 780px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/splash/splash-1080x2340.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/splash/splash-1125x2436.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/splash/splash-1170x2532.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/splash/splash-1179x2556.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/splash/splash-1206x2622.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/splash/splash-1242x2688.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/splash/splash-1284x2778.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/splash/splash-1290x2796.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/splash/splash-1320x2868.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <!--
+      localStorage-driven FOUC. localStorage is the per-browser source of
+      truth for the user's theme/font/scale (preferences.ts mirrors every
+      change there); reading it synchronously before any stylesheet
+      evaluates makes first paint match the user's choice without a cookie
+      or DB roundtrip. Same-origin iframes (sandbox includes
+      allow-same-origin) inherit the same localStorage, so the parent and
+      every app iframe agree on first-paint values.
+    -->
+    <script>
+      (function() {
+        var d = document.documentElement;
+        var raw = localStorage.getItem('lucidos-theme');
+        var theme = (raw === 'light' || raw === 'dark' || raw === 'system') ? raw : 'dark';
+        var mqLight = matchMedia('(prefers-color-scheme: light)').matches;
+        var resolved = theme === 'system' ? (mqLight ? 'light' : 'dark') : theme;
+        d.setAttribute('data-theme', resolved);
+        var bg = resolved === 'light' ? '#ffffff' : '#0d1117';
+        d.style.setProperty('--bg-primary', bg);
+        // iOS PWA cold-restart flashes WKWebView's underlying white until
+        // global.css applies `html { background: var(--bg-primary); }`.
+        // Inlining the bg on <html> covers that gap.
+        d.style.background = bg;
+        var FONTS = {
+          monospace: "'SF Mono', 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
+          system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+          inter: "'Inter', system-ui, sans-serif",
+          'jetbrains-mono': "'JetBrains Mono', monospace",
+          'ibm-plex-mono': "'IBM Plex Mono', monospace"
+        };
+        var fontKey = localStorage.getItem('lucidos-font-family');
+        d.style.setProperty('--font-ui', FONTS[fontKey] || FONTS.monospace);
+        var scale = localStorage.getItem('lucidos-ui-scale');
+        if (scale) {
+          var legacy = { small: '100%', medium: '113%', large: '125%' };
+          var value = legacy[scale] || (/^\d+$/.test(scale) ? scale + '%' : null);
+          if (value) d.style.setProperty('--user-ui-scale', value);
+        }
+
+        // Always-on theme-flash telemetry: POST breadcrumbs to engine.log so
+        // we can grep for the transition that preceded a reported flash. The
+        // bug we're hunting (iOS WKWebView matchMedia returning a stale
+        // synchronous value at random post-FOUC moments) doesn't reproduce on
+        // demand, so the only way to catch it is to log every transition and
+        // inspect after the fact. Theme transitions fire ~3-5 times per cold
+        // load — negligible noise. window.__themeLogEvt is the same hook
+        // applyTheme() uses, kept here so both surfaces share one channel.
+        try {
+          var t0 = performance.now();
+          window.__themeLogEvt = function(label, info) {
+            var body = JSON.stringify({
+              category: 'theme',
+              message: label,
+              data: Object.assign({ tMs: Math.round(performance.now() - t0) }, info)
+            });
+            // keepalive=true so the POST survives a navigation away (pageshow
+            // breadcrumbs in particular can fire just before a route swap).
+            fetch('/api/internal/client-log', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: body,
+              keepalive: true
+            }).catch(function() {});
+          };
+          window.__themeLogEvt('fouc', {
+            raw: raw, theme: theme, resolved: resolved, mqLight: mqLight
+          });
+          // pageshow fires on bfcache restore — the IIFE doesn't re-run, so
+          // re-read live values here instead of trusting the stale FOUC entry.
+          window.addEventListener('pageshow', function(e) {
+            window.__themeLogEvt('pageshow', {
+              persisted: e.persisted,
+              dataTheme: d.getAttribute('data-theme'),
+              rawNow: localStorage.getItem('lucidos-theme'),
+              mqLightNow: matchMedia('(prefers-color-scheme: light)').matches
+            });
+          });
+        } catch (e) { /* telemetry must never break FOUC */ }
+      })();
+    </script>
+    <script>
+      (function() {
+        var t = document.documentElement.getAttribute('data-theme') || 'dark';
+        document.documentElement.style.colorScheme = t;
+        var m = document.querySelector('meta[name="theme-color"]');
+        if (m) m.setAttribute('content', t === 'light' ? '#ffffff' : '#0d1117');
+      })();
+    </script>
+</head>
+<body style="background:var(--bg-primary, #0d1117)">
+    <div id="app"></div>
+    <script type="module" src="/src/main.tsx"></script>
+</body>
+</html>

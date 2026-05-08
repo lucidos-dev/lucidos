@@ -1,0 +1,61 @@
+# Build stage
+FROM rust:1.83 AS builder
+
+WORKDIR /app
+COPY . .
+
+# Build with release optimizations.
+# lucidos-cli is built alongside the engine so the `lucidos` binary lands in
+# /usr/bin (next to lucidos-engine), matching what `lucidos_cli_dir()` expects
+# at runtime when prepending to spawned CC sessions' PATH.
+RUN cargo build -p lucidos-engine -p lucidos-cli --release
+
+# Runtime stage - single container with PostgreSQL + pgvector + Lucidos
+FROM debian:bookworm-slim
+
+# Install PostgreSQL, pgvector, and other dependencies
+RUN apt-get update && apt-get install -y \
+    # PostgreSQL
+    postgresql-16 \
+    postgresql-16-pgvector \
+    # Python
+    python3 \
+    python3-pip \
+    python3-venv \
+    # Libraries
+    libpq5 \
+    libssl3 \
+    ca-certificates \
+    # PDF text extraction
+    poppler-utils \
+    # OCR for scanned PDFs
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-nor \
+    # Image processing for OCR
+    imagemagick \
+    ghostscript \
+    # Utilities
+    sudo \
+    && rm -rf /var/lib/apt/lists/* \
+    # Allow ImageMagick to process PDFs
+    && sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml 2>/dev/null || true
+
+# Create workspace directory
+RUN mkdir -p /workspace/artifacts /workspace/.lucidos /workspace/data/postgres
+
+# Copy the built binaries — `lucidos` must live next to `lucidos-engine` because
+# the engine resolves it relative to its own current_exe.
+COPY --from=builder /app/target/release/lucidos-engine /usr/bin/lucidos-engine
+COPY --from=builder /app/target/release/lucidos /usr/bin/lucidos
+
+# Copy entrypoint script
+COPY docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
+RUN chmod +x /usr/bin/docker-entrypoint.sh
+
+WORKDIR /workspace
+
+# Expose API port
+EXPOSE 3000
+
+ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]

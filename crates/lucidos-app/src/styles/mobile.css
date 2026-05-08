@@ -1,0 +1,928 @@
+/* Prevent iOS Safari from scrolling the document when the keyboard opens.
+   overflow:hidden on html reduces (but doesn't fully prevent) the
+   window.scrollY drift that pushes the prompt below the viewport.
+   The JS catch-all in MobileSwipeContainer handles remaining cases.
+   NOTE: Do NOT add height constraints (100%, 100dvh) on html — that
+   causes a black gap at the bottom on iOS Safari PWA (see ba317430). */
+@media (max-width: 768px) {
+    html {
+        overflow: hidden;
+    }
+
+    /* iOS long-press near container edges auto-selects the nearest block
+       element (rendering as a thin vertical highlight). Suppress globally,
+       then re-enable on content surfaces where selecting text is the point. */
+    body {
+        -webkit-user-select: none;
+        user-select: none;
+    }
+
+    input, textarea, [contenteditable] {
+        -webkit-user-select: text;
+        user-select: text;
+    }
+
+    .markdown-content, .response-content {
+        -webkit-user-select: text;
+        user-select: text;
+    }
+}
+
+/* Drawer */
+.drawer-backdrop {
+    position: fixed;
+    top: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 200;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.drawer {
+    position: fixed;
+    top: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+    left: 0;
+    bottom: 0;
+    width: fit-content;
+    min-width: 10rem;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border-color);
+    z-index: 201;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    animation: drawer-slide-in var(--duration-fast) ease-out;
+}
+
+/* Safari ignores padding-bottom on scrollable flex containers — the last item
+   scrolls under the padding instead of stopping before it. Use a flex-child
+   pseudo-element to create reliable bottom space within the scroll flow.
+   The safe-area-inset-bottom covers the home indicator zone on notched iPhones. */
+.drawer::after {
+    content: '';
+    flex-shrink: 0;
+    height: env(safe-area-inset-bottom, 0px);
+    min-height: 0.5rem;
+}
+
+@keyframes drawer-slide-in {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(0); }
+}
+
+.drawer.closing {
+    animation: drawer-slide-out 0.2s ease-in forwards;
+}
+
+@keyframes drawer-slide-out {
+    from { transform: translateX(0); }
+    to { transform: translateX(-100%); }
+}
+
+.drawer-backdrop.closing {
+    animation: backdrop-fade-out 0.2s ease-in forwards;
+}
+
+@keyframes backdrop-fade-out {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+.drawer-item {
+    padding: 0.875rem 1.5rem 0.875rem max(2.5rem, env(safe-area-inset-left, 0px));
+    font-size: 0.8125rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+    border-bottom: 1px solid var(--border-color);
+    min-height: 2.75rem;
+    display: flex;
+    align-items: center;
+    -webkit-tap-highlight-color: transparent;
+}
+
+@media (hover: hover) {
+    .drawer-item:hover {
+        background: var(--bg-hover);
+        color: var(--text-primary);
+    }
+}
+
+.drawer-item.active {
+    color: var(--accent);
+    background: rgba(88, 166, 255, 0.08);
+    font-weight: 600;
+}
+
+.drawer-badge {
+    margin-left: auto;
+    background: var(--accent-red);
+    color: var(--text-on-accent);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    border-radius: 0.5625rem;
+    min-width: 1.25rem;
+    height: 1.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 0.375rem;
+}
+
+/* Desktop: drawer emerges from the split divider, scoped to panel area */
+@media (min-width: 769px) {
+    .drawer-backdrop {
+        top: calc(2.5rem + 0.25rem + env(safe-area-inset-top, 0px));
+        left: calc(var(--divider-x) + var(--divider-width));
+        overflow: hidden;
+    }
+
+    .drawer {
+        position: absolute;
+        top: 0;
+        left: 0;
+    }
+}
+
+
+/* Mobile responsive overrides */
+@media (max-width: 600px) {
+    html, body {
+        overflow: hidden;
+        width: 100%;
+    }
+
+    html {
+        font-size: var(--user-ui-scale, 112.5%); /* default 18px base on mobile, user-configurable */
+    }
+
+    /* Container — full width, tighter padding on mobile */
+    .container {
+        max-width: 100%;
+        overflow-x: hidden;
+        padding: 0.75rem;
+        padding-top: calc(4.5rem + env(safe-area-inset-top, 0px));
+        padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
+        padding-right: max(0.75rem, env(safe-area-inset-right, 0px));
+        padding-bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
+    }
+
+    .drawer-item {
+        padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
+    }
+
+    .prompt-box .prompt-textarea {
+        font-size: 0.9rem; /* 0.9 × 18px mobile base = 16.2px — above 16px iOS zoom threshold */
+        min-height: 2.25rem; /* Accommodate clear-button height in prompt row */
+        -webkit-user-select: text;
+        user-select: text;
+    }
+
+    .files-hint {
+        display: none;
+    }
+
+    .prompt-area {
+        margin-bottom: 0;
+        padding-left: 0.75rem;
+        padding-right: 0.75rem;
+        padding-bottom: 0.5rem;
+        background: var(--bg-primary);
+        /* Above edge-swipe-zone (z-index: 1) so prompt buttons are clickable */
+        position: relative;
+        z-index: 2;
+        box-shadow: 0 -0.75rem 0.75rem 0 var(--bg-primary);
+    }
+
+    /* Rounder textarea corners to match phone screen rounding */
+    .prompt-box {
+        border-radius: 1.5rem;
+    }
+
+    /* List rows — stack vertically so actions don't cramp text. */
+    .list-row {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.5rem;
+    }
+
+    /* Force the info column to the row width so a nowrap label
+       (.list-row-label) ellipsizes instead of growing the column to its
+       intrinsic content width — which would drag .list-row-actions off-screen
+       to the right. flex-shrink alone won't do it: align-items: flex-start
+       sizes children by intrinsic cross-axis content, and `overflow: hidden`
+       only clips visually. */
+    .list-row-info {
+        width: 100%;
+    }
+
+    .list-row-name {
+        font-weight: 500;
+    }
+
+    .list-row-actions {
+        align-self: flex-end;
+        justify-content: flex-end;
+    }
+
+    .thread-row {
+        flex-direction: row;
+        align-items: flex-start;
+    }
+
+    .thread-row-right {
+        align-self: flex-start;
+    }
+
+    .list-row-url {
+        max-width: calc(100vw - 4.5rem);
+    }
+
+    /* Response content — prevent overflow */
+    .response-content pre,
+    .response-content table {
+        overflow-x: auto;
+        max-width: calc(100vw - 1.5rem);
+    }
+
+    .response-content img {
+        max-width: 100%;
+        height: auto;
+    }
+
+    /* Break long words in conversation content and initiator panels */
+    .response-content,
+    .initiator-panel,
+    .initiator-body {
+        word-break: break-word;
+        overflow-wrap: break-word;
+    }
+
+    .response-content code {
+        overflow-wrap: break-word;
+    }
+
+    .step {
+        word-break: break-word;
+        overflow-wrap: break-word;
+        min-width: 0;
+    }
+
+    /* Invisible extended touch targets — visual size unchanged */
+    .action-btn::before {
+        content: '';
+        position: absolute;
+        inset: -0.375rem -0.25rem;
+    }
+
+    .action-btn {
+        position: relative;
+    }
+
+    /* Notifications — touch-friendly */
+    .notification-item {
+        min-height: 2.75rem;
+    }
+
+    .dropdown-panel-toolbar {
+        flex-shrink: 0;
+        padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
+        padding-right: max(0.75rem, env(safe-area-inset-right, 0px));
+    }
+
+    .confirm-dialog {
+        max-width: 90vw;
+    }
+
+    .toast-container {
+        /* Below the fixed header, above the thread title row.
+           When keyboard is open --mobile-header-height drops to 0 —
+           max() keeps the toast below the safe-area (notch). */
+        top: max(
+            calc(env(safe-area-inset-top, 0px) + 0.5rem),
+            calc(var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px))) + 0.5rem)
+        );
+        left: max(0.75rem, env(safe-area-inset-left, 0px));
+        right: max(0.75rem, env(safe-area-inset-right, 0px));
+    }
+
+    .toast {
+        max-width: 100%;
+    }
+
+    .toast-message {
+        min-width: 0;
+    }
+
+    #tooltip {
+        max-width: calc(100vw - 2rem);
+    }
+}
+
+
+/* ─── Mobile split layout override ─── */
+@media (max-width: 768px) {
+    /* Use --app-height (set by visualViewport JS) instead of 100dvh.
+       iOS Safari does NOT shrink dvh/vh when the keyboard opens —
+       visualViewport.height is the only reliable signal. */
+    .app-shell {
+        height: var(--app-height, 100dvh);
+    }
+
+    .split-layout {
+        flex-direction: column !important;
+    }
+
+    /* Collapse desktop content row on mobile — can't use display:none because
+       ThreadDrawer (position:fixed) inside it must remain in the rendering tree
+       for the mobile hamburger overlay. overflow:hidden clips non-fixed children
+       (SplitLayout, DrawerDivider) at zero height. */
+    .content-row {
+        flex: none;
+        height: 0;
+        min-height: 0;
+    }
+
+    /* SplitLayout is fully replaced by MobileSwipeContainer on mobile.
+       display:none prevents desktop elements (position:absolute .thread-content,
+       .thread-view-header) from leaking non-zero dimensions via getBoundingClientRect
+       into dual-layout-aware selectors. ThreadDrawer is a sibling, unaffected. */
+    .content-row > .split-layout {
+        display: none !important;
+    }
+
+    /* Thread toggle in pane body: hidden on mobile — mobile header has it */
+    .thread-pane-toggle {
+        display: none !important;
+    }
+
+    /* ─── Mobile header: fixed, direction-aware hide on scroll ─── */
+
+    .app-header {
+        position: fixed !important;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 100;
+        will-change: transform;
+        background: var(--bg-primary);
+        border-bottom: 1px solid var(--border-color);
+        padding-top: env(safe-area-inset-top, 0px);
+        flex-direction: column;
+        align-items: stretch;
+        height: auto;
+    }
+
+    /* Show the right mobile header section based on current view */
+    .app-header[data-mobile-view="threads"] .mobile-threads-header { display: flex; }
+    .app-header[data-mobile-view="thread"] .mobile-thread-header { display: flex; }
+    /* mobile-thread-title-row is no longer in the header — it lives inside
+       .thread-content (scroll container) so it swipes with the pane. */
+    .app-header[data-mobile-view="content"] .mobile-content-header { display: flex; }
+
+    /* Row inside each mobile header — holds icons + title */
+    .mobile-header-row {
+        display: flex;
+        align-items: center;
+        width: 100%;
+        min-height: 2rem;
+        gap: 0.25rem;
+        position: relative;
+    }
+
+    /* Left-aligned title — flows in the flex row */
+    .mobile-header-title {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        min-width: 0;
+        margin-left: 0.125rem;
+    }
+
+    /* Brand label doesn't need truncation — allow badge to overflow */
+    .pane-header-brand.mobile-header-title {
+        overflow: visible;
+    }
+
+    /* Mobile header slot — square so hamburger/nav/search line up. Drawer
+     * rows are sized separately in drawer.css. */
+    .mobile-header-row .icon-btn.header-icon {
+        width: 1.75rem;
+        height: 1.75rem;
+    }
+
+    /* Title-bar copy/pin: height matches the title text (~1.14rem) so the
+     * buttons sit flush with the title baseline. Width keeps the slot. */
+    .mobile-thread-title-row .icon-btn.header-icon {
+        width: 1.75rem;
+        height: 1.25rem;
+    }
+
+    /* Title-bar copy/pin glyphs use the compact md size; .mobile-header-row
+     * keeps --icon-size-lg. (Drawer-row glyphs are sized unconditionally in
+     * drawer.css.) */
+    .mobile-thread-title-row .icon-btn.header-icon svg {
+        width: var(--icon-size-md);
+        height: var(--icon-size-md);
+    }
+
+    /* Badge position reset for smaller mobile icons */
+    .badge {
+        top: -0.125rem;
+        right: -0.125rem;
+    }
+
+    .mobile-header-row .hamburger-panel {
+        padding: 0.375rem;
+    }
+
+    .mobile-nav-slot {
+        display: flex;
+        align-items: center;
+        flex-shrink: 0;
+    }
+
+    .mobile-nav-slot .content-back-btn,
+    .mobile-nav-slot .content-forward-btn,
+    .mobile-nav-slot .thread-nav-btn {
+        width: 1.375rem;
+        height: 1.75rem;
+    }
+
+    .mobile-content-title {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    /* Hide desktop content title on mobile */
+    .pane-header-content-title {
+        display: none;
+    }
+
+    /* Always in DOM so iOS can focus() synchronously within a user gesture.
+       No width/height constraints — composeHandlers focuses before toggling
+       .search-active, so the input needs natural dimensions for correct caret. */
+    .mobile-thread-search-bar {
+        position: absolute;
+        overflow: hidden;
+        clip-path: inset(50%);
+        pointer-events: none;
+    }
+
+    .mobile-threads-header.search-active .mobile-thread-search-bar {
+        position: static;
+        overflow: visible;
+        clip-path: none;
+        pointer-events: auto;
+        flex: 1;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding-left: 0.5rem;
+        min-width: 0;
+    }
+
+    .mobile-threads-header.search-active .mobile-header-row > *:not(.mobile-thread-search-bar) {
+        display: none !important;
+    }
+
+    .mobile-thread-search-bar .thread-search-input {
+        flex: 1;
+        background: none;
+        border: none;
+        outline: none;
+        color: var(--text-primary);
+        font-size: 0.875rem;
+        font-family: var(--font-ui);
+        min-width: 0;
+    }
+
+    .mobile-thread-search-bar .thread-search-input::placeholder {
+        color: var(--text-muted);
+    }
+
+    /* ─── Sticky thread title bar inside the scroll container ─── */
+    /* Positioned via CSS vars set by useHideOnScroll so it tracks the header
+       bottom edge and hides proportionally when the header scrolls out. */
+    .mobile-swipe-pane .mobile-thread-title-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        /* Right padding matches `.pane-header`'s `--header-padding-x` so the
+         * action icons land in the same slot as the mobile header above. */
+        padding: 0.5rem 0.625rem 0.5rem 1rem;
+        background: color-mix(in srgb, var(--accent) 12%, var(--bg-primary));
+        -webkit-user-select: none;
+        user-select: none;
+        -webkit-tap-highlight-color: transparent;
+        border-bottom: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border-color));
+        flex-shrink: 0;
+        position: sticky;
+        /* Tracks the header's bottom edge via CSS vars from useHideOnScroll.
+           The offset extends past -headerHeight by titleHeight so the title
+           bar scrolls fully off-screen at the same speed as the header. */
+        top: calc(var(--mobile-header-height, 3rem) + var(--mobile-header-offset, 0rem));
+        z-index: 2;
+        /* Stretch to full width, cancelling .thread-content's horizontal padding */
+        margin-left: -0.75rem;
+        margin-right: -0.75rem;
+        /* Space below title bar (before first message) */
+        margin-bottom: 0.5rem;
+    }
+
+}
+
+/* ─── Keyboard-active: disable accidental taps ─── */
+/* When a textarea is focused on mobile, block pointer-events on
+   everything except the prompt area so stray taps can't select threads,
+   tabs, or other UI elements while the keyboard is open. */
+@media (max-width: 768px) {
+    :root[data-keyboard-active] .app-header {
+        pointer-events: none;
+    }
+
+    :root[data-keyboard-active] .mobile-thread-title-row {
+        pointer-events: none;
+    }
+
+    /* Pin/unpin is an intentional in-place action on the current thread,
+       not a navigation — keep it tappable while the keyboard is up so iOS
+       Safari (which has no fallback click path) can still toggle the pin. */
+    :root[data-keyboard-active] .mobile-thread-title-row .icon-btn {
+        pointer-events: auto;
+    }
+
+    :root[data-keyboard-active] .mobile-dot-indicator {
+        pointer-events: none;
+    }
+
+    :root[data-keyboard-active] .edge-swipe-zone {
+        pointer-events: none;
+    }
+
+    :root[data-keyboard-active] .thread-content {
+        pointer-events: none;
+    }
+
+    /* Re-enable pointer events on the prompt area and its children */
+    :root[data-keyboard-active] .prompt-area {
+        pointer-events: auto;
+    }
+}
+
+/* ─── Mobile swipe container ─── */
+
+.mobile-swipe-wrapper {
+    display: none;
+}
+
+@media (max-width: 768px) {
+    .mobile-swipe-wrapper {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        position: relative;
+    }
+
+    .mobile-swipe-container {
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
+        position: relative;
+        /* Let the browser handle vertical pan natively; JS handles horizontal swipe.
+           Without this, Android Chrome may fight for horizontal gestures (back nav). */
+        touch-action: pan-y;
+        /* Force a compositor layer so overflow:hidden clips .mobile-swipe-track
+           at composition time. The track has will-change:transform (own layer);
+           without a layer here too, iOS Safari clips at paint time and during
+           rapid back-and-forth swipes the full 300%-wide track can momentarily
+           render outside this container — showing all three panes at once
+           before self-correcting on the next frame. */
+        -webkit-transform: translateZ(0);
+        transform: translateZ(0);
+    }
+
+    .mobile-swipe-track {
+        display: flex;
+        width: 300%;
+        height: 100%;
+        will-change: transform;
+        transition: transform 0.3s ease;
+    }
+
+    /* Edge swipe zones: transparent strips at screen edges that sit above
+       iframes so touch events reach the parent swipe handler. Without these,
+       iframes capture all touches and pane navigation doesn't work.
+       Left zone is wider (2.5rem / 40px) so the "back" swipe gesture is easy
+       to initiate — Apple's HIG recommends 44px minimum touch targets. */
+    .edge-swipe-zone {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        z-index: 1;
+        touch-action: pan-y;
+    }
+    .edge-swipe-left  { left: 0; width: 2.5rem; }
+    .edge-swipe-right { right: 0; width: 1.25rem; }
+
+    /* Use ::before pseudo-elements as flex-child spacers instead of padding-top
+       so the header space is a real element in the layout flow. */
+    .mobile-swipe-pane .content-pane-body::before,
+    .mobile-swipe-pane .thread-drawer-list::before,
+    .mobile-swipe-pane .thread-content::before {
+        content: '';
+        display: block;
+        flex-shrink: 0;
+        height: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+    }
+
+    /* The ::before spacer replaces padding-top, so zero out the base padding-top
+       on .thread-content (which has padding: 0.5rem 0.75rem 4rem in chat.css).
+       Also reduce padding-bottom: the 4rem is for the desktop floating bottom bar
+       that overlays the scroll area. On mobile the prompt/buttons sit below the
+       scroll container in normal flex flow, so only a small bottom margin is needed.
+       .thread-content must stay display:block — Safari ignores scrollTo on
+       flex-column + overflow-y:auto elements. */
+    .mobile-swipe-pane .thread-content-wrap {
+        display: flex;
+        flex-direction: column;
+    }
+    .mobile-swipe-pane .thread-content {
+        padding-top: 0;
+        padding-bottom: 0.75rem;
+        position: relative;
+        flex: 1;
+        min-height: 0;
+        /* Force a permanent compositor layer so iOS Safari doesn't batch this
+           element's painting into .mobile-swipe-track's cached layer texture.
+           Without this, the compositor can serve a stale (blank) texture after
+           thread switches, PWA resume, or prolonged use — content is in the
+           DOM but invisible. The child layer's texture is updated independently
+           whenever DOM content changes, breaking the caching chain.
+           History: translateZ(0) was tried on the old position:absolute layout
+           (5a66dcb6) but removed (13c460f7) because iOS recycled the layer for
+           abs-positioned overflow:auto inside scroll-snap. With position:relative
+           (normal flow), that recycling pattern doesn't apply. */
+        -webkit-transform: translateZ(0);
+        transform: translateZ(0);
+        /* Above .edge-swipe-zone (z:1) so taps on the sticky title row's
+           pin button (sitting at the left edge, inside the swipe zone's
+           2.5rem strip) reach the button instead of the overlay. The
+           translateZ above creates a stacking context with no explicit
+           z-index — without this, the title row's own z-index:2 is
+           trapped inside .thread-content (effective z:0) and the swipe
+           zone wins hit-testing. iframes that need the swipe-zone bypass
+           live in other panes (content), not here. */
+        z-index: 2;
+    }
+
+
+    /* No reveal animation on mobile — the swipe gesture already provides
+       visual continuity; no animation is safer than a broken one. */
+    .mobile-swipe-pane .thread-view.revealing {
+        animation: none;
+    }
+
+    /* Position scroll-to-top chevron below the sticky thread title bar.
+       --mobile-thread-title-height is the actual measured height of the
+       title bar (set by useHideOnScroll via ResizeObserver) so the chevron
+       stays anchored to the bar's bottom edge even when the title wraps
+       to multiple lines. The 2.75rem fallback covers the brief mount
+       window before the observer fires. Clamp offset to header height so
+       the chevron tracks the header hide but not the extended title-bar
+       scroll-out. The outer max() floor keeps clearance below the
+       dynamic island when the header+title bar are fully scrolled away. */
+    .mobile-swipe-pane .scroll-to-top {
+        top: max(
+            calc(env(safe-area-inset-top, 0px) + 0.75rem),
+            calc(var(--mobile-header-height, 3rem) + max(var(--mobile-header-offset, 0rem), calc(-1 * var(--mobile-header-height, 3rem))) + var(--mobile-thread-title-height, 2.75rem) + 0.5rem)
+        );
+    }
+
+    /* Hide thread title bar on mobile — app header handles navigation */
+    .mobile-swipe-pane .thread-view-header {
+        display: none;
+    }
+
+    .mobile-swipe-pane {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        /* Anchor the absolute-positioned .edge-swipe-zone children to this pane. */
+        position: relative;
+        /* Opaque background so an adjacent pane (or its iframe) can never
+           show through during a swipe — iOS Safari renders iframes in their
+           own compositor layers that don't always honor an ancestor's
+           overflow:hidden during transforms. */
+        background: var(--bg-primary);
+        /* Establish a stacking context per pane so z-indexes inside one
+           pane (sticky title bar, prompt area, edge-swipe zones) cannot
+           paint above a sibling pane during transition. */
+        isolation: isolate;
+        /* Force each pane onto its own compositor layer so the iframe
+           inside the content pane is composited as a child of THIS layer
+           and clips at the pane's bounds. Without this, on iOS Safari
+           the iframe layer is composited as a child of the swipe-track's
+           layer and can paint outside its pane during the swipe — the
+           user sees the iframe's pixels in the wrong place and reads it
+           as "different app". The header refresh button then re-mounts
+           the iframe and the correct pixels return.
+           translateZ(0) chosen over `contain: paint` because Safari's
+           contain support is newer; translateZ has worked reliably on
+           iOS Safari for compositor-layer promotion since iOS 9.
+           History: an unmeasured perf-only version was added (5979772eb)
+           and reverted (a48524016) the same day in 2026-04. This re-add
+           is bug-driven (observed iframe paint corruption), not perf. */
+        -webkit-transform: translateZ(0);
+        transform: translateZ(0);
+    }
+
+    /* Panes inside swipe container need full height */
+    .mobile-swipe-pane > .thread-pane,
+    .mobile-swipe-pane > .content-pane,
+    .mobile-swipe-pane > .mobile-threads-pane {
+        height: 100%;
+    }
+
+    /* Skill UI iframe: content-pane-body must not scroll — the iframe
+       handles its own scrolling. Without this, the ::before spacer +
+       height:100% skill-ui-inline overflows by the spacer height,
+       making the parent scrollable and causing scroll jitter. */
+    .mobile-swipe-pane .content-pane-body.has-app-ui {
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+    .mobile-swipe-pane .content-pane-body.has-app-ui .app-ui-inline {
+        flex: 1;
+        min-height: 0;
+        height: auto;
+    }
+
+    /* ─── Mobile threads pane (standalone swipe pane) ─── */
+
+    .mobile-threads-pane {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+    }
+
+    /* Thread drawer rendered as a view inside the mobile threads pane */
+    .mobile-threads-pane > .thread-drawer {
+        display: flex !important;
+        flex-direction: column;
+        position: static;
+        width: 100% !important;
+        border-right: none;
+        flex: 1;
+        min-height: 0;
+        z-index: auto;
+        padding-top: 0;
+    }
+
+    /* thread-pane-body needs to be a real element on mobile (not display:contents) */
+    .thread-pane-body {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+    }
+
+    /* Keep prompt pinned to bottom on mobile — no vertical centering.
+       Centering causes the prompt to jump when the first message is sent. */
+    .compose-empty .thread-pane-body {
+        justify-content: flex-end;
+    }
+
+    /* File search overlay starts below the mobile header. max() ensures it
+       never goes behind the dynamic island — when keyboard opens, the header
+       hides and --mobile-header-height drops to 0. */
+    .file-search-overlay {
+        top: max(
+            var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px))),
+            env(safe-area-inset-top, 0px)
+        );
+        padding-top: 0.5rem;
+    }
+}
+
+/* ─── Mobile dot indicator (inside header) ─── */
+
+.mobile-dot-indicator {
+    display: none;
+}
+
+@media (max-width: 768px) {
+    .mobile-dot-indicator {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 0.375rem;
+        margin-top: -0.25rem;
+        padding-bottom: 0.375rem;
+        width: 100%;
+    }
+
+    .mobile-dot {
+        width: 0.3125rem;
+        height: 0.3125rem;
+        border-radius: 50%;
+        border: none;
+        padding: 0;
+        background: var(--text-muted);
+        opacity: 0.3;
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+    }
+
+    .mobile-dot.active {
+        opacity: 1;
+        background: var(--accent);
+    }
+}
+
+/* ─── Pseudo-fullscreen on mobile ─── */
+/* .mobile-swipe-track's will-change:transform + inline transform create a
+   containing block that traps position:fixed descendants. When pseudo-fullscreen
+   is active, remove the containing block so the app iframe's position:fixed
+   covers the real viewport. Also hide the header and dot indicator. */
+@media (max-width: 768px) {
+    :root[data-pseudo-fullscreen] .app-header {
+        display: none !important;
+    }
+
+    :root[data-pseudo-fullscreen] .mobile-dot-indicator {
+        display: none !important;
+    }
+
+    :root[data-pseudo-fullscreen] .mobile-swipe-track {
+        will-change: auto !important;
+        transform: none !important;
+        transition: none !important;
+    }
+
+    /* .mobile-swipe-pane's translateZ(0) (added for iframe compositor clipping)
+       also creates a containing block. Drop it during pseudo-fullscreen so the
+       app iframe's position:fixed escapes to the real viewport. */
+    :root[data-pseudo-fullscreen] .mobile-swipe-pane {
+        -webkit-transform: none !important;
+        transform: none !important;
+    }
+}
+
+/* Reduced motion: disable slide/fade animations, keep instant state changes */
+@media (prefers-reduced-motion: reduce) {
+    .drawer,
+    .drawer.closing,
+    .drawer-backdrop.closing {
+        animation: none;
+    }
+
+    .mobile-swipe-track {
+        transition: none;
+    }
+}
+
+/* ─── Landscape lock ─── */
+/* Hidden by default; shown only on phones in landscape orientation.
+   Detection: orientation:landscape + max-height:500px catches all phones
+   (height in landscape is ~300-450px) without triggering on tablets
+   (height ≥768px in landscape) or short desktop windows (orientation
+   is normally portrait or square at typical desktop heights). */
+.landscape-lock {
+    display: none;
+}
+
+@media (orientation: landscape) and (max-height: 500px) and (hover: none) and (pointer: coarse) {
+    .landscape-lock {
+        display: flex;
+        position: fixed;
+        inset: 0;
+        z-index: var(--z-tooltip);
+        background: var(--bg-primary);
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        padding: 1rem;
+        color: var(--text-primary);
+        text-align: center;
+        -webkit-user-select: none;
+        user-select: none;
+    }
+
+    .landscape-lock svg {
+        width: 3rem;
+        height: 3rem;
+        color: var(--accent);
+    }
+
+    .landscape-lock p {
+        margin: 0;
+        font-size: 1rem;
+        color: var(--text-secondary);
+    }
+}
