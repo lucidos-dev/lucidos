@@ -1,5 +1,5 @@
 import { useEffect } from 'preact/hooks';
-import { unfocusThread } from '../store/actions/threads';
+import { unfocusThread, handleCloseFocusedThread } from '../store/actions/threads';
 import { focusPromptNow } from '../components/chat/promptFocus';
 import { searchEverywhereOpen } from '../store/store';
 import { toggleThreads } from '../store/actions/pane';
@@ -29,6 +29,15 @@ export function useKeyboardShortcuts(): void {
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'O') {
         e.preventDefault();
         startNewThread();
+        return;
+      }
+
+      // Cmd/Ctrl+Shift+W: close focused thread — discard if draft, archive
+      // if active idle. Plain Cmd+W is intentionally avoided: browsers and
+      // Tauri intercept it to close the tab/window before our handler runs.
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'W') {
+        e.preventDefault();
+        void handleCloseFocusedThread();
         return;
       }
 

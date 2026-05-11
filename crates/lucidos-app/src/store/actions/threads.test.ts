@@ -35,6 +35,7 @@ import {
   unfocusThread,
   handleSaveThread,
   handleArchiveThread,
+  handleCloseFocusedThread,
 } from './threads';
 import { scrolledUp, notAtTop, getResizeMode } from '../../components/chat/scrollState';
 import { threadScrollKey } from '../../hooks/useScrollMemory';
@@ -73,7 +74,8 @@ vi.mock('../../api/client', async (importOriginal) => ({
   deleteThread: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { fetchThreads } from '../../api/threads';
+import { fetchThreads, archiveThread } from '../../api/threads';
+import { deleteThread } from '../../api/client';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 
 // ---------------------------------------------------------------------------
@@ -1566,5 +1568,94 @@ describe('handleArchiveThread', () => {
     await handleArchiveThread('t2');
 
     expect(focusedThreadId.value).toBe('t1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleCloseFocusedThread — Cmd/Ctrl+Shift+W shortcut
+// ---------------------------------------------------------------------------
+
+describe('handleCloseFocusedThread', () => {
+  beforeEach(() => {
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+    (deleteThread as ReturnType<typeof vi.fn>).mockClear();
+  });
+
+  it('no-ops when no thread is focused', async () => {
+    focusedThreadId.value = null;
+
+    await handleCloseFocusedThread();
+
+    expect(archiveThread).not.toHaveBeenCalled();
+    expect(deleteThread).not.toHaveBeenCalled();
+  });
+
+  it('discards a composing draft', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', {
+      meta: { state: 'composing', section: 'inbox' },
+    }));
+    threadMap.value = map;
+    focusThread('t1');
+
+    await handleCloseFocusedThread();
+
+    expect(deleteThread).toHaveBeenCalledWith('t1');
+    // discardCompose unfocuses the thread on the way out.
+    expect(focusedThreadId.value).toBeNull();
+  });
+
+  it('archives an active idle inbox thread', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', {
+      meta: { id: 't1', channel: 'chat', state: 'active', status: 'idle', section: 'inbox' },
+    }));
+    threadMap.value = map;
+    focusThread('t1');
+
+    await handleCloseFocusedThread();
+
+    expect(archiveThread).toHaveBeenCalledWith('t1');
+  });
+
+  it('does not archive a thread that is mid-turn (running)', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', {
+      meta: { id: 't1', channel: 'chat', state: 'active', status: 'running', section: 'inbox' },
+    }));
+    threadMap.value = map;
+    focusThread('t1');
+
+    await handleCloseFocusedThread();
+
+    expect(archiveThread).not.toHaveBeenCalled();
+  });
+
+  it('does not archive a CC thread with pending changes', async () => {
+    // Pending changes need an explicit Apply or Discard — close shortcut must
+    // not silently archive over a decision the user hasn't made yet.
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', {
+      meta: { id: 't1', channel: 'claude_code', state: 'active', status: 'waiting', section: 'inbox', ccHasChanges: true },
+    }));
+    threadMap.value = map;
+    focusThread('t1');
+
+    await handleCloseFocusedThread();
+
+    expect(archiveThread).not.toHaveBeenCalled();
+  });
+
+  it('does not archive an already-archived thread', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', {
+      meta: { id: 't1', channel: 'chat', state: 'active', status: 'idle', section: 'archived' },
+    }));
+    threadMap.value = map;
+    focusThread('t1');
+
+    await handleCloseFocusedThread();
+
+    expect(archiveThread).not.toHaveBeenCalled();
   });
 });

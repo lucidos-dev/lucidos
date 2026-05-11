@@ -1,13 +1,14 @@
-import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, getReviewThreads, revealOnFocus, resetCCPendingPreferences, setFocusedThread } from '../store';
+import { showToast, showConfirm, threadMap, focusedThreadId, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, getReviewThreads, revealOnFocus, resetCCPendingPreferences, setFocusedThread, changes, effectiveThreadStatus, isMidTurn } from '../store';
 import { navigateToPane } from './pane';
 import { isMobile } from '../../utils/viewport';
-import { byReviewOrder } from '../thread-events';
+import { byReviewOrder, getCCWaitingInfo } from '../thread-events';
 import { saveThread, unsaveThread, archiveThread } from '../../api/threads';
 import { loadThreadEvents, ensureThreadByIdInMap } from './thread-loading';
 import { scrollToBottom } from '../../components/chat/scrollState';
 import { pushThreadNavState } from './thread-navigation';
 import { hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
 import { errorDetail } from '../../utils/errorDetail';
+import { resolveActions } from '../../generated/thread-lifecycle';
 
 // Minimum time the in-flight Archive feedback is visible — long enough to register
 const ARCHIVE_MIN_MS = 250;
@@ -185,5 +186,53 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     const next = new Set(archivingThreadIds.value);
     next.delete(threadId);
     archivingThreadIds.value = next;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Close (keyboard shortcut)
+// ---------------------------------------------------------------------------
+
+/** Close the focused thread via its visible close-style action: discard for
+ *  drafts (deletes the thread), archive for active idle threads. Mid-turn
+ *  and pending-changes states have no close action and silently no-op —
+ *  those need an explicit Cancel / Apply / Discard click so a stray
+ *  shortcut press can't drop work. Mirrors getWaitingState's gating but
+ *  importing it would create a store↔components cycle. */
+export async function handleCloseFocusedThread(): Promise<void> {
+  const id = focusedThreadId.value;
+  if (!id) return;
+  const thread = threadMap.value.get(id);
+  if (!thread) return;
+
+  if (thread.meta.state === 'composing') {
+    // Dynamic import: compose.ts → chat.ts → connection.ts → chat-changes.ts
+    // already imports threads.ts, so a static `import { discardCompose }`
+    // would close that cycle and break vitest's mock hoisting in tests that
+    // partially mock chat-changes.
+    const { discardCompose } = await import('./compose');
+    await discardCompose(id);
+    return;
+  }
+
+  if (
+    applyingNowThreadIds.value.has(id) ||
+    discardingCCThreadIds.value.has(id) ||
+    archivingThreadIds.value.has(id)
+  ) return;
+
+  const status = effectiveThreadStatus(thread);
+  if (isMidTurn(status)) return;
+
+  const threadType = thread.meta.channel === 'claude_code' ? 'claude_code' : 'chat';
+  const ccInfo = threadType === 'claude_code' ? getCCWaitingInfo(thread.meta) : null;
+  const pendingChange = changes.value.find(
+    c => c.thread_id === id && c.status === 'pending' && c.file_count > 0,
+  );
+  const hasPendingChanges = !!pendingChange || (ccInfo?.hasChanges ?? false);
+
+  const actions = resolveActions(threadType, status, thread.meta.section, hasPendingChanges, thread.meta.saved);
+  if (actions.includes('archive')) {
+    await handleArchiveThread(id);
   }
 }
