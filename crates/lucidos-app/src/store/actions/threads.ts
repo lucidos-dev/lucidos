@@ -193,12 +193,9 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
 // Close (keyboard shortcut)
 // ---------------------------------------------------------------------------
 
-/** Close the focused thread via its visible close-style action: discard for
- *  drafts (deletes the thread), archive for active idle threads. Mid-turn
- *  and pending-changes states have no close action and silently no-op —
- *  those need an explicit Cancel / Apply / Discard click so a stray
- *  shortcut press can't drop work. Mirrors getWaitingState's gating but
- *  importing it would create a store↔components cycle. */
+/** Close the focused thread: discard if composing draft, archive if active
+ *  idle. Mid-turn / pending-changes / apply-in-progress states no-op so a
+ *  stray shortcut press can't drop work behind an in-flight operation. */
 export async function handleCloseFocusedThread(): Promise<void> {
   const id = focusedThreadId.value;
   if (!id) return;
@@ -215,11 +212,12 @@ export async function handleCloseFocusedThread(): Promise<void> {
     return;
   }
 
-  if (
-    applyingNowThreadIds.value.has(id) ||
-    discardingCCThreadIds.value.has(id) ||
-    archivingThreadIds.value.has(id)
-  ) return;
+  // handleArchiveThread already early-returns on archivingThreadIds and
+  // discardingCCThreadIds. It does NOT early-return on applyingNowThreadIds
+  // — instead it clears the apply state and proceeds. That's right for the
+  // Archive button (user clicked over an in-flight apply on purpose) but
+  // wrong for a stray keypress, so guard it here.
+  if (applyingNowThreadIds.value.has(id)) return;
 
   const status = effectiveThreadStatus(thread);
   if (isMidTurn(status)) return;

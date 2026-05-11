@@ -1,28 +1,11 @@
 import { test, expect, type Page } from '@playwright/test';
-import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, waitForVisibleInput, isMobileViewport } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, waitForVisibleInput, isMobileViewport, waitForThreadInSection } from './helpers';
 import { clearAllThreads } from './db-helpers';
-
-/** Cross-platform Cmd/Ctrl+Shift+W. Matches the `e.metaKey || e.ctrlKey`
- *  guard in useKeyboardShortcuts.ts. */
-async function pressCloseShortcut(page: Page): Promise<void> {
-  await page.keyboard.press('ControlOrMeta+Shift+W');
-}
 
 async function getFocusedThreadId(page: Page): Promise<string> {
   const id = await (await waitForVisibleInput(page)).getAttribute('data-thread-id');
   expect(id, 'focused thread id missing on visible prompt input').toBeTruthy();
   return id!;
-}
-
-async function waitForThreadInArchiveSection(page: Page, threadId: string): Promise<void> {
-  await page.waitForFunction(
-    (id) => {
-      const titles = Array.from(document.querySelectorAll('[data-flip-id="__section_archive"]'));
-      return titles.some(t => t.closest('.drawer-section')?.querySelector(`[data-thread-nav="${id}"]`));
-    },
-    threadId,
-    { timeout: 10_000 },
-  );
 }
 
 test.describe('Cmd/Ctrl+Shift+W — close focused thread', () => {
@@ -41,8 +24,10 @@ test.describe('Cmd/Ctrl+Shift+W — close focused thread', () => {
     await waitForResponse(page);
     const threadId = await getFocusedThreadId(page);
 
-    await pressCloseShortcut(page);
+    // ControlOrMeta = Cmd on macOS, Ctrl elsewhere — matches the
+    // `e.metaKey || e.ctrlKey` guard in useKeyboardShortcuts.ts.
+    await page.keyboard.press('ControlOrMeta+Shift+W');
 
-    await waitForThreadInArchiveSection(page, threadId);
+    await waitForThreadInSection(page, threadId, 'archive');
   });
 });

@@ -230,6 +230,25 @@ export async function assertHealthy(page: Page): Promise<void> {
   expect(body.status).toBe('ok');
 }
 
+/** Wait for a thread row to appear inside the named drawer section. Sections
+ *  are titled with `data-flip-id="__section_<key>"`, so the assertion finds
+ *  the section header then walks back up to the `.drawer-section` to look
+ *  for the `[data-thread-nav="<id>"]` row inside it. */
+export async function waitForThreadInSection(
+  page: Page,
+  threadId: string,
+  sectionKey: 'saved' | 'archive' | 'review',
+): Promise<void> {
+  await page.waitForFunction(
+    ({ id, key }) => {
+      const titles = Array.from(document.querySelectorAll(`[data-flip-id="__section_${key}"]`));
+      return titles.some(t => t.closest('.drawer-section')?.querySelector(`[data-thread-nav="${id}"]`));
+    },
+    { id: threadId, key: sectionKey },
+    { timeout: 10_000 },
+  );
+}
+
 /** Switch the input mode to "Claude" (Claude Code) — dual-layout safe */
 export async function switchToClaudeMode(page: Page): Promise<void> {
   await ensureOnThreadPane(page);

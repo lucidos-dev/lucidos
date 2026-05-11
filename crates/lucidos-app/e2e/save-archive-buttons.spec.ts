@@ -8,6 +8,7 @@ import {
   ensureOnThreadPane,
   assertHealthy,
   waitForVisibleInput,
+  waitForThreadInSection,
 } from './helpers';
 
 test.describe('Section-aware Save/Archive buttons', () => {
@@ -19,21 +20,6 @@ test.describe('Section-aware Save/Archive buttons', () => {
     const id = await (await waitForVisibleInput(page)).getAttribute('data-thread-id');
     expect(id, 'focused thread id missing on visible prompt input').toBeTruthy();
     return id!;
-  }
-
-  async function waitForThreadInSection(
-    page: Page,
-    threadId: string,
-    sectionKey: 'saved' | 'archive' | 'review',
-  ): Promise<void> {
-    await page.waitForFunction(
-      ({ id, key }) => {
-        const titles = Array.from(document.querySelectorAll(`[data-flip-id="__section_${key}"]`));
-        return titles.some(t => t.closest('.drawer-section')?.querySelector(`[data-thread-nav="${id}"]`));
-      },
-      { id: threadId, key: sectionKey },
-      { timeout: 10_000 },
-    );
   }
 
   async function isThreadInSection(
