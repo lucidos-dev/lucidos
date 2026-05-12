@@ -2,7 +2,7 @@ import { isMac } from './platform';
 
 export type ShortcutCategory = 'Navigation' | 'View';
 
-/** A single key combination, e.g. Cmd+Shift+O. */
+/** A single key combination, e.g. Cmd+K. */
 export interface ShortcutBinding {
   /** Logical key tokens. Modifiers: 'cmd', 'shift', 'alt', 'ctrl'. Otherwise a single character. */
   keys: string[];
@@ -11,7 +11,7 @@ export interface ShortcutBinding {
 export interface ShortcutDef {
   category: ShortcutCategory;
   description: string;
-  /** Multiple bindings render as "Cmd+Shift+O or C". */
+  /** Multiple bindings render as "Ctrl+Shift+O or C". */
   bindings: ShortcutBinding[];
   /** Context note shown only in the cheat-sheet, omitted from tooltips. */
   note?: string;
