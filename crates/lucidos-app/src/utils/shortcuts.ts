@@ -52,7 +52,7 @@ export const SHORTCUTS: Record<ShortcutId, ShortcutDef> = {
   zoomIn: {
     category: 'View',
     description: 'Increase UI scale',
-    bindings: [{ keys: ['cmd', '='] }],
+    bindings: [{ keys: ['cmd', '+'] }],
   },
   zoomOut: {
     category: 'View',
