@@ -72,10 +72,9 @@ const ALT_TOKEN = isMac ? '⌥' : 'Alt';
 const CTRL_TOKEN = isMac ? '⌃' : 'Ctrl';
 const JOIN = isMac ? '' : '+';
 
-/** Format a single token (modifier or character) for display. */
 export function formatKey(key: string): string {
   switch (key) {
-    case 'cmd': case 'mod': return MOD_TOKEN;
+    case 'cmd': return MOD_TOKEN;
     case 'shift': return SHIFT_TOKEN;
     case 'alt': return ALT_TOKEN;
     case 'ctrl': return CTRL_TOKEN;
@@ -83,13 +82,12 @@ export function formatKey(key: string): string {
   }
 }
 
-/** Format one binding as a single string ("⌘⇧O" on Mac, "Ctrl+Shift+O" elsewhere). */
 export function formatBinding(binding: ShortcutBinding): string {
   return binding.keys.map(formatKey).join(JOIN);
 }
 
-export function tooltipWithShortcut(text: string, name: ShortcutId): string {
-  const def = SHORTCUTS[name];
+export function tooltipWithShortcut(text: string, id: ShortcutId): string {
+  const def = SHORTCUTS[id];
   const formatted = def.bindings.map(formatBinding).join(' or ');
   return `${text} · ${formatted}`;
 }

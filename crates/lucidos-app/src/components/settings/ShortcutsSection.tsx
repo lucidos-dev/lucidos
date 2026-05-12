@@ -2,14 +2,13 @@ import { SHORTCUTS, formatKey, type ShortcutBinding, type ShortcutCategory, type
 
 const CATEGORY_ORDER: ShortcutCategory[] = ['Navigation', 'View'];
 
-function groupByCategory(): Map<ShortcutCategory, ShortcutDef[]> {
-  const groups = new Map<ShortcutCategory, ShortcutDef[]>();
-  for (const cat of CATEGORY_ORDER) groups.set(cat, []);
+const GROUPED_SHORTCUTS: Record<ShortcutCategory, ShortcutDef[]> = (() => {
+  const groups = Object.fromEntries(CATEGORY_ORDER.map((cat) => [cat, [] as ShortcutDef[]])) as Record<ShortcutCategory, ShortcutDef[]>;
   for (const def of Object.values(SHORTCUTS)) {
-    groups.get(def.category)!.push(def);
+    groups[def.category].push(def);
   }
   return groups;
-}
+})();
 
 function BindingDisplay({ binding }: { binding: ShortcutBinding }) {
   return (
@@ -41,13 +40,12 @@ function ShortcutRow({ def }: { def: ShortcutDef }) {
 }
 
 export function ShortcutsSection() {
-  const groups = groupByCategory();
   return (
     <>
       {CATEGORY_ORDER.map((category) => (
         <div class="settings-section" key={category}>
           <div class="settings-section-title" data-search-anchor={`shortcuts:${category.toLowerCase()}`}>{category}</div>
-          {groups.get(category)!.map((def, i) => (
+          {GROUPED_SHORTCUTS[category].map((def, i) => (
             <ShortcutRow key={i} def={def} />
           ))}
         </div>
