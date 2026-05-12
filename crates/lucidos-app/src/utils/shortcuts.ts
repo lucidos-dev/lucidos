@@ -35,13 +35,13 @@ export const SHORTCUTS: Record<ShortcutId, ShortcutDef> = {
   newThread: {
     category: 'Navigation',
     description: 'Start a new thread',
-    bindings: [{ keys: ['cmd', 'shift', 'o'] }, { keys: ['c'] }],
+    bindings: [{ keys: ['ctrl', 'shift', 'o'] }, { keys: ['c'] }],
     note: '"C" only fires when no text input is focused',
   },
   closeFocusedThread: {
     category: 'Navigation',
     description: 'Close focused thread (discard if draft, archive if active)',
-    bindings: [{ keys: ['cmd', 'shift', 'w'] }],
+    bindings: [{ keys: ['ctrl', 'shift', 'w'] }],
   },
   toggleThreadDrawer: {
     category: 'Navigation',

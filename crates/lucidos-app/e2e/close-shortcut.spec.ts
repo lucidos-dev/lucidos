@@ -8,7 +8,7 @@ async function getFocusedThreadId(page: Page): Promise<string> {
   return id!;
 }
 
-test.describe('Cmd/Ctrl+Shift+W — close focused thread', () => {
+test.describe('Ctrl+Shift+W — close focused thread', () => {
   test.beforeEach(async ({ page }) => {
     clearAllThreads();
     await assertHealthy(page);
@@ -24,9 +24,9 @@ test.describe('Cmd/Ctrl+Shift+W — close focused thread', () => {
     await waitForResponse(page);
     const threadId = await getFocusedThreadId(page);
 
-    // ControlOrMeta = Cmd on macOS, Ctrl elsewhere — matches the
-    // `e.metaKey || e.ctrlKey` guard in useKeyboardShortcuts.ts.
-    await page.keyboard.press('ControlOrMeta+Shift+W');
+    // Ctrl on every platform — matches the e.ctrlKey-only guard in
+    // useKeyboardShortcuts.ts.
+    await page.keyboard.press('Control+Shift+W');
 
     await waitForThreadInSection(page, threadId, 'archive');
   });

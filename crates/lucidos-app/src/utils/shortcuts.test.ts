@@ -51,6 +51,6 @@ describe('tooltipWithShortcut', () => {
   });
 
   it('joins multiple bindings with " or "', () => {
-    expect(tooltipWithShortcut('New thread', 'newThread')).toBe('New thread · ⌘⇧O or C');
+    expect(tooltipWithShortcut('New thread', 'newThread')).toBe('New thread · ⌃⇧O or C');
   });
 });
