@@ -25,18 +25,18 @@ export function useKeyboardShortcuts(): void {
         return;
       }
 
-      // Ctrl+Shift+O: new thread. Cmd is intentionally excluded — Cmd+Shift+O
-      // is a system-reserved combo on some setups and was unreliable for the user.
-      if (e.ctrlKey && !e.metaKey && e.shiftKey && e.key === 'O') {
+      // Ctrl+Shift+O: new thread. Ctrl-only on every platform — Cmd+Shift+O
+      // is system-reserved on some macOS setups and was unreliable.
+      if (e.ctrlKey && e.shiftKey && e.key === 'O') {
         e.preventDefault();
         startNewThread();
         return;
       }
 
       // Ctrl+Shift+W: close focused thread — discard if draft, archive if
-      // active idle. Cmd is intentionally excluded (see Ctrl+Shift+O above);
-      // plain Ctrl+W is also avoided since browsers/Tauri intercept it.
-      if (e.ctrlKey && !e.metaKey && e.shiftKey && e.key === 'W') {
+      // active idle. Ctrl-only (same reason as Ctrl+Shift+O); plain Ctrl+W
+      // is also avoided since browsers/Tauri intercept it.
+      if (e.ctrlKey && e.shiftKey && e.key === 'W') {
         e.preventDefault();
         void handleCloseFocusedThread();
         return;
