@@ -13,6 +13,7 @@ import { MemoryInspector } from './MemoryInspector';
 import { BackupSection } from './BackupSection';
 import { CcAllowedToolsSection } from './CcAllowedToolsSection';
 import { DiskUsagePage } from './DiskUsagePage';
+import { ShortcutsSection } from './ShortcutsSection';
 import { ChevronRightIcon } from '../shared/icons';
 import { CredentialItem } from '../credentials/CredentialItem';
 import { openAddCredential, loadCredentials } from '../../store/actions/credentials';
@@ -677,6 +678,7 @@ export function SettingsView() {
     switch (settingsSubview.value) {
       case 'models': return modelsSection();
       case 'appearance': return appearanceSection();
+      case 'shortcuts': return <ShortcutsSection />;
       case 'memory': return <MemoryInspector />;
       case 'devices': return devicesSection();
       case 'accounts': return accountsSection();

@@ -91,7 +91,7 @@ export function closeInlineForm(): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'disk-usage' | 'tool-permissions';
+export type SettingsSubview = 'main' | 'models' | 'appearance' | 'shortcuts' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'disk-usage' | 'tool-permissions';
 export const settingsSubview = signal<SettingsSubview>('main');
 /** Anchor to scroll/highlight after navigating from Search Everywhere. SettingsView clears it after applying. */
 export const settingsScrollTarget = signal<string | null>(null);
@@ -99,6 +99,7 @@ export const settingsScrollTarget = signal<string | null>(null);
 export const SETTINGS_NAV_ITEMS: Array<{ key: Exclude<SettingsSubview, 'main'>; label: string }> = [
   { key: 'models', label: 'Models' },
   { key: 'appearance', label: 'Appearance' },
+  { key: 'shortcuts', label: 'Keyboard Shortcuts' },
   { key: 'devices', label: 'Devices' },
   { key: 'accounts', label: 'Accounts' },
   { key: 'repositories', label: 'Repositories' },

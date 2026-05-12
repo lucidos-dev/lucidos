@@ -26,6 +26,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Top-level subviews
   { id: 'models', label: 'Models', subview: 'models', path: 'Settings' },
   { id: 'appearance', label: 'Appearance', subview: 'appearance', path: 'Settings' },
+  { id: 'shortcuts', label: 'Keyboard Shortcuts', subview: 'shortcuts', path: 'Settings' },
   { id: 'devices', label: 'Devices', subview: 'devices', path: 'Settings' },
   { id: 'accounts', label: 'Accounts', subview: 'accounts', path: 'Settings' },
   { id: 'repositories', label: 'Repositories', subview: 'repositories', path: 'Settings' },
@@ -50,6 +51,10 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'appearance:font', label: 'Font', subview: 'appearance', path: 'Settings → Appearance → Typography', anchor: 'appearance:font' },
   { id: 'appearance:ui-scale', label: 'UI scale', subview: 'appearance', path: 'Settings → Appearance → Typography', anchor: 'appearance:ui-scale' },
   { id: 'appearance:animation-speed', label: 'Animation speed', subview: 'appearance', path: 'Settings → Appearance → Typography', anchor: 'appearance:animation-speed' },
+
+  // Keyboard Shortcuts subview
+  { id: 'shortcuts:navigation', label: 'Navigation', subview: 'shortcuts', path: 'Settings → Keyboard Shortcuts', anchor: 'shortcuts:navigation' },
+  { id: 'shortcuts:view', label: 'View', subview: 'shortcuts', path: 'Settings → Keyboard Shortcuts', anchor: 'shortcuts:view' },
 
   // Backup subview
   { id: 'backup:restore', label: 'Restore from backup', subview: 'backup', path: 'Settings → Backup', anchor: 'backup:restore' },
