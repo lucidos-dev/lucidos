@@ -21,7 +21,7 @@ This knowhow does **not** restate the rules. It points at them. Each check below
 |---|---|
 | `system-knowhow/best-practices.md` | Workspace file conventions: artifacts/, apps/, knowhow/, intents/, scripts/, config/ layout, naming, "never nest artifacts", import-the-minimum |
 | `system-knowhow/js-sdk.md` | Current app HTML boilerplate and the full `lucidos.*` API surface (anything not listed is either deprecated or invented) |
-| `system-knowhow/lucidos-cli.md` | What scripts and CC subprocesses use for `data.*` writes, `events.*` emits, `proxy` calls to external APIs (preferred over raw `curl -H "Authorization: ..."` with `$CRED_*`), and `spawn-thread` thread spawning (sidequests + cross-workspace) |
+| `system-knowhow/lucidos-cli.md` | What scripts and CC subprocesses use for `data.*` writes, `events.*` emits, `proxy` calls to external APIs (preferred over raw `curl -H "Authorization: ..."` with `$CRED_*`), and `spawn-thread` thread spawning (sub-threads + cross-workspace) |
 | `system-knowhow/intent-registry.md` | Which on-disk files become intents in the system prompt (trigger files double as intents — easy to miss) |
 | The active engine system prompt | The intent vs knowhow taxonomy, the trigger worked example |
 
@@ -34,12 +34,13 @@ Resolve `data/` paths via the `lucidos` CLI. The audit covers:
 | Surface | Path |
 |---|---|
 | Apps | `data/apps/<id>/` |
-| Standalone triggers | `data/triggers/<name>/` |
-| App-scoped triggers | `data/apps/<id>/triggers/<name>/` |
+| Standalone triggers | `data/triggers/<slug>/` |
+| App-scoped triggers | `data/apps/<id>/triggers/<slug>/` |
 | Shared knowhow | `data/knowhow/<id>.md` and `data/knowhow/<id>/` |
 | App-scoped knowhow | `data/apps/<id>/knowhow/` |
-| Intents | `data/apps/<id>/intents/`, `data/apps/<id>/triggers/`, `data/triggers/<name>/*.md` — all three feed the registry; see `system-knowhow/intent-registry.md`. There is no top-level `data/intents/` source. |
-| Scripts | `data/scripts/`, `data/apps/<id>/scripts/`, `data/triggers/<name>/scripts/`, `data/knowhow/<id>/scripts/` |
+| Trigger-scoped knowhow | `data/triggers/<slug>/knowhow/` (visible only to threads of trigger `<slug>`) |
+| Intents | `data/apps/<id>/intents/`, `data/apps/<id>/triggers/`, `data/triggers/<slug>/*.md` — all three feed the registry; see `system-knowhow/intent-registry.md`. There is no top-level `data/intents/` source. |
+| Scripts | `data/scripts/`, `data/apps/<id>/scripts/`, `data/triggers/<slug>/scripts/`, `data/knowhow/<id>/scripts/` |
 | Artifacts (structural only) | `data/artifacts/` |
 
 Trigger intent text lives in the `TriggerCreated` event payload (`run.intent`), not on disk — pull via `lucidos events query --type TriggerCreated`.
@@ -50,11 +51,15 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
 
 ### 1. Triggers — intent vs knowhow split
 
-Per the engine prompt's taxonomy section and the worked example in `docs/taxonomy.md` (mirrored in best-practices). For each `TriggerCreated` (and any subsequent `TriggerUpdated` that mutated `run`):
+Per the engine prompt's taxonomy section and the worked example in `docs/taxonomy.md` (mirrored in best-practices). Trigger threads discover knowhow at fire time via `load_knowhow` (same as chat); there is no per-trigger allow-list on the trigger config. For each `TriggerCreated` (and any subsequent `TriggerUpdated` that mutated `run`), reduce to the *latest* `run` (most recent payload by sequence) before applying these checks:
 
-- Imperative verbs about *how* in `run.intent` (hit, parse, scan, fall back, retry, GET, POST, scrape) → procedure leaked into intent.
-- Empty `run.knowhow` when the intent obviously needs domain knowledge (mentions an API, a service, a data format).
-- **Each ID in `run.knowhow` resolves to an existing file** — severity **broken**. An ID is the path under `data/knowhow/` (or `system-knowhow/`) without the `.md` suffix INCLUDING any subdirectory. The most common drift is a bare basename when the file lives in a subdirectory: `'nightly-pipeline-trigger'` referenced for a file at `data/knowhow/lucidos-ops/nightly-pipeline-trigger.md` (correct id: `lucidos-ops/nightly-pipeline-trigger`). The engine now rejects unknown ids on `create_trigger`/`update_trigger` and aborts a pre-existing trigger's fire with a failure notification, but a paused or low-cadence trigger may not have surfaced yet — the audit should still flag it. Resolve each id by listing `data/knowhow/` (and `system-knowhow/` for prefixed ids) and matching the full relative path.
+- **Imperative verbs about *how* in `run.intent`** (hit, parse, scan, fall back, retry, GET, POST, scrape) → procedure leaked into intent.
+
+- **Stale `run.knowhow: [...]` field** — per `system-knowhow/building-a-trigger.md` § "Setup checklist" item 5: legacy `run.knowhow:[...]` is silently dropped by the deserializer. The trigger keeps firing, but no knowhow gets pre-loaded — the LLM's behavior now depends on whether it picks the same files up via discovery. Surface each affected trigger's id and the `knowhow` ids it used to request, and recommend the rewrite the source file specifies. Severity: **stale** (silently broken).
+
+- **Missing explicit `slug` field** — per `system-knowhow/building-a-trigger.md` § "Setup checklist" item 5: when slug isn't persisted on the event, the engine derives one from the name on read; renaming the trigger then silently moves any per-trigger knowhow path. Recommend persisting an explicit `slug` via a `TriggerUpdated` event when the trigger has (or will have) per-trigger knowhow files. Severity: **nit** (preventive).
+
+- **Per-trigger knowhow dir orphaned from any live trigger** — for each directory under `data/triggers/<slug>/knowhow/`, confirm `<slug>` matches the slug of an active (non-deleted) trigger. Knowhow under an unreferenced slug is invisible (the system prompt scopes by exact slug match); flag and recommend renaming the directory to a live slug or deleting it. Reference: `system-knowhow/building-a-trigger.md`.
 
 ### 2. Apps — SDK boilerplate and structure
 
@@ -62,9 +67,13 @@ Per `system-knowhow/js-sdk.md`:
 
 - `index.html` matches the current boilerplate (script order, which pieces are required vs optional).
 - Every `lucidos.*` call used in app code appears in the SDK reference. Calls not listed are either deprecated or invented.
-- External-API calls from the iframe go through `lucidos.proxy(name).fetch(...)`. Patterns to flag:
-  - `fetch('http://...')` or `fetch('https://<external-host>/...')` from inside an iframe — mixed-content / CORS will block it; the credential (if any) is in the iframe. Suggest adding a `data/config/apis.json` entry and switching to `lucidos.proxy`.
-  - Hardcoded `Authorization` / `X-API-Key` / `Bearer ...` headers in app code — the credential belongs in the engine credential store, referenced by name from `apis.json`.
+- **External-API calls from the iframe — USE `lucidos.proxy(name).fetch(path, init)`.** The engine forwards the request server-side, injects the configured auth header from the credential store, and strips Cookie/Origin/Referer/Host. The credential never reaches the iframe. Configure the backend once in `data/config/apis.json`. Reference: `system-knowhow/js-sdk.md` § `lucidos.proxy`.
+
+  **DO NOT USE** any of the following — flag each occurrence and recommend the SDK helper:
+
+  - `fetch('http://...')` or `fetch('https://<external-host>/...')` from inside an iframe. Mixed-content / CORS blocks it; if it works the credential is sitting in the iframe. Suggest adding a `data/config/apis.json` entry and switching to `lucidos.proxy(name).fetch(...)`.
+  - `fetch('/api/v1/proxy/<name>/...')` — same wire format as the SDK helper, but bypasses it. The proxy name becomes a magic string (typo-prone, undiscoverable), and future SDK-side concerns (timeouts, retries, response parsing, error shape) won't apply. Suggest switching to `lucidos.proxy('<name>').fetch(path, init)`.
+  - Hardcoded `Authorization` / `X-API-Key` / `Bearer ...` headers in app code. The credential belongs in the engine credential store, referenced by name from `apis.json`. Suggest moving the credential and switching the call to `lucidos.proxy(name).fetch(...)`.
 
 Per `system-knowhow/best-practices.md`:
 
@@ -79,6 +88,7 @@ Per `docs/taxonomy.md` (frontmatter shape) and `system-knowhow/best-practices.md
 - Frontmatter has `name` (required) and `description` (recommended — semantic discovery uses it).
 - Filename is descriptive, not generic.
 - App-scoped knowhow doesn't reference things outside its app; shared knowhow doesn't name specific apps.
+- **Orphaned files under `data/knowhow/`** — a knowhow file whose id appears in NO trigger's stale `run.knowhow` (see § 1), in NO intent's `knowhow:` frontmatter (see § 4), and in NO app `manifest.json`/`config/*.json` reference is potentially dead. Most common cause is a trigger that lost its `run.knowhow` reference when the preload was retired and never had its content moved into the trigger's intent. Surface the file path and recommend either (a) inlining the relevant procedure into a trigger's intent, (b) moving the file into `data/triggers/<slug>/knowhow/` if it was always trigger-specific, or (c) deleting it if no consumer remains. Severity: **stale** (review). Reference: `system-knowhow/building-a-trigger.md`.
 
 Per `system-knowhow/lucidos-cli.md` and `system-knowhow/best-practices.md` § `config/`, also grep knowhow bodies for pre-proxy API patterns — knowhow tells future LLM/CC sessions *how* to call APIs, so a stale recipe propagates the leak even after apps and scripts are clean. Patterns to flag:
 
@@ -90,12 +100,12 @@ Suggest rewriting the recipe around `proxy_request` (LLM tool), `lucidos.proxy(n
 
 ### 4. Intents — frontmatter and tone
 
-Scope is **every `.md` file the registry reads** (per `system-knowhow/intent-registry.md`): `apps/<id>/intents/`, `apps/<id>/triggers/`, and `triggers/<name>/`. Trigger `.md` files are intents too — don't skip them. If an ID appears in the engine's "Available Intents" list but you can't find a file under `intents/`, look in the sibling `triggers/` directory before flagging it as a phantom.
+Scope is **every `.md` file the registry reads** (per `system-knowhow/intent-registry.md`): `apps/<id>/intents/`, `apps/<id>/triggers/`, and `triggers/<slug>/`. Trigger `.md` files are intents too — don't skip them. If an ID appears in the engine's "Available Intents" list but you can't find a file under `intents/`, look in the sibling `triggers/` directory before flagging it as a phantom.
 
 - `name` present.
-- `knowhow:` IDs (if any) resolve — same severity and resolution rule as triggers § 1 (full path including subdirectories; bare basenames for files in a subdirectory are the common bug).
+- `knowhow:` IDs in the frontmatter (if any) resolve to existing files — severity **broken**. An ID is the path under `data/knowhow/` (or `system-knowhow/`) without the `.md` suffix INCLUDING any subdirectory. The most common drift is a bare basename when the file lives in a subdirectory: `'nightly-pipeline-trigger'` for a file at `data/knowhow/lucidos-ops/nightly-pipeline-trigger.md` (correct id: `lucidos-ops/nightly-pipeline-trigger`). Resolve each id by listing `data/knowhow/` (and `system-knowhow/` for prefixed ids) and matching the full relative path.
 - Reads in user terms, not engineer terms (same test as triggers).
-- **Do not flag:** a missing `data/triggers/<name>/<name>.md` for a *standalone scheduled trigger* is not drift on its own. The trigger's `run.intent` (captured in the `TriggerCreated` payload) is sufficient for scheduled firing. An on-disk procedure file under `data/triggers/<name>/` is only warranted when the procedure has dual use — scheduled firing **and** on-demand `execute_intent` invocation. Pure scheduled orchestrators that nothing ever calls manually are correct as-is.
+- **Do not flag:** a missing `data/triggers/<slug>/<slug>.md` for a *standalone scheduled trigger* is not drift on its own. The trigger's `run.intent` (captured in the `TriggerCreated` payload) is sufficient for scheduled firing. An on-disk procedure file under `data/triggers/<slug>/` is only warranted when the procedure has dual use — scheduled firing **and** on-demand `execute_intent` invocation. Pure scheduled orchestrators that nothing ever calls manually are correct as-is.
 
 ### 5. Scripts — CLI usage and isolation
 

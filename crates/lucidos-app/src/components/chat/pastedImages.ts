@@ -2,7 +2,7 @@ import { computed, effect } from '@preact/signals';
 
 import { blobPreviewUrl } from '../../api/client';
 import { focusedThreadId } from '../../store/store';
-import { composeDrafts, getDraft, patchDraft } from '../../store/composeDrafts';
+import { composeDrafts, getDraft } from '../../store/composeDrafts';
 import { updateCompose } from '../../store/actions/compose';
 import { safeRevokeObjectUrl } from '../../utils/objectUrl';
 
@@ -113,13 +113,6 @@ export function addAttachedImageHash(threadId: string, hash: string): void {
 export function removeAttachedImage(threadId: string, index: number): void {
   const next = getDraft(threadId).image_hashes.filter((_, i) => i !== index);
   updateCompose(threadId, { image_hashes: next });
-}
-
-/** Local-only: drop a hash without touching the server. Used by retry paths
- *  so we can prune a stale reference without firing a PUT compose. */
-export function pruneAttachedImageLocal(threadId: string, hash: string): void {
-  const next = getDraft(threadId).image_hashes.filter((h) => h !== hash);
-  patchDraft(threadId, { image_hashes: next });
 }
 
 export function _resetSessionBlobUrlsForTesting(): void {

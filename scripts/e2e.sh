@@ -1,17 +1,23 @@
 #!/bin/bash
-# Run the full e2e suite — API tests then browser tests.
+# Run the full e2e suite — API tests, browser tests, then heavy integration
+# suites that need external setup (WASM signer artifacts; real fastembed model).
 #
 # Usage:
 #   ./scripts/e2e.sh
 #
 # Holds the e2e lock and the workspace lifecycle (engine + Vite) for the
-# duration of both phases — sub-scripts detect $LUCIDOS_E2E_UMBRELLA and
-# skip their own lifecycle work, so the workspace is booted once instead
-# of twice. set -e means an API failure short-circuits browser tests.
+# duration of the API + browser phases — sub-scripts detect
+# $LUCIDOS_E2E_UMBRELLA and skip their own lifecycle work, so the workspace
+# is booted once instead of twice. The wasm + embedder phases don't need
+# the workspace, but run inside the same lock so a second concurrent
+# `./scripts/e2e.sh` doesn't race the WASM build. `set -e` means an early
+# failure short-circuits the rest.
 #
 # For granular runs (single suite, single test), use the sub-scripts directly:
 #   ./scripts/e2e-api.sh [-f filter]
 #   ./scripts/e2e-browser.sh [-h] [-f file] [--webkit]
+#   ./scripts/e2e-wasm.sh
+#   ./scripts/e2e-embedder.sh
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,3 +51,15 @@ echo "════════════════════════�
 echo "  Running browser e2e tests"
 echo "═══════════════════════════════════════════════════"
 "$SCRIPT_DIR/e2e-browser.sh"
+
+echo ""
+echo "═══════════════════════════════════════════════════"
+echo "  Running wasm signer e2e tests"
+echo "═══════════════════════════════════════════════════"
+"$SCRIPT_DIR/e2e-wasm.sh"
+
+echo ""
+echo "═══════════════════════════════════════════════════"
+echo "  Running real-embedder integration tests"
+echo "═══════════════════════════════════════════════════"
+"$SCRIPT_DIR/e2e-embedder.sh"

@@ -2,6 +2,87 @@ use super::actor::build_message_origin;
 use super::*;
 use crate::engine::thread_events::ActorMode;
 use crate::engine::thread_state::ThreadState;
+use crate::engine::InjectedPrompt;
+use std::collections::VecDeque;
+
+/// Re-process orphaned injections sequentially until the chain settles.
+///
+/// `process_message_with_steps` for a re-processed orphan can itself produce
+/// orphans (a follow-up MessageReceived arrived during the re-process loop
+/// but landed on `injection_rx` after the loop's final `try_recv()`). The
+/// caller used to fire-and-forget a `tokio::spawn` per orphan, throwing away
+/// `ProcessResult` and the inner `orphaned_injections` with it — so an
+/// orphan-of-orphan was silently lost, leaving its MR without a response and
+/// stamping the NEXT reply with the prior orphan's `request_event_id`
+/// (observed on real thread 9b5a05aa as a chat exchange where the second
+/// follow-up's MR went unanswered while the third turn's response bound
+/// onto the wrong MR). Iterating here keeps the chain bounded by the
+/// available orphans and serializes per-thread (`register_thread_queued`
+/// already serializes anyway, so a queue costs nothing extra).
+async fn process_orphan_chain(
+    engine: SharedEngine,
+    thread_id: Uuid,
+    initial_orphans: Vec<InjectedPrompt>,
+) {
+    drain_orphan_queue(initial_orphans, |orphan| {
+        let engine = engine.clone();
+        async move {
+            match engine
+                .process_message_with_steps(
+                    &orphan.text,
+                    None,
+                    None,
+                    None,
+                    None,
+                    orphan.images.as_deref(),
+                    None,
+                    None,
+                    None,
+                    Some(thread_id),
+                    None,
+                    None,
+                    None,
+                    None,
+                    orphan.spawning_event_id,
+                    orphan.mode,
+                    None,
+                    orphan.event_id,
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(res) => res.orphaned_injections,
+                Err(e) => {
+                    log!(
+                        "[Chat] Failed to re-process orphaned injection for thread {}: {}",
+                        thread_id,
+                        e
+                    );
+                    Vec::new()
+                }
+            }
+        }
+    })
+    .await;
+}
+
+/// Iterate over `initial`, calling `process_one` per item; any items the
+/// processor returns are appended to the queue and processed in turn. Pure
+/// queue-drain logic, extracted from `process_orphan_chain` so the
+/// orphan-of-orphan invariant ("if A's re-process produces orphan B, B is
+/// processed too") is unit-testable without a real engine.
+async fn drain_orphan_queue<F, Fut>(initial: Vec<InjectedPrompt>, mut process_one: F)
+where
+    F: FnMut(InjectedPrompt) -> Fut,
+    Fut: std::future::Future<Output = Vec<InjectedPrompt>>,
+{
+    let mut queue: VecDeque<InjectedPrompt> = initial.into();
+    while let Some(item) = queue.pop_front() {
+        let new_orphans = process_one(item).await;
+        queue.extend(new_orphans);
+    }
+}
 
 /// Convert API request contexts into engine file context string.
 fn resolve_file_ctx(
@@ -513,52 +594,15 @@ pub(super) async fn chat_submit(
                         .await;
                 }
 
-                // Re-submit orphaned injections as regular follow-up messages.
-                // These are messages that arrived after the processing loop exited
-                // but before cleanup finished — either agentic loop orphans (from
-                // inject_prompt after the loop) or CC lost follow-ups (from msg_tx
-                // after CC process exit). MessageReceived was already emitted for
-                // each, so pass pre_emitted_origin to skip duplicate emission.
-                for orphan in &res.orphaned_injections {
+                // Re-submit orphaned injections (follow-ups that arrived after
+                // the processing loop exited but before cleanup finished). See
+                // `process_orphan_chain` for the chain-drain invariant.
+                if !res.orphaned_injections.is_empty() {
                     let engine = engine_clone.clone();
-                    let text = orphan.text.clone();
-                    let pre_emitted = orphan.event_id;
-                    let orphan_mode = orphan.mode;
-                    let orphan_spawning_event_id = orphan.spawning_event_id;
-                    let images = orphan.images.clone();
                     let tid = res.thread_id;
+                    let orphans = res.orphaned_injections.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = engine
-                            .process_message_with_steps(
-                                &text,
-                                None,
-                                None,
-                                None,
-                                None,
-                                images.as_deref(),
-                                None,
-                                None,
-                                None,
-                                Some(tid),
-                                None,
-                                None,
-                                None,
-                                None,
-                                orphan_spawning_event_id,
-                                orphan_mode,
-                                None,
-                                pre_emitted,
-                                None,
-                                None,
-                            )
-                            .await
-                        {
-                            log!(
-                                "[Chat] Failed to re-process orphaned injection for thread {}: {}",
-                                tid,
-                                e
-                            );
-                        }
+                        process_orphan_chain(engine, tid, orphans).await;
                     });
                 }
             }
@@ -985,5 +1029,100 @@ mod tests {
         // mode switch and must be rejected.
         let err = validate_thread_continuity(Some("trigger"), None, Some(true), None).unwrap_err();
         assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    // ── drain_orphan_queue ──
+
+    fn make_orphan(text: &str) -> InjectedPrompt {
+        InjectedPrompt {
+            text: text.to_string(),
+            event_id: Some(Uuid::new_v4()),
+            mode: ActorMode::Human,
+            spawning_event_id: None,
+            images: None,
+            origin: None,
+            kind: crate::engine::InjectedPromptKind::UserText,
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_orphan_queue_processes_each_initial_orphan_in_order() {
+        let initial = vec![make_orphan("a"), make_orphan("b"), make_orphan("c")];
+        let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let processed_clone = processed.clone();
+        drain_orphan_queue(initial, move |orphan| {
+            let processed = processed_clone.clone();
+            async move {
+                processed.lock().unwrap().push(orphan.text.clone());
+                Vec::new()
+            }
+        })
+        .await;
+        assert_eq!(*processed.lock().unwrap(), vec!["a", "b", "c"]);
+    }
+
+    // Regression: a re-processed orphan whose own loop produces NEW orphans
+    // (the in-the-wild thread 9b5a05aa scenario where the user sent two
+    // follow-ups in quick succession during recovery) used to lose those
+    // child orphans because the spawned task discarded the ProcessResult.
+    // The chain must keep draining until every appended orphan is processed.
+    #[tokio::test]
+    async fn drain_orphan_queue_processes_orphans_of_orphans() {
+        // Orphan "a" produces orphan "b" when processed; orphan "b" produces
+        // nothing. Both must be processed.
+        let initial = vec![make_orphan("a")];
+        let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let processed_clone = processed.clone();
+        drain_orphan_queue(initial, move |orphan| {
+            let processed = processed_clone.clone();
+            async move {
+                let text = orphan.text.clone();
+                processed.lock().unwrap().push(text.clone());
+                if text == "a" {
+                    vec![make_orphan("b")]
+                } else {
+                    Vec::new()
+                }
+            }
+        })
+        .await;
+        assert_eq!(*processed.lock().unwrap(), vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn drain_orphan_queue_handles_deep_chains() {
+        // Each orphan produces one more orphan, four levels deep.
+        let initial = vec![make_orphan("0")];
+        let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let processed_clone = processed.clone();
+        drain_orphan_queue(initial, move |orphan| {
+            let processed = processed_clone.clone();
+            async move {
+                let n: i32 = orphan.text.parse().unwrap();
+                processed.lock().unwrap().push(orphan.text);
+                if n < 4 {
+                    vec![make_orphan(&(n + 1).to_string())]
+                } else {
+                    Vec::new()
+                }
+            }
+        })
+        .await;
+        assert_eq!(*processed.lock().unwrap(), vec!["0", "1", "2", "3", "4"]);
+    }
+
+    #[tokio::test]
+    async fn drain_orphan_queue_no_op_for_empty_initial() {
+        let processed = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let processed_clone = processed.clone();
+        drain_orphan_queue(vec![], move |_orphan| {
+            let processed = processed_clone.clone();
+            async move {
+                *processed.lock().unwrap() += 1;
+                Vec::new()
+            }
+        })
+        .await;
+        assert_eq!(*processed.lock().unwrap(), 0);
     }
 }

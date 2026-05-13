@@ -130,4 +130,15 @@ describe('applySingleChange feedback', () => {
     expect(toast).toBeTruthy();
     expect(toast!.message).toContain('Merge conflict');
   });
+
+  it('does not show bare "timeout" toast when client AbortController fires', async () => {
+    mockedApply.mockRejectedValue(new DOMException('aborted', 'AbortError'));
+
+    await applySingleChange('change-timeout');
+
+    const toast = toasts.value.find(t => t.type === 'error');
+    expect(toast).toBeTruthy();
+    expect(toast!.message).not.toBe('timeout');
+    expect(toast!.message).toContain('timed out');
+  });
 });

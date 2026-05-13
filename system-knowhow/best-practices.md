@@ -65,7 +65,7 @@ Intent definitions not tied to a single app. App-specific intents go in `apps/{i
 
 ## scripts/ — Shared Scripts
 
-Scripts invoked by triggers, not tied to a single app:
+Helper scripts invoked by intents, knowhow, or proxy auth handshakes — not tied to a single app:
 - `scripts/{name}/run.py`
 - App-specific scripts go in `apps/{id}/scripts/`
 

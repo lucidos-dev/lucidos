@@ -4,6 +4,8 @@ import { activeMenuItem, panelOverlay, pinnedApps, appsList, changes } from '../
 import { switchMenuItem } from '../../store/actions/menu';
 import { openUrl } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
+import { showToast } from '../../store/store';
+import { errorDetail } from '../../utils/errorDetail';
 import { isTauri } from '../../utils/platform';
 import { hidePanelWebview, showPanelWebview } from '../../utils/tauri';
 import type { MenuItem } from '../../store/types';
@@ -101,7 +103,9 @@ export function Drawer() {
             key={`pin-${p.appId}`}
             class="drawer-item"
             onClick={() => {
-              openAppById(p.appId);
+              openAppById(p.appId).catch((err) => {
+                showToast(`Failed to open app: ${errorDetail(err)}`, 'error');
+              });
               closeDrawer();
             }}
           >

@@ -22,9 +22,9 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue([]),
 }));
 
-import { discardCompose, ensureFocusedComposeThread, sendFollowup, updateCompose, applyRemoteCompose } from './compose';
+import { discardCompose, ensureFocusedComposeThread, pendingComposePuts, sendFollowup, updateCompose, applyRemoteCompose } from './compose';
 import { focusThread, unfocusThread } from './threads';
-import { connectionStatus, focusedThreadId, threadMap, FOCUSED_THREAD_KEY } from '../store';
+import { connectionStatus, focusedThreadId, threadMap, FOCUSED_THREAD_KEY, toasts } from '../store';
 import {
   _resetThreadNavForTesting,
   _threadNavStateForTesting,
@@ -537,5 +537,145 @@ describe('ensureFocusedComposeThread persists focusedThreadId across reload', ()
     const id = ensureFocusedComposeThread();
     expect(id).toBe('existing');
     expect(localStorage.getItem(FOCUSED_THREAD_KEY)).toBe('existing');
+  });
+});
+
+/** Race regression: ensureFocusedComposeThread fires POST /threads as
+ *  fire-and-forget. The compose PUT is debounced ~250ms. On a slow link the
+ *  POST hasn't landed when the debounce fires, so the PUT 404s with
+ *  "thread not found" and the user sees one error toast per typing burst.
+ *  pushNow must await the in-flight thread-start before issuing the PUT. */
+describe('compose PUT waits for the thread-start POST to land (slow-network race)', () => {
+  beforeEach(() => {
+    connectionStatus.value = 'connected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    _resetComposeDraftsForTesting();
+    _resetThreadNavForTesting();
+    localStorage.removeItem(FOCUSED_THREAD_KEY);
+    toasts.value = [];
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    _resetComposeDraftsForTesting();
+    _resetThreadNavForTesting();
+    localStorage.removeItem(FOCUSED_THREAD_KEY);
+    toasts.value = [];
+    vi.restoreAllMocks();
+  });
+
+  it('debounced PUT does not fire until POST /threads resolves; no 404 toast', async () => {
+    const seen: Array<{ method: string; url: string }> = [];
+    let resolveCreate: ((r: Response) => void) | null = null;
+
+    const mockFetch = vi.fn((url: string, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      seen.push({ method, url });
+      if (url === '/api/v1/threads' && method === 'POST') {
+        return new Promise<Response>((r) => { resolveCreate = r; });
+      }
+      if (url.endsWith('/compose') && method === 'PUT') {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      return Promise.resolve(new Response(null, { status: 200 }));
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+    const isComposePut = (s: { method: string; url: string }) =>
+      s.method === 'PUT' && s.url.endsWith('/compose');
+
+    // Simulate first keystroke: allocate the thread + schedule the PUT.
+    const id = ensureFocusedComposeThread();
+    updateCompose(id, { text: 'D' });
+
+    // Walk past the 250ms debounce window. The buggy version fires the PUT
+    // here while POST /threads is still in flight → server 404 → toast.
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(
+      seen.filter(isComposePut),
+      'compose PUT must NOT fire while POST /threads is still in flight',
+    ).toEqual([]);
+
+    // Resolve POST /threads; the queued PUT should fire now.
+    resolveCreate!(new Response(null, { status: 201 }));
+    await vi.runAllTimersAsync();
+
+    expect(seen.filter(isComposePut)).toHaveLength(1);
+    expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
+  });
+
+  it('clears pendingComposePuts and suppresses duplicate toast when POST /threads rejects', async () => {
+    // ensureFocusedComposeThread already toasts "Failed to start compose"
+    // when its POST rejects. Without try/finally + an inner catch, pushNow
+    // would (a) leak the pendingComposePuts entry, blocking subsequent
+    // loadAllThreads refreshes for that thread for the rest of the session,
+    // and (b) toast a second "Compose sync failed" with the same error.
+    let rejectCreate: ((err: Error) => void) | null = null;
+    const mockFetch = vi.fn((url: string, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url === '/api/v1/threads' && method === 'POST') {
+        return new Promise<Response>((_, reject) => { rejectCreate = reject; });
+      }
+      return Promise.resolve(new Response(null, { status: 200 }));
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+    const id = ensureFocusedComposeThread();
+    updateCompose(id, { text: 'hello' });
+    expect(pendingComposePuts.has(id)).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(300);
+
+    rejectCreate!(new Error('network down'));
+    await vi.runAllTimersAsync();
+
+    expect(pendingComposePuts.has(id)).toBe(false);
+    const errorToasts = toasts.value.filter((t) => t.type === 'error');
+    expect(errorToasts).toHaveLength(1);
+    expect(errorToasts[0].message).toMatch(/Failed to start compose/);
+  });
+
+  it('skips PUT when discardCompose runs while POST /threads is still in flight', async () => {
+    // Pre-fix, the await widened the discard race: discardCompose flips state
+    // to 'discarded' (thread stays in threadMap), pushNow's `if (!thread)`
+    // doesn't catch it, so when POST resolves the PUT fires against a
+    // discarded thread → backend 410 → toast "Compose sync failed: thread
+    // discarded". The post-await guard must reject discarded state too.
+    const seen: Array<{ method: string; url: string }> = [];
+    let resolveCreate: ((r: Response) => void) | null = null;
+    const mockFetch = vi.fn((url: string, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      seen.push({ method, url });
+      if (url === '/api/v1/threads' && method === 'POST') {
+        return new Promise<Response>((r) => { resolveCreate = r; });
+      }
+      return Promise.resolve(new Response(null, { status: 204 }));
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+    const id = ensureFocusedComposeThread();
+    updateCompose(id, { text: 'about to discard' });
+
+    await vi.advanceTimersByTimeAsync(300);
+
+    // User discards before POST resolves. discardCompose flips state to
+    // 'discarded' and DELETEs server-side; the in-flight pushNow must skip.
+    void discardCompose(id);
+
+    resolveCreate!(new Response(null, { status: 201 }));
+    await vi.runAllTimersAsync();
+
+    expect(
+      seen.filter((s) => s.method === 'PUT' && s.url.endsWith('/compose')),
+      'no compose PUT should fire against a discarded thread',
+    ).toEqual([]);
+    expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
   });
 });

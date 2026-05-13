@@ -65,13 +65,11 @@ export function FileSearchModal() {
     return <div class="modal-overlay file-search-overlay file-search-closed" aria-hidden="true" />;
   }
 
-  const workspaceLoaded = artifacts.value.status === 'loaded';
-  const anyLoaded = workspaceLoaded
-    || repoFiles.value.status === 'loaded'
-    || changes.value.length > 0;
-  const failed = artifacts.value.status === 'failed';
-
   const isRepo = repoSource.value !== null;
+  const primarySource = isRepo ? repoFiles.value : artifacts.value;
+  const anyLoaded = primarySource.status === 'loaded' || changes.value.length > 0;
+  const failed = primarySource.status === 'failed';
+
   const workspacePaths = isRepo ? [] : loadedOr(artifacts.value, []);
   const repoPaths = isRepo ? loadedOr(repoFiles.value, []) : [];
   const diffFiles = isRepo && repoDiff.value.status === 'loaded'

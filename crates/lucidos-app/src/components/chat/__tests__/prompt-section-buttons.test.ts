@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { getPromptSectionButtons } from '../PromptInput';
+import { getPromptSectionButtons, shouldLiftSectionButtons } from '../PromptInput';
+import type { BannerState } from '../WaitingBanner';
 
 // Args: (section, isActive, hasPendingChanges, hasContent).
 // isActive = mid-turn OR has active children — collapsed at the call site.
@@ -26,8 +27,11 @@ describe('getPromptSectionButtons', () => {
     expect(getPromptSectionButtons('active', true, false, true)).toEqual([]);
   });
 
-  it('Active section returns no buttons when Apply is pending', () => {
-    expect(getPromptSectionButtons('active', true, true, false)).toEqual([]);
+  // Save / ✓ Saved stays visible while Apply is pending so the user can park
+  // the thread alongside resolving the change. WaitingBanner renders
+  // Discard + Apply in the same row, after Save.
+  it('Active section keeps Save when Apply is pending', () => {
+    expect(getPromptSectionButtons('active', true, true, false)).toEqual(['save']);
   });
 
   // Saved-section threads stay in `saved` while running (saved wins over
@@ -64,19 +68,55 @@ describe('getPromptSectionButtons', () => {
     expect(getPromptSectionButtons('archive', true, false, false)).toEqual([]);
   });
 
-  // WaitingBanner already renders Discard + Apply for pending changes — Save
-  // (on Review) and Archive (on Saved) would compete for space in the same
-  // row. Unsave is also suppressed: get the pending change resolved before
-  // changing section.
-  it('Review section returns no buttons when Apply is pending', () => {
-    expect(getPromptSectionButtons('review', false, true, false)).toEqual([]);
+  // Save / ✓ Saved stays visible while Apply is pending so the user can park
+  // the thread without resolving the change first. WaitingBanner renders
+  // Discard + Apply in the same row, after the section button. Archive is
+  // suppressed on Saved when pending — Discard owns "drop the changes".
+  it('Review section keeps Save when Apply is pending', () => {
+    expect(getPromptSectionButtons('review', false, true, false)).toEqual(['save']);
   });
 
-  it('Saved section returns no buttons when Apply is pending', () => {
-    expect(getPromptSectionButtons('saved', false, true, false)).toEqual([]);
+  it('Saved section keeps the unsave toggle when Apply is pending', () => {
+    expect(getPromptSectionButtons('saved', false, true, false)).toEqual(['unsave']);
   });
 
-  it('Saved section returns no buttons when Apply is pending while active', () => {
-    expect(getPromptSectionButtons('saved', true, true, false)).toEqual([]);
+  it('Saved section keeps the unsave toggle when Apply is pending while active', () => {
+    expect(getPromptSectionButtons('saved', true, true, false)).toEqual(['unsave']);
+  });
+});
+
+describe('shouldLiftSectionButtons', () => {
+  function actionsState(requiresRestart: boolean): BannerState {
+    return {
+      type: 'actions',
+      actions: ['discard', 'apply'],
+      threadId: 'tid',
+      isArchiving: false,
+      requiresRestart,
+      incomplete: false,
+      pendingChange: null,
+      ccDiff: 'hidden',
+    };
+  }
+
+  it('lifts Save when stacked AND Apply requires restart', () => {
+    expect(shouldLiftSectionButtons(true, actionsState(true))).toBe(true);
+  });
+
+  it('does not lift Save when stacked but Apply is the short label', () => {
+    expect(shouldLiftSectionButtons(true, actionsState(false))).toBe(false);
+  });
+
+  it('does not lift Save when not stacked, even with Apply & Restart', () => {
+    expect(shouldLiftSectionButtons(false, actionsState(true))).toBe(false);
+  });
+
+  it('does not lift Save while applying / discarding (Save sits next to the spinner)', () => {
+    expect(shouldLiftSectionButtons(true, { type: 'applying' })).toBe(false);
+    expect(shouldLiftSectionButtons(true, { type: 'discarding' })).toBe(false);
+  });
+
+  it('does not lift Save when there is no banner (compose state)', () => {
+    expect(shouldLiftSectionButtons(true, null)).toBe(false);
   });
 });

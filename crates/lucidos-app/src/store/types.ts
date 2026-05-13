@@ -49,15 +49,81 @@ export interface Step {
    *  ambiguous for parallel calls like two `Read SKILL.md`. Absent for
    *  engine tools and legacy DB rows. */
   tool_use_id?: string;
+  /** Legacy fields — kept for old DB rows. New emissions carry these
+   *  on `contextCapture.usage`. */
   context_tokens?: number;
   context_messages?: number;
   trimmed?: boolean;
+  /** Absent for steps that aren't an LLM call (memory search, tool result). */
+  contextCapture?: ContextCapture;
+}
+
+/** One labeled chunk of the LLM's assembled prompt. `char_count` is the
+ *  original length; `content` is omitted when the `capture_context`
+ *  preference is off (the modal still renders the section with its name and
+ *  size, just without the body). */
+export interface ContextSection {
+  name: string;
+  content?: string;
+  char_count: number;
+}
+
+/** `cache_*` are Anthropic-only; zero on OpenAI / Gemini. */
+export interface ApiUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+}
+
+export type ContextProducer = 'main_llm' | 'claude_code';
+
+/** Mirrors the Rust `ContextCaptured` ThreadEvent. `usage` is absent on
+ *  pre-call snapshots and on providers that don't report it (OpenAI,
+ *  Gemini). `legacy` is set by `synthesizeContextCapture` for old rows. */
+export interface ContextCapture {
+  producer: ContextProducer;
+  model: string;
+  context_window: number;
+  sections: ContextSection[];
+  tools: string[];
+  estimated_total_tokens: number;
+  usage?: ApiUsage;
+  trimmed: boolean;
+  legacy?: boolean;
+}
+
+/** @deprecated kept for the `ResponseEvent.context` slot until that wiring
+ *  is migrated. New code should use `ContextCapture`. */
+export interface ContextAssembledData {
+  sections: ContextSection[];
+  tools: string[];
+  model: string;
+  total_chars: number;
 }
 
 // A response event — interleaved text blocks and steps (from backend ResponseEvent).
 export type ResponseEvent =
   | { type: 'text'; md: string }
-  | { type: 'step'; description: string; tool_name?: string; success: boolean | null; tool_use_id?: string; detail?: string; context_tokens?: number; context_messages?: number; trimmed?: boolean; full?: string }
+  | {
+      type: 'step';
+      description: string;
+      tool_name?: string;
+      success: boolean | null;
+      tool_use_id?: string;
+      detail?: string;
+      /** Legacy fields — see Step.context_tokens above. */
+      context_tokens?: number;
+      context_messages?: number;
+      trimmed?: boolean;
+      full?: string;
+      created?: string;
+      result?: string;
+      result_images?: string[];
+      /** @deprecated kept for legacy backend payloads. */
+      context?: ContextAssembledData;
+      contextCapture?: ContextCapture;
+    }
   | { type: 'section_break'; channel: string }
   | { type: 'image'; base64: string; mime_type: string; index: number }
   | {
@@ -86,6 +152,9 @@ export interface Notification {
   id: string;
   task_id?: string;
   app_id?: string;
+  /** Originating thread, when the notification has one. Drives the inbox
+   *  modal's "Open thread" action. */
+  thread_id?: string;
   title: string;
   message: string;
   created_at: string;
@@ -93,7 +162,7 @@ export interface Notification {
 }
 
 export type TriggerRun =
-  | { type: 'intent'; intent: string; knowhow: string[] }
+  | { type: 'intent'; intent: string }
   | { type: 'script'; path: string };
 
 // A trigger config (event-sourced).
@@ -207,6 +276,8 @@ export type ToastType = 'success' | 'info' | 'error' | 'warning';
 export interface ToastAction {
   label: string;
   onClick: () => void;
+  /** Visual intent. Default = neutral; 'danger' = destructive; 'confirm' = positive. */
+  variant?: 'danger' | 'confirm';
 }
 
 export interface ToastItem {
@@ -215,6 +286,10 @@ export interface ToastItem {
   type: ToastType;
   key?: string;
   action?: ToastAction;
+  /** Rendered next to `action`. The restart-required toast uses this for
+   *  "Dismiss" so the explicit affordance sits beside "Restart" instead of
+   *  hiding behind the close (X) button. */
+  secondaryAction?: ToastAction;
   onClick?: () => void;
   spinning?: boolean;
   /** false = suppress the close (X) button. Used for "Restarting engine…" so
@@ -229,6 +304,49 @@ export interface CredentialRequest {
   base_url?: string;
   auth_type?: AuthType;
   prompt?: string;
+}
+
+/** Plugin install awaiting user confirmation in the install panel. Mirrors
+ *  the JSON payload built by `engine::tools::plugins::prepare_install_request`.
+ *  The user clicks Confirm/Cancel; the panel POSTs to
+ *  `/api/v1/plugins/install/:install_id/{confirm|cancel}` to resolve. */
+export interface PluginInstallRequest {
+  install_id: string;
+  source: string;
+  source_type: 'git' | 'archive';
+  /** Raw manifest as parsed from `manifest.toml` — id/version/name/description
+   *  required, source/engine/setup optional, plus any extra forward-compatible
+   *  fields. Render the four required ones; show the rest only on demand. */
+  manifest: Record<string, unknown>;
+  /** `data/`-relative paths the install will write. */
+  files: string[];
+  /** Subset of `files` that already exist under `data/` and would be
+   *  overwritten. Highlight separately from the rest. */
+  overwrites: string[];
+  /** Optional post-install instruction text from the manifest. Render as
+   *  markdown so the LLM-shippable instructions wrap nicely. */
+  setup?: string | null;
+  plugin_id: string;
+  plugin_version: string;
+  plugin_name: string;
+}
+
+/** Plugin uninstall awaiting user confirmation in the uninstall panel.
+ *  Mirrors the JSON payload built by
+ *  `engine::tools::plugins::prepare_uninstall_request`. The user clicks
+ *  Confirm/Cancel; the panel POSTs to
+ *  `/api/v1/plugins/uninstall/:uninstall_id/{confirm|cancel}` to resolve. */
+export interface PluginUninstallRequest {
+  uninstall_id: string;
+  plugin_id: string;
+  plugin_version: string;
+  plugin_name: string;
+  /** Recorded files that exist on disk RIGHT NOW (will be deleted on Confirm). */
+  files_present: string[];
+  /** Recorded files that were ALREADY gone at prepare time (manually
+   *  deleted, or shared with another plugin). Shown for transparency
+   *  but never re-deleted. */
+  files_missing: string[];
 }
 
 // Email confirmation request from SSE (engine wants user to confirm sending)

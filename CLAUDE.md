@@ -2,10 +2,13 @@
 
 Top-level guidance for Claude Code. Detailed conventions live in `.claude/rules/` files (each has glob frontmatter — Claude reads them when working on matching files).
 
-- `rust.md` — Rust, DB, events, migrations, EventBus, HTTP/API rules
+- `rust.md` — Rust, events, migrations, EventBus, HTTP/API rules
+- `db.md` — DB schema reference (tables, event types, column notes); loads on `*.sql` / `migrations/**`
 - `frontend.md` — TS/CSS, `Loadable<T>`, intent-vs-logic, component conventions
 - `testing.md` — Browser e2e (Playwright), API e2e, contract tests
 - `scripts.md` — Dev/build scripts, ports, Makefile
+- `system-knowhow.md` — drift-prevention rule: code changes that touch a documented surface (`ThreadEvent`, `SystemEvent`, scheduler allowlist, `lucidos.*` SDK, `lucidos` CLI, plugin manifest, `apis.json` shape, …) MUST update the matching `system-knowhow/*.md` in the same change; `/harden` flags omissions. Also covers recipe-maintenance reminders (workspace-audit / workspace-learning). Loads on `system-knowhow/**` and the documented engine surfaces it gates.
+- `sdk.md` — JS SDK extension rules (check `js-sdk.md` first, update it in the same commit); loads on `packages/lucidos-sdk/**`
 
 ## Workspace Rules
 
@@ -13,17 +16,17 @@ Top-level guidance for Claude Code. Detailed conventions live in `.claude/rules/
 - **Confirm before mutating.** State-changing actions require user confirmation unless part of an agreed plan. Read-only (GET, file/log reads, `git status`/`log`/`diff`) is always fine.
 - **Browser**: headed Chrome, window `osascript -e 'tell application "Google Chrome" to set bounds of front window to {3840, 200, 5120, 2357}'`, zoom `document.body.style.zoom = '125%'`. Default workspace ports: read `~/workspaces/dev/.lucidos/ports`, navigate to `https://localhost:$VITE_PORT`.
 
-## CC Worktree Isolation
+## CC Operational Rules
 
-CC sessions run in isolated worktrees under `<workspace>/.lucidos/worktrees/`. All edits, builds, script runs stay in the worktree. Scripts resolve paths via `SCRIPT_DIR`. Never reference main's absolute path. Before finishing: `git diff` and `git checkout -- <file>` to discard abandoned edits.
-
-## Process Safety — Never Kill Broadly
-
-Multiple workspaces (dev, personal, work, e2e-test) run concurrently. NEVER use `pkill`, `killall`, or broad `pgrep | xargs kill` on `lucidos-engine` — macOS `pkill` excludes ancestors, so the calling engine survives while silently killing every other workspace. To stop one: `./scripts/stop.sh -w <ws>` or `kill $(cat <ws>/.lucidos/engine.pid)`.
-
-## Long-Running Bash — Never `pgrep` to Wait
-
-Multiple CC sessions share the host process namespace, so `pgrep -f "cargo test ..."` matches *every* session's tests, not just yours. Polling patterns like `while ps -p $(pgrep -f "cargo test") > /dev/null; do sleep 30; done` wedge until the Bash timeout fires (10 min). For long commands, use the Bash tool's `run_in_background: true` and poll with `BashOutput` — it's per-session and reliable. If you must wait in shell, capture the PID directly: `cargo test ... & BG=$!; wait $BG`.
+- **Worktree isolation.** CC sessions run in isolated worktrees under `<workspace>/.lucidos/worktrees/`. All edits, builds, script runs stay in the worktree. Scripts resolve paths via `SCRIPT_DIR` — never reference main's absolute path. Before finishing: `git diff` and `git checkout -- <file>` to discard abandoned edits.
+- **Never kill broadly.** Multiple workspaces (dev, personal, work, e2e-test) run concurrently. NEVER use `pkill`, `killall`, or broad `pgrep | xargs kill` on `lucidos-engine` — macOS `pkill` excludes ancestors, so the calling engine survives while silently killing every other workspace. To stop one: `./scripts/stop.sh -w <ws>` or `kill $(cat <ws>/.lucidos/engine.pid)`.
+- **Never `pgrep` to wait.** CC sessions share the host process namespace, so `pgrep -f "cargo test ..."` matches *every* session's tests. Polling patterns like `while ps -p $(pgrep -f "cargo test") > /dev/null; do sleep 30; done` wedge until the Bash timeout fires. For long commands, use the Bash tool's `run_in_background: true` and poll with `BashOutput` — per-session and reliable. If you must wait in shell, capture the PID directly: `cargo test ... & BG=$!; wait $BG`.
+- **Never run two `cargo test` invocations against the same worktree in parallel.** The `lucidos-engine` crate is heavy — a foreground `cargo test` while a background `cargo test` is also compiling forks two parallel rustc trees on the same crate and OOM-kills the host (SIGKILL → exit 137; SIGTERM → exit 143). Run one `cargo test` at a time: either fully foreground, or fully `run_in_background: true` and then `BashOutput` for the result. Never both. Narrow the filter to a *specific test module* (e.g. `engine::agent_session::lifecycle::tests::`) instead of a broad path prefix (e.g. `engine::agent_session::`) — narrower filters are still useful even with one invocation, because they cut runtime and blast radius if anything hangs.
+- **Bash exit 137 / 143 is a hard failure, not "task done".** Exit 137 = SIGKILL (OOM-killer), 143 = SIGTERM (something asked the process to die). When ANY tool — `cargo test`, build, e2e, anything — returns 137 or 143, the work is incomplete: re-run with a narrower scope, free memory, kill the parallel invocation, then retry. Never treat the non-zero exit as confirmation that the validating step ran. Engine-side defense: an empty assistant Result on a non-shutdown, non-error, non-cancel turn surfaces as `ResponseFailed` (see the empty-text branch of `classify_result` in `agent_session/lifecycle.rs`) so the UI shows a red dot instead of a silent "completed" turn — but don't rely on the safety net; fix the OOM by not running tests in parallel in the first place.
+- **`Edit` needs a fresh `Read`.** Always Read immediately before Edit — an earlier Read in the same session doesn't count once context drifts, a sub-task intervenes, or a watcher/linter touches the file. On `File has been modified since read`, re-Read and re-Edit; do NOT retry the same Edit verbatim — the on-disk content has changed and the old `old_string` may no longer match.
+- **Prefer `Glob`/`Grep` tools over `ls`/`grep` with absolute paths.** A remembered `/abs/path/to/file.rs` goes stale the moment a refactor moves it — `grep -n 'pat' /abs/path/to/file.rs` then fails with "no such file or directory", while `Grep pattern: 'pat'` finds the new location automatically. Cheaper too — dedicated tools skip the shell hop and avoid spending Bash-output tokens on misses. Reach for `Glob`/`Grep` for any path you didn't just see this turn.
+- **Anchor cargo at the worktree root — never `cd ..` then cargo.** Your default cwd is the worktree root; `cd ..` from there lands at `.lucidos/worktrees/`, which has no `Cargo.toml`, and `cargo check -p lucidos-engine` then errors "could not find Cargo.toml". Run cargo from the worktree root, or pass `--manifest-path Cargo.toml` (or `crates/<name>/Cargo.toml`) if you must invoke it from elsewhere.
+- **Quote globs in Bash — zsh fails the whole command on no match.** The Bash tool runs under zsh, where unquoted `ls rust-toolchain*` exits non-zero with `zsh: no matches found: rust-toolchain*` if zero files match — bash would pass the literal through, zsh aborts. Quote it (`ls 'rust-toolchain*'`) or use `Glob pattern: 'rust-toolchain*'` for a real match. The error mentions `zsh` and looks like a tool problem, not a shell-syntax one.
 
 ## Code Style — Core Principles
 
@@ -32,6 +35,7 @@ Multiple CC sessions share the host process namespace, so `pgrep -f "cargo test 
 - **KISS.** Resist special cases, flags, branches. Leave files cleaner than you found them.
 - **Test-driven.** Write tests first. Bug fixes reproduce with a failing test first. Run relevant suites before claiming done.
 - **Filtered Rust tests need `--lib`**: `cargo test -p lucidos-engine --lib "filter"`. Without `--lib`, runs zero tests silently. Verify `running N tests` line is > 0.
+- **Multiple test name filters need `--`**: `cargo test -p lucidos-engine --lib -- name1 name2 …`. Without the `--` separator, clap treats every name after the first as an unknown positional and fails with `error: unexpected argument 'X' found`.
 - **Integration tests for refactors.** Refactors that change data flow MUST have integration tests — unit tests miss wiring bugs.
 - **Contract tests are sacred.** If you change `thread_lifecycle.rs`, regenerate: `cargo test -p lucidos-engine generate_typescript_file -- --ignored && cargo test -p lucidos-engine generate_cross_validation_fixture_file -- --ignored`. Never hand-edit `src/generated/`.
 - **Zero warnings, errors, failing tests.** "Pre-existing" is never an excuse — if you see it, you own it.
@@ -41,7 +45,7 @@ Multiple CC sessions share the host process namespace, so `pgrep -f "cargo test 
   - CSS-only / docs-only → no tests
   - Mixed Rust + TS → run both
 - **Test locations** — Rust unit: inline `#[cfg(test)]`. TS unit: `*.test.ts` next to source. Browser e2e: `crates/lucidos-app/e2e/*.spec.ts` (`./scripts/e2e-browser.sh`). API e2e: `crates/lucidos-e2e/tests/` (`./scripts/e2e-api.sh`). Contract tests: `crates/lucidos-app/src/generated/`. See `testing.md`.
-- **Hardening enforced at Apply time.** CC MUST run `/harden` after implementation — no exceptions, even for docs-only, CSS-only, or comment-only changes. The skill itself decides what to test (auto-skipping phases when no relevant layers were touched) and iterates from Phase 1 if anything fails. The engine doesn't auto-trigger at idle. If the marker is missing when the user clicks Apply, Apply runs `/harden` synchronously then proceeds — making the user wait. Marker existence (Fresh or Stale) means CC has hardened the branch at least once and is trusted; follow-up commits don't re-trigger.
+- **Hardening enforced at Apply time.** CC MUST run `/harden` once the work is complete and you're about to hand back to the user — no exceptions, even for docs-only, CSS-only, or comment-only changes. Don't harden mid-work; one `/harden` covering the whole finished batch of commits is enough. The skill itself decides what to test (auto-skipping phases when no relevant layer applies) and iterates from Phase 1 if anything fails. If the marker is `MISSING` when the user clicks Apply, Apply runs `/harden` synchronously and the user waits — so don't leave a finished batch un-hardened. Never tell the user you're "postponing", "deferring", or "skipping" `/harden` — there is no such option in the system. Either Phase 0 reports `ALREADY_HARDENED` (say so and stop) or you run it. Saying you'll postpone and then having Apply run it anyway is a confusing lie.
 - **Ruthless refactoring + DRY + no dead code.** Fix unclear names, dead branches, copy-paste when you touch a file. Delete unused — don't comment out or `_`-prefix.
 - **No provider-specific instructions in code.** Use `web_search` for provider details.
 - **Conventional commits**: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`.
@@ -71,7 +75,7 @@ Lucidos is a cognitive OS: prompt as primary interface, events as single source 
 ## Environment Variables
 
 - `LUCIDOS_WORKSPACE` — workspace dir (default `./workspace`)
-- `DATABASE_URL` — Postgres (default `postgres://lucidos:lucidos@localhost:5432/lucidos`)
+- `DATABASE_URL` — Postgres connection string for the engine. **Never hardcode the URL or password into a `psql`/Python invocation** — the engine sets `PGUSER`/`PGPASSWORD`/`PGHOST`/`PGPORT`/`PGDATABASE` in every spawned subprocess (CC sessions, bash + python tools, scheduled scripts), so just run `psql -c '…'` bare. Putting the URL in argv leaks the password into the persisted `Bash` tool-call payload that the steps UI renders.
 - `LUCIDOS_MODEL` — LLM model (default `claude-opus-4-7`). `[1m]` = 1M context. `gpt-*` = OpenAI.
 - `VERTEX_PROJECT_ID` / `VERTEX_REGION` — GCP (default region `europe-west1`)
 - `OPENAI_API_KEY` — for `gpt-*` models
@@ -89,7 +93,7 @@ See `docs/taxonomy.md` for the full content taxonomy. Key points:
 - **Survivability test**: "Does this survive if I delete the app?" → top-level. "Only makes sense for this app?" → inside the app.
 - Never use generic names like `app.md` or `knowhow.md` — name by what they describe.
 - **Manifest** = user-facing UI. **Knowhow / intents** = engine-facing LLM context.
-- **Triggers — keep procedure out of intent.** A trigger's `run.intent` is what the user would say ("notify me when X happens"). Every imperative verb about *how* (hit, parse, scan, fall back, retry, emit) belongs in a knowhow file, referenced by ID in `run.knowhow: [...]`. The HTTP API takes one big string and won't stop you from dumping the recipe in — that's the trap. See `docs/taxonomy.md` § Triggers for the worked example.
+- **Triggers — keep procedure out of intent.** A trigger's `run.intent` is what the user would say ("notify me when X happens"). Every imperative verb about *how* (hit, parse, scan, fall back, retry, emit) belongs in a knowhow file. The trigger thread looks up knowhow itself via `load_knowhow` at fire time — same as chat — so there is no per-trigger allow-list to configure on the trigger. The HTTP API takes one big string and won't stop you from dumping the recipe in — that's the trap. See `docs/taxonomy.md` § Triggers for the worked example.
 
 ## One-Click Install
 
@@ -97,25 +101,4 @@ Self-contained desktop app — no terminal, Docker, or dev tools required (macOS
 
 ## Maintaining This File
 
-When a new convention or architectural decision is established, update this file or the appropriate `.claude/rules/` file in the same session.
-
-## Maintaining workspace-audit
-
-`system-knowhow/workspace-audit.md` is the recipe Lucidos uses to audit a workspace for drift against current conventions. It deliberately **references** the other system-knowhow files instead of restating their rules — so when you change one of those files, the audit may need to follow.
-
-If your change touches `system-knowhow/best-practices.md`, `system-knowhow/js-sdk.md`, `system-knowhow/lucidos-cli.md`, `system-knowhow/intent-registry.md`, `docs/taxonomy.md`, or the engine system prompt's taxonomy / trigger section, open `system-knowhow/workspace-audit.md` and check that:
-
-- The reference table still names the right files and what they own.
-- Any check that names a section heading or filename in those sources still resolves.
-- New rules warrant a new check (or expansion of an existing check).
-- Removed / renamed rules don't leave dangling checks.
-
-## Maintaining workspace-learning
-
-`system-knowhow/workspace-learning.md` is the sibling recipe that looks at runtime *events* and proposes improvements to the workspace's apps, triggers, knowhow, and scripts. Where audit checks compliance against today's rules, learning surfaces the cases where today's rules might be wrong. Both produce a report under `data/artifacts/` and emit a completion event; neither edits anything.
-
-The learning recipe queries event types by name. If you rename, retire, or add an event type that signals friction (failures, aborts, circuit-breaker trips, trigger errors, repeated user corrections), open `system-knowhow/workspace-learning.md` and check that:
-
-- The event names listed under "What to walk" still exist and still mean the same thing.
-- New friction signals warrant a new pattern category.
-- The completion event name (`WorkspaceLearningCompleted`) still matches what the recipe emits.
+When a new convention or architectural decision is established, update this file or the appropriate `.claude/rules/` file in the same session. Recipe-maintenance rules for `system-knowhow/` live in `.claude/rules/system-knowhow.md`.

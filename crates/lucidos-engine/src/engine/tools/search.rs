@@ -13,6 +13,14 @@ pub const GLOB_MAX_LIMIT: usize = 1000;
 pub const GREP_DEFAULT_MAX_MATCHES: usize = 100;
 pub const GREP_MAX_MAX_MATCHES: usize = 500;
 pub const GREP_MAX_CONTEXT_LINES: usize = 5;
+/// Per-line truncation cap. Files like PDF text dumps or single-line JSON have
+/// individual lines of many KB; without a cap the matched line + context window
+/// can dump megabytes of text into the LLM context.
+pub const GREP_MAX_LINE_CHARS: usize = 300;
+/// Hard ceiling on the serialized text content (matched line + context lines)
+/// across all returned matches. ~50 KB ≈ ~12k tokens — comfortably under any
+/// model's context budget for a single tool result.
+pub const GREP_MAX_TOTAL_BYTES: usize = 50 * 1024;
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 /// Skip files larger than this when grepping — keeps a single pathological log
 /// file from OOM-ing the engine. Glob walk is metadata-only so doesn't need it.
@@ -96,6 +104,20 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(BINARY_SNIFF_BYTES).any(|b| *b == 0)
 }
 
+/// Char-aware so we never split a multi-byte UTF-8 sequence — `&s[..N]` would
+/// panic on inputs like the Polish/Norwegian artifacts we routinely grep.
+fn cap_line(s: &str) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(GREP_MAX_LINE_CHARS).collect();
+    if chars.next().is_some() {
+        let mut out = head;
+        out.push('…');
+        out
+    } else {
+        head
+    }
+}
+
 /// Search file contents for a regex pattern. Walks the same directories as
 /// `list_files` / `glob_files` and stops as soon as `max_matches` is reached.
 pub fn grep_files(
@@ -132,6 +154,7 @@ pub fn grep_files(
 
     let mut matches = Vec::new();
     let mut truncated = false;
+    let mut total_bytes: usize = 0;
 
     'outer: for (rel, abs) in entries {
         if let Some(ref pat) = path_filter {
@@ -166,21 +189,30 @@ pub fn grep_files(
                 }
                 let before_start = idx.saturating_sub(context_lines);
                 let after_end = (idx + 1 + context_lines).min(lines.len());
-                let context_before = lines[before_start..idx]
+                let capped_line = cap_line(line);
+                let context_before: Vec<String> =
+                    lines[before_start..idx].iter().map(|s| cap_line(s)).collect();
+                let context_after: Vec<String> = lines[idx + 1..after_end]
                     .iter()
-                    .map(|s| s.to_string())
+                    .map(|s| cap_line(s))
                     .collect();
-                let context_after = lines[idx + 1..after_end]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+                let match_bytes = capped_line.len()
+                    + context_before.iter().map(|s| s.len()).sum::<usize>()
+                    + context_after.iter().map(|s| s.len()).sum::<usize>();
                 matches.push(GrepMatch {
                     path: rel.clone(),
                     line_number: idx + 1,
-                    line: (*line).to_string(),
+                    line: capped_line,
                     context_before,
                     context_after,
                 });
+                total_bytes += match_bytes;
+                // Soft cap: check after pushing so we always include the match
+                // that trips it — otherwise a single huge match could return zero.
+                if total_bytes >= GREP_MAX_TOTAL_BYTES {
+                    truncated = true;
+                    break 'outer;
+                }
             }
         }
     }
@@ -562,5 +594,133 @@ mod tests {
         write(ws.path(), "artifacts/a.md", "hello");
         let r = grep_files(ws.path(), "hello", Some(""), false, 100, 0).unwrap();
         assert_eq!(r.matches.len(), 1);
+    }
+
+    #[test]
+    fn grep_truncates_long_match_line() {
+        let ws = make_workspace();
+        // PDF-style dump: one giant line containing the match.
+        let prefix = "x".repeat(GREP_MAX_LINE_CHARS + 500);
+        let line = format!("{}MATCH{}", prefix, "y".repeat(500));
+        write(ws.path(), "artifacts/a.md", &line);
+        let r = grep_files(ws.path(), "MATCH", None, false, 100, 0).unwrap();
+        assert_eq!(r.matches.len(), 1);
+        let returned = &r.matches[0].line;
+        assert!(
+            returned.chars().count() <= GREP_MAX_LINE_CHARS + 1,
+            "expected <= {} chars, got {}",
+            GREP_MAX_LINE_CHARS + 1,
+            returned.chars().count()
+        );
+        assert!(
+            returned.ends_with('…'),
+            "expected ellipsis marker, got: {}",
+            returned
+        );
+    }
+
+    #[test]
+    fn grep_truncates_long_context_lines() {
+        let ws = make_workspace();
+        let big = "z".repeat(GREP_MAX_LINE_CHARS + 200);
+        let content = format!("{}\nMATCH\n{}", big, big);
+        write(ws.path(), "artifacts/a.md", &content);
+        let r = grep_files(ws.path(), "MATCH", None, false, 100, 1).unwrap();
+        assert_eq!(r.matches.len(), 1);
+        let m = &r.matches[0];
+        assert_eq!(m.context_before.len(), 1);
+        assert_eq!(m.context_after.len(), 1);
+        for ctx in [&m.context_before[0], &m.context_after[0]] {
+            assert!(
+                ctx.chars().count() <= GREP_MAX_LINE_CHARS + 1,
+                "context line too long: {} chars",
+                ctx.chars().count()
+            );
+            assert!(ctx.ends_with('…'), "context missing ellipsis: {}", ctx);
+        }
+    }
+
+    #[test]
+    fn grep_short_lines_not_truncated() {
+        let ws = make_workspace();
+        write(ws.path(), "artifacts/a.md", "short MATCH line\nbefore\nMATCH again");
+        let r = grep_files(ws.path(), "MATCH", None, false, 100, 1).unwrap();
+        for m in &r.matches {
+            assert!(
+                !m.line.ends_with('…'),
+                "short line should not be truncated: {}",
+                m.line
+            );
+            for c in m.context_before.iter().chain(m.context_after.iter()) {
+                assert!(!c.ends_with('…'), "short context should not be truncated: {}", c);
+            }
+        }
+    }
+
+    #[test]
+    fn grep_stops_at_total_bytes_cap() {
+        let ws = make_workspace();
+        // Each line ~250 chars + "MATCH" — under per-line cap, but stacking
+        // many of them blows past the total cap quickly.
+        let mut content = String::new();
+        for _ in 0..1000 {
+            content.push_str("MATCH ");
+            content.push_str(&"q".repeat(250));
+            content.push('\n');
+        }
+        write(ws.path(), "artifacts/a.md", &content);
+        let r = grep_files(ws.path(), "MATCH", None, false, 500, 0).unwrap();
+        assert!(r.truncated, "expected total-bytes cap to trip");
+        let total_bytes: usize = r
+            .matches
+            .iter()
+            .map(|m| {
+                m.line.len()
+                    + m.context_before.iter().map(|s| s.len()).sum::<usize>()
+                    + m.context_after.iter().map(|s| s.len()).sum::<usize>()
+            })
+            .sum();
+        // Some overshoot expected (we always include the match that trips the cap),
+        // but the result must stay within an order of magnitude of the limit.
+        assert!(
+            total_bytes <= GREP_MAX_TOTAL_BYTES * 2,
+            "total bytes {} should be near the cap of {}",
+            total_bytes,
+            GREP_MAX_TOTAL_BYTES
+        );
+        assert!(
+            r.matches.len() < 500,
+            "should have stopped well before max_matches=500, got {}",
+            r.matches.len()
+        );
+    }
+
+    #[test]
+    fn grep_total_bytes_cap_always_returns_first_match() {
+        let ws = make_workspace();
+        // Single line just under the per-line cap and over the total cap on its own
+        // (after per-line truncation it's still well within total cap; this just
+        // verifies we don't drop the first match even if it would push us over).
+        let line = format!("{} MATCH", "p".repeat(GREP_MAX_LINE_CHARS - 10));
+        write(ws.path(), "artifacts/a.md", &line);
+        let r = grep_files(ws.path(), "MATCH", None, false, 100, 0).unwrap();
+        assert_eq!(r.matches.len(), 1, "first match must always be returned");
+    }
+
+    #[test]
+    fn grep_truncation_handles_multibyte_chars() {
+        let ws = make_workspace();
+        // Mix of multi-byte chars to ensure we don't slice mid-codepoint.
+        let prefix = "ñ".repeat(GREP_MAX_LINE_CHARS + 100);
+        let line = format!("{}MATCH", prefix);
+        write(ws.path(), "artifacts/a.md", &line);
+        let r = grep_files(ws.path(), "MATCH", None, false, 100, 0).unwrap();
+        assert_eq!(r.matches.len(), 1);
+        let returned = &r.matches[0].line;
+        assert!(returned.ends_with('…'));
+        assert!(
+            returned.chars().count() <= GREP_MAX_LINE_CHARS + 1,
+            "char-aware truncation should respect codepoint boundaries"
+        );
     }
 }

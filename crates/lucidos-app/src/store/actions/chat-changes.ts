@@ -12,6 +12,11 @@ import type { ToastAction } from '../types';
 
 export const RESTART_TOAST_KEY = 'restart-required';
 export const RESTART_LS_KEY = 'lucidos-restart-required';
+/** Fingerprint of the restart-needing change set the user has explicitly
+ *  dismissed. While this matches the current fingerprint, the toast stays
+ *  hidden — a new commit or new thread group changes the fingerprint and
+ *  the toast comes back. */
+export const RESTART_DISMISSED_FP_LS_KEY = 'lucidos-restart-dismissed-fp';
 
 /** Timestamp (ms) when this page's JavaScript was loaded.
  *  Changes applied before this time are already reflected in the running client. */
@@ -113,20 +118,67 @@ export async function initiateEngineRestart(): Promise<void> {
   }
 }
 
+function isEngineOutdated(): boolean {
+  const ev = engineVersion.value;
+  const lev = latestEngineVersion.value;
+  return !!(ev && lev && isNewerVersion(lev, ev));
+}
+
+/** Stable fingerprint of the per-thread commits the toast is warning about.
+ *  When the user adds a commit, the fingerprint changes and the previously
+ *  dismissed toast comes back.
+ *
+ *  Engine-outdated state is intentionally excluded: the engineVersion /
+ *  latestEngineVersion signals are populated asynchronously (after the
+ *  health check resolves), so they're null at restoreRestartToast() time.
+ *  Including them in the fingerprint would make the restored fingerprint
+ *  spuriously diverge from the dismissed one and silently invalidate the
+ *  dismissal across reloads. The ControlPanel badge still reflects engine
+ *  outdated; the toast just doesn't re-nag on its own. */
+function currentRestartFingerprint(): string {
+  const groups = restartGroups.value
+    .slice()
+    .sort((a, b) => a.threadId.localeCompare(b.threadId))
+    .map(g => [g.threadId, g.commits] as const);
+  return JSON.stringify(groups);
+}
+
+/** User clicked Dismiss on the restart toast: hide it for the *current* set
+ *  of restart-needing changes. `restartRequired` stays true so the
+ *  ControlPanel "Restart needed" indicator remains visible. */
+export function dismissRestartToast(): void {
+  localStorage.setItem(RESTART_DISMISSED_FP_LS_KEY, currentRestartFingerprint());
+  dismissToast(RESTART_TOAST_KEY);
+}
+
 /** Show or dismiss the restart-required toast based on restartRequired signal.
- *  Also persists to localStorage so the toast survives page reloads / Vite HMR. */
+ *  Also persists to localStorage so the toast survives page reloads / Vite HMR.
+ *  Honors a stored dismissal fingerprint: if the user dismissed the toast and
+ *  the change set hasn't grown, stays hidden; otherwise the dismissal is
+ *  cleared and the toast reappears. */
 export function syncRestartToast(): void {
   if (restartRequired.value) {
     localStorage.setItem(RESTART_LS_KEY, 'true');
+    const dismissedFp = localStorage.getItem(RESTART_DISMISSED_FP_LS_KEY);
+    const currentFp = currentRestartFingerprint();
+    if (dismissedFp !== null && dismissedFp === currentFp) {
+      dismissToast(RESTART_TOAST_KEY);
+      return;
+    }
+    if (dismissedFp !== null) localStorage.removeItem(RESTART_DISMISSED_FP_LS_KEY);
     // If warning toast already exists with same message, skip to avoid re-renders
     const existing = toasts.value.find(t => t.key === RESTART_TOAST_KEY && t.type === 'warning');
     if (existing && existing.message === RESTART_TOAST_MESSAGE) return;
     showToast(RESTART_TOAST_MESSAGE, 'warning', {
       key: RESTART_TOAST_KEY,
       action: { label: 'Restart', onClick: () => initiateEngineRestart() },
+      secondaryAction: { label: 'Dismiss', onClick: () => dismissRestartToast(), variant: 'danger' },
     });
   } else {
     localStorage.removeItem(RESTART_LS_KEY);
+    if (localStorage.getItem(RESTART_DISMISSED_FP_LS_KEY) !== null) {
+      localStorage.removeItem(RESTART_DISMISSED_FP_LS_KEY);
+    }
     restartGroups.value = [];
     persistRestartGroups();
     dismissToast(RESTART_TOAST_KEY);
@@ -150,28 +202,37 @@ export function restoreRestartToast(): void {
   }
 }
 
-/** Fetch changes from backend and update all related signals. */
+/** Fetch changes from backend and update all related signals.
+ *  On AbortError (10s client timeout) we retry once before bothering the user:
+ *  the iOS PWA fires this from `runResumeSync` after every visibilitychange,
+ *  and the cellular/Wi-Fi radio just-waking case can hang the first request
+ *  past the timeout even when the engine is responding fast. */
 export function refreshChangesState(): void {
-  apiFetchChanges({ limit: 15 }).then(state => {
-    const applied = state.applied || [];
-    changes.value = state.pending;
-    appliedChanges.value = applied;
-    changesHasMore.value = state.has_more_applied;
-    const ev = engineVersion.value;
-    const lev = latestEngineVersion.value;
-    const engineOutdated = !!(ev && lev && isNewerVersion(lev, ev));
-    restartRequired.value = state.restart_required || engineOutdated;
-    // Backend is the source of truth across page reloads — the live
-    // ChangeApplied SSE event isn't replayed, so the toast detail would
-    // otherwise be lost.
-    restartGroups.value = (state.restart_groups ?? []).map(g => ({
-      threadId: g.thread_id ?? '',
-      threadTitle: g.thread_title ?? 'unknown',
-      commits: g.commits,
-    }));
-    if (hasClientUpdateSincePageLoad(applied)) updateAvailable.value = true;
-    syncRestartToast();
-  }).catch(e => showToast(`Failed to fetch changes: ${errorDetail(e)}`, 'error'));
+  apiFetchChanges({ limit: 15 })
+    .catch(e => {
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        return apiFetchChanges({ limit: 15 });
+      }
+      throw e;
+    })
+    .then(state => {
+      const applied = state.applied || [];
+      changes.value = state.pending;
+      appliedChanges.value = applied;
+      changesHasMore.value = state.has_more_applied;
+      restartRequired.value = state.restart_required || isEngineOutdated();
+      // Backend is the source of truth across page reloads — the live
+      // ChangeApplied SSE event isn't replayed, so the toast detail would
+      // otherwise be lost.
+      restartGroups.value = (state.restart_groups ?? []).map(g => ({
+        threadId: g.thread_id ?? '',
+        threadTitle: g.thread_title ?? 'unknown',
+        commits: g.commits,
+      }));
+      if (hasClientUpdateSincePageLoad(applied)) updateAvailable.value = true;
+      syncRestartToast();
+    })
+    .catch(e => showToast(`Failed to fetch changes: ${errorDetail(e)}`, 'error'));
 }
 
 /** Apply a single pending change by ID. */

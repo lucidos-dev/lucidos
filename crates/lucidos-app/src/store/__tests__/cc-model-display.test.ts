@@ -181,9 +181,12 @@ describe('exchangeResponseModel for CC sessions', () => {
 
 describe('displayModelName', () => {
   it('maps known full model IDs to friendly labels', () => {
+    expect(displayModelName('claude-opus-4-7')).toBe('Opus 4.7');
+    expect(displayModelName('claude-opus-4-7[1m]')).toBe('Opus 4.7 (1M)');
     expect(displayModelName('claude-opus-4-6')).toBe('Opus 4.6');
-    expect(displayModelName('claude-sonnet-4-6')).toBe('Sonnet 4.6');
     expect(displayModelName('claude-opus-4-6[1m]')).toBe('Opus 4.6 (1M)');
+    expect(displayModelName('claude-sonnet-4-6')).toBe('Sonnet 4.6');
+    expect(displayModelName('claude-sonnet-4-6[1m]')).toBe('Sonnet 4.6 (1M)');
     expect(displayModelName('claude-haiku-4-5-20251001')).toBe('Haiku 4.5');
     expect(displayModelName('claude-opus-4-1')).toBe('Opus 4.1');
     expect(displayModelName('claude-opus-4-5@20251101')).toBe('Opus 4.5');
@@ -198,11 +201,11 @@ describe('displayModelName', () => {
     expect(displayModelName('some-custom-model')).toBe('some-custom-model');
   });
 
-  it('maps legacy short aliases to versioned labels', () => {
-    // Old events stored before the migration had short aliases.
-    // These are historical facts — opus was 4.6, sonnet was 4.6, haiku was 4.5.
+  it('maps CC short aliases (and their 1M variants) to versioned labels', () => {
     expect(displayModelName('opus')).toBe('Opus 4.6');
+    expect(displayModelName('opus[1m]')).toBe('Opus 4.6 (1M)');
     expect(displayModelName('sonnet')).toBe('Sonnet 4.6');
+    expect(displayModelName('sonnet[1m]')).toBe('Sonnet 4.6 (1M)');
     expect(displayModelName('haiku')).toBe('Haiku 4.5');
   });
 });

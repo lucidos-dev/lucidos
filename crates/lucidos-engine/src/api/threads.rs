@@ -329,16 +329,16 @@ pub(super) async fn suggest_title(
 /// instead of auto-spawning. We emit `ContinueSignal { reason: "user_clicked_continue" }`
 /// on the CC channel — the spawn dispatcher dedupes via the event id and
 /// re-enters CC via `--resume` against the recorded `cc_session_id`. The
-/// resume path then emits `SessionRecovered { actor: <user> }` BEFORE the
+/// resume path then emits `ContinuationStarted { actor: <user> }` BEFORE the
 /// first CC text arrives so the timeline reads "You restarted" → resume.
 ///
 /// **Chat / trigger threads.** Calls into `engine.continue_chat(...)` which
-/// emits `SessionRecovered` + `UserPromptInjected` (engine note summarizing
-/// completed tool pairs from the aborted run) and re-enters the agentic loop
-/// with a fresh `request_event_id`.
+/// emits `ContinuationStarted` + `UserPromptInjected` (engine note
+/// summarizing completed tool pairs from the aborted run) and re-enters the
+/// agentic loop with a fresh `request_event_id`.
 ///
 /// Body is empty. Idempotent — the chat path checks for an existing
-/// SessionRecovered newer than the latest abort; the CC dispatcher's
+/// ContinuationStarted newer than the latest abort; the CC dispatcher's
 /// `already_spawned` check rejects duplicates.
 pub(super) async fn continue_thread(
     State(state): State<AppState>,
@@ -589,11 +589,12 @@ pub struct ThreadSearchQuery {
     pub q: String,
 }
 
-/// Bound on how long archive_thread waits for cancel-fallout terminal event
-/// (ResponseCanceled / ResponseAborted / ResponseFailed) before emitting
-/// ThreadArchived anyway. The signal-driven cancel path normally lands the
-/// event in <100 ms; this is the safety net for a stuck CC subprocess.
-const CANCEL_FALLOUT_TIMEOUT_MS: u64 = 2000;
+/// Bound on how long archive_thread waits for the stop-fallout terminal event
+/// (`ResponseAborted` / `ResponseFailed`) before emitting `ThreadArchived`
+/// anyway. Only fires when CC was actively working (not idle) — the
+/// stop signal lands the event in <100 ms; this is the safety net for a
+/// stuck CC subprocess.
+const STOP_FALLOUT_TIMEOUT_MS: u64 = 2000;
 
 /// POST /api/threads/archive — archive a thread (emits ThreadArchived, moves to history)
 pub(super) async fn archive_thread(
@@ -653,56 +654,64 @@ pub(super) async fn archive_thread(
     )
     .await;
 
-    // Live CC subprocess: subscribe BEFORE cancel so the cancel-fallout
-    // terminal event lands in our buffer, then wait for it before emitting
-    // ThreadArchived. The wait serializes ResponseCanceled's projection update
-    // (section='inbox' per the lifecycle rule) BEFORE ThreadArchived's
-    // (section='archived') — without it, the trailing terminal commits last
-    // and undoes the archive ("click Archive twice" bug).
+    // Stop the CC session on archive. `stop_agent(StopReason::Archive, ...)`
+    // sets `pending_stop = Some(Archive)` on the session; the stop arm reads
+    // that and suppresses `ResponseCanceled` so `ThreadArchived` stays the sole
+    // terminator.
     //
-    // Idle threads need no cancel: end_stale_waiting_session would emit a
-    // spurious ResponseCanceled with the same race.
-    if state.engine.is_agent_running_for(thread_uuid).await {
+    // Wait for the fallout terminal ONLY when CC was actively working — the
+    // wait serializes any pre-existing pending terminal (e.g. `ResponseFailed`
+    // from a mid-stream API drop) BEFORE `ThreadArchived`, otherwise the
+    // trailing terminal commits last and undoes the archive ("click Archive
+    // twice" bug). On an idle session the stop arm emits nothing, so the wait
+    // would always time out for the full 2s.
+    let liveness = state.engine.agent_liveness(thread_uuid).await;
+    if liveness.running {
         let mut bus_rx = state.engine.event_bus.subscribe();
         if let Err(e) = state
             .engine
-            .cancel_agent(false, false, Some(thread_uuid), actor.clone())
+            .stop_agent(
+                crate::engine::claude_code::StopReason::Archive,
+                Some(thread_uuid),
+                actor.clone(),
+            )
             .await
         {
             log!("[API] Failed to end CC session on archive: {}", e);
         }
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(CANCEL_FALLOUT_TIMEOUT_MS),
-            async {
-                loop {
-                    match bus_rx.recv().await {
-                        Ok(evt) => {
-                            let crate::engine::event_bus::BusEvent::Thread {
-                                thread_id: tid,
-                                event,
-                                ..
-                            } = &evt.typed
-                            else {
-                                continue;
-                            };
-                            if *tid == thread_uuid
-                                && matches!(
+        if liveness.actively_working {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(STOP_FALLOUT_TIMEOUT_MS),
+                async {
+                    loop {
+                        match bus_rx.recv().await {
+                            Ok(evt) => {
+                                let crate::engine::event_bus::BusEvent::Thread {
+                                    thread_id: tid,
                                     event,
-                                    crate::engine::thread_events::ThreadEvent::ResponseCanceled { .. }
-                                        | crate::engine::thread_events::ThreadEvent::ResponseAborted { .. }
-                                        | crate::engine::thread_events::ThreadEvent::ResponseFailed { .. }
-                                )
-                            {
-                                return;
+                                    ..
+                                } = &evt.typed
+                                else {
+                                    continue;
+                                };
+                                if *tid == thread_uuid
+                                    && matches!(
+                                        event,
+                                        crate::engine::thread_events::ThreadEvent::ResponseAborted { .. }
+                                            | crate::engine::thread_events::ThreadEvent::ResponseFailed { .. }
+                                    )
+                                {
+                                    return;
+                                }
                             }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     }
-                }
-            },
-        )
-        .await;
+                },
+            )
+            .await;
+        }
     }
 
     state

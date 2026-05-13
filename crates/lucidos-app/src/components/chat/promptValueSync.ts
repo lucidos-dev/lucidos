@@ -22,16 +22,17 @@ export function syncTextareaValue(
   return true;
 }
 
-/** Decide whether to skip the textarea sync to protect an in-flight
- *  keystroke. Skip ONLY when the user is focused here AND has typed
- *  something locally (`el.value` non-empty). On initial autofocus after
- *  page reload el.value is empty, and the persisted draft text MUST reach
- *  the textarea — otherwise the input shows blank while the store and
- *  drawer label still reflect the saved draft. */
+/** Skip the textarea sync only when THIS specific element is the active one
+ *  and already holds locally-typed content. Element-identity (not "any
+ *  prompt-input with this thread id is active") matters: SplitLayout and
+ *  MobileSwipeContainer mount PromptInput twice with the same
+ *  `data-thread-id`, and the unfocused copy must still re-sync after a
+ *  Send on the focused copy. Empty `el.value` always re-syncs so the
+ *  persisted draft reaches the textarea on initial autofocus. */
 export function shouldSkipSyncWhileEditing(
   el: HTMLTextAreaElement,
   sameThread: boolean,
-  focusedHere: boolean,
+  thisElementActive: boolean,
 ): boolean {
-  return sameThread && focusedHere && el.value.length > 0;
+  return sameThread && thisElementActive && el.value.length > 0;
 }

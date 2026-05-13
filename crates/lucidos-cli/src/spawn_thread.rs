@@ -10,9 +10,12 @@
 //! `mode` defaults to "agent" since this CLI is invoked from CC subprocesses;
 //! override with --mode for engine-mode helpers.
 //!
-//! With `--parent`, the body emits `parent_thread_id` + `spawning_event_id`
-//! instead, for same-workspace parent-with-callback spawns. Target workspace
-//! basename must match $LUCIDOS_WORKSPACE basename in --parent mode (else error).
+//! `--relation sub` emits `parent_thread_id` + `spawning_event_id` instead of
+//! `caller_*` fields, for same-workspace parent-with-callback spawns. The
+//! target workspace basename must match `$LUCIDOS_WORKSPACE` basename in
+//! `sub` mode (else error). `--relation top` (the default) emits caller_*
+//! and never gets a callback. `--parent` is a deprecated alias for
+//! `--relation sub` and prints a stderr warning.
 //!
 //! The CLI generates the new thread's UUID up front and includes it in the
 //! request body so it can print a `[title](thread:workspace/uuid)` markdown
@@ -22,7 +25,7 @@
 use std::path::PathBuf;
 
 use crate::workspace::{read_api_port, BoxError};
-use crate::SpawnThreadArgs;
+use crate::{CliRelation, SpawnThreadArgs};
 
 pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     let target_root = resolve_target(&args.to)?;
@@ -39,12 +42,25 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    if args.parent {
-        // Same-workspace + parent-callback semantics. Verify target == caller.
+    // Resolve relation: explicit `--relation` wins; `--parent` is a
+    // deprecated alias for `--relation sub` (warn once on stderr); otherwise
+    // default to `top` so existing cross-workspace recipes keep their
+    // fire-and-forget behavior.
+    let relation = match (args.relation, args.parent) {
+        (Some(r), _) => r,
+        (None, true) => {
+            eprintln!("warning: --parent is deprecated; use --relation sub");
+            CliRelation::Sub
+        }
+        (None, false) => CliRelation::Top,
+    };
+
+    if matches!(relation, CliRelation::Sub) {
         let caller_basename = caller_workspace.as_deref().unwrap_or("");
         if target_basename != caller_basename {
             return Err(format!(
-                "--parent requires --to to match $LUCIDOS_WORKSPACE basename ({}), got {}",
+                "--relation sub requires --to to match $LUCIDOS_WORKSPACE basename ({}), got {} \
+                 — same-workspace only (callbacks across workspaces are unsupported)",
                 caller_basename, target_basename
             ).into());
         }
@@ -77,13 +93,16 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     if let Some(m) = args.model { obj.insert("model".into(), m.into()); }
     if let Some(r) = repo { obj.insert("repo_id".into(), r.into()); }
 
-    if args.parent {
-        if let Some(t) = caller_thread_id { obj.insert("parent_thread_id".into(), t.into()); }
-        if let Some(e) = caller_event_id { obj.insert("spawning_event_id".into(), e.into()); }
-    } else {
-        if let Some(w) = caller_workspace { obj.insert("caller_workspace".into(), w.into()); }
-        if let Some(t) = caller_thread_id { obj.insert("caller_thread_id".into(), t.into()); }
-        if let Some(e) = caller_event_id { obj.insert("caller_event_id".into(), e.into()); }
+    match relation {
+        CliRelation::Sub => {
+            if let Some(t) = caller_thread_id { obj.insert("parent_thread_id".into(), t.into()); }
+            if let Some(e) = caller_event_id { obj.insert("spawning_event_id".into(), e.into()); }
+        }
+        CliRelation::Top => {
+            if let Some(w) = caller_workspace { obj.insert("caller_workspace".into(), w.into()); }
+            if let Some(t) = caller_thread_id { obj.insert("caller_thread_id".into(), t.into()); }
+            if let Some(e) = caller_event_id { obj.insert("caller_event_id".into(), e.into()); }
+        }
     }
 
     let scheme = if args.insecure_http { "http" } else { "https" };

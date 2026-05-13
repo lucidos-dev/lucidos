@@ -316,6 +316,7 @@ fn system_notification_created_matches_server_event_shape() {
             message: "Hello".into(),
             task_id: None,
             app_id: None,
+            thread_id: None,
         }),
         aggregate: None,
     };
@@ -521,6 +522,7 @@ fn reserved_type_names_match_event_type() {
             message: "m".into(),
             task_id: None,
             app_id: None,
+            thread_id: None,
         },
         NotificationRead {
             id: "x".into(),
@@ -685,6 +687,7 @@ fn notification_created_is_persisted() {
         message: "Hello".into(),
         task_id: Some("t-1".into()),
         app_id: Some("morning-brief".into()),
+        thread_id: Some("11111111-1111-1111-1111-111111111111".into()),
     };
     assert!(event.is_persisted());
     assert_eq!(event.aggregate(), "notification");
@@ -703,6 +706,7 @@ fn notification_created_skips_none_fields_in_sse() {
             message: "Something happened".into(),
             task_id: None,
             app_id: None,
+            thread_id: None,
         }),
         aggregate: None,
     };
@@ -714,6 +718,33 @@ fn notification_created_skips_none_fields_in_sse() {
     assert!(
         json["data"].get("app_id").is_none(),
         "None app_id should be skipped"
+    );
+    assert!(
+        json["data"].get("thread_id").is_none(),
+        "None thread_id should be skipped"
+    );
+}
+
+#[test]
+fn notification_created_carries_thread_id_in_sse() {
+    let emitted = EmittedEvent {
+        event_id: Uuid::new_v4(),
+        seq: None,
+        created: Utc::now(),
+        typed: BusEvent::System(SystemEvent::NotificationCreated {
+            id: "n-3".into(),
+            title: "Workspace learning".into(),
+            message: "Report at artifacts/...".into(),
+            task_id: None,
+            app_id: None,
+            thread_id: Some("22222222-2222-2222-2222-222222222222".into()),
+        }),
+        aggregate: None,
+    };
+    let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
+    assert_eq!(
+        json["data"]["thread_id"], "22222222-2222-2222-2222-222222222222",
+        "thread_id should ride along on the SSE frame so the inbox can deep-link"
     );
 }
 
@@ -1276,19 +1307,19 @@ async fn test_fan_out_parent_callback() {
     );
     for cb in &callbacks {
         assert_eq!(cb.parent_thread_id, parent_id);
-        assert!(
-            cb.callback_text.contains("completed"),
-            "callback_text should contain 'completed', got: {}",
-            cb.callback_text
-        );
-        // Regression: orchestrators were stopping when a child's result said
-        // "session can finish". The wrapper must explicitly tell the parent
-        // that such phrases scope to the child only.
-        assert!(
-            cb.callback_text.contains("session can finish")
-                && cb.callback_text.contains("child subprocess"),
-            "callback_text must clarify that 'session can finish' refers to the child only, got: {}",
-            cb.callback_text
+        // Phase-4 child-completion-card refactor: ParentCallback no longer
+        // carries a synthesized `wake_text` chat bubble. The structured
+        // outcome (status, title, summary, pending changes) lives in the
+        // typed `ChildThreadCompleted` event already persisted on the
+        // parent's history; the callback just carries that event id so the
+        // resume path can attribute the parent LLM's response back to it
+        // (request_event_id → response panel of the same exchange — see
+        // docs/plans/2026-05-12-child-completion-card-design.md). Assert
+        // the linkage exists and the typed event is on the parent.
+        assert_ne!(
+            cb.child_completed_event_id,
+            uuid::Uuid::nil(),
+            "ParentCallback must carry the typed event id"
         );
     }
 
@@ -1301,6 +1332,111 @@ async fn test_fan_out_parent_callback() {
         callback_children, expected_children,
         "each callback should reference a different child thread"
     );
+
+    // Verify the typed ChildThreadCompleted events were actually persisted
+    // on the parent — every callback carries the event id of one of these
+    // rows, so a missing row would mean the parent's resume path attributes
+    // its response to a phantom card.
+    let cc_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted'"
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        cc_count, 3,
+        "expected 3 ChildThreadCompleted events on parent (one per child)"
+    );
+
+    // Each callback's child_completed_event_id must be a real persisted
+    // event row on the parent — the resume path stamps it as
+    // `request_event_id` on the parent LLM's response, so a phantom id
+    // would have the response panel grouping under nothing.
+    for cb in &callbacks {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(\
+                SELECT 1 FROM events \
+                WHERE id = $1 AND event_type = 'ChildThreadCompleted' AND aggregate_id = $2\
+            )",
+        )
+        .bind(cb.child_completed_event_id)
+        .bind(parent_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            exists,
+            "ParentCallback carries event id {} which must be a persisted ChildThreadCompleted row on parent {}",
+            cb.child_completed_event_id, parent_id
+        );
+    }
+
+    // Phase 4 child-completion-card refactor: the wake path must NOT
+    // persist a synthetic MessageReceived ("Child thread X completed.
+    // See the [CHILD THREAD COMPLETED] block in your conversation
+    // history") on the parent — that bubble is what the typed event +
+    // ChildCompletionCard replaces. The parent gets exactly one
+    // MessageReceived (the original "do three things") plus the three
+    // typed ChildThreadCompleted rows; no extra MessageReceived per
+    // wake-up.
+    let parent_mr_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'MessageReceived'",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        parent_mr_count, 1,
+        "wake path must NOT persist a synthetic MessageReceived on the parent; \
+         expected exactly the original prompt's MR, got {}",
+        parent_mr_count
+    );
+
+    // Spot-check one row's payload for the expected typed shape: status,
+    // child_thread_id, and pending_change_ids must round-trip the event.
+    let row: (serde_json::Value,) = sqlx::query_as(
+        "SELECT payload FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted' \
+         ORDER BY created LIMIT 1",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let payload = row.0;
+    let status = payload
+        .get("status")
+        .and_then(|v| v.as_str())
+        .expect("status field present");
+    assert!(
+        matches!(status, "success" | "failure" | "no_changes"),
+        "status must be one of the typed enum variants, got {:?}",
+        status
+    );
+    let child_id_str = payload
+        .get("child_thread_id")
+        .and_then(|v| v.as_str())
+        .expect("child_thread_id field present");
+    let parsed: Uuid = child_id_str
+        .parse()
+        .expect("child_thread_id is a UUID string");
+    assert!(
+        child_ids.contains(&parsed),
+        "child_thread_id must match one of the spawned children"
+    );
+    // `pending_change_ids` is `skip_serializing_if = "Vec::is_empty"` (chat
+    // children and no-changes CC idles produce []), so just assert the
+    // shape: when present, it's an array. The CC-with-changes path is
+    // exercised by the changes-projection-aware integration tests.
+    if let Some(v) = payload.get("pending_change_ids") {
+        assert!(
+            v.is_array(),
+            "pending_change_ids must be an array when present, got {:?}",
+            v
+        );
+    }
 
     // Cleanup
     pool.close().await;
@@ -1419,6 +1555,116 @@ async fn test_fan_out_chat_children_all_report_back() {
     .await;
 
     // Cleanup
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// `relation: "top"` on `run_thread` / `run_claude` produces a top-thread:
+/// the spawned thread carries `parent_thread_id = NULL` in its
+/// MessageReceived. `notify_parent_if_child` must early-return on the NULL
+/// projection lookup, so the fan-out callback channel must stay empty and
+/// the (would-be) spawning thread's `active_children_count` must stay at
+/// zero. This is the projection-side contract that makes top-relation
+/// fire-and-forget — without it, top spawns would silently behave like sub
+/// spawns whenever the wiring layer regressed.
+#[tokio::test]
+async fn test_top_relation_thread_does_not_callback_or_increment_count() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let spawning_id = Uuid::new_v4();
+    let top_thread_id = Uuid::new_v4();
+
+    // Spawning thread (the one that "would have been" the parent).
+    bus.emit(BusEvent::Thread {
+        thread_id: spawning_id,
+        event: ThreadEvent::MessageReceived {
+            text: "kick off some research".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    // Top-thread the agent spawns: parent_thread_id is None on purpose.
+    bus.emit(BusEvent::Thread {
+        thread_id: top_thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "do the research independently".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    assert_active_children(
+        &pool,
+        spawning_id,
+        0,
+        "top-thread spawn must not increment the spawning thread's active_children_count",
+    )
+    .await;
+
+    // Top-thread reaches a terminal state. Sub-thread regression test
+    // covers the "callback fires" path; here we assert the inverse: no
+    // callback for a thread with NULL parent.
+    bus.emit(BusEvent::Thread {
+        thread_id: top_thread_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "all done — independent thread.".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let mut callbacks = vec![];
+    while let Ok(cb) = callback_rx.try_recv() {
+        callbacks.push(cb);
+    }
+    assert!(
+        callbacks.is_empty(),
+        "top-thread terminal must not produce a parent callback (got {} callbacks)",
+        callbacks.len()
+    );
+
+    assert_active_children(
+        &pool,
+        spawning_id,
+        0,
+        "spawning thread's active_children_count must stay 0 after top-thread terminates",
+    )
+    .await;
+
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -2105,6 +2351,7 @@ async fn test_permission_request_transitions_status_to_waiting_for_user_answer()
             request_id: "req-1".into(),
             allowed: true,
             reason: None,
+            persist_scope: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::CodingAgent),
@@ -2349,6 +2596,7 @@ async fn test_active_children_decremented_on_canceled_child() {
             images: vec![],
             model: None,
             reasoning_effort: None,
+            cause: crate::engine::thread_events::CancelCause::UserStop,
         },
         meta: EventMeta::NONE,
     })
@@ -2367,8 +2615,12 @@ async fn test_active_children_decremented_on_canceled_child() {
     teardown_test_db(&db_name).await;
 }
 
+/// Transient `ResponseAborted` (engine shutdown, recovery sweep) is mid-retry —
+/// the engine resumes the child on next visit. The active-children counter
+/// must stay put so the parent's UI keeps showing the child as still running
+/// until either resume succeeds (no change) or the user explicitly cancels.
 #[tokio::test]
-async fn test_active_children_decremented_on_aborted_child() {
+async fn test_active_children_not_decremented_on_transient_aborted_child() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -2382,6 +2634,46 @@ async fn test_active_children_decremented_on_aborted_child() {
             images: vec![],
             model: None,
             reasoning_effort: None,
+            cause: crate::engine::thread_events::AbortCause::EngineShutdown,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    assert_active_children(
+        &pool,
+        parent_id,
+        1,
+        "parent active_children_count must stay at 1 after transient abort — \
+         the engine resumes the child on next visit",
+    )
+    .await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Terminal `ResponseAborted` (SafetyNet / ProcessKilled) is unrecoverable
+/// without explicit user resume — the parent's counter must drop or the
+/// parent UI displays as Active forever (regression of the bug fixed by
+/// commit 5a017815c).
+#[tokio::test]
+async fn test_active_children_decremented_on_terminal_aborted_child() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::Chat).await;
+    assert_active_children(&pool, parent_id, 1, "parent should have 1 active child").await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::ResponseAborted {
+            text: "".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+            cause: crate::engine::thread_events::AbortCause::SafetyNet,
         },
         meta: EventMeta::NONE,
     })
@@ -2392,7 +2684,8 @@ async fn test_active_children_decremented_on_aborted_child() {
         &pool,
         parent_id,
         0,
-        "parent active_children_count must be 0 after child aborted",
+        "parent active_children_count must drop to 0 after terminal abort \
+         (SafetyNet) — without it the parent stays Active forever",
     )
     .await;
 
@@ -2418,6 +2711,7 @@ async fn test_cc_child_session_ended_without_idle_decrements_parent() {
             images: vec![],
             model: None,
             reasoning_effort: None,
+            cause: crate::engine::thread_events::CancelCause::UserStop,
         },
         meta: EventMeta::NONE,
     })
@@ -2470,6 +2764,7 @@ async fn test_cc_child_canceled_without_session_ended_decrements_parent() {
             images: vec![],
             model: None,
             reasoning_effort: None,
+            cause: crate::engine::thread_events::CancelCause::UserStop,
         },
         meta: EventMeta::NONE,
     })
@@ -2489,10 +2784,10 @@ async fn test_cc_child_canceled_without_session_ended_decrements_parent() {
     teardown_test_db(&db_name).await;
 }
 
-/// Symmetric to the cancel case: a CC sub-thread aborted (engine-driven) without
-/// ever emitting CodingAgentIdled or SessionEnded must still decrement the parent.
+/// Transient-cause CC abort (EngineShutdown / RecoveryAfterRestart) is
+/// mid-retry — must NOT decrement, the engine resumes on next visit.
 #[tokio::test]
-async fn test_cc_child_aborted_without_session_ended_decrements_parent() {
+async fn test_cc_child_transient_abort_does_not_decrement_parent() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -2507,6 +2802,46 @@ async fn test_cc_child_aborted_without_session_ended_decrements_parent() {
             images: vec![],
             model: None,
             reasoning_effort: None,
+            cause: crate::engine::thread_events::AbortCause::EngineShutdown,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    assert_active_children(
+        &pool,
+        parent_id,
+        1,
+        "parent active_children_count must stay at 1 after transient CC abort \
+         — the engine resumes the child on next visit",
+    )
+    .await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Terminal-cause CC abort (SafetyNet / ProcessKilled) is unrecoverable
+/// without explicit user resume — must decrement (regression of 5a017815c
+/// otherwise: parent stays Active forever).
+#[tokio::test]
+async fn test_cc_child_terminal_abort_decrements_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::CodingAgent).await;
+    emit_cc_session_started(&bus, child_id).await;
+    assert_active_children(&pool, parent_id, 1, "parent should have 1 active child").await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::ResponseAborted {
+            text: "".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+            cause: crate::engine::thread_events::AbortCause::ProcessKilled,
         },
         meta: EventMeta::NONE,
     })
@@ -2517,7 +2852,8 @@ async fn test_cc_child_aborted_without_session_ended_decrements_parent() {
         &pool,
         parent_id,
         0,
-        "parent active_children_count must be 0 after CC child aborted without SessionEnded",
+        "parent active_children_count must drop to 0 after terminal CC abort \
+         (ProcessKilled) — without it the parent stays Active forever",
     )
     .await;
 
@@ -2545,6 +2881,7 @@ async fn test_cc_child_idle_after_cancel_does_not_double_decrement() {
             images: vec![],
             model: None,
             reasoning_effort: None,
+            cause: crate::engine::thread_events::CancelCause::UserStop,
         },
         meta: EventMeta::NONE,
     })
@@ -3496,6 +3833,7 @@ async fn response_aborted_surfaces_chat_thread_to_inbox() {
             images: vec![],
             model: None,
             reasoning_effort: None,
+            cause: crate::engine::thread_events::AbortCause::EngineShutdown,
         },
         meta: EventMeta::NONE,
     })
@@ -3576,6 +3914,7 @@ async fn response_canceled_sets_has_response_true() {
             images: vec![],
             model: None,
             reasoning_effort: None,
+            cause: crate::engine::thread_events::CancelCause::UserStop,
         },
         meta: EventMeta::NONE,
     })
@@ -4716,6 +5055,7 @@ async fn startup_skips_already_resolved_permission_requests() {
             request_id: "req-done".into(),
             allowed: true,
             reason: None,
+            persist_scope: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::CodingAgent),
@@ -5048,20 +5388,24 @@ async fn archived_then_cc_idled_undoes_archive() {
     teardown_test_db(&db_name).await;
 }
 
-/// Bug-pinning counter-test for the ResponseCanceled variant of the same race:
-/// archive_thread calls cancel_agent (signal-based, async) then emits
-/// ThreadArchived. The cancel surfaces a ResponseCanceled AFTER ThreadArchived,
-/// whose section transition flips section back to 'inbox' — so the user
-/// clicks Archive, sees navigation, but the thread reappears in REVIEW.
-/// archive_thread must wait for the cancel-fallout terminal event to settle
-/// before emitting ThreadArchived.
+/// Projection invariant: a `ResponseCanceled` arriving AFTER `ThreadArchived`
+/// flips the thread's section back to 'inbox', undoing the archive.
+///
+/// `archive_thread` itself no longer produces this sequence — `stop_agent` is
+/// called with `StopReason::Archive` which sets `archiving=true` so the stop
+/// arm suppresses `ResponseCanceled` (`ThreadArchived` is the terminator).
+/// This test pins the projection rule for any OTHER caller that emits a
+/// trailing `ResponseCanceled` (e.g. an in-flight cancel that races the
+/// archive). The lifecycle rule (`ResponseCanceled → to_inbox`) intentionally
+/// surfaces the thread so the user can act; if archive_thread regresses and
+/// starts emitting a trailing `ResponseCanceled`, this test catches it.
 #[tokio::test]
 async fn archived_then_response_canceled_undoes_archive() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
 
-    start_cc_session(&bus, thread_id, "claude-code/cancel-race").await;
+    start_cc_session(&bus, thread_id, "claude-code/stop-race").await;
     emit_cc_idle(&bus, thread_id, true, None).await;
 
     bus.emit(BusEvent::Thread {
@@ -5078,6 +5422,7 @@ async fn archived_then_response_canceled_undoes_archive() {
             images: vec![],
             model: None,
             reasoning_effort: None,
+            cause: crate::engine::thread_events::CancelCause::UserStop,
         },
         meta: EventMeta::NONE,
     })
@@ -5123,6 +5468,7 @@ async fn sse_thread_event_carries_aggregate() {
             images: vec![],
             model: None,
             reasoning_effort: None,
+            cause: crate::engine::thread_events::CancelCause::UserStop,
         },
         meta: EventMeta::NONE,
     })
@@ -5963,6 +6309,7 @@ fn persisted_system_events_round_trip_through_json() {
             message: "Hello".into(),
             task_id: Some("t-1".into()),
             app_id: Some("morning-brief".into()),
+            thread_id: Some("33333333-3333-3333-3333-333333333333".into()),
         },
         SystemEvent::PreferencesChanged {
             key: "timezone".into(),
@@ -6894,7 +7241,7 @@ async fn message_received_overrides_stale_compose_source_on_composing_to_active(
 
 /// Regression: `register_thread_queued`'s 60s eviction used to leak a
 /// `ResponseCanceled` (no actor) onto the evicted thread because the
-/// downstream cancel arms read `is_shutdown=false` and defaulted to
+/// downstream stop arm read `is_shutdown=false` and defaulted to
 /// "user-driven cancel" semantics. The frontend then rendered "Canceled"
 /// next to the affected exchange — misleading users into thinking they
 /// pressed Stop. The fix emits `ResponseAborted` with `actor=System`
@@ -6959,6 +7306,297 @@ async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
     // 'failed' (not 'idle') so the UI shows the error indicator — eviction is
     // a hard failure, not a clean dismissal.
     assert_eq!(status, "failed");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// I3: a child's `ResponseFailed` with a giant error string (panic + stack
+/// trace, hostile user input, etc.) must NOT propagate the full text into
+/// the parent's `ChildThreadCompleted.summary`. The failure path caps at
+/// 200 chars + "… (truncated)" — separate from the success path's 2000-char
+/// budget, because failures are usually noise we don't want dominating the
+/// parent's resume context.
+#[tokio::test]
+async fn child_thread_completed_failure_summary_capped_at_200_chars() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+
+    // Parent + chat child wired up so the fan-in path runs.
+    bus.emit(BusEvent::Thread {
+        thread_id: parent_id,
+        event: ThreadEvent::MessageReceived {
+            text: "do thing".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::MessageReceived {
+            text: "subtask".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: Some(parent_id),
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    // 5000-char error — well over both the 200 (failure) and 2000 (success)
+    // caps. Should be truncated to ≤ ~213 chars (200 + ellipsis suffix).
+    let huge_error = "X".repeat(5000);
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::ResponseFailed {
+            error: huge_error,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let row: (serde_json::Value,) = sqlx::query_as(
+        "SELECT payload FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted' \
+         ORDER BY created LIMIT 1",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("ChildThreadCompleted must be persisted on parent");
+    let summary = row
+        .0
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .expect("summary field present")
+        .to_string();
+    let status = row
+        .0
+        .get("status")
+        .and_then(|v| v.as_str())
+        .expect("status field present");
+
+    assert_eq!(status, "failure", "status must be failure for ResponseFailed");
+    // 200 chars of payload + "… (truncated)" suffix.
+    assert!(
+        summary.ends_with("… (truncated)"),
+        "long failure summary must carry the truncation marker, got len={}, summary={:?}",
+        summary.len(),
+        summary
+    );
+    // Total length: 200 chars of "X" + the ellipsis suffix. The ellipsis is
+    // 13 chars but as bytes it's 15 (the "…" char takes 3 bytes). Assert
+    // the byte length is small enough that no stack-trace flooding is
+    // possible — << 250 bytes.
+    assert!(
+        summary.len() <= 250,
+        "failure summary must be truncated at 200 chars (+ short suffix), got len={} bytes",
+        summary.len()
+    );
+    // And the prefix must be the original payload (not garbage).
+    assert!(
+        summary.starts_with("XXX"),
+        "summary must keep the prefix of the original error, got: {:?}",
+        summary
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression: a system-actor synthetic `ToolResult` (the recovery sweep's
+/// backfill that pairs an orphan `ToolCalled` so the next LLM call doesn't
+/// trip the Anthropic API's "tool_use without tool_result" rule) must NOT
+/// resurrect a terminated thread to `status='running'`. The activity-event
+/// arm's normal "bump to Running" exists as defense-in-depth against
+/// premature `CodingAgentIdled` drift on a *live* turn — system-stamped
+/// activity events arrive long after the turn is already settled (see
+/// `recover_orphan_tool_calls` in `engine/chat/recovery.rs`), so the bump is
+/// wrong for them. Without this guard, every engine restart that finds
+/// orphan ToolCalled events on already-terminated threads silently parks
+/// those threads in the Active section forever.
+#[tokio::test]
+async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+
+    // 1. Live exchange: user message arrives, thread goes Running.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "do a thing".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    // 2. Engine crashes mid-tool: ToolCalled writes, ToolResult never does.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ToolCalled {
+            name: "run_python".into(),
+            args: serde_json::json!({"code": "print(1)"}),
+            description: String::new(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    // 3. Engine restarts — chat orphan-thread sweep emits ResponseAborted
+    //    (EngineShutdown). For a chat thread (cc_has_changes=false) that
+    //    maps to status='failed'.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseAborted {
+            text: "interrupted".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+            cause: crate::engine::thread_events::AbortCause::EngineShutdown,
+        },
+        meta: EventMeta::with_actor(Some(MessageOrigin::system())),
+    })
+    .await
+    .unwrap();
+
+    let after_abort: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        after_abort, "failed",
+        "ResponseAborted with cc_has_changes=false must mark the thread failed"
+    );
+
+    // 4. Tool-orphan sweep emits the synthetic ToolResult (system actor) to
+    //    pair the orphan ToolCalled. This MUST NOT resurrect status to
+    //    'running' — the thread's last lifecycle event is still the abort
+    //    above; nothing has actually re-entered the LLM loop.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ToolResult {
+            name: "run_python".into(),
+            result: "[Tool execution interrupted by engine restart — original ToolCalled event_id: \
+                     00000000-0000-0000-0000-000000000000]"
+                .into(),
+            images: vec![],
+            success: false,
+        },
+        meta: EventMeta::with_actor(Some(MessageOrigin::system())),
+    })
+    .await
+    .unwrap();
+
+    let after_synthetic: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        after_synthetic, "failed",
+        "system-actor synthetic ToolResult must not resurrect status to 'running' — \
+         the recovery backfill is not live activity"
+    );
+
+    // 5. Sanity check: a live (no-actor) ToolResult arriving while the
+    //    thread is still Running keeps the existing "bump to running"
+    //    behavior. This guards against the fix accidentally killing the
+    //    defense-in-depth path the activity arm exists for.
+    let live_thread = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id: live_thread,
+        event: ThreadEvent::MessageReceived {
+            text: "live".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    bus.emit(BusEvent::Thread {
+        thread_id: live_thread,
+        event: ThreadEvent::ToolResult {
+            name: "search".into(),
+            result: "ok".into(),
+            images: vec![],
+            success: true,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    let live_status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(live_thread)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        live_status, "running",
+        "live (no-actor) ToolResult must still bump status to 'running' — \
+         the System-actor guard must not regress the live-activity path"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;

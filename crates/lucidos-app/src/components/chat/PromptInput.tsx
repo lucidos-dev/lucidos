@@ -1,17 +1,28 @@
 import { useRef, useEffect, useState } from 'preact/hooks';
 import { signal } from '@preact/signals';
-import { pendingChatMessage, showToast, inputMode, openImagePopup, focusedThreadId, threadMap, repositories, selectedRepoId, panelUrl, panelTitle, cancelingThreadIds, effectiveThreadStatus, getThreadDisplaySection, isMidTurn } from '../../store/store';
+import { pendingChatMessage, showToast, inputMode, openImagePopupFromGroup, focusedThreadId, threadMap, repositories, selectedRepoId, panelUrl, panelTitle, cancelingThreadIds, effectiveThreadStatus, getThreadDisplaySection, isMidTurn } from '../../store/store';
 import { sendMessage, loadRepositories, handleCancelExchange } from '../../store/actions/chat';
 import { handleSaveThread, handleUnsaveThread, handleArchiveThread } from '../../store/actions/threads';
+import { answerCCQuestion } from '../../store/actions/chat-claude-code';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
+import { computeExchanges, findQuestionAnswer, type AnswerKind, type ThreadState } from '../../store/thread-events';
+import {
+  multiSelectedByToolUse,
+  pendingAnswerByToolUse,
+  getMultiSelectedIds,
+  setMultiSelectedIds,
+  setPendingAnswer,
+  clearPendingAnswer,
+} from './QuestionCard';
 import { updateCompose, discardCompose, sendCompose, sendFollowup, ensureFocusedComposeThread, type ComposeMode } from '../../store/actions/compose';
 import { getDraft } from '../../store/composeDrafts';
-import { scrollToBottom, scrolledUp } from './scrollState';
+import { scrollToBottom, preserveAtBottom } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon } from '../shared/icons';
 import { Dropdown } from '../shared/Dropdown';
 import { CCControlMenu, ccMenuOpenRequest } from './CCControlMenu';
-import { WaitingBanner, getWaitingState, type BannerState } from './WaitingBanner';
-import { focusIfNeeded, composeHandlers, isComposeFocusedHere } from './promptFocus';
+import { getBannerSlots, getWaitingState, type BannerState } from './WaitingBanner';
+import { useFitsInOneRow } from '../../hooks/useFitsInOneRow';
+import { focusIfNeeded, composeHandlers } from './promptFocus';
 import { syncTextareaValue, shouldSkipSyncWhileEditing } from './promptValueSync';
 import { effectiveSendMode } from './promptToggleMode';
 import { resizeTextarea, useFontMetricsResize } from './promptResize';
@@ -29,8 +40,8 @@ const cameraOpen = signal(false);
  *  running/waiting_for_user_answer yet. Drives the optimistic Send→Cancel
  *  morph so the action slot doesn't flash empty during the request gap.
  *  Cleared when the thread becomes cancellable (via the effect below) or
- *  on send failure (via the catch handler in submit). Only consumed here. */
-const submittingThreadIds = signal<Set<string>>(new Set());
+ *  on send failure (via the catch handler in submit). */
+export const submittingThreadIds = signal<Set<string>>(new Set());
 
 function addImageFile(file: File) {
   attachImageToActiveDraft(file).catch((err) => {
@@ -122,7 +133,7 @@ export function composeHasContent(
 //   canceling   — visible, red,  disabled, label "Cancel..."
 //   placeholder — invisible (visibility:hidden, takes space) to keep row height
 //   hidden      — not rendered; banner or section buttons own the slot
-export type MorphMode = 'send' | 'cancel' | 'canceling' | 'placeholder' | 'hidden';
+type MorphMode = 'send' | 'cancel' | 'canceling' | 'placeholder' | 'hidden';
 
 export function computeMorphMode(args: {
   hasContent: boolean;
@@ -134,6 +145,69 @@ export function computeMorphMode(args: {
   if (args.cancelTargetId !== null) return args.isCanceling ? 'canceling' : 'cancel';
   if (args.hasBannerOrSectionButtons) return 'hidden';
   return 'placeholder';
+}
+
+// Stamp cancelTargetId BEFORE invoking send. sendCompose's sync prefix
+// clears the draft and flips state→'active' (section buttons appear); if
+// cancelTargetId is still null at that render, morphMode resolves to
+// 'hidden', the button unmounts, and Send→Cancel blinks instead of morphing.
+// Raw new sends (threadId null) have no prior button to preserve and pick up
+// the new id from focusedThreadId after send's sync prefix runs setFocusedThread.
+export function dispatchSend(
+  threadId: string | null,
+  send: () => Promise<void>,
+): { promise: Promise<void>; submittedId: string | null } {
+  if (threadId) {
+    const next = new Set(submittingThreadIds.value);
+    next.add(threadId);
+    submittingThreadIds.value = next;
+  }
+  const promise = send();
+  const submittedId = threadId ?? focusedThreadId.value;
+  if (!threadId && submittedId) {
+    const next = new Set(submittingThreadIds.value);
+    next.add(submittedId);
+    submittingThreadIds.value = next;
+  }
+  return { promise, submittedId };
+}
+
+// Toggled options + the textarea's custom answer each count as one selection.
+// Whitespace-only text is dropped to mirror submitMultiAnswer's text.trim().
+export function computeSubmitMultiCount(toggledCount: number, customAnswerText: string): number {
+  return toggledCount + (customAnswerText.trim().length > 0 ? 1 : 0);
+}
+
+/** Latest unanswered multi-select `UserQuestionAsked` on the thread — each
+ *  pending question lives in its own divider exchange (the `UserQuestionAsked`
+ *  is the exchange's `userEvent`). Callers must gate by status; this walks
+ *  every exchange and is too expensive to run on every keystroke otherwise. */
+export function findPendingMultiSelectQuestion(
+  thread: ThreadState | undefined,
+): { toolUseId: string } | null {
+  if (!thread) return null;
+  const exchanges = computeExchanges(thread);
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const ex = exchanges[i];
+    const ue = ex.userEvent;
+    if (ue.type !== 'UserQuestionAsked' || !ue.multi_select) continue;
+    if (findQuestionAnswer(ex, ue.tool_use_id)) return null;
+    return { toolUseId: ue.tool_use_id };
+  }
+  return null;
+}
+
+// Apply & Restart is the only case where the bottom sub-row
+// [Save][Discard][Apply & Restart] still overflows a phone-width
+// .prompt-actions-subrow (no flex-wrap) after Diff lifts. Lift Save too so
+// [Discard][Apply & Restart] stays on a row that fits.
+export function shouldLiftSectionButtons(
+  isStacked: boolean,
+  bannerState: BannerState | null,
+): boolean {
+  return isStacked
+    && bannerState?.type === 'actions'
+    && bannerState.requiresRestart;
 }
 
 // Archive on Review threads is rendered by WaitingBanner (via resolveActions);
@@ -149,9 +223,10 @@ export function computeMorphMode(args: {
 // a saved one in `saved` (✓ Saved). The review/archive arms here only matter
 // for the rare race where status flips before display_section recomputes.
 //
-// Pending Apply wins over everything (even active): WaitingBanner owns
-// Discard + Apply, and a saved+pending thread can't be distinguished from
-// unsaved+pending by section alone — suppress all section buttons.
+// Pending Apply: WaitingBanner owns Discard + Apply. Save / ✓ Saved still
+// shows next to it so the user can park the thread without resolving the
+// pending change first. Archive is suppressed — a thread with pending changes
+// shouldn't be archived, that's what Discard is for.
 //
 // Composing (hasContent): Send/Discard owns the action slot. Saved keeps its
 // unsave toggle so the user can drop a Saved draft without sending first.
@@ -161,7 +236,7 @@ export function getPromptSectionButtons(
   hasPendingChanges: boolean,
   hasContent: boolean,
 ): Array<'save' | 'archive' | 'unsave'> {
-  if (hasPendingChanges) return [];
+  if (hasPendingChanges) return section === 'saved' ? ['unsave'] : ['save'];
   if (hasContent) return section === 'saved' ? ['unsave'] : [];
   switch (section) {
     case 'review': return isActive ? [] : ['save'];
@@ -177,6 +252,7 @@ function SavePromptButton({ threadId }: { threadId: string }) {
       class="action-btn action-btn-confirm save-thread-btn"
       onClick={() => handleSaveThread(threadId)}
       aria-label="Save thread"
+      data-row-item
     >
       Save
     </button>
@@ -189,6 +265,7 @@ function ArchiveSavedPromptButton({ threadId }: { threadId: string }) {
       class="action-btn"
       onClick={() => handleArchiveThread(threadId)}
       aria-label="Archive thread"
+      data-row-item
     >
       Archive
     </button>
@@ -204,6 +281,7 @@ function UnsaveSavedPromptButton({ threadId }: { threadId: string }) {
       class="action-btn action-btn-confirm save-thread-btn"
       onClick={() => handleUnsaveThread(threadId)}
       aria-label="Remove thread from Saved section"
+      data-row-item
     >
       ✓ Saved
     </button>
@@ -214,6 +292,14 @@ export function PromptInput() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const promptActionsAreaRef = useRef<HTMLDivElement>(null);
+  // Measure-driven stacking. The hook sums every [data-row-item]'s width and
+  // compares against promptActionsAreaRef.clientWidth, so user font scaling,
+  // browser zoom, and per-thread label changes (Apply ↔ Apply & Restart) all
+  // feed in directly — no viewport-width heuristics that miss the squeeze on
+  // dense rows. When false, the secondary candidate (Diff for the banner,
+  // Discard draft for compose) lifts to a row above the icons.
+  const fitsInOneRow = useFitsInOneRow(promptActionsAreaRef);
   // Watch for pending messages from other modules (e.g. new app modal)
   useEffect(() => {
     const msg = pendingChatMessage.value;
@@ -239,8 +325,8 @@ export function PromptInput() {
     const el = inputRef.current;
     if (!el) return;
     const sameThread = prevTidRef.current === tid;
-    const focusedHere = isComposeFocusedHere(tid ?? '');
-    if (!shouldSkipSyncWhileEditing(el, sameThread, focusedHere)
+    const thisElementActive = document.activeElement === el;
+    if (!shouldSkipSyncWhileEditing(el, sameThread, thisElementActive)
         && syncTextareaValue(el, composeText, sameThread)) {
       autoResize();
       requestAnimationFrame(() => requestAnimationFrame(() => autoResize()));
@@ -268,9 +354,7 @@ export function PromptInput() {
   function autoResize() {
     const el = inputRef.current;
     if (!el) return;
-    if (resizeTextarea(el) && !scrolledUp.value) {
-      scrollToBottom();
-    }
+    if (resizeTextarea(el)) preserveAtBottom();
   }
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -280,7 +364,8 @@ export function PromptInput() {
     }
     if (e.key === 'Enter' && !e.shiftKey && !isMobile()) {
       e.preventDefault();
-      submit();
+      if (hasPendingMultiQ) submitMultiAnswer();
+      else submit();
     }
   }
 
@@ -300,28 +385,18 @@ export function PromptInput() {
     const useClaudeCode = effectiveSendMode(thread) === 'claude_code';
 
     const imageHashes = currentImages.length > 0 ? currentImages.map((i) => i.hash) : undefined;
-    let sendPromise: Promise<void>;
-    if (threadId && thread?.meta.state === 'composing') {
-      // Composing thread: send through compose so server transitions
-      // state→active and clears compose fields atomically.
-      sendPromise = sendCompose(threadId, { useClaudeCode });
-    } else if (threadId) {
-      sendPromise = sendFollowup(threadId, msg, imageHashes, { useClaudeCode: useClaudeCode || undefined });
-    } else {
-      sendPromise = sendMessage(msg, imageHashes, { useClaudeCode: useClaudeCode || undefined });
-    }
 
-    // For first-message sends `threadId` is null at submit-entry, but
-    // sendMessage's synchronous prefix runs setFocusedThread before
-    // returning the promise — so focusedThreadId.value is now the new id.
-    // Prefer the captured threadId (avoids any focus-shift surprise) and
-    // fall back to focusedThreadId.value only for raw new sends.
-    const submittedId = threadId ?? focusedThreadId.value;
-    if (submittedId) {
-      const next = new Set(submittingThreadIds.value);
-      next.add(submittedId);
-      submittingThreadIds.value = next;
-    }
+    const { promise: sendPromise, submittedId } = dispatchSend(threadId, () => {
+      if (threadId && thread?.meta.state === 'composing') {
+        // Composing thread: send through compose so server transitions
+        // state→active and clears compose fields atomically.
+        return sendCompose(threadId, { useClaudeCode });
+      } else if (threadId) {
+        return sendFollowup(threadId, msg, imageHashes, { useClaudeCode: useClaudeCode || undefined });
+      } else {
+        return sendMessage(msg, imageHashes, { useClaudeCode: useClaudeCode || undefined });
+      }
+    });
 
     sendPromise.catch((error) => {
       if (submittedId) {
@@ -358,6 +433,12 @@ export function PromptInput() {
 
   function handleInput() {
     autoResize();
+    // Typing the first character flips hasContent → the action row swaps
+    // section buttons for Send/Discard, often changing prompt-actions-row
+    // height even when the textarea itself didn't grow. Pin the user to the
+    // bottom across the upcoming re-render so onResize can't escalate
+    // scrolledUp=true on the layout shift.
+    preserveAtBottom();
     const el = inputRef.current;
     if (!el) return;
     const val = el.value;
@@ -461,6 +542,22 @@ export function PromptInput() {
   const pending = focusedTid ? getPendingUploads(focusedTid) : [];
   const uploadsBlocking = focusedTid ? hasInFlightUploads(focusedTid) : false;
   const hasContent = composeHasContent(hasText, images.length, pending.length);
+  void multiSelectedByToolUse.value;
+  const pendingAnswers = pendingAnswerByToolUse.value;
+  // Gate the exchange walk by status — without it, every keystroke would
+  // sort + group all events. Suppress once optimistically answered so Submit
+  // hides instead of flashing back as disabled.
+  const focusedStatus = focusedThread ? effectiveThreadStatus(focusedThread) : 'idle';
+  const rawPendingMultiQ = focusedStatus === 'waiting_for_user_answer'
+    ? findPendingMultiSelectQuestion(focusedThread)
+    : null;
+  const pendingMultiQ = rawPendingMultiQ && !pendingAnswers.has(rawPendingMultiQ.toolUseId)
+    ? rawPendingMultiQ
+    : null;
+  const multiSelectedIds = pendingMultiQ ? getMultiSelectedIds(pendingMultiQ.toolUseId) : [];
+  const hasPendingMultiQ = pendingMultiQ !== null;
+  // Submit consumes the typed text — keep the morph in 'cancel' even with content.
+  const morphHasContent = hasContent && !hasPendingMultiQ;
   // CC doesn't use browser context — hide the pill when it won't be sent
   const toggleMode = effectiveSendMode(focusedThread);
   const willUseClaudeCode = toggleMode === 'claude_code';
@@ -496,9 +593,18 @@ export function PromptInput() {
           hasContent,
         )
       : [];
+  const sectionButtonNodes = tid && sectionButtons.length > 0
+    ? sectionButtons.map(name => {
+        switch (name) {
+          case 'save': return <SavePromptButton key="save" threadId={tid} />;
+          case 'unsave': return <UnsaveSavedPromptButton key="unsave" threadId={tid} />;
+          case 'archive': return <ArchiveSavedPromptButton key="archive" threadId={tid} />;
+        }
+      })
+    : null;
 
   const morphMode = computeMorphMode({
-    hasContent,
+    hasContent: morphHasContent,
     cancelTargetId,
     isCanceling,
     hasBannerOrSectionButtons: !!bannerState || sectionButtons.length > 0,
@@ -545,6 +651,121 @@ export function PromptInput() {
     // is intentionally omitted from deps.
   }, [focusedThreadId.value, threadMap.value]);
 
+  // Bundles toggled option_ids + textarea text into one MultiSelected answer.
+  // Backend joins them with `, ` for CC.
+  async function submitMultiAnswer() {
+    if (!pendingMultiQ) return;
+    const focused = focusedThreadId.value;
+    if (!focused) return;
+    const el = inputRef.current;
+    const text = el?.value.trim() ?? '';
+    const ids = getMultiSelectedIds(pendingMultiQ.toolUseId);
+    if (ids.length === 0 && text.length === 0) return;
+    preserveAtBottom();
+    const answer: AnswerKind = {
+      kind: 'MultiSelected',
+      option_ids: ids,
+      ...(text.length > 0 ? { text } : {}),
+    };
+    setPendingAnswer(pendingMultiQ.toolUseId, answer);
+    if (el) {
+      el.value = '';
+      el.style.height = 'auto';
+    }
+    updateCompose(focused, { text: '' });
+    setMultiSelectedIds(pendingMultiQ.toolUseId, []);
+    if (isMobile()) el?.blur();
+    const ok = await answerCCQuestion(focused, pendingMultiQ.toolUseId, answer);
+    if (!ok) {
+      // Drop optimistic so the question card un-resolves and the row
+      // re-shows Submit. The toast tells the user to retry; not restoring the
+      // cleared toggles + text avoids racing fresh input typed during the
+      // failure window.
+      clearPendingAnswer(pendingMultiQ.toolUseId);
+      showToast('Could not send answer — please try again.', 'error');
+    }
+  }
+
+  const submitMultiCount = computeSubmitMultiCount(multiSelectedIds.length, composeText);
+  const submitMultiDisabled = submitMultiCount === 0;
+  const submitMultiButton = pendingMultiQ ? (
+    <button
+      key="submit-multi"
+      type="button"
+      class="action-btn action-btn-confirm"
+      disabled={submitMultiDisabled}
+      onClick={submitMultiAnswer}
+      aria-label="Submit answer"
+      data-row-item
+    >
+      {submitMultiCount > 0 ? `Submit (${submitMultiCount})` : 'Submit'}
+    </button>
+  ) : null;
+
+  const composeDiscardButton = hasContent && !bannerState ? (
+    <button
+      key="discard-draft"
+      class="action-btn action-btn-danger"
+      onClick={handleDiscard}
+      aria-label="Discard draft"
+      data-row-item
+    >
+      Discard draft
+    </button>
+  ) : null;
+  // sectionButtons (Save / ✓ Saved) are rendered separately below so they
+  // anchor to the bottom row instead of lifting alongside Diff / Discard draft
+  // when the row stacks.
+  const slots = bannerState
+    ? getBannerSlots(bannerState)
+    : { liftable: composeDiscardButton, primary: null };
+  const stacked = !fitsInOneRow;
+  const sendButton = morphMode !== 'hidden' ? (
+    <button
+      key="send-cancel-morph"
+      class={
+        'action-btn send-cancel-morph'
+        + (morphMode === 'cancel' || morphMode === 'canceling' ? ' action-btn-danger' : '')
+        + (morphMode === 'placeholder' ? ' morph-placeholder' : '')
+      }
+      onClick={
+        morphMode === 'send' ? submit
+        : morphMode === 'cancel' ? () => handleCancelExchange(cancelTargetId!)
+        : undefined
+      }
+      aria-label={morphMode === 'cancel' || morphMode === 'canceling' ? 'Cancel' : 'Send message'}
+      aria-hidden={morphMode === 'placeholder' ? 'true' : undefined}
+      tabIndex={morphMode === 'send' || morphMode === 'cancel' ? undefined : -1}
+      disabled={
+        morphMode === 'send' ? uploadsBlocking
+        : morphMode === 'cancel' ? false
+        : true
+      }
+      data-tooltip={morphMode === 'send' && uploadsBlocking ? 'Waiting for image upload…' : undefined}
+      data-row-item
+    >
+      {morphMode === 'canceling' ? 'Cancel...'
+        : morphMode === 'cancel' ? 'Cancel'
+        : 'Send'}
+    </button>
+  ) : null;
+  // .thread-action-buttons is the e2e-test hook for "the banner is visible
+  // with action buttons" — keep it bound to bannerState so the selector still
+  // flips when the banner appears/disappears, even though the row wrapper is
+  // always rendered.
+  const rowClass = bannerState
+    ? 'prompt-actions-row thread-action-buttons'
+    : 'prompt-actions-row';
+  // `stacked` reflects only the measurement; lifting requires something to
+  // lift. A row that overflows but has no liftable slot (e.g. the disabled
+  // "Apply..." spinner during an apply turn) renders inline anyway, so the
+  // is-stacked column layout would be wrong there.
+  const isStacked = stacked && !!slots.liftable;
+  const liftSection = shouldLiftSectionButtons(isStacked, bannerState);
+  const rightClass = isStacked
+    ? 'prompt-actions-right is-stacked'
+    : 'prompt-actions-right';
+
   return (
     <div class="prompt-input-container">
       {(images.length > 0 || pending.length > 0) && (
@@ -554,14 +775,18 @@ export function PromptInput() {
               <img
                 src={img.previewUrl}
                 class="image-preview-thumb"
-                onClick={() => openImagePopup(img.previewUrl)}
+                onClick={(e) => openImagePopupFromGroup(e.currentTarget.src, e.currentTarget)}
               />
               <button class="icon-btn image-preview-remove" onClick={() => removeImage(i)} aria-label="Remove" data-tooltip="Remove"><CloseIcon /></button>
             </div>
           ))}
           {pending.map((p) => (
             <div class={`image-preview-item image-preview-pending image-preview-pending-${p.status}`} key={`pending-${p.localId}`}>
-              <img src={p.previewUrl} class="image-preview-thumb" />
+              <img
+                src={p.previewUrl}
+                class="image-preview-thumb"
+                onClick={(e) => openImagePopupFromGroup(e.currentTarget.src, e.currentTarget)}
+              />
               <button
                 class="icon-btn image-preview-remove"
                 onClick={() => focusedTid && removePendingUpload(focusedTid, p.localId)}
@@ -669,18 +894,19 @@ export function PromptInput() {
           aria-hidden="true"
           onChange={handleFileSelect}
         />
-        <div class="prompt-actions-row">
+        <div class={rowClass} ref={promptActionsAreaRef}>
           {showCCCommands && <CCControlMenu threadId={focusedThreadId.value ?? undefined} />}
           {isNarrow ? (
             <button
               class="icon-btn header-icon"
               onClick={() => fileInputRef.current?.click()}
               aria-label="Attach image"
+              data-row-item
             >
               <ImageIcon />
             </button>
           ) : (
-            <div class="image-attach-anchor" ref={menuRef}>
+            <div class="image-attach-anchor" ref={menuRef} data-row-item>
               {/* composeHandlers keeps the prompt textarea focused (iPad PWA
                   keyboard stays open) so the menu anchors to the right spot —
                   see 5ca953fd7. */}
@@ -706,51 +932,28 @@ export function PromptInput() {
               )}
             </div>
           )}
-          <div class="prompt-actions-right">
-            {hasContent && (
-              <button
-                class="action-btn action-btn-danger"
-                onClick={handleDiscard}
-                aria-label="Discard draft"
-              >
-                Discard draft
-              </button>
-            )}
-            {tid && sectionButtons.map(name => {
-              switch (name) {
-                case 'save': return <SavePromptButton key="save" threadId={tid} />;
-                case 'unsave': return <UnsaveSavedPromptButton key="unsave" threadId={tid} />;
-                case 'archive': return <ArchiveSavedPromptButton key="archive" threadId={tid} />;
-              }
-            })}
-            {bannerState && <WaitingBanner state={bannerState} />}
-            {morphMode !== 'hidden' && (
-              <button
-                key="send-cancel-morph"
-                class={
-                  'action-btn send-cancel-morph'
-                  + (morphMode === 'cancel' || morphMode === 'canceling' ? ' action-btn-danger' : '')
-                  + (morphMode === 'placeholder' ? ' morph-placeholder' : '')
-                }
-                onClick={
-                  morphMode === 'send' ? submit
-                  : morphMode === 'cancel' ? () => handleCancelExchange(cancelTargetId!)
-                  : undefined
-                }
-                aria-label={morphMode === 'cancel' || morphMode === 'canceling' ? 'Cancel' : 'Send message'}
-                aria-hidden={morphMode === 'placeholder' ? 'true' : undefined}
-                tabIndex={morphMode === 'send' || morphMode === 'cancel' ? undefined : -1}
-                disabled={
-                  morphMode === 'send' ? uploadsBlocking
-                  : morphMode === 'cancel' ? false
-                  : true
-                }
-                data-tooltip={morphMode === 'send' && uploadsBlocking ? 'Waiting for image upload…' : undefined}
-              >
-                {morphMode === 'canceling' ? 'Cancel...'
-                  : morphMode === 'cancel' ? 'Cancel'
-                  : 'Send'}
-              </button>
+          <div class={rightClass}>
+            {isStacked ? (
+              <>
+                <div class="prompt-actions-subrow">
+                  {liftSection ? sectionButtonNodes : null}
+                  {slots.liftable}
+                </div>
+                <div class="prompt-actions-subrow">
+                  {liftSection ? null : sectionButtonNodes}
+                  {slots.primary}
+                  {sendButton}
+                  {submitMultiButton}
+                </div>
+              </>
+            ) : (
+              <>
+                {sectionButtonNodes}
+                {slots.liftable}
+                {slots.primary}
+                {sendButton}
+                {submitMultiButton}
+              </>
             )}
           </div>
         </div>

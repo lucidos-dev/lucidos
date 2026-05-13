@@ -21,17 +21,42 @@ function formatAuthType(authType: AuthType): string {
   }
 }
 
-async function copyField(serviceName: string, field: 'client_id' | 'client_secret') {
+interface CopyTarget {
+  label: string;
+  jsonField?: string;
+}
+
+const COPY_TARGETS: Record<AuthType, CopyTarget[]> = {
+  api_key: [{ label: 'Key' }],
+  bearer: [{ label: 'Token' }],
+  basic: [{ label: 'Value' }],
+  password: [
+    { label: 'Username', jsonField: 'username' },
+    { label: 'Password', jsonField: 'password' },
+  ],
+  oauth_client: [
+    { label: 'ID', jsonField: 'client_id' },
+    { label: 'Secret', jsonField: 'client_secret' },
+  ],
+  email_password: [{ label: 'Password' }],
+};
+
+async function copyCredential(serviceName: string, target: CopyTarget) {
   try {
     const { auth_value } = await getCredentialValue(serviceName);
-    const parsed = JSON.parse(auth_value);
-    const value = parsed[field];
+    let value: string;
+    if (target.jsonField) {
+      const parsed = JSON.parse(auth_value);
+      value = parsed[target.jsonField] ?? '';
+    } else {
+      value = auth_value;
+    }
     if (!value) {
-      showToast(`No ${field === 'client_id' ? 'Client ID' : 'Client Secret'} found`, 'error');
+      showToast(`No ${target.label} found`, 'error');
       return;
     }
     await navigator.clipboard.writeText(value);
-    showToast(`${field === 'client_id' ? 'Client ID' : 'Client Secret'} copied`);
+    showToast(`${target.label} copied`);
   } catch (e) {
     showToast(`Failed to copy: ${errorDetail(e)}`, 'error');
   }
@@ -39,9 +64,10 @@ async function copyField(serviceName: string, field: 'client_id' | 'client_secre
 
 export function CredentialItem({ credential }: Props) {
   const dateStr = formatShortDate(new Date(credential.created_at));
+  const copyTargets = COPY_TARGETS[credential.auth_type] ?? [];
 
   return (
-    <div class="list-row">
+    <div class="list-row credential-row">
       <div class="list-row-info">
         <div class="title list-row-name">{credential.service_name}</div>
         <div class="list-row-details">
@@ -51,22 +77,15 @@ export function CredentialItem({ credential }: Props) {
         <div class="list-row-date">Added {dateStr}</div>
       </div>
       <div class="list-row-actions">
-        {credential.auth_type === 'oauth_client' && (
-          <>
-            <button
-              class="action-btn"
-              onClick={() => copyField(credential.service_name, 'client_id')}
-            >
-              Copy ID
-            </button>
-            <button
-              class="action-btn"
-              onClick={() => copyField(credential.service_name, 'client_secret')}
-            >
-              Copy Secret
-            </button>
-          </>
-        )}
+        {copyTargets.map((target) => (
+          <button
+            key={target.label}
+            class="action-btn"
+            onClick={() => copyCredential(credential.service_name, target)}
+          >
+            Copy {target.label}
+          </button>
+        ))}
         <button
           class="action-btn"
           onClick={() => openEditCredential(credential.service_name)}

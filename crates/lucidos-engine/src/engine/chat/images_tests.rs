@@ -247,7 +247,7 @@ fn oversized_history_images_skipped() {
     let tmp = tempfile::TempDir::new().unwrap();
     let big_bytes = {
         let mut buf = png_with_marker(1);
-        buf.extend(std::iter::repeat(0u8).take(MAX_TOTAL_IMAGE_BASE64 + 1));
+        buf.extend(std::iter::repeat_n(0u8, MAX_TOTAL_IMAGE_BASE64 + 1));
         buf
     };
     let big_hash = write_blob(tmp.path(), &big_bytes).unwrap().hash;

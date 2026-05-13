@@ -5,6 +5,7 @@ import {
   clickVisibleElement, getHeaderTop,
   sendMessage, uniqueMessage, waitForActionPanel,
 } from './helpers';
+import { clearAllThreads } from './db-helpers';
 
 /** Check if any element matching the selector is physically visible (dual-layout safe). */
 function hasVisibleElement(page: Page, selector: string): Promise<boolean> {
@@ -49,6 +50,7 @@ async function typeSlash(page: Page) {
 
 test.describe('CC slash command menu', () => {
   test.beforeEach(async ({ page }) => {
+    clearAllThreads();
     await assertHealthy(page);
   });
 

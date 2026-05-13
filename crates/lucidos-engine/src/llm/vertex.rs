@@ -133,7 +133,7 @@ impl VertexProvider {
     }
 
     /// Snapshot the current region. URL builders call this per-request.
-    pub fn current_location(&self) -> String {
+    fn current_location(&self) -> String {
         read_location(&self.location)
     }
 
@@ -189,15 +189,6 @@ impl VertexProvider {
         get_cached_access_token(&self.token_cache)
     }
 
-    /// Force-refresh the access token from gcloud, bypassing the cache.
-    fn refresh_access_token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Invalidate cache first
-        if let Ok(mut guard) = self.token_cache.lock() {
-            *guard = None;
-        }
-        get_cached_access_token(&self.token_cache)
-    }
-
     /// Invalidate the cached token and refresh it. Returns the new token on success.
     /// `retried_auth` is flipped to true to prevent infinite retry loops.
     fn handle_auth_refresh(&self, model: &str, retried_auth: &mut bool) -> Option<String> {
@@ -205,7 +196,7 @@ impl VertexProvider {
         if let Ok(mut cache) = self.token_cache.lock() {
             *cache = None;
         }
-        match self.refresh_access_token() {
+        match get_cached_access_token(&self.token_cache) {
             Ok(new_token) => {
                 log!("[{}] HTTP 401, refreshed access token and retrying", model);
                 Some(new_token)
@@ -326,7 +317,7 @@ impl VertexProvider {
 
     async fn chat_claude(
         &self,
-        messages: Vec<Message>,
+        mut messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
         model: &str,
         system_prompt: Option<&str>,
@@ -336,8 +327,20 @@ impl VertexProvider {
         // Strip [1m] suffix — same model ID, just needs beta header
         let (base_model, is_1m) = Self::parse_context_suffix(model);
 
+        // Pre-flight: repair orphan `tool_use` blocks before Anthropic 400s.
+        // Last line of defense — ANY caller that builds `messages` goes
+        // through this gate, even ones that bypass the agentic loop.
+        let stubs = crate::engine::validate_tool_use_pairing(&mut messages);
+        if stubs > 0 {
+            crate::log!(
+                "[Vertex] WARNING: pre-flight injected {} stub tool_result block(s) before Claude API call (model={})",
+                stubs,
+                model
+            );
+        }
+
         // Convert to Anthropic Messages API format
-        let claude_messages: Vec<ClaudeMessage> = messages
+        let mut claude_messages: Vec<ClaudeMessage> = messages
             .iter()
             .map(|m| ClaudeMessage {
                 role: m.role.clone(),
@@ -348,17 +351,20 @@ impl VertexProvider {
         let claude_tools: Option<Vec<ClaudeTool>> = if tools.is_empty() {
             None
         } else {
-            Some(
-                tools
-                    .into_iter()
-                    .map(|t| ClaudeTool {
-                        name: t.name,
-                        description: t.description,
-                        input_schema: t.parameters,
-                    })
-                    .collect(),
-            )
+            let mut converted: Vec<ClaudeTool> = tools
+                .into_iter()
+                .map(|t| ClaudeTool {
+                    name: t.name,
+                    description: t.description,
+                    input_schema: t.parameters,
+                    cache_control: None,
+                })
+                .collect();
+            apply_cache_control_to_last_tool(&mut converted);
+            Some(converted)
         };
+
+        apply_cache_control_to_last_message(&mut claude_messages);
 
         let (thinking, output_config, max_tokens) = if Self::supports_extended_thinking(base_model)
         {
@@ -408,7 +414,7 @@ impl VertexProvider {
             anthropic_version: "vertex-2023-10-16".to_string(),
             max_tokens,
             stream: true,
-            system: system_prompt.map(|s| s.to_string()),
+            system: system_with_cache_control(system_prompt),
             messages: claude_messages,
             tools: claude_tools,
             thinking,
@@ -605,6 +611,8 @@ impl VertexProvider {
             stop_reason: turn_meta.stop_reason,
             output_tokens: turn_meta.output_tokens,
             input_tokens: turn_meta.input_tokens,
+            cache_creation_tokens: turn_meta.cache_creation_tokens,
+            cache_read_tokens: turn_meta.cache_read_tokens,
             thinking_chars: Some(thinking_chars),
         })
     }
@@ -685,6 +693,12 @@ impl VertexProvider {
                 let total = input + cache_write + cache_read;
                 if total > 0 {
                     meta.input_tokens = Some(total as u32);
+                }
+                if cache_write > 0 {
+                    meta.cache_creation_tokens = Some(cache_write as u32);
+                }
+                if cache_read > 0 {
+                    meta.cache_read_tokens = Some(cache_read as u32);
                 }
             }
             "message_delta" => {
@@ -927,8 +941,79 @@ impl VertexProvider {
             stop_reason: None,
             output_tokens: None,
             input_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
             thinking_chars: None,
         })
+    }
+}
+
+// ===== Claude/Anthropic prompt caching =====
+
+/// Anthropic ephemeral cache marker (5-minute TTL, the default). Writes cost
+/// ~1.25× input price; reads cost ~0.1×, so a single cache hit pays back the
+/// write premium and everything beyond is pure savings. Render order is
+/// `tools` → `system` → `messages` — a marker on the last block of each tier
+/// caches everything before it. We place markers on tools[-1], the system
+/// block, and the last message's last content block (3 of the 4 allowed).
+fn ephemeral_cache_marker() -> serde_json::Value {
+    serde_json::json!({"type": "ephemeral"})
+}
+
+/// Build a typed-content text block with a `cache_control` marker, taking
+/// ownership of the body so callers don't pay a copy. Used to wrap both the
+/// system prompt and the last message's bare-string content into the array
+/// form Anthropic requires for cache breakpoints.
+fn text_block_with_cache_control(text: String) -> serde_json::Value {
+    let mut obj = serde_json::Map::with_capacity(3);
+    obj.insert("type".to_string(), serde_json::Value::from("text"));
+    obj.insert("text".to_string(), serde_json::Value::String(text));
+    obj.insert("cache_control".to_string(), ephemeral_cache_marker());
+    serde_json::Value::Object(obj)
+}
+
+/// Wrap the system prompt as a one-block content array tagged with
+/// `cache_control`. Returning `None` for empty/missing input keeps the
+/// request body minimal (`system` is omitted entirely) and avoids sending
+/// an empty text block, which Anthropic rejects.
+fn system_with_cache_control(system: Option<&str>) -> Option<serde_json::Value> {
+    let s = system?;
+    if s.is_empty() {
+        return None;
+    }
+    Some(serde_json::Value::Array(vec![text_block_with_cache_control(
+        s.to_string(),
+    )]))
+}
+
+fn apply_cache_control_to_last_tool(tools: &mut [ClaudeTool]) {
+    if let Some(last) = tools.last_mut() {
+        last.cache_control = Some(ephemeral_cache_marker());
+    }
+}
+
+/// Mark the final message so the entire prior conversation prefix becomes a
+/// cache breakpoint on the next turn. Bare-string content is rewritten into
+/// the array form (the only shape that accepts `cache_control`); existing
+/// arrays get the marker on their final block. Empty strings are left alone
+/// — they have nothing worth caching and round-tripping them through the
+/// array form would produce an empty text block, which the API rejects.
+fn apply_cache_control_to_last_message(messages: &mut [ClaudeMessage]) {
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    match &mut last.content {
+        serde_json::Value::String(s) if !s.is_empty() => {
+            let text = std::mem::take(s);
+            last.content = serde_json::Value::Array(vec![text_block_with_cache_control(text)]);
+        }
+        serde_json::Value::Array(arr) => {
+            let Some(last_block) = arr.last_mut().and_then(|b| b.as_object_mut()) else {
+                return;
+            };
+            last_block.insert("cache_control".to_string(), ephemeral_cache_marker());
+        }
+        _ => {}
     }
 }
 
@@ -939,8 +1024,11 @@ struct ClaudeRequest {
     anthropic_version: String,
     max_tokens: u32,
     stream: bool,
+    /// Either a bare string or an array of typed content blocks (the latter
+    /// is required to attach `cache_control`). `system_with_cache_control`
+    /// emits the array form so the system prompt becomes a cache breakpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<serde_json::Value>,
     messages: Vec<ClaudeMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ClaudeTool>>,
@@ -976,6 +1064,11 @@ struct ClaudeTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
+    /// Set on the last tool to make tools+system a cached prefix. The cap is
+    /// 4 cache_control breakpoints per request; we use 3 (this + system + the
+    /// last message), so the budget is comfortably under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
 }
 
 enum AccumulatedBlock {
@@ -993,13 +1086,16 @@ enum AccumulatedBlock {
 
 /// Per-turn metadata captured from Anthropic's streaming SSE events.
 /// `input_tokens` is the real prompt size (uncached + cache write + cache read)
-/// from `message_start`; `stop_reason` and `output_tokens` come from
-/// `message_delta`.
+/// from `message_start`; the cache breakdown stays available separately so
+/// the unified ContextCaptured modal can show cache hit rate. `stop_reason`
+/// and `output_tokens` come from `message_delta`.
 #[derive(Default)]
 struct TurnMeta {
     stop_reason: Option<String>,
     output_tokens: Option<u32>,
     input_tokens: Option<u32>,
+    cache_read_tokens: Option<u32>,
+    cache_creation_tokens: Option<u32>,
 }
 
 // ===== Gemini/Vertex request/response types =====
@@ -1443,5 +1539,196 @@ mod tests {
         // Real prompt size = uncached input + cache writes + cache reads
         // (everything the model actually processed). 4321 + 1000 + 500 = 5821.
         assert_eq!(meta.input_tokens, Some(5821));
+        // Cache breakdown survives separately so the modal can show hit rate.
+        assert_eq!(meta.cache_creation_tokens, Some(1000));
+        assert_eq!(meta.cache_read_tokens, Some(500));
+    }
+
+    #[test]
+    fn system_with_cache_control_none_returns_none() {
+        assert!(system_with_cache_control(None).is_none());
+    }
+
+    #[test]
+    fn system_with_cache_control_empty_string_returns_none() {
+        assert!(system_with_cache_control(Some("")).is_none());
+    }
+
+    #[test]
+    fn system_with_cache_control_wraps_string_in_block_with_marker() {
+        let value = system_with_cache_control(Some("you are a helpful assistant")).unwrap();
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "you are a helpful assistant");
+        assert_eq!(arr[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn apply_cache_control_to_last_tool_marks_only_last() {
+        let mut tools = vec![
+            ClaudeTool {
+                name: "a".into(),
+                description: "first".into(),
+                input_schema: serde_json::json!({}),
+                cache_control: None,
+            },
+            ClaudeTool {
+                name: "b".into(),
+                description: "second".into(),
+                input_schema: serde_json::json!({}),
+                cache_control: None,
+            },
+        ];
+        apply_cache_control_to_last_tool(&mut tools);
+        assert!(tools[0].cache_control.is_none());
+        assert_eq!(
+            tools[1].cache_control.as_ref().unwrap()["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn apply_cache_control_to_last_tool_empty_is_noop() {
+        let mut tools: Vec<ClaudeTool> = Vec::new();
+        apply_cache_control_to_last_tool(&mut tools);
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn apply_cache_control_to_last_message_string_content_becomes_block() {
+        let mut messages = vec![ClaudeMessage {
+            role: "user".into(),
+            content: serde_json::Value::String("hello there".into()),
+        }];
+        apply_cache_control_to_last_message(&mut messages);
+        let arr = messages[0].content.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "hello there");
+        assert_eq!(arr[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn apply_cache_control_to_last_message_array_content_marks_last_block_only() {
+        let mut messages = vec![ClaudeMessage {
+            role: "user".into(),
+            content: serde_json::json!([
+                {"type": "text", "text": "first block"},
+                {"type": "text", "text": "second block"},
+            ]),
+        }];
+        apply_cache_control_to_last_message(&mut messages);
+        let arr = messages[0].content.as_array().unwrap();
+        assert!(arr[0].get("cache_control").is_none());
+        assert_eq!(arr[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn apply_cache_control_to_last_message_only_touches_final_message() {
+        let mut messages = vec![
+            ClaudeMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("first turn".into()),
+            },
+            ClaudeMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::String("second turn".into()),
+            },
+        ];
+        apply_cache_control_to_last_message(&mut messages);
+        // First message untouched (still a bare string)
+        assert!(messages[0].content.is_string());
+        // Last message converted to a block array with cache_control
+        assert!(messages[1].content.is_array());
+    }
+
+    #[test]
+    fn apply_cache_control_to_last_message_empty_is_noop() {
+        let mut messages: Vec<ClaudeMessage> = Vec::new();
+        apply_cache_control_to_last_message(&mut messages);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn apply_cache_control_to_last_message_skips_empty_string() {
+        // An empty string would round-trip into an empty text block, which
+        // Anthropic rejects. Cache_control on nothing is meaningless anyway.
+        let mut messages = vec![ClaudeMessage {
+            role: "user".into(),
+            content: serde_json::Value::String(String::new()),
+        }];
+        apply_cache_control_to_last_message(&mut messages);
+        // Untouched
+        assert!(messages[0].content.is_string());
+        assert_eq!(messages[0].content.as_str(), Some(""));
+    }
+
+    #[test]
+    fn cache_control_serializes_into_wire_format() {
+        // End-to-end: build a request the way chat_claude does, serialize it,
+        // and check cache_control lands on tools[-1], the system block, and
+        // messages[-1]'s last content block.
+        let mut tools = vec![
+            ClaudeTool {
+                name: "search".into(),
+                description: "search the web".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            },
+            ClaudeTool {
+                name: "calculator".into(),
+                description: "do math".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            },
+        ];
+        apply_cache_control_to_last_tool(&mut tools);
+
+        let mut messages = vec![
+            ClaudeMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("first turn".into()),
+            },
+            ClaudeMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::String("response".into()),
+            },
+            ClaudeMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("follow-up".into()),
+            },
+        ];
+        apply_cache_control_to_last_message(&mut messages);
+
+        let req = ClaudeRequest {
+            anthropic_version: "vertex-2023-10-16".into(),
+            max_tokens: 1024,
+            stream: true,
+            system: system_with_cache_control(Some("system prompt body")),
+            messages,
+            tools: Some(tools),
+            thinking: None,
+            output_config: None,
+            anthropic_beta: None,
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+
+        // Tools: only the last one carries cache_control
+        let tools_arr = json["tools"].as_array().unwrap();
+        assert!(tools_arr[0].get("cache_control").is_none());
+        assert_eq!(tools_arr[1]["cache_control"]["type"], "ephemeral");
+
+        // System: array form with cache_control on its single block
+        let system_arr = json["system"].as_array().unwrap();
+        assert_eq!(system_arr[0]["cache_control"]["type"], "ephemeral");
+
+        // Messages: only the final message's last block carries cache_control
+        let msgs = json["messages"].as_array().unwrap();
+        assert!(msgs[0]["content"].is_string());
+        assert!(msgs[1]["content"].is_string());
+        let last_blocks = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(last_blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
     }
 }

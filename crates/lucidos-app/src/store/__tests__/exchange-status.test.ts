@@ -234,6 +234,20 @@ describe('exchangeStatus — full branch coverage', () => {
     expect(exchangeStatus(exchange, '', true)).toBe('pending');
   });
 
+  // Regression for thread 9b5a05aa: a chat MR landed but its response ended
+  // up bound to a sibling exchange (an off-by-one in the orphan re-process
+  // chain). When the engine then went idle, the empty MR exchange used to
+  // either render the "Aborted" yellow triangle (if a stray non-routed step
+  // had leaked in) or spin forever on "Requesting" (if it was truly empty).
+  // Treat the empty isLast chat exchange when the thread is idle the same
+  // way the !isLast empty case is treated — silent 'done'. The user message
+  // shows; the missing response is visible by absence, not by a misleading
+  // system-error label.
+  it('returns "done" for empty isLast chat exchange when thread is idle (no stuck "Requesting" / no false "Aborted")', () => {
+    const exchange = makeExchange(msg('what was it...'));
+    expect(exchangeStatus(exchange, '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ true)).toBe('done');
+  });
+
   it('failed takes priority over canceled', () => {
     const exchange = makeExchange(msg(), [
       step(1, { type: 'ResponseCanceled' }),

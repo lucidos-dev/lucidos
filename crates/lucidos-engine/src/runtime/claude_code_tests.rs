@@ -130,6 +130,53 @@ fn parse_assistant_mixed_content() {
 }
 
 #[test]
+fn parse_assistant_extracts_usage() {
+    // CC mirrors Anthropic's usage block on each assistant frame; the
+    // parser must surface it as a separate `Usage` event so the
+    // consumer can emit a real `ContextCaptured` with producer=CC.
+    let line = r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1234,"output_tokens":56,"cache_read_input_tokens":900,"cache_creation_input_tokens":100}}}"#;
+    let events = parse_line(line);
+    assert_eq!(events.len(), 2, "expected one Message and one Usage");
+    assert!(matches!(&events[0], AgentEvent::Message { .. }));
+    match &events[1] {
+        AgentEvent::Usage {
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        } => {
+            assert_eq!(model.as_deref(), Some("claude-opus-4-7"));
+            assert_eq!(*input_tokens, 1234);
+            assert_eq!(*output_tokens, 56);
+            assert_eq!(*cache_read_tokens, 900);
+            assert_eq!(*cache_creation_tokens, 100);
+        }
+        other => panic!("Expected Usage, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_assistant_usage_skipped_when_all_zero() {
+    // Continuation frames with zeroed usage shouldn't emit a misleading
+    // snapshot — no real API call happened.
+    let line = r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"continuing"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+    let events = parse_line(line);
+    assert_eq!(events.len(), 1, "all-zero usage frames must produce only the Message");
+    assert!(matches!(&events[0], AgentEvent::Message { .. }));
+}
+
+#[test]
+fn parse_assistant_no_usage_block() {
+    // Defensive: assistant frames without a usage block (e.g. older CC
+    // format) must still parse text/tool_use without panicking.
+    let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#;
+    let events = parse_line(line);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], AgentEvent::Message { .. }));
+}
+
+#[test]
 fn parse_legacy_tool_result() {
     let line = r#"{"type":"tool_result","content":"file contents here","is_error":false,"tool_use_id":"toolu_legacy"}"#;
     let events = parse_line(line);
@@ -620,6 +667,55 @@ fn normalize_cc_model_id_preserves_unknown() {
     assert_eq!(normalize_cc_model_id("custom-model"), "custom-model");
 }
 
+#[test]
+fn reconcile_cc_model_preserves_1m_suffix_when_cc_strips_it() {
+    // CC strips the [1m] suffix when echoing the model in stream-json
+    // (both Init and per-message Usage frames). The engine pinned the
+    // 1M-context variant when invoking CC, so the reconciled name must
+    // keep the [1m] marker — context_window_for needs it to return 1M.
+    assert_eq!(
+        reconcile_cc_model(Some("claude-opus-4-7[1m]"), "claude-opus-4-7"),
+        "claude-opus-4-7[1m]"
+    );
+    assert_eq!(
+        reconcile_cc_model(Some("opus[1m]"), "claude-opus-4-6"),
+        "opus[1m]"
+    );
+    assert_eq!(
+        reconcile_cc_model(Some("sonnet[1m]"), "claude-sonnet-4-6"),
+        "sonnet[1m]"
+    );
+}
+
+#[test]
+fn reconcile_cc_model_drops_1m_when_user_switched_models() {
+    // /model in CC can swap the active model mid-session. If the new model
+    // doesn't share a base with the original [1m] alias, don't fabricate
+    // a [1m] suffix on it.
+    assert_eq!(
+        reconcile_cc_model(Some("claude-opus-4-7[1m]"), "claude-sonnet-4-6"),
+        "sonnet"
+    );
+    assert_eq!(
+        reconcile_cc_model(Some("opus[1m]"), "claude-haiku-4-5"),
+        "haiku"
+    );
+}
+
+#[test]
+fn reconcile_cc_model_passes_through_when_no_1m() {
+    // No suffix on the original alias → behave exactly like normalize.
+    assert_eq!(
+        reconcile_cc_model(Some("claude-opus-4-7"), "claude-opus-4-7"),
+        "claude-opus-4-7"
+    );
+    assert_eq!(
+        reconcile_cc_model(Some("sonnet"), "claude-sonnet-4-6"),
+        "sonnet"
+    );
+    assert_eq!(reconcile_cc_model(None, "claude-opus-4-7"), "claude-opus-4-7");
+}
+
 fn collect_envs(
     cmd: &tokio::process::Command,
 ) -> std::collections::HashMap<std::ffi::OsString, std::ffi::OsString> {
@@ -645,6 +741,7 @@ fn test_spawn_args<'a>(
         thread_id,
         spawning_event_id: None,
         repo_name: None,
+        interactive: false,
     }
 }
 
@@ -665,6 +762,7 @@ fn test_spawn_args_with_event<'a>(
         thread_id,
         spawning_event_id,
         repo_name: None,
+        interactive: false,
     }
 }
 
@@ -685,6 +783,7 @@ fn test_spawn_args_with_repo<'a>(
         thread_id,
         spawning_event_id: None,
         repo_name,
+        interactive: false,
     }
 }
 
@@ -745,6 +844,42 @@ fn build_command_omits_lucidos_event_id_when_spawning_event_id_none() {
     assert!(
         env.get(std::ffi::OsStr::new("LUCIDOS_EVENT_ID")).is_none(),
         "LUCIDOS_EVENT_ID must be unset when no spawning_event_id"
+    );
+}
+
+#[test]
+fn build_command_sets_lucidos_session_kind_when_interactive() {
+    // Interactive sessions (chat / recovery / external-repo) must set
+    // LUCIDOS_SESSION_KIND=interactive so the cc-stop-reminder hook knows
+    // it can safely block CC with an AskUserQuestion redirect when CC ends
+    // a turn with a plaintext question.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let mut args = test_spawn_args(p, p, thread_id);
+    args.interactive = true;
+    let cmd = build_command(&args, None);
+    let env = collect_envs(&cmd);
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("LUCIDOS_SESSION_KIND"))
+            .map(|v| v.as_os_str()),
+        Some(std::ffi::OsStr::new("interactive")),
+    );
+}
+
+#[test]
+fn build_command_omits_lucidos_session_kind_when_not_interactive() {
+    // Conflict-resolution sessions are unattended — they would hang on a
+    // question redirect waiting for an answer that's not coming. The
+    // cc-stop-reminder hook treats absence of LUCIDOS_SESSION_KIND as
+    // "unattended, skip the question redirect".
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let args = test_spawn_args(p, p, thread_id); // interactive=false by default
+    let cmd = build_command(&args, None);
+    let env = collect_envs(&cmd);
+    assert!(
+        env.get(std::ffi::OsStr::new("LUCIDOS_SESSION_KIND"))
+            .is_none(),
     );
 }
 

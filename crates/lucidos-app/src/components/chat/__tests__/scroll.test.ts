@@ -17,7 +17,7 @@ if (typeof globalThis.queueMicrotask === 'undefined') {
   (globalThis as any).queueMicrotask = (cb: any) => { Promise.resolve().then(cb); };
 }
 
-import { scrolledUp, awayFromBottom, notAtTop, scrollToBottom, getResizeMode, extendSuppression, setActiveScrollElement, getActiveScrollElement, makeScrollObservers } from '../scrollState';
+import { scrolledUp, awayFromBottom, notAtTop, scrollToBottom, preserveAtBottom, getResizeMode, extendSuppression, setActiveScrollElement, getActiveScrollElement, makeScrollObservers } from '../scrollState';
 import { withScrollAnchor } from '../CreateThreadView';
 import { composeHandlers } from '../promptFocus';
 
@@ -826,6 +826,98 @@ describe('scrollToBottom suppression', () => {
     expect(mockEl.scrollTop).toBe(2500);
 
     setActiveScrollElement(null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// preserveAtBottom — keeps the user pinned to the bottom across user-initiated
+// layout shifts (typing in prompt, clicking question / permission buttons).
+//
+// onResize escalates scrolledUp=true whenever a layout change pushes the user
+// past the 80px stickiness window — fine for content arriving from the LLM
+// (useEffect snaps back), but wrong for user clicks that grow the answered card
+// or change the prompt action row. preserveAtBottom mirrors PromptInput's
+// autoResize pattern: if the user was at the bottom, engage scroll mode so the
+// upcoming ResizeObserver fire is suppressed; if they had scrolled up, no-op.
+// ---------------------------------------------------------------------------
+describe('preserveAtBottom', () => {
+  beforeEach(() => {
+    scrolledUp.value = false;
+    awayFromBottom.value = false;
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    // Drain the suppression timer so _resizeMode flips back to 'ignore'
+    // before the next test installs fresh fake timers — otherwise the leak
+    // surfaces as "expected ignore, received scroll" in the no-op test.
+    vi.advanceTimersByTime(600);
+    setActiveScrollElement(null);
+    vi.useRealTimers();
+  });
+
+  it('engages scroll mode and scrolls to bottom when user was at bottom', () => {
+    const el = mockScrollEl({ scrollTop: 1500, scrollHeight: 2000 });
+    setActiveScrollElement(el);
+
+    preserveAtBottom();
+
+    expect(getResizeMode()).toBe('scroll');
+    expect(el.scrollTop).toBe(2000);
+    expect(scrolledUp.value).toBe(false);
+  });
+
+  it('is a no-op when user has scrolled up — preserves their intent', () => {
+    scrolledUp.value = true;
+    const el = mockScrollEl({ scrollTop: 100, scrollHeight: 2000 });
+    setActiveScrollElement(el);
+
+    preserveAtBottom();
+
+    expect(getResizeMode()).toBe('ignore');
+    expect(el.scrollTop).toBe(100);
+    expect(scrolledUp.value).toBe(true);
+  });
+
+  it('upcoming ResizeObserver fire after preserveAtBottom does not flip scrolledUp', () => {
+    // Reproduces the question-card / permission-card click scenario:
+    // user is at bottom → click handler runs → preserveAtBottom() →
+    // re-render grows the card → ResizeObserver fires → must NOT flip scrolledUp.
+    const el = mockScrollEl({ scrollTop: 1500, scrollHeight: 2000 });
+    Object.assign(el, { clientHeight: 500 });
+    setActiveScrollElement(el);
+
+    preserveAtBottom();
+
+    // Card answered-state DOM lands → child grew, scrollHeight increases.
+    el.scrollHeight = 2300;
+
+    // Mirror onResize's branch in scrollState.ts.
+    if (getResizeMode() === 'scroll') {
+      el.scrollTop = el.scrollHeight;
+      extendSuppression();
+    } else if (el.scrollTop + (el as any).clientHeight < el.scrollHeight - 80) {
+      scrolledUp.value = true;
+    }
+
+    expect(scrolledUp.value).toBe(false);
+    expect(el.scrollTop).toBe(2300);
+  });
+
+  it('extends suppression so a delayed re-render still scrolls to the new bottom', () => {
+    const el = mockScrollEl({ scrollTop: 1500, scrollHeight: 2000 });
+    setActiveScrollElement(el);
+
+    preserveAtBottom();
+    expect(el.scrollTop).toBe(2000);
+
+    // Re-render lands a few frames later (Preact commit + layout).
+    vi.advanceTimersByTime(100);
+    el.scrollHeight = 2400;
+    vi.advanceTimersByTime(20);
+
+    // The continuous loop driven by scrollToBottom catches the new bottom.
+    expect(el.scrollTop).toBe(2400);
+    expect(scrolledUp.value).toBe(false);
   });
 });
 

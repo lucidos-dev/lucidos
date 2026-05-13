@@ -11,6 +11,25 @@ export function isRedundantTooltip(visibleText: string, tooltipText: string, isT
   return tooltipText.trim().toLowerCase() === visibleText.trim().toLowerCase();
 }
 
+/** Touch movement past this many pixels is treated as a swipe/scroll, not a tap. */
+const TOUCH_SWIPE_THRESHOLD_PX = 10;
+
+/** Did the finger travel far enough between touchstart and the current point
+ *  that we should treat the gesture as a swipe (not a tap)? */
+export function isTouchSwipe(startX: number, startY: number, currentX: number, currentY: number): boolean {
+  return Math.hypot(currentX - startX, currentY - startY) > TOUCH_SWIPE_THRESHOLD_PX;
+}
+
+/** Compute a new anchor point so the tooltip stays glued to the same spot on
+ *  its target after the page (or any scroll container) has scrolled. The
+ *  offset is captured at show-time relative to the target's top-left. */
+export function reanchorToTarget(
+  rect: { left: number; top: number },
+  offset: { x: number; y: number },
+): { x: number; y: number } {
+  return { x: rect.left + offset.x, y: rect.top + offset.y };
+}
+
 function shouldSuppress(target: HTMLElement): boolean {
   const text = target.getAttribute('data-tooltip');
   if (!text) return false;
@@ -32,6 +51,10 @@ export function useTooltip() {
     let textEl: HTMLDivElement | null = null;
     let showTimer: number | null = null;
     let currentTarget: HTMLElement | null = null;
+    // Anchor offset relative to the target's top-left at show time, so we can
+    // re-position to the same spot after the page (or container) scrolls.
+    let anchorOffsetX = 0;
+    let anchorOffsetY = 0;
 
     function ensureEl() {
       if (!tipEl) {
@@ -50,6 +73,10 @@ export function useTooltip() {
       }
     }
 
+    function isVisible(): boolean {
+      return !!tipEl && tipEl.style.opacity === '1';
+    }
+
     function position(target: HTMLElement, mouseX: number, mouseY: number) {
       ensureEl();
       const text = target.getAttribute('data-tooltip');
@@ -59,9 +86,14 @@ export function useTooltip() {
       titleEl.textContent = title;
       textEl.textContent = text;
 
-      // Make visible but transparent so we can measure
-      tipEl.style.display = 'block';
-      tipEl.style.opacity = '0';
+      // Skip the show-time opacity dance if we're just re-positioning a
+      // tooltip that's already on screen (e.g. mouse-move, scroll-follow):
+      // toggling opacity 0→1 each scroll frame would flicker on slow devices.
+      const wasVisible = isVisible();
+      if (!wasVisible) {
+        tipEl.style.display = 'block';
+        tipEl.style.opacity = '0';
+      }
       tipEl.classList.remove('above');
 
       const tipRect = tipEl.getBoundingClientRect();
@@ -95,12 +127,20 @@ export function useTooltip() {
 
       tipEl.style.top = `${top}px`;
       tipEl.style.left = `${left}px`;
-      tipEl.style.opacity = '1';
+      if (!wasVisible) tipEl.style.opacity = '1';
       tipEl.classList.toggle('above', above);
 
       // Arrow: point at mouse X, clamped within tooltip bounds
       const arrowX = Math.max(10, Math.min(mouseX - left, tipRect.width - 10));
       arrowEl.style.left = `${arrowX}px`;
+    }
+
+    function show(target: HTMLElement, mouseX: number, mouseY: number) {
+      const targetRect = target.getBoundingClientRect();
+      anchorOffsetX = mouseX - targetRect.left;
+      anchorOffsetY = mouseY - targetRect.top;
+      currentTarget = target;
+      position(target, mouseX, mouseY);
     }
 
     function hide() {
@@ -139,63 +179,97 @@ export function useTooltip() {
         // Clear currentTarget when suppressing so a later mouseout doesn't
         // try to hide() a tooltip we never showed.
         if (shouldSuppress(target)) { currentTarget = null; return; }
-        position(target, e.clientX, e.clientY);
+        show(target, e.clientX, e.clientY);
       }, 300);
     }
 
     function onMove(e: MouseEvent) {
+      if (isTouchDevice) return;
       if (!currentTarget) return;
       const target = findTarget(e.target);
       if (target !== currentTarget) { hide(); return; }
-      // Update position if already visible
-      if (tipEl && tipEl.style.opacity === '1') {
-        position(currentTarget, e.clientX, e.clientY);
-      }
+      if (isVisible()) show(currentTarget, e.clientX, e.clientY);
     }
 
     function onOut(e: MouseEvent) {
+      if (isTouchDevice) return;
       const from = findTarget(e.target);
       const to = findTarget(e.relatedTarget);
       if (from === currentTarget && to !== currentTarget) hide();
     }
 
-    // Also hide on scroll and click
-    function onDismiss() { if (currentTarget) hide(); }
-
-    function onTouchStart(e: TouchEvent) {
-      // Dismiss any visible tooltip on tap
-      if (currentTarget) { hide(); return; }
-
-      // Elements with data-tooltip-tap opt into tap-to-show on touch devices
-      const target = findTarget(e.target);
-      if (target?.hasAttribute('data-tooltip-tap')) {
-        if (shouldSuppress(target)) return;
-        const touch = e.touches[0];
-        currentTarget = target;
-        position(target, touch.clientX, touch.clientY);
-      }
-    }
-
-    function onTouchMove() {
+    // Mouse-only dismissal. Touch dismissal happens in onTouchEnd so we can
+    // distinguish taps from swipes and avoid flashing the tooltip mid-swipe.
+    function onMouseDown() {
+      if (isTouchDevice) return;
       if (currentTarget) hide();
     }
 
+    // Keep an *already visible* tooltip glued to its target as the page (or
+    // any scroll container) scrolls. Capture-phase so we catch nested
+    // scrollers too. Skip when only the hover timer has armed currentTarget
+    // — otherwise scroll would reveal a tooltip that hasn't shown yet.
+    function onScroll() {
+      if (!currentTarget || !isVisible()) return;
+      const rect = currentTarget.getBoundingClientRect();
+      const { x, y } = reanchorToTarget(rect, { x: anchorOffsetX, y: anchorOffsetY });
+      position(currentTarget, x, y);
+    }
+
+    let touchStartX = 0;
+    let touchStartY = 0;
+    let touchMoved = false;
+
+    function onTouchStart(e: TouchEvent) {
+      const touch = e.touches[0];
+      touchStartX = touch.clientX;
+      touchStartY = touch.clientY;
+      touchMoved = false;
+    }
+
+    function onTouchMove(e: TouchEvent) {
+      if (touchMoved) return;
+      const touch = e.touches[0];
+      if (isTouchSwipe(touchStartX, touchStartY, touch.clientX, touch.clientY)) {
+        touchMoved = true;
+      }
+    }
+
+    function onTouchEnd(e: TouchEvent) {
+      if (touchMoved) return; // Swipe, not tap — ignore.
+
+      // Tap on an already-visible tooltip dismisses it.
+      if (currentTarget) { hide(); return; }
+
+      // Elements with data-tooltip-tap opt into tap-to-show on touch devices.
+      const target = findTarget(e.target);
+      if (!target?.hasAttribute('data-tooltip-tap')) return;
+      if (shouldSuppress(target)) return;
+      const touch = e.changedTouches[0];
+      show(target, touch.clientX, touch.clientY);
+    }
+
+    // Passive on scroll/touch so a global document-level listener can't block
+    // mobile scroll start. None of these handlers call preventDefault().
+    const passiveCapture = { capture: true, passive: true };
     document.addEventListener('mouseover', onOver, true);
     document.addEventListener('mousemove', onMove, true);
     document.addEventListener('mouseout', onOut, true);
-    document.addEventListener('scroll', onDismiss, true);
-    document.addEventListener('mousedown', onDismiss, true);
-    document.addEventListener('touchstart', onTouchStart, true);
-    document.addEventListener('touchmove', onTouchMove, true);
+    document.addEventListener('mousedown', onMouseDown, true);
+    document.addEventListener('scroll', onScroll, passiveCapture);
+    document.addEventListener('touchstart', onTouchStart, passiveCapture);
+    document.addEventListener('touchmove', onTouchMove, passiveCapture);
+    document.addEventListener('touchend', onTouchEnd, passiveCapture);
 
     return () => {
       document.removeEventListener('mouseover', onOver, true);
       document.removeEventListener('mousemove', onMove, true);
       document.removeEventListener('mouseout', onOut, true);
-      document.removeEventListener('scroll', onDismiss, true);
-      document.removeEventListener('mousedown', onDismiss, true);
-      document.removeEventListener('touchstart', onTouchStart, true);
-      document.removeEventListener('touchmove', onTouchMove, true);
+      document.removeEventListener('mousedown', onMouseDown, true);
+      document.removeEventListener('scroll', onScroll, passiveCapture);
+      document.removeEventListener('touchstart', onTouchStart, passiveCapture);
+      document.removeEventListener('touchmove', onTouchMove, passiveCapture);
+      document.removeEventListener('touchend', onTouchEnd, passiveCapture);
       if (tipEl?.parentNode) tipEl.parentNode.removeChild(tipEl);
     };
   }, []);

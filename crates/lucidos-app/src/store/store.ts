@@ -12,9 +12,12 @@ import type {
   App,
   ConfirmState,
   ConfirmDetails,
+  ResponseEvent,
   ToastAction, ToastItem, ToastType,
   CredentialRequest,
   EmailConfirmRequest,
+  PluginInstallRequest,
+  PluginUninstallRequest,
 } from './types';
 import { MENU_ITEMS } from './types';
 import type { ThreadState, ThreadStatus, Exchange } from './thread-events';
@@ -36,7 +39,9 @@ export type InlineForm =
   | { type: 'app-edit'; appId: string }
   | { type: 'new-app' }
   | { type: 'trigger'; taskId?: string }
-  | { type: 'email-confirm'; request: EmailConfirmRequest };
+  | { type: 'email-confirm'; request: EmailConfirmRequest }
+  | { type: 'plugin-install'; request: PluginInstallRequest }
+  | { type: 'plugin-uninstall'; request: PluginUninstallRequest };
 
 // --- Panel overlay (discriminated union replacing 6 independent signals) ---
 export type PanelOverlay =
@@ -287,6 +292,19 @@ export function effectiveThreadStatus(thread: ThreadState): ThreadStatus {
  *  UserQuestionAnswered) so almost every "mid-turn" check needs both. */
 export function isMidTurn(status: ThreadStatus): boolean {
   return status === 'running' || status === 'waiting_for_user_answer';
+}
+
+/** True when CC is not producing output: future events won't resolve trailing
+ *  Thinking spinners in non-current exchanges, so the renderer must clean
+ *  them up itself. NOT the inverse of `isMidTurn` — `waiting_for_user_answer`
+ *  belongs to BOTH sets (mid-turn cancellable, but quiescent for output).
+ *  That overlap is exactly the bug surface this predicate addresses: a
+ *  CodingAgentPromptSent for a queued mid-flight follow-up that CC paused
+ *  before consuming has a stranded Thinking step which can never be resolved
+ *  naturally — CC's resume events attach to the new UserQuestionAsked
+ *  exchange via current-pointer routing, not the stranded one. */
+export function isThreadQuiescent(status: ThreadStatus | undefined): boolean {
+  return status === 'idle' || status === 'waiting_for_user_answer';
 }
 
 export function getThreadDisplaySection(thread: ThreadState): DisplaySection {
@@ -695,19 +713,19 @@ export const toasts = signal<ToastItem[]>([]);
  *  Map entry would survive until the setTimeout fires. */
 const keyedDismissTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; onClick?: () => void; spinning?: boolean; autoDismissMs?: number; dismissable?: boolean }) {
-  const { key, action, onClick, spinning, autoDismissMs, dismissable } = opts ?? {};
+export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; autoDismissMs?: number; dismissable?: boolean }) {
+  const { key, action, secondaryAction, onClick, spinning, autoDismissMs, dismissable } = opts ?? {};
   // If a key is provided, update an existing toast with the same key instead of creating a new one
   if (key) {
     const existing = toasts.value.find((t) => t.key === key);
     if (existing) {
-      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, message, type, action, onClick, spinning, dismissable } : t);
+      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, message, type, action, secondaryAction, onClick, spinning, dismissable } : t);
       scheduleAutoDismiss(key, autoDismissMs);
       return;
     }
   }
   const id = ++toastIdCounter;
-  toasts.value = [...toasts.value, { id, message, type, key, action, onClick, spinning, dismissable }];
+  toasts.value = [...toasts.value, { id, message, type, key, action, secondaryAction, onClick, spinning, dismissable }];
   if (key) {
     scheduleAutoDismiss(key, autoDismissMs);
     return;
@@ -779,6 +797,11 @@ export function showConfirm(
   });
 }
 
+// --- Step detail modal ---
+// Set to a step ResponseEvent to open the per-step detail modal; null = closed.
+export type StepDetailModalState = Extract<ResponseEvent, { type: 'step' }> | null;
+export const stepDetailModal = signal<StepDetailModalState>(null);
+
 // --- Image popup ---
 export interface ImagePopupState {
   images: string[];
@@ -792,12 +815,13 @@ export function openImagePopup(src: string): void {
 }
 
 /** Open the popup with prev/next nav across every sibling thumbnail in the
- *  same `.thread-content` as `clicked`. Degrades to single-image when no
- *  siblings can be collected. */
-export function openImagePopupFromThread(src: string, clicked: Element | EventTarget | null): void {
-  const container = (clicked instanceof Element) ? clicked.closest('.thread-content') : null;
+ *  nearest image group around `clicked` — either a sent-message thread
+ *  (`.thread-content`) or the unsent prompt strip (`.image-preview-strip`).
+ *  Degrades to single-image when no siblings can be collected. */
+export function openImagePopupFromGroup(src: string, clicked: Element | EventTarget | null): void {
+  const container = (clicked instanceof Element) ? clicked.closest('.thread-content, .image-preview-strip') : null;
   if (!container) { openImagePopup(src); return; }
-  const els = container.querySelectorAll<HTMLImageElement>('.image-thumbnail, .user-image-thumb');
+  const els = container.querySelectorAll<HTMLImageElement>('.image-thumbnail, .user-image-thumb, .image-preview-thumb');
   const seen = new Set<string>();
   const images: string[] = [];
   els.forEach(el => {

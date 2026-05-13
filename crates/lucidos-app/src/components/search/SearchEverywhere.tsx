@@ -7,6 +7,7 @@ import { openAppById } from '../../store/actions/apps';
 import { switchMenuItem, openSettingsSubview } from '../../store/actions/menu';
 import { viewChangeDiffById } from '../../store/actions/repositories';
 import { navigateToTrigger } from '../../store/actions/triggers';
+import { RECENTS_KEY } from '../../store/actions/entityReferences';
 import { SearchIcon, CloseIcon, ClearIcon } from '../shared/icons';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
 import { errorDetail } from '../../utils/errorDetail';
@@ -22,7 +23,6 @@ const CATEGORIES: { id: SearchCategory; label: string }[] = [
   { id: 'changes', label: 'Changes' },
 ];
 
-const RECENTS_KEY = 'lucidos-search-recents';
 const MAX_RECENTS = 15;
 
 function loadRecents(): SearchResultItem[] {

@@ -133,6 +133,25 @@ pub(super) fn estimate_message_chars(message: &Message) -> usize {
     }
 }
 
+/// Per-model prompt-token budget. The ContextCaptured modal uses this to
+/// render the budget bar's denominator. Anthropic's 1M-context Opus build
+/// is signalled by the `[1m]` suffix the engine pins when invoking it; the
+/// bare model id stays at the default 200k. OpenAI's `gpt-5` family is 400k.
+/// Unknown models fall back to 200k — slight under-report on a 1M-context
+/// fork is preferable to over-promising headroom we can't deliver.
+pub fn context_window_for(model: &str) -> usize {
+    if model.contains("[1m]") {
+        return 1_000_000;
+    }
+    if model.starts_with("claude-") {
+        return 200_000;
+    }
+    if model.starts_with("gpt-5") {
+        return 400_000;
+    }
+    200_000
+}
+
 /// Trim the agent loop message history to fit within a character budget.
 ///
 /// Two-pass approach:
@@ -265,12 +284,17 @@ pub(super) fn trim_context_if_needed(messages: &mut Vec<Message>, budget: usize)
     removed
 }
 
-/// Validate that every assistant tool_use block has a matching tool_result in the
-/// immediately following user message. If any are missing, log a warning and inject
-/// stub tool_result blocks so the API doesn't reject the request.
+/// Validate that every assistant tool_use block has a matching tool_result in
+/// the immediately following user message. If any are missing, inject stub
+/// `tool_result` blocks so Anthropic doesn't 400 with "tool_use ids were
+/// found without tool_result blocks immediately after". Promotes the next
+/// user message from `Text` to `Blocks` first so the stubs land — Text
+/// content can't carry tool_results.
 ///
-/// Returns the number of stub results injected (0 = valid).
-pub(super) fn validate_tool_use_pairing(messages: &mut Vec<Message>) -> usize {
+/// Returns the number of stub results injected (0 = valid). Called by the
+/// agentic loop each iteration AND by the LLM provider layer (defense in
+/// depth — covers callers that bypass the loop).
+pub(crate) fn validate_tool_use_pairing(messages: &mut Vec<Message>) -> usize {
     let mut stubs_injected = 0;
     let mut i = 0;
     while i < messages.len() {
@@ -310,6 +334,9 @@ pub(super) fn validate_tool_use_pairing(messages: &mut Vec<Message>) -> usize {
                         }
                     })
                     .collect(),
+                // Text content carries no tool_results — every tool_use_id is
+                // missing. Falls through to the injection path below, which
+                // promotes the Text content to Blocks so the stubs land.
                 _ => std::collections::HashSet::new(),
             };
 
@@ -326,13 +353,29 @@ pub(super) fn validate_tool_use_pairing(messages: &mut Vec<Message>) -> usize {
                     missing
                 );
 
+                // Promote Text -> Blocks before injecting stubs: ToolResult
+                // blocks can only live inside `Blocks` content. Without this,
+                // an orphan tool_use followed by the user's plain-text prompt
+                // (the thread-b101c3d7 shape) silently sailed through to
+                // Anthropic and produced a 400.
+                if let MessageContent::Text(text) = &mut messages[i + 1].content {
+                    let promoted = if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![ContentBlock::Text {
+                            text: std::mem::take(text),
+                        }]
+                    };
+                    messages[i + 1].content = MessageContent::Blocks(promoted);
+                }
+
                 if let MessageContent::Blocks(blocks) = &mut messages[i + 1].content {
                     for id in &missing {
                         blocks.insert(
                             0,
                             ContentBlock::ToolResult {
                                 tool_use_id: (*id).clone(),
-                                content: "[tool result unavailable]".to_string(),
+                                content: crate::core::store::ORPHAN_TOOL_RESULT_STUB.to_string(),
                             },
                         );
                         stubs_injected += 1;
@@ -349,7 +392,7 @@ pub(super) fn validate_tool_use_pairing(messages: &mut Vec<Message>) -> usize {
                     stubs_injected += 1;
                     ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
-                        content: "[tool result unavailable]".to_string(),
+                        content: crate::core::store::ORPHAN_TOOL_RESULT_STUB.to_string(),
                     }
                 })
                 .collect();
@@ -435,10 +478,25 @@ const HISTORY_STEPS_MAX_BYTES: usize = 2_000;
 /// string. Returns `None` when there's nothing tool-shaped to report
 /// (synthetic Thinking/MemorySearched steps lack `tool_name` and are
 /// skipped). Output is capped at [`HISTORY_STEPS_MAX_BYTES`].
-pub(crate) fn format_history_steps(steps: &[Step]) -> Option<String> {
+///
+/// `skip_tool_event_ids` is the set of `ToolCalled` event ids that are
+/// already represented as full `Message::Blocks(...)` pairs prepended to the
+/// LLM messages vec by `build_resume_tool_blocks_with_skip_ids`. Their
+/// summary lines are suppressed here so the LLM doesn't see the same tool
+/// call twice (once verbatim, once as a `[tools: ...]` summary).
+pub(crate) fn format_history_steps(
+    steps: &[Step],
+    skip_tool_event_ids: &std::collections::HashSet<String>,
+) -> Option<String> {
     let descs: Vec<String> = steps
         .iter()
         .filter(|s| s.tool_name.is_some())
+        .filter(|s| {
+            s.tool_called_event_id
+                .as_ref()
+                .map(|id| !skip_tool_event_ids.contains(id))
+                .unwrap_or(true)
+        })
         .map(|s| {
             let mark = if s.success { "ok" } else { "FAIL" };
             // describe_tool's trailing "..." is for live progress, not history.
@@ -710,3 +768,17 @@ mod history_format_tests;
 #[cfg(test)]
 #[path = "context_tests/sanitize.rs"]
 mod sanitize_file_content_tests;
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::context_window_for;
+
+    #[test]
+    fn context_window_for_known_models() {
+        assert_eq!(context_window_for("claude-opus-4-7[1m]"), 1_000_000);
+        assert_eq!(context_window_for("claude-opus-4-7"), 200_000);
+        assert_eq!(context_window_for("claude-sonnet-4-6"), 200_000);
+        assert_eq!(context_window_for("gpt-5"), 400_000);
+        assert_eq!(context_window_for("unknown-model"), 200_000);
+    }
+}

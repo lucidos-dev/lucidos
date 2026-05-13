@@ -10,14 +10,29 @@ use crate::memory::{cosine_similarity, EmbeddingProvider};
 /// workspace-local or shared user-curated knowhow dirs.
 pub const SYSTEM_KNOWHOW_PREFIX: &str = "system-knowhow/";
 
+/// Test-only helper: write a single knowhow file with the YAML frontmatter
+/// (`name: ...`) the loader expects. Shared by `core::knowhow::tests` so all
+/// knowhow fixtures share one definition.
+#[cfg(test)]
+pub(crate) fn write_knowhow_file(path: &std::path::Path, name: &str, body: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, format!("---\nname: {}\n---\n{}", name, body)).unwrap();
+}
+
 /// Bundles the user-curated knowhow search directories.
-/// Priority (highest wins): local > shared > apps.
+/// Priority (highest wins): local > shared > apps > triggers.
 ///
 /// `apps` is the workspace's `data/apps/` root. App-scoped knowhow ids of the
 /// form `<app_id>/<rest>` resolve to `<apps>/<app_id>/knowhow/<rest>.md` as the
 /// last fallback — bare-id local + shared still win when both exist. The
 /// engine surfaces app-scoped ids in the system prompt's Know-how list, so
 /// validators and loaders that work with `KnowhowDirs` must accept them.
+///
+/// `triggers` is the workspace's `data/triggers/` root. Ids of the form
+/// `triggers/<slug>/<rest>` resolve to `<triggers>/<slug>/knowhow/<rest>.md`,
+/// mirroring the app-scoped namespace one level down. Listed in the system
+/// prompt only for threads of the matching trigger; resolution is global so
+/// `load_knowhow` can fetch by id from any caller that knows it.
 ///
 /// Engine-shipped reference knowhow lives in `<repo>/system-knowhow/` and is
 /// loaded separately via [`crate::core::SystemKnowhowStore`] — it cannot be
@@ -26,6 +41,7 @@ pub struct KnowhowDirs {
     pub shared: Option<PathBuf>,
     pub local: PathBuf,
     pub apps: Option<PathBuf>,
+    pub triggers: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,7 +127,7 @@ fn derive_description(name: &str, body: &str) -> String {
     }
 }
 
-fn collect_md_files(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn collect_md_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -144,7 +160,7 @@ fn collect_md_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// e.g., `knowhow/lucidos/cross-workspace.md` → `lucidos/cross-workspace`
-fn id_from_path(root: &Path, path: &Path) -> Option<String> {
+pub(crate) fn id_from_path(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
     let without_ext = rel.with_extension("");
     let s = without_ext.to_str()?;
@@ -189,6 +205,16 @@ impl KnowhowStore {
         }
 
         summaries
+    }
+
+    /// Load know-how summaries for one trigger from
+    /// `<triggers_dir>/<slug>/knowhow/`. Returns empty if no knowhow dir
+    /// exists for the slug. IDs are bare filenames (no slug prefix in
+    /// the id; the trigger system prompt section labels them by slug
+    /// separately, mirroring `load_app_summaries`).
+    pub fn load_trigger_summaries(triggers_dir: &Path, slug: &str) -> Vec<KnowhowSummary> {
+        let kh_dir = triggers_dir.join(slug).join("knowhow");
+        Self::load_summaries(&kh_dir)
     }
 
     /// Load know-how summaries from all app knowhow/ subdirectories.
@@ -246,11 +272,13 @@ impl KnowhowStore {
     }
 
     /// Load full content for a specific know-how file.
-    /// Priority (highest wins): local > shared > app-scoped.
+    /// Priority (highest wins): local > shared > app-scoped > trigger-scoped.
     /// App-scoped: an id of the form `<app_id>/<rest>` falls back to
-    /// `<apps>/<app_id>/knowhow/<rest>.md` — only consulted if the bare id
-    /// matched neither local nor shared, so a top-level file with the same
-    /// id-shape always wins.
+    /// `<apps>/<app_id>/knowhow/<rest>.md`.
+    /// Trigger-scoped: an id of the form `triggers/<slug>/<rest>` falls back
+    /// to `<triggers>/<slug>/knowhow/<rest>.md`. The `triggers/` prefix
+    /// disambiguates from the `<app>/<rest>` namespace; both are consulted
+    /// only if no top-level file matched, so a same-shaped local entry wins.
     pub fn load_with_fallback(dirs: &KnowhowDirs, id: &str) -> Option<Knowhow> {
         Self::load(&dirs.local, id)
             .or_else(|| {
@@ -260,6 +288,10 @@ impl KnowhowStore {
             })
             .or_else(|| {
                 let path = app_scoped_knowhow_path(dirs.apps.as_deref()?, id)?;
+                read_knowhow_file(&path, id)
+            })
+            .or_else(|| {
+                let path = trigger_scoped_knowhow_path(dirs.triggers.as_deref()?, id)?;
                 read_knowhow_file(&path, id)
             })
     }
@@ -305,40 +337,6 @@ fn read_knowhow_file(path: &Path, id: &str) -> Option<Knowhow> {
     })
 }
 
-/// Format the user-facing error for a "knowhow id doesn't resolve" failure.
-/// Shared between the HTTP trigger handler and the LLM `create_trigger` /
-/// `update_trigger` tool so the wording stays in lockstep across surfaces.
-pub fn format_missing_knowhow_message(missing: &[String]) -> String {
-    format!(
-        "Knowhow not found: {}. IDs are paths under data/knowhow/ (or system-knowhow/) without .md \
-         — include subdirectories (e.g. lucidos-ops/nightly-pipeline-trigger).",
-        missing.join(", ")
-    )
-}
-
-/// Returns the subset of `ids` that do NOT resolve to an existing knowhow
-/// file. An empty Vec means every id resolves. Resolution mirrors
-/// [`load_knowhow_sections_merged`]: `system-knowhow/X` looks in `system_dir`,
-/// bare ids fall back local → shared, then `<app>/<rest>` ids fall back to
-/// the workspace's `apps/<app>/knowhow/<rest>.md`.
-///
-/// Order is preserved so callers can show users the offending ids verbatim.
-/// Existence-only — never reads file bodies — so it's cheap on the trigger
-/// fire path and the LLM tool turn.
-pub fn missing_knowhow_ids(
-    dirs: &KnowhowDirs,
-    system_dir: Option<&Path>,
-    ids: &[String],
-) -> Vec<String> {
-    let mut missing = Vec::new();
-    for id in ids {
-        if !id_resolves(dirs, system_dir, id) {
-            missing.push(id.clone());
-        }
-    }
-    missing
-}
-
 /// Same path-traversal guard as [`KnowhowStore::load`]; ids that fail this
 /// can never resolve to a real file regardless of which dir we look in.
 fn is_safe_id(id: &str) -> bool {
@@ -368,32 +366,28 @@ fn app_scoped_knowhow_path(apps_dir: &Path, id: &str) -> Option<PathBuf> {
     )
 }
 
-fn id_resolves(dirs: &KnowhowDirs, system_dir: Option<&Path>, id: &str) -> bool {
+/// Resolve `triggers/<slug>/<rest>` to `<triggers>/<slug>/knowhow/<rest>.md`.
+/// Mirrors [`app_scoped_knowhow_path`] one level deeper — the leading
+/// `triggers/` prefix disambiguates the trigger namespace from the bare
+/// `<app>/<rest>` namespace. Returns `None` for ids that aren't trigger-scoped,
+/// have empty segments, or fail the same path-traversal guards.
+fn trigger_scoped_knowhow_path(triggers_dir: &Path, id: &str) -> Option<PathBuf> {
     if !is_safe_id(id) {
-        return false;
+        return None;
     }
-    if let Some(sys_id) = id.strip_prefix(SYSTEM_KNOWHOW_PREFIX) {
-        return system_dir
-            .map(|dir| dir.join(format!("{}.md", sys_id)).is_file())
-            .unwrap_or(false);
+    let stripped = id.strip_prefix("triggers/")?;
+    let (slug, rest) = stripped.split_once('/')?;
+    // Same guard as the app-scoped helper: an absolute / backslash-prefixed
+    // `rest` would let `Path::join` escape the triggers_dir prefix.
+    if slug.is_empty() || rest.is_empty() || !is_safe_id(rest) {
+        return None;
     }
-    let filename = format!("{}.md", id);
-    if dirs.local.join(&filename).is_file() {
-        return true;
-    }
-    if dirs
-        .shared
-        .as_deref()
-        .map(|s| s.join(&filename).is_file())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    dirs.apps
-        .as_deref()
-        .and_then(|apps| app_scoped_knowhow_path(apps, id))
-        .map(|p| p.is_file())
-        .unwrap_or(false)
+    Some(
+        triggers_dir
+            .join(slug)
+            .join("knowhow")
+            .join(format!("{}.md", rest)),
+    )
 }
 
 /// Load referenced know-how for LLM context.
@@ -432,6 +426,42 @@ pub fn load_knowhow_sections_merged(
         String::new()
     } else {
         format!("\n\n{}", sections.join("\n\n"))
+    }
+}
+
+/// Load and format a single know-how section by id.
+///
+/// `Some` of a formatted `[KNOW-HOW: ...]` or `[SYSTEM-KNOWHOW: ...]` block,
+/// or `None` if the id resolves to nothing. The `load_knowhow` LLM tool
+/// handler is implemented on top of this helper so any future callers get
+/// identical formatted output.
+pub fn load_one_knowhow_section(
+    dirs: &KnowhowDirs,
+    system_dir: Option<&Path>,
+    id: &str,
+) -> Option<String> {
+    if let Some(sys_id) = id.strip_prefix(SYSTEM_KNOWHOW_PREFIX) {
+        let dir = system_dir?;
+        return SystemKnowhowStore::load(dir, sys_id)
+            .map(|sd| SystemKnowhowStore::format_section(&sd));
+    }
+    KnowhowStore::load_with_fallback(dirs, id).map(|kh| kh.format_section())
+}
+
+/// Format the "knowhow not found" message that the `load_knowhow` LLM tool
+/// surfaces to the model when an id doesn't resolve. Centralized so any
+/// future callers stay byte-identical with the LLM tool's miss path.
+pub fn knowhow_not_found_body(id: &str) -> String {
+    if id.starts_with(SYSTEM_KNOWHOW_PREFIX) {
+        format!(
+            "System knowhow '{}' not found. Check the System Knowhow list in the system prompt for available IDs.",
+            id
+        )
+    } else {
+        format!(
+            "Know-how '{}' not found. Use the know-how list in the system prompt to see available IDs.",
+            id
+        )
     }
 }
 
@@ -553,10 +583,7 @@ pub async fn discover_knowhow(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn shared_provider() -> &'static dyn EmbeddingProvider {
-        crate::test_util::shared_embedder()
-    }
+    use crate::test_util::KeywordEmbedder;
 
     #[test]
     fn parse_knowhow_with_description() {
@@ -616,9 +643,10 @@ mod tests {
         assert!(!json.contains("content"));
     }
 
+    #[cfg(feature = "real-embedder-tests")]
     #[tokio::test]
     async fn discover_semantic_match() {
-        let provider = shared_provider();
+        let provider = crate::test_util::shared_embedder();
         let summaries = vec![KnowhowSummary {
             id: "heatpump".to_string(),
             name: "Heatpump".to_string(),
@@ -638,9 +666,10 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "real-embedder-tests")]
     #[tokio::test]
     async fn discover_ranks_related_above_unrelated() {
-        let provider = shared_provider();
+        let provider = crate::test_util::shared_embedder();
         let description = "Controls and monitors Panasonic heatpumps via Comfort Cloud API";
         let related = "What is the heatpump temperature?";
         let unrelated = "How to bake a chocolate cake with dark chocolate ganache";
@@ -662,7 +691,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_includes_explicit_refs() {
-        let provider = shared_provider();
+        let provider = KeywordEmbedder::new(&["heatpump"]);
         let summaries = vec![KnowhowSummary {
             id: "heatpump".to_string(),
             name: "Heatpump".to_string(),
@@ -672,7 +701,7 @@ mod tests {
             "unrelated message about cooking",
             &summaries,
             &["heatpump".to_string()],
-            provider,
+            &provider,
         )
         .await;
         assert_eq!(result, vec!["heatpump"]);
@@ -680,7 +709,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_deduplicates_explicit_and_semantic() {
-        let provider = shared_provider();
+        let provider = KeywordEmbedder::new(&["heatpump"]);
         let summaries = vec![KnowhowSummary {
             id: "heatpump".to_string(),
             name: "Heatpump".to_string(),
@@ -691,16 +720,17 @@ mod tests {
             "Check the heatpump temperature",
             &summaries,
             &["heatpump".to_string()],
-            provider,
+            &provider,
         )
         .await;
         assert_eq!(result, vec!["heatpump"]);
         assert_eq!(result.len(), 1);
     }
 
+    #[cfg(feature = "real-embedder-tests")]
     #[tokio::test]
     async fn discover_ranks_by_relevance() {
-        let provider = shared_provider();
+        let provider = crate::test_util::shared_embedder();
         let summaries = vec![
             KnowhowSummary {
                 id: "heatpump".to_string(),
@@ -723,26 +753,23 @@ mod tests {
             provider,
         )
         .await;
-        // Heatpump should be the top match
         assert!(!result.is_empty(), "should have at least one match");
         assert_eq!(result[0], "heatpump", "heatpump should be ranked first");
     }
 
     #[tokio::test]
     async fn discover_empty_message_returns_only_explicit() {
-        let provider = shared_provider();
+        // No embedder calls expected — empty message short-circuits before the
+        // embed_batch call. Use the mock to keep this test offline-safe.
+        let provider = KeywordEmbedder::new(&["test"]);
         let summaries = vec![KnowhowSummary {
             id: "test".to_string(),
             name: "Test".to_string(),
             description: "Test description".to_string(),
         }];
-        let result = discover_knowhow("", &summaries, &["explicit".to_string()], provider).await;
+        let result =
+            discover_knowhow("", &summaries, &["explicit".to_string()], &provider).await;
         assert_eq!(result, vec!["explicit"]);
-    }
-
-    fn write_knowhow_file(path: &std::path::Path, name: &str, body: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, format!("---\nname: {}\n---\n{}", name, body)).unwrap();
     }
 
     #[test]
@@ -847,6 +874,7 @@ mod tests {
             shared: shared.map(|p| p.to_path_buf()),
             local: local.to_path_buf(),
             apps: None,
+            triggers: None,
         }
     }
 
@@ -859,6 +887,19 @@ mod tests {
             shared: shared.map(|p| p.to_path_buf()),
             local: local.to_path_buf(),
             apps: Some(apps.to_path_buf()),
+            triggers: None,
+        }
+    }
+
+    fn dirs_with_triggers(
+        local: &std::path::Path,
+        triggers: &std::path::Path,
+    ) -> KnowhowDirs {
+        KnowhowDirs {
+            shared: None,
+            local: local.to_path_buf(),
+            apps: None,
+            triggers: Some(triggers.to_path_buf()),
         }
     }
 
@@ -1065,6 +1106,32 @@ mod tests {
     }
 
     #[test]
+    fn load_one_knowhow_section_returns_system_or_user_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        let system = tmp.path().join("system");
+        write_knowhow_file(&local.join("user-doc.md"), "User Doc", "User body.");
+        write_knowhow_file(&system.join("sys-doc.md"), "Sys Doc", "Sys body.");
+
+        let user = load_one_knowhow_section(&dirs(None, &local), Some(&system), "user-doc")
+            .expect("user knowhow should resolve");
+        assert!(user.contains("[KNOW-HOW: User Doc]"));
+        assert!(user.contains("User body."));
+
+        let sys = load_one_knowhow_section(
+            &dirs(None, &local),
+            Some(&system),
+            "system-knowhow/sys-doc",
+        )
+        .expect("system knowhow should resolve");
+        assert!(sys.contains("[SYSTEM-KNOWHOW: Sys Doc]"));
+        assert!(sys.contains("Sys body."));
+
+        let missing = load_one_knowhow_section(&dirs(None, &local), Some(&system), "no-such");
+        assert!(missing.is_none());
+    }
+
+    #[test]
     fn load_knowhow_sections_merged_handles_missing_system_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().join("local");
@@ -1075,125 +1142,12 @@ mod tests {
         assert_eq!(sections, "", "missing system_dir should drop system ids silently");
     }
 
-    // --- missing_knowhow_ids ---
-
-    #[test]
-    fn missing_knowhow_ids_returns_empty_when_all_resolve() {
-        let tmp = tempfile::tempdir().unwrap();
-        let local = tmp.path().join("local");
-        let system = tmp.path().join("system");
-        write_knowhow_file(&local.join("nested").join("foo.md"), "Foo", "Body.");
-        write_knowhow_file(&system.join("guide.md"), "Guide", "Sys body.");
-
-        let ids = vec![
-            "nested/foo".to_string(),
-            "system-knowhow/guide".to_string(),
-        ];
-        let missing = missing_knowhow_ids(&dirs(None, &local), Some(&system), &ids);
-        assert!(missing.is_empty(), "all ids should resolve, got: {:?}", missing);
-    }
-
-    #[test]
-    fn missing_knowhow_ids_flags_bare_id_in_subdirectory() {
-        // The reported bug: a knowhow at `lucidos-ops/nightly-pipeline-trigger.md`
-        // is referenced as `nightly-pipeline-trigger` (bare). The validator must
-        // catch this so the trigger save fails instead of 404ing later.
-        let tmp = tempfile::tempdir().unwrap();
-        let local = tmp.path().join("local");
-        write_knowhow_file(
-            &local.join("lucidos-ops").join("nightly-pipeline-trigger.md"),
-            "Nightly",
-            "Body.",
-        );
-
-        let ids = vec!["nightly-pipeline-trigger".to_string()];
-        let missing = missing_knowhow_ids(&dirs(None, &local), None, &ids);
-        assert_eq!(missing, vec!["nightly-pipeline-trigger".to_string()]);
-    }
-
-    #[test]
-    fn missing_knowhow_ids_flags_missing_system_knowhow() {
-        let tmp = tempfile::tempdir().unwrap();
-        let local = tmp.path().join("local");
-        let system = tmp.path().join("system");
-        std::fs::create_dir_all(&local).unwrap();
-        std::fs::create_dir_all(&system).unwrap();
-
-        let ids = vec!["system-knowhow/does-not-exist".to_string()];
-        let missing = missing_knowhow_ids(&dirs(None, &local), Some(&system), &ids);
-        assert_eq!(missing, vec!["system-knowhow/does-not-exist".to_string()]);
-    }
-
-    #[test]
-    fn missing_knowhow_ids_preserves_input_order() {
-        let tmp = tempfile::tempdir().unwrap();
-        let local = tmp.path().join("local");
-        write_knowhow_file(&local.join("real.md"), "Real", "Body.");
-
-        let ids = vec![
-            "ghost-1".to_string(),
-            "real".to_string(),
-            "ghost-2".to_string(),
-        ];
-        let missing = missing_knowhow_ids(&dirs(None, &local), None, &ids);
-        assert_eq!(missing, vec!["ghost-1".to_string(), "ghost-2".to_string()]);
-    }
-
-    #[test]
-    fn missing_knowhow_ids_falls_back_to_shared() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shared = tmp.path().join("shared");
-        let local = tmp.path().join("local");
-        std::fs::create_dir_all(&local).unwrap();
-        write_knowhow_file(&shared.join("only-shared.md"), "Only Shared", "Body.");
-
-        let ids = vec!["only-shared".to_string()];
-        let missing = missing_knowhow_ids(&dirs(Some(&shared), &local), None, &ids);
-        assert!(missing.is_empty(), "shared fallback should resolve, got: {:?}", missing);
-    }
-
     // --- App-scoped knowhow resolution ---
     //
-    // The reported bug: triggers reference knowhow ids of the form `<app>/<rest>`
-    // (e.g. `finn-jobs/finn-search-workflow`) which the engine surfaces in the
-    // system prompt's Know-how list. The validator and trigger fire path must
-    // resolve these against `<workspace>/data/apps/<app>/knowhow/<rest>.md` —
-    // not just the top-level local/shared dirs — or the trigger save fails and
-    // pre-existing rows error at fire time.
-
-    #[test]
-    fn missing_knowhow_ids_resolves_app_scoped_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let local = tmp.path().join("local");
-        std::fs::create_dir_all(&local).unwrap();
-        let apps = tmp.path().join("apps");
-        write_knowhow_file(
-            &apps.join("finn-jobs").join("knowhow").join("finn-search-workflow.md"),
-            "Finn search workflow",
-            "How to search Finn.",
-        );
-
-        let ids = vec!["finn-jobs/finn-search-workflow".to_string()];
-        let missing = missing_knowhow_ids(&dirs_with_apps(None, &local, &apps), None, &ids);
-        assert!(
-            missing.is_empty(),
-            "app-scoped id should resolve, got: {:?}",
-            missing
-        );
-    }
-
-    #[test]
-    fn missing_knowhow_ids_flags_unknown_app_scoped_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let local = tmp.path().join("local");
-        std::fs::create_dir_all(&local).unwrap();
-        let apps = tmp.path().join("apps");
-        std::fs::create_dir_all(&apps).unwrap();
-
-        let ids = vec!["finn-jobs/does-not-exist".to_string()];
-        let missing = missing_knowhow_ids(&dirs_with_apps(None, &local, &apps), None, &ids);
-        assert_eq!(missing, vec!["finn-jobs/does-not-exist".to_string()]);
-    }
+    // Knowhow ids of the form `<app>/<rest>` (e.g. `finn-jobs/finn-search-workflow`)
+    // — surfaced in the system prompt's Know-how list — must resolve against
+    // `<workspace>/data/apps/<app>/knowhow/<rest>.md` in addition to the top-level
+    // local/shared dirs.
 
     #[test]
     fn load_knowhow_sections_merged_loads_app_scoped_knowhow() {
@@ -1268,24 +1222,6 @@ mod tests {
         assert_eq!(kh.name, "Local Foo Bar", "local must win over app-scoped");
     }
 
-    #[test]
-    fn id_resolves_rejects_traversal_in_app_scoped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let local = tmp.path().join("local");
-        std::fs::create_dir_all(&local).unwrap();
-        let apps = tmp.path().join("apps");
-        // Even if the file existed, the path-traversal guard must reject `..`.
-        write_knowhow_file(
-            &apps.join("foo").join("knowhow").join("bar.md"),
-            "Foo Bar",
-            "Body.",
-        );
-
-        let ids = vec!["../escape/bar".to_string()];
-        let missing = missing_knowhow_ids(&dirs_with_apps(None, &local, &apps), None, &ids);
-        assert_eq!(missing, vec!["../escape/bar".to_string()]);
-    }
-
     // app_scoped_knowhow_path is the security boundary — an absolute or
     // backslash-prefixed `rest` segment would let `Path::join("/etc/passwd.md")`
     // replace the apps_dir prefix and escape to the filesystem root. The
@@ -1317,6 +1253,107 @@ mod tests {
         // contract directly so a future refactor doesn't lose this behavior.
         let apps = std::path::PathBuf::from("/tmp/lucidos-test/apps");
         assert!(app_scoped_knowhow_path(&apps, "foo/../bar").is_none());
+    }
+
+    #[test]
+    fn knowhow_not_found_body_branches_on_prefix() {
+        let user = knowhow_not_found_body("foo/bar");
+        assert!(user.starts_with("Know-how 'foo/bar' not found."));
+        assert!(user.contains("Use the know-how list"));
+
+        let sys = knowhow_not_found_body("system-knowhow/baz");
+        assert!(sys.starts_with("System knowhow 'system-knowhow/baz' not found."));
+        assert!(sys.contains("Check the System Knowhow list"));
+    }
+
+    // --- Trigger-scoped resolution via load_with_fallback ---
+
+    #[test]
+    fn load_with_fallback_resolves_trigger_scoped_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let triggers = tmp.path().join("triggers");
+        write_knowhow_file(
+            &triggers
+                .join("nightly-build")
+                .join("knowhow")
+                .join("orchestration.md"),
+            "Orchestration",
+            "Body.",
+        );
+
+        let kh = KnowhowStore::load_with_fallback(
+            &dirs_with_triggers(&local, &triggers),
+            "triggers/nightly-build/orchestration",
+        )
+        .expect("trigger-scoped id should resolve");
+        assert_eq!(kh.name, "Orchestration");
+        assert_eq!(kh.id, "triggers/nightly-build/orchestration");
+    }
+
+    #[test]
+    fn load_with_fallback_returns_none_for_unknown_trigger_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let triggers = tmp.path().join("triggers");
+        std::fs::create_dir_all(&triggers).unwrap();
+
+        let kh = KnowhowStore::load_with_fallback(
+            &dirs_with_triggers(&local, &triggers),
+            "triggers/unknown/foo",
+        );
+        assert!(kh.is_none());
+    }
+
+    #[test]
+    fn trigger_scoped_path_rejects_traversal() {
+        let triggers = std::path::PathBuf::from("/tmp/lucidos-test/triggers");
+        // outer is_safe_id catches `..`
+        assert!(trigger_scoped_knowhow_path(&triggers, "triggers/foo/../bar").is_none());
+        // empty slug
+        assert!(trigger_scoped_knowhow_path(&triggers, "triggers//bar").is_none());
+        // empty rest
+        assert!(trigger_scoped_knowhow_path(&triggers, "triggers/foo/").is_none());
+        // missing prefix
+        assert!(trigger_scoped_knowhow_path(&triggers, "foo/bar").is_none());
+    }
+
+    // --- Per-trigger knowhow summaries ---
+
+    #[test]
+    fn load_trigger_summaries_reads_files_under_slug_knowhow_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triggers = tmp.path().join("triggers");
+        let kh_dir = triggers.join("nightly-build").join("knowhow");
+        write_knowhow_file(
+            &kh_dir.join("orchestration.md"),
+            "Orchestration",
+            "How nightly orchestrates each phase.",
+        );
+        write_knowhow_file(
+            &kh_dir.join("rollback.md"),
+            "Rollback",
+            "Rollback procedure when a phase fails.",
+        );
+
+        let summaries = KnowhowStore::load_trigger_summaries(&triggers, "nightly-build");
+        let ids: Vec<&str> = summaries.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(summaries.len(), 2, "got: {:?}", ids);
+        assert!(ids.contains(&"orchestration"));
+        assert!(ids.contains(&"rollback"));
+        let orch = summaries.iter().find(|s| s.id == "orchestration").unwrap();
+        assert_eq!(orch.name, "Orchestration");
+    }
+
+    #[test]
+    fn load_trigger_summaries_returns_empty_when_no_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triggers = tmp.path().join("triggers");
+        std::fs::create_dir_all(&triggers).unwrap();
+        let summaries = KnowhowStore::load_trigger_summaries(&triggers, "no-such-slug");
+        assert!(summaries.is_empty());
     }
 
     #[test]

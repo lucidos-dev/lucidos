@@ -319,6 +319,24 @@ impl LucidosEngine {
                 "waiting for post-hardening tests",
             )
             .await?;
+
+            // A canceled `/harden` reaches `wait_and_commit`'s idle state too,
+            // so the marker is the proof — not the wait returning Ok.
+            if !branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await {
+                log!(
+                    "[ApplyNow] Hardening session ended without writing marker for branch {} — aborting apply",
+                    branch_name
+                );
+                self.emit_apply_failed_unhardened(
+                    thread_id,
+                    "",
+                    actor.clone(),
+                    "[ApplyNow] ChangeApplyFailed (incomplete hardening)",
+                )
+                .await;
+                self.reset_worktree_and_idle(thread_id, worktree_path).await;
+                return Ok(());
+            }
         }
 
         // Step 3: Check for commits
@@ -432,6 +450,7 @@ impl LucidosEngine {
     /// Fast path: try ff directly. If main diverged, send CC a single prompt
     /// to merge, resolve conflicts, harden, and test — then ff again.
     /// Returns (pre_sha, post_sha) on success.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn merge_via_cc_session(
         &self,
         thread_id: Uuid,

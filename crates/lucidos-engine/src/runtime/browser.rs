@@ -1117,5 +1117,4 @@ impl BrowserRuntime {
             Err(_) => None,
         }
     }
-
 }

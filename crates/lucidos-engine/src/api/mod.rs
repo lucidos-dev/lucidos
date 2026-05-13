@@ -19,8 +19,19 @@ mod notifications;
 mod plugins;
 mod presence;
 pub(crate) mod proxy;
+pub(crate) mod proxy_auth_layer;
+pub(crate) mod proxy_hmac_layer;
+pub mod proxy_migration;
+pub(crate) mod proxy_pipeline;
+pub(crate) mod proxy_pipeline_builder;
+pub(crate) mod proxy_pipeline_config;
+pub(crate) mod proxy_script_layer;
+pub(crate) mod proxy_script_runner;
+pub(crate) mod proxy_static_layers;
+pub(crate) mod proxy_token_cache;
+pub(crate) mod proxy_wasm_host;
+pub(crate) mod proxy_wasm_signer;
 mod repositories;
-mod saved_contexts;
 mod sdk;
 mod sdk_prefs;
 mod search;
@@ -718,7 +729,7 @@ pub fn create_router(
         .route("/chat/stream", post(chat::chat_submit))
         .route("/chat/cancel", post(chat::cancel_chat))
         .route("/chat/inject", post(chat::inject_prompt))
-        .route("/claude-code/cancel", post(claude_code::claude_code_cancel))
+        .route("/claude-code/stop", post(claude_code::claude_code_stop))
         .route(
             "/claude-code/interrupt",
             post(claude_code::claude_code_interrupt),
@@ -896,6 +907,10 @@ pub fn create_router(
         )
         .route("/internal/mark-hardened", post(internal::mark_hardened))
         .route("/internal/hardened-state", get(internal::query_hardened))
+        .route(
+            "/internal/cc-edit-preread",
+            get(internal::cc_edit_preread_check),
+        )
         .route("/internal/commit-made", post(internal::commit_made))
         .route("/internal/client-log", post(internal::client_log))
         .route(
@@ -924,15 +939,6 @@ pub fn create_router(
             get(backup::validate_workspace_name),
         )
         .route("/backup/start-workspace", post(backup::start_workspace))
-        // Saved contexts endpoints
-        .route(
-            "/saved-contexts",
-            get(saved_contexts::list_saved_contexts).post(saved_contexts::save_context),
-        )
-        .route(
-            "/saved-context",
-            get(saved_contexts::get_saved_context).delete(saved_contexts::delete_saved_context),
-        )
         // Thread endpoints
         .route("/threads", get(threads::list_threads))
         .route("/threads/search", get(threads::search_threads))
@@ -1011,17 +1017,31 @@ pub fn create_router(
             post(plugins::upload_archive)
                 .layer(DefaultBodyLimit::max(plugins::MAX_ARCHIVE_BYTES)),
         )
+        .route(
+            "/plugins/install/:install_id/confirm",
+            post(plugins::confirm_install),
+        )
+        .route(
+            "/plugins/install/:install_id/cancel",
+            post(plugins::cancel_install),
+        )
+        .route(
+            "/plugins/uninstall/:uninstall_id/confirm",
+            post(plugins::confirm_uninstall),
+        )
+        .route(
+            "/plugins/uninstall/:uninstall_id/cancel",
+            post(plugins::cancel_uninstall),
+        )
         // Generic API proxy — forwards to a backend configured in
         // `data/config/apis.json`. Two routes so callers can hit
         // `/proxy/sonos` (no trailing path) as well as `/proxy/sonos/play/2`.
         .route("/proxy/:name", any(proxy::proxy_handler_root))
         .route("/proxy/:name/", any(proxy::proxy_handler_root))
         .route("/proxy/:name/*path", any(proxy::proxy_handler))
-        // Sibling route (not /proxy/:name/_credentials) to avoid colliding
-        // with the *path wildcard above.
         .route(
-            "/proxy-credentials/:name",
-            get(proxy::proxy_credentials_handler),
+            "/proxy-modules/reload",
+            post(proxy::proxy_modules_reload),
         )
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .route(

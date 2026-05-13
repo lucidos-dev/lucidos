@@ -757,6 +757,38 @@ fn is_excluded_workspace_path(rel: &Path) -> bool {
     p == "postgres" || p.starts_with("postgres.")
 }
 
+/// Build a tar header for a file, copying size + mtime from filesystem metadata.
+/// Falls back to mtime=0 when the OS doesn't expose modified time (best-effort,
+/// matches tar's "no mtime known" convention).
+fn header_for_file(metadata: &std::fs::Metadata) -> tar::Header {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(metadata.len());
+    header.set_mode(0o644);
+    header.set_mtime(
+        metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+    header.set_cksum();
+    header
+}
+
+/// Append a single file at `path` to the tar `builder` under archive path `archive_path`.
+fn append_file<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    path: &Path,
+    archive_path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), BoxError> {
+    let mut header = header_for_file(metadata);
+    let mut file = std::fs::File::open(path)?;
+    builder.append_data(&mut header, archive_path, &mut file)?;
+    Ok(())
+}
+
 /// Tar workspace files (excluding .lucidos/) and SQL dump, then zstd compress.
 ///
 /// Streams tar entries directly through zstd to a file — never holds the full
@@ -782,39 +814,18 @@ fn tar_and_compress(
 
         let metadata = std::fs::metadata(&path)?;
         if metadata.is_file() {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(metadata.len());
-            header.set_mode(0o644);
-            header.set_mtime(
-                metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            );
-            header.set_cksum();
-            let mut file = std::fs::File::open(&path)?;
-            builder.append_data(&mut header, rel, &mut file)?;
+            append_file(&mut builder, &path, rel, &metadata)?;
         }
     }
 
     // Add the SQL dump at the archive root
     let sql_metadata = std::fs::metadata(sql_dump)?;
-    let mut header = tar::Header::new_gnu();
-    header.set_size(sql_metadata.len());
-    header.set_mode(0o644);
-    header.set_mtime(
-        sql_metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    );
-    header.set_cksum();
-    let mut sql_file = std::fs::File::open(sql_dump)?;
-    builder.append_data(&mut header, "lucidos_backup.dump", &mut sql_file)?;
+    append_file(
+        &mut builder,
+        sql_dump,
+        Path::new("lucidos_backup.dump"),
+        &sql_metadata,
+    )?;
 
     // Add user-level shared data (~/.lucidos/) under "user_dir/" prefix in the archive
     if let Some(user_dir) = user_dir {
@@ -827,21 +838,8 @@ fn tar_and_compress(
                 }
                 let metadata = std::fs::metadata(&path)?;
                 if metadata.is_file() {
-                    let mut header = tar::Header::new_gnu();
-                    header.set_size(metadata.len());
-                    header.set_mode(0o644);
-                    header.set_mtime(
-                        metadata
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0),
-                    );
-                    header.set_cksum();
                     let archive_path = std::path::Path::new("user_dir").join(rel);
-                    let mut file = std::fs::File::open(&path)?;
-                    builder.append_data(&mut header, archive_path, &mut file)?;
+                    append_file(&mut builder, &path, &archive_path, &metadata)?;
                 }
             }
         }

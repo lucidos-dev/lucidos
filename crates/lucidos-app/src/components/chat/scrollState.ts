@@ -174,6 +174,19 @@ export function scrollToBottom() {
   extendSuppression();
 }
 
+/** Re-pin the user to the bottom across a layout shift the user just caused —
+ *  typing in the prompt (action buttons grow), clicking a question option
+ *  (card transitions to the answered state), clicking a permission button
+ *  (card grows the picked/rejected styling). If they were at the bottom,
+ *  engage scroll mode so the upcoming ResizeObserver fire is suppressed; if
+ *  they had scrolled up, no-op so we don't override their intent.
+ *
+ *  Without this, onResize sees the post-shift layout cross the 80px window
+ *  and flips scrolledUp=true, breaking auto-scroll for subsequent streaming. */
+export function preserveAtBottom() {
+  if (!scrolledUp.value) scrollToBottom();
+}
+
 /** Build the scroll- and resize-event handlers for a single .thread-content
  *  element. The visibility gate at the top of each handler is required by the
  *  dual-mounting contract documented at the top of this file. */

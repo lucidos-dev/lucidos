@@ -37,7 +37,7 @@ describe('user-image-thumb tap opens popup', () => {
   it('user-image-thumb passes e.currentTarget.src (absolute) to the collector, not the closure src (relative)', () => {
     const match = source.match(/<img[\s\S]*?class="user-image-thumb"[\s\S]*?\/>/);
     expect(match, 'user-image-thumb img element not found').not.toBeNull();
-    expect(match![0]).toMatch(/openImagePopupFromThread\(\s*e\.currentTarget\.src/);
-    expect(match![0]).not.toMatch(/openImagePopupFromThread\(\s*src\b/);
+    expect(match![0]).toMatch(/openImagePopupFromGroup\(\s*e\.currentTarget\.src/);
+    expect(match![0]).not.toMatch(/openImagePopupFromGroup\(\s*src\b/);
   });
 });

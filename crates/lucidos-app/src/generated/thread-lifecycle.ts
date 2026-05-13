@@ -22,7 +22,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   MessageReceived: 'start',
   TextStreamed: 'activity',
   Thinking: 'activity',
-  ContextTokensMeasured: 'metadata',
+  ContextCaptured: 'metadata',
   MemorySearched: 'activity',
   ToolCalled: 'activity',
   ToolResult: 'activity',
@@ -31,7 +31,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ResponseAborted: 'terminal',
   ResponseFailed: 'action_required',
   SessionStarted: 'metadata',
-  SessionRecovered: 'metadata',
+  ContinuationStarted: 'metadata',
   SessionEnded: 'terminal',
   CodingAgentTextStreamed: 'activity',
   CodingAgentToolCalled: 'activity',
@@ -69,11 +69,14 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   CodingAgentPermissionRequest: 'action_required',
   CodingAgentPermissionResolved: 'activity',
   WorktreeCleaned: 'metadata',
+  ChildThreadCompleted: 'start',
+  ContextDismissed: 'metadata',
+  BackgroundBashStarted: 'metadata',
+  BackgroundBashCompleted: 'metadata',
 } as const;
 
 export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([
   'SessionStarted',
-  'SessionRecovered',
   'SessionEnded',
   'CodingAgentTextStreamed',
   'CodingAgentToolCalled',

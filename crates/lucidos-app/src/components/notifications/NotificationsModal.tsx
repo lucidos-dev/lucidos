@@ -13,6 +13,7 @@ import {
 } from '../../api/client';
 import { openApp } from '../../store/actions/apps';
 import { resetViewDedup, loadNotifications } from '../../store/actions/notifications';
+import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { formatNotificationDate } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
@@ -77,6 +78,12 @@ export function NotificationsModal() {
     openApp(linked.app);
   }
 
+  function handleOpenThread() {
+    if (!detail?.thread_id) return;
+    close();
+    focusThreadOrBootstrap(detail.thread_id);
+  }
+
   function handleBodyClick(e: MouseEvent) {
     const target = e.target as HTMLElement;
     const link = target.closest<HTMLAnchorElement>('a.app-link');
@@ -130,11 +137,18 @@ export function NotificationsModal() {
           onClick={handleBodyClick}
           dangerouslySetInnerHTML={{ __html: content }}
         />
-        {linked.kind === 'linked' && (
+        {(linked.kind === 'linked' || detail.thread_id) && (
           <div class="notification-detail-actions">
-            <button class="action-btn" onClick={handleOpenApp}>
-              Open {linked.app.name}
-            </button>
+            {linked.kind === 'linked' && (
+              <button class="action-btn" onClick={handleOpenApp}>
+                Open {linked.app.name}
+              </button>
+            )}
+            {detail.thread_id && (
+              <button class="action-btn" onClick={handleOpenThread}>
+                Open thread
+              </button>
+            )}
           </div>
         )}
         {linked.kind === 'unknown' && (

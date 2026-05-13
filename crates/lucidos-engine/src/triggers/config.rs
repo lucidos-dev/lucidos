@@ -39,7 +39,7 @@ fn supported_extensions_display() -> String {
 }
 
 /// What a trigger executes — either an LLM intent or a deterministic script.
-/// The tagged union enforces mutual exclusivity: know-how is only relevant for intents.
+/// The tagged union enforces mutual exclusivity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TriggerRun {
@@ -47,8 +47,6 @@ pub enum TriggerRun {
     Intent {
         #[serde(alias = "text")]
         intent: String,
-        #[serde(default)]
-        knowhow: Vec<String>,
     },
     #[serde(rename = "script")]
     Script { path: String },
@@ -59,6 +57,12 @@ pub enum TriggerRun {
 pub struct TriggerConfig {
     pub id: String,
     pub name: String,
+    /// Stable kebab-case identifier derived from `name` (or supplied explicitly
+    /// at create time). Used as the directory segment for per-trigger
+    /// know-how at `data/triggers/{slug}/knowhow/`. Legacy `TriggerCreated`
+    /// payloads without this field derive it on read so existing workspaces
+    /// keep working.
+    pub slug: String,
     pub schedule: Vec<String>,
     pub timezone: String,
     pub run: TriggerRun,
@@ -77,6 +81,48 @@ pub struct TriggerConfig {
     /// scheduled reports. Default false preserves the unattended-execution
     /// behavior expected of most cron triggers.
     pub go_to_review: bool,
+}
+
+/// Convert a human-facing trigger name to a stable kebab-case slug.
+///
+/// - NFKD-normalize then strip combining marks ("Café" → "cafe")
+/// - Lowercase ASCII alphanumerics; collapse other runs to `-`
+/// - Trim leading/trailing dashes
+///
+/// Returns `""` if the name is empty after stripping (e.g. `"!!!"`); pair with
+/// [`slugify_trigger_name_with_fallback`] to get a guaranteed non-empty slug.
+pub fn slugify_trigger_name(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let normalized: String = name
+        .nfkd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .collect();
+    let mut out = String::with_capacity(normalized.len());
+    let mut last_dash = true;
+    for c in normalized.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// Like [`slugify_trigger_name`] but guarantees a non-empty result by falling
+/// back to the first 8 chars of the trigger UUID (dashes stripped) when the
+/// name slugifies to empty (e.g. `"!!!"`).
+pub fn slugify_trigger_name_with_fallback(name: &str, uuid: &str) -> String {
+    let s = slugify_trigger_name(name);
+    if s.is_empty() {
+        let no_dashes = uuid.replace('-', "");
+        let take = 8.min(no_dashes.len());
+        format!("trigger-{}", &no_dashes[..take])
+    } else {
+        s
+    }
 }
 
 impl TriggerConfig {
@@ -110,10 +156,19 @@ impl TriggerConfig {
             .get("go_to_review")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Legacy `TriggerCreated` events lack `slug`; derive from name (with
+        // UUID fallback) so existing workspaces keep resolving without a
+        // backfill migration. New events from the API carry slug explicitly.
+        let slug = payload
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| slugify_trigger_name_with_fallback(&name, &id));
 
         Ok(TriggerConfig {
             id,
             name,
+            slug,
             schedule,
             timezone,
             run,
@@ -187,9 +242,29 @@ impl TriggerConfig {
 
     /// Apply a partial update from a TriggerUpdated event payload.
     /// Only fields present in the payload are updated.
+    ///
+    /// Note: legacy `run.knowhow: [...]` payloads are silently dropped — Phase 1
+    /// of the trigger-knowhow-discovery refactor removed the field, and serde
+    /// ignores unknown fields on `TriggerRun`. The rest of the `run` object is
+    /// applied normally.
     pub fn apply_update(&mut self, payload: &Value) {
         if let Some(name) = payload["name"].as_str() {
             self.name = name.to_string();
+        }
+        // Slug edits (e.g. trigger renamed) propagate so the per-trigger
+        // know-how dir resolves against the new slug. Validation of edit
+        // shape happens at the API boundary; corrupt payloads here are
+        // ignored so a bad event can never wedge the in-memory config.
+        if let Some(slug) = payload.get("slug").and_then(|v| v.as_str()) {
+            if is_valid_trigger_slug(slug) {
+                self.slug = slug.to_string();
+            } else {
+                log!(
+                    "[Triggers] Ignored invalid slug '{}' in TriggerUpdated for {}",
+                    slug,
+                    self.id
+                );
+            }
         }
         if let Some(schedule) = payload["schedule"].as_array() {
             self.schedule = schedule
@@ -245,6 +320,27 @@ pub(crate) fn derive_app_id_from_script_path(path: &str) -> Option<String> {
         return None;
     }
     Some(dir.to_string())
+}
+
+/// True if `slug` is a well-formed trigger slug suitable as a directory name.
+///
+/// Length 1-64, ASCII lowercase + digits + dashes, must start AND end with
+/// `[a-z0-9]` (so `--foo` and `foo--` are rejected). Used by both the API
+/// boundary (HTTP 400 on reject) and the `apply_update` path (drop bad
+/// in-flight edits).
+pub fn is_valid_trigger_slug(slug: &str) -> bool {
+    let len = slug.len();
+    if !(1..=64).contains(&len) {
+        return false;
+    }
+    let bytes = slug.as_bytes();
+    let is_ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    if !is_ok(bytes[0]) || !is_ok(bytes[len - 1]) {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Read the paused state from an event payload.
@@ -305,7 +401,10 @@ mod tests {
     }
 
     #[test]
-    fn prompt_knowhow() {
+    fn prompt_with_legacy_knowhow_field_is_ignored() {
+        // Phase 1 dropped run.knowhow; serde drops unknown fields silently
+        // (the default), so on-disk events still carry the field but it must
+        // not affect the parsed config.
         let payload = json!({
             "trigger_id": "heatpump-logging",
             "name": "Heatpump Logging",
@@ -315,10 +414,9 @@ mod tests {
         });
 
         let config = TriggerConfig::from_created_payload(&payload).unwrap();
-        if let TriggerRun::Intent { knowhow, .. } = &config.run {
-            assert_eq!(knowhow, &vec!["heatpump".to_string()]);
-        } else {
-            panic!("Expected Intent variant");
+        assert!(matches!(config.run, TriggerRun::Intent { .. }));
+        if let TriggerRun::Intent { intent } = &config.run {
+            assert_eq!(intent, "Log heat pump status");
         }
     }
 
@@ -381,9 +479,8 @@ mod tests {
         // On-disk TriggerCreated events from before the rename carry `text:`.
         let val = json!({"type": "intent", "text": "legacy payload"});
         let run: TriggerRun = serde_json::from_value(val).unwrap();
-        if let TriggerRun::Intent { intent, knowhow } = run {
+        if let TriggerRun::Intent { intent } = run {
             assert_eq!(intent, "legacy payload");
-            assert!(knowhow.is_empty());
         } else {
             panic!("Expected Intent variant");
         }
@@ -393,7 +490,6 @@ mod tests {
     fn trigger_run_serde_roundtrip() {
         let prompt = TriggerRun::Intent {
             intent: "Do something".into(),
-            knowhow: vec!["domain".into()],
         };
         let json = serde_json::to_value(&prompt).unwrap();
         assert_eq!(json["type"], "intent");
@@ -401,6 +497,10 @@ mod tests {
         assert!(
             json.get("text").is_none(),
             "serialized output must not contain the legacy `text` key"
+        );
+        assert!(
+            json.get("knowhow").is_none(),
+            "serialized output must not contain the deleted `knowhow` field"
         );
 
         let back: TriggerRun = serde_json::from_value(json).unwrap();
@@ -496,52 +596,48 @@ mod tests {
     }
 
     #[test]
-    fn trigger_run_deserialize_prompt_without_knowhow() {
-        // LLM often omits knowhow when calling update_trigger — must default to []
+    fn trigger_run_deserialize_prompt_legacy_alias() {
         let val = json!({"type": "prompt", "text": "do something"});
         let run: Result<TriggerRun, _> = serde_json::from_value(val);
         assert!(
             run.is_ok(),
-            "TriggerRun should deserialize without knowhow field"
+            "TriggerRun should deserialize the legacy 'prompt' variant"
         );
-        if let TriggerRun::Intent { intent, knowhow } = run.unwrap() {
+        if let TriggerRun::Intent { intent } = run.unwrap() {
             assert_eq!(intent, "do something");
-            assert!(knowhow.is_empty());
         } else {
             panic!("Expected Intent variant");
         }
     }
 
     #[test]
-    fn trigger_run_deserialize_intent_without_knowhow() {
+    fn trigger_run_deserialize_intent_minimal() {
         let val = json!({"type": "intent", "text": "do something"});
         let run: Result<TriggerRun, _> = serde_json::from_value(val);
         assert!(
             run.is_ok(),
-            "TriggerRun should deserialize without knowhow field"
+            "TriggerRun should deserialize from minimal {{type, text}} shape"
         );
     }
 
     #[test]
-    fn apply_update_run_without_knowhow() {
+    fn apply_update_run_carries_intent() {
         let payload = json!({
             "trigger_id": "test",
             "name": "Test",
             "schedule": ["0 0 8 * * *"],
             "timezone": "UTC",
-            "run": { "type": "prompt", "text": "old prompt", "knowhow": [] }
+            "run": { "type": "prompt", "text": "old prompt" }
         });
         let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
 
-        // LLM sends run without knowhow field — update must still apply
         config.apply_update(&json!({
             "trigger_id": "test",
             "run": { "type": "prompt", "text": "new prompt" }
         }));
 
-        if let TriggerRun::Intent { intent, knowhow } = &config.run {
+        if let TriggerRun::Intent { intent } = &config.run {
             assert_eq!(intent, "new prompt");
-            assert!(knowhow.is_empty());
         } else {
             panic!("Expected Intent variant");
         }
@@ -642,9 +738,8 @@ mod tests {
         assert_eq!(config.timezone, "Europe/Oslo");
         assert_eq!(config.on, Some("SomeEvent".to_string()));
         assert!(config.condition.is_some());
-        if let TriggerRun::Intent { intent, knowhow } = &config.run {
+        if let TriggerRun::Intent { intent } = &config.run {
             assert_eq!(intent, "original prompt");
-            assert_eq!(knowhow, &vec!["domain".to_string()]);
         } else {
             panic!("Expected Intent variant");
         }
@@ -675,11 +770,10 @@ mod tests {
         // Switch back to intent
         config.apply_update(&json!({
             "trigger_id": "test",
-            "run": { "type": "intent", "text": "new prompt", "knowhow": ["kh1"] }
+            "run": { "type": "intent", "text": "new prompt" }
         }));
-        if let TriggerRun::Intent { intent, knowhow } = &config.run {
+        if let TriggerRun::Intent { intent } = &config.run {
             assert_eq!(intent, "new prompt");
-            assert_eq!(knowhow, &vec!["kh1".to_string()]);
         } else {
             panic!("Expected Intent variant");
         }
@@ -918,6 +1012,100 @@ mod tests {
         assert_eq!(derive_app_id_from_script_path("apps/./foo"), None);
         assert_eq!(derive_app_id_from_script_path("apps/.git/x/y"), None);
         assert_eq!(derive_app_id_from_script_path("apps//foo"), None);
+    }
+
+    #[test]
+    fn trigger_config_carries_slug_field() {
+        let payload = json!({
+            "trigger_id": "uuid-1", "name": "Send Daily Summary",
+            "slug": "send-daily-summary",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "intent", "text": "x" }
+        });
+        let config = TriggerConfig::from_created_payload(&payload).unwrap();
+        assert_eq!(config.slug, "send-daily-summary");
+    }
+
+    #[test]
+    fn trigger_config_derives_slug_from_name_when_missing() {
+        // Legacy events lack the `slug` field — must derive from `name` so
+        // existing workspaces resolve trigger knowhow without a backfill.
+        let payload = json!({
+            "trigger_id": "uuid-1", "name": "Nightly CI Build",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "intent", "text": "x" }
+        });
+        let config = TriggerConfig::from_created_payload(&payload).unwrap();
+        assert_eq!(config.slug, "nightly-ci-build");
+    }
+
+    #[test]
+    fn slug_kebab_strips_unicode_arrows_and_lowercases() {
+        assert_eq!(
+            slugify_trigger_name("Nightly Build → Harden → E2E"),
+            "nightly-build-harden-e2e"
+        );
+        assert_eq!(
+            slugify_trigger_name("Send Daily Summary"),
+            "send-daily-summary"
+        );
+        assert_eq!(
+            slugify_trigger_name("Café Morning Briefing"),
+            "cafe-morning-briefing"
+        );
+        assert_eq!(slugify_trigger_name("My  Trigger!  v2"), "my-trigger-v2");
+    }
+
+    #[test]
+    fn slug_kebab_falls_back_to_uuid_short_when_empty() {
+        let s = slugify_trigger_name_with_fallback("!!!", "abcdef-1234-5678");
+        assert_eq!(s, "trigger-abcdef12");
+    }
+
+    #[test]
+    fn apply_update_accepts_slug_edit() {
+        let payload = json!({
+            "trigger_id": "t1", "name": "Old Name",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "intent", "text": "x" }
+        });
+        let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+        assert_eq!(config.slug, "old-name");
+
+        config.apply_update(&json!({ "trigger_id": "t1", "slug": "renamed" }));
+        assert_eq!(config.slug, "renamed");
+    }
+
+    #[test]
+    fn apply_update_ignores_invalid_slug() {
+        let payload = json!({
+            "trigger_id": "t1", "name": "Original",
+            "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "intent", "text": "x" }
+        });
+        let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+        let before = config.slug.clone();
+
+        config.apply_update(&json!({ "trigger_id": "t1", "slug": "Has Spaces" }));
+        assert_eq!(config.slug, before, "invalid slug must not clobber existing");
+    }
+
+    #[test]
+    fn is_valid_trigger_slug_accepts_well_formed() {
+        assert!(is_valid_trigger_slug("a"));
+        assert!(is_valid_trigger_slug("9"));
+        assert!(is_valid_trigger_slug("send-daily-summary"));
+        assert!(is_valid_trigger_slug("trigger-abc12345"));
+    }
+
+    #[test]
+    fn is_valid_trigger_slug_rejects_malformed() {
+        assert!(!is_valid_trigger_slug(""));
+        assert!(!is_valid_trigger_slug("-leading-dash"));
+        assert!(!is_valid_trigger_slug("trailing-dash-"));
+        assert!(!is_valid_trigger_slug("Has Capitals"));
+        assert!(!is_valid_trigger_slug("under_score"));
+        assert!(!is_valid_trigger_slug(&"a".repeat(65)));
     }
 
     #[test]

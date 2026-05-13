@@ -1,5 +1,6 @@
 mod apps;
-mod bash;
+pub(crate) mod bash;
+pub(crate) mod bash_background;
 mod browser;
 mod bulk_limits;
 pub(crate) mod credentials;
@@ -10,7 +11,7 @@ pub(crate) mod image;
 mod import;
 mod mcp;
 mod memory;
-mod plugins;
+pub(crate) mod plugins;
 mod preferences;
 mod proxy;
 mod python;
@@ -21,8 +22,44 @@ mod web;
 use super::LucidosEngine;
 use crate::llm::tool_names as tn;
 
+/// Result of a tool dispatch: `Ok(text)` = success, `Err(text)` = failure.
+/// In both cases `text` is what the LLM sees as the tool result; the typed
+/// tag is what the agentic loop persists into `ToolResult.success`. Routing
+/// failure through `Err` instead of inferring it from a `result.starts_with(
+/// "Error:")` prefix keeps the success bit honest when a tool's error string
+/// happens to start with `Error reading…` / `Error executing…` / etc. (the
+/// pre-typed dispatch silently stamped those as `success: true`).
+pub(crate) type ToolOutcome = Result<String, String>;
+
+/// Lift a raw `String` tool result into a `ToolOutcome` using the legacy
+/// "starts with `Error:`" convention. Single source for the legacy lift —
+/// `to_outcome`, the plugin-tool branch, and the special-tool / read-cache
+/// sites in the agentic loops all route through here so the convention can
+/// be retired in one place once every tool internally returns typed `Err`.
+pub(crate) fn lift_legacy_string(s: String) -> ToolOutcome {
+    if s.starts_with("Error:") {
+        Err(s)
+    } else {
+        Ok(s)
+    }
+}
+
+/// Convert a `Result<String, Box<dyn Error + Send + Sync>>`-returning helper
+/// into a `ToolOutcome`. The Err arm is rendered with the canonical
+/// `Error: <e>` prefix so the LLM still sees a familiar failure shape; the
+/// Ok arm goes through `lift_legacy_string` so legacy `Ok("Error: …")`
+/// in-band errors land as typed `Err` until every internal site is migrated.
+fn to_outcome(
+    r: Result<String, Box<dyn std::error::Error + Send + Sync>>,
+) -> ToolOutcome {
+    match r {
+        Ok(s) => lift_legacy_string(s),
+        Err(e) => Err(format!("Error: {}", e)),
+    }
+}
+
 impl LucidosEngine {
-    /// Execute a tool call and return the result string.
+    /// Execute a tool call and return its outcome.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_tool(
         &self,
@@ -33,7 +70,7 @@ impl LucidosEngine {
         device_id: Option<&str>,
         cancel_token: &tokio_util::sync::CancellationToken,
         thread_id: uuid::Uuid,
-    ) -> String {
+    ) -> ToolOutcome {
         match name {
             tn::READ_FILE
             | tn::WRITE_FILE
@@ -42,10 +79,7 @@ impl LucidosEngine {
             | tn::GLOB_FILES
             | tn::GREP_FILES
             | tn::COPY_FILE
-            | tn::DELETE_FILE => self
-                .execute_file_tool(name, args)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
+            | tn::DELETE_FILE => to_outcome(self.execute_file_tool(name, args).await),
             tn::BROWSER_OPEN
             | tn::BROWSER_EXTRACT
             | tn::BROWSER_CLICK
@@ -54,90 +88,73 @@ impl LucidosEngine {
             | tn::BROWSER_SCREENSHOT
             | tn::BROWSER_CLOSE
             | tn::BROWSER_FORGET_LOGIN
-            | tn::BROWSER_CLEAR_DATA => self
-                .execute_browser_tool(name, args, request_id)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
+            | tn::BROWSER_CLEAR_DATA => {
+                to_outcome(self.execute_browser_tool(name, args, request_id).await)
+            }
             tn::SEND_EMAIL
             | tn::READ_EMAILS
             | tn::READ_EMAIL
             | tn::CONFIGURE_EMAIL
-            | tn::SAVE_EMAIL_ATTACHMENT => self
-                .execute_email_tool(name, args, request_id)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::HTTP_REQUEST => self
-                .execute_http_tool(args)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::PROXY_REQUEST => self
-                .execute_proxy_tool(args)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::IMPORT_FILE | tn::GIT_CLONE => self
-                .execute_import_tool(name, args, extraction_ctx)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
+            | tn::SAVE_EMAIL_ATTACHMENT => {
+                to_outcome(self.execute_email_tool(name, args, request_id).await)
+            }
+            tn::HTTP_REQUEST => to_outcome(self.execute_http_tool(args).await),
+            tn::PROXY_REQUEST => to_outcome(self.execute_proxy_tool(args).await),
+            tn::RELOAD_PROXY_MODULES => {
+                to_outcome(self.execute_reload_proxy_modules_tool().await)
+            }
+            tn::IMPORT_FILE | tn::GIT_CLONE => {
+                to_outcome(self.execute_import_tool(name, args, extraction_ctx).await)
+            }
             tn::CREATE_TRIGGER
             | tn::LIST_TRIGGERS
             | tn::UPDATE_TRIGGER
             | tn::DELETE_TRIGGER
             | tn::PAUSE_TRIGGER
-            | tn::RESUME_TRIGGER => self
-                .execute_scheduler_tool(name, args)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::SET_LANGUAGE | tn::SET_TIMEZONE | tn::ENABLE_PUSH_NOTIFICATIONS => self
-                .execute_preferences_tool(name, args, device_id)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::WEB_SEARCH | tn::FETCH_NEWS => self
-                .execute_web_tool(name, args)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::REQUEST_CREDENTIAL | tn::CONNECT_OAUTH_ACCOUNT => self
-                .execute_credential_tool(name, args)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::CREATE_APP | tn::LIST_APPS | tn::LOAD_KNOWHOW => self
-                .execute_app_tool(name, args)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::EXECUTE_INTENT => Box::pin(self.handle_execute_intent(
-                args,
-                extraction_ctx,
-                request_id,
-                device_id,
-                cancel_token,
-                thread_id,
-            ))
-            .await
-            .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::RUN_PYTHON => self
-                .execute_python_tool(args)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::RUN_BASH => self
-                .execute_bash_tool(args)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::CORRECT_MEMORY => self
-                .execute_memory_tool(args)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::GENERATE_IMAGE => self
-                .execute_generate_image(args, thread_id)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            tn::SAVE_THREAD_IMAGE => self
-                .execute_save_thread_image(args, thread_id)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
+            | tn::RESUME_TRIGGER => {
+                to_outcome(self.execute_scheduler_tool(name, args).await)
+            }
+            tn::SET_LANGUAGE | tn::SET_TIMEZONE | tn::ENABLE_PUSH_NOTIFICATIONS => {
+                to_outcome(self.execute_preferences_tool(name, args, device_id).await)
+            }
+            tn::WEB_SEARCH | tn::FETCH_NEWS => {
+                to_outcome(self.execute_web_tool(name, args).await)
+            }
+            tn::REQUEST_CREDENTIAL | tn::CONNECT_OAUTH_ACCOUNT => {
+                to_outcome(self.execute_credential_tool(name, args).await)
+            }
+            tn::CREATE_APP | tn::LIST_APPS | tn::LOAD_KNOWHOW => {
+                to_outcome(self.execute_app_tool(name, args).await)
+            }
+            tn::EXECUTE_INTENT => to_outcome(
+                Box::pin(self.handle_execute_intent(
+                    args,
+                    extraction_ctx,
+                    request_id,
+                    device_id,
+                    cancel_token,
+                    thread_id,
+                ))
+                .await,
+            ),
+            tn::RUN_PYTHON => to_outcome(self.execute_python_tool(args).await),
+            tn::RUN_BASH => to_outcome(self.execute_bash_tool(args).await),
+            tn::RUN_BASH_BACKGROUND => self.execute_bash_background_tool(args, thread_id).await,
+            tn::BASH_OUTPUT => self.execute_bash_output_tool(args, thread_id).await,
+            tn::BASH_KILL => self.execute_bash_kill_tool(args).await,
+            tn::CORRECT_MEMORY => to_outcome(self.execute_memory_tool(args).await),
+            tn::GENERATE_IMAGE => to_outcome(self.execute_generate_image(args, thread_id).await),
+            tn::SAVE_THREAD_IMAGE => {
+                to_outcome(self.execute_save_thread_image(args, thread_id).await)
+            }
             tn::NAVIGATE_UI => self.execute_navigate_ui(args, thread_id).await,
             tn::SEND_NOTIFICATION => self.execute_send_notification(args, thread_id).await,
             tn::READ_NOTIFICATIONS => self.execute_read_notifications(args).await,
             tn::EMIT_EVENT => self.execute_emit_event(args).await,
             tn::QUERY_EVENTS => self.execute_query_events(args).await,
+            tn::DISMISS_FROM_CONTEXT => {
+                self.execute_dismiss_from_context(args, thread_id).await
+            }
             tn::MANAGE_REPOSITORIES => self.execute_manage_repositories(args).await,
             tn::INSTALL_PLUGIN
             | tn::CHECK_PLUGIN_UPDATES
@@ -147,25 +164,28 @@ impl LucidosEngine {
             | tn::LIST_MCP_SERVERS
             | tn::START_MCP_SERVER
             | tn::STOP_MCP_SERVER
-            | tn::REMOVE_MCP_SERVER => self
-                .execute_mcp_management_tool(name, args)
-                .await
-                .unwrap_or_else(|e| format!("Error: {}", e)),
+            | tn::REMOVE_MCP_SERVER => {
+                to_outcome(self.execute_mcp_management_tool(name, args).await)
+            }
             _ if name.starts_with("mcp__") => {
                 // Safety fallback — MCP tools are handled by handle_special_tool() before reaching here
-                format!(
+                Err(format!(
                     "Error: MCP tool '{}' must be routed through handle_special_tool()",
                     name
-                )
+                ))
             }
-            _ => format!("Unknown tool: {}", name),
+            _ => Err(format!("Error: Unknown tool: {}", name)),
         }
     }
 
-    async fn execute_navigate_ui(&self, args: &serde_json::Value, thread_id: uuid::Uuid) -> String {
+    async fn execute_navigate_ui(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
         let target = match args.get("target").and_then(|v| v.as_str()) {
             Some(t) if !t.is_empty() => t,
-            _ => return "Error: target is required".to_string(),
+            _ => return Err("Error: target is required".to_string()),
         };
         if let Err(e) = self
             .event_bus
@@ -178,48 +198,48 @@ impl LucidosEngine {
             })
             .await
         {
-            return format!("Error: failed to emit NavigationRequested: {}", e);
+            return Err(format!("Error: failed to emit NavigationRequested: {}", e));
         }
 
         // Return contextual help so the LLM knows what the UI offers
         let settings_view = args.get("settings_view").and_then(|v| v.as_str());
         if target == "settings" && settings_view == Some("backup") {
-            return "Navigated to Backup & Restore settings. The UI shows:\n\
+            return Ok("Navigated to Backup & Restore settings. The UI shows:\n\
                 - Connected backup providers (e.g. Google Drive)\n\
                 - A list of available cloud backups with dates\n\
                 - Buttons to create a new backup or restore from an existing one\n\
                 - The user's encryption key (needed for restore)\n\
                 Tell the user they can pick a backup from the list and restore it directly — \
                 no manual downloading or uploading needed."
-                .to_string();
+                .to_string());
         }
 
         if target == "url" {
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
             if url.is_empty() {
-                return "Error: url is required when target is 'url'".to_string();
+                return Err("Error: url is required when target is 'url'".to_string());
             }
-            return format!(
+            return Ok(format!(
                 "Opened {} in the internal browser panel. The user can now see this page.",
                 url
-            );
+            ));
         }
 
-        format!("Navigated to {}", target)
+        Ok(format!("Navigated to {}", target))
     }
 
     async fn execute_send_notification(
         &self,
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
-    ) -> String {
+    ) -> ToolOutcome {
         let title = match args.get("title").and_then(|v| v.as_str()) {
             Some(t) if !t.is_empty() => t,
-            _ => return "Error: title is required".to_string(),
+            _ => return Err("Error: title is required".to_string()),
         };
         let message = match args.get("message").and_then(|v| v.as_str()) {
             Some(m) if !m.is_empty() => m,
-            _ => return "Error: message is required".to_string(),
+            _ => return Err("Error: message is required".to_string()),
         };
 
         // The notification popover compares `notification.app_id` against the
@@ -252,11 +272,12 @@ impl LucidosEngine {
                     message: message.to_string(),
                     task_id: None,
                     app_id: app_id.clone(),
+                    thread_id: Some(link_thread.to_string()),
                 },
             ))
             .await
         {
-            return format!("Error creating notification: {}", e);
+            return Err(format!("Error: failed to create notification: {}", e));
         }
 
         // `link_thread` does double duty: suppress pushes to devices already
@@ -271,10 +292,10 @@ impl LucidosEngine {
         )
         .await;
 
-        "Notification sent.".to_string()
+        Ok("Notification sent.".to_string())
     }
 
-    async fn execute_read_notifications(&self, args: &serde_json::Value) -> String {
+    async fn execute_read_notifications(&self, args: &serde_json::Value) -> ToolOutcome {
         let filter = args
             .get("filter")
             .and_then(|v| v.as_str())
@@ -291,11 +312,11 @@ impl LucidosEngine {
         .await
         {
             Ok(n) => n,
-            Err(e) => return format!("Error reading notifications: {}", e),
+            Err(e) => return Err(format!("Error: failed to read notifications: {}", e)),
         };
 
         if notifications.is_empty() {
-            return format!("No {} notifications.", filter);
+            return Ok(format!("No {} notifications.", filter));
         }
 
         let items: Vec<serde_json::Value> = notifications
@@ -313,33 +334,48 @@ impl LucidosEngine {
             .collect();
 
         serde_json::to_string_pretty(&items)
-            .unwrap_or_else(|e| format!("Error serializing notifications: {}", e))
+            .map_err(|e| format!("Error: failed to serialise notifications: {}", e))
     }
 
-    async fn execute_emit_event(&self, args: &serde_json::Value) -> String {
+    async fn execute_emit_event(&self, args: &serde_json::Value) -> ToolOutcome {
         let event_type = match args.get("event_type").and_then(|v| v.as_str()) {
             Some(t) if !t.is_empty() => t,
-            _ => return "Error: event_type is required".to_string(),
+            _ => return Err("Error: event_type is required".to_string()),
         };
         let payload = args
             .get("payload")
             .cloned()
             .unwrap_or(serde_json::json!({}));
         match self.emit_domain_event(event_type, payload).await {
-            Ok(id) => format!("Event {} emitted (id: {})", event_type, id),
-            Err(e) => format!("Error emitting event: {}", e),
+            Ok(id) => Ok(format!("Event {} emitted (id: {})", event_type, id)),
+            Err(e) => Err(format!("Error: failed to emit event: {}", e)),
         }
     }
 
-    async fn execute_manage_repositories(&self, args: &serde_json::Value) -> String {
+    /// Drop a prior `ToolCalled` (and its matching `ToolResult`) or
+    /// `ChildThreadCompleted` from the agent's future resume context. Emits a
+    /// `ContextDismissed` event the resume helper honours on every subsequent
+    /// assembly. Validates that the referenced event exists in *this* thread
+    /// and is one of the dismissible event types — cross-thread dismissals
+    /// would let one agent prune another's history, and dismissing arbitrary
+    /// events (e.g. ResponseGenerated) would corrupt history rendering.
+    async fn execute_dismiss_from_context(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        dismiss_from_context_impl(&self.pool, &self.event_bus, args, thread_id).await
+    }
+
+    async fn execute_manage_repositories(&self, args: &serde_json::Value) -> ToolOutcome {
         let action = match args.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
-            None => return "Error: 'action' is required (add, list, remove)".to_string(),
+            None => return Err("Error: 'action' is required (add, list, remove)".to_string()),
         };
 
         match action {
             "list" => match crate::core::repositories::RepositoryStore::list(&self.pool).await {
-                Ok(repos) if repos.is_empty() => "No repositories registered.".to_string(),
+                Ok(repos) if repos.is_empty() => Ok("No repositories registered.".to_string()),
                 Ok(repos) => {
                     let mut out = format!("{} registered repositories:\n", repos.len());
                     for r in &repos {
@@ -349,18 +385,18 @@ impl LucidosEngine {
                         }
                         out.push('\n');
                     }
-                    out
+                    Ok(out)
                 }
-                Err(e) => format!("Error listing repositories: {}", e),
+                Err(e) => Err(format!("Error: failed to list repositories: {}", e)),
             },
             "add" => {
                 let name = match args.get("name").and_then(|v| v.as_str()) {
                     Some(n) if !n.is_empty() => n,
-                    _ => return "Error: 'name' is required for 'add' action".to_string(),
+                    _ => return Err("Error: 'name' is required for 'add' action".to_string()),
                 };
                 let path = match args.get("path").and_then(|v| v.as_str()) {
                     Some(p) if !p.is_empty() => p,
-                    _ => return "Error: 'path' is required for 'add' action".to_string(),
+                    _ => return Err("Error: 'path' is required for 'add' action".to_string()),
                 };
 
                 // Expand ~/
@@ -376,7 +412,7 @@ impl LucidosEngine {
 
                 // Validate path exists and is a git repo
                 if !std::path::Path::new(&expanded).exists() {
-                    return format!("Error: path does not exist: {}", expanded);
+                    return Err(format!("Error: path does not exist: {}", expanded));
                 }
 
                 let git_check = tokio::process::Command::new("git")
@@ -386,9 +422,9 @@ impl LucidosEngine {
                     .await;
                 match git_check {
                     Ok(o) if !o.status.success() => {
-                        return format!("Error: not a git repository: {}", expanded);
+                        return Err(format!("Error: not a git repository: {}", expanded));
                     }
-                    Err(e) => return format!("Error checking git repo: {}", e),
+                    Err(e) => return Err(format!("Error: failed to check git repo: {}", e)),
                     _ => {}
                 }
 
@@ -398,16 +434,17 @@ impl LucidosEngine {
                 )
                 .await
                 {
-                    Ok(repo) => {
-                        format!("Repository '{}' registered at `{}`", repo.name, repo.path)
-                    }
-                    Err(e) => format!("Error adding repository: {}", e),
+                    Ok(repo) => Ok(format!(
+                        "Repository '{}' registered at `{}`",
+                        repo.name, repo.path
+                    )),
+                    Err(e) => Err(format!("Error: failed to add repository: {}", e)),
                 }
             }
             "remove" => {
                 let name = match args.get("name").and_then(|v| v.as_str()) {
                     Some(n) if !n.is_empty() => n,
-                    _ => return "Error: 'name' is required for 'remove' action".to_string(),
+                    _ => return Err("Error: 'name' is required for 'remove' action".to_string()),
                 };
 
                 match crate::core::repositories::RepositoryStore::get_by_name(&self.pool, name).await {
@@ -415,26 +452,29 @@ impl LucidosEngine {
                         match crate::core::repositories::RepositoryStore::remove(
                             &self.pool, repo.id,
                         ).await {
-                            Ok(true) => format!("Repository '{}' removed", name),
-                            Ok(false) => format!("Repository '{}' not found", name),
-                            Err(e) => format!("Error removing repository: {}", e),
+                            Ok(true) => Ok(format!("Repository '{}' removed", name)),
+                            Ok(false) => Err(format!(
+                                "Error: repository '{}' not found at remove time",
+                                name
+                            )),
+                            Err(e) => Err(format!("Error: failed to remove repository: {}", e)),
                         }
                     }
-                    Ok(None) => format!(
-                        "No repository found with name '{}'. Use action 'list' to see registered repos.",
+                    Ok(None) => Err(format!(
+                        "Error: no repository found with name '{}'. Use action 'list' to see registered repos.",
                         name
-                    ),
-                    Err(e) => format!("Error looking up repository: {}", e),
+                    )),
+                    Err(e) => Err(format!("Error: failed to look up repository: {}", e)),
                 }
             }
-            other => format!(
-                "Unknown action '{}'. Use 'add', 'list', or 'remove'.",
+            other => Err(format!(
+                "Error: unknown action '{}'. Use 'add', 'list', or 'remove'.",
                 other
-            ),
+            )),
         }
     }
 
-    async fn execute_query_events(&self, args: &serde_json::Value) -> String {
+    async fn execute_query_events(&self, args: &serde_json::Value) -> ToolOutcome {
         let event_type = args.get("event_type").and_then(|v| v.as_str());
         let since = args
             .get("since")
@@ -458,8 +498,93 @@ impl LucidosEngine {
             .await
         {
             Ok(events) => serde_json::to_string_pretty(&events)
-                .unwrap_or_else(|e| format!("Error serializing events: {}", e)),
-            Err(e) => format!("Error querying events: {}", e),
+                .map_err(|e| format!("Error: failed to serialise events: {}", e)),
+            Err(e) => Err(format!("Error: failed to query events: {}", e)),
         }
     }
 }
+
+/// Validation core for the `dismiss_from_context` tool, factored out of the
+/// `LucidosEngine` impl so unit tests can exercise the parsing / event-type /
+/// thread-scope branches against a real Postgres pool without booting the
+/// full engine. The handler on `LucidosEngine` is now a thin wrapper.
+///
+/// Accepts the event_id as either:
+/// - bare UUID (hyphenated `xxxxxxxx-xxxx-...` or simple `xxxxxxxx...`), or
+/// - the `evt-<uuid>` form rendered as `tool_use_id` in resumed tool blocks
+///   (see [`synthesize_tool_use_id`](crate::core::store::messages)).
+pub(crate) async fn dismiss_from_context_impl(
+    pool: &sqlx::PgPool,
+    event_bus: &crate::engine::event_bus::EventBus,
+    args: &serde_json::Value,
+    thread_id: uuid::Uuid,
+) -> ToolOutcome {
+    // Errors flow through the typed `Err` arm — the agentic loop persists
+    // ToolResult.success from the Result tag, not from a string prefix.
+    let event_id_str = match args.get("event_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => return Err("Error: event_id is required".to_string()),
+    };
+    // Accept the `evt-<uuid>` form the LLM sees as tool_use_id in resumed
+    // tool blocks; `Uuid::parse_str` then handles either hyphenated or
+    // simple-form UUID after the prefix is stripped.
+    let stripped = event_id_str.strip_prefix("evt-").unwrap_or(event_id_str);
+    let event_id = match uuid::Uuid::parse_str(stripped) {
+        Ok(u) => u,
+        Err(_) => {
+            return Err(
+                "Error: event_id must be a UUID (or 'evt-<uuid>' as shown in tool blocks)"
+                    .to_string(),
+            );
+        }
+    };
+    // Lookup must scope to (event_id, thread_id) AND restrict event_type
+    // to the dismissible set — otherwise a typo or hallucinated id silently
+    // succeeds, leaving phantom ContextDismissed rows the resume helper
+    // would happily honour.
+    let row: Option<(String,)> = match sqlx::query_as(
+        "SELECT event_type FROM events \
+         WHERE id = $1 AND aggregate_id = $2 \
+         AND event_type IN ('ToolCalled', 'ChildThreadCompleted')",
+    )
+    .bind(event_id)
+    .bind(thread_id.to_string())
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(opt) => opt,
+        Err(e) => {
+            crate::log!(
+                "[DismissFromContext] DB lookup failed for thread={} event={}: {}",
+                thread_id,
+                event_id,
+                e
+            );
+            return Err(format!("Error: failed to look up event: {}", e));
+        }
+    };
+    if row.is_none() {
+        return Err("Error: event id not found or not dismissible".to_string());
+    }
+
+    if let Err(e) = event_bus
+        .emit(crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: crate::engine::thread_events::ThreadEvent::ContextDismissed {
+                dismissed_event_id: event_id,
+            },
+            meta: crate::engine::thread_events::EventMeta::NONE,
+        })
+        .await
+    {
+        return Err(format!("Error: failed to emit ContextDismissed: {}", e));
+    }
+    Ok(format!(
+        "Dismissed event {} from future resume context.",
+        event_id
+    ))
+}
+
+#[cfg(test)]
+#[path = "tools_tests.rs"]
+mod tests;

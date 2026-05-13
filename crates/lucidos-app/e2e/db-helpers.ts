@@ -22,9 +22,12 @@ export function getDbPort(): string {
 
 /** Wipe drawer state between tests in the same Playwright project. The DB
  *  resets only between projects, so survivors push the test's own row past
- *  any `:visible.first()` locator. Deliberately does NOT truncate `events`:
- *  that desyncs in-memory CC session state and stalls follow-on CC tests on
- *  their commands fetch. */
+ *  any `:visible.first()` locator. On mobile the threads drawer doesn't
+ *  auto-close after Archive, so leftover threads can also cover the prompt
+ *  area on the next test's compose view — clearing thread_summaries lets
+ *  newThread reliably land on an empty compose. Deliberately does NOT
+ *  truncate `events`: that desyncs in-memory CC session state and stalls
+ *  follow-on CC tests on their commands fetch. */
 export function clearAllThreads(): void {
   psql([
     "TRUNCATE TABLE thread_summaries CASCADE",
@@ -42,7 +45,9 @@ export function psql(sql: string): string {
 }
 
 /** Create a CC thread with a pending change (git branch + DB rows). */
-export function createCCThreadWithChange(titlePrefix: string, suffix: string): {
+export function createCCThreadWithChange(titlePrefix: string, suffix: string, opts: {
+  requiresRestart?: boolean;
+} = {}): {
   threadId: string; changeId: string; branch: string; file: string;
 } {
   const threadId = randomUUID();
@@ -50,6 +55,7 @@ export function createCCThreadWithChange(titlePrefix: string, suffix: string): {
   const branch = `e2e-test/${suffix}`;
   const file = `e2e-${suffix}.txt`;
   const now = new Date().toISOString();
+  const requiresRestart = opts.requiresRestart ?? false;
 
   git(['checkout', '-b', branch, 'main']);
   writeFileSync(resolve(WORKSPACE, file), `test content ${suffix}`);
@@ -62,11 +68,11 @@ export function createCCThreadWithChange(titlePrefix: string, suffix: string): {
   const idleEventId = randomUUID();
   const requestId = randomUUID();
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count, cc_has_changes, cc_requires_restart, cc_is_external_repo) VALUES ('${threadId}', '${titlePrefix} ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, true, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count, cc_has_changes, cc_requires_restart, cc_is_external_repo) VALUES ('${threadId}', '${titlePrefix} ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, true, ${requiresRestart}, false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${msgEventId}', 'MessageReceived', '{"text":"test","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${respEventId}', 'ResponseGenerated', '{"text":"Done.","images":[]}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
-    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${idleEventId}', 'CodingAgentIdled', '{"has_changes":true,"is_external_repo":false,"requires_restart":false}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
-    `INSERT INTO changes (id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, hardened, thread_id) VALUES ('${changeId}', '${requestId}', '${branch}', '${WORKSPACE}', '${titlePrefix} change ${suffix}', 1, ARRAY['${file}'], false, true, '${threadId}')`,
+    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${idleEventId}', 'CodingAgentIdled', '{"has_changes":true,"is_external_repo":false,"requires_restart":${requiresRestart}}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+    `INSERT INTO changes (id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, hardened, thread_id) VALUES ('${changeId}', '${requestId}', '${branch}', '${WORKSPACE}', '${titlePrefix} change ${suffix}', 1, ARRAY['${file}'], ${requiresRestart}, true, '${threadId}')`,
   ].join(';\n'));
 
   return { threadId, changeId, branch, file };

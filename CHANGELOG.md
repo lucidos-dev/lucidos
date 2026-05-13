@@ -1,16 +1,87 @@
 # Changelog
 
-## Unreleased
+## v0.9.5 — 2026-05-13
 
 ### Added
-- **Proxy auth modes** (`apis.json`):
-  - `query_param` — inject the credential as a URL query parameter (`?api-key=…`); useful for Helius / Solana RPC.
-  - `hmac_signed` — sign each request with HMAC-SHA256 / SHA512 over the query string (with optional millis-since-epoch timestamp injection); Binance shape.
-  - `credential_bundle` — return a JSON map of credentials over `GET /api/v1/proxy-credentials/<name>` (CLI: `lucidos proxy <name> --credentials`) for libraries that perform their own login (e.g. `pcomfortcloud`). The `proxy_request` LLM tool refuses this mode so raw credentials never reach the model.
+- **Pluggable proxy auth pipeline + WASM signers** — `apis.json` migrated from a 6-variant `ProxyAuth` enum to a `Vec<AuthLayer>` pipeline (`static_credential`, `script_handshake`, `hmac_signed`, `wasm_signer`); same-host redirect re-signing; cross-host refused with 502; 1MB body threshold + manifest-declared `body_mode`; pipeline-aware 401 retry across opted-in cache hits; `WasmSignerLayer` with sign-only ABI, `SignInput`/`SignOutput`, capability gating, host imports for crypto + opaque secret handles, module-loader sidecars; first-class **Binance HMAC** signer; `reload_proxy_modules` LLM tool + HTTP endpoint; plugins can ship signers via `auth-modules/`.
+- **`script_handshake` proxy auth** — token cache with singleflight gate, retry on cached-token 401; OAuth tokens injected into handshake env; `script_handshake` follower no longer flags `cache_was_hit`; replaces `credential_bundle`.
+- **Background bash trio** — `run_bash_background` / `bash_output` / `bash_kill` chat tools backed by a new `BackgroundBashRegistry`; `BackgroundBashStarted/Completed` thread events wired through the lifecycle.
+- **`ContextSnapshot` event + unified context modal** — per-LLM-iteration snapshot with sections + real provider usage; frontend collapses Step + Context tabs into one `ContextSnapshot` panel; estimated token count surfaced; legacy `ContextTokensMeasured` / `ContextAssembled` / `Thinking` events deleted.
+- **Typed `ChildThreadCompleted` + child-completion card** — exchange-starter event with status, summary, link, disclosure; auto-resume callback for sub-threads; `dismiss_from_context` tool to drop prior tool results / child completions from resume context.
+- **`run_thread` / `run_claude` `relation: sub|top`** — sub spawns auto-resume parent; top is fire-and-forget; CLI gains `--relation sub|top` on `spawn-thread` (replaces `--parent`); typed `top`-relation pathway through `notify_parent_if_child`.
+- **Multi-select `AskUserQuestion`** — `AnswerKind::MultiSelected`, `multi_select` flag on `UserQuestionAsked`, multi-select toggle + Submit in the prompt action row; CC hook joins selected labels; option-id + compatibility validation.
+- **CC stop-hook plaintext-question redirect** — detects plaintext questions in the CC transcript and redirects them through `AskUserQuestion`; UUID sentinel path; question-redirect reason text.
+- **Per-trigger knowhow** — `data/triggers/{slug}/knowhow/`; LLM uses `load_knowhow` like chat instead of inlined preload turns; end-to-end ID validation across core, HTTP, LLM tools, and the scheduler.
+- **Plugin uninstall + lifecycle** — real uninstall with `PluginUninstallPanel` confirm UI, deletes recorded files, stamps actor on confirm/cancel; `uninstall_plugin` resolves by id, name, or installed app folder; install-via-chat drag-and-drop; `delete_file` refuses plugin-owned paths; refresh apps + triggers on `Plugin{Installed,Uninstalled}`; install-state keyed by canonical plugin id.
+- **`lucidos.ui.startThread` SDK API** — prefilled new-chat from app code.
+- **Step detail modal** — clickable CC step rows on desktop, hover/tap tooltip on mobile, event timestamp; renders TodoWrite todos.
+- **Notification → originating thread** — notifications link back to the thread that spawned them; standard 0.5rem gap between detail action buttons.
+- **Permission card answer state** — keeps prompt buttons after answer with picked/struck styling.
+- **Vertex prompt caching** — caches tools, system, and conversation prefix on Claude requests.
+- **CC nightly-pipeline + run-tests + run-e2e skills** — per-batch CC orchestration recipes.
+- **Image popup wraparound + slot rendering** — true carousel feel, n=2 black flash on swipe fixed, tap toggles chrome.
+- **Code-block ellipsis highlighting** — visible elision in tool descriptions.
+- **Tooltip-on-scroll + capture-phase listeners** — open tooltips follow target on scroll, passive capture for global scroll/touch.
+- **Capture-context settings toggle** — opt-in deletion of unused `saved_contexts`.
+- **Files panel surfaces `config/` + `auth-modules/`**.
+- **Restart toast Dismiss action** — hides until a new change arrives, JSON fingerprint excluding engine version.
+- **`/app/<id>/` route move** — app UI routes off `/api/`.
 
 ### Changed
-- `ProxyAuth` is now a serde-tagged enum (one variant per auth mode). The on-disk shape for `bearer` / `api_key` / `basic` is unchanged — existing `apis.json` files keep working.
+- **System-knowhow doc set expanded** — `system-knowhow/coding-agent-events`, `system-knowhow/thread-events`, `system-knowhow/intent-registry`, `system-knowhow/workspace-audit`, `system-knowhow/workspace-learning`, rewritten `system-knowhow/building-an-auth-handshake` for the pipeline + WASM signer architecture; `building-a-trigger` rewritten for the post-preload model; tools docs clarified that `run_claude` is same-workspace only and that `run_bash` `timeout_secs` should be bumped for long jobs.
+- **`read_file` archive support** — line-range slicing + transparent zip traversal; tighter `validate_archive_entry_path`; clear message for binary entries inside archives; zip-entry decompression capped at 10MB; schema mins on line args; deduped extension sniff.
+- **CC stop-reminder hook** — plaintext-question detection, `LUCIDOS_SESSION_KIND=interactive` for chat-style CC sessions, `transcript_path` parsed from hook payload, sentinel-write failures surfaced on stderr; CC PreToolUse coerces Read offset/limit and forces Read-before-Edit.
+- **CC Bash kill-pattern guard** — blocks kill patterns that would catch sibling CC subprocesses.
+- **Typed `CancelCause` / `AbortCause` on `Response{Canceled,Aborted}`** — emit centralized through helpers; stale-settle moved from `CancelCause` to `AbortCause` (idle status, no Continue surfacing).
+- **`SessionRecovered` → `ContinuationStarted`** — rename + lifecycle violation fixed; duplicate restart abort suppressed.
+- **`grep_files` capping** — per-line and total result size capped to prevent context overflow.
+- **Credential UX** — copy buttons for all credential types; rows wrap at narrow widths; LLM asked for one credential at a time; mobile autofocus skipped.
+- **CC banner Diff button** — always rendered, disabled when no signal; lifted Save into Diff row when Apply gains the "& Restart" suffix; merged Diff into actions row when there's room.
+- **Scheduler refactor** — backup pipeline extracted to `backup.rs`; task runner free fns extracted to `task_runner.rs`; tighter visibility.
+- **Inline tests lifted to sibling files** across plugins, threads, change_ops, claude_code, agentic_loop, agent_recovery, changes_projection, thread_events, chat/process, engine mod.rs/run_session.rs, memory, llm/tools, email, change_ops, event_bus.
+- **Project-wide harden + simplify passes** — narrative comments trimmed; helper extractions; redundant guards dropped; `responseCanceledSummary` JSDoc tightened; many small DRY wins.
+- **Workspace data walker now includes `scripts/`**.
 
+### Fixed
+- **Postgres password leak through Bash tool calls** — redactor short-circuited on no-match; PG env bundle cached.
+- **Orphan `tool_use` repair** — single source of truth + tighter validator; engine LLM repairs orphan blocks before they reach Anthropic.
+- **CC phantom `ResponseCanceled`** — stopped emitting on Apply/Discard/Archive/idle and on conflict-resolution session ends; safety-net firings treated as crashes (error state, no `ChangeProposed`).
+- **Engine cancel mid-tool-execution** — chat honors cancel; SIGKILL hung subprocesses; `emit_response_canceled` made idempotent against pre-emitted terminators.
+- **System-actor activity events no longer resurrect terminated threads** (projection fix).
+- **`changes_projection` flake** — cutoff/order tests de-flaked; constant for cutoff gap.
+- **Apply ordering** — serialize against concurrent data writes; `delete_file` locked against apply dirty check; helper method on `workspace_repo_lock`; gate apply on real marker, not session-end.
+- **Backup** — Google Drive resumable upload protocol; O(1) chunk-body clone; deduped Drive PUT helpers.
+- **Wasmtime test isolation** — own binary to avoid macOS Mach IPC abort; shared engine between WASM compile + instantiate; loader returns empty for missing dir.
+- **CC questions** — orphaned `UserQuestionAsked` skipped during pending-question lookup; archive still cancel-stamps orphaned questions; orphan-of-orphan re-process; frontend `req_id` routing.
+- **Title generation** — skip opaque IDs (UUIDs, hashes), reject empty LLM responses, reject titles that echo the prompt instruction, instruction moved to system prompt.
+- **Compose race** — await thread-create before pasting an image; await thread-start POST before debounced compose PUT; `pendingComposePuts` leak plugged; PUT skipped on discarded thread.
+- **Drawer pagination** — gated on `archive` (renamed from `history` since v0.7.2); regression tests tightened.
+- **`HEAD` is current** — re-applied lost Akram fixes (Ctrl+Shift+O on Mac, history-collapsed pagination guard) with regression tests.
+- **`ResponseFailed` on empty CC Result text** — surfaced explicitly.
+- **CC context** — sums `input + cache_read + cache_write` for total prompt size.
+- **Stale `apply` timeouts** — extended so backend doesn't outlive client `AbortController`.
+- **File preview download attribute** — uses real basename; deduped basename derivation.
+- **Permission card** — Allowed badge right-aligned on resolved card.
+- **z-index** — `--z-modal` lifted above `--z-control-panel` so modals block the header; `.toast-container` routed through `--z-toast` token.
+- **iOS** — shake-to-undo blocked from wiping focused input (then reverted as iOS popup is system UI); landscape allowed when image popup is open.
+- **Worktree cleanup** — skips threads with live agent session; deterministic stale-dir reuse on lost-session recovery; chat repo resolver narrowed to names only; `repo_root` fallback when default Lucidos row missing.
+- **Image popup** — gesture lock release on pinch end, lock-before-flush; cancel commit timer when pinch starts; flush pending swipe-commit on follow-up gesture; render every image at fixed slot, signal-driven transform.
+- **Plugin install** — per-route body cap; install sentinel redacted from LLM; confirm panels closed in `finally` so failures don't wedge UI.
+- **`refreshChangesState`** — retried once on `AbortError`.
+- **Email + OAuth row deserialization** — `sqlx::FromRow` derive replaces hand-rolled impls.
+- **`throwIfNotOk`** — falls through to `statusText` when JSON has no error field; mutating handlers routed through it.
+- **Triggers UI** — Delete/Edit kept at full opacity when paused; dead `trigger-toggle-btn` class dropped.
+- **Header** — only opens control panel when clicking visible brand elements.
+- **Notifications** — `optional chain` restored on `detail.thread_id`.
+- **Tools** — `generate_image` misuse guard (warn when called for analysis instead of synthesis); type-driven tool dispatch.
+- **Release wrapper** — refuses Mode 1 release while Mode 2 PRs are unmerged to main; deleted-files-vs-PREV_TAG drift check; `--accept-drift` escape hatch.
+
+### Removed
+- Six-variant legacy `ProxyAuth` enum (single-release migration to pipeline).
+- `credential_bundle` proxy auth (superseded by `script_handshake`).
+- Legacy `ContextTokensMeasured` / `ContextAssembled` / `Thinking`-tokens events (replaced by `ContextSnapshot`).
+- `wake_text` from `ParentCallback` (typed event is the source of truth).
+- Skill: `run-nightly-pipeline` (Lucidos territory, not a CC skill).
 ## v0.9.4 — 2026-05-08
 
 ### Added

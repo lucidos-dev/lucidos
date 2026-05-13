@@ -1,35 +1,8 @@
 use super::super::LucidosEngine;
-use crate::core::knowhow::{format_missing_knowhow_message, missing_knowhow_ids};
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::llm::tool_names as tn;
 use crate::triggers::TriggerRun;
 use std::str::FromStr;
-
-/// Same shape as the HTTP layer's check — see [`crate::api::triggers`].
-/// Returns an LLM-facing error string when any knowhow id is missing so the
-/// model gets feedback on the same turn instead of silently shipping a
-/// trigger that won't load its knowhow at fire time.
-fn validate_intent_knowhow_for_tool(engine: &LucidosEngine, run: &TriggerRun) -> Option<String> {
-    let TriggerRun::Intent { knowhow, .. } = run else {
-        return None;
-    };
-    if knowhow.is_empty() {
-        return None;
-    }
-    let missing = missing_knowhow_ids(
-        &engine.knowhow_dirs(),
-        engine.system_knowhow_dir(),
-        knowhow,
-    );
-    if missing.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "Error: {} Use list_files or read_file to find the right id.",
-            format_missing_knowhow_message(&missing)
-        ))
-    }
-}
 
 /// Hard guard: scheduling tools (`create_trigger`, `update_trigger`,
 /// `delete_trigger`, `pause_trigger`, `resume_trigger`) called from inside a
@@ -145,25 +118,21 @@ impl LucidosEngine {
                     );
                 }
 
-                // Parse run field: { type: "intent", text: "...", knowhow: [...] } or { type: "script", path: "..." }
+                // Parse run field: { type: "intent", intent: "..." } or { type: "script", path: "..." }
                 let run: TriggerRun = match args.get("run") {
                     Some(run_val) if !run_val.is_null() => {
                         serde_json::from_value(run_val.clone())
-                            .map_err(|e| format!("Invalid 'run' field: {}. Expected {{ type: 'intent', intent: '...', knowhow: [] }} or {{ type: 'script', path: '...' }}", e))?
+                            .map_err(|e| format!("Invalid 'run' field: {}. Expected {{ type: 'intent', intent: '...' }} or {{ type: 'script', path: '...' }}", e))?
                     }
                     _ => {
                         // Backward compat: accept prompt_text as a shorthand
                         let prompt_text = args.get("prompt_text").and_then(|v| v.as_str()).unwrap_or("");
                         if prompt_text.is_empty() {
-                            return Ok("Error: 'run' is required. Use { type: 'intent', intent: '...', knowhow: [] } or { type: 'script', path: '...' }".to_string());
+                            return Ok("Error: 'run' is required. Use { type: 'intent', intent: '...' } or { type: 'script', path: '...' }".to_string());
                         }
-                        TriggerRun::Intent { intent: prompt_text.to_string(), knowhow: vec![] }
+                        TriggerRun::Intent { intent: prompt_text.to_string() }
                     }
                 };
-
-                if let Some(err) = validate_intent_knowhow_for_tool(self, &run) {
-                    return Ok(err);
-                }
 
                 // Check if timezone is set - required for triggers
                 let tz_val = self.user_timezone.read().await.clone();
@@ -215,7 +184,7 @@ impl LucidosEngine {
 
                 let trigger_desc = trigger_description(&cron_display, on_event.as_deref());
                 let run_desc = match &run {
-                    TriggerRun::Intent { intent, .. } => {
+                    TriggerRun::Intent { intent } => {
                         let end = intent.floor_char_boundary(50);
                         format!("intent '{}'", &intent[..end])
                     }
@@ -244,14 +213,9 @@ impl LucidosEngine {
                             .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                             .unwrap_or_else(|| "never".to_string());
                         let run_info = match &config.run {
-                            TriggerRun::Intent { intent, knowhow } => {
-                                let kh = if knowhow.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" [knowhow: {}]", knowhow.join(", "))
-                                };
+                            TriggerRun::Intent { intent } => {
                                 let end = intent.floor_char_boundary(60);
-                                format!("intent: {}{}", &intent[..end], kh)
+                                format!("intent: {}", &intent[..end])
                             }
                             TriggerRun::Script { path } => format!("script: {}", path),
                         };
@@ -292,14 +256,9 @@ impl LucidosEngine {
                 let new_name = args.get("name").and_then(|v| v.as_str());
                 let new_run: Option<TriggerRun> = match args.get("run").filter(|v| !v.is_null()) {
                     Some(v) => Some(serde_json::from_value(v.clone())
-                        .map_err(|e| format!("Invalid 'run' field: {}. Expected {{ type: 'intent', text: '...', knowhow: [] }} or {{ type: 'script', path: '...' }}", e))?),
+                        .map_err(|e| format!("Invalid 'run' field: {}. Expected {{ type: 'intent', text: '...' }} or {{ type: 'script', path: '...' }}", e))?),
                     None => None,
                 };
-                if let Some(ref run) = new_run {
-                    if let Some(err) = validate_intent_knowhow_for_tool(self, run) {
-                        return Ok(err);
-                    }
-                }
                 // Parse on_event once — reused for payload and validation
                 let new_on_event: Option<Option<String>> = if args.get("on_event").is_some() {
                     Some(

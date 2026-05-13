@@ -107,7 +107,7 @@ describe('button visual state', () => {
  */
 function shouldBumpCcSessionVersion(eventType: string): boolean {
   return eventType === 'SessionStarted'
-    || eventType === 'SessionRecovered'
+    || eventType === 'ContinuationStarted'
     || eventType === 'SessionEnded'
     || eventType === 'CodingAgentUserMessageSent'
     || eventType === 'CodingAgentIdled';
@@ -118,8 +118,8 @@ describe('ccSessionVersion bump triggers re-fetch of CC commands', () => {
     expect(shouldBumpCcSessionVersion('SessionStarted')).toBe(true);
   });
 
-  it('bumps on SessionRecovered', () => {
-    expect(shouldBumpCcSessionVersion('SessionRecovered')).toBe(true);
+  it('bumps on ContinuationStarted', () => {
+    expect(shouldBumpCcSessionVersion('ContinuationStarted')).toBe(true);
   });
 
   it('bumps on SessionEnded', () => {

@@ -1,5 +1,7 @@
 Harden the code: review changed code for reuse, quality, and efficiency, then fix any issues found. Check for bugs and CLAUDE.md compliance, then run the test suites for what was touched (iterating from Phase 1 if anything fails). Run this before finishing your session.
 
+**No postpone option.** Never tell the user you're "postponing", "deferring", or "skipping" `/harden`. There is no such mode — if you say it, you're misleading them, because Apply will run hardening synchronously when the marker is `MISSING` (and the user waits at that point). Either Phase 0 reports `ALREADY_HARDENED` (say so and stop) or you run the full skill. The only honest answers are "already hardened — skipping" or "running hardening now".
+
 ## Phase 0: Check if Already Hardened
 
 `lucidos hardened query` prints `FRESH`, `STALE`, or `MISSING` for the branch
@@ -94,7 +96,16 @@ Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-s
 - `.rs`, `Cargo.toml`, `Cargo.lock`, `.sql` → `cargo check && cargo test -p lucidos-engine`
 - `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
 - CSS-only / docs-only → skip
-- Mixed → run both
+- Mixed → run both **in parallel**
+
+When the diff is mixed, kick the Rust and TS suites off concurrently — they're independent toolchains (cargo vs npm) with no shared state, so running them serially wastes wall-clock. Use the Bash tool's `run_in_background: true` for each, then `BashOutput` to join. Pattern:
+
+```
+# Launch both in parallel
+Bash(cmd="cargo check && cargo test -p lucidos-engine", run_in_background=true)  → task_id A
+Bash(cmd="cd crates/lucidos-app && npx tsc --noEmit && npm test", run_in_background=true)  → task_id B
+# Then BashOutput on A and B until both finish
+```
 
 If everything passes, proceed to Phase 5.
 

@@ -153,6 +153,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(&workspace_path)?;
     log!("[Startup] Using workspace: {}", workspace_path.display());
 
+    // Upgrade legacy `apis.json` (single `auth.type` per provider) to
+    // the pipeline shape. Idempotent. Failure is fatal — better to
+    // refuse to start than to silently lose proxy auth (operator can
+    // restore from the backup the migration just wrote).
+    match lucidos_engine::api::proxy_migration::migrate_apis_json_if_needed(&workspace_path) {
+        Ok(lucidos_engine::api::proxy_migration::MigrationOutcome::Migrated { backup_path }) => {
+            log!(
+                "[Startup] migrated apis.json to pipeline shape (backup at {})",
+                backup_path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log!("[Startup] apis.json migration failed: {}", e);
+            return Err(format!("apis.json migration failed: {e}").into());
+        }
+    }
+
     // Get database URL from environment (set by Docker) or use default for local dev
     let database_url = lucidos_engine::core::database_url();
     log!("[Startup] Connecting to PostgreSQL...");
@@ -323,20 +341,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .recover_orphaned_threads(&recovering_threads)
         .await;
 
+    // Recover orphan `ToolCalled` events (engine died mid-tool, no matching
+    // `ToolResult` in the events table). Without this, the next LLM call on
+    // the affected thread reconstructs an assistant `tool_use` block whose
+    // pair is missing — Anthropic 400s with "tool_use ids were found without
+    // tool_result blocks immediately after". Mirror of the inner-tool layer
+    // for the ResponseAborted recovery above.
+    shared_engine.recover_orphan_tool_calls().await;
+
     // Start memory indexer — subscribes to EventBus and indexes chat events
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());
 
-    // Start the worktree cleanup worker (Phase 10.2 + 10.3).
-    //
-    // Hourly background task that reclaims build artifacts from long-idle
-    // worktrees (Tier 1, 24h+) and removes the entire worktree dir for very
-    // long-idle clean threads (Tier 2, 30 days+, also deletes the branch when
-    // fully merged). Emits a `NotificationCreated` if total worktree disk
-    // usage exceeds 50 GB. See `engine::worktree_cleanup` module docs.
+    // Start the worktree cleanup worker. See `engine::worktree_cleanup` module docs.
     lucidos_engine::engine::worktree_cleanup::WorktreeCleanup::spawn(
         shared_engine.pool().clone(),
         std::sync::Arc::new(shared_engine.event_bus.clone()),
         workspace_path.clone(),
+        shared_engine.worktree_cleanup_active_threads(),
     );
 
     // Start the CC spawn dispatcher (Phase 5, Task 5.2).

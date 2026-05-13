@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
 import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, animationSpeed, speedMultiplier, repositories } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, toggleDevicePush, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, type Theme, type FontFamily } from '../../store/actions/preferences';
+import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCaptureContext, setCaptureContext, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/ScaleModal';
 import { formatDateTime } from '../../utils/formatTime';
 import { loadOAuthAccounts, disconnectOAuthAccount, grantOAuthScope } from '../../store/actions/oauth';
@@ -17,7 +17,7 @@ import { ChevronRightIcon } from '../shared/icons';
 import { CredentialItem } from '../credentials/CredentialItem';
 import { openAddCredential, loadCredentials } from '../../store/actions/credentials';
 import { loadRepositories } from '../../store/actions/chat';
-import { API_BASE } from '../../api/client';
+import { API_BASE, mutatingFetch, throwIfNotOk } from '../../api/client';
 import { DirectoryPicker } from './DirectoryPicker';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { formatTimeAgo } from '../../utils/formatTime';
@@ -219,15 +219,12 @@ function AddRepositoryForm() {
     if (!trimmedName || !trimmedPath) return;
     setSaving(true);
     try {
-      const res = await fetch(`${API_BASE}/api/repositories`, {
+      const res = await mutatingFetch(`${API_BASE}/api/repositories`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: trimmedName, path: trimmedPath }),
       });
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text);
-      }
+      await throwIfNotOk(res);
       setAdding(false);
       setName('');
       setPath('');
@@ -530,8 +527,8 @@ export function SettingsView() {
                 <button class="action-btn action-btn-danger" onClick={async () => {
                   if (await showConfirm(`Remove "${repo.name}"?`, 'Remove')) {
                     try {
-                      const res = await fetch(`${API_BASE}/api/repositories/${repo.id}`, { method: 'DELETE' });
-                      if (!res.ok) throw new Error(await res.text());
+                      const res = await mutatingFetch(`${API_BASE}/api/repositories/${repo.id}`, { method: 'DELETE' });
+                      await throwIfNotOk(res);
                       loadRepositories();
                     } catch (e) {
                       showToast(`Failed to remove repository: ${errorDetail(e)}`, 'error');
@@ -551,7 +548,7 @@ export function SettingsView() {
     return (
       <>
         <div class="settings-section">
-          <div class="settings-section-title" data-search-anchor="models:chat">Chat</div>
+          <div class="settings-section-title" data-search-anchor="models:chat">Chat &amp; Triggers</div>
           <div class="settings-row">
             <span class="settings-row-label">Model</span>
             <Dropdown
@@ -605,6 +602,20 @@ export function SettingsView() {
               value={currentBackgroundModel('model_memory')}
               onChange={(v) => setBackgroundModel('model_memory', v)}
             />
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-section-title" data-search-anchor="models:debugging">Debugging</div>
+          <div class="settings-row" data-search-anchor="models:capture-context">
+            <span class="settings-row-label">Capture context per step</span>
+            <label class="toggle-switch">
+              <input
+                type="checkbox"
+                checked={currentCaptureContext()}
+                onChange={(e) => setCaptureContext((e.currentTarget as HTMLInputElement).checked)}
+              />
+              <span class="toggle-slider" />
+            </label>
           </div>
         </div>
         <VertexRegionSetting />

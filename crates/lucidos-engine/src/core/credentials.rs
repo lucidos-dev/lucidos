@@ -291,3 +291,116 @@ impl CredentialStore {
         Ok(None)
     }
 }
+
+/// Build CRED_* environment variables from a list of credentials.
+/// - `password` type: emits `CRED_{NAME}_USERNAME` and `CRED_{NAME}_PASSWORD`
+///   from the JSON-encoded auth_value.
+/// - other types (api_key, bearer, basic): emits `CRED_{NAME}` with the raw
+///   auth_value.
+///
+/// `{NAME}` is the credential's `service_name` uppercased with `-`/`.`/space
+/// replaced by `_`.
+pub fn credential_env_vars(credentials: Vec<Credential>) -> Vec<(String, String)> {
+    let mut env_vars = Vec::new();
+    for cred in credentials {
+        let env_name = cred
+            .service_name
+            .to_uppercase()
+            .replace(['-', ' ', '.'], "_");
+        let prefix = format!("CRED_{}", env_name);
+
+        if cred.auth_type == AuthType::Password {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cred.auth_value) {
+                let username = parsed["username"].as_str().unwrap_or("");
+                let password = parsed["password"].as_str().unwrap_or("");
+                env_vars.push((format!("{}_USERNAME", prefix), username.to_string()));
+                env_vars.push((format!("{}_PASSWORD", prefix), password.to_string()));
+            }
+        } else {
+            env_vars.push((prefix, cred.auth_value));
+        }
+    }
+    env_vars
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_cred(service_name: &str, auth_type: AuthType, auth_value: &str) -> Credential {
+        Credential {
+            id: Uuid::nil(),
+            service_name: service_name.to_string(),
+            base_url: String::new(),
+            auth_type,
+            auth_value: auth_value.to_string(),
+            auth_header: "Authorization".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn password_emits_split_username_and_password() {
+        let cred = make_cred(
+            "comfort-cloud",
+            AuthType::Password,
+            r#"{"username":"alice","password":"s3cret"}"#,
+        );
+        let env: std::collections::HashMap<_, _> =
+            credential_env_vars(vec![cred]).into_iter().collect();
+        assert_eq!(env.get("CRED_COMFORT_CLOUD_USERNAME").map(String::as_str), Some("alice"));
+        assert_eq!(env.get("CRED_COMFORT_CLOUD_PASSWORD").map(String::as_str), Some("s3cret"));
+        assert!(env.get("CRED_COMFORT_CLOUD").is_none());
+    }
+
+    #[test]
+    fn api_key_emits_single_cred_var() {
+        let cred = make_cred(
+            "firebase-web-api-key",
+            AuthType::ApiKey,
+            "AIzaSy-fake-key-value",
+        );
+        let env: std::collections::HashMap<_, _> =
+            credential_env_vars(vec![cred]).into_iter().collect();
+        assert_eq!(
+            env.get("CRED_FIREBASE_WEB_API_KEY").map(String::as_str),
+            Some("AIzaSy-fake-key-value")
+        );
+        assert!(env.get("CRED_FIREBASE_WEB_API_KEY_USERNAME").is_none());
+        assert!(env.get("CRED_FIREBASE_WEB_API_KEY_PASSWORD").is_none());
+    }
+
+    #[test]
+    fn bearer_emits_single_cred_var() {
+        let cred = make_cred("openai-key", AuthType::Bearer, "sk-test-123");
+        let env: std::collections::HashMap<_, _> =
+            credential_env_vars(vec![cred]).into_iter().collect();
+        assert_eq!(env.get("CRED_OPENAI_KEY").map(String::as_str), Some("sk-test-123"));
+        assert!(env.get("CRED_OPENAI_KEY_USERNAME").is_none());
+    }
+
+    #[test]
+    fn basic_emits_single_cred_var_with_user_colon_password() {
+        // `basic` stores `user:password` literally; we hand the whole string
+        // to the script as `CRED_<NAME>` and let the script decide how to
+        // split it. Mirrors what `run_python` / `run_bash` already do.
+        let cred = make_cred("svc-basic", AuthType::Basic, "alice:s3cret");
+        let env: std::collections::HashMap<_, _> =
+            credential_env_vars(vec![cred]).into_iter().collect();
+        assert_eq!(env.get("CRED_SVC_BASIC").map(String::as_str), Some("alice:s3cret"));
+        assert!(env.get("CRED_SVC_BASIC_USERNAME").is_none());
+        assert!(env.get("CRED_SVC_BASIC_PASSWORD").is_none());
+    }
+
+    #[test]
+    fn name_transform_uppercases_and_replaces_separators() {
+        let cred = make_cred("snake.storage familien-prod", AuthType::ApiKey, "v");
+        let env: std::collections::HashMap<_, _> =
+            credential_env_vars(vec![cred]).into_iter().collect();
+        assert_eq!(
+            env.get("CRED_SNAKE_STORAGE_FAMILIEN_PROD").map(String::as_str),
+            Some("v")
+        );
+    }
+}

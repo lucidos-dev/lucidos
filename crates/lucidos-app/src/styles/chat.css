@@ -177,6 +177,10 @@
     border-radius: 0.25rem;
     border: 1px solid var(--border-color);
     cursor: pointer;
+    /* Skeleton-toned fill so the loading <img> doesn't show the dark page
+       background through it (the visible "black flash" on iOS PWA when
+       the preview re-fetches after HTTP-cache eviction). */
+    background-color: var(--bg-tertiary);
 }
 
 /* Generated image inline in response */
@@ -222,8 +226,8 @@
 
 .prompt-actions-row {
     display: flex;
-    align-items: center;
-    padding: 0 0.75rem 0.25rem 0.5rem;
+    align-items: flex-end;
+    padding: 0 0.75rem 0.5rem 0.5rem;
     /* Anchor for absolutely-positioned fade-out children. The row width is
      * stable across cluster reflows, unlike .prompt-actions-right (which has
      * margin-left:auto and shifts when its leftmost child leaves flow). */
@@ -234,11 +238,36 @@
     position: relative;
 }
 
+/* Center-align the 2.25rem image icon with the shorter action buttons:
+ * shift its visual box ~6px down so the SVG center matches the action
+ * button center. Tap area moves with it but stays inside the row's
+ * 0.5rem bottom padding. */
+.prompt-actions-row .icon-btn.header-icon {
+    transform: translateY(0.375rem);
+}
+
 .prompt-actions-right {
     display: flex;
-    align-items: center;
+    align-items: flex-end;
     gap: 0.5rem;
     margin-left: auto;
+}
+
+/* Stacked variant — useFitsInOneRow detected overflow, so the secondary
+ * button (Diff for the banner, Discard draft for compose) lifts onto a
+ * sub-row directly above the primary buttons. Stays inside this column so
+ * the icons (siblings on the left of .prompt-actions-row) don't introduce a
+ * tall flex-end gap above the primary sub-row. */
+.prompt-actions-right.is-stacked {
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.5rem;
+}
+
+.prompt-actions-subrow {
+    display: flex;
+    align-items: flex-end;
+    gap: 0.5rem;
 }
 
 .save-thread-btn {
@@ -256,15 +285,6 @@
     display: block;
     font-size: 0.75rem;
     font-weight: 400;
-}
-
-.thread-action-buttons {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    align-items: center;
-    gap: 0.375rem;
-    margin-left: auto;
 }
 
 .cc-control-menu {
@@ -911,13 +931,16 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     border-radius: 0.25rem;
     color: inherit;
     font: inherit;
-    cursor: pointer;
     transition: background var(--duration-fast);
     text-align: left;
 }
+button.initiator-actor,
+.response-executor {
+    cursor: pointer;
+}
 
 @media (hover: hover) {
-    .initiator-actor:hover,
+    button.initiator-actor:hover,
     .response-executor:hover {
         background: color-mix(in srgb, var(--bg-secondary) 80%, var(--accent));
     }
@@ -1019,7 +1042,7 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     padding: 0.75rem 1rem;
 }
 
-/* SessionRecovered engine note — collapsed by default, expands inline when
+/* ContinuationStarted engine note — collapsed by default, expands inline when
    the user clicks the subline. Sits inside an initiator-panel body so it
    inherits the panel's padding; we only style the disclosure summary and
    the expanded preformatted block. */
@@ -1389,8 +1412,11 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     white-space: normal;
 }
 
-/* Highlighted: the picked option in Selected answers — accent border + tint. */
-.cc-question-option-selected {
+/* Highlighted: the picked option in Selected answers — accent border + tint.
+   Same treatment for live multi-select toggles via aria-pressed, so changing
+   the accent recipe touches one block. */
+.cc-question-option-selected,
+.cc-question-option[aria-pressed="true"] {
     border-color: color-mix(in srgb, var(--accent) 50%, var(--border-color));
     background: color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary));
 }
@@ -1451,8 +1477,10 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 
 /* CC permission divider — body of a CodingAgentPermissionRequest initiator
    panel. Like .cc-question-body, the .initiator-body wrapper provides chrome;
-   the body is just a vertical stack of the prompt text, action rows, and (in
-   answered state) the allowed/denied badge. */
+   the body is just a vertical stack of the prompt text and action rows. After
+   the user resolves the request the same buttons stay rendered (disabled, with
+   the picked one marked and the rest struck through) so layout doesn't jump
+   and history reads at a glance. */
 .cc-permission-body {
     display: flex;
     flex-direction: column;
@@ -1482,37 +1510,31 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     font-size: 0.875em;
 }
 
-/* "Allowed" pill on a resolved permission divider — green to match the
-   accent-green confirm semantics used elsewhere (action-btn-confirm). */
-.cc-permission-allowed-badge {
-    display: inline-flex;
-    align-self: flex-start;
-    padding: 0.125rem 0.5rem;
-    border: 1px solid color-mix(in srgb, var(--accent-green) 40%, var(--border-color));
-    border-radius: 1rem;
-    background: color-mix(in srgb, var(--accent-green) 12%, transparent);
-    color: var(--accent-green);
-    font-size: 0.6875rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
+/* Picked button on an answered permission card — keep it at full opacity (the
+   default .action-btn:disabled fades to 40%, which would visually demote the
+   choice) so the chosen scope reads as the surviving decision. */
+.cc-permission-btn-picked.action-btn:disabled {
+    opacity: 1;
 }
 
-/* "Denied: …" pill on a resolved permission divider — red to match the
-   accent-red danger semantics (action-btn-danger). May contain reason text,
-   so allow it to wrap rather than forcing a single line. */
-.cc-permission-denied-badge {
-    display: inline-flex;
-    align-self: flex-start;
-    max-width: 100%;
-    padding: 0.125rem 0.5rem;
-    border: 1px solid color-mix(in srgb, var(--accent-red) 40%, var(--border-color));
-    border-radius: 1rem;
-    background: color-mix(in srgb, var(--accent-red) 12%, transparent);
-    color: var(--accent-red);
-    font-size: 0.6875rem;
-    font-weight: 600;
-    word-break: break-word;
+/* Rejected (not-picked) buttons on an answered permission card — strike them
+   through and drop them to a muted slate. The default .action-btn:disabled
+   opacity (0.4) already greys the colour; the line-through tells the user
+   these buttons WERE on offer but were not chosen. */
+.cc-permission-btn-rejected.action-btn:disabled {
+    background-color: var(--bg-tertiary);
+    color: var(--text-muted);
+    text-decoration: line-through;
+    text-decoration-color: var(--text-muted);
+    opacity: 0.7;
+}
+
+.cc-permission-btn-rejected.action-btn:disabled code {
+    text-decoration: line-through;
+}
+
+.cc-permission-btn-check {
+    margin-right: 0.125rem;
 }
 
 /* Tool-permissions settings section: full-width monospace textarea + action row */
@@ -1685,4 +1707,59 @@ body:not(.is-touch) .code-block-copy-btn {
 body:not(.is-touch) .code-block-wrapper:hover .code-block-copy-btn,
 body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
     opacity: 1;
+}
+
+/* Flat — no border/background; the surrounding InitiatorPanel owns the chrome. */
+.child-completion-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+.child-completion-header-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+}
+.child-completion-prefix {
+    color: var(--text-secondary);
+}
+.child-completion-status {
+    display: inline-flex;
+    align-items: center;
+    font-size: 0.75rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 0.25rem;
+    font-weight: 600;
+}
+.child-completion-status-success {
+    background: color-mix(in srgb, var(--accent-green) 18%, transparent);
+    color: var(--accent-green);
+}
+.child-completion-status-failure {
+    background: color-mix(in srgb, var(--accent-red) 18%, transparent);
+    color: var(--accent-red);
+}
+.child-completion-status-no-changes {
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+}
+.child-completion-status-canceled {
+    background: color-mix(in srgb, var(--accent-yellow) 18%, transparent);
+    color: var(--accent-yellow);
+}
+.child-completion-disclosure {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+.child-completion-disclosure > summary {
+    cursor: pointer;
+    user-select: none;
+}
+.child-completion-disclosure > summary:hover {
+    color: var(--text-secondary);
+}
+.child-completion-summary {
+    margin-top: 0.375rem;
+    color: var(--text-secondary);
 }

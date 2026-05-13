@@ -13,12 +13,10 @@ use uuid::Uuid;
 
 use crate::engine::context::{
     format_history_content, format_history_steps, trim_history_from_oldest,
-    AGENT_CONTEXT_CHAR_BUDGET, HISTORY_COMPRESS_THRESHOLD, HISTORY_RECENT_MESSAGES,
-    HISTORY_VERBATIM_TAIL,
+    truncate_head_tail, AGENT_CONTEXT_CHAR_BUDGET, HISTORY_COMPRESS_THRESHOLD,
+    HISTORY_RECENT_MESSAGES, HISTORY_VERBATIM_TAIL,
 };
-use crate::engine::thread_events::{
-    ActorMode, EngineReason, EventChannel, MessageOrigin, TriggerInvocation,
-};
+use crate::engine::thread_events::{ActorMode, EventChannel, MessageOrigin, TriggerInvocation};
 use crate::engine::types::*;
 use crate::engine::LucidosEngine;
 
@@ -29,120 +27,12 @@ use super::images::{
     build_user_content_with_images, filter_recent_history_image_hashes, image_recency_cutoff,
     save_images_to_tmp, MAX_HISTORY_IMAGE_MESSAGES,
 };
+use super::process_helpers::{
+    build_system_knowhow_section, build_trigger_knowhow_section, build_trigger_started_event,
+    classify_or_fallback, summarize_or_fallback, TriggerContext, ENGINE_RESTART_RULE,
+};
 use super::recursion_guard::MAX_THREAD_DEPTH;
 use super::title::emit_generated_title;
-use std::future::Future;
-use std::time::Duration;
-
-/// Build the TriggerStarted thread-event + meta for a scheduler-fired trigger
-/// run. Extracted as a pure function so the wiring rule "the `config.id`
-/// passed in is what gets stamped into both `TriggerStarted.trigger_id` and
-/// `EngineReason::Scheduler.trigger_id`" stays unit-testable without standing
-/// up the LLM that `process_trigger` runs through.
-fn build_trigger_started_event(
-    trigger_id: &str,
-    trigger_name: &str,
-    invocation: &TriggerInvocation,
-    user_message: &str,
-    go_to_review: bool,
-) -> (
-    crate::engine::thread_events::ThreadEvent,
-    crate::engine::thread_events::EventMeta,
-) {
-    use crate::engine::thread_events::{EventMeta, ThreadEvent};
-    (
-        ThreadEvent::TriggerStarted {
-            trigger_id: trigger_id.to_string(),
-            trigger_name: Some(trigger_name.to_string()),
-            prompt: Some(user_message.to_string()),
-            invocation: Some(invocation.clone()),
-            // Scheduler-fired triggers always carry Engine origin so the
-            // route popover can render "Engine · Scheduled · <name>".
-            origin: Some(MessageOrigin::engine(EngineReason::Scheduler {
-                trigger_id: trigger_id.to_string(),
-                trigger_name: Some(trigger_name.to_string()),
-            })),
-            go_to_review,
-        },
-        EventMeta {
-            channel: Some(EventChannel::Trigger),
-            ..EventMeta::NONE
-        },
-    )
-}
-
-/// Wall-clock cap on auxiliary Flash calls in the chat slow path
-/// (history summarization, query classification). The Vertex non-streaming
-/// client itself allows 900s, so without this an occasional Flash hang would
-/// silently stall the chat between MessageReceived and the first agentic step
-/// — exactly the "stuck thread" symptom users observe. Defaults are safe: on
-/// timeout we fall back to truncation / "needs everything" classification.
-const AUX_LLM_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Run the Flash summarization future under `AUX_LLM_TIMEOUT`. On error or
-/// timeout, fall back to the truncation placeholder used elsewhere in the
-/// chat path.
-async fn summarize_or_fallback<F>(fut: F, older_len: usize) -> String
-where
-    F: Future<Output = Result<String, Box<dyn std::error::Error + Send + Sync>>>,
-{
-    let truncation_fallback = || format!("({} earlier messages not shown)", older_len);
-    match tokio::time::timeout(AUX_LLM_TIMEOUT, fut).await {
-        Ok(Ok(s)) => {
-            log!(
-                "[Chat] Compressed {} older messages into {} char summary",
-                older_len,
-                s.len()
-            );
-            s
-        }
-        Ok(Err(e)) => {
-            log!(
-                "[Chat] History summarization failed, falling back to truncation: {}",
-                e
-            );
-            truncation_fallback()
-        }
-        Err(_) => {
-            log!(
-                "[Chat] History summarization timed out ({}s), falling back to truncation",
-                AUX_LLM_TIMEOUT.as_secs()
-            );
-            truncation_fallback()
-        }
-    }
-}
-
-/// Run the Flash classification future under `AUX_LLM_TIMEOUT`. On error or
-/// timeout, fall back to `QueryClassification::default()` ("needs everything").
-async fn classify_or_fallback<F>(fut: F) -> crate::memory::QueryClassification
-where
-    F: Future<
-        Output = Result<
-            crate::memory::QueryClassification,
-            Box<dyn std::error::Error + Send + Sync>,
-        >,
-    >,
-{
-    match tokio::time::timeout(AUX_LLM_TIMEOUT, fut).await {
-        Ok(Ok(c)) => {
-            log!("[Chat] Query classification: needs_memory={}, needs_file_list={}, needs_credentials={}, sub_queries={:?}",
-                c.needs_memory, c.needs_file_list, c.needs_credentials, c.sub_queries);
-            c
-        }
-        Ok(Err(e)) => {
-            log!("[Chat] Query classification failed (defaulting to all): {}", e);
-            crate::memory::QueryClassification::default()
-        }
-        Err(_) => {
-            log!(
-                "[Chat] Query classification timed out ({}s), defaulting to all",
-                AUX_LLM_TIMEOUT.as_secs()
-            );
-            crate::memory::QueryClassification::default()
-        }
-    }
-}
 
 impl LucidosEngine {
     /// Process a trigger prompt (emits TriggerStarted instead of MessageReceived).
@@ -150,28 +40,32 @@ impl LucidosEngine {
     /// `external_cancel`, when set, is forwarded into the per-thread cancellation
     /// token so the scheduler can stop an in-flight trigger cleanly (UI delete,
     /// disable, update) without aborting the agentic loop mid-tool.
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_trigger(
         &self,
         trigger_id: &str,
         trigger_name: &str,
+        slug: &str,
         prompt: &str,
         invocation: TriggerInvocation,
         go_to_review: bool,
         external_cancel: Option<CancellationToken>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
-        let (model, reasoning_effort) = PreferenceStore::user_chat_settings(&self.pool).await;
+        // Chat-pref resolution lives in `process_message_with_steps_internal`
+        // — pass `None` here and let the single canonical resolver apply it.
         self.process_message_with_steps_internal(
             prompt,
-            model.as_deref(),
-            Some((
-                trigger_id.to_string(),
-                trigger_name.to_string(),
+            None,
+            Some(TriggerContext {
+                trigger_id: trigger_id.to_string(),
+                trigger_name: trigger_name.to_string(),
+                slug: slug.to_string(),
                 invocation,
                 go_to_review,
-            )),
+            }),
             None,
             None,
-            reasoning_effort.as_deref(),
+            None,
             None,
             None,
             None,
@@ -249,7 +143,7 @@ impl LucidosEngine {
         &self,
         user_message: &str,
         model_override: Option<&str>,
-        trigger: Option<(String, String, TriggerInvocation, bool)>, // (config.id, trigger_name, invocation, go_to_review) when this is a trigger run
+        trigger: Option<TriggerContext>, // None for user-driven chat; Some when fired by the scheduler
         app_context: Option<AppContext>, // app context if chatting from within an app
         file_context: Option<String>,    // file path if user is viewing a file
         reasoning_effort: Option<&str>,  // unified reasoning level: none/low/medium/high/xhigh/max
@@ -282,6 +176,19 @@ impl LucidosEngine {
         let mut pre_emitted_origin = pre_emitted_origin;
 
         let is_trigger = trigger.is_some();
+
+        // `None` here means "use the user's chat defaults", not "use
+        // `LlmProvider::default_model()`" — which strips the `[1m]` suffix and
+        // doesn't carry an effort, so without this resolve the stamp drifts
+        // away from the user's selection on every internal re-entry path.
+        let (resolved_model, resolved_effort) = PreferenceStore::resolve_chat_overrides(
+            &self.pool,
+            model_override.map(str::to_string),
+            reasoning_effort.map(str::to_string),
+        )
+        .await;
+        let model_override = resolved_model.as_deref();
+        let reasoning_effort = resolved_effort.as_deref();
 
         // Resolve device tooltip info for the MessageReceived event
         let device_name = if let Some(did) = device_id {
@@ -333,9 +240,15 @@ impl LucidosEngine {
         // option, route the message to the answer-question handler with
         // `FreeText` instead of creating a new exchange. Without this, the user's
         // text would spawn a brand-new CC turn alongside an unresolved question.
+        //
+        // Uses `lookup_active_question_tool_use_id` (not `..pending..`) so a
+        // question orphaned by a prior `ResponseAborted`/`Canceled`/`Failed`/
+        // `CodingAgentIdled` doesn't intercept the follow-up — otherwise the
+        // typed text would be silently consumed as the dead question's answer
+        // and `MessageReceived` would never be emitted.
         if use_claude_code == Some(true) && !is_new_thread && !user_message.is_empty() {
             if let Some(pending_tool_use_id) =
-                crate::engine::agent_question::lookup_pending_question_tool_use_id(
+                crate::engine::agent_question::lookup_active_question_tool_use_id(
                     self.pool(),
                     thread_id,
                 )
@@ -547,6 +460,7 @@ impl LucidosEngine {
                                 spawning_event_id,
                                 images,
                                 origin: origin.clone(),
+                                kind: crate::engine::InjectedPromptKind::UserText,
                             })
                             .is_ok()
                     } else {
@@ -623,15 +537,13 @@ impl LucidosEngine {
             id
         } else {
             let (user_thread_event, user_meta) =
-                if let Some((ref trigger_id, ref trigger_name, ref invocation, go_to_review)) =
-                    trigger
-                {
+                if let Some(ref tc) = trigger {
                     build_trigger_started_event(
-                        trigger_id,
-                        trigger_name,
-                        invocation,
+                        &tc.trigger_id,
+                        &tc.trigger_name,
+                        &tc.invocation,
                         user_message,
-                        go_to_review,
+                        tc.go_to_review,
                     )
                 } else {
                     let is_cc = use_claude_code == Some(true);
@@ -646,7 +558,7 @@ impl LucidosEngine {
                             user_message,
                             user_images,
                             device_id,
-                            device_name,
+                            device_name.clone(),
                             parent_thread_id,
                             spawning_event_id,
                             mode,
@@ -708,12 +620,12 @@ impl LucidosEngine {
 
         // Trigger threads are titled "Run <trigger name>" so users can spot trigger runs at a glance.
         if is_trigger && !has_caller_title {
-            if let Some((_, ref name, _, _)) = trigger {
+            if let Some(ref tc) = trigger {
                 self.event_bus
                     .emit(crate::engine::event_bus::BusEvent::Thread {
                         thread_id,
                         event: crate::engine::thread_events::ThreadEvent::ThreadTitleGenerated {
-                            title: format!("Run {}", name),
+                            title: format!("Run {}", tc.trigger_name),
                         },
                         meta: EventMeta::NONE,
                     })
@@ -765,187 +677,27 @@ impl LucidosEngine {
             }
         }
 
-        // Direct Claude Code mode — run CC in the same thread (no spawn)
+        // `_guard` MUST stay alive across this await so cancel_thread lands
+        // on the per-thread cancel_token (see process_cc.rs module doc).
         if use_claude_code == Some(true) {
-            log!(
-                "[Chat] [TIMING] pre-CC overhead: {:?}",
-                chat_start.elapsed()
-            );
-            // Hold `_guard` through the CC lifecycle so cancel_thread can
-            // land on this thread's cancel_token during the startup window
-            // (before agent_sessions is populated). Dropping it here would
-            // route the cancel into settle_stuck_running_thread, leaving
-            // CC still running.
-            let repo_id_str = repo_id.map(|s| s.to_string());
-            let cc_model_str = cc_model.map(|s| s.to_string());
-            let cc_effort_str = reasoning_effort.map(|s| s.to_string());
-
-            // Coalesce rapid-fire follow-ups arriving while no CC subprocess
-            // is alive (Phase 2 made every CC exit on idle, so two messages
-            // typed within ~250ms of each other both reach this branch).
-            // The leader proceeds to spawn CC; followers queue their messages
-            // for the leader to drain into a single combined input. Phase 5's
-            // event-driven dispatcher will subsume this. See
-            // `agent_session/cc_spawn_coalesce.rs` for the helper module.
-            //
-            // Skip coalescing for conflict-resolution turns — those have a
-            // distinct lifecycle (per-merge worktree) and are never
-            // user-typed in rapid succession.
-            const CC_SPAWN_DEBOUNCE: std::time::Duration =
-                std::time::Duration::from_millis(250);
-            if conflict_change_id.is_none() {
-                use crate::engine::agent_session::{LeaderElection, QueuedMessage};
-                let my_msg = QueuedMessage {
-                    text: user_message.to_string(),
-                    images: user_images.map(|imgs| imgs.to_vec()),
-                    origin_event_id: Some(origin_id),
-                };
-                match self
-                    .cc_spawn_coalesce
-                    .try_become_leader(thread_id, my_msg)
-                {
-                    LeaderElection::Queued => {
-                        // Leader will pick up our message via drain. Our
-                        // MessageReceived event is already persisted; the
-                        // response will arrive via SSE for both turns.
-                        log!(
-                            "[Chat] CC follow-up for thread {} queued behind active spawn leader",
-                            thread_id
-                        );
-                        return Ok(ProcessResult {
-                            response: String::new(),
-                            steps: vec![],
-                            images: vec![],
-                            request_id,
-                            thread_id,
-                            proposed_change: false,
-                            auto_apply: false,
-                            orphaned_injections: vec![],
-                        });
-                    }
-                    LeaderElection::Leader => {
-                        // Fall through to spawn CC. Drain happens just before
-                        // run_direct_agent so we capture any followups that
-                        // arrive during the brief debounce window.
-                    }
-                }
-            }
-
-            // Brief debounce window: wait so any follow-ups typed within
-            // CC_SPAWN_DEBOUNCE land in our queue before we spawn. Single
-            // messages still pay this cost, but a CC spawn takes 5-10s of
-            // process startup anyway, so the overhead is in the noise. Skip
-            // for conflict resolution (no leader-election there).
-            if conflict_change_id.is_none() {
-                tokio::time::sleep(CC_SPAWN_DEBOUNCE).await;
-            }
-
-            // Drain any queued followups and combine with our own message.
-            let queued = if conflict_change_id.is_none() {
-                self.cc_spawn_coalesce.drain_queue(thread_id)
-            } else {
-                Vec::new()
-            };
-            let coalesced_count = queued.len();
-            let (combined_text, combined_images) = crate::engine::agent_session::combine_messages(
-                user_message,
-                user_images.map(|imgs| imgs.to_vec()),
-                queued,
-            );
-            if coalesced_count > 0 {
-                log!(
-                    "[Chat] Coalesced {} follow-up(s) into leader CC spawn for thread {}",
-                    coalesced_count,
-                    thread_id
-                );
-            }
-            let combined_images_slice = combined_images.as_deref();
-
-            // Recover the prior CC session id from the event store so a follow-up
-            // after the in-memory entry was removed (subprocess died, engine
-            // restart, change-less idle) still resumes the same conversation.
-            // Without this, the resolver's auto-detect path returns no sid when
-            // the most recent lifecycle event is SessionEnded — even though
-            // CodingAgentIdled with a usable sid exists earlier in the timeline.
-            let resume_sid = crate::engine::agent_session::lookup_latest_cc_session_id(
-                &self.pool,
-                thread_id,
-            )
-            .await;
-            let result = self
-                .run_direct_agent(
-                    request_id,
+            return self
+                .run_cc_chat_branch(
                     thread_id,
-                    &combined_text,
-                    combined_images_slice,
+                    request_id,
+                    user_message,
+                    user_images,
+                    repo_id,
+                    cc_model,
+                    reasoning_effort,
+                    conflict_change_id,
                     origin_id,
                     spawning_event_id,
                     &cancel_token,
-                    conflict_change_id,
-                    None,
-                    repo_id_str.clone(),
-                    None,
-                    resume_sid,
-                    cc_model_str.clone(),
-                    cc_effort_str.clone(),
-                    None,
+                    chat_start,
                 )
                 .await;
-            // Stale resume: CC process was expired and returned empty Result.
-            // SessionEnded was emitted to prevent re-resume. Retry with a fresh
-            // session — explicitly no resume_session_id, so the resolver starts
-            // CC on a clean conversation rather than the sid we just proved
-            // unusable.
-            //
-            // Phase 9: prepend a reconstruction of the prior conversation so
-            // CC has rough context instead of starting from amnesia.
-            let mut result = result;
-            if let Err(ref e) = result {
-                if e.to_string() == crate::engine::claude_code::STALE_RESUME_ERROR {
-                    log!("[Chat] Stale CC resume — retrying with fresh session");
-                    self.clear_cc_debounce(thread_id);
-                    let retry_text = crate::engine::agent_session::prepend_reconstruction(
-                        &self.pool,
-                        thread_id,
-                        &combined_text,
-                    )
-                    .await;
-                    result = self
-                        .run_direct_agent(
-                            request_id,
-                            thread_id,
-                            &retry_text,
-                            combined_images_slice,
-                            origin_id,
-                            spawning_event_id,
-                            &cancel_token,
-                            conflict_change_id,
-                            None,
-                            repo_id_str,
-                            None,
-                            None,
-                            cc_model_str,
-                            cc_effort_str,
-                            None,
-                        )
-                        .await;
-                }
-            }
-            // Surface any follow-ups that arrived between drain and clear (a
-            // small race window) as orphans so the caller re-routes them
-            // rather than dropping them silently.
-            if conflict_change_id.is_none() {
-                let residual = self.cc_spawn_coalesce.clear(thread_id);
-                if !residual.is_empty() {
-                    let mut orphans =
-                        crate::engine::agent_session::queued_to_orphans(residual);
-                    if let Ok(ref mut pr) = result {
-                        pr.orphaned_injections.append(&mut orphans);
-                    }
-                }
-            }
-            return result;
         }
+
 
         // Snapshot RwLock values once per request
         let user_timezone = self.user_timezone.read().await.clone();
@@ -959,19 +711,58 @@ impl LucidosEngine {
             .flatten()
             .unwrap_or_default();
 
+        // Resume tool blocks: full ToolUse + ToolResult Message pairs for the
+        // most recent N tool calls (Phase 3). Pinned `load_knowhow` results
+        // survive regardless of N — see
+        // `build_resume_tool_blocks_with_skip_ids`. Empty for triggers and
+        // the no-history path.
+        let mut resume_tool_blocks: Vec<Message> = Vec::new();
+        let mut resume_skip_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         // Load conversation history from DB.
         // For follow-ups, load only the thread's messages to avoid cross-thread leakage.
         // If >HISTORY_COMPRESS_THRESHOLD messages, older messages are summarized via Flash
         // and only the last HISTORY_RECENT_MESSAGES are included verbatim.
         let (mut history_context, conversation_summary, history_image_hashes) = if !is_trigger {
-            // Follow-ups: scope to thread; new threads: load global recent messages
+            // Follow-ups: scope to thread; new threads: load global recent messages.
+            //
+            // For follow-ups we fetch the thread's events ONCE and derive both
+            // the SessionMessage history (for stringified `[CONVERSATION
+            // HISTORY]` formatting) AND the verbatim resume tool blocks (most
+            // recent N + pinned `load_knowhow` results) from that single
+            // walk. The earlier shape did two separate DB calls
+            // (`get_thread_messages` then `get_thread_events`) for the same
+            // rows — same SQL, same thread_id, twice the round-trip — and
+            // also silently swallowed the second call's error, losing
+            // procedure context exactly when the bug Phase 3 fixes recurs.
             let messages_result = if !is_new_thread {
-                self.event_store.get_thread_messages(&thread_id_str).await
+                match self.event_store.get_thread_events(&thread_id_str).await {
+                    Ok(events) => {
+                        let (blocks, skip_ids) =
+                            crate::core::store::build_resume_tool_blocks_with_skip_ids(
+                                &events,
+                                crate::core::store::RESUME_VERBATIM_TOOL_TAIL,
+                            );
+                        resume_tool_blocks = blocks;
+                        resume_skip_ids = skip_ids;
+                        Ok(crate::core::store::build_session_messages(&events))
+                    }
+                    Err(e) => {
+                        log!(
+                            "[Chat] resume context load failed (DB error): {}; \
+                             orchestrator will resume without verbatim tool history",
+                            e
+                        );
+                        Err(e)
+                    }
+                }
             } else {
                 self.event_store
                     .get_recent_messages((HISTORY_RECENT_MESSAGES * 2 + 2) as i64, None)
                     .await
             };
+
             match messages_result {
                 Ok(messages) => {
                     // All messages except the one we just appended (last one)
@@ -1093,8 +884,12 @@ impl LucidosEngine {
                             )
                         };
                         // Assistant turns may have only tool calls; m.content covers prose only.
+                        // Tools whose `tool_called_event_id` is in `resume_skip_ids`
+                        // are already represented as full Message::Blocks(...) pairs
+                        // prepended to the LLM messages vec — suppress the
+                        // duplicate `[tools: ...]` summary for them.
                         let steps_summary = if m.role == "assistant" {
-                            format_history_steps(&m.steps).unwrap_or_default()
+                            format_history_steps(&m.steps, &resume_skip_ids).unwrap_or_default()
                         } else {
                             String::new()
                         };
@@ -1343,7 +1138,7 @@ TIMEZONE HANDLING:
         let workspace_name = self.workspace_name();
 
         let system_prompt = format!(
-            r#"You are Lucidos, a personal cognitive assistant running in the "{workspace_name}" workspace. You help users organize their life and work through natural conversation.
+            r#"You are managing Lucidos, a personal assistant running in the "{workspace_name}" workspace. You help users organize their life and work through natural conversation.
 
 WORKSPACE: {workspace_name} ({workspace_path})
 All threads, events, artifacts, and data you access belong to this workspace. When the user refers to "my threads", "events", or other data, it means data in this workspace.
@@ -1588,6 +1383,12 @@ SEARCHING FILES:
 - grep_files(pattern, path_glob?, case_insensitive?, max_matches?, context_lines?): regex-search file contents. Use path_glob to scope (e.g. 'artifacts/**/*.md').
 - Prefer these over run_bash with rg/grep/find — they're structured, faster, and respect workspace boundaries.
 
+LONG-RUNNING SHELL COMMANDS:
+- run_bash is synchronous with a 300s ceiling — it WILL kill anything longer mid-stream.
+- For HTTP polling, builds, scrapers, npm/cargo installs, large repo scans: use run_bash_background(command, timeout_secs?) to spawn and get a task_id immediately.
+- Drain output with bash_output(task_id) — returns only what's new since the last call. Cancel with bash_kill(task_id).
+- NEVER hand-roll `for i in range(...): time.sleep(...)` polling loops in run_python — that's exactly what this trio replaces.
+
 REFRESHING OPEN WINDOWS:
 When you modify a file that the user has open (shown in FOCUSED WINDOW context):
 - After writing/editing: call refresh_file(path)
@@ -1615,14 +1416,16 @@ Use emit_event and query_events to track and retrieve structured facts about wha
 - Prefer emit_event and query_events over run_python/SQL for event access. Use Python only for complex reporting or analysis that query_events can't handle.
 
 PARALLEL WORK (FAN-OUT):
-You have two tools for delegating work to child threads:
+You have two tools for spawning Lucidos threads:
 - run_claude: Start a Claude Code session for code tasks (creates worktree, proposes changes)
 - run_thread: Start a Lucidos thread for non-code tasks (research, analysis, drafting)
-Each child thread runs independently. When it completes, a callback resumes this thread with its result. NOTE: this callback only works for SAME-workspace children spawned via these tools. POSTs to another workspace's /api/chat/stream are fire-and-forget — see the cross-workspace knowhow.
-For pipelines where step N depends on step N-1's outcome, spawn one child per response and wait for the callback before spawning the next — do not batch sequential spawns in one response.
+Both accept an optional `relation` argument (default `"sub"`):
+- `relation: "sub"` — sub-thread. Runs independently; when it completes a callback resumes this thread with its result. Use for delegated subtasks whose outcome you need yourself.
+- `relation: "top"` — top-thread. Independent top-level thread; this thread does NOT resume when it finishes. Use when the spawn is for the user to follow themselves (e.g. "do this in a separate thread", report-style work the user reads later).
+The callback only works for SAME-workspace sub-threads spawned via these tools. POSTs to another workspace's /api/chat/stream are always fire-and-forget — see the cross-workspace knowhow.
+For pipelines where step N depends on step N-1's outcome, spawn one sub-thread per response and wait for the callback before spawning the next — do not batch sequential spawns in one response.
 
-ENGINE RESTARTS WIPE THREAD CONTEXT:
-After an engine restart (including the rebuild prompted by backend changes), this thread is no longer active and you have NO memory of what you were doing. Never promise to do something "after the restart", "once it comes back up", or "in a minute when it's live" — you will not be here. If a restart is about to happen, tell the user they will need to come back and re-prompt to continue. Treat each restart as a hard cut-off.
+__ENGINE_RESTART_RULE__
 
 ENGINE INTERNALS YOU CANNOT OBSERVE:
 You cannot count your own tool calls, detect a per-turn cap, or measure any internal engine budget. The only real per-turn cap is at 100 tool calls; when it fires the engine prepends "[ENGINE-LIMIT]" to its message — that prefix is the only signal the cap was hit. Never claim you "hit a tool-call cap", "tool-call limit", "tool-call budget", "per-turn limit", or any similar made-up engine internal. If you stop mid-task, give the real reason or just keep going. Do NOT cite specific numbers (e.g. "~25 calls", "agentic_loop.rs", "MAX_ITERATIONS") about the agent loop — those numbers are not visible to you and inventing them poisons long-term memory for future turns.
@@ -1643,6 +1446,9 @@ CRITICAL RULES:
 5. MULTIPLE FILES: When asked to create N files, call write_file N times IN THE SAME RESPONSE
 
 VERIFICATION: Before saying "done", check that write_file returned "Created:" or "Updated:" — if not, you didn't actually do it!"#;
+
+        let system_prompt_base =
+            system_prompt_base.replace("__ENGINE_RESTART_RULE__", ENGINE_RESTART_RULE);
 
         let system_prompt = format!("{}{}", system_prompt, system_prompt_base);
 
@@ -1736,20 +1542,7 @@ VERIFICATION: Before saying "done", check that write_file returned "Created:" or
             .system_knowhow_dir()
             .map(crate::core::SystemKnowhowStore::load_summaries)
             .unwrap_or_default();
-        let system_knowhow_section = if !system_knowhow_summaries.is_empty() {
-            let mut section = String::from("\n\n## System Knowhow\n\n\
-                Authoritative reference shipped with the Lucidos engine. Use \
-                `load_knowhow` with the prefixed id (e.g. `system-knowhow/<id>`) to load full content.\n\n");
-            for sd in &system_knowhow_summaries {
-                section.push_str(&format!(
-                    "- **{}** (id: `system-knowhow/{}`): {}\n",
-                    sd.name, sd.id, sd.description
-                ));
-            }
-            section
-        } else {
-            String::new()
-        };
+        let system_knowhow_section = build_system_knowhow_section(&system_knowhow_summaries);
 
         let system_prompt = format!(
             "{}{}{}{}{}",
@@ -1780,10 +1573,22 @@ VERIFICATION: Before saying "done", check that write_file returned "Created:" or
         // docs). Appended last so the unconditional sections above stay
         // byte-identical between trigger fires and regular chats — that
         // shared prefix is what the LLM provider's prompt cache keys on.
+        // The per-trigger knowhow listing is also trigger-only, so it lives
+        // here next to the addendum (NOT in the unconditional knowhow_section
+        // above, which would invalidate the cache prefix for every other
+        // trigger thread).
         let system_prompt = if is_trigger {
+            let trigger_knowhow_section = trigger
+                .as_ref()
+                .map(|t| {
+                    let triggers_dir = self.workspace_path.join(crate::core::TRIGGERS_DIR);
+                    build_trigger_knowhow_section(&triggers_dir, &t.slug)
+                })
+                .unwrap_or_default();
             format!(
-                "{}{}",
+                "{}{}{}",
                 system_prompt,
+                trigger_knowhow_section,
                 crate::scheduler::user_tasks::TRIGGER_SYSTEM_ADDENDUM
             )
         } else {
@@ -2128,37 +1933,48 @@ URL: {}\n\
             }
         };
 
-        // Emit context sections for the frontend context viewer
-        {
-            let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-            let tool_names_str = tool_names.join(", ");
-
-            let mut sections = Vec::new();
-            let add = |sections: &mut Vec<ContextSection>, name: &str, content: &str| {
-                if !content.is_empty() {
-                    sections.push(ContextSection {
-                        name: name.to_string(),
-                        content: content.to_string(),
-                        char_count: content.len(),
-                    });
+        // Section *shape* (name + char_count) is always built so the
+        // modal can render the breakdown; only the body is gated by
+        // `capture_context`. Body cap (8 KB) prevents a 100 KB system
+        // prompt from bloating every events row.
+        let capture_body = PreferenceStore::capture_context(&self.pool).await;
+        const SECTION_PERSIST_MAX: usize = 8_000;
+        let labeled: [(&str, &str); 12] = [
+            ("System Instructions", &system_prompt),
+            ("User Profile", &profile_context),
+            ("Long-term Memory", &memory_context),
+            ("Conversation History", &history_context),
+            ("File List", &file_list_context),
+            ("Credentials", &credentials_context),
+            ("Email Accounts", &email_accounts_context),
+            ("OAuth", &oauth_context),
+            ("App Context", &app_context_section),
+            ("File Context", &file_context_section),
+            ("URL Context", &url_context_section),
+            ("User Message", user_message),
+        ];
+        let capture_sections: Vec<ContextSection> = labeled
+            .into_iter()
+            .filter(|(_, content)| !content.is_empty())
+            .map(|(name, content)| {
+                let body = capture_body.then(|| {
+                    if content.len() > SECTION_PERSIST_MAX {
+                        truncate_head_tail(content, SECTION_PERSIST_MAX)
+                    } else {
+                        content.to_string()
+                    }
+                });
+                ContextSection {
+                    name: name.to_string(),
+                    content: body,
+                    char_count: content.chars().count(),
                 }
-            };
-            add(&mut sections, "System Instructions", &system_prompt);
-            add(&mut sections, "User Profile", &profile_context);
-            add(&mut sections, "Long-term Memory", &memory_context);
-            add(&mut sections, "Conversation History", &history_context);
-            add(&mut sections, "File List", &file_list_context);
-            add(&mut sections, "Credentials", &credentials_context);
-            add(&mut sections, "Email Accounts", &email_accounts_context);
-            add(&mut sections, "OAuth", &oauth_context);
-            add(&mut sections, "App Context", &app_context_section);
-            add(&mut sections, "File Context", &file_context_section);
-            add(&mut sections, "URL Context", &url_context_section);
-            add(&mut sections, "User Message", user_message);
-            add(&mut sections, "Tools", &tool_names_str);
-
-            // ContextAssembled was internal-only — dropped.
-        }
+            })
+            .collect();
+        let capture_tools: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+        let capture_model = model_override
+            .unwrap_or_else(|| self.llm.default_model())
+            .to_string();
 
         let user_content = build_user_content_with_images(
             user_message_text,
@@ -2167,10 +1983,17 @@ URL: {}\n\
             user_images,
         );
 
-        let mut messages = vec![Message {
+        // Prepend reconstructed (ToolUse, ToolResult) Message pairs for the
+        // most recent N tool calls (Phase 3). This keeps tool result bodies —
+        // notably `load_knowhow` recipe contents — alive across resumes so
+        // multi-step trigger pipelines don't collapse to the stringified
+        // `[tools: ...]` summary on the next turn. See
+        // `core::store::build_resume_tool_blocks_with_skip_ids`.
+        let mut messages = resume_tool_blocks;
+        messages.push(Message {
             role: "user".to_string(),
             content: user_content,
-        }];
+        });
 
         // Run the agentic loop (LLM call → parse response → execute tools → repeat)
         let mut terminator_emitted = false;
@@ -2194,6 +2017,12 @@ URL: {}\n\
                 &cancel_token,
                 &mut injection_rx,
                 &mut terminator_emitted,
+                crate::engine::agentic_loop::ContextCaptureSeed {
+                    sections: &capture_sections,
+                    tools: &capture_tools,
+                    model: &capture_model,
+                    capture_body,
+                },
             )
             .await;
 
@@ -2269,94 +2098,5 @@ URL: {}\n\
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{build_trigger_started_event, classify_or_fallback, summarize_or_fallback};
-    use crate::engine::thread_events::{
-        EngineReason, EventChannel, MessageOrigin, ThreadEvent, TriggerInvocation,
-    };
-    use crate::memory::QueryClassification;
-    use std::future::pending;
-
-    /// Regression for the v5-hash leak: the trigger id passed in (a
-    /// `config.id` from `/api/v1/triggers`) must propagate verbatim to both
-    /// `TriggerStarted.trigger_id` and `EngineReason::Scheduler.trigger_id`,
-    /// otherwise the dropdown filter (which posts the same `config.id`) finds
-    /// nothing in `thread_summaries.trigger_id`.
-    #[test]
-    fn build_trigger_started_event_preserves_config_id_verbatim() {
-        let config_id = "5633f3e1-110c-4df4-a6fc-c0df8fd36df4";
-        let (event, meta) = build_trigger_started_event(
-            config_id,
-            "Job Listing Check",
-            &TriggerInvocation::Schedule,
-            "Run the check.",
-            false,
-        );
-        assert_eq!(meta.channel, Some(EventChannel::Trigger));
-        let ThreadEvent::TriggerStarted {
-            trigger_id,
-            trigger_name,
-            origin,
-            ..
-        } = event
-        else {
-            panic!("expected TriggerStarted");
-        };
-        assert_eq!(trigger_id, config_id);
-        assert_eq!(trigger_name.as_deref(), Some("Job Listing Check"));
-        let MessageOrigin::Engine {
-            reason:
-                EngineReason::Scheduler {
-                    trigger_id: origin_id,
-                    trigger_name: origin_name,
-                },
-        } = origin.expect("scheduler origin")
-        else {
-            panic!("expected Engine{{Scheduler}} origin");
-        };
-        assert_eq!(origin_id, config_id);
-        assert_eq!(origin_name.as_deref(), Some("Job Listing Check"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn summarize_falls_back_when_flash_hangs() {
-        let hang = pending::<Result<String, Box<dyn std::error::Error + Send + Sync>>>();
-        let result = summarize_or_fallback(hang, 7).await;
-        assert_eq!(result, "(7 earlier messages not shown)");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn summarize_falls_back_on_provider_error() {
-        let err = async {
-            Err::<String, Box<dyn std::error::Error + Send + Sync>>("vertex 503".into())
-        };
-        let result = summarize_or_fallback(err, 4).await;
-        assert_eq!(result, "(4 earlier messages not shown)");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn classify_falls_back_when_flash_hangs() {
-        let hang =
-            pending::<Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>>>();
-        let result = classify_or_fallback(hang).await;
-        let default = QueryClassification::default();
-        assert_eq!(result.needs_memory, default.needs_memory);
-        assert_eq!(result.needs_file_list, default.needs_file_list);
-        assert_eq!(result.needs_credentials, default.needs_credentials);
-        assert!(result.sub_queries.is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn classify_falls_back_on_provider_error() {
-        let err = async {
-            Err::<QueryClassification, Box<dyn std::error::Error + Send + Sync>>(
-                "bad json".into(),
-            )
-        };
-        let result = classify_or_fallback(err).await;
-        assert!(result.needs_memory);
-        assert!(result.needs_file_list);
-        assert!(result.needs_credentials);
-        assert!(result.sub_queries.is_empty());
-    }
-}
+#[path = "process_tests.rs"]
+mod tests;

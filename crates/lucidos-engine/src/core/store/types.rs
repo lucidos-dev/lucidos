@@ -14,6 +14,13 @@ pub struct Step {
     pub context_messages: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trimmed: Option<bool>,
+    /// UUID (as string) of the originating `ToolCalled` event for tool steps.
+    /// `None` for synthetic steps (Thinking, MemorySearched). Used by the
+    /// resume path to suppress the `[tools: ...]` summary for tool calls
+    /// already reconstructed as full `Message::Blocks(...)` pairs in the
+    /// LLM messages vec — see `build_resume_tool_blocks_with_skip_ids`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_called_event_id: Option<String>,
 }
 
 /// A response event — either a text block (raw markdown) or a step.

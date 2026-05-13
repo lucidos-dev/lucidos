@@ -5,6 +5,7 @@
 //! the events table to control "idle age", and drives [`WorktreeCleanup::run_once`]
 //! directly so we don't sleep on the hour-long real-world cycle.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,7 +21,25 @@ use crate::engine::git_ops::{git_cmd, worktrees_dir};
 use crate::engine::thread_events::ThreadEvent;
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-use super::WorktreeCleanup;
+use super::{ActiveThreads, WorktreeCleanup};
+
+/// Captured at construction — matches what production sees in one pass.
+struct StaticActiveThreads(HashSet<Uuid>);
+
+#[async_trait::async_trait]
+impl ActiveThreads for StaticActiveThreads {
+    async fn is_active(&self, thread_id: Uuid) -> bool {
+        self.0.contains(&thread_id)
+    }
+}
+
+fn no_active_threads() -> Arc<dyn ActiveThreads> {
+    Arc::new(StaticActiveThreads(HashSet::new()))
+}
+
+fn active_threads(ids: &[Uuid]) -> Arc<dyn ActiveThreads> {
+    Arc::new(StaticActiveThreads(ids.iter().copied().collect()))
+}
 
 /// Build a minimal workspace + repo on disk: a tempdir, an initialized git
 /// repo at its root with one commit on `main`, and `.lucidos/worktrees/`
@@ -162,6 +181,15 @@ async fn insert_old_event(pool: &PgPool, thread_id: Uuid, age_secs: i64) {
 /// thresholds so the alert never fires by accident. Tests that need a trigger
 /// override these fields directly.
 fn make_worker(pool: PgPool, bus: Arc<EventBus>, workspace: PathBuf) -> WorktreeCleanup {
+    make_worker_with_active(pool, bus, workspace, no_active_threads())
+}
+
+fn make_worker_with_active(
+    pool: PgPool,
+    bus: Arc<EventBus>,
+    workspace: PathBuf,
+    active_threads: Arc<dyn ActiveThreads>,
+) -> WorktreeCleanup {
     let changes = crate::core::changes_projection::ChangesProjection::new(pool.clone());
     WorktreeCleanup {
         pool,
@@ -176,6 +204,7 @@ fn make_worker(pool: PgPool, bus: Arc<EventBus>, workspace: PathBuf) -> Worktree
         large_footprint_bytes: super::LARGE_FOOTPRINT_BYTES,
         alerts: Mutex::new(super::AlertState::default()),
         changes,
+        active_threads,
     }
 }
 
@@ -193,15 +222,18 @@ async fn drain_cleaned_events(
         let Ok(EmittedEvent { typed, .. }) = item else {
             continue;
         };
-        if let BusEvent::Thread { thread_id, event, .. } = typed {
-            if let ThreadEvent::WorktreeCleaned {
-                tier,
-                freed_bytes,
-                branch_deleted,
-            } = event
-            {
-                out.push((thread_id, tier, freed_bytes, branch_deleted));
-            }
+        if let BusEvent::Thread {
+            thread_id,
+            event:
+                ThreadEvent::WorktreeCleaned {
+                    tier,
+                    freed_bytes,
+                    branch_deleted,
+                },
+            ..
+        } = typed
+        {
+            out.push((thread_id, tier, freed_bytes, branch_deleted));
         }
     }
     out
@@ -1192,6 +1224,55 @@ async fn tier_0_skips_thread_with_pending_change() {
         cleaned
     );
     assert!(worktree.exists(), "worktree with pending change must remain");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression: a CC subprocess parked on `AskUserQuestion` keeps the
+/// `agent_sessions` entry but emits no events while the user thinks. If the
+/// wait crosses `TIER_0_GRACE` (1 h), tier 0 sees no pending change, a clean
+/// worktree, and a branch with no commits — and `git branch -D`'s the live
+/// session's branch out from under it. The next `propose_change_at_idle`
+/// then runs `branch_changed_files(repo_root, branch_name)` against the now-
+/// deleted ref, gets back an empty list, and silently skips proposing the
+/// change. No `ChangeProposed` event ever fires; the user sees no Apply
+/// button. Probing `agent_sessions` before any tier action is the fix.
+#[tokio::test]
+async fn tier_0_skips_thread_with_live_agent_session() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    // Same shape as the production trigger: branch at main HEAD, clean
+    // worktree, no pending change. Without the fix, tier 0 would happily
+    // delete the branch.
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_0_AGE_SECS).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker_with_active(
+        pool.clone(),
+        bus.clone(),
+        root.clone(),
+        active_threads(&[thread_id]),
+    );
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    assert!(
+        cleaned.is_empty(),
+        "no cleanup events for a thread with a live agent session, got: {:?}",
+        cleaned
+    );
+    assert!(
+        worktree.exists(),
+        "worktree of an active CC session must remain on disk"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;

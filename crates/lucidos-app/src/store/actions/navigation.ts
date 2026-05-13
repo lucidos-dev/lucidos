@@ -9,6 +9,7 @@ import type { SettingsSubview, InlineForm, PanelOverlay } from '../store';
 import type { MenuItem } from '../types';
 import { MENU_ITEMS } from '../types';
 import { normalizeUrl } from './artifacts';
+import { NAV_KEY } from './entityReferences';
 import { isTauri } from '../../utils/platform';
 
 /** A snapshot of panel navigation state. */
@@ -42,6 +43,13 @@ function inlineFormsEqual(a: InlineForm | null, b: InlineForm | null): boolean {
         ar.to.every((addr, i) => addr === br.to[i])
       );
     }
+    case 'plugin-install':
+      // Two staged installs always have distinct install_ids (UUID per call),
+      // so install_id is the cheapest correct equality.
+      return a.request.install_id === (b as typeof a).request.install_id;
+    case 'plugin-uninstall':
+      // Same as install — fresh UUID per prepare call.
+      return a.request.uninstall_id === (b as typeof a).request.uninstall_id;
   }
 }
 
@@ -154,8 +162,6 @@ function restoreState(entry: NavEntry): void {
   }
 }
 
-const NAV_STORAGE_KEY = 'lucidos-nav-history';
-
 const navStack = signal<NavEntry[]>([]);
 const navCursor = signal(-1);
 let _restoring = false;
@@ -163,7 +169,7 @@ let _initialized = false;
 
 function saveNavState(): void {
   try {
-    localStorage.setItem(NAV_STORAGE_KEY, JSON.stringify({
+    localStorage.setItem(NAV_KEY, JSON.stringify({
       stack: navStack.value,
       cursor: navCursor.value,
     }));
@@ -174,7 +180,7 @@ function ensureInitialized(): void {
   if (_initialized) return;
   _initialized = true;
   try {
-    const saved = localStorage.getItem(NAV_STORAGE_KEY);
+    const saved = localStorage.getItem(NAV_KEY);
     if (saved) {
       const { stack, cursor } = JSON.parse(saved) as { stack: NavEntry[]; cursor: number };
       if (Array.isArray(stack) && stack.length > 0 && cursor >= 0 && cursor < stack.length) {

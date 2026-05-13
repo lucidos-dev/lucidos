@@ -1,7 +1,7 @@
 import type { ComponentChildren } from 'preact';
 import { signal } from '@preact/signals';
 import { useEffect, useState } from 'preact/hooks';
-import { API_BASE } from '../../api/client';
+import { API_BASE, mutatingFetch, throwIfNotOk } from '../../api/client';
 import { showConfirm, showToast } from '../../store/store';
 import { toFailed, type Loadable } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -38,9 +38,7 @@ async function loadSummary(): Promise<void> {
   summary.value = { status: 'loading' };
   try {
     const res = await fetch(`${API_BASE}/api/disk-usage/summary`);
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-    }
+    await throwIfNotOk(res);
     summary.value = { status: 'loaded', data: (await res.json()) as DiskSummary };
   } catch (e) {
     summary.value = toFailed(e);
@@ -51,9 +49,7 @@ async function loadInventory(): Promise<void> {
   inventory.value = { status: 'loading' };
   try {
     const res = await fetch(`${API_BASE}/api/disk-usage/worktrees`);
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-    }
+    await throwIfNotOk(res);
     const body = (await res.json()) as InventoryResponse;
     inventory.value = { status: 'loaded', data: body.worktrees };
   } catch (e) {
@@ -64,7 +60,7 @@ async function loadInventory(): Promise<void> {
 }
 
 async function runCleanup(threadId: string, tier: 1 | 2 | 3): Promise<{ tier: number; freed_bytes: number; branch_deleted: boolean } | null> {
-  const res = await fetch(
+  const res = await mutatingFetch(
     `${API_BASE}/api/disk-usage/worktrees/${threadId}/cleanup`,
     {
       method: 'POST',
@@ -75,9 +71,7 @@ async function runCleanup(threadId: string, tier: 1 | 2 | 3): Promise<{ tier: nu
   if (res.status === 409) {
     return null; // dirty — caller decides whether to retry as Tier 3
   }
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-  }
+  await throwIfNotOk(res);
   return res.json();
 }
 

@@ -29,7 +29,7 @@ const VALID_CHANNELS: ReadonlySet<string> = new Set<string>(ALL_CHANNELS);
 const highlightedThreadId = signal<string | null>(null);
 
 /** Ordered list of navigable thread IDs, set by ThreadList or SearchResults. */
-export const navigableIds = signal<string[]>([]);
+const navigableIds = signal<string[]>([]);
 
 export function selectHighlighted() {
     const id = highlightedThreadId.value;
@@ -280,7 +280,7 @@ function ThreadList() {
 
         const observer = new IntersectionObserver(
             (entries) => {
-                if (entries[0]?.isIntersecting) {
+                if (entries[0]?.isIntersecting && shouldLoadOlderOnIntersection(collapsedSections.value)) {
                     loadOlderThreads();
                 }
             },
@@ -346,6 +346,13 @@ function saveCollapsed(set: Set<string>) {
 
 /** Shared collapsed state so ThreadList can read it for navigableIds. */
 const collapsedSections = signal(loadCollapsed());
+
+// Skip pagination when Archive is collapsed: collapsing shrinks the list, pops the
+// sentinel into view, and would silently bloat the count badge on every toggle.
+// Archive is the bottom section and the one that absorbs paginated older threads.
+export function shouldLoadOlderOnIntersection(collapsed: ReadonlySet<string>): boolean {
+    return !collapsed.has('archive');
+}
 
 function DrawerSection({ sectionKey, title, children, reviewBadge = 0 }: { sectionKey: string; title: string; children: ComponentChildren; reviewBadge?: number }) {
     const collapsed = collapsedSections.value.has(sectionKey);

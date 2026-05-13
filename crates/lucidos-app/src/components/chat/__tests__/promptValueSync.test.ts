@@ -96,7 +96,7 @@ describe('shouldSkipSyncWhileEditing', () => {
     return { value } as HTMLTextAreaElement;
   }
 
-  it('skips sync when the user is focused here on the same thread with local content', () => {
+  it('skips sync when this element is the active one on the same thread with local content', () => {
     expect(shouldSkipSyncWhileEditing(makeEl('hello'), true, true)).toBe(true);
   });
 
@@ -108,7 +108,25 @@ describe('shouldSkipSyncWhileEditing', () => {
     expect(shouldSkipSyncWhileEditing(makeEl('stale-from-prev-thread'), false, true)).toBe(false);
   });
 
-  it('does NOT skip when focus is elsewhere — no in-flight keystroke to protect', () => {
+  it('does NOT skip when this element is not the active one — no in-flight keystroke to protect', () => {
     expect(shouldSkipSyncWhileEditing(makeEl('hello'), true, false)).toBe(false);
+  });
+
+  // Regression: the parameter used to be a broader "any prompt-input with this
+  // thread id is focused" boolean, computed via isComposeFocusedHere. In the
+  // dual-rendered SplitLayout + MobileSwipeContainer setup, both PromptInput
+  // copies share data-thread-id, so the broader check returned true for the
+  // hidden copy even though its textarea wasn't actually the active element.
+  // The hidden copy then refused to clear its stale text after a Send on the
+  // focused copy. A subsequent layout flip (window resize across the 768px
+  // breakpoint) would surface that stale text — text the user thought they'd
+  // already sent. Element-identity is the contract: each PromptInput's effect
+  // passes `document.activeElement === el`, so only the actually-focused copy
+  // protects its in-flight keystrokes; the unfocused copy always re-syncs.
+  it('REGRESSION: dual-render unfocused copy re-syncs even while sibling with same thread id is focused', () => {
+    const focusedEl = makeEl('user-typed-here');
+    const unfocusedEl = makeEl('stale-from-prior-sync');
+    expect(shouldSkipSyncWhileEditing(focusedEl, true, true)).toBe(true);
+    expect(shouldSkipSyncWhileEditing(unfocusedEl, true, false)).toBe(false);
   });
 });

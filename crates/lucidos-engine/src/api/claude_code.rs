@@ -1,23 +1,48 @@
 use super::*;
 
 #[derive(Deserialize)]
-pub(super) struct CancelQuery {
+pub(super) struct StopQuery {
+    /// `apply=true` — user clicked Apply Now. The resulting change auto-applies
+    /// after CC terminates; no `ResponseCanceled` (ChangeApplied is the terminator).
     #[serde(default)]
     apply: bool,
+    /// `discard=true` — user clicked Discard. Change is dropped; no
+    /// `ResponseCanceled` (ChangeDiscarded is the terminator).
     #[serde(default)]
     discard: bool,
     thread_id: Option<String>,
 }
 
-pub(super) async fn claude_code_cancel(
+impl StopQuery {
+    fn reason(&self) -> crate::engine::claude_code::StopReason {
+        use crate::engine::claude_code::StopReason;
+        match (self.apply, self.discard) {
+            (true, _) => StopReason::Apply,
+            (_, true) => StopReason::Discard,
+            _ => StopReason::UserStop,
+        }
+    }
+}
+
+/// `POST /api/claude-code/stop` — stop a running CC session.
+///
+/// Three modes via query params:
+///   - default: real Cancel/Stop click — emits `ResponseCanceled(UserStop)` if
+///     CC was actively working, nothing if CC was already idle.
+///   - `apply=true`: Apply Now — change auto-applies after CC terminates.
+///   - `discard=true`: Discard — change is dropped.
+///
+/// Archiving uses a different code path (`POST /api/threads/archive` →
+/// `stop_agent(StopReason::Archive, ...)`) because it also emits `ThreadArchived`.
+pub(super) async fn claude_code_stop(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<CancelQuery>,
+    Query(query): Query<StopQuery>,
 ) -> Result<StatusCode, StatusCode> {
     let thread_id = super::parse_optional_uuid(query.thread_id.as_deref())?;
     // Stamp the user actor so any ChangeApplied / ChangeApplyFailed emitted by
-    // the stale-session fallback (cancel?apply=true on a thread whose CC
-    // already exited) carries the device that clicked Stop instead of
+    // the stale-session fallback (stop?apply=true on a thread whose CC
+    // already exited) carries the device that clicked the button instead of
     // collapsing to "Lucidos Engine" via the actor-missing fallback.
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
@@ -34,12 +59,12 @@ pub(super) async fn claude_code_cancel(
 
     match state
         .engine
-        .cancel_agent(query.apply, query.discard, thread_id, actor)
+        .stop_agent(query.reason(), thread_id, actor)
         .await
     {
         Ok(_) => Ok(StatusCode::OK),
         Err(e) => {
-            crate::log!("[API] cancel_agent failed: {}", e);
+            crate::log!("[API] stop_agent failed: {}", e);
             Err(StatusCode::NOT_FOUND)
         }
     }
@@ -123,29 +148,25 @@ pub(super) async fn claude_code_commands(
     let res = if let Some(tid) = tid {
         state.engine.cc_categorized_commands(tid).await
     } else {
-        // Compose-view: resolve repo_id (possibly empty/missing) to a repo
+        // Compose-view: resolve repo_id (possibly empty/missing) to a path
         // and look up just that repo's cache. Never fall back to "first
         // cache entry" — that leaks skills from other repos into the menu.
-        let repo = match query.repo_id.as_deref() {
+        // For the default (no `repo_id`), use the engine's own repo_root —
+        // the cache key is path-based, the engine registered itself with
+        // exactly this path at startup, and bypassing the DB also covers
+        // the recoverable case where the `repositories` row was truncated.
+        let repo_path: std::path::PathBuf = match query.repo_id.as_deref() {
             Some(rid) if !rid.is_empty() => {
                 let uuid = uuid::Uuid::parse_str(rid).map_err(|_| StatusCode::BAD_REQUEST)?;
-                crate::core::repositories::RepositoryStore::get(&state.pool, uuid)
+                let repo = crate::core::repositories::RepositoryStore::get(&state.pool, uuid)
                     .await
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                    .ok_or(StatusCode::NOT_FOUND)?
+                    .ok_or(StatusCode::NOT_FOUND)?;
+                repo.path.into()
             }
-            _ => crate::core::repositories::RepositoryStore::get_by_name(
-                &state.pool,
-                crate::engine::LucidosEngine::DEFAULT_REPO_NAME,
-            )
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND)?,
+            _ => state.engine.repo_root().to_path_buf(),
         };
-        state
-            .engine
-            .cc_commands_for_repo(std::path::Path::new(&repo.path))
-            .await
+        state.engine.cc_commands_for_repo(&repo_path).await
     };
     Ok(Json(serde_json::json!({
         "control_commands": crate::runtime::claude_code::cc_command_definitions(),

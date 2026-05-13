@@ -1,45 +1,7 @@
-use super::lifecycle::{cancel_terminal_kind, TerminalKind};
-use crate::engine::git_ops::has_branch_commits;
+use super::lifecycle::{stop_terminal_kind, TerminalKind};
 use crate::engine::thread_events::{EventChannel, MessageOrigin, SessionEndReason};
-use crate::engine::worktree_cleanup::is_worktree_dirty;
 use crate::engine::LucidosEngine;
-use std::path::Path;
 use uuid::Uuid;
-
-/// Decision for the run_session safety net when CC's event loop ends without
-/// emitting a `Result` event (process exit, stream EOF, parser glitch).
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum SafetyNetOutcome {
-    /// Treat as a successful turn: commits exist on the branch and the cleanup
-    /// path will propose them as a reviewable change.
-    Completed,
-    /// Treat as aborted: no worktree, or no commits to surface.
-    Aborted,
-}
-
-/// Decide which terminal event the safety net should emit when CC's event
-/// loop ended without a `Result`. The cleanup path (run_session.rs) will
-/// auto-commit any dirty files in the worktree *after* this runs, so the
-/// signal must agree with the eventual outcome — anything that will become
-/// a `ChangeProposed` must be Completed, or the user sees a misleading
-/// "Response interrupted" toast for work that was actually preserved.
-///
-/// Completed when the worktree exists AND either has commits ahead of main
-/// OR has dirty/untracked files the cleanup path is about to commit.
-pub(crate) async fn safety_net_outcome(
-    worktree_path: Option<&Path>,
-    repo_root: &Path,
-    branch_name: &str,
-) -> SafetyNetOutcome {
-    let Some(wt) = worktree_path else {
-        return SafetyNetOutcome::Aborted;
-    };
-    if has_branch_commits(repo_root, branch_name).await || is_worktree_dirty(wt).await {
-        SafetyNetOutcome::Completed
-    } else {
-        SafetyNetOutcome::Aborted
-    }
-}
 
 impl LucidosEngine {
     pub(crate) fn clear_cc_debounce(&self, thread_id: Uuid) {
@@ -133,20 +95,24 @@ impl LucidosEngine {
                     reasoning_effort,
                 }
             }
-            TerminalKind::Canceled => {
+            TerminalKind::Canceled(cause) => {
                 crate::engine::thread_events::ThreadEvent::ResponseCanceled {
                     text,
                     images: vec![],
                     model,
                     reasoning_effort,
+                    cause,
                 }
             }
-            TerminalKind::Aborted => crate::engine::thread_events::ThreadEvent::ResponseAborted {
-                text,
-                images: vec![],
-                model,
-                reasoning_effort,
-            },
+            TerminalKind::Aborted(cause) => {
+                crate::engine::thread_events::ThreadEvent::ResponseAborted {
+                    text,
+                    images: vec![],
+                    model,
+                    reasoning_effort,
+                    cause,
+                }
+            }
             // ResponseFailed has no text/model fields — the partial response is
             // already in the timeline as CodingAgentTextStreamed events. The
             // error string is what the frontend renders next to the red dot.
@@ -156,20 +122,26 @@ impl LucidosEngine {
         }
     }
 
-    /// Run the cancel-arm body shared by both `cancel.notified()` and
+    /// Run the stop-arm body shared by both `stop.notified()` and
     /// `chat_cancel.cancelled()` in `run_session`. Kills the CC subprocess,
     /// flushes any unpersisted text, then emits the terminal event chosen by
-    /// `cancel_terminal_kind` (deduping against the restart pre-emit when
+    /// `stop_terminal_kind` (deduping against the restart pre-emit when
     /// emitting Aborted, stamping `actor: System` when appropriate). `arm`
-    /// is a stable label ("cancel" / "chat_cancel") used in log lines and the
+    /// is a stable label ("stop" / "chat_cancel") used in log lines and the
     /// dedup site so traces stay distinguishable across the two select arms.
+    ///
+    /// `suppress_user_terminal` is set by the caller when the stop signal
+    /// originated from Apply / Discard / Archive — those paths emit their
+    /// own lifecycle event (`ChangeApplied` / `ChangeDiscarded` /
+    /// `ThreadArchived`) and must NOT also emit `ResponseCanceled`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn emit_cancel_terminal(
+    pub(crate) async fn emit_stop_terminal(
         &self,
         arm: &'static str,
         thread_id: Uuid,
         is_waiting: bool,
         is_shutdown: bool,
+        suppress_user_terminal: bool,
         agent_cancel: &tokio_util::sync::CancellationToken,
         claude_text_buf: &str,
         last_text_persisted_len: usize,
@@ -187,15 +159,17 @@ impl LucidosEngine {
             meta,
         )
         .await;
-        let Some(kind) = cancel_terminal_kind(is_shutdown, is_waiting) else {
+        let Some(kind) = stop_terminal_kind(is_shutdown, is_waiting, suppress_user_terminal)
+        else {
             crate::log!(
-                "[ClaudeCode] {} arm: session {} was idle, skipping terminal event",
+                "[ClaudeCode] {} arm: session {} stopped without a terminal event \
+                 (idle, user-action, or idle shutdown)",
                 arm,
                 thread_id
             );
             return;
         };
-        let is_aborted = kind == TerminalKind::Aborted;
+        let is_aborted = matches!(kind, TerminalKind::Aborted(_));
         // Dedup BOTH Aborted and Canceled — eviction-path pre-emits set the
         // flag with actor=System, so a follow-up Canceled here would mask the
         // engine-initiated abort as a user cancel.
@@ -375,8 +349,9 @@ mod tests {
 
     #[test]
     fn terminal_event_matches_kind() {
+        use crate::engine::thread_events::{AbortCause, CancelCause};
         let aborted = LucidosEngine::make_terminal_event(
-            TerminalKind::Aborted,
+            TerminalKind::Aborted(AbortCause::EngineShutdown),
             "partial output".into(),
             Some("claude-opus-4-6".into()),
             Some("high".into()),
@@ -385,131 +360,28 @@ mod tests {
             crate::engine::thread_events::ThreadEvent::ResponseAborted {
                 model,
                 reasoning_effort,
+                cause,
                 ..
             } => {
                 assert_eq!(model.as_deref(), Some("claude-opus-4-6"));
                 assert_eq!(reasoning_effort.as_deref(), Some("high"));
+                assert_eq!(*cause, AbortCause::EngineShutdown);
             }
             _ => panic!("Expected ResponseAborted"),
         }
         assert!(matches!(
-            LucidosEngine::make_terminal_event(TerminalKind::Canceled, "x".into(), None, None),
+            LucidosEngine::make_terminal_event(
+                TerminalKind::Canceled(CancelCause::UserStop),
+                "x".into(),
+                None,
+                None
+            ),
             crate::engine::thread_events::ThreadEvent::ResponseCanceled { .. }
         ));
         assert!(matches!(
             LucidosEngine::make_terminal_event(TerminalKind::Generated, "x".into(), None, None),
             crate::engine::thread_events::ThreadEvent::ResponseGenerated { .. }
         ));
-    }
-
-    /// Helper: temp git repo with an initial commit on `main`.
-    async fn make_test_repo() -> (tempfile::TempDir, std::path::PathBuf) {
-        use crate::engine::git_ops::git_cmd;
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().to_path_buf();
-        let _ = git_cmd(&["init"], &repo).await;
-        let _ = git_cmd(&["checkout", "-b", "main"], &repo).await;
-        tokio::fs::write(repo.join("init.txt"), "initial")
-            .await
-            .unwrap();
-        let _ = git_cmd(&["add", "."], &repo).await;
-        let _ = git_cmd(&["commit", "-m", "initial"], &repo).await;
-        (tmp, repo)
-    }
-
-    /// Regression: CC committed work but the engine never saw a `Result`
-    /// event AND `/harden` had not run yet. Old heuristic required the
-    /// harden marker too, so it returned Aborted and the UI showed
-    /// "Response interrupted" even though the change was about to be
-    /// proposed by the cleanup path.
-    #[tokio::test]
-    async fn safety_net_completed_when_commits_exist_without_harden_marker() {
-        use crate::engine::git_ops::git_cmd;
-        let (_tmp, repo) = make_test_repo().await;
-        let branch = "claude-code/test-completed";
-        let _ = git_cmd(&["checkout", "-b", branch], &repo).await;
-        tokio::fs::write(repo.join("work.txt"), "some work")
-            .await
-            .unwrap();
-        let _ = git_cmd(&["add", "."], &repo).await;
-        let _ = git_cmd(&["commit", "-m", "CC work"], &repo).await;
-
-        // No record_hardened call — marker is absent.
-        let outcome = safety_net_outcome(Some(&repo), &repo, branch).await;
-        assert_eq!(
-            outcome,
-            SafetyNetOutcome::Completed,
-            "commits without harden marker should still be treated as completed"
-        );
-    }
-
-    #[tokio::test]
-    async fn safety_net_aborted_when_no_worktree() {
-        let (_tmp, repo) = make_test_repo().await;
-        let outcome = safety_net_outcome(None, &repo, "claude-code/anything").await;
-        assert_eq!(outcome, SafetyNetOutcome::Aborted);
-    }
-
-    #[tokio::test]
-    async fn safety_net_aborted_when_branch_has_no_commits_and_worktree_clean() {
-        use crate::engine::git_ops::git_cmd;
-        let (_tmp, repo) = make_test_repo().await;
-        let branch = "claude-code/test-empty";
-        let _ = git_cmd(&["checkout", "-b", branch], &repo).await;
-        // Branch exists but has the same HEAD as main AND no dirty files —
-        // genuine no-op session.
-        let outcome = safety_net_outcome(Some(&repo), &repo, branch).await;
-        assert_eq!(outcome, SafetyNetOutcome::Aborted);
-    }
-
-    /// Regression for the "Adding GPT-5.5 Support to Lucidos" incident
-    /// (2026-04-25): CC's stream ended without a `Result` event but it had
-    /// modified files in the worktree without committing. The cleanup path
-    /// auto-commits dirty work *after* the safety net runs, so the old
-    /// "commits exist?" check fired before any commit existed and emitted
-    /// `ResponseAborted` ("Response interrupted") even though a Change was
-    /// about to be proposed. Treat dirty worktree as Completed so the
-    /// terminal event matches the cleanup outcome.
-    #[tokio::test]
-    async fn safety_net_completed_when_worktree_dirty_without_commits() {
-        use crate::engine::git_ops::git_cmd;
-        let (_tmp, repo) = make_test_repo().await;
-        let branch = "claude-code/test-dirty";
-        let _ = git_cmd(&["checkout", "-b", branch], &repo).await;
-        // Modify a tracked file but do NOT commit. CC left work uncommitted;
-        // the cleanup path is about to auto-commit it.
-        tokio::fs::write(repo.join("init.txt"), "modified by cc")
-            .await
-            .unwrap();
-
-        let outcome = safety_net_outcome(Some(&repo), &repo, branch).await;
-        assert_eq!(
-            outcome,
-            SafetyNetOutcome::Completed,
-            "dirty worktree without commits should be Completed — cleanup will rescue the work"
-        );
-    }
-
-    /// Untracked-only counterpart: CC created a brand-new file (e.g. wrote a
-    /// fresh module via Bash heredoc) but didn't add or commit it. Cleanup
-    /// path's `git add -A` + `git commit` rescues it, so the safety net
-    /// should agree the turn was Completed.
-    #[tokio::test]
-    async fn safety_net_completed_when_worktree_has_untracked_files() {
-        use crate::engine::git_ops::git_cmd;
-        let (_tmp, repo) = make_test_repo().await;
-        let branch = "claude-code/test-untracked";
-        let _ = git_cmd(&["checkout", "-b", branch], &repo).await;
-        tokio::fs::write(repo.join("new_file.txt"), "fresh from cc")
-            .await
-            .unwrap();
-
-        let outcome = safety_net_outcome(Some(&repo), &repo, branch).await;
-        assert_eq!(
-            outcome,
-            SafetyNetOutcome::Completed,
-            "untracked files in worktree should be Completed — cleanup will commit them"
-        );
     }
 
     #[tokio::test]

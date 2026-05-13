@@ -435,7 +435,7 @@ export function CCControlMenu({ threadId }: Props) {
   }
 
   return (
-    <div class="cc-control-menu" ref={menuRef}>
+    <div class="cc-control-menu" data-row-item ref={menuRef}>
       {/* Never disabled — openMenu() guards against empty commands instead.
           disabled={...} caused intermittent UX issues during CC session startup races. */}
       <button

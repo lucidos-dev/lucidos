@@ -1,6 +1,9 @@
 import { test, expect } from '@playwright/test';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, ensureOnThreadPane, waitForVisibleInput } from './helpers';
 
+const SAVE_BTN = 'button[aria-label="Save thread"]:visible';
+const UNSAVE_BTN = 'button[aria-label="Remove thread from Saved section"]:visible';
+
 test.describe('Thread save (formerly pin)', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
@@ -13,11 +16,11 @@ test.describe('Thread save (formerly pin)', () => {
     await sendMessage(page, `Say exactly: "saved ${msg}"`);
     await waitForResponse(page);
 
-    const saveBtn = page.locator('button[aria-label="Save thread"]:visible').first();
+    const saveBtn = page.locator(SAVE_BTN).first();
     await expect(saveBtn).toBeVisible({ timeout: 10_000 });
     await saveBtn.click();
 
-    const savedBtn = page.locator('button[aria-label="Unsave thread"]:visible').first();
+    const savedBtn = page.locator(UNSAVE_BTN).first();
     await expect(savedBtn).toBeVisible({ timeout: 5_000 });
   });
 
@@ -28,14 +31,14 @@ test.describe('Thread save (formerly pin)', () => {
     await sendMessage(page, `Say exactly: "persist-save ${msg}"`);
     await waitForResponse(page);
 
-    await page.locator('button[aria-label="Save thread"]:visible').first().click();
-    await expect(page.locator('button[aria-label="Unsave thread"]:visible').first()).toBeVisible({ timeout: 5_000 });
+    await page.locator(SAVE_BTN).first().click();
+    await expect(page.locator(UNSAVE_BTN).first()).toBeVisible({ timeout: 5_000 });
 
     await page.reload();
     await ensureOnThreadPane(page);
     await waitForVisibleInput(page);
 
-    await expect(page.locator('button[aria-label="Unsave thread"]:visible').first()).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator(UNSAVE_BTN).first()).toBeVisible({ timeout: 10_000 });
   });
 
   test('unsave a thread (with confirm)', async ({ page }) => {
@@ -45,14 +48,14 @@ test.describe('Thread save (formerly pin)', () => {
     await sendMessage(page, `Say exactly: "unsave ${msg}"`);
     await waitForResponse(page);
 
-    await page.locator('button[aria-label="Save thread"]:visible').first().click();
-    const unsaveBtn = page.locator('button[aria-label="Unsave thread"]:visible').first();
+    await page.locator(SAVE_BTN).first().click();
+    const unsaveBtn = page.locator(UNSAVE_BTN).first();
     await expect(unsaveBtn).toBeVisible({ timeout: 5_000 });
 
     await unsaveBtn.click();
     await expect(page.locator('.confirm-dialog')).toBeVisible({ timeout: 5_000 });
     await page.locator('.confirm-btn-ok').click();
 
-    await expect(page.locator('button[aria-label="Save thread"]:visible').first()).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator(SAVE_BTN).first()).toBeVisible({ timeout: 5_000 });
   });
 });

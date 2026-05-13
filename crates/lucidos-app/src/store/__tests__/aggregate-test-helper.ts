@@ -153,9 +153,4 @@ export function handleEventWithAgg(
   return handleEvent(threadMap, threadId, seq, event, created, eventId, agg);
 }
 
-/** Build a ThreadAggregate from a thread's current meta + overrides. */
-export function aggFor(thread: ThreadState, overrides: Partial<ThreadAggregate> = {}): ThreadAggregate {
-  return { ...aggregateFromMeta(thread.meta), ...overrides };
-}
-
 export { applyAggregateToMeta };

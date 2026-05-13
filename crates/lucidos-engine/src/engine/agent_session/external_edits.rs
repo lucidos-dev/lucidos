@@ -28,6 +28,10 @@ use crate::engine::git_ops::{git_cmd, worktree_current_branch};
 
 /// Result of [`verify_branch`] when the worktree's checked-out branch
 /// doesn't match the engine's expected branch.
+///
+/// Custom error type (exception to the `Box<dyn Error>` convention in
+/// CLAUDE.md) because the spawn dispatcher needs the structured fields
+/// (`expected`, `found`) to surface a precise mismatch to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchMismatch {
     pub expected: String,

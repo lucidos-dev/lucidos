@@ -1,6 +1,13 @@
 use std::path::{Path, PathBuf};
 
-pub(crate) const CONTENT_DIRS: [&str; 4] = ["apps", "knowhow", "triggers", "scripts"];
+/// Plugin top-level directory (and `data/` subdirectory) that holds compiled
+/// WASM auth signers — `<name>.wasm` plus optional `<name>.manifest.json`
+/// sidecar. Naming a single source for the literal so a typo in one place
+/// (e.g. the post-install reload trigger) cannot silently break the auto-reload.
+pub const AUTH_MODULES_DIR: &str = "auth-modules";
+
+pub(crate) const CONTENT_DIRS: [&str; 5] =
+    ["apps", "knowhow", "triggers", "scripts", AUTH_MODULES_DIR];
 
 /// File extension marking a plugin archive (renamed zip). Lowercase — callers
 /// that match on filenames should compare against `to_ascii_lowercase()`.
@@ -59,11 +66,11 @@ impl std::fmt::Display for ValidationError {
             Self::InvalidSource(s) => write!(f, "invalid source URL: {}", s),
             Self::EmptyTree => write!(
                 f,
-                "plugin has no content (none of apps/, knowhow/, triggers/, scripts/ exist)"
+                "plugin has no content (none of apps/, knowhow/, triggers/, scripts/, auth-modules/ exist)"
             ),
             Self::UnexpectedTopLevelEntry(e) => write!(
                 f,
-                "unexpected top-level entry '{}' (only manifest.toml + apps/knowhow/triggers/scripts allowed)",
+                "unexpected top-level entry '{}' (only manifest.toml + apps/knowhow/triggers/scripts/auth-modules allowed)",
                 e
             ),
             Self::UnsafePath(p) => write!(f, "unsafe path in archive: {}", p),
@@ -196,11 +203,12 @@ pub fn validate_tree(root: &Path) -> Result<(PluginManifest, Vec<PlannedFile>), 
     Ok((manifest, planned))
 }
 
-/// Verify that no archive entry path uses `..` or absolute paths (zip-slip).
-/// Used during zip extraction. Pass each entry name in turn before extracting.
+/// Verify that no archive entry path uses `..` or absolute paths (zip-slip), and
+/// reject the empty string outright — empty inner names produce an opaque
+/// "not found" downstream and are never a real entry name.
 pub fn validate_archive_entry_path(path: &str) -> Result<(), ValidationError> {
     if path.is_empty() {
-        return Ok(());
+        return Err(ValidationError::UnsafePath(path.into()));
     }
     if path.starts_with('/') || path.starts_with('\\') {
         return Err(ValidationError::UnsafePath(path.into()));

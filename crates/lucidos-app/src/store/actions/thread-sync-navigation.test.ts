@@ -31,6 +31,16 @@ vi.mock('./triggers', () => ({ navigateToTrigger, loadTriggers: vi.fn() }));
 const pushNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState }));
 
+const unfocusThread = vi.fn();
+vi.mock('./threads', () => ({ focusThread: vi.fn(), unfocusThread }));
+
+const ensureFocusedComposeThread = vi.fn(() => 'new-thread-id');
+const updateCompose = vi.fn();
+vi.mock('./compose', () => ({ ensureFocusedComposeThread, updateCompose }));
+
+const focusPromptNow = vi.fn();
+vi.mock('../../components/chat/promptFocus', () => ({ focusPromptNow }));
+
 // Minimal mocks for other imports that thread-sync.ts pulls in
 vi.mock('../../api/client', () => ({
   API_BASE: '',
@@ -42,7 +52,6 @@ vi.mock('./preferences', () => ({ loadPreferences: vi.fn() }));
 vi.mock('./push', () => ({ initPushSubscription: vi.fn() }));
 vi.mock('./devices', () => ({ getDeviceId: vi.fn(), toggleDevicePush: vi.fn() }));
 vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom: vi.fn() }));
-vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./repositories', () => ({ refreshRepoView: vi.fn() }));
 vi.mock('./entityReferences', () => ({ processSSEForReferences: vi.fn() }));
 
@@ -110,5 +119,39 @@ describe('handleNavigationRequest', () => {
     );
     expect(switchMenuItem).not.toHaveBeenCalled();
     expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens fresh compose for new-chat target (no prefill)', async () => {
+    panelOverlay.value = { type: 'file-preview', path: 'notes.md' };
+    handleNavigationRequest({ target: 'new-chat' });
+    // Closes any open overlay so the chat panel is visible.
+    expect(panelOverlay.value).toBeNull();
+    // Drops focus first so ensureFocusedComposeThread allocates a fresh id
+    // (it returns the existing id otherwise).
+    expect(unfocusThread).toHaveBeenCalledTimes(1);
+    expect(ensureFocusedComposeThread).toHaveBeenCalledTimes(1);
+    // No prompt → no draft prefill, just a blank compose.
+    expect(updateCompose).not.toHaveBeenCalled();
+    // Focus runs in rAF so the chat panel can mount before we query its DOM.
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    expect(focusPromptNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('prefills compose draft with prompt for new-chat target', async () => {
+    handleNavigationRequest({ target: 'new-chat', prompt: 'Set up a daily standup trigger' });
+    expect(unfocusThread).toHaveBeenCalledTimes(1);
+    expect(ensureFocusedComposeThread).toHaveBeenCalledTimes(1);
+    expect(updateCompose).toHaveBeenCalledWith('new-thread-id', {
+      text: 'Set up a daily standup trigger',
+    });
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    expect(focusPromptNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips prefill for new-chat when prompt is empty string', () => {
+    handleNavigationRequest({ target: 'new-chat', prompt: '' });
+    expect(ensureFocusedComposeThread).toHaveBeenCalledTimes(1);
+    // Empty string is treated as "no prefill" — equivalent to omitting prompt.
+    expect(updateCompose).not.toHaveBeenCalled();
   });
 });

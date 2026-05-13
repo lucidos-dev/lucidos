@@ -4,6 +4,7 @@ import {
   sendMessage, waitForCCToStart, waitForActionPanel, dismissCCSession,
   waitForActiveSession, waitAndClick, waitForVisibleElement,
 } from './helpers';
+import { clearAllThreads } from './db-helpers';
 
 /**
  * Bug: when a user selects a model before starting a CC session, the backend's
@@ -16,6 +17,7 @@ import {
 
 test.describe('CC model pre-session selection', () => {
   test.beforeEach(async ({ page }) => {
+    clearAllThreads();
     await assertHealthy(page);
   });
 

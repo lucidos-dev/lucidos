@@ -172,3 +172,100 @@ fn consecutive_orphaned_assistants_all_get_stubs() {
     assert_eq!(messages[3].role, "assistant");
     assert_eq!(messages[4].role, "user");
 }
+
+/// The Anthropic 400 reproduced in thread b101c3d7: an assistant `tool_use`
+/// is followed by a user message whose content is `MessageContent::Text`
+/// (e.g. the user's prompt after a trim that removed the matching
+/// `tool_result`). The validator must inject the missing `tool_result` block
+/// even when the next user message has plain `Text` content — converting it
+/// to `Blocks([stubs..., Text])` so the original prompt is preserved.
+#[test]
+fn missing_tool_result_when_next_user_is_text_gets_stub() {
+    let mut messages = vec![
+        user_text("hello"),
+        assistant_with_tool_uses(&["evt-090b688bf0dd4fed90470ad54d76b2a4"]),
+        user_text("the next user prompt"),
+    ];
+    let stubs = validate_tool_use_pairing(&mut messages);
+    assert_eq!(
+        stubs, 1,
+        "must inject 1 stub even when next user message is Text"
+    );
+
+    let blocks = match &messages[2].content {
+        MessageContent::Blocks(b) => b,
+        _ => panic!(
+            "validator must promote Text content to Blocks when injecting stubs, got: {:?}",
+            messages[2].content
+        ),
+    };
+
+    let injected_id = blocks.iter().find_map(|b| {
+        if let ContentBlock::ToolResult { tool_use_id, content } = b {
+            assert!(
+                content.contains("orphan") || content.contains("unavailable"),
+                "stub content should mark itself as unavailable: {:?}",
+                content
+            );
+            Some(tool_use_id.clone())
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        injected_id.as_deref(),
+        Some("evt-090b688bf0dd4fed90470ad54d76b2a4"),
+        "stub must use the orphaned tool_use_id"
+    );
+
+    let preserved_text = blocks.iter().find_map(|b| {
+        if let ContentBlock::Text { text } = b {
+            Some(text.as_str())
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        preserved_text,
+        Some("the next user prompt"),
+        "original Text content must survive the conversion"
+    );
+}
+
+/// Mid-flight `WakeFromChild` injection (or any other `MessageContent::Text`
+/// user message) lands AFTER tool_use+tool_result, then on the next loop the
+/// LLM emits a new tool_use whose result the next iteration provides. But if
+/// trim later removes that user(tool_result), the orphan tool_use ends up
+/// followed by the WakeFromChild Text message — exactly the bug shape.
+#[test]
+fn missing_tool_result_when_next_user_text_preserves_other_blocks() {
+    // assistant has TWO tool_use blocks; next user has Text only — both stubs
+    // need to land, plus the original Text must survive.
+    let mut messages = vec![
+        user_text("hello"),
+        assistant_with_tool_uses(&["t1", "t2"]),
+        user_text("[CHILD THREAD COMPLETED] some text"),
+    ];
+    let stubs = validate_tool_use_pairing(&mut messages);
+    assert_eq!(stubs, 2);
+    let blocks = match &messages[2].content {
+        MessageContent::Blocks(b) => b,
+        _ => panic!("expected Blocks after promotion"),
+    };
+    let result_ids: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(result_ids.contains(&"t1") && result_ids.contains(&"t2"));
+    let texts: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["[CHILD THREAD COMPLETED] some text"]);
+}

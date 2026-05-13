@@ -1,5 +1,10 @@
 use super::*;
 use crate::core::store::types::Step;
+use std::collections::HashSet;
+
+fn no_skip() -> HashSet<String> {
+    HashSet::new()
+}
 
 fn tool_step(name: &str, description: &str, success: bool) -> Step {
     Step {
@@ -9,6 +14,7 @@ fn tool_step(name: &str, description: &str, success: bool) -> Step {
         context_tokens: None,
         context_messages: None,
         trimmed: None,
+        tool_called_event_id: None,
     }
 }
 
@@ -20,12 +26,13 @@ fn synthetic_step(description: &str) -> Step {
         context_tokens: None,
         context_messages: None,
         trimmed: None,
+        tool_called_event_id: None,
     }
 }
 
 #[test]
 fn format_history_steps_empty_returns_none() {
-    assert!(format_history_steps(&[]).is_none());
+    assert!(format_history_steps(&[], &no_skip()).is_none());
 }
 
 #[test]
@@ -35,7 +42,7 @@ fn format_history_steps_skips_thinking_and_memory() {
         synthetic_step("Memory: 3 results"),
     ];
     assert!(
-        format_history_steps(&steps).is_none(),
+        format_history_steps(&steps, &no_skip()).is_none(),
         "synthetic (no tool_name) steps must not appear in history"
     );
 }
@@ -50,7 +57,7 @@ fn format_history_steps_renders_tool_calls() {
         ),
         tool_step("emit_event", "Emitting BuildClean event...", true),
     ];
-    let out = format_history_steps(&steps).unwrap();
+    let out = format_history_steps(&steps, &no_skip()).unwrap();
     assert!(out.starts_with(" [tools: "));
     assert!(out.contains("Loading know-how 'ops/nightly-pipeline'"));
     assert!(out.contains("Emitting BuildClean event"));
@@ -62,7 +69,7 @@ fn format_history_steps_renders_tool_calls() {
 #[test]
 fn format_history_steps_marks_failures() {
     let steps = vec![tool_step("load_knowhow", "Loading know-how 'oops'...", false)];
-    let out = format_history_steps(&steps).unwrap();
+    let out = format_history_steps(&steps, &no_skip()).unwrap();
     assert!(out.contains("[FAIL]"));
     assert!(!out.contains("[ok]"));
 }
@@ -73,7 +80,7 @@ fn format_history_steps_capped_at_2k() {
     let steps: Vec<Step> = (0..50)
         .map(|i| tool_step("read_file", &format!("Reading {}.rs...", "x".repeat(80 + i)), true))
         .collect();
-    let out = format_history_steps(&steps).unwrap();
+    let out = format_history_steps(&steps, &no_skip()).unwrap();
     // Cap is 2KB on the joined inner string + a small prefix; allow some slack.
     assert!(
         out.len() <= 2_200,
@@ -81,6 +88,23 @@ fn format_history_steps_capped_at_2k() {
         out.len()
     );
     assert!(out.contains("chars omitted"), "expected truncation marker");
+}
+
+/// Skipping a tool by event id removes it from the summary entirely. Used by
+/// the resume path to dedupe tools that were already emitted as full
+/// `Message::Blocks(...)` pairs.
+#[test]
+fn format_history_steps_skips_tools_in_skip_set() {
+    let mut load = tool_step("load_knowhow", "Loading 'r'...", true);
+    load.tool_called_event_id = Some("evt-load-id".into());
+    let mut emit = tool_step("emit_event", "Emitting...", true);
+    emit.tool_called_event_id = Some("evt-emit-id".into());
+    let steps = vec![load, emit];
+    let mut skip = HashSet::new();
+    skip.insert("evt-load-id".to_string());
+    let out = format_history_steps(&steps, &skip).unwrap();
+    assert!(!out.contains("Loading"), "skipped tool must not appear: {}", out);
+    assert!(out.contains("Emitting"), "non-skipped tool must remain: {}", out);
 }
 
 #[test]

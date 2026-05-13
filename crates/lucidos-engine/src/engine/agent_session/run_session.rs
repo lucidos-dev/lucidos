@@ -12,7 +12,7 @@ use crate::engine::git_ops::{
     worktree_current_branch,
 };
 use crate::engine::thread_events::{EventChannel, SessionEndReason};
-use crate::engine::{AgentSession, AgentUserInput, LucidosEngine, ProcessResult};
+use crate::engine::{AgentSession, AgentUserInput, LucidosEngine, ProcessResult, StopReason};
 use crate::runtime::{AgentEvent, AgentInput, AgentKind};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,12 +20,11 @@ use uuid::Uuid;
 
 use super::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use super::lifecycle::{
-    change_is_incomplete_from_terminal, classify_result, classify_session_end_action,
-    is_silent_resume, is_stale_resume_signal, reset_per_turn_flags, should_auto_end_on_idle,
-    should_exit_subprocess_on_idle, should_propose_change_at_idle, SessionEndAction, TerminalKind,
+    change_is_incomplete_from_terminal, classify_result, classify_session_end_action, idle_action,
+    is_silent_resume, is_stale_resume_signal, reset_per_turn_flags, should_propose_change_at_idle,
+    IdleAction, SessionEndAction, TerminalKind,
 };
 use super::node_modules_setup::has_install_marker;
-use super::runtime_helpers::{safety_net_outcome, SafetyNetOutcome};
 use super::prompts::{
     conflict_resolution_system_prompt, external_repo_recovery_system_prompt,
     external_repo_system_prompt, recovery_system_prompt, worktree_system_prompt,
@@ -221,7 +220,14 @@ impl LucidosEngine {
         let last_idle_sha =
             super::resume::lookup_latest_worktree_head_sha(self.pool(), thread_id).await;
         let mut adoption_note: Option<String> = None;
-        let (cwd, system_prompt, branch_name, worktree_path) = if let Some((wt_path, branch)) =
+        // `interactive_session`: true for sessions where a user is at the keyboard
+        // (chat, recovery, external-repo, normal). False for unattended sessions
+        // (conflict-resolution). Drives `LUCIDOS_SESSION_KIND` and gates the
+        // cc-stop-reminder AskUserQuestion redirect, which would hang an
+        // unattended session waiting for an answer that's not coming.
+        let (cwd, system_prompt, branch_name, worktree_path, interactive_session) = if let Some(
+            (wt_path, branch),
+        ) =
             recovery_worktree
         {
             // Recovery mode: reuse an orphaned worktree from a previous session
@@ -237,7 +243,7 @@ impl LucidosEngine {
             } else {
                 recovery_system_prompt(&branch, &workspace_name)
             };
-            (wt_path.clone(), system_prompt, branch, Some(wt_path))
+            (wt_path.clone(), system_prompt, branch, Some(wt_path), true)
         } else if let Some(ref change) = conflict_change {
             // Conflict mode: run in the merge worktree where the merge is in progress
             let wt_path_str = change
@@ -250,7 +256,13 @@ impl LucidosEngine {
                 .ok_or("Conflict change has no merge temp branch")?;
             let cwd = PathBuf::from(wt_path_str);
             let system_prompt = conflict_resolution_system_prompt().to_string();
-            (cwd.clone(), system_prompt, temp_branch.clone(), Some(cwd))
+            (
+                cwd.clone(),
+                system_prompt,
+                temp_branch.clone(),
+                Some(cwd),
+                false,
+            )
         } else {
             // Normal mode: create an isolated worktree.
             // If resuming an idle session, reuse the previous branch (preserving its changes)
@@ -614,7 +626,7 @@ impl LucidosEngine {
             } else {
                 worktree_system_prompt(&branch_name, &workspace_name)
             };
-            (cwd, system_prompt, branch_name, Some(wt_path))
+            (cwd, system_prompt, branch_name, Some(wt_path), true)
         };
 
         // Install the per-commit ChangeProposed hook (Phase 4.2) for any path
@@ -724,6 +736,7 @@ impl LucidosEngine {
                 thread_id,
                 spawning_event_id,
                 repo_name: repo_name.as_deref(),
+                interactive: interactive_session,
             },
             agent_cancel.clone(),
         )
@@ -835,7 +848,7 @@ impl LucidosEngine {
 
         // Create channel for user follow-up messages and register the session
         let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<AgentUserInput>();
-        let cancel = Arc::new(tokio::sync::Notify::new());
+        let stop = Arc::new(tokio::sync::Notify::new());
         let interrupt = Arc::new(tokio::sync::Notify::new());
         let idle_notify = Arc::new(tokio::sync::Notify::new());
         let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -854,9 +867,8 @@ impl LucidosEngine {
                 is_waiting: false,
                 has_changes: false,
                 requires_restart: false,
-                auto_apply: false,
-                discard: false,
-                cancel: cancel.clone(),
+                pending_stop: None,
+                stop: stop.clone(),
                 interrupt: interrupt.clone(),
                 idle_notify: idle_notify.clone(),
                 apply_now_in_progress: false,
@@ -948,7 +960,7 @@ impl LucidosEngine {
         // synthesize an idle event before SessionEnded.
         let mut last_emitted_idle = false;
 
-        loop {
+        'event_loop: loop {
             tokio::select! {
                 event_opt = events_rx.recv() => {
                     let Some(ev) = event_opt else {
@@ -1049,7 +1061,13 @@ impl LucidosEngine {
                                     // authoritative over any alias the user selected.
                                     let mut needs_event = false;
                                     if let Some(ref m) = init_model {
-                                        let norm = crate::runtime::claude_code::normalize_cc_model_id(m).to_string();
+                                        // Reconcile against the originally-supplied alias so the
+                                        // [1m] suffix survives — CC strips it when echoing the
+                                        // model id, and context_window_for keys on it for 1M.
+                                        let norm = crate::runtime::claude_code::reconcile_cc_model(
+                                            cc_model.as_deref(),
+                                            m,
+                                        );
                                         let changed = normalized_model.as_deref() != Some(norm.as_str());
                                         s.current_model = Some(norm.clone());
                                         normalized_model = Some(norm);
@@ -1153,6 +1171,15 @@ impl LucidosEngine {
                                 // `UserQuestionAsked`), no kill (CC keeps running), no session removal.
                             } else {
                                 let description = crate::core::describe_cc_tool(&name, &input);
+                                // Safety net: env-side fix (`pg_env_vars` injected
+                                // into the CC subprocess env) keeps the password
+                                // out of `psql` argv in the common case, but a
+                                // hardcoded URI in a Bash command or Python script
+                                // can still slip through. Walk every string in
+                                // `args` and mask `postgres(ql)://user:pass@…`
+                                // before the event reaches the store / SSE stream.
+                                let mut input = input;
+                                crate::core::redact_postgres_secrets_in_json(&mut input);
                                 self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                     thread_id,
                                     event: crate::engine::thread_events::ThreadEvent::CodingAgentToolCalled {
@@ -1178,6 +1205,68 @@ impl LucidosEngine {
                                 },
                                 meta: meta.clone(),
                             }, "[ClaudeCode] CodingAgentToolResult").await;
+                        }
+                        AgentEvent::Usage {
+                            model: cc_msg_model,
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens,
+                            cache_creation_tokens,
+                        } => {
+                            // Sections stay empty — CC doesn't expose its
+                            // system prompt or tool schemas via stream-json.
+                            // CC strips the [1m] suffix on the per-message
+                            // model echo too, so reconcile against
+                            // normalized_model (which the Init handler keeps
+                            // suffix-correct) before measuring the window.
+                            let snapshot_model = cc_msg_model
+                                .as_deref()
+                                .map(|m| crate::runtime::claude_code::reconcile_cc_model(
+                                    normalized_model.as_deref(),
+                                    m,
+                                ))
+                                .or_else(|| normalized_model.clone())
+                                .unwrap_or_default();
+                            let context_window =
+                                crate::engine::context::context_window_for(&snapshot_model);
+                            // Anthropic reports `input_tokens` as the
+                            // uncached portion only. `ApiUsage.input_tokens`
+                            // stores the TOTAL prompt size — same convention
+                            // as `vertex.rs:678` — so the budget bar shows
+                            // real context use and the modal's cache-miss
+                            // formula (`input - read - write`) recovers
+                            // the uncached count. `saturating_add` defends
+                            // against a pathologically large stream.
+                            let total_input = input_tokens
+                                .saturating_add(cache_read_tokens)
+                                .saturating_add(cache_creation_tokens);
+                            let estimated_total_tokens =
+                                (total_input as usize) + (output_tokens as usize);
+                            let usage = crate::engine::ApiUsage {
+                                input_tokens: total_input,
+                                output_tokens,
+                                cache_read_tokens,
+                                cache_creation_tokens,
+                            };
+                            self.event_bus
+                                .emit_or_log(
+                                    crate::engine::event_bus::BusEvent::Thread {
+                                        thread_id,
+                                        event: crate::engine::thread_events::ThreadEvent::ContextCaptured {
+                                            producer: crate::engine::ContextProducer::ClaudeCode,
+                                            model: snapshot_model,
+                                            context_window,
+                                            sections: Vec::new(),
+                                            tools: Vec::new(),
+                                            estimated_total_tokens,
+                                            usage: Some(usage),
+                                            trimmed: false,
+                                        },
+                                        meta: meta.clone(),
+                                    },
+                                    "[ClaudeCode] ContextCaptured",
+                                )
+                                .await;
                         }
                         AgentEvent::Exited => unreachable!("Exited handled above"),
                         AgentEvent::Result { text, error: cc_error, .. } => {
@@ -1222,14 +1311,19 @@ impl LucidosEngine {
                                                 meta: meta.clone(),
                                             }, "[ClaudeCode] CodingAgentTextStreamed (slash command result)").await;
                                         }
+                                        // Both buffers must be checked: the slash-command path emits
+                                        // Result.text without buffering it, so `claude_text_buf` alone
+                                        // would mis-flag /model output as empty.
+                                        let result_text_empty = text.trim().is_empty();
+                                        let buffered_text_empty = claude_text_buf.trim().is_empty();
                                         // Detect stale resume: CC returned empty Result immediately
                                         // after resume. The session was expired and produced no output.
                                         // Abort without emitting ResponseGenerated/CodingAgentIdled so
                                         // the caller can retry with a fresh session.
                                         if is_stale_resume_signal(
                                             resume_session_id.is_some(),
-                                            text.trim().is_empty(),
-                                            claude_text_buf.trim().is_empty(),
+                                            result_text_empty,
+                                            buffered_text_empty,
                                             result_texts.is_empty(),
                                             !user_message.is_empty(),
                                             cc_error.is_some(),
@@ -1276,12 +1370,13 @@ impl LucidosEngine {
                                             user_hit_stop,
                                             is_shutdown,
                                             cc_error,
+                                            buffered_text_empty && result_text_empty,
                                         );
                                         // Captured before the `if let Some(kind)` below moves out.
                                         let from_failure =
                                             change_is_incomplete_from_terminal(&terminal_kind);
                                         if let Some(kind) = terminal_kind {
-                                            if kind == TerminalKind::Aborted {
+                                            if matches!(kind, TerminalKind::Aborted(_)) {
                                                 // Reset on next user follow-up.
                                                 user_hit_stop = false;
                                             }
@@ -1466,48 +1561,29 @@ impl LucidosEngine {
                                             }
                                         }
 
-                                        // Auto-end autonomous sessions that have no user at the keyboard:
-                                        // - Conflict resolution: merge is committed, nothing to review
-                                        // - Orphan recovery: runs autonomously, nobody sends follow-ups
-                                        //   (with or without changes — cleanup proposes changes if any)
-                                        //
-                                        // For these, route through `cancel.notify_one()` → the cancel
-                                        // arm runs the post-loop cleanup (worktree removal, SessionEnded
-                                        // emission) which conflict resolution and orphan recovery rely
-                                        // on. The exit-on-idle path below is only for normal
-                                        // user-driven sessions, where the worktree must persist on disk
-                                        // for the next user follow-up to reuse via `--resume`.
-                                        if should_auto_end_on_idle(conflict_change.is_some()) {
-                                            cancel.notify_one();
-                                        } else if should_exit_subprocess_on_idle(is_shutdown) {
-                                            // Every idle exits the CC subprocess so the next turn
-                                            // arrives via `--resume` against a fresh process. The
-                                            // existing `Exited` arm (above) handles auto-commit,
-                                            // session-map removal, and orphan-injection drain —
-                                            // worktree+branch persist on disk for the resume.
-                                            //
-                                            // Cancelling `agent_cancel` makes the runtime driver
-                                            // kill the child and emit `AgentEvent::Exited`; the
-                                            // event loop reads that on the next iteration and the
-                                            // Exited arm returns the ProcessResult with
-                                            // `proposed_change` correctly tracked above.
-                                            //
-                                            // See `AgentSession.pending_followups`. `swap(0)`
-                                            // resets per-Result (turn boundary); pre-swap > 1
-                                            // means a follow-up was inflight (queued in msg_rx
-                                            // or merged into this Result) — keep CC alive so
-                                            // the queued entry can be consumed without
-                                            // round-tripping through a respawn. AcqRel pairs
-                                            // with the fast-path `fetch_add` in
-                                            // `chat::process` so a racing increment is observed.
-                                            let prev = pending_followups
-                                                .swap(0, std::sync::atomic::Ordering::AcqRel);
-                                            if prev > 1 {
-                                                log!("[ClaudeCode] Skipping subprocess termination for thread {} — {} follow-up(s) inflight (queued or merged)", thread_id, prev - 1);
-                                            } else {
-                                                log!("[ClaudeCode] Idle reached — terminating CC subprocess for thread {} so next turn resumes via --resume", thread_id);
-                                                agent_cancel.cancel();
+                                        match idle_action(conflict_change.is_some(), is_shutdown) {
+                                            IdleAction::EndSession => {
+                                                log!("[ClaudeCode] Conflict-resolution session idle for thread {} — ending loop", thread_id);
+                                                break 'event_loop;
                                             }
+                                            IdleAction::ExitSubprocess => {
+                                                // `swap(0)` resets per-Result (turn boundary);
+                                                // pre-swap > 1 means a follow-up is inflight
+                                                // (queued in msg_rx or merged into this Result),
+                                                // so keep CC alive to consume it without a
+                                                // respawn round-trip. AcqRel pairs with the
+                                                // fast-path `fetch_add` in `chat::process` so a
+                                                // racing increment is observed.
+                                                let prev = pending_followups
+                                                    .swap(0, std::sync::atomic::Ordering::AcqRel);
+                                                if prev > 1 {
+                                                    log!("[ClaudeCode] Skipping subprocess termination for thread {} — {} follow-up(s) inflight (queued or merged)", thread_id, prev - 1);
+                                                } else {
+                                                    log!("[ClaudeCode] Idle reached — terminating CC subprocess for thread {} so next turn resumes via --resume", thread_id);
+                                                    agent_cancel.cancel();
+                                                }
+                                            }
+                                            IdleAction::Nothing => {}
                                         }
                                     }
                                 }
@@ -1585,13 +1661,22 @@ impl LucidosEngine {
                     // Don't break — let the loop continue to read the Result event
                 }
 
-                _ = cancel.notified() => {
+                _ = stop.notified() => {
+                    // Apply / Discard / Archive emit their own lifecycle terminator
+                    // (`ChangeApplied` / `ChangeDiscarded` / `ThreadArchived`); only
+                    // a real `UserStop` (or no reason set — engine shutdown direct
+                    // notify) lets `ResponseCanceled` through.
                     let is_shutdown = shutting_down.load(std::sync::atomic::Ordering::Relaxed);
-                    self.emit_cancel_terminal(
-                        "cancel",
+                    let suppress_user_terminal = matches!(
+                        self.pending_stop_reason(thread_id).await,
+                        Some(StopReason::Apply | StopReason::Discard | StopReason::Archive),
+                    );
+                    self.emit_stop_terminal(
+                        "stop",
                         thread_id,
                         is_waiting,
                         is_shutdown,
+                        suppress_user_terminal,
                         &agent_cancel,
                         &claude_text_buf,
                         last_text_persisted_len,
@@ -1606,12 +1691,14 @@ impl LucidosEngine {
 
                 _ = chat_cancel.cancelled() => {
                     // Upstream chat handler cancelled (engine shutdown / request abort).
+                    // No user-action context here — suppress flag is always false.
                     let is_shutdown = shutting_down.load(std::sync::atomic::Ordering::Relaxed);
-                    self.emit_cancel_terminal(
+                    self.emit_stop_terminal(
                         "chat_cancel",
                         thread_id,
                         is_waiting,
                         is_shutdown,
+                        false,
                         &agent_cancel,
                         &claude_text_buf,
                         last_text_persisted_len,
@@ -1642,63 +1729,37 @@ impl LucidosEngine {
         // so the caller re-processes them instead of showing "interrupted".
         let cc_orphans = lost_followups_to_orphans(drain_lost_followups(&mut msg_rx));
 
-        // Safety net: CC's event loop ended without a terminal event
-        // (process crash, stream EOF before Result, parser glitch).
-        if !emitted_terminal_event {
-            let outcome =
-                safety_net_outcome(worktree_path.as_deref(), &repo_root, &branch_name).await;
+        // Safety net: CC's event loop ended without a Result event — always a
+        // crash. Emit ResponseAborted (thread → error state); the cleanup path
+        // below reads `safety_net_fired` and skips propose_change so partial
+        // commits stay on the branch without surfacing as an "Apply" card.
+        let safety_net_fired = !emitted_terminal_event;
+        if safety_net_fired {
             log!(
-                "[ClaudeCode] safety net firing for thread {} — outcome={:?}, buffered_text_len={}",
+                "[ClaudeCode] safety net firing for thread {} — buffered_text_len={}",
                 thread_id,
-                outcome,
                 claude_text_buf.len()
             );
-            // SafetyNetOutcome::Completed emits ResponseGenerated (unrelated to
-            // restart). Aborted is the only variant that can collide.
-            let skip_for_restart = matches!(outcome, SafetyNetOutcome::Aborted)
-                && Self::external_terminal_already_emitted(&external_terminal_emitted, thread_id, "safety net");
+            let skip_for_restart = Self::external_terminal_already_emitted(
+                &external_terminal_emitted,
+                thread_id,
+                "safety net",
+            );
             if !skip_for_restart {
-                let (event, label) = match outcome {
-                    SafetyNetOutcome::Completed => (
-                        crate::engine::thread_events::ThreadEvent::ResponseGenerated {
-                            text: claude_text_buf.clone(),
-                            images: vec![],
-                            model: normalized_model.clone(),
-                            reasoning_effort: cc_reasoning_effort.clone(),
-                        },
-                        "ResponseGenerated",
-                    ),
-                    SafetyNetOutcome::Aborted => (
-                        crate::engine::thread_events::ThreadEvent::ResponseAborted {
-                            text: claude_text_buf.clone(),
-                            images: vec![],
-                            model: normalized_model.clone(),
-                            reasoning_effort: cc_reasoning_effort.clone(),
-                        },
-                        "ResponseAborted",
-                    ),
-                };
                 let mut emit_meta = meta.clone();
-                Self::stamp_system_actor_if_aborted(
-                    &mut emit_meta,
-                    matches!(outcome, SafetyNetOutcome::Aborted),
-                );
-                if let Err(e) = self
-                    .event_bus
-                    .emit(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event,
-                        meta: emit_meta,
-                    })
-                    .await
-                {
-                    log!(
-                        "[ClaudeCode] Failed to emit safety-net {} for thread {}: {}",
-                        label,
-                        thread_id,
-                        e
-                    );
-                }
+                Self::stamp_system_actor_if_aborted(&mut emit_meta, true);
+                crate::engine::thread_events::emit_response_aborted(
+                    &self.event_bus,
+                    thread_id,
+                    crate::engine::thread_events::AbortCause::SafetyNet,
+                    claude_text_buf.clone(),
+                    vec![],
+                    normalized_model.clone(),
+                    cc_reasoning_effort.clone(),
+                    emit_meta,
+                    "[ClaudeCode] safety-net ResponseAborted",
+                )
+                .await;
             }
         }
 
@@ -1708,12 +1769,12 @@ impl LucidosEngine {
 
         // During engine shutdown, skip all cleanup — preserve the worktree and branch
         // so recover_orphaned_worktrees can resume the session after restart.
-        // Read session flags before cleanup. Read discard early so we can skip
-        // unnecessary work (auto-commit, hardening) when the user chose to discard.
-        let should_discard = {
-            let guard = self.agent_sessions.lock().await;
-            guard.get(&thread_id).map(|s| s.discard).unwrap_or(false)
-        };
+        // Read discard early so we can skip unnecessary work (auto-commit,
+        // hardening) when the user chose Discard.
+        let should_discard = matches!(
+            self.pending_stop_reason(thread_id).await,
+            Some(StopReason::Discard),
+        );
 
         // Auto-commit any uncommitted changes so they survive on disk.
         {
@@ -1949,10 +2010,17 @@ impl LucidosEngine {
                     has_commits,
                     changed_files.is_empty(),
                     is_external_repo,
+                    safety_net_fired,
                 ) {
                     SessionEndAction::KeepExternalBranch => {
                         log!(
                             "[ClaudeCode] External repo branch {} — keeping branch, no change proposed",
+                            effective_branch
+                        );
+                    }
+                    SessionEndAction::CrashedKeepBranch => {
+                        log!(
+                            "[ClaudeCode] Safety net fired with commits on {} — keeping branch on disk, NOT proposing change (thread ended in ResponseAborted)",
                             effective_branch
                         );
                     }
@@ -2042,13 +2110,17 @@ impl LucidosEngine {
             }
         }
 
-        // Read auto_apply and remove session at the very end of cleanup.
-        // Keeping the session in the map during git/change-proposal work lets the
-        // cancel endpoint set auto_apply even if the user clicks "Apply Now" while
-        // cleanup is already in progress (avoids a 404 race).
+        // Read pending_stop and remove the session in one lock acquisition.
+        // Keeping the session in the map during git/change-proposal work lets
+        // the stop endpoint set `pending_stop = Some(Apply)` even if the user
+        // clicks "Apply Now" while cleanup is already in progress (avoids a
+        // 404 race).
         let auto_apply = {
             let mut guard = self.agent_sessions.lock().await;
-            let val = guard.get(&thread_id).map(|s| s.auto_apply).unwrap_or(false);
+            let val = matches!(
+                guard.get(&thread_id).and_then(|s| s.pending_stop),
+                Some(StopReason::Apply),
+            );
             guard.remove(&thread_id);
             val
         };
@@ -2117,65 +2189,5 @@ impl LucidosEngine {
 }
 
 #[cfg(test)]
-mod tests {
-    /// Verifies that `try_wait()` detects a dead child process even when
-    /// the stdout pipe hasn't produced EOF. This is the watchdog that
-    /// prevents threads from getting stuck in RUNNING state after the CC
-    /// process is killed (e.g. macOS sleep killing the process).
-    #[tokio::test]
-    async fn try_wait_detects_dead_cc_process() {
-        use tokio::process::Command;
-
-        // Spawn a short-lived process
-        let mut child = Command::new("echo")
-            .arg("done")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("failed to spawn 'echo'");
-
-        // Take stdin/stdout (same as the real CC code does)
-        let _stdin = child.stdin.take();
-        let _stdout = child.stdout.take();
-
-        // Wait for process to exit (with explicit wait, not just sleep)
-        let _ = child.wait().await;
-
-        // try_wait should report the exit status
-        let status = child.try_wait().expect("try_wait should not error");
-        assert!(
-            status.is_some(),
-            "try_wait must detect dead process even after stdin/stdout are taken"
-        );
-        assert!(
-            status.unwrap().success(),
-            "process should have exited successfully"
-        );
-    }
-
-    /// Verifies that `try_wait()` returns None for a still-running process.
-    /// This ensures the watchdog doesn't false-positive on healthy CC sessions.
-    #[tokio::test]
-    async fn try_wait_returns_none_for_running_process() {
-        use tokio::process::Command;
-
-        let mut child = Command::new("sleep")
-            .arg("10")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("failed to spawn 'sleep'");
-
-        let _stdin = child.stdin.take();
-        let _stdout = child.stdout.take();
-
-        let status = child.try_wait().expect("try_wait should not error");
-        assert!(
-            status.is_none(),
-            "try_wait must return None for a running process"
-        );
-
-        // Clean up
-        let _ = child.kill().await;
-    }
-}
+#[path = "run_session_tests.rs"]
+mod tests;

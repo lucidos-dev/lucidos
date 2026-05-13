@@ -199,6 +199,115 @@ async fn spawn_thread_defaults_repo_from_lucidos_repo_env() {
     assert_eq!(body["repo_id"], "user-acquisition", "$LUCIDOS_REPO is the default");
 }
 
+/// `--relation top` on a same-workspace target must produce the
+/// fire-and-forget body shape (caller_* fields, no parent_*). Today's
+/// `--parent` flag couples "same-workspace" with "callback"; the new
+/// `--relation` flag splits the two so `--to <same-ws> --relation top`
+/// becomes a valid in-engine "spawn a top-level thread" expression
+/// without triggering the callback wiring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_workspace_relation_top_omits_parent_fields() {
+    let (port, captured) = start_capture_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, port);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let thread_id = uuid::Uuid::new_v4().to_string();
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let status = std::process::Command::new(bin)
+        .args([
+            "spawn-thread", "--to", "dev", "--relation", "top",
+            "--message", "fire and forget", "--title", "Top", "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", &thread_id)
+        .env("LUCIDOS_EVENT_ID", &event_id)
+        .env_remove("LUCIDOS_REPO")
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .status().expect("spawn cli");
+    assert!(status.success());
+
+    let body = captured.lock().unwrap().clone().expect("server received body");
+    assert!(body.get("parent_thread_id").is_none(), "top must NOT emit parent_thread_id");
+    assert!(body.get("spawning_event_id").is_none(), "top must NOT emit spawning_event_id");
+    assert_eq!(body["caller_workspace"], "dev");
+    assert_eq!(body["caller_thread_id"], thread_id);
+    assert_eq!(body["caller_event_id"], event_id);
+}
+
+/// `--relation sub` requires a same-workspace target — callbacks across
+/// workspaces aren't wired. Mirrors the existing `--parent` cross-workspace
+/// rejection but expressed through the new flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_workspace_relation_sub_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("caller");
+    let other = tmp.path().join("other");
+    write_ports_file(&caller, 1);
+    write_ports_file(&other, 2);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread", "--to", "other", "--relation", "sub",
+            "--message", "x", "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output().expect("spawn cli");
+    assert!(!output.status.success(), "CLI must error on --relation sub with cross-workspace target");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("relation") && (stderr.contains("same-workspace") || stderr.contains("$LUCIDOS_WORKSPACE")),
+        "stderr must explain that sub requires same-workspace, got: {}",
+        stderr
+    );
+}
+
+/// `--parent` is the deprecated alias for `--relation sub`. It must still
+/// work for one release so existing recipes / scripts don't break, and
+/// it must print a deprecation warning to stderr so callers know to
+/// migrate. The HTTP body must look identical to a `--relation sub` call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parent_flag_still_works_with_deprecation_warning() {
+    let (port, captured) = start_capture_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, port);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let thread_id = uuid::Uuid::new_v4().to_string();
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread", "--parent", "--to", "dev", "--cc",
+            "--message", "compat", "--title", "Compat", "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", &thread_id)
+        .env("LUCIDOS_EVENT_ID", &event_id)
+        .env_remove("LUCIDOS_REPO")
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output().expect("spawn cli");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+
+    let body = captured.lock().unwrap().clone().expect("server received body");
+    assert_eq!(body["parent_thread_id"], thread_id, "--parent must still set parent_thread_id");
+    assert_eq!(body["spawning_event_id"], event_id, "--parent must still set spawning_event_id");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--parent") && stderr.contains("deprecated"),
+        "must warn about --parent being deprecated, got stderr: {}",
+        stderr
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_thread_empty_repo_flag_overrides_env_to_workspace_default() {
     // `--repo ""` is the explicit "use the target workspace's default repo"

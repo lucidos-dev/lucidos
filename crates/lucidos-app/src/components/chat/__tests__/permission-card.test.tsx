@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { BROAD_ALLOW_INEFFECTIVE, renderQuestion, sessionLabel } from '../PermissionCard';
+import {
+  BROAD_ALLOW_INEFFECTIVE,
+  renderQuestion,
+  resolvedChoice,
+  sessionLabel,
+} from '../PermissionCard';
 
 /** Minimal vnode → plain text walker (no DOM, no preact-render-to-string).
  *  The tests just need to assert "the tool name appears as <strong>" and
@@ -85,5 +90,24 @@ describe('sessionLabel', () => {
     expect(sessionLabel('Edit', {})).toBeNull();
     expect(sessionLabel('Bash', {})).toBeNull();
     expect(sessionLabel('Read', { file_path: '/x' })).toBeNull();
+  });
+});
+
+describe('resolvedChoice', () => {
+  it('maps a deny to "deny" regardless of scope', () => {
+    expect(resolvedChoice({ allowed: false })).toBe('deny');
+    // Recovery-emitted orphans arrive as `allowed: false` with a reason but
+    // no scope — still "deny" so the answered card marks the Deny button.
+    expect(resolvedChoice({ allowed: false, reason: 'orphan' } as { allowed: boolean })).toBe('deny');
+  });
+
+  it('maps allow + no scope to "allow" (the bare Allow-once button)', () => {
+    expect(resolvedChoice({ allowed: true })).toBe('allow');
+  });
+
+  it('maps allow + scope to the scope name', () => {
+    expect(resolvedChoice({ allowed: true, persist_scope: 'session' })).toBe('session');
+    expect(resolvedChoice({ allowed: true, persist_scope: 'narrow' })).toBe('narrow');
+    expect(resolvedChoice({ allowed: true, persist_scope: 'broad' })).toBe('broad');
   });
 });

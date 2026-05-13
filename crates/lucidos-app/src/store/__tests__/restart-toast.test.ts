@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { restartRequired, restartGroups, toasts, showToast } from '../store';
-import { syncRestartToast, restoreRestartToast, addRestartGroup, RESTART_LS_KEY } from '../actions/chat-changes';
+import { restartRequired, restartGroups, toasts, showToast, engineVersion, latestEngineVersion } from '../store';
+import { syncRestartToast, restoreRestartToast, addRestartGroup, dismissRestartToast, RESTART_LS_KEY, RESTART_DISMISSED_FP_LS_KEY } from '../actions/chat-changes';
 
 const RESTART_TOAST_KEY = 'restart-required';
 const RESTART_GROUPS_LS_KEY = 'lucidos-restart-groups';
@@ -13,6 +13,7 @@ beforeEach(() => {
   localStorage.removeItem(RESTART_LS_KEY);
   localStorage.removeItem(RESTART_GROUPS_LS_KEY);
   localStorage.removeItem(LEGACY_REASONS_LS_KEY);
+  localStorage.removeItem(RESTART_DISMISSED_FP_LS_KEY);
 });
 
 describe('restart-required toast persistence', () => {
@@ -218,5 +219,109 @@ describe('restart groups tracking (thread title + commits)', () => {
     expect(restartGroups.value).toEqual([]);
     const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
     expect(toast!.message).toBe('Engine restart required to apply changes.');
+  });
+});
+
+describe('dismissRestartToast — "dismiss for this change"', () => {
+  function seedAndDismiss(): void {
+    addRestartGroup({ threadId: 't1', threadTitle: 'Fix auth', commits: ['feat: a'] });
+    dismissRestartToast();
+  }
+  const restartToast = () => toasts.value.find(t => t.key === RESTART_TOAST_KEY);
+
+  it('renders a Dismiss action on the warning toast', () => {
+    addRestartGroup({ threadId: 't1', threadTitle: 'Fix auth', commits: ['feat: a'] });
+    const toast = restartToast();
+    expect(toast!.secondaryAction).toBeTruthy();
+    expect(toast!.secondaryAction!.label).toBe('Dismiss');
+  });
+
+  it('dismissRestartToast removes the toast and persists a fingerprint', () => {
+    addRestartGroup({ threadId: 't1', threadTitle: 'Fix auth', commits: ['feat: a'] });
+    expect(restartToast()).toBeTruthy();
+
+    dismissRestartToast();
+
+    expect(restartToast()).toBeFalsy();
+    expect(localStorage.getItem(RESTART_DISMISSED_FP_LS_KEY)).toBeTruthy();
+  });
+
+  it('keeps restartRequired true after dismiss (ControlPanel badge stays)', () => {
+    seedAndDismiss();
+    expect(restartRequired.value).toBe(true);
+  });
+
+  it('syncRestartToast does not re-show toast when fingerprint matches dismissed', () => {
+    seedAndDismiss();
+
+    syncRestartToast();
+    expect(restartToast()).toBeFalsy();
+  });
+
+  it('restoreRestartToast does not re-show toast when fingerprint matches dismissed', () => {
+    seedAndDismiss();
+
+    // Simulate page reload: signals reset, localStorage retained.
+    toasts.value = [];
+    restartRequired.value = false;
+    restartGroups.value = [];
+
+    restoreRestartToast();
+
+    expect(restartRequired.value).toBe(true);
+    expect(restartToast()).toBeFalsy();
+  });
+
+  it('toast reappears when a new thread group is added after dismiss', () => {
+    seedAndDismiss();
+    expect(restartToast()).toBeFalsy();
+
+    addRestartGroup({ threadId: 't2', threadTitle: 'Update API', commits: ['refactor: handler'] });
+
+    expect(restartToast()).toBeTruthy();
+    expect(localStorage.getItem(RESTART_DISMISSED_FP_LS_KEY)).toBeNull();
+  });
+
+  it('toast reappears when a new commit is added to an existing dismissed group', () => {
+    seedAndDismiss();
+    expect(restartToast()).toBeFalsy();
+
+    addRestartGroup({ threadId: 't1', threadTitle: 'Fix auth', commits: ['fix: b'] });
+
+    expect(restartToast()).toBeTruthy();
+  });
+
+  it('clears dismissed fingerprint when restartRequired becomes false', () => {
+    seedAndDismiss();
+    expect(localStorage.getItem(RESTART_DISMISSED_FP_LS_KEY)).toBeTruthy();
+
+    restartRequired.value = false;
+    syncRestartToast();
+
+    expect(localStorage.getItem(RESTART_DISMISSED_FP_LS_KEY)).toBeNull();
+  });
+
+  it('survives page reload when engine version signals are not yet hydrated', () => {
+    // Engine version signals load asynchronously after restoreRestartToast()
+    // runs. The fingerprint must not depend on them, otherwise restoring
+    // before the health check completes would silently drop the dismissal.
+    engineVersion.value = '1.2.3';
+    latestEngineVersion.value = '1.2.4';
+    seedAndDismiss();
+
+    // Simulate page reload BEFORE the health check has populated versions.
+    toasts.value = [];
+    restartRequired.value = false;
+    restartGroups.value = [];
+    engineVersion.value = null;
+    latestEngineVersion.value = null;
+
+    restoreRestartToast();
+
+    expect(restartToast()).toBeFalsy();
+    expect(localStorage.getItem(RESTART_DISMISSED_FP_LS_KEY)).toBeTruthy();
+
+    engineVersion.value = null;
+    latestEngineVersion.value = null;
   });
 });

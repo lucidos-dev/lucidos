@@ -56,7 +56,11 @@ impl PythonRuntime {
             self.venv_path.display()
         );
 
-        fs::create_dir_all(self.venv_path.parent().unwrap()).map_err(|e| e.to_string())?;
+        let parent = self
+            .venv_path
+            .parent()
+            .ok_or_else(|| format!("venv path has no parent: {}", self.venv_path.display()))?;
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
 
         let output = tokio::process::Command::new("python3")
             .args(["-m", "venv", self.venv_path.to_string_lossy().as_ref()])
@@ -95,7 +99,14 @@ impl PythonRuntime {
         let mut cmd = tokio::process::Command::new(&self.python_bin);
         cmd.arg(&script_path)
             .current_dir(&self.workspace_path)
-            .stdin(std::process::Stdio::null());
+            .stdin(std::process::Stdio::null())
+            // Without kill_on_drop, dropping this command future on cancel
+            // (the agent loop's run_tool_with_cancel wrapper) leaves the
+            // python child orphaned — a hung urlopen() / time.sleep() keeps
+            // running in the background while the engine logs nothing about
+            // it. With it, the OS sends SIGKILL when the future drops, so a
+            // user clicking Stop reliably reaps the subprocess.
+            .kill_on_drop(true);
         for (key, value) in &env_vars {
             cmd.env(key, value);
         }
@@ -228,6 +239,9 @@ impl PythonRuntime {
         let output = tokio::process::Command::new(&self.python_bin)
             .args(&args)
             .stdin(std::process::Stdio::null())
+            // pip install can hang on a slow network — kill_on_drop ensures
+            // the cancel path reaps it instead of leaking the child.
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| format!("Failed to install packages: {}", e))?;
@@ -391,5 +405,79 @@ mod tests {
         assert!(result.is_ok());
         // Non-data/ writes go directly to workspace
         assert!(ws.join("scratch.txt").exists());
+    }
+
+    /// Regression: a hung subprocess (e.g. `urllib.request.urlopen` to a
+    /// dead host with no timeout) used to park the agent loop forever
+    /// because (a) the loop didn't race execute_tool against cancel, and
+    /// (b) even when the future was dropped, tokio's Child does NOT kill
+    /// its OS child on drop unless `kill_on_drop(true)` is set.
+    ///
+    /// This test pins (b): drop the execute() future via tokio::select!
+    /// against a 200ms cancel, then verify the python child has actually
+    /// exited (no zombie). Uses a marker file as the witness — if the
+    /// subprocess survives the drop, it overwrites the marker after
+    /// `time.sleep(2)`; if it was SIGKILL'd, the marker keeps its initial
+    /// content. We check after 3s (longer than the python sleep) so a
+    /// surviving child has had time to expose itself.
+    #[tokio::test]
+    async fn execute_kills_subprocess_when_future_dropped() {
+        let dir = tempdir().unwrap();
+        let runtime = PythonRuntime::new(dir.path().to_path_buf());
+
+        // Marker lives outside the workspace sandbox so the python sandbox
+        // doesn't reject the write — write_guard_preamble allows writes
+        // under realpath(workspace) and realpath(tempdir()), and tempdir's
+        // realpath on macOS is /private/var/folders/... which is allowed.
+        // We use the workspace_path itself (which IS allowed) for the marker.
+        let marker = dir.path().join("marker.txt");
+        let marker_str = marker.to_string_lossy().replace('\\', "\\\\");
+
+        // Step 1: write "alive". Step 2: sleep 2s. Step 3: write "survived".
+        // If kill_on_drop works, the subprocess dies between step 1 and
+        // step 3, so marker stays "alive".
+        let code = format!(
+            "open('{m}', 'w').write('alive')\nimport time\ntime.sleep(2)\nopen('{m}', 'w').write('survived')",
+            m = marker_str,
+        );
+
+        // Pre-warm the venv so the cancel below races the actual subprocess
+        // and not the one-time venv creation (which can take a couple seconds
+        // on a fresh tempdir).
+        runtime
+            .execute("print('warmup')")
+            .await
+            .expect("warmup");
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let token_clone = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            token_clone.cancel();
+        });
+
+        // Race the execute against the cancel token. On cancel, the
+        // execute future is dropped — taking the inner Command future and
+        // its Child handle with it. kill_on_drop(true) on the Command
+        // makes the OS send SIGKILL to the python process.
+        tokio::select! {
+            _ = token.cancelled() => {}
+            r = runtime.execute(&code) => {
+                panic!("execute completed before cancel: {:?}", r);
+            }
+        };
+
+        // Wait longer than the python sleep so a surviving child has time
+        // to overwrite the marker.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        let content = std::fs::read_to_string(&marker)
+            .expect("marker should exist — step 1 ran before cancel");
+        assert_eq!(
+            content, "alive",
+            "subprocess survived the dropped future and overwrote the marker — \
+             kill_on_drop(true) is missing on the Python Command, or tokio is \
+             not delivering SIGKILL on Child drop"
+        );
     }
 }

@@ -109,11 +109,11 @@ Data storage: pick artifacts (git) OR events (postgres), not both.
 
 ## Triggers
 
-Triggers are scheduled tasks that run on cron or in response to events. The **intent** lives in the `TriggerCreated` event payload (`run.intent`) — there is no `intent.md` file. The intent references **knowhow** by ID (`run.knowhow: ["openai-api"]`), which IS on disk under `data/knowhow/<id>.md` and gets concatenated onto the intent at fire time. Optional **scripts** live alongside the trigger.
+Triggers are scheduled tasks that run on cron or in response to events. The **intent** lives in the `TriggerCreated` event payload (`run.intent`) — there is no `intent.md` file. The intent is a single sentence in the user's voice (`{ type: 'intent', intent: '...' }`); there is no per-trigger knowhow allow-list to configure. When the trigger fires, the spawned thread looks up knowhow itself via `load_knowhow` — same as a chat session. Optional **scripts** and trigger-scoped **knowhow files** live alongside the trigger on disk.
 
 ### Intent vs Knowhow Split (the rule everyone gets wrong)
 
-Triggers tempt you to dump procedure into the intent — there's one big text field, the API doesn't enforce structure, and the procedure is fresh in your head when you create it. **Resist.** Every imperative verb about *how* (hit, parse, scan, fall back, retry, emit) belongs in knowhow, not intent.
+Triggers tempt you to dump procedure into the intent — there's one big text field, the API doesn't enforce structure, and the procedure is fresh in your head when you create it. **Resist.** Every imperative verb about *how* (hit, parse, scan, fall back, retry, emit) belongs in a knowhow file the LLM can discover, not in the intent.
 
 - **Intent**: a sentence the user would say. "Notify me when GPT-5.5 is available via the OpenAI API."
 - **Knowhow**: the recipe. "GET `/v1/models` with `Authorization: Bearer $OPENAI_API_KEY`; scan `data[].id` for ids starting with `gpt-5.5`; on 401/403/network error fall back to one `web_search` for ..."
@@ -129,10 +129,9 @@ with Authorization: Bearer $OPENAI_API_KEY. Scan data[].id for any id starting
 with gpt-5.5. If found, send_notification + update_trigger to disable. If 401/403
 or network error, fall back to web_search for 'gpt-5.5 OpenAI API available'.
 If not yet available, stay silent."
-run.knowhow: []
 ```
 
-**Good** (recipe lives in a knowhow file):
+**Good** (recipe lives in a knowhow file the trigger thread will discover at fire time):
 ```
 # data/knowhow/openai-api-availability.md
 ---
@@ -146,17 +145,35 @@ fall back to one `web_search` distinguishing API availability from ChatGPT-only 
 ```
 run.intent: "Notify me when an OpenAI model with id prefix gpt-5.5 becomes available
 via the API. Once notified, disable this trigger."
-run.knowhow: ["openai-api-availability"]
 ```
 
-When OpenAI changes their endpoint, you update one knowhow file — not every trigger that uses it. When a new model needs watching, you create a new trigger that points to the same knowhow.
+When OpenAI changes their endpoint, you update one knowhow file — not every trigger that touches it. When a new model needs watching, you create a new trigger; the same knowhow surfaces via semantic discovery.
+
+### Knowhow discovery at fire time
+
+The trigger thread inherits the chat-thread knowhow surface: the system prompt advertises the intent registry, and the LLM calls `load_knowhow` when it judges a recipe relevant. There is no allow-list to configure on the trigger and no pre-load step. Make the knowhow file's `name` and `description` frontmatter precise so semantic discovery finds it.
 
 ### Order of Operations
 
-When creating a trigger that needs knowhow, write the knowhow file first (so it exists when the trigger fires), then create the trigger referencing it by ID.
+When creating a trigger that needs a recipe, write the knowhow file first (so it exists when the trigger fires and discovery can surface it), then create the trigger.
 
 ### Locations
 
-- **Standalone triggers** live in `triggers/<name>/` (intent is event-sourced; the directory holds scripts and trigger-specific knowhow).
-- **App-specific triggers** live in `apps/<name>/triggers/`.
+- **Standalone triggers** live in `triggers/<slug>/` (intent is event-sourced; the directory holds scripts and trigger-specific knowhow). `<slug>` is the trigger's kebab-case `slug` field.
+- **App-specific triggers** live in `apps/<id>/triggers/<slug>/`.
+- **Trigger-scoped knowhow** lives at `data/triggers/<slug>/knowhow/<descriptive>.md` (or `data/apps/<id>/triggers/<slug>/knowhow/` for app-specific triggers). Visible only to threads of trigger `<slug>`.
 - **Shared knowhow** lives in `data/knowhow/<id>.md` (or `data/knowhow/<id>/<descriptive>.md` for multi-file domains).
+
+## Thread Vocabulary
+
+Threads spawned by other threads come in two flavors. The `relation` argument on `run_thread` / `run_claude` (and the `--relation sub|top` flag on `lucidos spawn-thread`) chooses between them.
+
+| Term | Meaning |
+|------|---------|
+| **Spawning thread** | The thread that issues the spawn (verb-derived, neutral). |
+| **Spawned thread** | The new thread the spawn creates. |
+| **Sub-thread** | A spawned thread with a parent. When it reaches a terminal state, the engine fires a callback that resumes the parent with the sub-thread's result. `relation: "sub"` (default for `run_thread` / `run_claude`); `--relation sub` on the CLI. |
+| **Top-thread** | A spawned thread with no parent. Appears in the main thread list as an independent top-level thread. The spawning thread is NOT resumed when it finishes. `relation: "top"`; `--relation top` (CLI default). |
+| **Parent thread** | The spawning thread of a sub-thread (only meaningful when callback wiring is active). |
+
+Database columns (`parent_thread_id`, `child_thread_id`) keep their names — sub-threads still have parents. New prose should standardize on the terms above; "child thread" is an older spelling of "sub-thread" still in use in some files.

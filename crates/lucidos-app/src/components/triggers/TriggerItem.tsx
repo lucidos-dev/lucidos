@@ -67,7 +67,7 @@ export function TriggerItem({ task }: Props) {
           Delete
         </button>
         <button
-          class="action-btn trigger-toggle-btn"
+          class="action-btn"
           onClick={() => toggleTrigger(task.id, !task.paused)}
         >
           {task.paused ? 'Resume' : 'Pause'}

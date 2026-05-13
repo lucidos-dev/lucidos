@@ -50,6 +50,21 @@ pub fn normalize_cc_model_id(full_id: &str) -> &str {
     full_id
 }
 
+/// Reconcile CC's stream-json model name with the engine-supplied alias.
+/// CC strips the `[1m]` suffix when echoing the model in Init / per-message
+/// Usage frames, so a naive `normalize_cc_model_id` loses the 1M-context
+/// signal that `context_window_for` keys on. If the engine pinned `[1m]` and
+/// CC reports the same base model, re-attach the suffix.
+pub fn reconcile_cc_model(original: Option<&str>, cc_reported: &str) -> String {
+    let normalized = normalize_cc_model_id(cc_reported);
+    if let Some(orig_base) = original.and_then(|o| o.strip_suffix("[1m]")) {
+        if orig_base == normalized || orig_base == cc_reported {
+            return format!("{}[1m]", normalized);
+        }
+    }
+    normalized.to_string()
+}
+
 /// Reasoning effort levels for Claude Code's thinking budget.
 pub const CC_REASONING_EFFORT_OPTIONS: &[(&str, &str, &str)] = &[
     // (value, label, description)
@@ -123,8 +138,8 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
         }
         "assistant" => {
             let mut events = Vec::new();
-            if let Some(content) = val
-                .get("message")
+            let message = val.get("message");
+            if let Some(content) = message
                 .and_then(|m| m.get("content"))
                 .and_then(|c| c.as_array())
             {
@@ -158,6 +173,47 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                         }
                         _ => {}
                     }
+                }
+            }
+            // CC mirrors Anthropic's `usage` block on each assistant
+            // message (one per LLM API call). Surfaced as a separate
+            // `Usage` event so the consumer can emit `ContextCaptured`.
+            if let Some(usage) = message.and_then(|m| m.get("usage")) {
+                let model = message
+                    .and_then(|m| m.get("model"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let input_tokens = usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                let output_tokens = usage
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                let cache_read_tokens = usage
+                    .get("cache_read_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                let cache_creation_tokens = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                // Skip empty-usage frames (CC sometimes emits a continuation
+                // assistant message with zeroed usage — no real API call
+                // happened, so a snapshot would be misleading).
+                if input_tokens > 0
+                    || output_tokens > 0
+                    || cache_read_tokens > 0
+                    || cache_creation_tokens > 0
+                {
+                    events.push(AgentEvent::Usage {
+                        model,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                    });
                 }
             }
             events
@@ -523,6 +579,12 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     // Read by spawn-thread skill; see ChatRequest::parent_thread_id.
     cmd.env("LUCIDOS_THREAD_ID", args.thread_id.to_string());
     cmd.env("LUCIDOS_WORKSPACE", args.workspace_path);
+    // PG* env so CC can run `psql -c '…'` bare without putting the
+    // password in argv (which gets persisted into CodingAgentToolCalled
+    // and rendered in the steps UI). See `core::pg_env_vars` doc.
+    for (key, value) in crate::core::pg_env_vars_cached() {
+        cmd.env(key, value);
+    }
     // Read by `lucidos spawn-thread` CLI to default `--caller-event-id` so
     // cross-workspace POSTs from a CC subprocess carry the originating event.
     if let Some(event_id) = args.spawning_event_id {
@@ -534,6 +596,15 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     // workspaces hosting multiple repos).
     if let Some(repo_name) = args.repo_name {
         cmd.env("LUCIDOS_REPO", repo_name);
+    }
+    // Read by `cc-stop-reminder` to gate the AskUserQuestion redirect.
+    // Unattended sessions (conflict-resolution) don't set this — they would
+    // hang on the redirect waiting for an answer that's not coming.
+    // Wire contract: name + value duplicated as `SESSION_KIND_ENV` /
+    // `SESSION_KIND_INTERACTIVE` consts in
+    // `crates/lucidos-cli/src/cc_stop_reminder.rs`. Keep both in sync.
+    if args.interactive {
+        cmd.env("LUCIDOS_SESSION_KIND", "interactive");
     }
     // The engine permission handler now waits indefinitely for the user
     // (matching `AskUserQuestion`'s "stay idle" behavior). CC has TWO

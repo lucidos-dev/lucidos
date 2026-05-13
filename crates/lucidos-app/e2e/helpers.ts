@@ -373,6 +373,18 @@ export async function countVisibleResponses(page: Page): Promise<number> {
   });
 }
 
+/** Trimmed text of the last visible response-content element, or '' if none. */
+export async function getLatestVisibleResponseText(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const els = document.querySelectorAll('.response-content');
+    const visible = Array.from(els).filter(el => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim().length > 0;
+    });
+    return (visible[visible.length - 1]?.textContent ?? '').trim();
+  });
+}
+
 /** Count visible thread-row elements (handles dual-layout) */
 export async function countVisibleThreadRows(page: Page): Promise<number> {
   return page.evaluate(() => {
@@ -385,11 +397,12 @@ export async function countVisibleThreadRows(page: Page): Promise<number> {
 }
 
 /** Wait for the prompt-area Cancel button, click it, wait for Canceled status.
- *  Works for both chat and Claude Code threads (single hard-cancel path). */
+ *  Works for both chat and Claude Code threads (single hard-cancel path).
+ *  Identify the Send→Cancel morph by its post-morph class — the disabled
+ *  `Cancel...` state shares the same aria-label, so :not(:disabled) is
+ *  load-bearing. */
 export async function cancelStreamingResponse(page: Page): Promise<void> {
-  // :not(:disabled) excludes the post-click 'Cancel...' state — substring
-  // match on 'Cancel' would otherwise also target it (and silently no-op).
-  await waitAndClick(page, '.thread-action-buttons button.action-btn-danger:not(:disabled)', 'Cancel', 30_000);
+  await waitAndClick(page, 'button.send-cancel-morph.action-btn-danger:not(:disabled)', undefined, 30_000);
 
   await page.waitForFunction(() => {
     const labels = document.querySelectorAll('.exchange-status-label');

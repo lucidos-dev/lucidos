@@ -1,4 +1,4 @@
-import { API_BASE } from '../../api/client';
+import { API_BASE, mutatingFetch, throwIfNotOk } from '../../api/client';
 import { showToast } from '../store';
 import { getDeviceId } from './devices';
 import { isTauri, isIOS, isStandalone } from '../../utils/platform';
@@ -28,7 +28,7 @@ async function getVapidKey(): Promise<string> {
 /** Send a push subscription to the backend */
 async function subscribePush(subscription: PushSubscription): Promise<void> {
   const json = subscription.toJSON();
-  const res = await fetch(`${API}/push/subscribe`, {
+  const res = await mutatingFetch(`${API}/push/subscribe`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -38,7 +38,7 @@ async function subscribePush(subscription: PushSubscription): Promise<void> {
       device_id: getDeviceId(),
     }),
   });
-  if (!res.ok) throw new Error(`Failed to store subscription: ${res.status}`);
+  await throwIfNotOk(res);
 }
 
 /**

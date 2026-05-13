@@ -1,3 +1,4 @@
+import { Fragment } from 'preact';
 import { useRef, useCallback } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
 import { changes, appliedChanges, changesHasMore, changesLoadingMore, busyChangeIds, showConfirm } from '../../store/store';
@@ -11,7 +12,7 @@ function ChangeDescription({ description }: { description: string }) {
   return (
     <span class="title change-description">
       {lines.map((line, i) => (
-        <>{line}{i < lines.length - 1 && <br />}</>
+        <Fragment key={i}>{line}{i < lines.length - 1 && <br />}</Fragment>
       ))}
     </span>
   );
@@ -104,7 +105,7 @@ export function ChangesView() {
                         }
                       }}>Revert</button>
                     ) : (
-                      <span class="secondary" style="font-size: 0.8em">Reverted</span>
+                      <span class="secondary" style="font-size: 0.8rem">Reverted</span>
                     )}
                   </div>
                 </div>

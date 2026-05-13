@@ -64,6 +64,20 @@ pub enum AgentEvent {
         duration_ms: u64,
         error: Option<String>,
     },
+    /// Per-LLM-call token usage reported by the agent. CC emits one
+    /// `message.usage` block per assistant message in its stream-json
+    /// output; the engine forwards these as `Usage` events so a
+    /// `ContextCaptured` can surface real input/output/cache counts in
+    /// the StepDetailModal — same event the main-LLM agentic loop emits,
+    /// just with `producer: ClaudeCode`. Cache fields are Anthropic-only
+    /// and stay zero on agents that don't expose them.
+    Usage {
+        model: Option<String>,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_creation_tokens: u32,
+    },
     /// Process exited. Always the last event before `events_rx` closes.
     /// Stderr is logged inside the runtime — consumers don't need to handle it.
     Exited,
@@ -120,6 +134,15 @@ pub struct SpawnArgs<'a> {
     /// target workspace's default repo. Always pass the resolved repo name
     /// when one is known; only legacy/early-startup callers should pass `None`.
     pub repo_name: Option<&'a str>,
+    /// True when this spawn is an interactive session — chat, recovery, or
+    /// external-repo work where the user is at the keyboard. False for
+    /// unattended sessions (conflict-resolution) that run autonomously.
+    ///
+    /// Forwarded as `LUCIDOS_SESSION_KIND=interactive` so the
+    /// `cc-stop-reminder` hook knows whether it can safely block CC with an
+    /// AskUserQuestion redirect (which would hang an unattended session
+    /// waiting for an answer that's not coming).
+    pub interactive: bool,
 }
 
 /// A spawned agent. The runtime owns the child process and an internal driver

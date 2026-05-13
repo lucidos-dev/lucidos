@@ -1,7 +1,7 @@
 import { preferences } from '../store/store';
 
 /** Get the user's configured timezone from preferences, or undefined for browser default. */
-export function getUserTimezone(): string | undefined {
+function getUserTimezone(): string | undefined {
   const prefs = preferences.value;
   return prefs.status === 'loaded' ? prefs.data.timezone || undefined : undefined;
 }

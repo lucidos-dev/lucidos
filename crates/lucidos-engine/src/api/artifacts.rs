@@ -134,7 +134,7 @@ pub(super) async fn list_commits(
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
 
-    match super::apps::get_git_history_with_paths(&state.workspace_path, prefix, limit, offset) {
+    match super::apps::get_git_history_with_paths(&state.workspace_path, prefix, limit, offset).await {
         Ok((commits, has_more)) => Json(CommitsResponse { commits, has_more }).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

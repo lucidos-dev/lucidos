@@ -52,7 +52,7 @@ impl LucidosEngine {
                             &commit[..commit.floor_char_boundary(8)]
                         ))
                     }
-                    Err(e) => Ok(format!("Error creating app: {}", e)),
+                    Err(e) => Err(format!("creating app: {}", e).into()),
                 }
             }
             "list_apps" => match self.app_manager.list_apps() {
@@ -67,37 +67,17 @@ impl LucidosEngine {
                             .join("\n"))
                     }
                 }
-                Err(e) => Ok(format!("Error listing apps: {}", e)),
+                Err(e) => Err(format!("listing apps: {}", e).into()),
             },
             "load_knowhow" => {
                 let id = args["id"]
                     .as_str()
                     .filter(|s| !s.is_empty())
                     .ok_or("id is required")?;
-
-                // System knowhow: explicit `system-knowhow/<id>` prefix routes to the
-                // engine-shipped, read-only knowhow at <repo>/system-knowhow/.
-                if let Some(sys_id) = id.strip_prefix(crate::core::knowhow::SYSTEM_KNOWHOW_PREFIX) {
-                    let dir = self
-                        .system_knowhow_dir()
-                        .ok_or("System knowhow not available")?;
-                    return Ok(match crate::core::SystemKnowhowStore::load(dir, sys_id) {
-                        Some(sd) => crate::core::SystemKnowhowStore::format_section(&sd),
-                        None => format!(
-                            "System knowhow '{}' not found. Check the System Knowhow list in the system prompt for available IDs.",
-                            id
-                        ),
-                    });
-                }
-
-                // load_with_fallback handles local → shared → app-scoped
-                // (`<app_id>/<rest>` → apps/<app_id>/knowhow/<rest>.md).
                 let kh_dirs = self.knowhow_dirs();
-                let kh = crate::core::KnowhowStore::load_with_fallback(&kh_dirs, id);
-                match kh {
-                    Some(kh) => Ok(kh.format_section()),
-                    None => Ok(format!("Know-how '{}' not found. Use the know-how list in the system prompt to see available IDs.", id)),
-                }
+                let system_dir = self.system_knowhow_dir();
+                Ok(crate::core::knowhow::load_one_knowhow_section(&kh_dirs, system_dir, id)
+                    .unwrap_or_else(|| crate::core::knowhow::knowhow_not_found_body(id)))
             }
             _ => Ok(format!("Unknown app tool: {}", name)),
         }

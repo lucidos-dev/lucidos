@@ -5,7 +5,7 @@ import { workspaceName, showToast } from '../store/store';
  *  sanitizer (see crates/lucidos-engine/src/engine/chat/title.rs) strips it
  *  out before the LLM sees it, so pasting a ref into a new thread does not
  *  bias the generated title toward the referenced thread's subject. */
-export function buildThreadRef(threadId: string, title: string): string {
+function buildThreadRef(threadId: string, title: string): string {
     const ws = workspaceName.value || 'unknown';
     const safeTitle = (title || 'Untitled Thread').replace(/[\[\]]/g, '');
     return `[${safeTitle}](thread:${ws}/${threadId})`;

@@ -10,7 +10,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // ---------------------------------------------------------------------------
 
 /// Full OAuth account row including tokens (internal use only)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OAuthAccount {
     pub id: Uuid,
     pub provider: String,
@@ -25,7 +25,7 @@ pub struct OAuthAccount {
 }
 
 /// OAuth account info without tokens (safe for API responses)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct OAuthAccountInfo {
     pub id: Uuid,
     pub provider: String,
@@ -165,21 +165,7 @@ impl OAuthStore {
 
     /// Get an OAuth account by ID (includes tokens)
     pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<OAuthAccount>, sqlx::Error> {
-        let result = sqlx::query_as::<
-            _,
-            (
-                Uuid,
-                String,
-                Option<String>,
-                Option<String>,
-                String,
-                Option<String>,
-                Option<DateTime<Utc>>,
-                String,
-                DateTime<Utc>,
-                DateTime<Utc>,
-            ),
-        >(
+        sqlx::query_as::<_, OAuthAccount>(
             r#"
             SELECT id, provider, email, display_name, access_token,
                    refresh_token, token_expiry, scopes,
@@ -190,35 +176,7 @@ impl OAuthStore {
         )
         .bind(id)
         .fetch_optional(pool)
-        .await?;
-
-        Ok(result.map(
-            |(
-                id,
-                provider,
-                email,
-                display_name,
-                access_token,
-                refresh_token,
-                token_expiry,
-                scopes,
-                created_at,
-                updated_at,
-            )| {
-                OAuthAccount {
-                    id,
-                    provider,
-                    email,
-                    display_name,
-                    access_token,
-                    refresh_token,
-                    token_expiry,
-                    scopes,
-                    created_at,
-                    updated_at,
-                }
-            },
-        ))
+        .await
     }
 
     /// Get the first OAuth account for a provider (ordered by created_at ASC)
@@ -226,21 +184,7 @@ impl OAuthStore {
         pool: &PgPool,
         provider: &str,
     ) -> Result<Option<OAuthAccount>, sqlx::Error> {
-        let result = sqlx::query_as::<
-            _,
-            (
-                Uuid,
-                String,
-                Option<String>,
-                Option<String>,
-                String,
-                Option<String>,
-                Option<DateTime<Utc>>,
-                String,
-                DateTime<Utc>,
-                DateTime<Utc>,
-            ),
-        >(
+        sqlx::query_as::<_, OAuthAccount>(
             r#"
             SELECT id, provider, email, display_name, access_token,
                    refresh_token, token_expiry, scopes,
@@ -253,35 +197,7 @@ impl OAuthStore {
         )
         .bind(provider)
         .fetch_optional(pool)
-        .await?;
-
-        Ok(result.map(
-            |(
-                id,
-                provider,
-                email,
-                display_name,
-                access_token,
-                refresh_token,
-                token_expiry,
-                scopes,
-                created_at,
-                updated_at,
-            )| {
-                OAuthAccount {
-                    id,
-                    provider,
-                    email,
-                    display_name,
-                    access_token,
-                    refresh_token,
-                    token_expiry,
-                    scopes,
-                    created_at,
-                    updated_at,
-                }
-            },
-        ))
+        .await
     }
 
     /// Update tokens after a refresh
@@ -314,18 +230,7 @@ impl OAuthStore {
 
     /// List all OAuth accounts without tokens (safe for API)
     pub async fn list(pool: &PgPool) -> Result<Vec<OAuthAccountInfo>, sqlx::Error> {
-        let results = sqlx::query_as::<
-            _,
-            (
-                Uuid,
-                String,
-                Option<String>,
-                Option<String>,
-                String,
-                DateTime<Utc>,
-                DateTime<Utc>,
-            ),
-        >(
+        sqlx::query_as::<_, OAuthAccountInfo>(
             r#"
             SELECT id, provider, email, display_name, scopes,
                    created_at, updated_at
@@ -334,43 +239,12 @@ impl OAuthStore {
             "#,
         )
         .fetch_all(pool)
-        .await?;
-
-        Ok(results
-            .into_iter()
-            .map(
-                |(id, provider, email, display_name, scopes, created_at, updated_at)| {
-                    OAuthAccountInfo {
-                        id,
-                        provider,
-                        email,
-                        display_name,
-                        scopes,
-                        created_at,
-                        updated_at,
-                    }
-                },
-            )
-            .collect())
+        .await
     }
 
     /// List all OAuth accounts including tokens (for env injection into scripts)
     pub async fn list_all_with_tokens(pool: &PgPool) -> Result<Vec<OAuthAccount>, sqlx::Error> {
-        let results = sqlx::query_as::<
-            _,
-            (
-                Uuid,
-                String,
-                Option<String>,
-                Option<String>,
-                String,
-                Option<String>,
-                Option<DateTime<Utc>>,
-                String,
-                DateTime<Utc>,
-                DateTime<Utc>,
-            ),
-        >(
+        sqlx::query_as::<_, OAuthAccount>(
             r#"
             SELECT id, provider, email, display_name, access_token,
                    refresh_token, token_expiry, scopes,
@@ -380,38 +254,7 @@ impl OAuthStore {
             "#,
         )
         .fetch_all(pool)
-        .await?;
-
-        Ok(results
-            .into_iter()
-            .map(
-                |(
-                    id,
-                    provider,
-                    email,
-                    display_name,
-                    access_token,
-                    refresh_token,
-                    token_expiry,
-                    scopes,
-                    created_at,
-                    updated_at,
-                )| {
-                    OAuthAccount {
-                        id,
-                        provider,
-                        email,
-                        display_name,
-                        access_token,
-                        refresh_token,
-                        token_expiry,
-                        scopes,
-                        created_at,
-                        updated_at,
-                    }
-                },
-            )
-            .collect())
+        .await
     }
 
     /// Delete an OAuth account by UUID
@@ -423,6 +266,43 @@ impl OAuthStore {
 
         Ok(result.rows_affected() > 0)
     }
+}
+
+/// User-facing message for "this OAuth provider was requested but no account
+/// is connected for it". One source of truth so the proxy `script_handshake`
+/// layer's production code and its test stub stay in lockstep.
+pub fn provider_not_connected_msg(provider: &str) -> String {
+    format!(
+        "script_handshake requires OAuth provider '{}' but no account is connected; \
+         user must connect it first via connect_oauth_account",
+        provider
+    )
+}
+
+/// Build `OAUTH_*` environment variables from connected OAuth accounts.
+/// For each account: `OAUTH_{PROVIDER}_ACCESS_TOKEN` (always),
+/// `OAUTH_{PROVIDER}_EMAIL` (if known). Provider name is uppercased and
+/// `-` / `.` / space → `_` so a hyphenated provider lands as a legal
+/// identifier in shell.
+///
+/// Used by both subprocess injection (`build_script_env_vars` for
+/// run_python / run_bash / scheduled scripts) and the proxy
+/// `script_handshake` layer's `oauth_providers` field, so the env-var
+/// names stay identical across all entry points.
+pub fn account_env_vars(accounts: Vec<OAuthAccount>) -> Vec<(String, String)> {
+    let mut env_vars = Vec::new();
+    for account in accounts {
+        let provider = account
+            .provider
+            .to_uppercase()
+            .replace(['-', ' ', '.'], "_");
+        let prefix = format!("OAUTH_{}", provider);
+        env_vars.push((format!("{}_ACCESS_TOKEN", prefix), account.access_token));
+        if let Some(email) = account.email {
+            env_vars.push((format!("{}_EMAIL", prefix), email));
+        }
+    }
+    env_vars
 }
 
 // ---------------------------------------------------------------------------
@@ -439,7 +319,7 @@ pub struct TokenResponse {
 }
 
 /// Exchange an authorization code for tokens.
-pub async fn exchange_code(
+async fn exchange_code(
     token_url: &str,
     client_id: &str,
     client_secret: &str,
@@ -471,7 +351,7 @@ pub async fn exchange_code(
 }
 
 /// Refresh an access token using a refresh token.
-pub async fn refresh_access_token(
+async fn refresh_access_token(
     token_url: &str,
     client_id: &str,
     client_secret: &str,
@@ -605,7 +485,7 @@ fn merge_scopes(existing: &str, requested: &str) -> String {
 }
 
 /// Wait for an OAuth callback on the given listener, extract the authorization code.
-pub(crate) async fn wait_for_oauth_callback(
+async fn wait_for_oauth_callback(
     listener: tokio::net::TcpListener,
 ) -> Result<String, BoxError> {
     let (stream, _) = listener.accept().await?;
@@ -825,7 +705,7 @@ pub async fn run_oauth_flow(
 /// Returns (email, display_name). Best-effort: any error along the way
 /// (network, non-success status, JSON parse) is logged and downgraded to
 /// `(None, None)` so the OAuth flow can complete without optional metadata.
-pub async fn fetch_userinfo(
+async fn fetch_userinfo(
     userinfo_url: &str,
     access_token: &str,
 ) -> (Option<String>, Option<String>) {
@@ -995,5 +875,57 @@ mod tests {
             token_needs_refresh(&account),
             "token expiring in 59s should need refresh"
         );
+    }
+
+    fn make_env_account(provider: &str, email: Option<&str>, token: &str) -> OAuthAccount {
+        OAuthAccount {
+            id: Uuid::new_v4(),
+            provider: provider.to_string(),
+            email: email.map(String::from),
+            display_name: None,
+            access_token: token.to_string(),
+            refresh_token: None,
+            token_expiry: None,
+            scopes: String::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn account_env_vars_injects_access_token_and_email() {
+        let accounts = vec![make_env_account(
+            "google",
+            Some("user@gmail.com"),
+            "ya29.test-token",
+        )];
+        let map: std::collections::HashMap<_, _> = account_env_vars(accounts).into_iter().collect();
+        assert_eq!(
+            map.get("OAUTH_GOOGLE_ACCESS_TOKEN").unwrap(),
+            "ya29.test-token"
+        );
+        assert_eq!(map.get("OAUTH_GOOGLE_EMAIL").unwrap(), "user@gmail.com");
+    }
+
+    #[test]
+    fn account_env_vars_skips_email_when_none() {
+        let accounts = vec![make_env_account("github", None, "ghp_test123")];
+        let map: std::collections::HashMap<_, _> = account_env_vars(accounts).into_iter().collect();
+        assert_eq!(map.get("OAUTH_GITHUB_ACCESS_TOKEN").unwrap(), "ghp_test123");
+        assert!(!map.contains_key("OAUTH_GITHUB_EMAIL"));
+    }
+
+    #[test]
+    fn account_env_vars_normalizes_provider_name() {
+        let accounts = vec![make_env_account("my-provider", None, "tok")];
+        let map: std::collections::HashMap<_, _> = account_env_vars(accounts).into_iter().collect();
+        assert_eq!(map.get("OAUTH_MY_PROVIDER_ACCESS_TOKEN").unwrap(), "tok");
+    }
+
+    #[test]
+    fn provider_not_connected_msg_names_provider_and_recovery() {
+        let msg = provider_not_connected_msg("google");
+        assert!(msg.contains("google"));
+        assert!(msg.contains("connect_oauth_account"));
     }
 }

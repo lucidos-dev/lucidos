@@ -24,12 +24,24 @@ self.addEventListener('activate', (event) => event.waitUntil(clients.claim()));
 //
 // For GETs we wrap fetch in a single retry — iOS occasionally rejects the first
 // request when the SW just woke from suspension, and a retry succeeds.
+//
+// Content-addressed blob endpoints (/api/v1/blobs/<hash>[/preview]) get an extra
+// Cache API layer on top — the bytes for a hash never change, so a Cache entry
+// is valid forever and survives iOS PWA HTTP-cache eviction. Without this, every
+// thread visit re-fetches the preview and the empty <img> shows the dark page
+// background through it during the round-trip (the visible "black flash").
+const BLOB_CACHE = 'lucidos-blob-v1';
+
 self.addEventListener('fetch', (event) => {
   const url = event.request.url;
   if (!url.startsWith(self.location.origin + '/api/')) return;
   if (event.request.method !== 'GET') return;
   const path = url.slice(self.location.origin.length).split('?')[0];
   if (path === '/api/events') return;
+  if (path.startsWith('/api/v1/blobs/')) {
+    event.respondWith(fetchBlobWithCache(event.request));
+    return;
+  }
   event.respondWith(fetchWithRetry(event.request));
 });
 
@@ -39,6 +51,18 @@ async function fetchWithRetry(request) {
   } catch {
     return await fetch(request);
   }
+}
+
+async function fetchBlobWithCache(request) {
+  const cache = await caches.open(BLOB_CACHE);
+  const cached = await cache.match(request);
+  if (cached) return cached;
+  const response = await fetchWithRetry(request);
+  if (response.ok) {
+    // Clone off the response path so delivery isn't blocked on the cache write.
+    cache.put(request, response.clone()).catch(() => {});
+  }
+  return response;
 }
 
 // iOS doesn't reliably pass notification.data — fall back to the tag, which

@@ -9,8 +9,8 @@
 //! and the LLM calls `install_plugin` with that path.
 
 use axum::{
-    extract::{Multipart, State},
-    http::StatusCode,
+    extract::{Multipart, Path, State},
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use serde::Serialize;
@@ -19,6 +19,10 @@ use uuid::Uuid;
 
 use crate::api::AppState;
 use crate::core::plugins::PLUGIN_ARCHIVE_EXT;
+use crate::engine::tools::plugins::{
+    cancel_pending_install, cancel_pending_uninstall, confirm_pending_install,
+    confirm_pending_uninstall,
+};
 
 /// Plugin archives are mostly text bundles; cap well below the router-wide
 /// `DefaultBodyLimit`. The route in `api/mod.rs` applies a per-route
@@ -97,6 +101,103 @@ pub(super) async fn upload_archive(
         filename: safe_name,
         byte_size,
     }))
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ConfirmInstallResponse {
+    pub summary: String,
+    pub installed_files: Vec<String>,
+}
+
+/// 404 when the pending entry is gone (already consumed, expired, or wrong
+/// id); 500 for genuine write/emit failures. Both install and uninstall
+/// helpers return their "missing entry" error with the `no pending ` prefix.
+fn pending_status(err_msg: &str) -> StatusCode {
+    if err_msg.starts_with("no pending ") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+/// `POST /api/v1/plugins/install/:install_id/confirm` — user accepted the
+/// staged install in the install panel. Pops the entry, writes files into
+/// `data/`, emits `PluginInstalled` (stamped with the device that clicked
+/// Confirm), and (if the install touched any `auth-modules/` paths)
+/// auto-reloads the proxy WASM signer map.
+pub(super) async fn confirm_install(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(install_id): Path<String>,
+) -> Result<Json<ConfirmInstallResponse>, (StatusCode, Json<JsonValue>)> {
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match confirm_pending_install(&state.engine, &install_id, actor).await {
+        Ok(outcome) => Ok(Json(ConfirmInstallResponse {
+            summary: outcome.summary,
+            installed_files: outcome.installed_files,
+        })),
+        Err(e) => Err(err(pending_status(&e), &e)),
+    }
+}
+
+/// `POST /api/v1/plugins/install/:install_id/cancel` — user dismissed the
+/// staged install. Drops the staged temp dir and emits
+/// `PluginInstallCanceled` (stamped with the device that clicked Cancel)
+/// for audit. Idempotent: a missing `install_id` returns 404 (cleaner than
+/// treating "not pending" as success).
+pub(super) async fn cancel_install(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(install_id): Path<String>,
+) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match cancel_pending_install(&state.engine, &install_id, actor).await {
+        Ok(()) => Ok(Json(serde_json::json!({"canceled": true}))),
+        Err(e) => Err(err(pending_status(&e), &e)),
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ConfirmUninstallResponse {
+    pub summary: String,
+    pub files_deleted: Vec<String>,
+    pub files_missing: Vec<String>,
+}
+
+/// `POST /api/v1/plugins/uninstall/:uninstall_id/confirm` — user accepted the
+/// staged uninstall in the panel. Pops the entry, deletes the recorded files
+/// from `data/`, prunes empty parent dirs, emits `PluginUninstalled` (stamped
+/// with the confirming device), and (if any `auth-modules/` paths were
+/// touched) reloads the proxy WASM signer map. Symmetric with `confirm_install`.
+pub(super) async fn confirm_uninstall(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(uninstall_id): Path<String>,
+) -> Result<Json<ConfirmUninstallResponse>, (StatusCode, Json<JsonValue>)> {
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match confirm_pending_uninstall(&state.engine, &uninstall_id, actor).await {
+        Ok(outcome) => Ok(Json(ConfirmUninstallResponse {
+            summary: outcome.summary,
+            files_deleted: outcome.files_deleted,
+            files_missing: outcome.files_missing,
+        })),
+        Err(e) => Err(err(pending_status(&e), &e)),
+    }
+}
+
+/// `POST /api/v1/plugins/uninstall/:uninstall_id/cancel` — user dismissed the
+/// staged uninstall. No files are touched; emits `PluginUninstallCanceled`
+/// for audit. Idempotent (404 on missing id).
+pub(super) async fn cancel_uninstall(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(uninstall_id): Path<String>,
+) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match cancel_pending_uninstall(&state.engine, &uninstall_id, actor).await {
+        Ok(()) => Ok(Json(serde_json::json!({"canceled": true}))),
+        Err(e) => Err(err(pending_status(&e), &e)),
+    }
 }
 
 /// Reject filenames that would escape the upload directory or break the

@@ -37,10 +37,12 @@ function deviceIdHeader(): Record<string, string> {
 }
 
 /** `fetch` wrapped to always send `x-lucidos-device-id` so the engine can
- *  attribute the call to this device. Use for non-JSON-response mutating
- *  endpoints (apply-now, cancel, discard, etc.); JSON endpoints should use
- *  `json()` which already adds the header. */
-async function mutatingFetch(url: string, init?: RequestInit): Promise<Response> {
+ *  attribute the call to this device. Use when you need the raw `Response`
+ *  (custom `AbortSignal`, non-JSON body, status-specific handling like 409).
+ *  Pair with `throwIfNotOk(res)` so error responses surface the engine's
+ *  `{error}` body. JSON-response endpoints should use `json()`, which adds
+ *  the header and parses for you. */
+export async function mutatingFetch(url: string, init?: RequestInit): Promise<Response> {
   const headers = { ...deviceIdHeader(), ...(init?.headers as Record<string, string> | undefined) };
   return fetch(url, { ...init, headers });
 }
@@ -70,15 +72,20 @@ async function mutatingFetchIdempotent(url: string, init?: RequestInit): Promise
   }
 }
 
-/** Throw `ApiError` with the body's `{error}` field as the reason if present,
- *  otherwise fall back to `res.statusText`. */
-async function throwIfNotOk(res: Response): Promise<void> {
+/** Throw `ApiError` with the most specific reason available: the body's
+ *  `{error}` field when the body is JSON, the raw text when the body is
+ *  non-JSON (so proxy 502 HTML and plain-text panics surface their content),
+ *  else `res.statusText`. */
+export async function throwIfNotOk(res: Response): Promise<void> {
   if (res.ok) return;
+  const text = await res.text().catch(() => '');
   let reason = res.statusText;
-  try {
-    const body = await res.json();
-    if (body?.error) reason = body.error;
-  } catch { /* body not JSON, use statusText */ }
+  if (text) {
+    try {
+      const body = JSON.parse(text);
+      if (body?.error) reason = body.error;
+    } catch { reason = text; }
+  }
   throw new ApiError(res.status, reason);
 }
 
@@ -138,7 +145,7 @@ export async function submitChat(body: ChatRequestBody): Promise<{ event_id: str
 export async function cancelChat(threadId?: string): Promise<void> {
   const params = threadId ? `?thread_id=${encodeURIComponent(threadId)}` : '';
   const res = await mutatingFetchIdempotent(`${API}/chat/cancel${params}`, { method: 'POST' });
-  if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => res.statusText));
+  await throwIfNotOk(res);
 }
 
 export async function applyNow(threadId: string): Promise<void> {
@@ -209,17 +216,30 @@ export async function fetchCCCommands(
   return json<CCCommandsResponse>(`${API}/claude-code/commands${qs ? `?${qs}` : ''}`);
 }
 
-export async function cancelClaudeCode(apply?: boolean, threadId?: string, discard?: boolean): Promise<void> {
+/** Stop a running Claude Code session.
+ *
+ * Three modes:
+ *   - default (no `apply`, no `discard`): real Cancel/Stop click. Backend emits
+ *     `ResponseCanceled` if CC was actively working; nothing if CC was idle.
+ *   - `apply=true`: Apply Now. Backend auto-applies the change after CC stops.
+ *     No `ResponseCanceled` — `ChangeApplied` is the terminator.
+ *   - `discard=true`: Discard. Backend drops the change after CC stops. No
+ *     `ResponseCanceled` — `ChangeDiscarded` is the terminator.
+ *
+ * Archive uses a different endpoint (`POST /api/threads/archive`) which sets
+ * `StopReason::Archive` so `ThreadArchived` is the terminator.
+ */
+export async function stopClaudeCode(apply?: boolean, threadId?: string, discard?: boolean): Promise<void> {
   const params = new URLSearchParams();
   if (apply) params.set('apply', 'true');
   if (discard) params.set('discard', 'true');
   if (threadId) params.set('thread_id', threadId);
   const qs = params.toString();
-  const url = qs ? `${API}/claude-code/cancel?${qs}` : `${API}/claude-code/cancel`;
+  const url = qs ? `${API}/claude-code/stop?${qs}` : `${API}/claude-code/stop`;
   // Idempotent + iOS PWA retry: HTTP/2 half-closed POSTs after backgrounding
   // reject with TypeError("Load failed"), forcing the user to click again.
   const res = await mutatingFetchIdempotent(url, { method: 'POST' });
-  if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => res.statusText));
+  await throwIfNotOk(res);
 }
 
 export async function discardCCChanges(threadId: string): Promise<void> {
@@ -327,8 +347,13 @@ export interface ApplyChangeResult {
   review_thread_id?: string;
 }
 
+/** Apply spawns hardening / conflict CC sessions; Apply All loops synchronously
+ *  over N changes — both blow past the default 10s client timeout while the
+ *  backend keeps working, surfacing a misleading abort. */
+const APPLY_TIMEOUT_MS = 600_000;
+
 export async function applyChange(id: string): Promise<ApplyChangeResult> {
-  return json(`${API}/changes/${id}/apply`, { method: 'POST' });
+  return json(`${API}/changes/${id}/apply`, { method: 'POST' }, APPLY_TIMEOUT_MS);
 }
 
 export async function discardChange(id: string): Promise<{ message: string }> {
@@ -336,7 +361,7 @@ export async function discardChange(id: string): Promise<{ message: string }> {
 }
 
 export async function applyAllChanges(): Promise<{ message: string; restart_required: boolean }> {
-  return json(`${API}/changes/apply-all`, { method: 'POST' });
+  return json(`${API}/changes/apply-all`, { method: 'POST' }, APPLY_TIMEOUT_MS);
 }
 
 export async function discardAllChanges(): Promise<{ discarded: number; failed: number; errors: string[] }> {
@@ -438,6 +463,62 @@ export async function uploadPluginArchive(file: File): Promise<PluginArchiveUplo
   });
   await throwIfNotOk(res);
   return res.json();
+}
+
+export interface PluginConfirmInstallResponse {
+  summary: string;
+  installed_files: string[];
+}
+
+/** User accepted the staged install in the install panel. The engine writes
+ *  files into `data/`, emits `PluginInstalled`, and (if any `auth-modules/`
+ *  files were touched) auto-reloads the WASM signer map. */
+export async function confirmPluginInstall(installId: string): Promise<PluginConfirmInstallResponse> {
+  const res = await mutatingFetch(
+    `${API}/v1/plugins/install/${encodeURIComponent(installId)}/confirm`,
+    { method: 'POST' },
+  );
+  await throwIfNotOk(res);
+  return res.json();
+}
+
+/** User dismissed the staged install. The engine drops the staged temp dir
+ *  and emits `PluginInstallCanceled` for audit. */
+export async function cancelPluginInstall(installId: string): Promise<void> {
+  const res = await mutatingFetch(
+    `${API}/v1/plugins/install/${encodeURIComponent(installId)}/cancel`,
+    { method: 'POST' },
+  );
+  await throwIfNotOk(res);
+}
+
+export interface PluginConfirmUninstallResponse {
+  summary: string;
+  files_deleted: string[];
+  files_missing: string[];
+}
+
+/** User accepted the staged uninstall in the panel. The engine deletes the
+ *  recorded files from `data/`, prunes empty parent dirs, emits
+ *  `PluginUninstalled` with the deleted/missing partition, and (if any
+ *  `auth-modules/` files were removed) reloads the WASM signer map. */
+export async function confirmPluginUninstall(uninstallId: string): Promise<PluginConfirmUninstallResponse> {
+  const res = await mutatingFetch(
+    `${API}/v1/plugins/uninstall/${encodeURIComponent(uninstallId)}/confirm`,
+    { method: 'POST' },
+  );
+  await throwIfNotOk(res);
+  return res.json();
+}
+
+/** User dismissed the staged uninstall. No files touched; emits
+ *  `PluginUninstallCanceled` for audit. */
+export async function cancelPluginUninstall(uninstallId: string): Promise<void> {
+  const res = await mutatingFetch(
+    `${API}/v1/plugins/uninstall/${encodeURIComponent(uninstallId)}/cancel`,
+    { method: 'POST' },
+  );
+  await throwIfNotOk(res);
 }
 
 // --- Notifications (SDK delegation) ---
@@ -623,13 +704,7 @@ export async function postAppCapture(
 }
 
 // --- MCP Consent ---
-/** Scope to remember when the user grants an "Always allow"-style click.
- *  `narrow` / `broad` append to `~/.lucidos/cc-allowed-tools` and reach CC
- *  via `--allowedTools` on every spawn (survives engine restart, but only
- *  works for tools/paths CC respects). `session` is engine-side, in-memory,
- *  scoped to one thread — works for *every* tool and path, including CC's
- *  protected `.claude/` and `.git/` writes. Omit for one-shot Allow. */
-export type PersistScope = 'narrow' | 'broad' | 'session';
+import type { PersistScope } from '../store/thread-events';
 
 export async function postMcpConsent(
   requestId: string,

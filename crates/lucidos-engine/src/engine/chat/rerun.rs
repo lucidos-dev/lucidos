@@ -7,18 +7,18 @@
 //!    ResponseAborted on the thread.
 //! 2. Walks events between the originating event and the abort, summarizing
 //!    completed `ToolCalled` + `ToolResult` pairs into a markdown bullet list.
-//! 3. Emits `SessionRecovered { branch: "", actor }` so the frontend opens a
-//!    new "resume" exchange.
+//! 3. Emits `ContinuationStarted { branch: "", actor }` so the frontend
+//!    opens a new "resume" exchange.
 //! 4. Emits `UserPromptInjected { text: <engine note>, mode: engine,
 //!    actor: engine }` carrying the side-effect-aware system note. The engine
 //!    note is what the LLM will read; persisting it as `UserPromptInjected`
 //!    leaves the audit trail visible in the UI.
 //! 5. Re-enters `process_message_with_steps_internal` with the engine note as
-//!    the latest user message, using the SessionRecovered event id as
+//!    the latest user message, using the ContinuationStarted event id as
 //!    `pre_emitted_origin` so the rerun's events carry a fresh
 //!    `request_event_id` linking them to the resume boundary.
 //!
-//! Idempotency: if a SessionRecovered already exists newer than the most
+//! Idempotency: if a ContinuationStarted already exists newer than the most
 //! recent ResponseAborted, the call is a no-op (returns Ok). Prevents
 //! double-Continue from doubling the rerun.
 
@@ -39,11 +39,11 @@ const MAX_FIELD_CHARS: usize = 200;
 /// Outcome of `continue_chat` — used by the HTTP handler to log clearly.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ContinueChatOutcome {
-    /// Rerun was kicked off (SessionRecovered + UserPromptInjected emitted,
-    /// agentic loop spawned).
+    /// Rerun was kicked off (ContinuationStarted + UserPromptInjected
+    /// emitted, agentic loop spawned).
     Resumed,
-    /// A SessionRecovered already exists newer than the latest ResponseAborted.
-    /// The click is a no-op — likely a double-Continue race.
+    /// A ContinuationStarted already exists newer than the latest
+    /// ResponseAborted. The click is a no-op — likely a double-Continue race.
     AlreadyResumed,
     /// No ResponseAborted exists for this thread, or no originating event was
     /// found. Nothing to continue.
@@ -82,14 +82,17 @@ impl LucidosEngine {
             }
         };
 
-        // Idempotency: if a SessionRecovered already exists with a higher
+        // Idempotency: if a ContinuationStarted already exists with a higher
         // sequence than the abort, the user's previous click already started
-        // a rerun. Don't double-spawn.
+        // a rerun. Don't double-spawn. The 20260513 migration rewrites the
+        // older names (`SessionRecovered`, `SessionResumed`) to
+        // `ContinuationStarted` at startup, so a single-name match suffices
+        // — sqlx runs migrations before any query.
         let already_resumed: bool = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS ( \
                 SELECT 1 FROM events \
                 WHERE aggregate_id = $1 \
-                  AND event_type = 'SessionRecovered' \
+                  AND event_type = 'ContinuationStarted' \
                   AND sequence > (SELECT sequence FROM events WHERE id = $2) \
             )",
         )
@@ -100,7 +103,7 @@ impl LucidosEngine {
 
         if already_resumed {
             log!(
-                "[Continue] SessionRecovered already exists newer than abort for thread {} — no-op",
+                "[Continue] ContinuationStarted already exists newer than abort for thread {} — no-op",
                 thread_id
             );
             return Ok(ContinueChatOutcome::AlreadyResumed);
@@ -150,10 +153,10 @@ impl LucidosEngine {
         let summary = build_side_effect_summary(&between_events);
         let engine_note = build_engine_note(&summary);
 
-        // SessionRecovered opens the new exchange in the timeline. Use serde
-        // to map the abort's persisted channel string back to EventChannel —
-        // a hand-rolled match would silently downgrade unknown variants to
-        // Chat if the wire format ever grows.
+        // ContinuationStarted opens the new exchange in the timeline. Use
+        // serde to map the abort's persisted channel string back to
+        // EventChannel — a hand-rolled match would silently downgrade unknown
+        // variants to Chat if the wire format ever grows.
         let resume_channel: EventChannel = abort_channel
             .as_deref()
             .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
@@ -162,7 +165,7 @@ impl LucidosEngine {
             .event_bus
             .emit(BusEvent::Thread {
                 thread_id,
-                event: ThreadEvent::SessionRecovered {
+                event: ThreadEvent::ContinuationStarted {
                     branch: String::new(),
                     origin: None,
                 },
@@ -173,25 +176,25 @@ impl LucidosEngine {
                 },
             })
             .await?
-            .expect("SessionRecovered is persisted");
-        let session_recovered_id = recovered.event_id;
+            .expect("ContinuationStarted is persisted");
+        let continuation_started_id = recovered.event_id;
 
         // UserPromptInjected carries the engine note for the audit trail.
-        // request_event_id points at SessionRecovered so the resume exchange
-        // groups this event as its own step in the timeline.
+        // request_event_id points at ContinuationStarted so the resume
+        // exchange groups this event as its own step in the timeline.
         self.event_bus
             .emit(BusEvent::Thread {
                 thread_id,
                 event: ThreadEvent::UserPromptInjected {
                     text: engine_note.clone(),
                     mode: ActorMode::Engine,
-                    origin: Some(MessageOrigin::engine(EngineReason::SessionRecovered)),
+                    origin: Some(MessageOrigin::engine(EngineReason::ContinuationStarted)),
                     injected_message_id: None,
                 },
                 meta: EventMeta {
                     channel: Some(resume_channel),
-                    request_event_id: Some(session_recovered_id),
-                    actor: Some(MessageOrigin::engine(EngineReason::SessionRecovered)),
+                    request_event_id: Some(continuation_started_id),
+                    actor: Some(MessageOrigin::engine(EngineReason::ContinuationStarted)),
                     ..EventMeta::NONE
                 },
             })
@@ -199,10 +202,10 @@ impl LucidosEngine {
 
         // The engine note itself is the user prompt to the LLM (the original
         // prompt is in the thread history). `pre_emitted_origin =
-        // Some(session_recovered_id)` skips a fresh MessageReceived emit and
-        // stamps every resulting event with `request_event_id =
-        // session_recovered_id` — the frontend uses this to gather them into
-        // the resume exchange.
+        // Some(continuation_started_id)` skips a fresh MessageReceived emit
+        // and stamps every resulting event with `request_event_id =
+        // continuation_started_id` — the frontend uses this to gather them
+        // into the resume exchange.
         let engine = self.clone_arc();
         let prompt_for_llm = engine_note;
         tokio::spawn(async move {
@@ -225,9 +228,9 @@ impl LucidosEngine {
                     None,
                     ActorMode::Engine,
                     None,
-                    Some(session_recovered_id),
+                    Some(continuation_started_id),
                     None,
-                    Some(MessageOrigin::engine(EngineReason::SessionRecovered)),
+                    Some(MessageOrigin::engine(EngineReason::ContinuationStarted)),
                 )
                 .await
             {

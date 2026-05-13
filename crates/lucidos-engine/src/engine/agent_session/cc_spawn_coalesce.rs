@@ -183,6 +183,7 @@ pub(crate) fn queued_to_orphans(
                 spawning_event_id: None,
                 images: q.images,
                 origin: None,
+                kind: crate::engine::InjectedPromptKind::UserText,
             })
         })
         .collect()

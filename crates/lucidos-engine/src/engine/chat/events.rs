@@ -487,7 +487,7 @@ mod origin_invariants {
     #[test]
     fn engine_origin_with_engine_mode_ok() {
         let origin = MessageOrigin::Engine {
-            reason: crate::engine::thread_events::EngineReason::SessionRecovered,
+            reason: crate::engine::thread_events::EngineReason::ContinuationStarted,
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),

@@ -21,14 +21,37 @@ const HOOK_TIMEOUT_SECONDS: u64 = 86_400;
 pub(crate) fn build_cc_settings_json() -> String {
     serde_json::json!({
         "hooks": {
-            "PreToolUse": [{
-                "matcher": "AskUserQuestion",
-                "hooks": [{
-                    "type": "command",
-                    "command": "lucidos ask-user-question-hook",
-                    "timeout": HOOK_TIMEOUT_SECONDS
-                }]
-            }],
+            "PreToolUse": [
+                {
+                    "matcher": "AskUserQuestion",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "lucidos ask-user-question-hook",
+                        "timeout": HOOK_TIMEOUT_SECONDS
+                    }]
+                },
+                {
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "lucidos cc-bash-guard"
+                    }]
+                },
+                {
+                    "matcher": "Read",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "lucidos cc-read-coerce"
+                    }]
+                },
+                {
+                    "matcher": "Edit",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "lucidos cc-edit-preread"
+                    }]
+                }
+            ],
             "Stop": [{
                 "hooks": [{
                     "type": "command",
@@ -74,6 +97,72 @@ mod tests {
             entries[0]["hooks"][0]["timeout"],
             serde_json::json!(HOOK_TIMEOUT_SECONDS),
             "must override CC's 60s default so long-running user thinking doesn't kill the hook"
+        );
+    }
+
+    #[test]
+    fn json_registers_pretooluse_hook_for_bash_guard() {
+        // Without the Bash matcher, an in-CC `ps | grep cargo | xargs kill`
+        // would once again kill every concurrent CC. Regression test for the
+        // 2026-05-10 incident.
+        let json = build_cc_settings_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries = parsed["hooks"]["PreToolUse"].as_array().expect("array");
+        let bash_entry = entries
+            .iter()
+            .find(|e| e["matcher"] == "Bash")
+            .expect("must register a Bash matcher");
+        assert_eq!(bash_entry["hooks"][0]["type"], "command");
+        assert_eq!(
+            bash_entry["hooks"][0]["command"], "lucidos cc-bash-guard",
+            "must invoke the cc-bash-guard subcommand the engine ships",
+        );
+        assert!(
+            bash_entry["hooks"][0]["timeout"].is_null(),
+            "guard is fast — should not need an explicit timeout override",
+        );
+    }
+
+    #[test]
+    fn json_registers_pretooluse_hook_for_read_coerce() {
+        // The model occasionally sends `"offset": "16384"` (string) instead
+        // of a number; CC's input validator then fails the call. The
+        // `cc-read-coerce` hook absorbs that via the `updatedInput` mechanism
+        // before validation runs. Without the matcher wired here, the
+        // workaround never fires.
+        let json = build_cc_settings_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries = parsed["hooks"]["PreToolUse"].as_array().expect("array");
+        let read_entry = entries
+            .iter()
+            .find(|e| e["matcher"] == "Read")
+            .expect("must register a Read matcher");
+        assert_eq!(read_entry["hooks"][0]["type"], "command");
+        assert_eq!(
+            read_entry["hooks"][0]["command"], "lucidos cc-read-coerce",
+            "must invoke the cc-read-coerce subcommand the engine ships",
+        );
+    }
+
+    #[test]
+    fn json_registers_pretooluse_hook_for_edit_preread() {
+        // The "File has not been read yet" failure mode (14 occurrences in
+        // 24h post the doc-only nudge) is a workflow loop, not a doc gap —
+        // the agent jumps to Edit after sub-task switches and CC's internal
+        // validator rejects. The `cc-edit-preread` hook turns the rejection
+        // into an explicit "Read first, then retry Edit" deny so the model
+        // is forced into the right loop.
+        let json = build_cc_settings_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries = parsed["hooks"]["PreToolUse"].as_array().expect("array");
+        let edit_entry = entries
+            .iter()
+            .find(|e| e["matcher"] == "Edit")
+            .expect("must register an Edit matcher");
+        assert_eq!(edit_entry["hooks"][0]["type"], "command");
+        assert_eq!(
+            edit_entry["hooks"][0]["command"], "lucidos cc-edit-preread",
+            "must invoke the cc-edit-preread subcommand the engine ships",
         );
     }
 

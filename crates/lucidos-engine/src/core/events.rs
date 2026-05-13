@@ -113,19 +113,22 @@ pub fn walk_thread_images_meta<E: HasEventPayload>(
     workspace: &std::path::Path,
     events: &[E],
 ) -> Vec<ThreadImageMeta> {
-    let mut out = Vec::new();
-    let mut index = 0usize;
-    for (source, image_ref) in walk_thread_image_refs(events) {
-        let mime_type = match image_ref {
-            ImageRef::BlobHash(hash) => crate::core::blobs::resolve_blob(workspace, hash)
-                .map(|b| b.mime)
-                .unwrap_or_else(|| GENERATED_IMAGE_MIME.to_string()),
-            ImageRef::InlineBase64(_) => GENERATED_IMAGE_MIME.to_string(),
-        };
-        index += 1;
-        out.push(ThreadImageMeta { index, source, mime_type });
-    }
-    out
+    walk_thread_image_refs(events)
+        .enumerate()
+        .map(|(i, (source, image_ref))| {
+            let mime_type = match image_ref {
+                ImageRef::BlobHash(hash) => crate::core::blobs::resolve_blob(workspace, hash)
+                    .map(|b| b.mime)
+                    .unwrap_or_else(|| GENERATED_IMAGE_MIME.to_string()),
+                ImageRef::InlineBase64(_) => GENERATED_IMAGE_MIME.to_string(),
+            };
+            ThreadImageMeta {
+                index: i + 1,
+                source,
+                mime_type,
+            }
+        })
+        .collect()
 }
 
 /// Bytes-loading walk for tool resolution and thread-image GET. Missing
@@ -137,25 +140,32 @@ pub fn walk_thread_images<E: HasEventPayload>(
     workspace: &std::path::Path,
     events: &[E],
 ) -> Vec<ThreadImage> {
-    let mut images = Vec::new();
-    let mut index = 0usize;
-    for (source, image_ref) in walk_thread_image_refs(events) {
-        let (base64, mime_type) = match image_ref {
-            ImageRef::BlobHash(hash) => {
-                crate::core::blobs::read_blob_as_base64(workspace, hash).unwrap_or_else(|| {
+    walk_thread_image_refs(events)
+        .enumerate()
+        .map(|(i, (source, image_ref))| {
+            let (base64, mime_type) = match image_ref {
+                ImageRef::BlobHash(hash) => crate::core::blobs::read_blob_as_base64(
+                    workspace, hash,
+                )
+                .unwrap_or_else(|| {
                     crate::log!(
                         "[walk_thread_images] Blob {} missing or unreadable, yielding empty entry",
                         hash
                     );
                     (String::new(), GENERATED_IMAGE_MIME.to_string())
-                })
+                }),
+                ImageRef::InlineBase64(b64) => {
+                    (b64.to_string(), GENERATED_IMAGE_MIME.to_string())
+                }
+            };
+            ThreadImage {
+                index: i + 1,
+                source,
+                base64,
+                mime_type,
             }
-            ImageRef::InlineBase64(b64) => (b64.to_string(), GENERATED_IMAGE_MIME.to_string()),
-        };
-        index += 1;
-        images.push(ThreadImage { index, source, base64, mime_type });
-    }
-    images
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ pub(crate) use cc_spawn_coalesce::{
 };
 
 pub(crate) use external_edits::git_head_sha as external_edits_for_recovery_head_sha;
-pub(crate) use parsing::parse_ask_user_question_input;
+pub(crate) use parsing::parse_ask_user_question_inputs;
 pub(crate) use prompts::build_merge_prompt;
 pub(crate) use reconstruct::prepend_reconstruction;
 pub(crate) use resume::{change_description_fallback, latest_originating_event_id, lookup_latest_cc_session_id};

@@ -5,6 +5,7 @@ import type { EngineReason } from '../store/thread-events';
  *  The popover heading ("Why the engine acted") is owned by the renderer. */
 export function describeEngineReason(reason: EngineReason): string | null {
   switch (reason.kind) {
+    case 'continuation_started':
     case 'session_recovered':
       return 'CC sessions running when the engine stops are auto-resumed when it restarts. This event marks the resume.';
     case 'orphan_recovery':
@@ -14,7 +15,7 @@ export function describeEngineReason(reason: EngineReason): string | null {
     case 'stale_session':
       return 'The engine cleans up CC sessions that became stale (process gone, marker missing). This event marks the cleanup.';
     case 'merge_conflict':
-      return 'The engine detected a conflict when merging changes from main into your branch. Resolve it before applying.';
+      return 'The engine detected a conflict when merging changes from main into your branch. We need to resolve it before applying.';
     case 'missing_hardening':
       return 'Hardening (`/harden`) must run before changes are applied. The engine queues it automatically when the marker is missing.';
     case 'scheduler':

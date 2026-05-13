@@ -1,0 +1,93 @@
+---
+globs:
+  - "system-knowhow/**"
+  - "docs/taxonomy.md"
+  - "crates/lucidos-engine/src/engine/thread_events.rs"
+  - "crates/lucidos-engine/src/engine/event_bus.rs"
+  - "crates/lucidos-engine/src/scheduler/mod.rs"
+  - "crates/lucidos-engine/src/llm/tools.rs"
+  - "crates/lucidos-engine/src/engine/tools/**"
+  - "crates/lucidos-engine/src/engine/agent_session/prompts.rs"
+  - "crates/lucidos-engine/src/api/history.rs"
+  - "crates/lucidos-engine/src/api/app_ui.rs"
+  - "crates/lucidos-engine/src/api/proxy_pipeline_config.rs"
+  - "crates/lucidos-engine/src/api/proxy.rs"
+  - "crates/lucidos-engine/src/api/proxy_migration.rs"
+  - "crates/lucidos-engine/src/api/proxy_script_runner.rs"
+  - "crates/lucidos-engine/src/api/plugins.rs"
+  - "crates/lucidos-engine/src/core/plugins.rs"
+  - "crates/lucidos-engine/src/engine/tools/plugins.rs"
+  - "packages/lucidos-sdk/**"
+  - "crates/lucidos-cli/**"
+---
+
+# System-Knowhow Maintenance
+
+The `system-knowhow/` files are the workspace-facing contract: each `.md` file is loaded into the engine LLM's context as the canonical reference for the surface it documents. When the underlying surface drifts, the docs become a lie that the engine actively trusts — every workspace that retrieves the stale knowhow gets bad guidance.
+
+This rule has two halves:
+
+1. **Drift prevention (this file).** Every code change that touches a documented surface MUST update the matching `system-knowhow/*.md` in the same change. Reviewers and `/harden` flag any drift as a hardening failure.
+2. **Recipe maintenance (below).** When you change one system-knowhow file, the *other* recipes that reference it (workspace-audit, workspace-learning) may need to follow.
+
+## Drift prevention — required updates by surface
+
+When you touch any of the surfaces in the left column, you MUST update the file in the right column **in the same commit / branch**. Failing to do so is a `/harden` failure: the diff makes a promise the docs don't keep, and any LLM that loads the stale knowhow afterwards will be wrong.
+
+| You changed… | You MUST also update… |
+|---|---|
+| `crates/lucidos-engine/src/engine/thread_events.rs` (`ThreadEvent` enum — variant added/removed/renamed, payload field changed, persistence flipped, alias added/removed) | `system-knowhow/thread-events.md` (master enumeration + payload shapes), AND if the change touches a `CodingAgent*` / `UserQuestion*` / `CodingAgentPermission*` variant, also `system-knowhow/coding-agent-events.md` |
+| `crates/lucidos-engine/src/engine/event_bus.rs` (`SystemEvent` enum — variant added/removed/renamed, aggregate name changed, persistence/projection routing changed) | `.claude/rules/db.md` § Key event types, AND any `system-knowhow/*.md` that references that event by name (grep first — workspace-learning + thread-events + coding-agent-events all index events by name) |
+| `crates/lucidos-engine/src/scheduler/mod.rs` (`// Allow a curated subset of ThreadEvents` block — adding/removing an entry, changing the trigger matcher routing) | `system-knowhow/thread-events.md` "In allowlist" column, AND `system-knowhow/coding-agent-events.md` "CRITICAL" section, AND `system-knowhow/building-a-trigger.md` if the change opens a new "you can now `on_event:` X" path |
+| `packages/lucidos-sdk/**` (the `window.lucidos.*` JS surface — new/changed method, signature change, namespace addition) | `system-knowhow/js-sdk.md` § matching `lucidos.<namespace>` heading (also see `.claude/rules/sdk.md` for the same rule from the SDK side) |
+| `crates/lucidos-cli/**` (the `lucidos` CLI — new subcommand, flag change, output shape change) | `system-knowhow/lucidos-cli.md` |
+| `crates/lucidos-engine/src/{api,core}/plugins.rs` + `crates/lucidos-engine/src/engine/tools/plugins.rs` (plugin manifest schema, install / uninstall / list flow, plugin LLM tools) | `system-knowhow/building-a-plugin.md`, AND `docs/taxonomy.md` § plugins if the layout / install semantics changed |
+| `crates/lucidos-engine/src/llm/tools.rs` + `crates/lucidos-engine/src/engine/tools/**` (LLM tool added/removed/renamed, args schema changed) | `crates/lucidos-engine/src/engine/agent_session/prompts.rs` (system prompts advertise tools), AND `system-knowhow/best-practices.md` / `system-knowhow/intent-registry.md` if the tool's intent maps there |
+| `crates/lucidos-engine/src/api/history.rs` + `crates/lucidos-engine/src/api/app_ui.rs` (HTTP shapes for events / app UI bridge) | `system-knowhow/js-sdk.md` (the SDK calls these), AND `system-knowhow/building-an-app.md` if the app-side contract shifts |
+| `crates/lucidos-engine/src/api/proxy_pipeline_config.rs` + `proxy*.rs` siblings (the on-disk `data/config/apis.json` schema — auth pipeline, signer kinds, header/body shapes) | `system-knowhow/building-an-auth-handshake.md`, AND `system-knowhow/best-practices.md` § `config/` |
+| `crates/lucidos-engine/src/engine/agent_session/prompts.rs` (engine system prompts — the taxonomy/trigger sections, the intent registry advertise-list, the knowhow listing) | `system-knowhow/intent-registry.md` if intents added/removed, AND `system-knowhow/workspace-audit.md` (audit's reference table names sections of this file by heading) |
+
+The rule is simple: **the doc and the code ship together, in the same commit, on the same branch**. If the doc update would be large and you want to defer it, that's a sign the change itself needs to wait. Do not land a code change with a TODO to "update knowhow later" — the engine LLM doesn't read TODOs, it reads the published `system-knowhow/*.md`.
+
+## High-risk surfaces — new ones MUST ship with their doc
+
+A new surface in any of these categories cannot land without a matching `system-knowhow/*.md` (either a new file or a section appended to an existing file):
+
+- A new `ThreadEvent` variant — must land with a row in `system-knowhow/thread-events.md` (and a deep-dive section if the payload is non-trivial).
+- A new `SystemEvent` variant — must land with a row in `.claude/rules/db.md` § Key event types AND, if it's user-meaningful, in `system-knowhow/thread-events.md` or `system-knowhow/workspace-learning.md` as appropriate.
+- A new `lucidos.*` SDK method or namespace — must land with a `## lucidos.<namespace>` section in `system-knowhow/js-sdk.md` (signature, example, when-to-use).
+- A new `lucidos` CLI subcommand or flag — must land with a section in `system-knowhow/lucidos-cli.md`.
+- A new auth-pipeline shape in the `apis.json` schema (signer kind, layer, header/body mode — defined in `crates/lucidos-engine/src/api/proxy_pipeline_config.rs` and the `proxy*.rs` siblings) — must land with the worked example in `system-knowhow/building-an-auth-handshake.md`.
+- A new entry in the scheduler `ThreadEvent` allowlist — must land with the "In allowlist" column flipped in `system-knowhow/thread-events.md` AND a follow-up note in `system-knowhow/coding-agent-events.md` if the new entry is CC-related.
+- A change to the plugin manifest schema (required keys, validation rules, install / uninstall flow) — must land with the matching schema section in `system-knowhow/building-a-plugin.md`.
+
+## `/harden` enforcement
+
+`/harden` reviews the diff against this rule. A diff that touches any of the surfaces above without a corresponding `system-knowhow/*.md` update is a hardening failure — the same severity as a failing test. Re-open the work, write the doc update, and re-run `/harden`.
+
+The check is intentional, not just a heuristic: the engine LLM that reads these knowhow files is a downstream consumer of the same code, on every workspace install. Drift compounds across thousands of LLM calls. A 5-minute doc edit at change time saves hours of wrong guidance later.
+
+## After-the-fact detection
+
+`system-knowhow/workspace-audit.md` is the recipe a workspace can run to detect drift between its installed system-knowhow files and the actual engine surfaces. It's the safety net — useful for spotting drift introduced by older changes that landed without the rule above. The rule above is the prevention; the audit is the cleanup.
+
+## Maintaining workspace-audit
+
+`system-knowhow/workspace-audit.md` is the recipe Lucidos uses to audit a workspace for drift against current conventions. It deliberately **references** the other system-knowhow files instead of restating their rules — so when you change one of those files, the audit may need to follow.
+
+If your change touches `system-knowhow/best-practices.md`, `system-knowhow/js-sdk.md`, `system-knowhow/lucidos-cli.md`, `system-knowhow/intent-registry.md`, `docs/taxonomy.md`, or the engine system prompt's taxonomy / trigger section, open `system-knowhow/workspace-audit.md` and check that:
+
+- The reference table still names the right files and what they own.
+- Any check that names a section heading or filename in those sources still resolves.
+- New rules warrant a new check (or expansion of an existing check).
+- Removed / renamed rules don't leave dangling checks.
+
+## Maintaining workspace-learning
+
+`system-knowhow/workspace-learning.md` is the sibling recipe that looks at runtime *events* and proposes improvements to the workspace's apps, triggers, knowhow, and scripts. Where audit checks compliance against today's rules, learning surfaces the cases where today's rules might be wrong. Both produce a report under `data/artifacts/` and emit a completion event; neither edits anything.
+
+The learning recipe queries event types by name. If you rename, retire, or add an event type that signals friction (failures, aborts, circuit-breaker trips, trigger errors, repeated user corrections), open `system-knowhow/workspace-learning.md` and check that:
+
+- The event names listed under "What to walk" still exist and still mean the same thing.
+- New friction signals warrant a new pattern category.
+- The completion event name (`WorkspaceLearningCompleted`) still matches what the recipe emits.

@@ -1,8 +1,8 @@
 import { API_BASE, postMcpConsent } from '../../api/client';
 import type { Change } from '../../api/client';
 import { threadMap, focusedThreadId, changes, appliedChanges, changesHasMore, updateAvailable, applyingChangeIds, applyingNowThreadIds, generatedTitleIds, ccSessionVersion, setFocusedThread } from '../store';
-import { memoryRebuildProgress, backupProgress, backupListVersion, recoveryProgress, showConfirm, showToast, repoSource } from '../store';
-import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadState, type ThreadEvent, type TransientEvent } from '../thread-events';
+import { memoryRebuildProgress, backupProgress, backupListVersion, recoveryProgress, showConfirm, showToast, repoSource, panelOverlay } from '../store';
+import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import type { ThreadChannel } from '../store';
 import type { MenuItem } from '../types';
 import { handleNotificationSSE } from './notifications';
@@ -12,19 +12,21 @@ import { loadArtifacts, openFilePreview, openUrl, normalizeDataPath } from './ar
 import { navigateToTrigger } from './triggers';
 import { refreshAppUI, captureAppUI, openAppById } from './apps';
 import { openCredentialRequest } from './credentials';
+import { openPluginInstallRequest } from './plugin-install';
+import { openPluginUninstallRequest } from './plugin-uninstall';
 import { setActiveMenu, switchMenuItem, openSettingsSubview, landOnAccountsWithOverlay } from './menu';
 import { pushNavState } from './navigation';
 import { initPushSubscription } from './push';
 import { getDeviceId, toggleDevicePush } from './devices';
 import { scrollToBottom } from '../../components/chat/scrollState';
-import { focusThread } from './threads';
+import { focusThread, unfocusThread } from './threads';
 import { refreshRepoView } from './repositories';
 import { processSSEForReferences } from './entityReferences';
 import { loadAllThreads, refreshThreadEvents } from './thread-loading';
-import { applyRemoteCompose, pendingComposePuts } from './compose';
+import { applyRemoteCompose, ensureFocusedComposeThread, pendingComposePuts, updateCompose } from './compose';
 import { clearDraft, setDraft } from '../composeDrafts';
 import { removeThreadNavEntries } from './thread-navigation';
-import { isComposeFocusedHere } from '../../components/chat/promptFocus';
+import { focusPromptNow, isComposeFocusedHere } from '../../components/chat/promptFocus';
 import { formatBytes } from '../../utils/formatBytes';
 
 let eventSource: EventSource | null = null;
@@ -284,7 +286,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     }
     // Infer source from event type — coding-agent events mean claude_code, not chat
     const isCcEvent = event.type === 'SessionStarted'
-      || event.type === 'SessionRecovered'
+      || event.type === 'ContinuationStarted'
       || event.type.startsWith('CodingAgent');
     const isTriggerEvent = event.type === 'TriggerStarted';
     const isThreadStarted = event.type === 'ThreadStarted';
@@ -362,7 +364,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   //      the local PUT that may not have round-tripped yet.
   if (event.type === 'MessageReceived') {
     thread.meta.state = 'active';
-    if (!isFromThisDevice(event)) clearComposeIfUnfocused(thread, threadId);
+    if (!isFromThisDevice(event)) clearComposeIfUnfocused(threadId);
   }
   if (event.type === 'ThreadDiscarded') {
     thread.meta.state = 'discarded';
@@ -374,7 +376,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
         if (focusedThreadId.value === threadId) setFocusedThread(null);
         removeThreadNavEntries(threadId);
       }
-      clearComposeIfUnfocused(thread, threadId);
+      clearComposeIfUnfocused(threadId);
     }
   }
   if (event.type === 'ThreadArchived') {
@@ -386,7 +388,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // (no SessionStarted fires for those — the existing process resumes).
   // CodingAgentIdled guarantees CC binary is initialized — retry from
   // SessionStarted may have exhausted before Init arrived.
-  if (event.type === 'SessionStarted' || event.type === 'SessionRecovered'
+  if (event.type === 'SessionStarted' || event.type === 'ContinuationStarted'
       || event.type === 'SessionEnded' || event.type === 'CodingAgentUserMessageSent'
       || event.type === 'CodingAgentIdled' || event.type === 'CodingAgentSettingsChanged') {
     ccSessionVersion.value++;
@@ -637,7 +639,7 @@ function isFromThisDevice(event: ThreadEvent | TransientEvent): boolean {
   }
 }
 
-function clearComposeIfUnfocused(_thread: ThreadState, threadId: string): void {
+function clearComposeIfUnfocused(threadId: string): void {
   if (isComposeFocusedHere(threadId)) return;
   clearDraft(threadId);
 }
@@ -651,6 +653,24 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent): void {
       } catch (e) {
         console.error('Failed to parse credential request:', e);
         showToast('Failed to handle credential request from engine', 'error');
+      }
+      break;
+
+    case 'PluginInstallRequest':
+      try {
+        openPluginInstallRequest(JSON.parse((event as { payload: string }).payload));
+      } catch (e) {
+        console.error('Failed to parse plugin install request:', e);
+        showToast('Failed to handle plugin install request from engine', 'error');
+      }
+      break;
+
+    case 'PluginUninstallRequest':
+      try {
+        openPluginUninstallRequest(JSON.parse((event as { payload: string }).payload));
+      } catch (e) {
+        console.error('Failed to parse plugin uninstall request:', e);
+        showToast('Failed to handle plugin uninstall request from engine', 'error');
       }
       break;
 
@@ -763,6 +783,7 @@ export function handleNavigationRequest(nav: {
   file_path?: string;
   url?: string;
   id?: string;
+  prompt?: string;
 }): void {
   const navAppId = nav.app_id;
   switch (nav.target) {
@@ -804,6 +825,25 @@ export function handleNavigationRequest(nav: {
       setActiveMenu('triggers', { type: 'form', form: { type: 'trigger' } });
       pushNavState();
       break;
+    case 'new-chat': {
+      // Close any open overlay (app, file preview, settings panel) so the
+      // chat panel underneath becomes the visible target for the prefill.
+      panelOverlay.value = null;
+      // Drop any focused thread so ensureFocusedComposeThread allocates a
+      // fresh one — without this it returns the existing focused id and the
+      // prefill would land on whatever thread the user was viewing.
+      unfocusThread();
+      const id = ensureFocusedComposeThread();
+      if (typeof nav.prompt === 'string' && nav.prompt.length > 0) {
+        updateCompose(id, { text: nav.prompt });
+      }
+      // rAF — Preact hasn't committed the panelOverlay/unfocusThread mutations
+      // yet, so a sync focus would query the pre-render DOM and miss (or hit
+      // the wrong layout's) prompt-input element. Mirrors the keyboard
+      // shortcut path in useKeyboardShortcuts.ts.
+      requestAnimationFrame(() => focusPromptNow());
+      break;
+    }
     case 'url':
       if (nav.url) openUrl(nav.url);
       break;

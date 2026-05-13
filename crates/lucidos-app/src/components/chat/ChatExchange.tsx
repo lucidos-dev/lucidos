@@ -19,6 +19,7 @@ import {
   exchangeResponseEvents,
   exchangeStatus,
   exchangeError,
+  stepStatus,
   isEmptyContinuedExchange,
   findPermissionResolution,
   findQuestionAnswer,
@@ -26,12 +27,13 @@ import {
   modeToInitiator,
   originMode,
   responseAbortedSummary,
+  RESPONSE_CANCELED_SUMMARY,
   resumeEngineNote,
 } from '../../store/thread-events';
 import type { Change } from '../../api/client';
 import { continueThread, blobPreviewUrl } from '../../api/client';
 import { getSessionBlobUrlForHash } from './pastedImages';
-import { artifacts, appsList, openImagePopupFromThread, stepsExpanded, detailsExpanded, threadMap, findChangeById, lazyChanges, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel, showToast, cancelingThreadIds } from '../../store/store';
+import { artifacts, appsList, openImagePopupFromGroup, stepsExpanded, detailsExpanded, threadMap, findChangeById, lazyChanges, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel, showToast, cancelingThreadIds, isThreadQuiescent, stepDetailModal } from '../../store/store';
 import { ClaudeIcon } from '../shared/icons';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openApp } from '../../store/actions/apps';
@@ -40,16 +42,14 @@ import { viewChangeDiff } from '../../store/actions/repositories';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
 import { PermissionBody } from './PermissionCard';
+import { ChildCompletionCard } from './ChildCompletionCard';
 import { getEventToggleState, getCollapsedVisibleEvents, splitEventSections } from '../../store/event-rendering';
 import { statusLabel as getStatusLabel, isActive as isStatusActive } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
-
-function formatTokens(n: number): string {
-  if (n >= 1000) return `${Math.round(n / 1000)}k`;
-  return String(n);
-}
+import { formatTokens, contextPercent } from '../../utils/formatTokens';
+import { highlightEllipsis } from './highlightEllipsis';
 
 // Stable refs so loadedOr fallback doesn't yield a fresh [] each render —
 // without these, every dependent useMemo invalidates on every render whenever
@@ -67,7 +67,7 @@ interface Props {
   priorModel?: string;
   priorEffort?: string;
   /** True when this exchange is the most recent ResponseAborted with no
-   *  later SessionRecovered in the thread — the only one that shows the
+   *  later ContinuationStarted in the thread — the only one that shows the
    *  Continue button. */
   isUnresumedAbort?: boolean;
 }
@@ -85,7 +85,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
   const responseTextRaw = exchangeResponseText(exchange);
   const threadMeta = threadMap.value.get(threadId)?.meta;
   const threadIsCC = threadMeta?.channel === 'claude_code';
-  const threadIdle = threadMeta?.status === 'idle';
+  const threadIdle = isThreadQuiescent(threadMeta?.status);
   const steps = exchangeSteps(exchange, isLast, threadIdle);
   const events = exchangeResponseEvents(exchange, imageOffset, isLast, threadIdle);
   const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle);
@@ -114,7 +114,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
     if (imgTarget) {
       e.preventDefault();
       const src = imgTarget.dataset.fullSrc || imgTarget.src;
-      if (src) openImagePopupFromThread(src, imgTarget);
+      if (src) openImagePopupFromGroup(src, imgTarget);
       return;
     }
 
@@ -131,7 +131,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
       e.preventDefault();
       const appId = appTarget.dataset.appId;
       if (appId) {
-        const app = apps.find((s: App) => s.id === appId);
+        const app = apps.find((a) => a.id === appId);
         if (app) openApp(app);
       }
       return;
@@ -242,10 +242,11 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
     && collapsedInitiators.value.has(`${threadId}:${exchange.userSeq}`);
   const isChangePanel = isChangeLifecycleEvent(exchange.userEvent);
   const isAbortPanel = exchange.userEvent.type === 'ResponseAborted';
-  // Change lifecycle and abort-boundary exchanges are terminal — they have no
-  // response, just the initiator panel with optional actions (Diff/Revert,
-  // Continue).
-  const showResponsePanel = !isChangePanel && !isAbortPanel && !isEmptyContinued && (hasResponse || hasEvents || showStatus);
+  const isCancelPanel = exchange.userEvent.type === 'ResponseCanceled';
+  // Change lifecycle, abort-boundary, and cancel-boundary exchanges are
+  // terminal — they have no response, just the initiator panel with optional
+  // actions (Diff/Revert on change panels, Continue on the unresumed abort).
+  const showResponsePanel = !isChangePanel && !isAbortPanel && !isCancelPanel && !isEmptyContinued && (hasResponse || hasEvents || showStatus);
   let initiatorActions: ComponentChildren | undefined;
   if (isChangePanel) {
     initiatorActions = changeActions(
@@ -273,7 +274,9 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
       <InitiatorPanel
         initiator={initiator}
         timestamp={formatMessageTimestamp(timestamp)}
-        onActorClick={(e) => openInfoPanel('origin', e)}
+        onActorClick={initiator.actorClickable === false
+          ? undefined
+          : (e) => openInfoPanel('origin', e)}
         actions={initiatorActions}
         collapsible={canCollapseInitiator}
         collapsed={isInitiatorCollapsed}
@@ -352,9 +355,9 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
 // Click the actor to open the route popover for finer origin info.
 // ---------------------------------------------------------------------------
 
-export type InitiatorVariant = 'user' | 'system' | 'trigger' | 'lucidos';
+type InitiatorVariant = 'user' | 'system' | 'trigger' | 'lucidos';
 
-export interface InitiatorDescriptor {
+interface InitiatorDescriptor {
   variant: InitiatorVariant;
   icon: string;
   /** WHO performed this — always the initiator's display name. */
@@ -368,14 +371,20 @@ export interface InitiatorDescriptor {
   /** Optional CSS modifier for status-specific accents (change-applied,
    *  change-failed, change-discarded, change-reverted). Stacks with `variant`. */
   accent?: string;
+  /** Whether the actor chip opens the route popover. False when the panel
+   *  body itself surfaces the same affordance — currently only the
+   *  ChildThreadCompleted card, where the title-link replaces the popover's
+   *  origin row. Defaults to true. */
+  actorClickable?: boolean;
 }
 
 /** Action label shared by the panel header and the route popover's Origin row. */
-export function initiatorSummary(ev: Exchange['userEvent']): string {
+function initiatorSummary(ev: Exchange['userEvent']): string {
   switch (ev.type) {
     case 'TriggerStarted':           return 'Trigger fired';
-    case 'SessionRecovered':         return 'Resumed after engine restart';
-    case 'ResponseAborted':            return responseAbortedSummary(ev.actor);
+    case 'ContinuationStarted':         return 'Resumed after engine restart';
+    case 'ResponseAborted':            return responseAbortedSummary(ev.actor, ev.cause);
+    case 'ResponseCanceled':           return RESPONSE_CANCELED_SUMMARY;
     case 'MissingHardeningDetected': return 'Hardening required';
     case 'MergeConflictDetected':    return 'Merging changes from main';
     case 'CodingAgentPromptSent':    return 'Engine-injected prompt';
@@ -394,6 +403,7 @@ export function initiatorSummary(ev: Exchange['userEvent']): string {
     case 'CodingAgentPermissionRequest': return '';
     case 'CredentialRequested':          return `Credentials requested: ${ev.provider}`;
     case 'McpConsentRequested':          return `Tool consent requested: ${ev.tool}`;
+    case 'ChildThreadCompleted':         return '';
     default:                         return '';
   }
 }
@@ -437,8 +447,8 @@ export function describeInitiator(
         summary,
         details: ev.prompt ? <MarkdownBlock html={renderMarkdown(ev.prompt)} /> : undefined,
       };
-    case 'SessionRecovered':
-      // SessionRecovered carries an actor (device when triggered by Continue,
+    case 'ContinuationStarted':
+      // ContinuationStarted carries an actor (device when triggered by Continue,
       // engine if auto-resume returns). Drive the chip from that actor.
       return {
         variant: actorVariant(ev.actor),
@@ -447,13 +457,22 @@ export function describeInitiator(
         details: <ResumeNoteBody exchange={exchange} />,
       };
     case 'ResponseAborted':
-      // ResponseAborted is now an exchange boundary. Engine-attributed crashes
-      // render '⚙ System'; device-attributed restarts render '👤 You'.
+      // Exchange boundary — let the actor drive the chip (engine for crashes,
+      // device for restarts and user-triggered stale-settle cleanups).
       return {
         variant: actorVariant(ev.actor),
         ...actorInitiator(ev.actor),
         summary,
       };
+    case 'ResponseCanceled':
+      // ResponseCanceled is an exchange boundary. Cancellation is user-driven
+      // on a real in-flight response by definition (CancelCause doc), so
+      // default to a 'You' chip when actor is absent — the chat-thread cancel
+      // path doesn't yet plumb the actor through. When actor is present (CC
+      // cancel paths), let it drive the chip.
+      return ev.actor
+        ? { variant: actorVariant(ev.actor), ...actorInitiator(ev.actor), summary }
+        : youInitiator({ summary });
     case 'MissingHardeningDetected':
       return engineInitiator(summary);
     case 'MergeConflictDetected':
@@ -502,6 +521,21 @@ export function describeInitiator(
       }
       return youInitiator({ details });
     }
+    case 'ChildThreadCompleted':
+      return {
+        variant: 'lucidos',
+        icon: LUCIDOS_AGENT_ICON,
+        label: LUCIDOS_AGENT_LABEL,
+        actorClickable: false,
+        details: (
+          <ChildCompletionCard
+            childThreadId={ev.child_thread_id}
+            childThreadTitle={ev.child_thread_title}
+            status={ev.status}
+            summary={ev.summary}
+          />
+        ),
+      };
     case 'UserQuestionAsked': {
       // Resolution lives on this exchange's steps as UserQuestionAnswered;
       // matched by tool_use_id so a stale Answered from a different question
@@ -514,6 +548,7 @@ export function describeInitiator(
             toolUseId={ev.tool_use_id}
             question={ev.question}
             options={ev.options ?? []}
+            multiSelect={ev.multi_select}
             resolved={answered?.answer}
           />
         ),
@@ -522,7 +557,11 @@ export function describeInitiator(
     case 'CodingAgentPermissionRequest': {
       const resolvedStep = findPermissionResolution(exchange, ev.request_id);
       const resolved = resolvedStep
-        ? { allowed: resolvedStep.allowed, reason: resolvedStep.reason }
+        ? {
+            allowed: resolvedStep.allowed,
+            reason: resolvedStep.reason,
+            persist_scope: resolvedStep.persist_scope,
+          }
         : undefined;
       return youInitiator({
         details: (
@@ -588,7 +627,7 @@ function UserMessageBody({ html, imageHashes }: { html: string; imageHashes: str
                 src={src}
                 class="user-image-thumb"
                 alt=""
-                onClick={(e) => openImagePopupFromThread(e.currentTarget.src, e.currentTarget)}
+                onClick={(e) => openImagePopupFromGroup(e.currentTarget.src, e.currentTarget)}
               />
             );
           })}
@@ -652,7 +691,7 @@ function ContinueButton({ threadId }: { threadId: string }) {
       inFlight.value = false;
       return;
     }
-    // SessionRecovered will arrive via SSE and remove the button by hiding
+    // ContinuationStarted will arrive via SSE and remove the button by hiding
     // this exchange's `isUnresumedAbort` — re-enable as a safety net in case
     // the SSE event is delayed.
     setTimeout(() => { inFlight.value = false; }, 5000);
@@ -664,7 +703,7 @@ function ContinueButton({ threadId }: { threadId: string }) {
   );
 }
 
-/** Render the engine note for a SessionRecovered exchange — a one-line
+/** Render the engine note for a ContinuationStarted exchange — a one-line
  *  subline followed by a `<details>` expansion showing the full injected text.
  *  Returns null when no engine note is present (e.g. CC resume path). */
 function ResumeNoteBody({ exchange }: { exchange: Exchange }) {
@@ -719,6 +758,15 @@ interface InitiatorPanelProps {
   onToggle?: () => void;
 }
 
+function ActorChipBody({ initiator }: { initiator: InitiatorDescriptor }) {
+  return (
+    <>
+      <span class="initiator-icon">{initiator.icon}</span>
+      <span class="initiator-label">{initiator.label}</span>
+    </>
+  );
+}
+
 function InitiatorPanel({ initiator, timestamp, onActorClick, actions, collapsible, collapsed, onToggle }: InitiatorPanelProps) {
   const accentClass = initiator.accent ? ` initiator-panel-${initiator.accent}` : '';
   const hasBody = !!initiator.summary || !!initiator.details;
@@ -729,15 +777,20 @@ function InitiatorPanel({ initiator, timestamp, onActorClick, actions, collapsib
         class={`initiator-header${collapsible ? ' initiator-header-clickable' : ''}`}
         onClick={(e) => handlePanelHeaderClick(e, onToggle)}
       >
-        <button
-          type="button"
-          class="initiator-actor"
-          onClick={onActorClick}
-          aria-label={`Show info for ${initiator.label}`}
-        >
-          <span class="initiator-icon">{initiator.icon}</span>
-          <span class="initiator-label">{initiator.label}</span>
-        </button>
+        {onActorClick ? (
+          <button
+            type="button"
+            class="initiator-actor"
+            onClick={onActorClick}
+            aria-label={`Show info for ${initiator.label}`}
+          >
+            <ActorChipBody initiator={initiator} />
+          </button>
+        ) : (
+          <span class="initiator-actor">
+            <ActorChipBody initiator={initiator} />
+          </span>
+        )}
         <span class="initiator-timestamp">{timestamp}</span>
       </div>
       {hasBody && !collapsed && (
@@ -828,25 +881,36 @@ function GeneratedImage({ event }: { event: Extract<ResponseEvent, { type: 'imag
   );
 }
 
-/** Compact inline step rendered between text blocks. */
+/** Prefers `contextCapture` (new emissions + legacy synth); falls back
+ *  to the legacy `context_tokens` projection so old DB rows still render. */
 function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
-  const statusClass = event.success === null ? 'pending' : event.success ? 'success' : 'error';
-  const hasContext = event.context_tokens != null;
-  const tooltip = event.full !== event.description ? event.full : undefined;
+  const { className } = stepStatus(event.success);
+  const snap = event.contextCapture;
+  const used = snap?.usage?.input_tokens ?? snap?.estimated_total_tokens ?? event.context_tokens;
+  const window = snap?.context_window;
+  const trimmed = snap?.trimmed ?? event.trimmed;
+  const hasContext = used != null;
 
   return (
-    <div class={`inline-step ${statusClass}`} data-tooltip={tooltip}>
+    <button
+      type="button"
+      class={`inline-step ${className}`}
+      data-role="inline-step"
+      onClick={() => { stepDetailModal.value = event; }}
+    >
       <span class="step-icon">
         {event.success === null ? <span class="mini-spinner" /> : event.success ? '✓' : '⚠'}
       </span>
-      <span class="step-description">{event.description}</span>
-      {event.detail && <span class="step-detail">{event.detail}</span>}
+      <span class="step-description">{highlightEllipsis(event.description)}</span>
+      {event.detail && <span class="step-detail">{highlightEllipsis(event.detail)}</span>}
       {hasContext && (
-        <span class={`step-context${event.trimmed ? ' trimmed' : ''}`}>
-          {formatTokens(event.context_tokens!)} tokens, {event.context_messages} msgs
-          {event.trimmed && ' (trimmed)'}
+        <span class={`step-context${trimmed ? ' trimmed' : ''}`}>
+          {window
+            ? `${formatTokens(used!)} / ${formatTokens(window)} (${contextPercent(used!, window)}%)`
+            : `${formatTokens(used!)} tokens${event.context_messages != null ? `, ${event.context_messages} msgs` : ''}`}
+          {trimmed && ' · trimmed'}
         </span>
       )}
-    </div>
+    </button>
   );
 }

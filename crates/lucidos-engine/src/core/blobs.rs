@@ -104,7 +104,7 @@ pub fn compute_hash(bytes: &[u8]) -> String {
 /// HEIC detection requires looking past the leading box-size bytes to
 /// the `ftyp` box brand at offset 4–11; the rest are leading-byte checks.
 pub fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() >= 8 && &bytes[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+    if bytes.len() >= 8 && bytes[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
         return Some("image/png");
     }
     if bytes.len() >= 3 && bytes[..3] == [0xFF, 0xD8, 0xFF] {

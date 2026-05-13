@@ -5,6 +5,11 @@ pub mod types;
 
 use crate::core::EventRow;
 use chrono::{DateTime, Utc};
+pub(crate) use messages::{
+    build_resume_tool_blocks_with_skip_ids, build_session_messages, find_orphan_tool_called_ids,
+    ORPHAN_TOOL_RESULT_STUB, RESUME_VERBATIM_TOOL_TAIL,
+};
+pub use messages::format_child_thread_completed_block;
 use sqlx::PgPool;
 pub use threads::{
     fetch_thread_aggregate, LegacyInitiator, ThreadAggregate, ThreadInfo, ThreadSearchResult,
@@ -92,11 +97,6 @@ pub struct EventStore {
 impl EventStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
-    }
-
-    /// Get a clone of the connection pool for sharing with other components
-    pub fn pool(&self) -> PgPool {
-        self.pool.clone()
     }
 
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {

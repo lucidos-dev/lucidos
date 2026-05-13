@@ -59,6 +59,8 @@ impl LlmProvider for MockProvider {
             stop_reason: Some("end_turn".to_string()),
             output_tokens: None,
             input_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
             thinking_chars: None,
         })
     }

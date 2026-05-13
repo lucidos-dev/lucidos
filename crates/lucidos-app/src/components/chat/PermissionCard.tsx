@@ -1,7 +1,10 @@
+import type { ComponentChildren } from 'preact';
 import { useSignal } from '@preact/signals';
 import { showToast } from '../../store/store';
-import { postMcpConsent, type PersistScope } from '../../api/client';
+import { postMcpConsent } from '../../api/client';
+import type { PersistScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
+import { preserveAtBottom } from './scrollState';
 
 export interface PermissionEvent {
   request_id: string;
@@ -13,21 +16,7 @@ export interface PermissionEvent {
 
 export interface PermissionBodyProps {
   event: PermissionEvent;
-  resolved?: { allowed: boolean; reason?: string };
-}
-
-/** Split "skill update-config" into "skill " + <strong>update-config</strong>
- *  so the meaningful arg stands out from the tool-name prefix. Used by the
- *  answered card; the active prompt uses `renderQuestion` instead so the tool
- *  identity is unmistakable. */
-function renderSummary(summary: string) {
-  const space = summary.indexOf(' ');
-  if (space === -1) return <strong>{summary}</strong>;
-  return (
-    <>
-      {summary.slice(0, space)} <strong>{summary.slice(space + 1)}</strong>
-    </>
-  );
+  resolved?: { allowed: boolean; reason?: string; persist_scope?: PersistScope };
 }
 
 /** Frame the prompt around the tool name itself ("the **Edit** tool on `/path`")
@@ -122,22 +111,31 @@ export const BROAD_ALLOW_INEFFECTIVE: ReadonlySet<string> = new Set([
   'Write',
 ]);
 
+export type PermissionChoice = 'deny' | 'allow' | 'session' | 'narrow' | 'broad';
+
+/** Recovery-emitted orphan resolutions arrive with `allowed: false` and no
+ *  scope — those map to `'deny'`, which marks the Deny button as the
+ *  surviving outcome even though the user never clicked. */
+export function resolvedChoice(resolved: {
+  allowed: boolean;
+  persist_scope?: PersistScope;
+}): PermissionChoice {
+  if (!resolved.allowed) return 'deny';
+  return resolved.persist_scope ?? 'allow';
+}
+
 /** Body of a `CodingAgentPermissionRequest` divider exchange — rendered inside
- *  the initiator panel which provides the chrome. The `pending` signal is an
- *  optimistic override — replaced by `resolved` once the paired
- *  `CodingAgentPermissionResolved` event arrives over SSE. */
+ *  the initiator panel which provides the chrome. `pending` is an optimistic
+ *  override; SSE swaps in `resolved` once the paired
+ *  `CodingAgentPermissionResolved` event arrives. */
 export function PermissionBody({ event, resolved }: PermissionBodyProps) {
-  const pending = useSignal<boolean | null>(null);
+  const pending = useSignal<{ allowed: boolean; persist_scope?: PersistScope } | null>(null);
 
-  const effective = resolved
-    ?? (pending.value !== null ? { allowed: pending.value } : undefined);
-
-  if (effective) {
-    return <AnsweredBody event={event} resolved={effective} />;
-  }
+  const effective = resolved ?? pending.value;
 
   const decide = async (allowed: boolean, persist?: PersistScope) => {
-    pending.value = allowed;
+    preserveAtBottom();
+    pending.value = { allowed, persist_scope: persist };
     if (allowed && persist === 'broad') {
       // Coarse trust granted — let the user feel the weight of it.
       showToast('You only live once', 'info');
@@ -154,82 +152,98 @@ export function PermissionBody({ event, resolved }: PermissionBodyProps) {
   const showBroad = !BROAD_ALLOW_INEFFECTIVE.has(event.tool_name);
   const session = sessionLabel(event.tool_name, event.input);
 
+  const selected = effective ? resolvedChoice(effective) : null;
+  const answered = selected !== null;
+
+  type ButtonSpec = {
+    choice: PermissionChoice;
+    btnClass: string;
+    label: ComponentChildren;
+    ariaLabel: string;
+    row: 'primary' | 'secondary';
+    onClick: () => void;
+  };
+
+  const buttons: ButtonSpec[] = [
+    {
+      choice: 'deny',
+      btnClass: 'action-btn action-btn-danger',
+      label: 'Deny',
+      ariaLabel: 'Deny this permission request',
+      row: 'primary',
+      onClick: () => decide(false),
+    },
+    {
+      choice: 'allow',
+      btnClass: 'action-btn action-btn-confirm',
+      label: 'Allow once',
+      ariaLabel: 'Allow this permission request once',
+      row: 'primary',
+      onClick: () => decide(true),
+    },
+    {
+      choice: 'session',
+      btnClass: 'action-btn action-btn-confirm',
+      label: 'Allow for this thread',
+      ariaLabel: `Allow ${session ?? event.tool_name} for the rest of this thread`,
+      row: 'secondary',
+      onClick: () => decide(true, 'session'),
+    },
+    ...(narrow ? [{
+      choice: 'narrow' as const,
+      btnClass: 'action-btn action-btn-confirm',
+      label: <>Always allow <code>{narrow}</code></>,
+      ariaLabel: `Always allow ${narrow}`,
+      row: 'secondary' as const,
+      onClick: () => decide(true, 'narrow'),
+    }] : []),
+    ...(showBroad ? [{
+      choice: 'broad' as const,
+      btnClass: 'action-btn',
+      label: 'Always allow',
+      ariaLabel: `Always allow ${event.tool_name}`,
+      row: 'secondary' as const,
+      onClick: () => decide(true, 'broad'),
+    }] : []),
+  ];
+
+  const renderButton = (spec: ButtonSpec) => {
+    const isPicked = selected === spec.choice;
+    const stateClass = !answered ? ''
+      : isPicked ? ' cc-permission-btn-picked'
+      : ' cc-permission-btn-rejected';
+    return (
+      <button
+        type="button"
+        class={`${spec.btnClass}${stateClass}`}
+        onClick={answered ? undefined : spec.onClick}
+        disabled={answered}
+        aria-pressed={answered ? isPicked : undefined}
+        aria-label={spec.ariaLabel}
+      >
+        {isPicked && <span class="cc-permission-btn-check" aria-hidden="true">✓ </span>}
+        {spec.label}
+      </button>
+    );
+  };
+
+  const primary = buttons.filter(b => b.row === 'primary');
+  const secondary = buttons.filter(b => b.row === 'secondary');
+
   return (
-    <div class="cc-permission-body" data-request-id={event.request_id}>
+    <div
+      class={`cc-permission-body${answered ? ' cc-permission-body-answered' : ''}`}
+      data-request-id={event.request_id}
+    >
       <div class="cc-permission-text">{renderQuestion(event.tool_name, event.summary)}</div>
       <div class="cc-permission-actions">
-        <button
-          type="button"
-          class="action-btn action-btn-danger"
-          onClick={() => decide(false)}
-          aria-label="Deny this permission request"
-        >
-          Deny
-        </button>
-        <button
-          type="button"
-          class="action-btn action-btn-confirm"
-          onClick={() => decide(true)}
-          aria-label="Allow this permission request once"
-        >
-          Allow once
-        </button>
+        {primary.map(renderButton)}
       </div>
-      <div class="cc-permission-actions cc-permission-actions-secondary">
-        <button
-          type="button"
-          class="action-btn action-btn-confirm"
-          onClick={() => decide(true, 'session')}
-          aria-label={`Allow ${session ?? event.tool_name} for the rest of this thread`}
-        >
-          Allow for this thread
-        </button>
-      </div>
-      {narrow && (
-        <div class="cc-permission-actions cc-permission-actions-secondary">
-          <button
-            type="button"
-            class="action-btn action-btn-confirm"
-            onClick={() => decide(true, 'narrow')}
-            aria-label={`Always allow ${narrow}`}
-          >
-            Always allow <code>{narrow}</code>
-          </button>
+      {secondary.map(spec => (
+        <div key={spec.choice} class="cc-permission-actions cc-permission-actions-secondary">
+          {renderButton(spec)}
         </div>
-      )}
-      {showBroad && (
-        <div class="cc-permission-actions cc-permission-actions-secondary">
-          <button
-            type="button"
-            class="action-btn"
-            onClick={() => decide(true, 'broad')}
-            aria-label={`Always allow ${event.tool_name}`}
-          >
-            Always allow
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function AnsweredBody({
-  event,
-  resolved,
-}: {
-  event: PermissionEvent;
-  resolved: { allowed: boolean; reason?: string };
-}) {
-  return (
-    <div class="cc-permission-body cc-permission-body-answered">
-      <div class="cc-permission-text">{renderSummary(event.summary)}</div>
-      {resolved.allowed ? (
-        <div class="cc-permission-allowed-badge">Allowed</div>
-      ) : (
-        <div class="cc-permission-denied-badge">
-          {resolved.reason ? `Denied: ${resolved.reason}` : 'Denied'}
-        </div>
-      )}
+      ))}
     </div>
   );
 }

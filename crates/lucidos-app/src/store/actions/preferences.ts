@@ -284,6 +284,20 @@ export function setVertexRegion(region: string): Promise<void> {
   return savePreference('vertex_region', region);
 }
 
+// --- Capture context ---
+
+/** Per-step ContextAssembled capture toggle. Defaults to true (on). */
+export function currentCaptureContext(): boolean {
+  if (preferences.value.status !== 'loaded') return true;
+  const raw = preferences.value.data['capture_context'];
+  if (raw == null) return true;
+  return raw !== 'false';
+}
+
+export function setCaptureContext(enabled: boolean): Promise<void> {
+  return savePreference('capture_context', enabled ? 'true' : 'false');
+}
+
 // --- Background model ---
 
 /** Background model preference keys — stored in the DB, read by the engine. */

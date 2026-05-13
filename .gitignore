@@ -1,5 +1,10 @@
 # Build artifacts
 /target/
+# Per-signer build dirs and the copied artifact next to each signer's
+# Cargo.toml. Built by `signers/build-all.sh`; never checked in.
+signers/*/target/
+signers/*/*.wasm
+signers/*/Cargo.lock
 
 # IDE
 .idea/

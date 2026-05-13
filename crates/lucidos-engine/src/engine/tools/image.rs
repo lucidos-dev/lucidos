@@ -5,6 +5,39 @@ use crate::llm::image::ImageSize;
 use base64::Engine as _;
 use std::path::Path;
 
+/// True when `prompt` looks like a request to describe/analyse an existing
+/// image instead of synthesise a new one. Anchored at the start of the
+/// prompt so phrases like "a robot describing a painting" still synthesise
+/// a picture, while "describe this image in detail" gets blocked.
+/// ASCII-case-insensitive; only inspects the first ~32 bytes so ~4 KB
+/// generation prompts don't pay for a full lowercase allocation.
+fn looks_like_description_prompt(prompt: &str) -> bool {
+    /// Prefixes that signal a vision / analysis intent. Ordered with the
+    /// most-specific multi-word forms first so a longer match wins before
+    /// the bare word forms (`tell me about this image` vs `tell me what`).
+    const PREFIXES: &[&[u8]] = &[
+        b"describe ",
+        b"analyse ",
+        b"analyze ",
+        b"summarize ",
+        b"summarise ",
+        b"transcribe ",
+        b"explain ",
+        b"identify ",
+        b"read the ",
+        b"what is in ",
+        b"what's in ",
+        b"what does this ",
+        b"what do you see ",
+        b"tell me about this image",
+        b"tell me what ",
+    ];
+    let trimmed = prompt.trim_start().as_bytes();
+    PREFIXES
+        .iter()
+        .any(|needle| trimmed.len() >= needle.len() && trimmed[..needle.len()].eq_ignore_ascii_case(needle))
+}
+
 pub(crate) fn resolve_thread_image_refs<E: HasEventPayload>(
     workspace: &Path,
     events: &[E],
@@ -89,6 +122,22 @@ impl LucidosEngine {
             .and_then(|v| v.as_str())
             .ok_or("prompt is required")?;
 
+        // Guard against tool misuse: the model sometimes calls generate_image
+        // with prompts like "describe this image in detail" expecting back a
+        // text description. The provider would then synthesise a derivative
+        // image of nothing useful. Block these prompts with a pointer at the
+        // model's native vision instead.
+        if looks_like_description_prompt(prompt) {
+            return Err(
+                "this prompt looks like a request to describe/analyse an image, but \
+                 `generate_image` SYNTHESISES new images and returns image bytes — not \
+                 text descriptions. To describe or analyse an image, just describe it \
+                 directly in your reply: you have native vision over images already in \
+                 the conversation."
+                    .into(),
+            );
+        }
+
         let size = args
             .get("size")
             .and_then(|v| v.as_str())
@@ -110,13 +159,14 @@ impl LucidosEngine {
 
         // Multi-image validation: error if provider doesn't support it
         if input_refs.len() > 1 && !provider.supports_multi_image() {
-            return Ok(format!(
-                "Error: The current image provider ({}) only supports one input image for editing. \
+            return Err(format!(
+                "the current image provider ({}) only supports one input image for editing. \
                  You provided {} images. Please ask the user which image they'd like to use, \
                  or switch to a provider that supports multiple images.",
                 provider.name(),
                 input_refs.len()
-            ));
+            )
+            .into());
         }
 
         // Resolve each reference to raw bytes
@@ -124,7 +174,9 @@ impl LucidosEngine {
         for reference in &input_refs {
             match self.resolve_image_reference(reference, thread_id).await {
                 Ok(bytes) => input_images.push(bytes),
-                Err(e) => return Ok(format!("Error resolving image '{}': {}", reference, e)),
+                Err(e) => {
+                    return Err(format!("resolving image '{}': {}", reference, e).into())
+                }
             }
         }
 
@@ -490,6 +542,88 @@ mod tests {
             !desc.contains("'artifacts/"),
             "save_as_artifact example must NOT start with 'artifacts/' — that causes double nesting. Got: {}",
             desc
+        );
+    }
+
+    #[test]
+    fn looks_like_description_prompt_blocks_describe_variants() {
+        // Real prompts observed in the wild — the LLM mistaking generate_image
+        // for a vision/analysis tool.
+        let blocked = [
+            "describe this image in detail",
+            "Describe the screenshot",
+            "describe this image in detail, focus on any UI elements",
+            "  Analyse what's shown here",
+            "ANALYZE the chart",
+            "summarize the contents of this picture",
+            "transcribe the text in this image",
+            "what is in this image?",
+            "what's in this picture",
+            "what does this screenshot show",
+            "what do you see here",
+            "tell me about this image",
+            "tell me what the diagram represents",
+            "identify the objects in this photo",
+            "explain this UI",
+            "read the labels in the picture",
+        ];
+        for prompt in blocked {
+            assert!(
+                looks_like_description_prompt(prompt),
+                "expected to block describe-like prompt: {:?}",
+                prompt
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_description_prompt_allows_real_generation_prompts() {
+        // Genuine generation prompts that happen to contain the trigger
+        // words mid-sentence — should still be allowed through.
+        let allowed = [
+            "a robot describing a painting in a museum",
+            "a chart that summarizes Q3 revenue",
+            "an isometric illustration of a UI dashboard",
+            "edit this photo to make the sky purple",
+            "transcript-style title card for a podcast",
+            "a sunset over mountains, painterly",
+            "logo for an analyser product",
+        ];
+        for prompt in allowed {
+            assert!(
+                !looks_like_description_prompt(prompt),
+                "should not block generation prompt: {:?}",
+                prompt
+            );
+        }
+    }
+
+    #[test]
+    fn generate_image_tool_description_warns_against_vision_misuse() {
+        use crate::llm::tools::get_image_generation_tool;
+        let tool = get_image_generation_tool();
+        let lower = tool.description.to_lowercase();
+        // Must contain a clear NOT-a-vision-tool warning. Asserting on a
+        // single marker substring (rather than just "describe" + "not"
+        // anywhere in the text) prevents regressions like "Generates
+        // images. Describes nothing." from passing the gate. The exact
+        // wording is part of the contract — change the marker here AND
+        // the description text together.
+        const REQUIRED: &[&str] = &["not a vision", "not for"];
+        assert!(
+            REQUIRED.iter().any(|m| lower.contains(m)),
+            "tool description must contain one of {:?} so the LLM is told it is \
+             not a vision/analysis tool. Got: {}",
+            REQUIRED,
+            tool.description
+        );
+        // And it must mention the alternative — "describe directly" / native
+        // vision — otherwise the LLM has nowhere to redirect the request.
+        assert!(
+            lower.contains("describe") && lower.contains("directly"),
+            "tool description must instruct the model to describe images \
+             directly with native vision. Got: {}",
+            tool.description
         );
     }
 }

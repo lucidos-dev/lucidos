@@ -7,7 +7,7 @@ export function makeTrigger(overrides: Partial<TriggerInfo> = {}): TriggerInfo {
     cron_expressions: [],
     timezone: 'UTC',
     paused: false,
-    run: { type: 'intent', intent: 'test', knowhow: [] },
+    run: { type: 'intent', intent: 'test' },
     ...overrides,
   };
 }

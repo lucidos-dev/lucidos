@@ -48,9 +48,20 @@ export function Toast() {
               onClick={t.onClick}
             >{renderMessage(t.message)}</span>
           </div>
-          {t.action && (
+          {(t.action || t.secondaryAction) && (
             <div class="toast-actions">
-              <button class="action-btn" onClick={t.action.onClick}>{t.action.label}</button>
+              {t.secondaryAction && (
+                <button
+                  class={`action-btn${t.secondaryAction.variant ? ' action-btn-' + t.secondaryAction.variant : ''}`}
+                  onClick={t.secondaryAction.onClick}
+                >{t.secondaryAction.label}</button>
+              )}
+              {t.action && (
+                <button
+                  class={`action-btn${t.action.variant ? ' action-btn-' + t.action.variant : ''}`}
+                  onClick={t.action.onClick}
+                >{t.action.label}</button>
+              )}
             </div>
           )}
           {t.dismissable !== false && (

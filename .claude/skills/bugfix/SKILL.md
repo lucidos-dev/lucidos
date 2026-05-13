@@ -30,10 +30,10 @@ it('CC session shows Idle status, not Done', () => {
   // 2. Simulate the full event sequence as it arrives from SSE
   handleEvent(map, threadId, -1, { type: 'MessageReceived', text: 'fix the bug' });
   handleEvent(map, threadId, -2, { type: 'SessionStarted', session_id: 's1' });
-  handleEvent(map, threadId, -3, { type: 'ClaudeCodeToolCalled', name: 'Edit', args: {} });
-  handleEvent(map, threadId, -4, { type: 'ClaudeCodeToolResult', name: 'Edit', result: 'ok' });
+  handleEvent(map, threadId, -3, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} });
+  handleEvent(map, threadId, -4, { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok' });
   handleEvent(map, threadId, -5, { type: 'ResponseGenerated' });
-  handleEvent(map, threadId, -6, { type: 'ClaudeCodeIdled' });
+  handleEvent(map, threadId, -6, { type: 'CodingAgentIdled' });
 
   // 3. Assert the full pipeline produces correct output
   const exchanges = groupIntoExchanges(map.get(threadId)!.events);

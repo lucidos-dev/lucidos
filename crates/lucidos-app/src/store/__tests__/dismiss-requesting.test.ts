@@ -257,9 +257,9 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
     }
   });
 
-  it('exposes Diff for external repo even when ccHasChanges is false', () => {
+  it('exposes Diff (enabled) for external repo even when ccHasChanges is false', () => {
     // ccHasChanges can drift to false while the branch is still ahead of main;
-    // for external-repo CC threads the Diff button must show regardless.
+    // for external-repo CC threads the Diff button must stay enabled regardless.
     const thread = makeCCThread('t1', 'idle', 'inbox');
     thread.meta.ccHasChanges = false;
     thread.meta.ccIsExternalRepo = true;
@@ -270,7 +270,61 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
-      expect(state!.externalCcDiffAvailable).toBe(true);
+      expect(state!.ccDiff).toBe('enabled');
+    }
+  });
+});
+
+describe('Diff button is always offered for CC threads, disabled when there is no diff', () => {
+  it('internal CC thread with ccHasChanges=true shows Diff enabled even without a Change row', () => {
+    // The user's reported case: CC made changes, ChangeProposed has fired
+    // (cc_has_changes=true) but the Change row hasn't materialized yet.
+    // Pre-fix the Diff button only showed when pendingChange existed.
+    const thread = makeCCThread('t1', 'waiting', 'inbox');
+    thread.meta.ccHasChanges = true;
+    thread.meta.ccIsExternalRepo = false;
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('actions');
+    if (state!.type === 'actions') {
+      expect(state!.pendingChange).toBeNull();
+      expect(state!.ccDiff).toBe('enabled');
+    }
+  });
+
+  it('internal CC thread with no changes shows Diff disabled', () => {
+    // Archive-only banner on a CC thread that did no work. The Diff button
+    // still renders so the user sees the affordance, but it's disabled
+    // (with a tooltip) since there's nothing to look at.
+    const thread = makeCCThread('t1', 'idle', 'inbox');
+    thread.meta.ccHasChanges = false;
+    thread.meta.ccIsExternalRepo = false;
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('actions');
+    if (state!.type === 'actions') {
+      expect(state!.ccDiff).toBe('disabled');
+    }
+  });
+
+  it('chat thread does not render the Diff button at all (no branch concept)', () => {
+    const thread = makeCCThread('t1', 'idle', 'inbox');
+    thread.meta.channel = 'chat';
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('actions');
+    if (state!.type === 'actions') {
+      expect(state!.actions).toContain('archive');
+      expect(state!.ccDiff).toBe('hidden');
     }
   });
 });

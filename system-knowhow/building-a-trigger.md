@@ -19,7 +19,11 @@ If the user only wants it to happen once, don't create a trigger.
 
 ## The most important rule: `run.intent` is intent, not procedure
 
-A trigger's `run.intent` is **what the user would say** — one sentence in their voice. Everything about *how* (which API to hit, how to parse, what to retry, when to fall back) belongs in a knowhow file referenced by ID in `run.knowhow: [...]`. The HTTP API will accept a procedure-laden text and won't stop you — see `docs/taxonomy.md` § Triggers for the worked bad/good example.
+A trigger's `run.intent` is **what the user would say** — one sentence in their voice. Everything about *how* (which API to hit, how to parse, what to retry, when to fall back) belongs in a knowhow file. The trigger thread looks up knowhow itself by calling `load_knowhow` at fire time — same as a chat session — so the trigger config has no per-trigger allow-list to configure. The HTTP API will accept a procedure-laden intent text and won't stop you — see `docs/taxonomy.md` § Triggers for the worked bad/good example.
+
+### Don't paste procedure into `run.intent` to "make sure" the LLM sees it
+
+The trigger thread inherits the same knowhow surface a chat thread has: the system prompt's intent registry advertises what's available, and the LLM calls `load_knowhow` when it judges a recipe relevant. Writing the procedure inline to bypass that lookup turns the intent into a recipe and the next person who reads the trigger config can't tell what the user originally asked for. Keep the intent in the user's voice ("send me a daily summary of open PRs") and let the LLM pull the procedure on demand.
 
 ## Cron vs. on_event vs. both
 
@@ -114,15 +118,15 @@ Don't claim "I'll delete it after it runs" without doing one of the above — se
 2. **`list_triggers` first** to check whether an existing trigger should be updated instead of creating a new one.
 3. **Decide cron vs. on_event** before writing the trigger.
 4. **Write `run.intent` as the user would say it.**
-5. **Reference any procedure-laden knowhow in `run.knowhow`.** If the knowhow doesn't exist yet, create it first (see `building-knowhow.md`). A knowhow id is the file's path under `data/knowhow/` (or under the engine-shipped `system-knowhow/`) WITHOUT the `.md` suffix and INCLUDING any subdirectory: `data/knowhow/lucidos-ops/release-process.md` → `lucidos-ops/release-process`, NOT `release-process`. The engine rejects unknown ids — `create_trigger` and `update_trigger` fail with "Knowhow not found" before saving, and any pre-existing trigger whose knowhow file disappears now aborts at fire time with a notification instead of running without context.
+5. **If the trigger needs a procedure-laden recipe, write it to a knowhow file.** Trigger-scoped recipes belong at `data/triggers/<slug>/knowhow/<descriptive>.md` (where `<slug>` is the trigger's kebab-case slug field — set it explicitly via `create_trigger`/`update_trigger`; if you don't, the engine derives one from the name on read but never persists it, so renaming the trigger silently moves the per-trigger knowhow path). Broadly reusable recipes go in shared `data/knowhow/` (see `building-knowhow.md`). The trigger thread discovers knowhow the same way chat does — via `load_knowhow` calls the LLM makes itself — so there is no `run.knowhow` field to populate. Any legacy `run.knowhow:[...]` you might see in old `TriggerCreated` payloads is silently dropped by the deserializer; rewrite the intent to either name the relevant knowhow inline ("see `system-knowhow/X`") or be rich enough to nudge discovery from the system-prompt knowhow listing. Make the file's `name` and `description` frontmatter precise so semantic discovery finds it.
 
 ## Common mistakes to avoid
 
 - **Recreating instead of editing.** See "Edit, don't recreate" above. The single biggest source of orphaned thread history.
 - **Recipe-in-text.** Putting procedure into `run.intent` instead of knowhow. See "The most important rule" above.
 - **Cron when on_event fits.** Polling burns runs and adds latency. If an event exists, prefer it.
-- **Forgetting the knowhow reference.** The trigger runs without it, but the LLM has to re-derive the procedure every time and gets it slightly different each run.
-- **Bare knowhow id when the file is in a subdirectory.** Writing `knowhow: ['nightly-pipeline-trigger']` when the file is at `data/knowhow/lucidos-ops/nightly-pipeline-trigger.md` — the correct id is `lucidos-ops/nightly-pipeline-trigger`. Both `create_trigger` and `update_trigger` reject unknown ids; if you're unsure, run `list_files data/knowhow/` first.
+- **No knowhow file for a procedure the trigger clearly needs.** Without a discoverable knowhow file, the LLM re-derives the procedure every run and gets it slightly different each time. Write the recipe down — semantic discovery will surface it on the next fire.
+- **Vague `name`/`description` frontmatter on a trigger-scoped knowhow.** Discovery is semantic, not by id, so a knowhow titled `notes.md` with `name: Notes` won't surface when the LLM is reasoning about an API call. Name the file by what it teaches (`openai-availability-check.md`), and write the `description` as the kind of question that should retrieve it.
 - **Knowhow that recommends raw `curl`/`fetch` for an API the workspace already proxies.** When the recipe instructs the LLM to shell out with `curl -H "Authorization: Bearer $CRED_..."` (or the `requests`/`fetch` equivalent), the credential leaks into argv and tool transcripts. The right path is the `proxy_request` LLM tool against an entry in `data/config/apis.json` — see `system-knowhow/building-knowhow.md` § "Calling external APIs from a recipe".
 - **Notifying on every tick.** A trigger that always notifies trains the user to ignore notifications.
 - **Two live triggers with the same name.** Filter pickers and notification deep-links can't tell them apart. If you need two, name them differently.

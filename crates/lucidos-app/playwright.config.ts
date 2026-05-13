@@ -51,6 +51,11 @@ export default defineConfig({
     },
     {
       name: 'mobile',
+      // *-desktop.spec.ts files target desktop-only flows (resize-driven
+      // measurements, viewport shrink/grow) that don't apply when the
+      // mobile projects pin viewport via device emulation — exclude them
+      // rather than runtime-skipping so the mobile results stay clean.
+      testIgnore: /-desktop\.spec\.ts$/,
       use: {
         browserName: 'chromium',
         viewport: { width: 375, height: 812 },
@@ -60,6 +65,7 @@ export default defineConfig({
     },
     {
       name: 'mobile-webkit',
+      testIgnore: /-desktop\.spec\.ts$/,
       use: {
         browserName: 'webkit',
         viewport: { width: 390, height: 844 },

@@ -135,14 +135,21 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "MessageReceived" | "TriggerStarted" => EventClass::Start,
         "CodingAgentUserMessageSent" | "UserPromptInjected" => EventClass::Start,
         // Session lifecycle — invisible to user (no status change, no activity bump)
-        "SessionStarted" | "SessionRecovered" | "CodingAgentSettingsChanged" => {
+        "SessionStarted" | "ContinuationStarted" | "CodingAgentSettingsChanged" => {
             EventClass::Metadata
         }
         "MergeConflictDetected" | "MissingHardeningDetected" => EventClass::Start,
         // Activity
         "TextStreamed" | "Thinking" | "MemorySearched" => EventClass::Activity,
-        "ContextTokensMeasured" => EventClass::Metadata,
+        "ContextCaptured" => EventClass::Metadata,
         "ToolCalled" | "ToolResult" => EventClass::Activity,
+        // Background-bash lifecycle. Started fires synchronously inside
+        // the LLM tool turn; Completed fires asynchronously from the
+        // tokio watcher when the child exits. Both classified as Metadata
+        // so they don't bump status / activity (the paired ToolCalled /
+        // ToolResult already covers that for the started case, and
+        // completion happens outside any LLM turn).
+        "BackgroundBashStarted" | "BackgroundBashCompleted" => EventClass::Metadata,
         "CodingAgentTextStreamed" | "CodingAgentToolCalled" | "CodingAgentToolResult" => {
             EventClass::Activity
         }
@@ -182,6 +189,15 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "ChangeHardened" | "MergeResolutionStarted" | "MergeResolutionCleared" => {
             EventClass::Metadata
         }
+        // Phase 4 fan-in: parent's resume path renders this as the rich
+        // child-completion card (an exchange-starter, like MessageReceived).
+        // The parent LLM's response after the wake becomes the response panel
+        // of THIS exchange — same shape as a user-message exchange.
+        // See docs/plans/2026-05-12-child-completion-card-design.md.
+        "ChildThreadCompleted" => EventClass::Start,
+        // Resume-helper input from the `dismiss_from_context` tool. Pure
+        // bookkeeping — no UI surface, no activity bump.
+        "ContextDismissed" => EventClass::Metadata,
         _ => return None,
     })
 }
@@ -191,7 +207,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "MessageReceived",
         "TextStreamed",
         "Thinking",
-        "ContextTokensMeasured",
+        "ContextCaptured",
         "MemorySearched",
         "ToolCalled",
         "ToolResult",
@@ -200,7 +216,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ResponseAborted",
         "ResponseFailed",
         "SessionStarted",
-        "SessionRecovered",
+        "ContinuationStarted",
         "SessionEnded",
         "CodingAgentTextStreamed",
         "CodingAgentToolCalled",
@@ -238,6 +254,12 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "CodingAgentPermissionRequest",
         "CodingAgentPermissionResolved",
         "WorktreeCleaned",
+        // Phase 4 fan-in / resume bookkeeping.
+        "ChildThreadCompleted",
+        "ContextDismissed",
+        // Background-bash lifecycle (run_bash_background trio).
+        "BackgroundBashStarted",
+        "BackgroundBashCompleted",
     ]
 }
 
@@ -320,7 +342,6 @@ pub fn resolve_transition(
         "ThreadArchived" => to_archived,
         // CC-only events illegal for Chat
         "SessionStarted"
-        | "SessionRecovered"
         | "SessionEnded"
         | "CodingAgentTextStreamed"
         | "CodingAgentToolCalled"
@@ -374,10 +395,15 @@ pub fn resolve_transition(
         "MessageReceived"
         | "TextStreamed"
         | "Thinking"
-        | "ContextTokensMeasured"
+        | "ContextCaptured"
         | "MemorySearched"
         | "ToolCalled"
         | "ToolResult"
+        // ContinuationStarted opens the resume exchange after engine restart for
+        // both chat (via /api/threads/<id>/continue → chat/rerun.rs) and CC
+        // (via the spawn-dispatcher's --resume path). Pure boundary marker —
+        // the section transition belongs to the events that follow it.
+        | "ContinuationStarted"
         | "ThreadTitleGenerated"
         | "ThreadTitleRenamed"
         | "ThreadSaved"
@@ -404,7 +430,24 @@ pub fn resolve_transition(
         // background cleanup worker (Phase 10.2). It must NOT bump the thread
         // out of HISTORY or change status — that's the whole point of cleanup
         // running on long-idle threads.
-        | "WorktreeCleaned" => no_change,
+        | "WorktreeCleaned"
+        // Phase 4 fan-in events — typed callback emitted onto the parent
+        // when a child thread completes, and the dismissal record the
+        // `dismiss_from_context` tool produces. Both are pure resume-helper
+        // input: no section transition (parent's section was already moved
+        // by the child completion's other side effects), no status change.
+        // Without this entry, the bus rejects the typed emit and the
+        // wake-text path becomes a phantom-event reference (the C2 bug).
+        | "ChildThreadCompleted"
+        | "ContextDismissed"
+        // Background bash lifecycle — pure audit / fallback storage for
+        // the run_bash_background tools. Legal on both thread types
+        // (chat is the primary caller; CC could plausibly use them too).
+        // No section change — completion fires from a tokio watcher
+        // outside the LLM turn, so a status flip would surface a quiet
+        // thread for no user-visible reason.
+        | "BackgroundBashStarted"
+        | "BackgroundBashCompleted" => no_change,
         _ => violation("Unknown event type"),
     }?;
 
@@ -774,6 +817,18 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // activity-event arm in `event_bus.rs::update_thread_projection`
         // (`MemorySearched` is classified Activity but stays a projection
         // no-op there, so it's also absent here).
+        //
+        // Caveat: the projection skips this Running-bump when the event
+        // carries `meta.actor = MessageOrigin::System`. Live LLM-loop
+        // activity events never set an actor (`EventMeta::NONE`); only the
+        // recovery sweeps stamp System (e.g. `recover_orphan_tool_calls`
+        // emits a synthetic `ToolResult` to pair an orphan `ToolCalled`).
+        // Those backfills land on threads whose terminal event already
+        // wrote, so resurrecting them to Running parks the row in the
+        // Active section forever. The contract here describes the
+        // typical live-event path; the System-actor exception lives in
+        // `event_bus_projection.rs` and is covered by
+        // `system_actor_activity_event_does_not_resurrect_terminated_thread`.
         (
             "TextStreamed",
             StatusTransition {

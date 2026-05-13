@@ -1,16 +1,37 @@
 use super::*;
+use std::sync::LazyLock;
 
-/// Mutable workspace-data prefixes — the four user-owned trees the API may write/delete.
-const MUTABLE_PREFIXES: &[&str] = &["artifacts/", "apps/", "knowhow/", "triggers/"];
+/// Mutable workspace-data prefixes — user-owned trees the API may write/delete.
+/// `config/` and `auth-modules/` are coupled: `config/apis.json` references
+/// signers by name from `auth-modules/`, so deleting one without the other
+/// leaves a dangling reference.
+const MUTABLE_PREFIXES: &[&str] = &[
+    "artifacts/",
+    "apps/",
+    "knowhow/",
+    "triggers/",
+    "config/",
+    "auth-modules/",
+    "scripts/",
+];
 
 /// Read-only prefix for engine-shipped reference knowhow served from `<repo>/system-knowhow/`.
 /// Allowed for GET so the trigger UI's knowhow links resolve; rejected for PUT/DELETE/edit.
 const READ_ONLY_PREFIXES: &[&str] = &["system-knowhow/"];
 
-const READ_PREFIX_ERR: &str =
-    "Path must start with one of: artifacts/, apps/, knowhow/, triggers/, system-knowhow/";
-const MUTATE_PREFIX_ERR: &str =
-    "Path must start with one of: artifacts/, apps/, knowhow/, triggers/";
+static READ_PREFIX_ERR: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Path must start with one of: {}",
+        MUTABLE_PREFIXES
+            .iter()
+            .chain(READ_ONLY_PREFIXES.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+});
+static MUTATE_PREFIX_ERR: LazyLock<String> =
+    LazyLock::new(|| format!("Path must start with one of: {}", MUTABLE_PREFIXES.join(", ")));
 
 fn validate_path_basics(path: &str) -> Result<(), (StatusCode, String)> {
     if path.is_empty() {
@@ -185,6 +206,8 @@ pub(super) async fn write_data(
         Err(resp) => return *resp,
     };
 
+    let _repo_guard = state.engine.lock_workspace_repo().await;
+
     if let Some(artifact_path) = path.strip_prefix("artifacts/") {
         let content = String::from_utf8_lossy(&body).to_string();
         match am
@@ -250,6 +273,8 @@ pub(super) async fn delete_data(
         Ok(am) => am,
         Err(resp) => return *resp,
     };
+
+    let _repo_guard = state.engine.lock_workspace_repo().await;
 
     if let Some(artifact_path) = path.strip_prefix("artifacts/") {
         match am
@@ -432,10 +457,22 @@ mod tests {
         let data = tmp.path();
         touch(data, "artifacts/x.md");
         touch(data, "knowhow/y.md");
+        touch(data, "config/apis.json");
+        touch(data, "auth-modules/binance-hmac.wasm");
+        touch(data, "scripts/foo.py");
         touch(data, "postgres/internal.bin"); // Disallowed prefix — must be skipped.
 
         let result = list_data_inner(data, None);
-        assert_eq!(result, vec!["artifacts/x.md", "knowhow/y.md"]);
+        assert_eq!(
+            result,
+            vec![
+                "artifacts/x.md",
+                "auth-modules/binance-hmac.wasm",
+                "config/apis.json",
+                "knowhow/y.md",
+                "scripts/foo.py",
+            ]
+        );
     }
 
     /// system-knowhow files are engine-shipped reference docs and must NOT
@@ -483,6 +520,10 @@ mod tests {
             "apps/myapp/index.html",
             "knowhow/guide.md",
             "triggers/daily/config.json",
+            "config/apis.json",
+            "auth-modules/binance-hmac.wasm",
+            "auth-modules/binance-hmac.manifest.json",
+            "scripts/foo.py",
         ] {
             assert!(validate_data_path_read(p).is_ok());
             assert!(validate_data_path_mutate(p).is_ok());

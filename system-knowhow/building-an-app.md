@@ -34,7 +34,9 @@ Don't design on paper. Once the questions are answered, scaffold the smallest th
 - **Inline `<script>` for small apps.** Split into `app.js` only when the script grows past ~100 lines or you want to share it with another script.
 - **Inline `<style>` likewise.** External CSS is for shared design across apps.
 - **Use the SDK for everything stateful.** Direct `fetch` to `/api/*` works but bypasses the workspace abstraction — `lucidos.data.read` / `lucidos.data.write` are the right primitives.
-- **External APIs go through `lucidos.proxy`.** Apps load over HTTPS, so `fetch('http://...')` is mixed-content blocked and CORS blocks most cross-origin XHR. Add an entry to `data/config/apis.json` and call `lucidos.proxy(name).fetch(path, init)` — the engine forwards server-side and injects the configured auth header. Never paste credentials into iframe code. See `system-knowhow/js-sdk.md` § `lucidos.proxy`.
+- **External APIs — call `lucidos.proxy(name).fetch(path, init)`. Always.** Configure the backend in `data/config/apis.json`; the engine forwards server-side and injects the configured auth header. Never paste credentials into iframe code. See `system-knowhow/js-sdk.md` § `lucidos.proxy`. The two wrong shapes that look right:
+  - `fetch('https://<external-host>/...')` from the iframe — mixed-content / CORS will block it, and any credential is sitting in the iframe.
+  - `fetch('/api/v1/proxy/<name>/...')` from the iframe — same-origin so it *runs*, but it's the proxy URL the SDK helper builds for you. Constructing it by hand makes the proxy name a magic string and skips any future SDK-side concerns (timeouts, retries, response parsing, error shape). Use the helper.
 - **Manifest description matters.** It's how the user finds the app in the launcher and how the engine LLM knows what the app is for. Write it like a one-line README, not a tagline.
 
 ## Updating an app
@@ -44,8 +46,9 @@ There is no `update_app` tool. After `create_app`, all changes go through `write
 ## Common mistakes to avoid
 
 - **Storing data in `apps/{id}/`.** App data goes in `artifacts/{app-id}/`. The app code is git-tracked source; the data is user state. (See `best-practices.md`.)
+- **Forgetting the `artifacts/` prefix in `lucidos.data.*` paths.** Paths are relative to `data/`, not `data/artifacts/`. App data lives at `artifacts/{app-id}/data.json` — *not* `{app-id}/data.json`. Without the prefix, `read` returns a 404 `SdkError` and `write` fails silently, which usually surfaces as "the checkbox toggles back" or "state doesn't persist".
 - **Creating an app for a one-shot.** If the user only wants the answer once, just give it.
 - **Inventing SDK calls.** Always check `system-knowhow/js-sdk.md` before writing app JS — the SDK surface is small and stable, but easy to misremember.
-- **Direct `fetch` to an external API from the iframe.** Mixed-content / CORS will block it. Use `lucidos.proxy(name).fetch(...)` and configure the backend in `data/config/apis.json`.
+- **Hand-rolling the proxy URL with raw `fetch`.** Both `fetch('https://<external-host>/...')` (mixed-content / CORS will block it) and `fetch('/api/v1/proxy/<name>/...')` (same-origin so it runs, but constructs the helper's URL by hand and bypasses the SDK) are wrong. Use `lucidos.proxy(name).fetch(path, init)` and configure the backend in `data/config/apis.json` — one shape, no string-building.
 - **Hardcoding credentials in iframe code.** The credential belongs in the engine's credential store, referenced by name from `apis.json`. The SDK never sees the secret.
 - **Batching large rewrites.** After scaffold, prefer small visible changes the user can react to per round.

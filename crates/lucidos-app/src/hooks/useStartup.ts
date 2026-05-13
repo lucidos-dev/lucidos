@@ -20,7 +20,7 @@ import { refreshChangesState, restoreRestartToast } from '../store/actions/chat-
 import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { focusThreadOrBootstrap } from '../store/actions/threads';
 import { openThreadInWorkspace, THREAD_HASH_RE } from '../store/actions/cross-workspace';
-import { CHECK_ICON, COPY_ICON } from '../utils/renderMarkdown';
+import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
 import { activeMenuItem, settingsSubview, updateAvailable, threadsLoaded, showToast, showConfirm, FOCUSED_THREAD_KEY, setFocusedThread, workspaceName } from '../store/store';
 import { shouldShowSwUpdateToast, markSwUpdateDismissed } from './sw-update';
 import { resolveDeepLink, type DeepLinkTarget } from '../store/actions/notification-deeplink';

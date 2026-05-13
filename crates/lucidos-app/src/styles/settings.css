@@ -939,12 +939,21 @@
     border: 1px solid var(--border-color);
 }
 
-/* Worktree titles can be long ("Stopped thread: …") — wrap rather than ellipsis. */
-.disk-usage-row .list-row-name {
+/* Long titles ("Stopped thread: …", credential service names) should wrap
+   rather than ellipsis. */
+.disk-usage-row .list-row-name,
+.credential-row .list-row-name {
     white-space: normal;
     overflow: visible;
     text-overflow: clip;
     overflow-wrap: anywhere;
+}
+
+/* Credential rows: when the row is too narrow to fit name + actions
+   side-by-side, the actions stack below the info column. flex-basis on
+   .list-row-info promotes the wrap; .list-row already has flex-wrap: wrap. */
+.credential-row .list-row-info {
+    flex: 1 1 18rem;
 }
 
 /* On mobile, the row stacks; constrain actions to full width so the

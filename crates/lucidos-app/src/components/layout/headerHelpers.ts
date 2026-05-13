@@ -29,6 +29,8 @@ function getFormTitle(form: InlineForm): string {
     case 'new-app': return 'New App';
     case 'credential': return form.editing ? 'Edit Credential' : 'Add Credential';
     case 'email-confirm': return 'Confirm Email';
+    case 'plugin-install': return `Install ${form.request.plugin_name}`;
+    case 'plugin-uninstall': return `Uninstall ${form.request.plugin_name}`;
   }
 }
 

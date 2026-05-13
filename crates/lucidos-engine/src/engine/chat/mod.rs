@@ -1,6 +1,8 @@
 mod events;
 mod images;
 mod process;
+mod process_cc;
+mod process_helpers;
 mod recovery;
 mod recursion_guard;
 mod rerun;

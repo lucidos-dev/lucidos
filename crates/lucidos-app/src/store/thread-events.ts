@@ -3,7 +3,7 @@ import type { EventChannel, SessionEndReason } from '../generated/thread-lifecyc
 import { MODELS, REASONING_LEVELS } from './models';
 import type { ExchangeStatus } from './exchange-status';
 import { mergeAdjacentTextEvents, isMeaningfulText } from './event-rendering';
-import type { Step, ResponseEvent } from './types';
+import type { Step, ResponseEvent, ContextSection, ContextAssembledData, ContextCapture } from './types';
 
 /** Who started a thread: user-initiated or system-initiated (e.g. scheduled task). */
 export type ThreadInitiator = 'user' | 'system';
@@ -11,8 +11,13 @@ export type ThreadInitiator = 'user' | 'system';
 /** Mirrors the Rust `ActorMode` enum (lowercase strings). */
 export type ActorMode = 'human' | 'agent' | 'engine';
 
-/** Mirrors the Rust `EngineReason` enum (serde tag = "kind", snake_case). */
+/** Mirrors the Rust `EngineReason` enum (serde tag = "kind", snake_case).
+ *  `session_recovered` is the legacy name for `continuation_started` — kept
+ *  on the union so legacy DB rows still typecheck during the migration window
+ *  (the Rust side has the matching `#[serde(alias = "session_recovered")]`,
+ *  and the migration rewrites historical rows to the new name). */
 export type EngineReason =
+  | { kind: 'continuation_started' }
   | { kind: 'session_recovered' }
   | { kind: 'orphan_recovery' }
   | { kind: 'scheduler'; trigger_id: string; trigger_name?: string }
@@ -103,29 +108,85 @@ export function actorInitiator(actor: MessageOrigin | undefined): { icon: string
   }
 }
 
-/** Summary text for a `ResponseAborted` event, derived from its actor.
- *  Device actor = `/api/restart` pre-emit ("You — Restarted"); anything else
- *  is the host system killing the process ("System — Response interrupted"). */
-export function responseAbortedSummary(actor: MessageOrigin | undefined): string {
+/** Mirrors Rust's `CancelCause` (snake_case). User-driven termination of a
+ *  *real* in-flight response — `EventMeta.actor` identifies the user, this
+ *  enum identifies what they did. `unknown` covers legacy DB rows persisted
+ *  before the field existed and any retired cause string (e.g. `stale_settle`,
+ *  which moved to `AbortCause`). */
+export type CancelCause = 'user_stop' | 'user_action' | 'unknown';
+
+/** Mirrors Rust's `AbortCause` (snake_case). System-driven cleanup — the
+ *  engine or OS terminated the process, or the engine settled a projection
+ *  whose live process was already gone (`stale_settle`). `unknown` only
+ *  appears on legacy DB rows persisted before the field existed. */
+export type AbortCause =
+  | 'engine_shutdown'
+  | 'safety_net'
+  | 'recovery_after_restart'
+  | 'process_killed'
+  | 'stale_settle'
+  | 'unknown';
+
+/** Summary text for a `ResponseAborted` event. `stale_settle` (engine cleanup
+ *  of a stuck projection on a user button click) reads "Settled stuck
+ *  response" — distinct from a real abort because no live response existed.
+ *  Otherwise: device actor = `/api/restart` pre-emit ("You — Restarted");
+ *  anything else is the host system killing the process ("System — Response
+ *  interrupted"). */
+export function responseAbortedSummary(
+  actor: MessageOrigin | undefined,
+  cause: AbortCause | undefined,
+): string {
+  if (cause === 'stale_settle') return 'Settled stuck response';
   return actor?.kind === 'device' ? 'Restarted' : 'Response interrupted';
 }
 
+/** Summary text for a `ResponseCanceled` event — always a user-driven stop
+ *  on a real in-flight response, so no cause-dependent branching is needed. */
+export const RESPONSE_CANCELED_SUMMARY = 'Canceled the response';
+
 // Persisted thread events — stored in DB, appear in snapshots.
 // Optional fields (`?`) allow older DB rows (before the field was added) to deserialize safely.
+/** Mirrors the Rust `ChildCompletionStatus` (serde rename_all = "snake_case").
+ *  Drives the status badge on the child-completion card. */
+export type ChildCompletionStatus = 'success' | 'failure' | 'no_changes' | 'canceled';
+
+/** Mirrors the Rust `AllowScope` (serde rename_all = "snake_case"). Carried on
+ *  `CodingAgentPermissionResolved` so the answered card can render the same
+ *  button layout as the prompt with a check on the chosen scope and
+ *  strike-through on the rest. `undefined` covers Allow-once, Deny, and
+ *  recovery-emitted orphan resolutions (no scope was picked). */
+export type PersistScope = 'narrow' | 'broad' | 'session';
+
 export type ThreadEvent =
   | { type: 'MessageReceived'; text: string; channel?: EventChannel; user_image_hashes?: string[]; device_id?: string; device?: string; image_description?: string; mode?: ActorMode; model?: string; reasoning_effort?: string; parent_thread_id?: string; spawning_event_id?: string; origin?: MessageOrigin }
   | { type: 'TextStreamed'; text: string }
   | { type: 'Thinking'; text: string; context_tokens?: number; context_messages?: number; trimmed?: boolean }
+  // ContextTokensMeasured / ContextAssembled are legacy event types — old DB
+  // rows still surface them; new emissions use ContextCaptured below. Kept on
+  // the union so the projection's switch can branch on them without `as`.
   | { type: 'ContextTokensMeasured'; input_tokens: number }
+  | { type: 'ContextAssembled'; sections: ContextSection[]; tools: string[]; model: string; total_chars: number }
+  | {
+      type: 'ContextCaptured';
+      producer: 'main_llm' | 'claude_code';
+      model: string;
+      context_window: number;
+      sections: ContextSection[];
+      tools?: string[];
+      estimated_total_tokens: number;
+      usage?: { input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_creation_tokens: number };
+      trimmed?: boolean;
+    }
   | { type: 'MemorySearched'; results?: number; queries?: string[] }
   | { type: 'ToolCalled'; name: string; args: unknown; description?: string }
   | { type: 'ToolResult'; name: string; result: string; images?: string[] }
   | { type: 'ResponseGenerated'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; request_event_id?: string; channel?: EventChannel }
-  | { type: 'ResponseCanceled'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; channel?: EventChannel }
-  | { type: 'ResponseAborted'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; request_event_id?: string; actor?: MessageOrigin; channel?: EventChannel }
+  | { type: 'ResponseCanceled'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; actor?: MessageOrigin; channel?: EventChannel; cause?: CancelCause }
+  | { type: 'ResponseAborted'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; request_event_id?: string; actor?: MessageOrigin; channel?: EventChannel; cause?: AbortCause }
   | { type: 'ResponseFailed'; error: string; request_event_id?: string; channel?: EventChannel }
   | { type: 'SessionStarted'; session_id: string; branch?: string; repo_id?: string }
-  | { type: 'SessionRecovered'; branch?: string; origin?: MessageOrigin; actor?: MessageOrigin }
+  | { type: 'ContinuationStarted'; branch?: string; origin?: MessageOrigin; actor?: MessageOrigin }
   // SessionEnded.reason is loosely typed to tolerate legacy DB rows whose
   // payloads carry removed values like 'completed' / 'changes_proposed' /
   // 'auto_ended' / 'user_ended' / 'stale_resume' / 'discarded'. The current
@@ -159,10 +220,11 @@ export type ThreadEvent =
   | { type: 'CredentialRequested'; provider: string }
   | { type: 'McpConsentRequested'; tool: string; args: unknown }
   | { type: 'CodingAgentSettingsChanged'; model?: string; reasoning_effort?: string; permission_mode?: string }
-  | { type: 'UserQuestionAsked'; tool_use_id: string; cc_session_id: string; question: string; options?: QuestionOption[] }
+  | { type: 'UserQuestionAsked'; tool_use_id: string; cc_session_id: string; question: string; options?: QuestionOption[]; multi_select?: boolean }
   | { type: 'UserQuestionAnswered'; tool_use_id: string; answer: AnswerKind; actor?: MessageOrigin }
   | { type: 'CodingAgentPermissionRequest'; request_id: string; tool_use_id: string; tool_name: string; input: Record<string, unknown>; summary: string }
-  | { type: 'CodingAgentPermissionResolved'; request_id: string; allowed: boolean; reason?: string; actor?: MessageOrigin };
+  | { type: 'CodingAgentPermissionResolved'; request_id: string; allowed: boolean; reason?: string; persist_scope?: PersistScope; actor?: MessageOrigin }
+  | { type: 'ChildThreadCompleted'; child_thread_id: string; child_thread_title?: string; status: ChildCompletionStatus; summary: string; pending_change_ids?: string[] };
 
 /** Mirrors the Rust `QuestionOption` in thread_events.rs. */
 export interface QuestionOption {
@@ -179,10 +241,14 @@ export type TriggerInvocation =
   | { kind: 'Schedule' }
   | { kind: 'Event'; event_type: string; event_id?: string };
 
-/** Mirrors the Rust `AnswerKind` (serde tag = "kind"). */
+/** Mirrors the Rust `AnswerKind` (serde tag = "kind"). MultiSelected's
+ *  optional `text` carries freetext typed in the prompt textarea while the
+ *  question was on screen — backend joins it with the resolved labels when
+ *  relaying to CC. */
 export type AnswerKind =
   | { kind: 'Selected'; option_id: string }
   | { kind: 'FreeText'; text: string }
+  | { kind: 'MultiSelected'; option_ids: string[]; text?: string }
   | { kind: 'Canceled' };
 
 // Transient events — live SSE only, never stored
@@ -193,6 +259,8 @@ export type TransientEvent =
   | { type: 'PreambleCompleting' }
   // Side-effect commands — trigger frontend modals/actions
   | { type: 'CredentialRequest'; payload: string }
+  | { type: 'PluginInstallRequest'; payload: string }
+  | { type: 'PluginUninstallRequest'; payload: string }
   | { type: 'EmailConfirmRequest'; payload: string }
   | { type: 'PushNotificationRequest' }
   | { type: 'McpConsentRequest'; data: string }
@@ -208,7 +276,7 @@ export type StoredEvent = ThreadEvent & { created?: string; _displayCreated?: st
 /** Events that define (or redefine) a thread's channel/source. */
 export function isChannelDefiningEvent(eventType: string): boolean {
   return eventType === 'SessionStarted'
-    || eventType === 'SessionRecovered'
+    || eventType === 'ContinuationStarted'
     || eventType === 'TriggerStarted';
 }
 
@@ -527,11 +595,14 @@ export function exchangeUserMessage(exchange: Exchange): string {
   if (ev.type === 'TriggerStarted') {
     return ev.prompt || ev.trigger_name || '';
   }
-  if (ev.type === 'SessionRecovered') {
+  if (ev.type === 'ContinuationStarted') {
     return 'Resumed after engine restart';
   }
   if (ev.type === 'ResponseAborted') {
-    return responseAbortedSummary(ev.actor);
+    return responseAbortedSummary(ev.actor, ev.cause);
+  }
+  if (ev.type === 'ResponseCanceled') {
+    return RESPONSE_CANCELED_SUMMARY;
   }
   if (ev.type === 'MissingHardeningDetected') {
     return `${ENGINE_LABEL} — Hardening`;
@@ -551,10 +622,10 @@ export function exchangeUserMessage(exchange: Exchange): string {
 export function exchangeUserChannel(exchange: Exchange): string | undefined {
   const t = exchange.userEvent.type;
   if (t === 'TriggerStarted') return 'trigger';
-  if (t === 'SessionRecovered' || t === 'MissingHardeningDetected' || t === 'MergeConflictDetected') {
+  if (t === 'ContinuationStarted' || t === 'MissingHardeningDetected' || t === 'MergeConflictDetected') {
     return 'claude_code';
   }
-  if (t === 'ResponseAborted') {
+  if (t === 'ResponseAborted' || t === 'ResponseCanceled') {
     // Boundary event — channel is the original thread's channel; leaving it
     // undefined lets the caller fall back to thread meta when needed.
     return undefined;
@@ -597,15 +668,10 @@ export function modeToInitiator(mode: ActorMode | undefined): ThreadInitiator {
  *  rather than user-initiated. */
 function isSystemExchange(exchange: Exchange): boolean {
   const ev = exchange.userEvent;
-  return ev.type === 'SessionRecovered' || ev.type === 'TriggerStarted'
+  return ev.type === 'ContinuationStarted' || ev.type === 'TriggerStarted'
     || ev.type === 'MissingHardeningDetected' || ev.type === 'MergeConflictDetected'
     || ev.type === 'ResponseAborted'
     || isChangeLifecycleEvent(ev);
-}
-
-export interface UserImage {
-  base64: string;
-  mimeType: string;
 }
 
 /** Extract user-pasted image hashes from the exchange's MessageReceived event.
@@ -659,9 +725,13 @@ const MODEL_LABELS: Record<string, string> = Object.fromEntries([
   ['claude-opus-4-1', 'Opus 4.1'],
   ['claude-haiku-4-5-20251001', 'Haiku 4.5'],
   ['claude-haiku-4-5@20251001', 'Haiku 4.5'],
-  // Legacy short aliases from events stored before the migration.
+  // CC subprocess short aliases — `CodingAgentSettingsChanged.model` carries
+  // these verbatim, so without an explicit label the popover renders the bare
+  // alias (e.g. `opus[1m]`).
   ['opus', 'Opus 4.6'],
+  ['opus[1m]', 'Opus 4.6 (1M)'],
   ['sonnet', 'Sonnet 4.6'],
+  ['sonnet[1m]', 'Sonnet 4.6 (1M)'],
   ['haiku', 'Haiku 4.5'],
 ]);
 
@@ -694,7 +764,7 @@ export function exchangeResponseTimestamp(exchange: Exchange): string | undefine
 }
 
 /** Check if the exchange has actual CC content (tools/text, not just SessionStarted). */
-export function exchangeHasCCContent(exchange: Exchange): boolean {
+function exchangeHasCCContent(exchange: Exchange): boolean {
   return exchange.steps.some(({ event }) => CC_ACTIVITY_EVENTS.has(event.type));
 }
 
@@ -748,6 +818,46 @@ export function fullCommandForEngineTool(name: string, args: unknown): string | 
     case 'send_email': return s('subject');
     case 'generate_image':
     case 'run_thread': return s('prompt');
+    default: return undefined;
+  }
+}
+
+/** Full primary-arg value for a Claude Code tool call — used as a hover tooltip
+ *  when the rendered description elides it (Rust `describe_cc_tool()` in
+ *  `crates/lucidos-engine/src/core/mod.rs` shows basenames for paths,
+ *  truncates Bash commands to 57 chars + first line, and shows only the URL
+ *  origin for WebFetch). `Agent` returns `prompt` rather than the short
+ *  `description` field Rust uses, since the prompt is the actual hidden detail.
+ *  Undefined when no primary arg is defined for the tool. */
+export function fullCommandForCCTool(name: string, args: unknown): string | undefined {
+  const a = args as Record<string, unknown> | null | undefined;
+  if (!a) return undefined;
+  const s = (k: string) => (typeof a[k] === 'string' ? (a[k] as string) : undefined);
+
+  switch (name) {
+    case 'Read':
+    case 'Edit':
+    case 'MultiEdit':
+    case 'Write':
+    case 'NotebookEdit': return s('file_path');
+    case 'Bash': return s('command');
+    case 'WebFetch': return s('url');
+    case 'Glob':
+    case 'Grep': return s('pattern');
+    case 'WebSearch': return s('query');
+    case 'Agent': return s('prompt');
+    case 'Skill': return s('skill');
+    case 'TodoWrite': {
+      const todos = a.todos;
+      if (!Array.isArray(todos) || todos.length === 0) return undefined;
+      const MARKERS: Record<string, string> = { completed: '[x]', in_progress: '[~]', pending: '[ ]' };
+      return todos.map((t) => {
+        const { content, activeForm, status } = t as { content?: string; activeForm?: string; status?: string };
+        const marker = MARKERS[status ?? ''] ?? '[?]';
+        const text = (status === 'in_progress' && activeForm) ? activeForm : (content ?? '');
+        return `${marker} ${text}`;
+      }).join('\n');
+    }
     default: return undefined;
   }
 }
@@ -874,17 +984,103 @@ function resolvePendingSteps(steps: { success: boolean | null }[]): void {
 const isThinking = (s: { description?: string }) => s.description === 'Thinking';
 const isNotThinking = (s: { description?: string }) => !isThinking(s);
 
+/** Bag of legacy events. All optional — `synthesizeContextCapture`
+ *  produces something useful from any subset (Thinking-only is the
+ *  oldest case). */
+export interface LegacyContextEvents {
+  thinking?: { text?: string; context_tokens?: number; context_messages?: number; trimmed?: boolean };
+  tokensMeasured?: { input_tokens?: number };
+  assembled?: { sections?: ContextSection[]; tools?: string[]; model?: string; total_chars?: number };
+}
+
+/** Default context_window for legacy rows: 200k. Pre-ContextCaptured
+ *  events never persisted the budget; under-reporting on the 1M-context
+ *  Opus fork is preferable to faking headroom. */
+const LEGACY_CONTEXT_WINDOW = 200_000;
+
+export function synthesizeContextCapture(legacy: LegacyContextEvents): ContextCapture {
+  const usage = legacy.tokensMeasured?.input_tokens != null
+    ? {
+        input_tokens: legacy.tokensMeasured.input_tokens,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+      }
+    : undefined;
+  return {
+    producer: 'main_llm',
+    model: legacy.assembled?.model ?? '',
+    context_window: LEGACY_CONTEXT_WINDOW,
+    sections: legacy.assembled?.sections ?? [],
+    tools: legacy.assembled?.tools ?? [],
+    estimated_total_tokens: legacy.thinking?.context_tokens ?? legacy.assembled?.total_chars ?? 0,
+    usage,
+    trimmed: legacy.thinking?.trimmed ?? false,
+    legacy: true,
+  };
+}
+
+/** Convert a `ContextCaptured` ThreadEvent into the store-side
+ *  `ContextCapture` shape (mostly identity — clamps optional fields). */
+function capturedEventToData(
+  snap: Extract<ThreadEvent, { type: 'ContextCaptured' }>,
+): ContextCapture {
+  return {
+    producer: snap.producer,
+    model: snap.model,
+    context_window: snap.context_window,
+    sections: snap.sections,
+    tools: snap.tools ?? [],
+    estimated_total_tokens: snap.estimated_total_tokens,
+    usage: snap.usage,
+    trimmed: snap.trimmed ?? false,
+  };
+}
+
+/** Pick which step a ContextCaptured snapshot binds to. Main-LLM emits
+ *  fire after a `Thinking` step, so they bind there — the inline
+ *  `tokens / window (pct%)` chip then renders next to the request. CC
+ *  has no per-API-call Thinking step (CC manages its own loop), so a
+ *  CC snapshot binds to whichever step is on top of the stack —
+ *  typically the tool that just finished. Used by both `exchangeSteps`
+ *  and `exchangeResponseEvents` so the inline chip and summary
+ *  projection agree on which step owns each snapshot. The caller
+ *  supplies `assign` because Step and the ResponseEvent step variant
+ *  share the `contextCapture` field but live in different unions. */
+function bindSnapshotToStep<T>(
+  data: ContextCapture,
+  items: T[],
+  isStep: (item: T) => boolean,
+  isThinking: (item: T) => boolean,
+  assign: (item: T, snap: ContextCapture) => void,
+): void {
+  const acceptable = data.producer === 'claude_code' ? isStep : isThinking;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (acceptable(items[i])) {
+      assign(items[i], data);
+      return;
+    }
+  }
+}
+
 /** Build Step[] from exchange events (tool calls with success tracking).
  *  @param _isLast — kept for caller compatibility; spinners are no longer resolved
  *  on `!isLast` alone. A non-last exchange can still be the one the agentic loop
  *  is actively processing (chat mid-flight injection — the parent's
  *  request_event_id keeps attracting events even after the follow-up MR lands),
  *  so resolution waits for either an in-exchange completion event or `threadIdle`.
- *  @param threadIdle — true if the thread's DB status is 'idle'. Combined with
- *  the in-exchange completion flag to finalize pending steps. */
+ *  @param threadIdle — true when CC is not producing output (see
+ *  `isThreadQuiescent` in store.ts). Combined with the in-exchange completion
+ *  flag to finalize pending steps. */
 export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = false): Step[] {
   const steps: Step[] = [];
   let isComplete = false;
+  let legacyAcc: LegacyContextEvents = {};
+  let lastThinkingIdx = -1;
+  const refreshLegacySnapshot = () => {
+    if (lastThinkingIdx < 0) return;
+    steps[lastThinkingIdx].contextCapture = synthesizeContextCapture(legacyAcc);
+  };
   for (const { event } of exchange.steps) {
     switch (event.type) {
       case 'MemorySearched': {
@@ -893,7 +1089,8 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
         break;
       }
       case 'Thinking': {
-        const ctx = event as { context_tokens?: number; context_messages?: number; trimmed?: boolean };
+        const ctx = event as { context_tokens?: number; context_messages?: number; trimmed?: boolean; text?: string };
+        legacyAcc = { thinking: ctx };
         steps.push({
           description: 'Thinking',
           success: true,
@@ -901,16 +1098,38 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
           context_messages: ctx.context_messages,
           trimmed: ctx.trimmed,
         });
+        lastThinkingIdx = steps.length - 1;
+        if (ctx.context_tokens != null || ctx.context_messages != null) {
+          refreshLegacySnapshot();
+        }
         break;
       }
       case 'ContextTokensMeasured': {
         const measured = event as { input_tokens: number };
+        legacyAcc.tokensMeasured = measured;
         for (let i = steps.length - 1; i >= 0; i--) {
           if (steps[i].description === 'Thinking') {
             steps[i].context_tokens = measured.input_tokens;
             break;
           }
         }
+        refreshLegacySnapshot();
+        break;
+      }
+      case 'ContextAssembled': {
+        const ctx = event as { sections: ContextSection[]; tools: string[]; model: string; total_chars: number };
+        legacyAcc.assembled = ctx;
+        refreshLegacySnapshot();
+        break;
+      }
+      case 'ContextCaptured': {
+        bindSnapshotToStep(
+          capturedEventToData(event as Extract<ThreadEvent, { type: 'ContextCaptured' }>),
+          steps,
+          () => true,
+          (s) => s.description === 'Thinking',
+          (s, snap) => { s.contextCapture = snap; },
+        );
         break;
       }
       case 'ToolCalled': {
@@ -978,59 +1197,85 @@ export function exchangeImageCount(exchange: Exchange): number {
   return count;
 }
 
-/** Mark the last pending step in a ResponseEvent[] as completed.
- *  Optional `pred` narrows which pending step to resolve. */
+/** Mark the last pending step in a ResponseEvent[] as completed and return it
+ *  so callers can attach extra payload (tool result text, images). Optional
+ *  `pred` narrows which pending step to resolve. */
 function resolveLastPendingResponseStep(
   events: ResponseEvent[],
   pred?: (s: { description?: string }) => boolean,
-): void {
+): Extract<ResponseEvent, { type: 'step' }> | null {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
     if (e.type === 'step' && e.success === null && (!pred || pred(e))) {
       e.success = true;
-      return;
+      return e;
     }
   }
+  return null;
 }
 
 /** Build ResponseEvent[] from exchange events (interleaved text + steps for rendering).
  *  `imageOffset` is the number of images in all previous exchanges (for thread:N numbering).
  *  @param _isLast — kept for caller compatibility; no longer drives spinner resolution
  *  on its own. See `threadIdle`.
- *  @param threadIdle — true if the thread's DB status is 'idle'. Combined with
- *  the in-exchange completion flag to finalize pending steps. A non-last
- *  exchange can still be the one the engine is actively processing (chat
- *  mid-flight injection), so resolution must not trigger purely on `!isLast`. */
+ *  @param threadIdle — true when CC is not producing output (see
+ *  `isThreadQuiescent` in store.ts). Combined with the in-exchange completion
+ *  flag to finalize pending steps. A non-last exchange can still be the one
+ *  the engine is actively processing (chat mid-flight injection), so
+ *  resolution must not trigger purely on `!isLast`. */
 export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isLast = true, threadIdle = false): ResponseEvent[] {
   const events: ResponseEvent[] = [];
   const hasCCContent = exchangeHasCCContent(exchange);
   // Count images across the thread for thread:N numbering — starts after user images in this exchange
   let imageCounter = imageOffset + exchangeUserImageHashes(exchange).length;
   let isComplete = false;
+  // One ContextAssembled per exchange; attach to every step pushed after it.
+  let currentContext: ContextAssembledData | undefined;
+  let legacyAcc: LegacyContextEvents = {};
+  const attachLegacyToLastThinking = () => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.type === 'step' && e.description === 'Thinking') {
+        e.contextCapture = synthesizeContextCapture(legacyAcc);
+        return;
+      }
+    }
+  };
+  const pushStep = (step: Extract<ResponseEvent, { type: 'step' }>) => {
+    if (currentContext) step.context = currentContext;
+    events.push(step);
+  };
 
   for (const { event } of exchange.steps) {
+    const created = event.created;
     switch (event.type) {
       case 'MemorySearched': {
         const ms = event as { results?: number; queries?: string[] };
         const results = ms.results ?? 0;
         const detail = ms.queries?.length ? ms.queries.join(', ') : undefined;
-        events.push({ type: 'step', description: results > 0 ? 'Memory searched' : 'Memory: no results', success: true, detail });
+        pushStep({ type: 'step', description: results > 0 ? 'Memory searched' : 'Memory: no results', success: true, detail, created });
         break;
       }
       case 'Thinking': {
         const ctx = event as { context_tokens?: number; context_messages?: number; trimmed?: boolean };
-        events.push({
+        legacyAcc = { thinking: ctx };
+        pushStep({
           type: 'step',
           description: 'Thinking',
           success: true,
           context_tokens: ctx.context_tokens,
           context_messages: ctx.context_messages,
           trimmed: ctx.trimmed,
+          created,
         });
+        if (ctx.context_tokens != null || ctx.context_messages != null) {
+          attachLegacyToLastThinking();
+        }
         break;
       }
       case 'ContextTokensMeasured': {
         const measured = event as { input_tokens: number };
+        legacyAcc.tokensMeasured = measured;
         for (let i = events.length - 1; i >= 0; i--) {
           const e = events[i];
           if (e.type === 'step' && e.description === 'Thinking') {
@@ -1038,21 +1283,48 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
             break;
           }
         }
+        attachLegacyToLastThinking();
+        break;
+      }
+      case 'ContextAssembled': {
+        const ctx = event as { sections: ContextSection[]; tools: string[]; model: string; total_chars: number };
+        legacyAcc.assembled = ctx;
+        currentContext = {
+          sections: ctx.sections,
+          tools: ctx.tools,
+          model: ctx.model,
+          total_chars: ctx.total_chars,
+        };
+        attachLegacyToLastThinking();
+        break;
+      }
+      case 'ContextCaptured': {
+        bindSnapshotToStep(
+          capturedEventToData(event as Extract<ThreadEvent, { type: 'ContextCaptured' }>),
+          events,
+          (e) => e.type === 'step',
+          (e) => e.type === 'step' && e.description === 'Thinking',
+          (e, snap) => { if (e.type === 'step') e.contextCapture = snap; },
+        );
         break;
       }
       case 'ToolCalled': {
         const e = event as { name: string; args: unknown; description?: string };
         const description = e.description || describeEngineTool(e.name, e.args);
         const full = fullCommandForEngineTool(e.name, e.args);
-        events.push({ type: 'step', description, tool_name: e.name, success: null, full });
+        pushStep({ type: 'step', description, tool_name: e.name, success: null, full, created });
         break;
       }
       case 'ToolResult': {
-        resolveLastPendingResponseStep(events);
+        const toolResult = event as { result?: string; images?: string[] };
+        const resolved = resolveLastPendingResponseStep(events);
+        if (resolved) {
+          if (toolResult.result !== undefined) resolved.result = toolResult.result;
+          if (toolResult.images?.length) resolved.result_images = toolResult.images;
+        }
         // Render generated images inline
-        const toolImages = (event as { images?: string[] }).images;
-        if (toolImages?.length) {
-          for (const b64 of toolImages) {
+        if (toolResult.images?.length) {
+          for (const b64 of toolResult.images) {
             imageCounter++;
             events.push({ type: 'image', base64: b64, mime_type: 'image/jpeg', index: imageCounter });
           }
@@ -1066,29 +1338,36 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
         if (hasCCContent) events.push({ type: 'section_break', channel: 'claude_code' });
         break;
       case 'CodingAgentPromptSent':
-        events.push({ type: 'step', description: 'Thinking', success: null });
+        pushStep({ type: 'step', description: 'Thinking', success: null, created });
         break;
       case 'CodingAgentToolCalled': {
         resolveLastPendingResponseStep(events, isThinking);
         const e = event as { name: string; args: unknown; description?: string };
-        events.push({ type: 'step', description: e.description || describeCCTool(e.name, e.args), tool_name: e.name, success: null, tool_use_id: toolUseIdOf(event) });
+        const description = e.description || describeCCTool(e.name, e.args);
+        const full = fullCommandForCCTool(e.name, e.args);
+        pushStep({ type: 'step', description, tool_name: e.name, success: null, tool_use_id: toolUseIdOf(event), full, created });
         isComplete = false; // CC resumed — not finished yet
         break;
       }
       case 'CodingAgentToolResult': {
         // See exchangeSteps for the pairing rationale.
         const id = toolUseIdOf(event);
+        const ccResult = (event as { result?: string }).result;
         let resolved = false;
         if (id) {
           for (const e of events) {
             if (e.type === 'step' && e.success === null && e.tool_use_id === id) {
               e.success = true;
+              if (ccResult !== undefined) e.result = ccResult;
               resolved = true;
               break;
             }
           }
         }
-        if (!resolved) resolveLastPendingResponseStep(events, isNotThinking);
+        if (!resolved) {
+          const fallback = resolveLastPendingResponseStep(events, isNotThinking);
+          if (fallback && ccResult !== undefined) fallback.result = ccResult;
+        }
         break;
       }
       case 'CodingAgentTextStreamed':
@@ -1138,6 +1417,15 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
   return mergeAdjacentTextEvents(events);
 }
 
+/** Tri-state mapping for a step's `success` field: null = pending, true =
+ *  succeeded, false = failed. Both the inline-step row and the detail modal
+ *  consume this — the class drives the icon color, the label is user-facing. */
+export function stepStatus(success: boolean | null): { label: string; className: 'pending' | 'success' | 'error' } {
+  if (success === null) return { label: 'In progress', className: 'pending' };
+  if (success) return { label: 'Completed', className: 'success' };
+  return { label: 'Failed', className: 'error' };
+}
+
 /** Whether a non-last exchange's response panel should be hidden as visual
  *  noise. The next exchange's user message implies the chronological flow,
  *  so a panel that produced no real output isn't worth a "Continued below ↳"
@@ -1172,21 +1460,27 @@ export function exchangeError(exchange: Exchange): string {
 }
 
 /** Index of the last (newest) ResponseAborted exchange that has NO later
- *  SessionRecovered exchange anywhere in the thread. Used by AbortPanel to
+ *  ContinuationStarted exchange anywhere in the thread. Used by AbortPanel to
  *  decide whether to render the Continue button — only the unresumed abort
- *  shows it; older aborts that the user already continued past are inert. */
+ *  shows it; older aborts that the user already continued past are inert.
+ *
+ *  Stale-settle aborts (engine cleanup of a stuck-but-already-gone process,
+ *  fired by the user's Stop/Apply/Discard/Archive/Interrupt click) are
+ *  treated like ContinuationStarted: they terminate the scan with `null`.
+ *  Clicking Continue would re-run work the user just deliberately stopped. */
 export function unresumedAbortIndex(exchanges: Exchange[]): number | null {
-  // Scan once from the end: the first ResponseAborted we hit before any
-  // SessionRecovered is the unresumed one.
   for (let i = exchanges.length - 1; i >= 0; i--) {
-    const t = exchanges[i].userEvent.type;
-    if (t === 'SessionRecovered') return null;
-    if (t === 'ResponseAborted') return i;
+    const ev = exchanges[i].userEvent;
+    if (ev.type === 'ContinuationStarted') return null;
+    if (ev.type === 'ResponseAborted') {
+      if (ev.cause === 'stale_settle') return null;
+      return i;
+    }
   }
   return null;
 }
 
-/** Read the engine note (UserPromptInjected step) from a SessionRecovered
+/** Read the engine note (UserPromptInjected step) from a ContinuationStarted
  *  exchange. Returns the full text and a coarse count of bullet entries for
  *  the subline ("Reminded the model about N prior tool calls"). Returns null
  *  when no engine note is present (e.g., CC resume path). */
@@ -1258,9 +1552,10 @@ function supersededAbortIndices(steps: SequencedEvent[]): Set<number> {
  *  @param isLast — true if this is the last (newest) exchange in the thread
  *  @param hasPriorActive — true if a prior exchange is still active (pending/streaming/cc-working),
  *         meaning this exchange is queued behind it
- *  @param threadIdle — true if the thread's DB status is 'idle' (no active processing).
- *         When true and the exchange has no terminal event, the exchange was interrupted
- *         by an engine crash/lid close and should show as 'aborted', not 'streaming'. */
+ *  @param threadIdle — true when CC is not producing output (see
+ *         `isThreadQuiescent` in store.ts). When true and the exchange has no
+ *         terminal event, the exchange was interrupted by an engine crash/lid
+ *         close and should show as 'aborted', not 'streaming'. */
 export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLast: boolean, hasPriorActive?: boolean, threadIsCC?: boolean, threadIdle = false): ExchangeStatus {
   let isComplete = false;
   let isCanceled = false;
@@ -1405,15 +1700,17 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // Non-last CC exchange without a terminator was skipped by CC's msg_tx queue
   // — safely 'done'.
   if (!isLast && (isCC || threadIdle)) return 'done';
-  // Empty non-last chat exchange — engine never produced events for it
-  // (superseded by a later message, or skipped). Render as 'done' rather
-  // than letting it fall through to 'pending', which is in ACTIVE_STATUSES
-  // and would lock the next exchange's gate into 'queued' indefinitely.
+  // Empty chat exchange when the engine has gone idle — extends the !isLast
+  // empty-→-done rule to the isLast case, so an MR whose response landed in
+  // a sibling exchange (off-by-one in the orphan re-process chain — see
+  // thread 9b5a05aa) doesn't spin "Requesting" forever. Without `threadIdle`
+  // the isLast branch must keep falling through so a freshly-sent MR before
+  // the loop has emitted anything still reads as 'pending'/'Requesting'.
   // Relies on chat's request_event_id serialization invariant: by the time an
   // exchange is non-last, the loop has already moved past it (mid-flight
   // injection routes new events back to the parent's request_event_id, so a
   // non-last exchange the loop is still actively processing has steps).
-  if (!isLast && !hasSteps && !isCC) return 'done';
+  if (!hasSteps && !isCC && (!isLast || threadIdle)) return 'done';
   // CC exchanges are 'cc-working' once they have steps, 'pending' before.
   if (isCC) return hasSteps ? 'cc-working' : 'pending';
   if (streamingBuffer) return 'streaming';
@@ -1484,15 +1781,17 @@ export function computeExchanges(thread: ThreadState): Exchange[] {
  *  events (MessageReceived, UserPromptInjected), system-initiated events that
  *  spawn a fresh round of work (engine restart, auto-hardening, auto-merge),
  *  the abort/resume boundary pair, change lifecycle events
- *  (apply/discard/revert/fail), and the ActionRequired family
+ *  (apply/discard/revert/fail), the ActionRequired family
  *  (UserQuestionAsked, CodingAgentPermissionRequest, CredentialRequested,
  *  McpConsentRequested) — each agent pause is its own auditable boundary with
- *  an actor, not a step inside the prior agent response. */
+ *  an actor, not a step inside the prior agent response — and ChildThreadCompleted
+ *  where a sidequest result lands in the parent as a rich card. */
 const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'MessageReceived',
   'TriggerStarted',
   'ResponseAborted',
-  'SessionRecovered',
+  'ResponseCanceled',
+  'ContinuationStarted',
   'UserPromptInjected',
   'MissingHardeningDetected',
   'MergeConflictDetected',
@@ -1504,9 +1803,10 @@ const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'CodingAgentPermissionRequest',
   'CredentialRequested',
   'McpConsentRequested',
+  'ChildThreadCompleted',
 ]);
 
-function isExchangeStartEvent(type: string): boolean {
+export function isExchangeStartEvent(type: string): boolean {
   return EXCHANGE_START_TYPES.has(type);
 }
 
@@ -1540,7 +1840,7 @@ export function hasContentEvents(events: Map<number, StoredEvent>): boolean {
 /** Find an existing exchange to absorb `event` into instead of starting a new one.
  *
  *  Two convergent paths:
- *  1. Engine resume note — UPI emitted by chat/rerun.rs right after SessionRecovered
+ *  1. Engine resume note — UPI emitted by chat/rerun.rs right after ContinuationStarted
  *     belongs as a step under the resume initiator. A Human-mode UPI in the same
  *     position is a real correction and stays its own exchange.
  *  2. Mid-flight injection — chat fast-path emits MessageReceived first (with the
@@ -1559,7 +1859,7 @@ function findAbsorbTarget(
   if (event.type !== 'UserPromptInjected') return null;
   if (event.mode === 'engine'
       && current
-      && current.userEvent.type === 'SessionRecovered') {
+      && current.userEvent.type === 'ContinuationStarted') {
     return current;
   }
   if (event.injected_message_id) {
@@ -1577,10 +1877,20 @@ function findAbsorbTarget(
  *
  *  Response* events are dual-purpose (chat AND CC emit them). For CC they
  *  carry the session's persistent req_id (same reason CodingAgent* events do),
- *  so they're filtered out by `shouldRouteByRequestId` when channel is CC. */
+ *  so they're filtered out by `shouldRouteByRequestId` when channel is CC.
+ *
+ *  Every event the chat agentic loop stamps with `meta.request_event_id` must
+ *  appear here — anything missing falls through to the `current` pointer in
+ *  `groupIntoExchanges` and silently leaks into a follow-up MR's empty
+ *  exchange when the loop's events arrive after the follow-up was emitted.
+ *  That leak flipped `exchangeStatus` to 'aborted' for the follow-up via the
+ *  `threadIdle && hasSteps && !isComplete` branch — observed on real thread
+ *  9b5a05aa where a stray ContextAssembled landed in the empty MR exchange. */
 const REQUEST_ID_ROUTED_TYPES: ReadonlySet<string> = new Set([
   'Thinking',
   'MemorySearched',
+  'ContextAssembled',
+  'ContextTokensMeasured',
   'ToolCalled',
   'ToolResult',
   'TextStreamed',
@@ -1710,6 +2020,19 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
     if (event.type === 'ResponseAborted' && !isLegacySupersededAbort) {
       const target = owner ?? current;
       if (target && target.userEvent.type !== 'ResponseAborted') {
+        target.steps.push({ seq, event });
+        current = { userEvent: event, userSeq: seq, steps: [] };
+        exchanges.push(current);
+        continue;
+      }
+    }
+    // ResponseCanceled mirrors the abort dual-purpose pattern: keep the
+    // cancel as a step on the originating exchange (so its response panel
+    // reads 'Canceled ✕') AND open a new boundary exchange so a separate
+    // 'You — Canceled the response' panel renders below the truncated reply.
+    if (event.type === 'ResponseCanceled') {
+      const target = owner ?? current;
+      if (target && target.userEvent.type !== 'ResponseCanceled') {
         target.steps.push({ seq, event });
         current = { userEvent: event, userSeq: seq, steps: [] };
         exchanges.push(current);

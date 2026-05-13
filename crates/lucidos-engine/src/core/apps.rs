@@ -28,7 +28,6 @@ pub struct App {
 }
 
 pub struct AppManager {
-    workspace_path: PathBuf,
     apps_path: PathBuf,
     repo: Mutex<Repository>,
 }
@@ -50,21 +49,9 @@ impl AppManager {
         };
 
         Ok(Self {
-            workspace_path: workspace_path.to_path_buf(),
             apps_path,
             repo: Mutex::new(repo),
         })
-    }
-
-    /// Reset the index to match HEAD tree, avoiding stale staged entries
-    /// from previous operations polluting this commit.
-    fn reset_index_to_head(repo: &Repository, index: &mut git2::Index) -> Result<(), git2::Error> {
-        if let Ok(head) = repo.head() {
-            if let Ok(tree) = head.peel_to_tree() {
-                index.read_tree(&tree)?;
-            }
-        }
-        Ok(())
     }
 
     /// Stage a single app file and commit.
@@ -72,7 +59,7 @@ impl AppManager {
     pub fn commit(&self, app_path: &str, message: &str) -> Result<String, git2::Error> {
         let repo = self.repo.lock().unwrap();
         let mut index = repo.index()?;
-        Self::reset_index_to_head(&repo, &mut index)?;
+        super::reset_index_to_head(&repo, &mut index)?;
         let repo_path = format!("data/apps/{}", app_path);
         index.add_path(Path::new(&repo_path))?;
         index.write()?;
@@ -83,7 +70,7 @@ impl AppManager {
     pub fn commit_batch(&self, app_paths: &[String], message: &str) -> Result<String, git2::Error> {
         let repo = self.repo.lock().unwrap();
         let mut index = repo.index()?;
-        Self::reset_index_to_head(&repo, &mut index)?;
+        super::reset_index_to_head(&repo, &mut index)?;
         for p in app_paths {
             let repo_path = format!("data/apps/{}", p);
             index.add_path(Path::new(&repo_path))?;
@@ -209,7 +196,7 @@ impl AppManager {
 
         let repo = self.repo.lock().unwrap();
         let mut index = repo.index()?;
-        Self::reset_index_to_head(&repo, &mut index)?;
+        super::reset_index_to_head(&repo, &mut index)?;
         index.remove_dir(Path::new(&format!("data/apps/{}", app_id)), 0)?;
         index.write()?;
 
@@ -349,16 +336,6 @@ impl AppManager {
         files
     }
 
-    /// Get the workspace path.
-    pub fn workspace_path(&self) -> &Path {
-        &self.workspace_path
-    }
-
-    /// Get the apps directory path.
-    pub fn apps_path(&self) -> &Path {
-        &self.apps_path
-    }
-
     /// Delete a single file from an app and commit.
     /// `app_path` is relative to data/apps/ (e.g., "my-app/old-file.js").
     pub fn delete_file_and_commit(
@@ -371,7 +348,7 @@ impl AppManager {
 
         let repo = self.repo.lock().unwrap();
         let mut index = repo.index()?;
-        Self::reset_index_to_head(&repo, &mut index)?;
+        super::reset_index_to_head(&repo, &mut index)?;
         let repo_path = format!("data/apps/{}", app_path);
         index.remove_path(Path::new(&repo_path))?;
         index.write()?;
@@ -429,10 +406,7 @@ impl AppManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn shared_provider() -> &'static dyn EmbeddingProvider {
-        crate::test_util::shared_embedder()
-    }
+    use crate::test_util::KeywordEmbedder;
 
     #[test]
     fn app_manifest_deserializes() {
@@ -501,9 +475,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         let manager = AppManager::new(ws).unwrap();
-        let embedder = shared_provider();
+        // Deterministic embedder keyed on "heatpump" — both the app's
+        // content ("Heatpump Dashboard <h1>Heatpump Status</h1>") and the
+        // know-how description ("Controls and monitors Panasonic
+        // heatpumps...") contain it, so they encode to identical vectors
+        // and clear the discovery threshold without touching the network.
+        let embedder = KeywordEmbedder::new(&["heatpump"]);
 
-        // Create a test app with heatpump-related HTML
         let app_dir = ws.join("data/apps/test-app");
         std::fs::create_dir_all(&app_dir).unwrap();
         let manifest = AppManifest {
@@ -519,7 +497,6 @@ mod tests {
         .unwrap();
         std::fs::write(app_dir.join("index.html"), "<h1>Heatpump Status</h1>").unwrap();
 
-        // Create a know-how file with heatpump description
         let kh_dir = ws.join("data/knowhow");
         std::fs::create_dir_all(&kh_dir).unwrap();
         std::fs::write(
@@ -527,14 +504,12 @@ mod tests {
             "---\nname: Panasonic Heatpump\ndescription: Controls and monitors Panasonic heatpumps via Comfort Cloud API\n---\nAPI docs...",
         ).unwrap();
 
-        // Stamp know-how
         let summaries = crate::core::KnowhowStore::load_summaries(&kh_dir);
         let result = manager
-            .stamp_knowhow("test-app", &summaries, &[], embedder)
+            .stamp_knowhow("test-app", &summaries, &[], &embedder)
             .await;
         assert!(result.is_ok());
 
-        // Verify manifest was updated
         let updated: AppManifest =
             serde_json::from_str(&std::fs::read_to_string(app_dir.join("manifest.json")).unwrap())
                 .unwrap();
@@ -546,7 +521,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         let manager = AppManager::new(ws).unwrap();
-        let embedder = shared_provider();
+        // No semantic match needed — the explicit ref is added before any
+        // similarity scoring happens.
+        let embedder = KeywordEmbedder::new(&["oura"]);
 
         let app_dir = ws.join("data/apps/test-app");
         std::fs::create_dir_all(&app_dir).unwrap();
@@ -572,7 +549,7 @@ mod tests {
 
         let summaries = crate::core::KnowhowStore::load_summaries(&kh_dir);
         let result = manager
-            .stamp_knowhow("test-app", &summaries, &["oura".to_string()], embedder)
+            .stamp_knowhow("test-app", &summaries, &["oura".to_string()], &embedder)
             .await;
         assert!(result.is_ok());
 

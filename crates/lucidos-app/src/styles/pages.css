@@ -192,6 +192,149 @@
     white-space: pre-wrap;
 }
 
+/* ===== Plugin install panel ===== */
+
+.plugin-install-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    max-width: 50rem;
+}
+
+.plugin-install-header h2 {
+    margin: 0 0 0.5rem 0;
+    font-size: 1.1rem;
+    color: var(--text-primary);
+}
+
+.plugin-install-title-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+}
+
+.plugin-install-name {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.plugin-install-version {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    font-family: monospace;
+}
+
+.plugin-install-description {
+    margin: 0.375rem 0 0 0;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+}
+
+.plugin-install-section {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    padding: 0.75rem 0.875rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.plugin-install-label {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.plugin-install-source-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    justify-content: space-between;
+}
+
+.plugin-install-source-type {
+    font-size: 0.75rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 0.25rem;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+}
+
+.plugin-install-source-value {
+    background: var(--bg-tertiary);
+    padding: 0.375rem 0.5rem;
+    border-radius: 0.25rem;
+    font-size: 0.85rem;
+    color: var(--text-primary);
+    overflow-x: auto;
+    white-space: nowrap;
+}
+
+.plugin-install-files {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 12.5rem;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.plugin-install-file {
+    font-family: monospace;
+    font-size: 0.8rem;
+    color: var(--text-primary);
+    padding: 0.1875rem 0.375rem;
+    border-radius: 0.1875rem;
+}
+
+.plugin-install-file-overwrite {
+    color: var(--accent-yellow);
+    background: color-mix(in srgb, var(--accent-yellow) 10%, transparent);
+}
+
+.plugin-install-overwrites {
+    border-color: color-mix(in srgb, var(--accent-yellow) 50%, var(--border-color));
+}
+
+.plugin-install-warning-text {
+    margin: 0;
+    color: var(--accent-yellow);
+    font-size: 0.825rem;
+}
+
+.plugin-install-empty {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+.plugin-install-setup-body {
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    line-height: 1.5;
+}
+
+.plugin-install-setup-body p:first-child {
+    margin-top: 0;
+}
+
+.plugin-install-setup-body p:last-child {
+    margin-bottom: 0;
+}
+
+.plugin-install-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+
 .form-group {
     margin-bottom: 1rem;
 }

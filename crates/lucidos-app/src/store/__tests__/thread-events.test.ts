@@ -9,6 +9,9 @@ import {
   unresumedAbortIndex,
   resumeEngineNote,
   fullCommandForEngineTool,
+  fullCommandForCCTool,
+  synthesizeContextCapture,
+  isExchangeStartEvent,
   type ThreadAggregate,
   type ThreadEvent,
   type StoredEvent,
@@ -219,13 +222,13 @@ describe('groupIntoExchanges', () => {
     expect(exchanges[1].steps).toHaveLength(0);
   });
 
-  it('splits at SessionRecovered: opens a resume exchange that absorbs the engine note', () => {
+  it('splits at ContinuationStarted: opens a resume exchange that absorbs the engine note', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'fix the bug' }],
       [2, { type: 'ResponseAborted', text: '' }],
-      [3, { type: 'SessionRecovered' }],
+      [3, { type: 'ContinuationStarted' }],
       // Engine-mode UserPromptInjected (the engine note) — must absorb into the
-      // SessionRecovered exchange as a step, not start a new exchange.
+      // ContinuationStarted exchange as a step, not start a new exchange.
       [4, { type: 'UserPromptInjected', text: '[Engine note]', mode: 'engine' }],
       [5, { type: 'TextStreamed', text: 'On it.' }],
       [6, { type: 'ResponseGenerated' }],
@@ -234,21 +237,21 @@ describe('groupIntoExchanges', () => {
     expect(exchanges).toHaveLength(3);
     expect(exchanges[0].userEvent.type).toBe('MessageReceived');
     expect(exchanges[1].userEvent.type).toBe('ResponseAborted'); // boundary
-    expect(exchanges[2].userEvent.type).toBe('SessionRecovered');
+    expect(exchanges[2].userEvent.type).toBe('ContinuationStarted');
     expect(exchanges[2].steps.map(s => s.event.type)).toEqual([
       'UserPromptInjected', 'TextStreamed', 'ResponseGenerated',
     ]);
   });
 
-  it('Human-mode UserPromptInjected after SessionRecovered does NOT absorb (legacy correction)', () => {
+  it('Human-mode UserPromptInjected after ContinuationStarted does NOT absorb (legacy correction)', () => {
     const events = new Map<number, ThreadEvent>([
-      [1, { type: 'SessionRecovered' }],
+      [1, { type: 'ContinuationStarted' }],
       [2, { type: 'UserPromptInjected', text: 'human correction', mode: 'human' }],
     ]);
     const exchanges = groupIntoExchanges(events);
-    // Two exchanges: SessionRecovered, then UserPromptInjected as its own boundary.
+    // Two exchanges: ContinuationStarted, then UserPromptInjected as its own boundary.
     expect(exchanges).toHaveLength(2);
-    expect(exchanges[0].userEvent.type).toBe('SessionRecovered');
+    expect(exchanges[0].userEvent.type).toBe('ContinuationStarted');
     expect(exchanges[1].userEvent.type).toBe('UserPromptInjected');
   });
 
@@ -318,6 +321,51 @@ describe('groupIntoExchanges', () => {
     ]);
   });
 
+  // Regression for the off-by-one rendering observed in real thread
+  // 9b5a05aa: when the orphan-injection re-process loop stamped A's req_id
+  // onto a turn whose response actually belonged to B, the two events the
+  // chat loop emits BEFORE its first injection check (MemorySearched +
+  // ContextAssembled, plus ContextTokensMeasured at every step) used to
+  // bypass request-id routing and leak into B's exchange. ContextAssembled
+  // landing in B's empty exchange flipped the status heuristic to 'aborted'
+  // (the "stale exchange" branch needs hasSteps=true). Route every chat-loop
+  // event that carries request_event_id back to its anchor — none should
+  // fall through to `current`.
+  it('routes ContextAssembled/MemorySearched/ContextTokensMeasured by request_event_id, not current pointer', () => {
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'A', _eventId: 'A' }],
+      [2, { type: 'TextStreamed', text: 'a-reply', request_event_id: 'A' } as StoredEvent],
+      [3, { type: 'ResponseGenerated', text: 'a-reply', request_event_id: 'A' } as StoredEvent],
+      // B opens a new exchange in the timeline. Every late event for A's loop
+      // (including the chat-loop preludes) lands AFTER B's MR in the seq stream.
+      [4, { type: 'MessageReceived', text: 'B', _eventId: 'B' }],
+      [5, { type: 'MemorySearched', queries: [], results: [], request_event_id: 'A' } as unknown as StoredEvent],
+      [6, { type: 'ContextAssembled', sections: [], tools: [], model: 'm', total_chars: 0, request_event_id: 'A' } as unknown as StoredEvent],
+      [7, { type: 'ContextTokensMeasured', tokens: 100, message_count: 1, request_event_id: 'A' } as unknown as StoredEvent],
+      [8, { type: 'TextStreamed', text: 'late', request_event_id: 'A' } as StoredEvent],
+      [9, { type: 'ResponseGenerated', text: 'late', request_event_id: 'A' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges).toHaveLength(2);
+
+    expect((exchanges[0].userEvent as { text: string }).text).toBe('A');
+    // Every late event with req=A routes back to A, including the
+    // chat-loop preludes that previously fell through to `current`.
+    expect(exchanges[0].steps.map(s => s.event.type)).toEqual([
+      'TextStreamed',
+      'ResponseGenerated',
+      'MemorySearched',
+      'ContextAssembled',
+      'ContextTokensMeasured',
+      'TextStreamed',
+      'ResponseGenerated',
+    ]);
+
+    expect((exchanges[1].userEvent as { text: string }).text).toBe('B');
+    // B has no events of its own — none stamped with req=B in this scenario.
+    expect(exchanges[1].steps).toHaveLength(0);
+  });
+
   it('routes a late ResponseAborted to A (terminating it) and still opens a boundary exchange', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'A', _eventId: 'A' }],
@@ -373,8 +421,10 @@ describe('groupIntoExchanges', () => {
       [7, { type: 'ResponseCanceled', channel: 'claude_code', request_event_id: 'A' } as StoredEvent],
     ]);
     const exchanges = groupIntoExchanges(events);
-    expect(exchanges).toHaveLength(2);
+    // 1: A's CC reply, 2: B follow-up (with ResponseCanceled step), 3: cancel boundary panel
+    expect(exchanges).toHaveLength(3);
     expect(exchanges[1].steps.map(s => s.event.type)).toContain('ResponseCanceled');
+    expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
   });
 
   // Chat threads still need request_event_id routing (each chat exchange has
@@ -387,9 +437,12 @@ describe('groupIntoExchanges', () => {
       [4, { type: 'ResponseCanceled', channel: 'chat', request_event_id: 'A' } as StoredEvent],
     ]);
     const exchanges = groupIntoExchanges(events);
-    expect(exchanges).toHaveLength(2);
+    // 1: A's chat exchange (with ResponseCanceled step), 2: B's exchange,
+    // 3: cancel boundary panel
+    expect(exchanges).toHaveLength(3);
     expect(exchanges[0].steps.map(s => s.event.type)).toContain('ResponseCanceled');
     expect(exchanges[1].steps.map(s => s.event.type)).not.toContain('ResponseCanceled');
+    expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
   });
 
   // Legacy engine-spawned CC threads (merge-conflict, hardening) created before
@@ -444,7 +497,7 @@ describe('groupIntoExchanges', () => {
 });
 
 describe('unresumedAbortIndex', () => {
-  it('returns the latest aborted exchange when no SessionRecovered follows', () => {
+  it('returns the latest aborted exchange when no ContinuationStarted follows', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
       [2, { type: 'ResponseAborted' }],
@@ -460,7 +513,7 @@ describe('unresumedAbortIndex', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
       [2, { type: 'ResponseAborted' }],
-      [3, { type: 'SessionRecovered' }],
+      [3, { type: 'ContinuationStarted' }],
       [4, { type: 'ResponseGenerated' }],
     ]);
     const exchanges = groupIntoExchanges(events);
@@ -475,12 +528,37 @@ describe('unresumedAbortIndex', () => {
     const exchanges = groupIntoExchanges(events);
     expect(unresumedAbortIndex(exchanges)).toBeNull();
   });
+
+  // Stale-settle aborts are engine cleanup of stuck threads — clicking
+  // Continue would re-run work the user just stopped. Treat them like
+  // ContinuationStarted so the AbortPanel renders without a Continue button.
+  it('returns null when the latest abort is stale-settle', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'one' }],
+      [2, { type: 'ResponseAborted', cause: 'stale_settle' }],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(unresumedAbortIndex(exchanges)).toBeNull();
+  });
+
+  it('returns null when a stale-settle abort sits above an older real abort', () => {
+    // The older real abort is irrelevant once the user has triggered
+    // stale-settle on the thread — the thread is settled, no Continue.
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'one' }],
+      [2, { type: 'ResponseAborted', cause: 'engine_shutdown' }],
+      [3, { type: 'MessageReceived', text: 'two' }],
+      [4, { type: 'ResponseAborted', cause: 'stale_settle' }],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(unresumedAbortIndex(exchanges)).toBeNull();
+  });
 });
 
 describe('resumeEngineNote', () => {
-  it('reads the engine note from a SessionRecovered exchange and counts tool bullets', () => {
+  it('reads the engine note from a ContinuationStarted exchange and counts tool bullets', () => {
     const events = new Map<number, ThreadEvent>([
-      [1, { type: 'SessionRecovered' }],
+      [1, { type: 'ContinuationStarted' }],
       [2, { type: 'UserPromptInjected', mode: 'engine', text:
         '[Engine note — this is a rerun]\n' +
         'Your previous attempt at this turn was interrupted by an engine restart.\n' +
@@ -497,10 +575,10 @@ describe('resumeEngineNote', () => {
     expect(note!.text).toContain('Engine note');
   });
 
-  it('returns null when the SessionRecovered has no engine UserPromptInjected step', () => {
+  it('returns null when the ContinuationStarted has no engine UserPromptInjected step', () => {
     const events = new Map<number, ThreadEvent>([
-      [1, { type: 'SessionRecovered' }],
-      // CC resume path emits SessionRecovered alone (no engine note).
+      [1, { type: 'ContinuationStarted' }],
+      // CC resume path emits ContinuationStarted alone (no engine note).
       [2, { type: 'CodingAgentTextStreamed', text: 'Continuing.' }],
     ]);
     const exchanges = groupIntoExchanges(events);
@@ -1222,6 +1300,21 @@ describe('tool description from event', () => {
     expect(stepEvent?.full).toBe(fullCmd);
   });
 
+  it('exchangeResponseEvents stamps event.created on step events for the detail modal', () => {
+    // Steps come from events; the modal needs the originating event's timestamp.
+    const thread = makeThreadState();
+    const map = new Map([['t', thread]]);
+    handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-04-30T10:00:00Z');
+    handleEvent(map, 't', 2, { type: 'ToolCalled', name: 'run_bash', args: { command: 'ls' } } as ThreadEvent, '2026-04-30T10:00:01Z');
+    handleEvent(map, 't', 3, { type: 'Thinking' } as ThreadEvent, '2026-04-30T10:00:02Z');
+
+    const exchanges = groupIntoExchanges(map.get('t')!.events);
+    const respEvents = exchangeResponseEvents(exchanges[0]);
+    const steps = respEvents.filter((e): e is Extract<typeof e, { type: 'step' }> => e.type === 'step');
+    expect(steps[0]?.created).toBe('2026-04-30T10:00:01Z');
+    expect(steps[1]?.created).toBe('2026-04-30T10:00:02Z');
+  });
+
   it('fullCommandForEngineTool returns the un-elided arg for common engine tools', () => {
     expect(fullCommandForEngineTool('run_bash', { command: 'ls -la /tmp' })).toBe('ls -la /tmp');
     expect(fullCommandForEngineTool('run_python', { code: 'print(1)\nprint(2)' })).toBe('print(1)\nprint(2)');
@@ -1234,6 +1327,54 @@ describe('tool description from event', () => {
     expect(fullCommandForEngineTool('list_repositories', {})).toBeUndefined();
     expect(fullCommandForEngineTool('run_bash', null)).toBeUndefined();
     expect(fullCommandForEngineTool('run_bash', { command: 123 })).toBeUndefined();
+  });
+
+  it('fullCommandForCCTool returns the un-elided arg for common Claude Code tools', () => {
+    expect(fullCommandForCCTool('Read', { file_path: '/src/lib.rs' })).toBe('/src/lib.rs');
+    expect(fullCommandForCCTool('Edit', { file_path: '/src/lib.rs' })).toBe('/src/lib.rs');
+    expect(fullCommandForCCTool('MultiEdit', { file_path: '/src/lib.rs' })).toBe('/src/lib.rs');
+    expect(fullCommandForCCTool('Write', { file_path: '/src/lib.rs' })).toBe('/src/lib.rs');
+    expect(fullCommandForCCTool('NotebookEdit', { file_path: '/n.ipynb' })).toBe('/n.ipynb');
+    expect(fullCommandForCCTool('Bash', { command: 'cd /tmp && ls -la | head' })).toBe('cd /tmp && ls -la | head');
+    expect(fullCommandForCCTool('WebFetch', { url: 'https://example.com/path' })).toBe('https://example.com/path');
+    expect(fullCommandForCCTool('Glob', { pattern: '**/*.tsx' })).toBe('**/*.tsx');
+    expect(fullCommandForCCTool('Grep', { pattern: 'TODO' })).toBe('TODO');
+    expect(fullCommandForCCTool('WebSearch', { query: 'rust async' })).toBe('rust async');
+    expect(fullCommandForCCTool('Agent', { description: 'short', prompt: 'do the long thing' })).toBe('do the long thing');
+    expect(fullCommandForCCTool('Skill', { skill: 'foo' })).toBe('foo');
+    expect(fullCommandForCCTool('UnknownTool', { x: 'y' })).toBeUndefined();
+    expect(fullCommandForCCTool('Bash', null)).toBeUndefined();
+    expect(fullCommandForCCTool('Bash', { command: 123 })).toBeUndefined();
+  });
+
+  it('fullCommandForCCTool formats TodoWrite as a status-prefixed list (active form for in-progress)', () => {
+    const todos = [
+      { content: 'Write tests', activeForm: 'Writing tests', status: 'completed' },
+      { content: 'Implement feature', activeForm: 'Implementing feature', status: 'in_progress' },
+      { content: 'Update docs', activeForm: 'Updating docs', status: 'pending' },
+    ];
+    expect(fullCommandForCCTool('TodoWrite', { todos })).toBe(
+      '[x] Write tests\n[~] Implementing feature\n[ ] Update docs',
+    );
+    expect(fullCommandForCCTool('TodoWrite', { todos: [] })).toBeUndefined();
+    expect(fullCommandForCCTool('TodoWrite', { todos: 'nope' })).toBeUndefined();
+    expect(fullCommandForCCTool('TodoWrite', {})).toBeUndefined();
+  });
+
+  it('exchangeResponseEvents stamps full path on CodingAgentToolCalled steps for hover tooltip', () => {
+    // Rust describe_cc_tool() shows only basename(file_path); the full path is
+    // preserved on the step so the UI can show it on mouseover.
+    const thread = makeThreadState();
+    thread.meta.channel = 'claude_code';
+    const map = new Map([['t', thread]]);
+    const fullPath = '/Users/alex/IdeaProjects/lucidos/crates/lucidos-app/src/store/thread-events.ts';
+    handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'open it' } as ThreadEvent, '2026-05-09T10:00:00Z');
+    handleEvent(map, 't', 2, { type: 'CodingAgentToolCalled', name: 'Read', args: { file_path: fullPath }, description: 'Read thread-events.ts' } as ThreadEvent, '2026-05-09T10:00:01Z');
+
+    const exchanges = groupIntoExchanges(map.get('t')!.events);
+    const respEvents = exchangeResponseEvents(exchanges[0]);
+    const stepEvent = respEvents.find(e => e.type === 'step') as Extract<typeof respEvents[number], { type: 'step' }> | undefined;
+    expect(stepEvent?.full).toBe(fullPath);
   });
 
   it('exchangeResponseEvents falls back for CodingAgentToolCalled without description', () => {
@@ -1269,7 +1410,10 @@ describe('tool description from event', () => {
     handleEvent(map, 't', 6, { type: 'ResponseCanceled' } as ThreadEvent, '2026-04-13T19:30:15Z');
 
     const exchanges = groupIntoExchanges(map.get('t')!.events);
-    expect(exchanges).toHaveLength(2);
+    // 1: original 'find the file' (with orphaned ToolCalled), 2: 'stop, I found it'
+    // (with the late ToolResult + ResponseCanceled step), 3: cancel boundary panel.
+    expect(exchanges).toHaveLength(3);
+    expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
 
     // Verify the step IS pending when treated as the last exchange (the bug scenario)
     const stepsAsLast = exchangeSteps(exchanges[0], true);
@@ -1636,9 +1780,11 @@ describe('exchangeStatus — CC follow-up edge cases', () => {
       [8, { type: 'CodingAgentIdled', reason: 'engine_restart_interrupt', created: '2026-04-12T10:30:00Z' } as StoredEvent],
     ]);
     const exchanges = groupIntoExchanges(events);
-    expect(exchanges).toHaveLength(2);
-    const status = exchangeStatus(exchanges[1], '', true, false, true);
+    // 1: A's CC reply, 2: B follow-up (canceled), 3: cancel boundary panel
+    expect(exchanges).toHaveLength(3);
+    const status = exchangeStatus(exchanges[1], '', false, false, true);
     expect(status).toBe('canceled');
+    expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
   });
 
   it('follow-up with ResponseFailed = error, NOT aborted', () => {
@@ -1712,7 +1858,7 @@ describe('exchangeStatus — CC follow-up with pending user messages (optimistic
 });
 
 describe('exchangeStatus — CC session recovery and restart', () => {
-  it('SessionRecovered exchange after restart = done (not aborted)', () => {
+  it('ContinuationStarted exchange after restart = done (not aborted)', () => {
     const { statuses, exchanges } = buildCCThread([
       // Exchange 1: original session, engine restarted
       { seq: 1, event: { type: 'MessageReceived', text: 'fix', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:00:00Z' },
@@ -1720,7 +1866,7 @@ describe('exchangeStatus — CC session recovery and restart', () => {
       { seq: 3, event: { type: 'CodingAgentToolCalled', name: 'Read', args: {} } as ThreadEvent, created: '2026-04-12T10:00:02Z' },
       { seq: 4, event: { type: 'SessionEnded', reason: 'shutdown' } as ThreadEvent, created: '2026-04-12T10:00:03Z' },
       // Exchange 2: recovery after restart
-      { seq: 5, event: { type: 'SessionRecovered', branch: 'claude-code/fix' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
+      { seq: 5, event: { type: 'ContinuationStarted', branch: 'claude-code/fix' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 6, event: { type: 'SessionStarted', session_id: 's2' } as ThreadEvent, created: '2026-04-12T10:01:01Z' },
       { seq: 7, event: { type: 'CodingAgentIdled', has_changes: true } as ThreadEvent, created: '2026-04-12T10:01:02Z' },
     ]);
@@ -2090,3 +2236,120 @@ describe('Phase 4 — thread lifecycle under terminal-only SessionEnded', () => 
   });
 });
 
+describe('ContextCaptured projection — main_llm vs claude_code', () => {
+  // Main-LLM snapshots fire after a Thinking step — bind there so the
+  // inline chip renders next to the request. CC has no per-API-call
+  // Thinking step (CC manages its own loop), so a CC snapshot must bind
+  // to whatever step is on top of the stack at emission time —
+  // typically the tool that just finished. Without this split, every CC
+  // step's modal would still show "No context snapshot captured."
+  it('main_llm snapshot binds to the most recent Thinking step', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'hi', created: '2026-05-12T10:00:00Z' } as ThreadEvent],
+      [2, { type: 'Thinking', text: 'Context: 100 tokens, 1 messages' } as ThreadEvent],
+      [3, {
+        type: 'ContextCaptured',
+        producer: 'main_llm',
+        model: 'claude-opus-4-7',
+        context_window: 200_000,
+        sections: [],
+        tools: [],
+        estimated_total_tokens: 100,
+        usage: { input_tokens: 100, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      } as ThreadEvent],
+      [4, { type: 'ToolCalled', name: 'read_file', args: {} } as ThreadEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const respSteps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as Array<{ description: string; contextCapture?: { producer: string } }>;
+    const thinking = respSteps.find(s => s.description === 'Thinking');
+    const tool = respSteps.find(s => s.description !== 'Thinking');
+    expect(thinking?.contextCapture?.producer).toBe('main_llm');
+    expect(tool?.contextCapture).toBeUndefined();
+  });
+
+  it('claude_code snapshot binds to the most recent step (any kind)', () => {
+    // CC emits one ContextCaptured per LLM API call (see
+    // run_session.rs::AgentEvent::Usage). Between calls, CC may have
+    // executed several tools — the snapshot binds to the latest CC step
+    // so the user sees real token usage when they click any of them.
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'do work', created: '2026-05-12T10:00:00Z' } as ThreadEvent],
+      [2, { type: 'SessionStarted', session_id: 's1' } as ThreadEvent],
+      [3, { type: 'CodingAgentPromptSent' } as ThreadEvent],
+      [4, { type: 'CodingAgentToolCalled', name: 'Read', args: { file_path: 'a.rs' }, tool_use_id: 'tu-A' } as ThreadEvent],
+      [5, { type: 'CodingAgentToolResult', name: 'Read', result: 'ok', tool_use_id: 'tu-A' } as ThreadEvent],
+      [6, {
+        type: 'ContextCaptured',
+        producer: 'claude_code',
+        model: 'claude-opus-4-7',
+        context_window: 200_000,
+        sections: [],
+        tools: [],
+        estimated_total_tokens: 5000,
+        usage: { input_tokens: 5000, output_tokens: 100, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      } as ThreadEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const respSteps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as Array<{ description: string; contextCapture?: { producer: string; usage?: { input_tokens: number } } }>;
+    // Find the Read step (the most recent step before the ContextCaptured event)
+    const lastStep = respSteps[respSteps.length - 1];
+    expect(lastStep.contextCapture?.producer).toBe('claude_code');
+    expect(lastStep.contextCapture?.usage?.input_tokens).toBe(5000);
+  });
+});
+
+describe('synthesizeContextCapture — legacy event projection', () => {
+  // The new ContextCaptured event replaces the legacy
+  // Thinking{tokens} + ContextTokensMeasured + ContextAssembled trio. Old
+  // DB rows still surface as those three events; the shim stitches whatever
+  // subset is present into a ContextCapture so the same modal renders
+  // for replays without a backend migration. `legacy: true` lets the modal
+  // badge it so the user knows cache stats / section bodies may be partial.
+  it('synthesizeContextCapture stitches legacy Thinking + ContextTokensMeasured + ContextAssembled', () => {
+    const result = synthesizeContextCapture({
+      thinking: { text: 'Context: 36510 tokens, 1 messages', context_tokens: 36510, context_messages: 1 },
+      tokensMeasured: { input_tokens: 23500 },
+      assembled: { sections: [{ name: 'System', content: 'sys', char_count: 3 }], tools: ['read_file'], model: 'claude-opus-4-7', total_chars: 3 },
+    });
+    expect(result.producer).toBe('main_llm');
+    expect(result.model).toBe('claude-opus-4-7');
+    expect(result.sections).toHaveLength(1);
+    expect(result.usage?.input_tokens).toBe(23500);
+    expect(result.estimated_total_tokens).toBe(36510);
+    expect(result.legacy).toBe(true);
+  });
+
+  // Pre-ContextTokensMeasured (very old rows): only Thinking + ContextAssembled
+  // present. usage stays undefined; the modal still renders the section
+  // breakdown, just without a real cache hit rate.
+  it('synthesizeContextCapture survives missing tokensMeasured', () => {
+    const result = synthesizeContextCapture({
+      thinking: { text: 'Context: 1000 tokens, 2 messages', context_tokens: 1000 },
+      assembled: { sections: [], tools: [], model: 'claude-sonnet-4-6', total_chars: 0 },
+    });
+    expect(result.usage).toBeUndefined();
+    expect(result.estimated_total_tokens).toBe(1000);
+    expect(result.model).toBe('claude-sonnet-4-6');
+    expect(result.legacy).toBe(true);
+  });
+
+  // Even-older rows where only Thinking ever fired (capture_context off).
+  // No section list, no model — model defaults to empty string so the modal
+  // can render "(unknown model)". Producer stays main_llm; legacy=true.
+  it('synthesizeContextCapture survives missing assembled', () => {
+    const result = synthesizeContextCapture({
+      thinking: { text: 'Context: 500 tokens, 1 messages', context_tokens: 500, context_messages: 1 },
+    });
+    expect(result.sections).toEqual([]);
+    expect(result.tools).toEqual([]);
+    expect(result.model).toBe('');
+    expect(result.estimated_total_tokens).toBe(500);
+    expect(result.legacy).toBe(true);
+  });
+});
+
+describe('ChildThreadCompleted as exchange-starter', () => {
+  it('is recognized as an exchange-starter', () => {
+    expect(isExchangeStartEvent('ChildThreadCompleted')).toBe(true);
+  });
+});

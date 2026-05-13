@@ -82,7 +82,7 @@ describe('submitTrigger scroll reset', () => {
 
     const ok = await submitTrigger({
       name: 'Nightly Build',
-      run: { type: 'intent', intent: 'build', knowhow: [] },
+      run: { type: 'intent', intent: 'build' },
       cronExpressions: ['0 0 0 * * *'],
       taskId: 't1',
       goToReview: false,
@@ -98,7 +98,7 @@ describe('submitTrigger scroll reset', () => {
 
     const ok = await submitTrigger({
       name: 'New Trigger',
-      run: { type: 'intent', intent: 'do thing', knowhow: [] },
+      run: { type: 'intent', intent: 'do thing' },
       cronExpressions: ['0 0 0 * * *'],
       goToReview: false,
     });
@@ -113,7 +113,7 @@ describe('submitTrigger scroll reset', () => {
 
     const ok = await submitTrigger({
       name: 'X',
-      run: { type: 'intent', intent: 'x', knowhow: [] },
+      run: { type: 'intent', intent: 'x' },
       cronExpressions: ['0 0 0 * * *'],
       taskId: 't1',
       goToReview: false,

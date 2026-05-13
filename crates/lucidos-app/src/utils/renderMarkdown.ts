@@ -1,5 +1,5 @@
 import { marked } from 'marked';
-import { COPY_ICON, CHECK_ICON, escapeHtmlAttr } from './markedConfig';
+import { COPY_ICON, escapeHtmlAttr } from './markedConfig';
 
 // Unique marker prefix for copy block boundaries (survives marked processing)
 const COPY_MARKER = 'LUCIDOS_COPY_BLOCK';
@@ -106,5 +106,3 @@ export function renderMarkdown(md: string): string {
   );
   return html;
 }
-
-export { COPY_ICON, CHECK_ICON };

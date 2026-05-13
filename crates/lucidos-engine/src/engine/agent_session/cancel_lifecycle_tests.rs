@@ -26,7 +26,7 @@ use crate::engine::thread_events::{
 };
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-use super::lifecycle::{classify_result, TerminalKind};
+use super::lifecycle::{classify_result, stop_terminal_kind, TerminalKind};
 use crate::engine::LucidosEngine;
 
 fn cc_meta() -> EventMeta {
@@ -71,11 +71,14 @@ fn cancel_classifies_as_canceled_with_emit_idle_true() {
         user_hit_stop,
         is_shutdown,
         None,
+        false,
     );
 
     assert_eq!(
         terminal,
-        Some(TerminalKind::Canceled),
+        Some(TerminalKind::Canceled(
+            crate::engine::thread_events::CancelCause::UserStop
+        )),
         "user-driven cancel must produce TerminalKind::Canceled"
     );
     assert!(
@@ -90,7 +93,7 @@ fn cancel_classifies_as_canceled_with_emit_idle_true() {
 #[test]
 fn cancel_terminal_event_is_response_canceled() {
     let event = LucidosEngine::make_terminal_event(
-        TerminalKind::Canceled,
+        TerminalKind::Canceled(crate::engine::thread_events::CancelCause::UserStop),
         "partial text".into(),
         Some("claude-opus-4-7".into()),
         None,
@@ -161,6 +164,7 @@ async fn cancel_does_not_terminate_session() {
             images: vec![],
             model: Some("claude-opus-4-7".into()),
             reasoning_effort: None,
+            cause: crate::engine::thread_events::CancelCause::UserStop,
         },
         meta: cc_meta(),
     })
@@ -245,4 +249,54 @@ async fn cancel_does_not_terminate_session() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+/// A stop signal landing on an idle CC session must NOT emit a terminal
+/// event — the previous turn's `ResponseGenerated` + `CodingAgentIdled`
+/// already terminated the exchange, and a late "Canceled the response"
+/// would lie about a turn the user never canceled. Holds regardless of
+/// the suppress flag (Apply/Discard/Archive on idle, real Cancel racing
+/// idle — both must be no-ops).
+#[test]
+fn stop_on_idle_emits_no_terminal_event() {
+    assert_eq!(
+        stop_terminal_kind(false, true, false),
+        None,
+        "stop signal landing on idle CC must NOT emit a phantom ResponseCanceled — \
+         the previous turn's ResponseGenerated already terminated the exchange"
+    );
+    assert_eq!(
+        stop_terminal_kind(false, true, true),
+        None,
+        "Apply/Discard/Archive on idle CC must NOT emit ResponseCanceled either — \
+         their lifecycle event is the terminator"
+    );
+}
+
+/// Apply / Discard / Archive on an actively-working CC must NOT emit
+/// `ResponseCanceled` — each has its own lifecycle terminator
+/// (`ChangeApplied` / `ChangeDiscarded` / `ThreadArchived`). Emitting both
+/// labels the turn as "Canceled" when the user clicked something else.
+#[test]
+fn user_action_on_working_cc_suppresses_response_canceled() {
+    assert_eq!(
+        stop_terminal_kind(false, false, true),
+        None,
+        "Apply/Discard/Archive on actively-working CC must NOT emit \
+         ResponseCanceled — their lifecycle event (ChangeApplied / \
+         ChangeDiscarded / ThreadArchived) is the terminator"
+    );
+}
+
+/// Real Cancel click on actively-working CC is the ONLY path that emits
+/// `ResponseCanceled(UserStop)`. Anchor test for the happy cancel flow.
+#[test]
+fn real_cancel_on_working_cc_still_emits_canceled() {
+    use crate::engine::thread_events::CancelCause;
+    assert_eq!(
+        stop_terminal_kind(false, false, false),
+        Some(TerminalKind::Canceled(CancelCause::UserStop)),
+        "real Cancel click on actively-working CC must emit ResponseCanceled \
+         so the user sees the 'Canceled' chip on the in-flight turn"
+    );
 }

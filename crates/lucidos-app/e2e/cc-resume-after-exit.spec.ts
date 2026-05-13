@@ -4,7 +4,7 @@ import {
   navigateToApp, sendMessage, sendFollowUp, uniqueMessage,
   assertHealthy, switchToClaudeMode, newThread,
   waitForActionPanel, waitForCCToFinish, waitForCCToStart,
-  countVisibleResponses,
+  countVisibleResponses, getLatestVisibleResponseText,
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
@@ -138,26 +138,15 @@ test.describe('CC resume after process exit', () => {
     await waitForCCToStart(page, 120_000);
     await waitForCCToFinish(page, 120_000);
 
-    const responseCount = await countVisibleResponses(page);
-    expect(responseCount).toBeGreaterThanOrEqual(2);
-
-    // Find the latest visible response and assert it contains "pineapple".
-    // Case-insensitive — CC sometimes capitalizes a single-word answer.
-    const latestResponseText = await page.evaluate(() => {
-      const els = document.querySelectorAll('.response-content');
-      const visible = Array.from(els).filter(el => {
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim().length > 0;
-      });
-      return (visible[visible.length - 1]?.textContent ?? '').trim();
-    });
-
-    expect(
-      latestResponseText.toLowerCase(),
-      `Second response did not reference the codeword from turn 1. ` +
-        `If conversation memory was lost across turns, CC will answer with a ` +
-        `disclaimer instead of "pineapple". Response was: ${JSON.stringify(latestResponseText)}`,
-    ).toContain('pineapple');
+    // The status label can flip Done before the final response chunk reaches
+    // the DOM (msg_tx fast-path between turns can also flash a transient
+    // non-Working state), so poll until the codeword appears in the latest
+    // response. CC sometimes capitalizes a single-word answer — lowercase
+    // before matching.
+    await expect(async () => {
+      const latest = await getLatestVisibleResponseText(page);
+      expect(latest.toLowerCase()).toContain('pineapple');
+    }).toPass({ timeout: 30_000, intervals: [500, 1000, 2000] });
   });
 
   test('status label shows Requesting during CC follow-up', async ({ page }) => {

@@ -1,0 +1,20 @@
+# Standalone crate — explicitly NOT part of the parent workspace because
+# this crate targets `wasm32-unknown-unknown`.
+[workspace]
+
+[package]
+name = "binance-hmac"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Binance-style HMAC-SHA256 signer for the Lucidos proxy auth pipeline."
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

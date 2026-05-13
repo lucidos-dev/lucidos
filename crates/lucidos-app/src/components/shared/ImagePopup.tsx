@@ -1,4 +1,4 @@
-import { useRef, useEffect, useLayoutEffect } from 'preact/hooks';
+import { useRef, useEffect, useLayoutEffect, useState } from 'preact/hooks';
 import { popupImage } from '../../store/store';
 import { CloseIcon, ChevronLeftIcon, ChevronRightIcon } from './icons';
 import { ModalOverlay } from './ModalOverlay';
@@ -21,6 +21,22 @@ const SWIPE_SNAP_BACK_MS = 200;
 // transitionend isn't 100% reliable (background tab, dropped paint). Safety
 // timer guarantees the post-animation cleanup runs.
 const TRANSITION_TIMEOUT_MS = 400;
+
+// Strip rest position: slides are positioned by shortestDelta around the
+// current index, so the centered slide always sits at left=0 and the strip
+// translates to 0 to show it.
+const STRIP_REST_TRANSFORM = 'translate3d(0, 0, 0)';
+
+// Shortest signed distance from c to i in a ring of size n. Returns a value
+// in (-n/2, n/2]. Used to position each slide adjacent to the current one so
+// last↔first wraps slide in from the correct side instead of the strip
+// scrolling backward through every intermediate image.
+function shortestDelta(i: number, c: number, n: number): number {
+  if (n <= 1) return 0;
+  let d = ((i - c) % n + n) % n;
+  if (d > n / 2) d -= n;
+  return d;
+}
 
 function step(delta: -1 | 1) {
   const s = popupImage.value;
@@ -60,46 +76,45 @@ export function ImagePopup() {
   if (swipeRef.current === null) swipeRef.current = new SwipeTouch();
   const swipe = swipeRef.current;
   const swipeDxRef = useRef<number | null>(null);
-  // Captured at touchstart: index we started from, the strip's visual offset
-  // at that moment (could be mid-animation), and width.
-  const dragStartRef = useRef<{ index: number; offset: number; w: number } | null>(null);
+  // Captured at touchstart: the strip's visual offset at that moment (could be
+  // mid-animation), and width. Slide positions are computed from the live
+  // signal index, so we don't need to remember the start index.
+  const dragStartRef = useRef<{ offset: number; w: number } | null>(null);
   const layoutRef = useRef<LayoutCache | null>(null);
   const rafRef = useRef<number | null>(null);
   // Cleanup for the in-flight commit/snap-back transitionend listener.
   const transitionCleanupRef = useRef<(() => void) | null>(null);
-  // The index a pending commit is animating toward. If a new gesture starts
-  // before the animation lands, we flush this so the user doesn't lose the
-  // first swipe's intent.
-  const pendingCommitIndexRef = useRef<number | null>(null);
+  // The index a pending commit is animating toward, plus the index it started
+  // from. We need both to compensate the strip transform when a new gesture
+  // flushes the pending commit mid-animation.
+  const pendingCommitRef = useRef<{ from: number; to: number } | null>(null);
   // True while a touch gesture is in progress; tells the layout effect not to
   // clobber the imperatively-managed transform.
   const touchActiveRef = useRef(false);
   // Tracks the strip DOM node we last initialised — first set on each mount
   // skips the transition so opening the popup doesn't slide.
   const lastStripRef = useRef<HTMLDivElement | null>(null);
+  const [chromeHidden, setChromeHidden] = useState(false);
+  // Reset on each open so the chrome is always visible when re-launching.
+  useEffect(() => { if (state) setChromeHidden(false); }, [state !== null]);
 
   const total = state?.images.length ?? 0;
   const hasNav = total > 1;
 
-  // Sync strip transform from state.index. Single source of truth for the
-  // rest position; touch path manages it imperatively while a gesture is live.
+  // Strip rests at translateX(0); slides are positioned by shortest delta from
+  // the current index, so the centered slide is always at left=0. After a
+  // swipe commit / keyboard step, the imperative animation lands at ±W and
+  // this effect snaps the strip back to 0 with no transition — slides have
+  // repositioned in the same render tick, so the visual stays put.
   useLayoutEffect(() => {
     const strip = stripRef.current;
     if (!strip || !state || touchActiveRef.current) return;
-    const w = strip.offsetWidth;
-    if (w === 0) return;
-    const target = `translate3d(${-state.index * w}px, 0, 0)`;
+    strip.style.transition = 'none';
+    strip.style.transform = STRIP_REST_TRANSFORM;
     if (lastStripRef.current !== strip) {
-      // First set on a freshly-mounted strip: skip transition so popup-open
-      // doesn't animate from `transform: none`.
-      strip.style.transition = 'none';
-      strip.style.transform = target;
       void strip.offsetWidth;
       lastStripRef.current = strip;
-      return;
     }
-    strip.style.transition = `transform ${SWIPE_COMMIT_MS}ms ease-out`;
-    strip.style.transform = target;
   }, [state?.index]);
 
   // Reset zoom when navigating to a new image.
@@ -216,16 +231,27 @@ export function ImagePopup() {
     }
 
     // If a previous swipe started a commit animation that hasn't landed yet,
-    // advance the signal now — the user's next gesture starts from the
-    // committed index, not the pre-commit one.
+    // advance the signal now AND compensate the strip transform so the visual
+    // stays put. After the signal update, slides re-render based on the new
+    // index — we shift the strip by `delta * W` to keep every visible slide in
+    // the same on-screen position.
     function flushPendingCommit() {
-      const target = pendingCommitIndexRef.current;
-      pendingCommitIndexRef.current = null;
-      if (target === null) return;
+      const pending = pendingCommitRef.current;
+      pendingCommitRef.current = null;
+      if (!pending) return;
       const cur = popupImage.value;
-      if (cur && cur.index !== target) {
-        popupImage.value = { images: cur.images, index: target };
-      }
+      if (!cur || cur.index === pending.to) return;
+      const w = strip.offsetWidth;
+      const tBefore = parseTranslateX(strip);
+      const len = cur.images.length;
+      const delta = shortestDelta(pending.to, pending.from, len);
+      popupImage.value = { images: cur.images, index: pending.to };
+      // After the signal write, slides have repositioned. Compensate so
+      // visuals match: visual = newRelLeft*W + tNew, and we want it to equal
+      // oldRelLeft*W + tBefore. For the new center (newRelLeft=0,
+      // oldRelLeft=delta), tNew = delta*W + tBefore.
+      strip.style.transition = 'none';
+      strip.style.transform = `translate3d(${delta * w + tBefore}px, 0, 0)`;
     }
 
     // Run `done` exactly once when the strip's transform transition ends, or
@@ -316,15 +342,13 @@ export function ImagePopup() {
       // before we've captured the visual position.
       touchActiveRef.current = true;
       flushPendingCommit();
-      // Read the signal AFTER flush so we start from the just-committed index
-      // when the user chains a second swipe inside the commit window.
       const s = popupImage.value;
       if (!s || s.images.length <= 1) { releaseGesture(); return; }
       const w = strip.offsetWidth;
       const offset = parseTranslateX(strip);
       strip.style.transition = 'none';
       strip.style.transform = `translate3d(${offset}px, 0, 0)`;
-      dragStartRef.current = { index: s.index, offset, w };
+      dragStartRef.current = { offset, w };
       const t = e.touches[0];
       swipe.start(t.clientX, t.clientY);
     }
@@ -356,7 +380,7 @@ export function ImagePopup() {
     function releaseGesture() {
       touchActiveRef.current = false;
       dragStartRef.current = null;
-      pendingCommitIndexRef.current = null;
+      pendingCommitRef.current = null;
     }
 
     function handleTouchEnd(e: TouchEvent) {
@@ -381,16 +405,22 @@ export function ImagePopup() {
         const cur0 = popupImage.value;
         const len = cur0?.images.length ?? 0;
         if (len <= 1) { releaseGesture(); return; }
-        const newIndex = (drag.index + result + len) % len;
-        const targetPx = -newIndex * drag.w;
+        const fromIndex = cur0!.index;
+        const newIndex = (fromIndex + result + len) % len;
+        // Animate exactly one slot in the swipe direction; the wrapped slide
+        // already sits at ±W (see shortestDelta) and rides in from that side.
+        const targetPx = -result * drag.w;
         strip.style.transition = `transform ${SWIPE_COMMIT_MS}ms ease-out`;
         strip.style.transform = `translate3d(${targetPx}px, 0, 0)`;
-        pendingCommitIndexRef.current = newIndex;
-        // The animation lands at -newIndex*W; the layout effect re-asserts
-        // the same value when the signal updates, so no transform change ⇒
-        // no flash. Every image is mounted at its own slot, so srcs don't
-        // move either.
+        pendingCommitRef.current = { from: fromIndex, to: newIndex };
         onTransitionDone(() => {
+          // Snap strip back to 0 BEFORE the signal update — slides reposition
+          // in the same render tick, so the centered slide stays on screen.
+          // Without the snap the layout effect would re-set transform to 0
+          // with the default transition, animating a backward slide.
+          strip.style.transition = 'none';
+          strip.style.transform = STRIP_REST_TRANSFORM;
+          void strip.offsetWidth;
           const cur = popupImage.value;
           releaseGesture();
           if (cur && cur.index !== newIndex) {
@@ -402,9 +432,8 @@ export function ImagePopup() {
 
       if (wasHorizontal) {
         cancelSwipeRaf();
-        const restPx = -drag.index * drag.w;
         strip.style.transition = `transform ${SWIPE_SNAP_BACK_MS}ms ease-out`;
-        strip.style.transform = `translate3d(${restPx}px, 0, 0)`;
+        strip.style.transform = STRIP_REST_TRANSFORM;
         onTransitionDone(releaseGesture);
         return;
       }
@@ -455,6 +484,14 @@ export function ImagePopup() {
       }
     }
 
+    function onClick(e: MouseEvent) {
+      // detail>1 is the second click of a dblclick; skip so we don't
+      // toggle twice on the way to dblclick-zoom.
+      if (e.detail > 1) return;
+      if (zoomRef.current.scale > 1) return;
+      setChromeHidden(v => !v);
+    }
+
     strip.addEventListener('wheel', handleWheel, { passive: false });
     strip.addEventListener('touchstart', handleTouchStart, { passive: false });
     strip.addEventListener('touchmove', handleTouchMove, { passive: false });
@@ -465,6 +502,7 @@ export function ImagePopup() {
     strip.addEventListener('pointerup', onPointerUp);
     strip.addEventListener('pointercancel', onPointerUp);
     strip.addEventListener('dblclick', onDoubleClick);
+    strip.addEventListener('click', onClick);
     return () => {
       strip.removeEventListener('wheel', handleWheel);
       strip.removeEventListener('touchstart', handleTouchStart);
@@ -476,6 +514,7 @@ export function ImagePopup() {
       strip.removeEventListener('pointerup', onPointerUp);
       strip.removeEventListener('pointercancel', onPointerUp);
       strip.removeEventListener('dblclick', onDoubleClick);
+      strip.removeEventListener('click', onClick);
       cancelSwipeRaf();
       cancelTransition();
       pinchRef.current = null;
@@ -498,16 +537,14 @@ export function ImagePopup() {
   }, [hasNav]);
 
   // Recompute strip transform on viewport resize / orientation change.
+  // Slides reposition automatically via render; we just need to stay at rest.
   useEffect(() => {
     if (!state) return;
     function onResize() {
       const strip = stripRef.current;
-      const cur = popupImage.value;
-      if (!strip || !cur || touchActiveRef.current) return;
-      const w = strip.offsetWidth;
-      if (w === 0) return;
+      if (!strip || touchActiveRef.current) return;
       strip.style.transition = 'none';
-      strip.style.transform = `translate3d(${-cur.index * w}px, 0, 0)`;
+      strip.style.transform = STRIP_REST_TRANSFORM;
     }
     window.addEventListener('resize', onResize);
     window.addEventListener('orientationchange', onResize);
@@ -525,7 +562,7 @@ export function ImagePopup() {
 
   return (
     <ModalOverlay onClose={zoomRef.current.scale > 1 ? undefined : close} class="image-popup">
-      <div class="image-popup-content">
+      <div class={`image-popup-content${chromeHidden ? ' chrome-hidden' : ''}`}>
         <button class="image-popup-close icon-btn" onClick={close} aria-label="Close" data-tooltip="Close">
           <CloseIcon />
         </button>
@@ -555,10 +592,22 @@ export function ImagePopup() {
         )}
         <div class="image-popup-strip" ref={stripRef}>
           {state.images.map((imgSrc, i) => (
-            <div class="image-popup-slide" key={imgSrc} style={`left: ${i * 100}%;`}>
+            <div
+              class="image-popup-slide"
+              key={imgSrc}
+              style={`left: ${shortestDelta(i, state.index, total) * 100}%;`}
+            >
               <img src={imgSrc} alt={i === state.index ? 'Full size' : ''} draggable={false} />
             </div>
           ))}
+          {/* shortestDelta(_, _, 2) returns 0 or +1 only, never -1, so the
+              other image sits only at left:+100%. Mirror it at -100% to
+              fill the side a swipe might expose. */}
+          {total === 2 && (
+            <div class="image-popup-slide" key="mirror" style="left: -100%;">
+              <img src={state.images[1 - state.index]} alt="" draggable={false} />
+            </div>
+          )}
         </div>
       </div>
     </ModalOverlay>

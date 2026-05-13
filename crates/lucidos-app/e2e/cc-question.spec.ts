@@ -184,6 +184,88 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
     }
   });
 
+  test('multi-select: toggle two options, submit, panel flips to multi-resolved', async ({ page }) => {
+    await assertHealthy(page);
+
+    const suffix = randomUUID().slice(0, 8);
+    const threadId = randomUUID();
+    const toolUseId = `tu-multi-e2e-${suffix}`;
+    const now = new Date().toISOString();
+
+    const payload = JSON.stringify({
+      tool_use_id: toolUseId,
+      cc_session_id: 'sess-multi-e2e',
+      question: `Multi pick ${suffix}`,
+      options: [
+        { id: 'opt-0', label: `Red ${suffix}` },
+        { id: 'opt-1', label: `Blue ${suffix}` },
+        { id: 'opt-2', label: `Green ${suffix}` },
+      ],
+      multi_select: true,
+    }).replace(/'/g, "''");
+
+    psql([
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count) VALUES ('${threadId}', 'CC Multi Select E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"start","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'SessionStarted', '{"session_id":"sess-multi-e2e"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'UserQuestionAsked', '${payload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+    ].join(';\n'));
+
+    try {
+      await navigateToApp(page);
+      await openThreadDrawer(page);
+
+      const row = page.locator(`.thread-row:has-text("CC Multi Select E2E ${suffix}")`).first();
+      await expect(row).toBeVisible({ timeout: 10_000 });
+      await row.click();
+      await ensureOnThreadPane(page);
+
+      const panel = page
+        .locator(`.initiator-panel-user:visible:has(.cc-question-text:has-text("Multi pick ${suffix}"))`)
+        .first();
+      await expect(panel).toBeVisible({ timeout: 10_000 });
+      const pendingBody = panel.locator(`.cc-question-body[data-tool-use-id="${toolUseId}"]`).first();
+
+      // Submit lives in the prompt action row now (PromptInput.tsx) — there's
+      // one prompt rendered per layout (desktop + mobile both mount), so scope
+      // by visibility. Disabled with zero selections + empty textarea.
+      const submit = page.locator('.prompt-actions-row:visible button[aria-label="Submit answer"]').first();
+      await expect(submit).toBeVisible();
+      await expect(submit).toBeDisabled();
+
+      // Toggle Red and Green (skip Blue).
+      await pendingBody.locator('.cc-question-option').nth(0).click();
+      await pendingBody.locator('.cc-question-option').nth(2).click();
+      await expect(submit).toBeEnabled();
+      await expect(pendingBody.locator('.cc-question-option[aria-pressed="true"]')).toHaveCount(2);
+
+      // Toggle Red off — back to one.
+      await pendingBody.locator('.cc-question-option').nth(0).click();
+      await expect(pendingBody.locator('.cc-question-option[aria-pressed="true"]')).toHaveCount(1);
+
+      // Re-toggle Red, then Submit.
+      await pendingBody.locator('.cc-question-option').nth(0).click();
+      await submit.click();
+
+      // DB: UserQuestionAnswered with MultiSelected[opt-0, opt-2].
+      await expect.poll(
+        () => psql(`SELECT payload->'answer' FROM events WHERE thread_id = '${threadId}' AND event_type = 'UserQuestionAnswered' AND payload->>'tool_use_id' = '${toolUseId}'`),
+        { intervals: [400], timeout: 10_000 },
+      ).toContain('MultiSelected');
+
+      // Panel flips in place: Red and Green selected, Blue dimmed.
+      const answered = panel.locator('.initiator-body .cc-question-body-answered').first();
+      await expect(answered).toBeVisible({ timeout: 10_000 });
+      await expect(answered.locator('.cc-question-option-selected')).toHaveCount(2);
+      await expect(answered.locator('.cc-question-option-dimmed')).toHaveCount(1);
+    } finally {
+      psql([
+        `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
+        `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
+      ].join(';\n'));
+    }
+  });
+
   test('canceled answer dims options and shows the Canceled badge', async ({ page }) => {
     await assertHealthy(page);
 

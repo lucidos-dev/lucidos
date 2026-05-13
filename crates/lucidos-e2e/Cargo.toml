@@ -22,3 +22,7 @@ async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 image = "0.25"
+# Used by tests/wasm_signers.rs — heavy integration tests that exercise real
+# `signers/*/foo.wasm` artifacts built by `./signers/build-all.sh`.
+bytes = "1"
+axum = "0.7"

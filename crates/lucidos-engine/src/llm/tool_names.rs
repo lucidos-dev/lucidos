@@ -14,6 +14,9 @@ pub const DELETE_FILE: &str = "delete_file";
 // Execution
 pub const RUN_PYTHON: &str = "run_python";
 pub const RUN_BASH: &str = "run_bash";
+pub const RUN_BASH_BACKGROUND: &str = "run_bash_background";
+pub const BASH_OUTPUT: &str = "bash_output";
+pub const BASH_KILL: &str = "bash_kill";
 
 // Browser
 pub const BROWSER_OPEN: &str = "browser_open";
@@ -31,6 +34,7 @@ pub const WEB_SEARCH: &str = "web_search";
 pub const FETCH_NEWS: &str = "fetch_news";
 pub const HTTP_REQUEST: &str = "http_request";
 pub const PROXY_REQUEST: &str = "proxy_request";
+pub const RELOAD_PROXY_MODULES: &str = "reload_proxy_modules";
 
 // Email
 pub const SEND_EMAIL: &str = "send_email";
@@ -81,6 +85,9 @@ pub const CORRECT_MEMORY: &str = "correct_memory";
 // Events
 pub const EMIT_EVENT: &str = "emit_event";
 pub const QUERY_EVENTS: &str = "query_events";
+
+// Context management
+pub const DISMISS_FROM_CONTEXT: &str = "dismiss_from_context";
 
 // Notifications & UI
 pub const SEND_NOTIFICATION: &str = "send_notification";

@@ -2,7 +2,7 @@ import { request } from './_fetch';
 import { assertPlainObject, assertArray } from './_validate';
 
 export type TriggerRun =
-  | { type: 'intent'; intent: string; knowhow: string[] }
+  | { type: 'intent'; intent: string }
   | { type: 'script'; path: string };
 
 export interface Trigger {

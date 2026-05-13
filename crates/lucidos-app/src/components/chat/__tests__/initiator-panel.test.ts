@@ -1,10 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { describeInitiator } from '../ChatExchange';
 import { ENGINE_LABEL, LUCIDOS_AGENT_LABEL, SYSTEM_LABEL, type Exchange } from '../../../store/thread-events';
+import type { ComponentChildren, VNode } from 'preact';
 
 function exchangeWith(userEvent: Exchange['userEvent']): Exchange {
   return { userEvent, userSeq: 0, steps: [] };
 }
+
+interface AnyVNode extends VNode<{ children?: ComponentChildren; class?: string; [k: string]: unknown }> {}
 
 // Every initiator panel follows the same shape: `label` is WHO performed the
 // action, `summary` is WHAT was done. The popover surfaces extra origin info,
@@ -28,7 +31,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     // agent (not the engine itself) is the initiator, so the WHO label must be
     // "Lucidos Agent" and the panel accent must be the agent's violet.
     // The engine label/variant stays for engine-internal triggers
-    // (SessionRecovered, MissingHardeningDetected, scheduler with no human, …).
+    // (ContinuationStarted, MissingHardeningDetected, scheduler with no human, …).
     const ex = exchangeWith({
       type: 'MessageReceived',
       text: '[Child thread completed] ...',
@@ -59,18 +62,18 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('system');
   });
 
-  it('SessionRecovered (no actor): label falls back to engine, summary "Resumed after engine restart"', () => {
+  it('ContinuationStarted (no actor): label falls back to engine, summary "Resumed after engine restart"', () => {
     // Legacy DB rows / auto-resume case carry no actor; chip falls back to ⚙ Engine.
-    const ex = exchangeWith({ type: 'SessionRecovered' });
+    const ex = exchangeWith({ type: 'ContinuationStarted' });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe(ENGINE_LABEL);
     expect(desc.summary).toBe('Resumed after engine restart');
     expect(desc.variant).toBe('system');
   });
 
-  it('SessionRecovered (device actor): chip is "You"', () => {
+  it('ContinuationStarted (device actor): chip is "You"', () => {
     const ex = exchangeWith({
-      type: 'SessionRecovered',
+      type: 'ContinuationStarted',
       actor: { kind: 'device', device_id: 'd-1', label: 'My Mac' },
     });
     const desc = describeInitiator(ex, '', [], 'tid');
@@ -229,5 +232,41 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.label).toBe(ENGINE_LABEL);
     expect(desc.summary).toBe('Trigger fired');
     expect(desc.variant).toBe('trigger');
+  });
+
+  it('ChildThreadCompleted: label is "Lucidos Agent", lucidos variant, no panel summary line (card owns the prefix)', () => {
+    const ex = exchangeWith({
+      type: 'ChildThreadCompleted',
+      child_thread_id: 'child-1',
+      child_thread_title: 'Refactor foo',
+      status: 'success',
+      summary: 'cleaned up.',
+      pending_change_ids: [],
+    });
+    const desc = describeInitiator(ex, '', [], 'tid');
+    expect(desc.label).toBe(LUCIDOS_AGENT_LABEL);
+    expect(desc.summary).toBeUndefined();
+    expect(desc.variant).toBe('lucidos');
+  });
+
+  it('ChildThreadCompleted: details embed the ChildCompletionCard with child_thread_id, title, status, and summary', () => {
+    const ex = exchangeWith({
+      type: 'ChildThreadCompleted',
+      child_thread_id: 'child-1',
+      child_thread_title: 'Refactor foo',
+      status: 'success',
+      summary: 'done.',
+      pending_change_ids: ['cid-1'],
+    });
+    const desc = describeInitiator(ex, '', [], 'tid');
+    const node = desc.details as AnyVNode | undefined;
+    expect(node).toBeDefined();
+    expect(typeof node!.type).toBe('function');
+    expect((node!.type as { name?: string }).name).toBe('ChildCompletionCard');
+    const props = node!.props as Record<string, unknown>;
+    expect(props.childThreadId).toBe('child-1');
+    expect(props.childThreadTitle).toBe('Refactor foo');
+    expect(props.status).toBe('success');
+    expect(props.summary).toBe('done.');
   });
 });

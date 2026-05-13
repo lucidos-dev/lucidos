@@ -176,13 +176,7 @@ impl ArtifactManager {
         tokio::task::spawn_blocking(move || {
             let repo = repo.lock().unwrap();
             let mut index = repo.index()?;
-
-            // Reset index to HEAD to avoid capturing unrelated staged changes
-            if let Ok(head) = repo.head() {
-                if let Ok(tree) = head.peel_to_tree() {
-                    index.read_tree(&tree)?;
-                }
-            }
+            super::reset_index_to_head(&repo, &mut index)?;
 
             for artifact_path in &paths {
                 let repo_path = format!("{}/{}", ARTIFACTS_DIR, artifact_path);
@@ -228,12 +222,7 @@ impl ArtifactManager {
         tokio::task::spawn_blocking(move || {
             let repo = repo.lock().unwrap();
             let mut index = repo.index()?;
-
-            if let Ok(head) = repo.head() {
-                if let Ok(tree) = head.peel_to_tree() {
-                    index.read_tree(&tree)?;
-                }
-            }
+            super::reset_index_to_head(&repo, &mut index)?;
 
             for data_path in &paths {
                 let repo_path = format!("data/{}", data_path);
@@ -262,12 +251,7 @@ impl ArtifactManager {
         let commit_id = tokio::task::spawn_blocking(move || -> Result<String, git2::Error> {
             let repo = repo.lock().unwrap();
             let mut index = repo.index()?;
-
-            if let Ok(head) = repo.head() {
-                if let Ok(tree) = head.peel_to_tree() {
-                    index.read_tree(&tree)?;
-                }
-            }
+            super::reset_index_to_head(&repo, &mut index)?;
 
             index.remove_path(std::path::Path::new(&repo_path))?;
             index.write()?;
@@ -291,14 +275,7 @@ impl ArtifactManager {
         tokio::task::spawn_blocking(move || {
             let repo = repo.lock().unwrap();
             let mut index = repo.index()?;
-
-            // Reset index to HEAD to avoid capturing unrelated staged changes
-            // from previous operations (e.g. commit_all_dirty staging without committing)
-            if let Ok(head) = repo.head() {
-                if let Ok(tree) = head.peel_to_tree() {
-                    index.read_tree(&tree)?;
-                }
-            }
+            super::reset_index_to_head(&repo, &mut index)?;
 
             index.add_path(Path::new(&repo_path))?;
             index.write()?;
@@ -317,14 +294,7 @@ impl ArtifactManager {
         tokio::task::spawn_blocking(move || {
             let repo = repo.lock().unwrap();
             let mut index = repo.index()?;
-
-            // Reset index to HEAD first so we only capture data/ changes,
-            // not stale staged entries from previous operations
-            if let Ok(head) = repo.head() {
-                if let Ok(tree) = head.peel_to_tree() {
-                    index.read_tree(&tree)?;
-                }
-            }
+            super::reset_index_to_head(&repo, &mut index)?;
 
             // Add all changes under data/ (artifacts, apps, and any other data subdirs)
             index.add_all([super::DATA_DIR], git2::IndexAddOption::DEFAULT, None)?;

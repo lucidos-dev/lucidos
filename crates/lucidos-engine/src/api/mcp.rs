@@ -43,6 +43,7 @@ pub(super) struct McpConsentResponse {
     ///   * `session` — inserted into the engine's in-memory per-thread
     ///     allow set; lost on engine restart but works for tools/paths CC
     ///     itself never auto-approves (notably `.claude/` and `.git/`).
+    ///
     /// Absent (the Allow-once path) records nothing. Unknown wire values
     /// cause a 4xx via serde — match the engine's typed enum exactly.
     #[serde(default)]
@@ -73,10 +74,9 @@ pub(super) async fn submit_mcp_consent(
         } else {
             Some(DENIAL_REASON.to_string())
         };
-        if body.allowed {
-            if let Some(scope) = body.persist_scope {
-                record_allow_grant(&state, &entry, scope);
-            }
+        let persist_scope = if body.allowed { body.persist_scope } else { None };
+        if let Some(scope) = persist_scope {
+            record_allow_grant(&state, &entry, scope);
         }
         let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
         state
@@ -89,6 +89,7 @@ pub(super) async fn submit_mcp_consent(
                         request_id: body.request_id,
                         allowed: body.allowed,
                         reason,
+                        persist_scope,
                     },
                     meta: EventMeta::with_actor(actor),
                 },

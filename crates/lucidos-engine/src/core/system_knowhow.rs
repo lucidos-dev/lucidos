@@ -94,4 +94,29 @@ mod tests {
         assert!(!is_system_knowhow_path("artifacts/notes.md"));
         assert!(!is_system_knowhow_path("knowhow/lucidos/best-practices.md"));
     }
+
+    /// Files without `---\nname: ...\n---` are silently dropped at load time,
+    /// so `load_knowhow("system-knowhow/<id>")` returns missing and the LLM
+    /// concludes the file doesn't exist.
+    #[test]
+    fn shipped_system_knowhow_files_all_parse() {
+        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+        let dir = repo.join("system-knowhow");
+        let summary_ids: std::collections::HashSet<String> =
+            SystemKnowhowStore::load_summaries(&dir)
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+        let missing: Vec<String> = crate::core::knowhow::collect_md_files(&dir)
+            .into_iter()
+            .filter_map(|path| crate::core::knowhow::id_from_path(&dir, &path))
+            .filter(|id| !summary_ids.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "system-knowhow files missing valid `---\\nname: ...\\n---` frontmatter \
+             (load_knowhow returns missing for these): {:?}",
+            missing
+        );
+    }
 }

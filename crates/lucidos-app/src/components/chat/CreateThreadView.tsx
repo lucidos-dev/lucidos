@@ -8,6 +8,7 @@ import {
   mobileView,
   focusedThreadId,
   threadMap,
+  isThreadQuiescent,
 } from '../../store/store';
 import { scrolledUp, awayFromBottom, notAtTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers } from './scrollState';
 import { ChatExchange } from './ChatExchange';
@@ -24,11 +25,11 @@ export function renderExchanges(
   streamingBuffer: string,
 ): VNode[] {
   // Compute once which abort exchange (if any) gets the Continue button —
-  // the most recent ResponseAborted that has no later SessionRecovered.
+  // the most recent ResponseAborted that has no later ContinuationStarted.
   const unresumedIdx = unresumedAbortIndex(exchanges);
   const threadMeta = threadMap.value.get(threadId)?.meta;
   const threadIsCC = threadMeta?.channel === 'claude_code';
-  const threadIdle = threadMeta?.status === 'idle';
+  const threadIdle = isThreadQuiescent(threadMeta?.status);
   return exchanges.reduce<{ nodes: VNode[]; imgOffset: number; lastModel?: string; lastEffort?: string }>((acc, ex, i) => {
     const isLast = i === exchanges.length - 1;
     // Pass isLast=false for the prior exchange (it's at i-1, never the last

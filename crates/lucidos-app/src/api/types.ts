@@ -64,6 +64,7 @@ export interface NotificationsResponse {
     id: string;
     task_id?: string;
     app_id?: string;
+    thread_id?: string;
     title: string;
     message: string;
     created_at: string;

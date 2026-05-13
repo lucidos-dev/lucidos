@@ -44,9 +44,9 @@ Friction signals to pull:
 | Dead triggers | `TriggerCreated` with zero matching `TriggerCompleted` since creation |
 | App errors | App emits its own error events, or `ToolResult` errors in app-spawned threads |
 | User corrections in chats | `MessageReceived` immediately following a `ResponseGenerated` / `ResponseAborted` / `ToolResult` whose text reads like a correction ("no", "don't", "stop", "actually", "that's wrong", "instead", "you misunderstood") |
-| CC sessions ending without a useful change | `ClaudeCodeIdled` followed by `ChangeDiscarded`, or no `ChangeProposed` at all when one was clearly expected |
+| CC sessions ending without a useful change | `CodingAgentIdled` followed by `ChangeDiscarded`, or no `ChangeProposed` at all when one was clearly expected |
 
-Trigger intent text lives in `TriggerCreated` payloads (`run.intent`, `run.knowhow`) — pull those when assessing trigger findings.
+Trigger intent text lives in `TriggerCreated` payloads (`run.intent`) — pull it when assessing trigger findings.
 
 ## What to check
 
@@ -93,7 +93,7 @@ LLM looping on the same target. Almost always a sign that a knowhow doesn't tell
 
 #### 3. Trigger failures clustered on one trigger
 
-`TriggerCompleted` errors clustered on one `aggregate_id`. Read its `TriggerCreated`. If `run.intent` carries imperative how-to, the LLM is improvising the procedure each run and failing differently each time — the fix is to lift the procedure into a knowhow and reference it from `run.knowhow`. If `run.intent` is fine, the fix is in the referenced knowhow.
+`TriggerCompleted` errors clustered on one `aggregate_id`. Read its `TriggerCreated`. If `run.intent` carries imperative how-to, the LLM is improvising the procedure each run and failing differently each time — the fix is to lift the procedure into a knowhow file the trigger thread will discover via `load_knowhow` (per-trigger knowhow lives at `data/triggers/<slug>/knowhow/`). If `run.intent` is fine, the fix is in whichever knowhow the trigger thread is (or should be) loading.
 
 #### 4. Dead triggers
 
@@ -110,7 +110,7 @@ When the same correction shape recurs across threads ("the report is too long", 
 
 #### 7. CC sessions that produce nothing
 
-`ClaudeCodeIdled` with no `ChangeProposed` (or a `ChangeDiscarded` immediately after Apply isn't reached) on a recurring task suggests the knowhow that drives that CC flow is unclear about what success looks like. Fix lives in the knowhow.
+`CodingAgentIdled` with no `ChangeProposed` (or a `ChangeDiscarded` immediately after Apply isn't reached) on a recurring task suggests the knowhow that drives that CC flow is unclear about what success looks like. Fix lives in the knowhow.
 
 #### 8. App-level friction — splits
 

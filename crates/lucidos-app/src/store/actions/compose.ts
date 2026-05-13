@@ -150,17 +150,25 @@ function imageHashesUnchanged(threadId: string, current: string[]): boolean {
 }
 
 async function pushNow(threadId: string): Promise<void> {
-  const thread = threadMap.value.get(threadId);
-  if (!thread) {
-    pendingComposePuts.delete(threadId);
-    return;
-  }
-  const draft = getDraft(threadId);
-  // null = preserve via COALESCE (avoids the SSE re-broadcast).
-  const wireHashes: string[] | null = imageHashesUnchanged(threadId, draft.image_hashes)
-    ? null
-    : [...draft.image_hashes];
   try {
+    try {
+      // PUT 404s if the 250ms debounce elapses before POST /threads settles.
+      await awaitThreadStarted(threadId);
+    } catch {
+      // ensureFocusedComposeThread already toasts the start failure; a second
+      // toast from this PUT path would just duplicate the same error.
+      return;
+    }
+    const thread = threadMap.value.get(threadId);
+    // Discarded threads stay in threadMap with state='discarded' until the
+    // SSE confirms the DELETE, so existence alone is not enough — a PUT here
+    // would 410 against a thread the user already discarded.
+    if (!thread || thread.meta.state === 'discarded') return;
+    const draft = getDraft(threadId);
+    // null = preserve via COALESCE (avoids the SSE re-broadcast).
+    const wireHashes: string[] | null = imageHashesUnchanged(threadId, draft.image_hashes)
+      ? null
+      : [...draft.image_hashes];
     await putComposeOnThread(
       threadId,
       draft.text,

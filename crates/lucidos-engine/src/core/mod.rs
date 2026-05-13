@@ -3,12 +3,12 @@ pub mod artifacts;
 pub mod backup;
 pub mod blobs;
 pub mod changes;
-pub mod image_migration;
 pub mod changes_projection;
 pub mod credentials;
 pub mod devices;
 pub mod email;
 pub mod events;
+pub mod image_migration;
 pub mod intents;
 pub mod knowhow;
 pub mod mcp_servers;
@@ -28,11 +28,113 @@ pub fn database_url() -> String {
         .unwrap_or_else(|_| "postgres://lucidos:lucidos@localhost:5432/lucidos".to_string())
 }
 
+/// Process-lifetime cache of `pg_env_vars(&database_url())`. The DATABASE_URL
+/// env var doesn't change once the engine starts, so we parse the URL once and
+/// hand callers a slice they can either iterate (`runtime::claude_code` borrows
+/// `&String` into `cmd.env`) or clone-extend (`build_script_env_vars`).
+pub fn pg_env_vars_cached() -> &'static [(String, String)] {
+    static CACHED: std::sync::LazyLock<Vec<(String, String)>> =
+        std::sync::LazyLock::new(|| pg_env_vars(&database_url()));
+    CACHED.as_slice()
+}
+
+/// Parse a `postgres(ql)://user:password@host[:port]/dbname[?...]` URL into the
+/// libpq env-var bundle (`PGUSER`/`PGPASSWORD`/`PGHOST`/`PGPORT`/`PGDATABASE`).
+///
+/// The point is to inject these into every subprocess we spawn (engine bash
+/// tool, Python tool, scheduled scripts, Claude Code) so callers can run
+/// `psql -c '…'` bare without ever putting the password in argv. argv is what
+/// gets persisted into `CodingAgentToolCalled`/`ToolCalled` event payloads and
+/// rendered in the steps UI; env vars are not, so the password never leaks
+/// through the events table or the modal.
+///
+/// Returns an empty Vec if the URL doesn't match the expected shape — we'd
+/// rather skip the injection than emit a half-broken bundle that confuses
+/// libpq.
+pub fn pg_env_vars(database_url: &str) -> Vec<(String, String)> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^postgres(?:ql)?://([^:@/?]+):([^@/?]*)@([^:/?]+)(?::(\d+))?/([^?]+)")
+            .expect("postgres URL regex must compile")
+    });
+    let Some(caps) = RE.captures(database_url) else {
+        return Vec::new();
+    };
+    let user = urlencoding::decode(&caps[1])
+        .unwrap_or_default()
+        .into_owned();
+    let password = urlencoding::decode(&caps[2])
+        .unwrap_or_default()
+        .into_owned();
+    let host = caps[3].to_string();
+    let port = caps
+        .get(4)
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "5432".to_string());
+    let dbname = urlencoding::decode(&caps[5])
+        .unwrap_or_default()
+        .into_owned();
+    vec![
+        ("PGUSER".to_string(), user),
+        ("PGPASSWORD".to_string(), password),
+        ("PGHOST".to_string(), host),
+        ("PGPORT".to_string(), port),
+        ("PGDATABASE".to_string(), dbname),
+    ]
+}
+
+/// Mask the password segment of any `postgres(ql)://user:password@host…` URL
+/// occurring in `s`. Best-effort safety net for the path where the env-var
+/// injection (`pg_env_vars`) didn't take — a stray `psql "$DATABASE_URL"` from
+/// CC, a Python script that hardcoded the URI, an OAuth-style URL pasted into
+/// a curl call. Applied at the spawn-side log line and at the boundary where
+/// CC's bash `args` get persisted.
+pub fn redact_postgres_secrets(s: &str) -> String {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(postgres(?:ql)?://[^:@/?\s]+):[^@/?\s]+@")
+            .expect("postgres redaction regex must compile")
+    });
+    RE.replace_all(s, "$1:***@").into_owned()
+}
+
+/// Recursively apply `redact_postgres_secrets` to every string value inside a
+/// `serde_json::Value`. Used to scrub the `args` of `CodingAgentToolCalled`
+/// events before they reach the event store / SSE stream — the Bash tool's
+/// `command` field can carry a hardcoded `postgres://user:pass@…` URL.
+///
+/// Hot path: every ToolCalled event walks every string. The `contains` guard
+/// short-circuits the regex + allocation for any string that doesn't even
+/// mention "postgres" (the vast majority of bash commands, file paths, etc.).
+pub fn redact_postgres_secrets_in_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            if !s.contains("postgres") {
+                return;
+            }
+            let redacted = redact_postgres_secrets(s);
+            if redacted != *s {
+                *s = redacted;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_postgres_secrets_in_json(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                redact_postgres_secrets_in_json(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Directory structure within workspace/data/
 pub const DATA_DIR: &str = "data";
 pub const ARTIFACTS_DIR: &str = "data/artifacts";
 pub const APPS_DIR: &str = "data/apps";
 pub const KNOWHOW_DIR: &str = "data/knowhow";
+pub const TRIGGERS_DIR: &str = "data/triggers";
 
 pub use apps::{App, AppManager, AppManifest};
 pub use artifacts::{list_searchable_data_files, ArtifactChange, ArtifactManager};
@@ -59,38 +161,45 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
     let top_prompts = data_dir.join("prompts");
     if top_prompts.is_dir() {
         let triggers_dir = data_dir.join("triggers");
-        if let Ok(entries) = std::fs::read_dir(&top_prompts) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                    continue;
-                }
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    let dest_dir = triggers_dir.join(stem);
-                    if dest_dir.exists() {
+        match std::fs::read_dir(&top_prompts) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("md") {
                         continue;
                     }
-                    if let Err(e) = std::fs::create_dir_all(&dest_dir) {
-                        log!("[Migration] Failed to create {}: {}", dest_dir.display(), e);
-                        continue;
-                    }
-                    let dest = dest_dir.join(entry.file_name());
-                    if let Err(e) = std::fs::rename(&path, &dest) {
-                        log!(
-                            "[Migration] Failed to move {} → {}: {}",
-                            path.display(),
-                            dest.display(),
-                            e
-                        );
-                    } else {
-                        log!(
-                            "[Migration] Moved prompt {} → {}",
-                            path.display(),
-                            dest.display()
-                        );
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        let dest_dir = triggers_dir.join(stem);
+                        if dest_dir.exists() {
+                            continue;
+                        }
+                        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+                            log!("[Migration] Failed to create {}: {}", dest_dir.display(), e);
+                            continue;
+                        }
+                        let dest = dest_dir.join(entry.file_name());
+                        if let Err(e) = std::fs::rename(&path, &dest) {
+                            log!(
+                                "[Migration] Failed to move {} → {}: {}",
+                                path.display(),
+                                dest.display(),
+                                e
+                            );
+                        } else {
+                            log!(
+                                "[Migration] Moved prompt {} → {}",
+                                path.display(),
+                                dest.display()
+                            );
+                        }
                     }
                 }
             }
+            Err(e) => log!(
+                "[Migration] Failed to read {}: {}",
+                top_prompts.display(),
+                e
+            ),
         }
         if std::fs::read_dir(&top_prompts)
             .map(|mut d| d.next().is_none())
@@ -107,56 +216,53 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
     // App-level prompts/ → intents/ (simple rename)
     let apps_dir = data_dir.join("apps");
     if apps_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&apps_dir) {
-            for entry in entries.flatten() {
-                let app_prompts = entry.path().join("prompts");
-                let app_intents = entry.path().join("intents");
-                if app_prompts.is_dir() && !app_intents.exists() {
-                    if let Err(e) = std::fs::rename(&app_prompts, &app_intents) {
-                        log!(
-                            "[Migration] Failed to rename {}/prompts → intents: {}",
-                            entry.file_name().to_string_lossy(),
-                            e
-                        );
-                    } else {
-                        log!(
-                            "[Migration] Renamed {}/prompts → intents",
-                            entry.file_name().to_string_lossy()
-                        );
+        match std::fs::read_dir(&apps_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let app_prompts = entry.path().join("prompts");
+                    let app_intents = entry.path().join("intents");
+                    if app_prompts.is_dir() && !app_intents.exists() {
+                        if let Err(e) = std::fs::rename(&app_prompts, &app_intents) {
+                            log!(
+                                "[Migration] Failed to rename {}/prompts → intents: {}",
+                                entry.file_name().to_string_lossy(),
+                                e
+                            );
+                        } else {
+                            log!(
+                                "[Migration] Renamed {}/prompts → intents",
+                                entry.file_name().to_string_lossy()
+                            );
+                        }
                     }
                 }
             }
+            Err(e) => log!("[Migration] Failed to read {}: {}", apps_dir.display(), e),
         }
     }
 }
+
 /// Engine-managed entries in every workspace's `.gitignore`. Workspaces
 /// auto-track their `data/` tree under git (artifacts), so anything the
 /// engine writes there that should NOT be versioned has to be listed here.
 ///
 /// Order matters for diff stability: kept in the same order as historical
 /// values so existing files don't get rewritten on startup.
-const WORKSPACE_GITIGNORE_ENTRIES: &[&str] = &[
-    ".lucidos/",
-    "data/postgres/",
-    "data/blobs/",
-];
+const WORKSPACE_GITIGNORE_ENTRIES: &[&str] = &[".lucidos/", "data/postgres/", "data/blobs/"];
 
 /// Ensure the workspace `.gitignore` exists and contains every
 /// engine-managed entry from `WORKSPACE_GITIGNORE_ENTRIES`. Idempotent:
 /// pre-existing entries are left untouched (line-equality), missing
 /// entries are appended. Returns `true` when the file was created or
 /// updated — callers may use that as a signal to commit the change.
-pub fn ensure_workspace_gitignore_entries(
-    workspace: &std::path::Path,
-) -> std::io::Result<bool> {
+pub fn ensure_workspace_gitignore_entries(workspace: &std::path::Path) -> std::io::Result<bool> {
     let path = workspace.join(".gitignore");
     let existing = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
-    let already: std::collections::HashSet<&str> =
-        existing.lines().map(str::trim).collect();
+    let already: std::collections::HashSet<&str> = existing.lines().map(str::trim).collect();
     let missing: Vec<&str> = WORKSPACE_GITIGNORE_ENTRIES
         .iter()
         .copied()
@@ -190,8 +296,23 @@ pub use store::{
 };
 pub use thread_presence::ThreadPresenceStore;
 
+/// Reset the index to match HEAD's tree before staging — drops any entries
+/// left behind by a previous `commit_*` call that staged but didn't commit
+/// (e.g. a crash partway through `commit_all_dirty`). No-op on a freshly
+/// created repo with no HEAD yet.
+pub fn reset_index_to_head(
+    repo: &git2::Repository,
+    index: &mut git2::Index,
+) -> Result<(), git2::Error> {
+    if let Ok(head) = repo.head() {
+        if let Ok(tree) = head.peel_to_tree() {
+            index.read_tree(&tree)?;
+        }
+    }
+    Ok(())
+}
+
 /// Create a commit from the current index state.
-/// Shared by ArtifactManager and AppManager.
 pub fn commit_index(repo: &git2::Repository, message: &str) -> Result<String, git2::Error> {
     let mut index = repo.index()?;
     let tree_id = index.write_tree()?;
@@ -339,6 +460,31 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Truncate `s` to roughly `max` bytes, joining the head and tail with `…`
+/// so that meaningful suffixes (filenames, file extensions, query tails)
+/// survive. Returns `s` unchanged when it already fits. UTF-8-safe.
+fn middle_truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    const ELLIPSIS: &str = "…"; // 3 bytes, 1 char
+    if max <= ELLIPSIS.len() {
+        return ELLIPSIS.to_string();
+    }
+    let budget = max - ELLIPSIS.len();
+    let head_bytes = budget.div_ceil(2);
+    let tail_bytes = budget / 2;
+    let head_end = s.floor_char_boundary(head_bytes);
+    let tail_start = s.ceil_char_boundary(s.len() - tail_bytes);
+    if tail_start <= head_end {
+        // Boundary snapping collapsed the cuts (multi-byte char straddling both
+        // ends with a tiny budget). Return just the ellipsis rather than the
+        // original — the caller asked for shortening.
+        return ELLIPSIS.to_string();
+    }
+    format!("{}{}{}", &s[..head_end], ELLIPSIS, &s[tail_start..])
+}
+
 /// Summarize a `glob_files` / `grep_files` JSON result as "N items[, truncated]".
 /// Falls back to a char count if the JSON can't be parsed (e.g. the handler
 /// returned an "Error: ..." string).
@@ -435,6 +581,7 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             let path = args["path"].as_str().unwrap_or("");
             format!("{} via {} proxy: {}...", method, name, path)
         }
+        "reload_proxy_modules" => "Reloading WASM auth modules...".to_string(),
         "import_file" => format!(
             "Importing {}...",
             args["source_path"].as_str().unwrap_or("file")
@@ -702,7 +849,7 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
             if pat.is_empty() {
                 "Find files".into()
             } else {
-                format!("Find {}", pat)
+                format!("Find {}", middle_truncate(pat, 60))
             }
         }
         "Grep" => {
@@ -710,7 +857,7 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
             if pat.is_empty() {
                 "Search code".into()
             } else {
-                format!("Search '{}'", pat)
+                format!("Search '{}'", middle_truncate(pat, 60))
             }
         }
         "Bash" => {
@@ -723,7 +870,7 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
                     .find(|l| !l.trim().is_empty())
                     .map(|l| l.trim())
                     .unwrap_or(cmd);
-                format!("Run {}", truncate(first_line, 57))
+                format!("Run {}", middle_truncate(first_line, 60))
             }
         }
         "WebFetch" => {
@@ -740,7 +887,7 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
             if q.is_empty() {
                 "Web search".into()
             } else {
-                format!("Search '{}'", q)
+                format!("Search '{}'", middle_truncate(q, 60))
             }
         }
         "Agent" => {
@@ -772,390 +919,5 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_describe_tool_result_read_file() {
-        let content = "hello world"; // 11 chars
-        let result = describe_tool_result("read_file", content, true);
-        assert_eq!(result, Some("11 chars".to_string()));
-    }
-
-    #[test]
-    fn test_describe_tool_result_list_files() {
-        let result = describe_tool_result("list_files", "file1\nfile2\nfile3", true);
-        assert_eq!(result, Some("3 items".to_string()));
-    }
-
-    #[test]
-    fn test_describe_tool_result_search_artifacts() {
-        let result = describe_tool_result("search_artifacts", "match1\nmatch2", true);
-        assert_eq!(result, Some("2 results".to_string()));
-    }
-
-    #[test]
-    fn test_describe_tool_result_failure() {
-        let result = describe_tool_result(
-            "read_file",
-            "File not found: /foo/bar.txt\nsome stack trace",
-            false,
-        );
-        assert_eq!(result, Some("File not found: /foo/bar.txt".to_string()));
-    }
-
-    #[test]
-    fn test_describe_tool_result_failure_truncates() {
-        let long_err = "x".repeat(200);
-        let result = describe_tool_result("any_tool", &long_err, false);
-        let expected = format!("{}...", &"x".repeat(120));
-        assert_eq!(result, Some(expected));
-    }
-
-    #[test]
-    fn test_describe_tool_result_run_python() {
-        let result = describe_tool_result("run_python", "42\nsome debug output", true);
-        assert_eq!(result, Some("42".to_string()));
-    }
-
-    #[test]
-    fn test_describe_tool_result_write_file() {
-        assert_eq!(
-            describe_tool_result("write_file", "OK", true),
-            Some("Done".to_string())
-        );
-        assert_eq!(
-            describe_tool_result("edit_file", "OK", true),
-            Some("Done".to_string())
-        );
-        assert_eq!(
-            describe_tool_result("create_app", "OK", true),
-            Some("Done".to_string())
-        );
-    }
-
-    #[test]
-    fn test_describe_tool_result_git_commit() {
-        let result = describe_tool_result("git_commit", "[main abc123] feat: add feature", true);
-        assert_eq!(result, Some("[main abc123] feat: add feature".to_string()));
-    }
-
-    #[test]
-    fn test_describe_tool_result_git_diff() {
-        let diff = "--- a/file.rs\n+++ b/file.rs\n@@ -1,3 +1,4 @@\n+new line";
-        let result = describe_tool_result("git_diff", diff, true);
-        assert_eq!(result, Some("4 lines".to_string()));
-    }
-
-    #[test]
-    fn test_describe_tool_result_unknown_short() {
-        let result = describe_tool_result("custom_tool", "short result", true);
-        assert_eq!(result, Some("short result".to_string()));
-    }
-
-    #[test]
-    fn test_describe_tool_result_unknown_long() {
-        let long_result = "x".repeat(100);
-        let result = describe_tool_result("custom_tool", &long_result, true);
-        assert_eq!(result, Some("100 chars".to_string()));
-    }
-
-    #[test]
-    fn test_truncate_within_limit() {
-        assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn test_truncate_exceeds_limit() {
-        assert_eq!(truncate("hello world", 5), "hello...");
-    }
-
-    #[test]
-    fn test_truncate_multibyte_char_boundary() {
-        // Exact reproduction of the production panic:
-        // byte index 120 is not a char boundary; it is inside 'æ' (bytes 119..121)
-        let norwegian = "For å bestille et Buypass ID med høyt sikkerhetsnivå (nivå 4), må du vanligvis oppfylle visse krav, inkludert å være 13 år eller eldre";
-        // This must not panic — truncate at 120 bytes falls inside 'æ' in 'være'
-        let result = truncate(norwegian, 120);
-        assert!(result.ends_with("..."));
-        // Must not split a multi-byte char
-        assert!(result.is_char_boundary(result.len()));
-    }
-
-    #[test]
-    fn test_truncate_multibyte_various() {
-        // 'æ' is 2 bytes, 'ø' is 2 bytes, 'å' is 2 bytes
-        assert_eq!(truncate("æøå", 2), "æ..."); // cut at byte 2 = after 'æ'
-        assert_eq!(truncate("æøå", 3), "æ..."); // byte 3 is inside 'ø', back up to after 'æ'
-        assert_eq!(truncate("æøå", 1), "..."); // byte 1 is inside 'æ', back up to start
-    }
-
-    #[test]
-    fn test_describe_tool_result_failure_with_norwegian() {
-        // The actual crash: web_search result with Norwegian text treated as failure
-        let norwegian_error = "For å bestille et Buypass ID med høyt sikkerhetsnivå (nivå 4), må du vanligvis oppfylle visse krav, inkludert å være 13 år eller eldre og registrert i det norske folkeregisteret";
-        // Must not panic
-        let result = describe_tool_result("web_search", norwegian_error, false);
-        assert!(result.is_some());
-    }
-
-    // --- describe_cc_tool tests ---
-
-    #[test]
-    fn test_describe_cc_tool_read() {
-        let args = serde_json::json!({"file_path": "/home/user/src/main.rs"});
-        assert_eq!(describe_cc_tool("Read", &args), "Read main.rs");
-        assert_eq!(
-            describe_cc_tool("Read", &serde_json::json!({})),
-            "Read file"
-        );
-    }
-
-    #[test]
-    fn test_describe_cc_tool_edit() {
-        let args = serde_json::json!({"file_path": "/src/lib.rs"});
-        assert_eq!(describe_cc_tool("Edit", &args), "Edit lib.rs");
-        assert_eq!(describe_cc_tool("MultiEdit", &args), "Edit lib.rs");
-    }
-
-    #[test]
-    fn test_describe_cc_tool_write() {
-        let args = serde_json::json!({"file_path": "/tmp/output.txt"});
-        assert_eq!(describe_cc_tool("Write", &args), "Write output.txt");
-    }
-
-    #[test]
-    fn test_describe_cc_tool_glob() {
-        let args = serde_json::json!({"pattern": "**/*.rs"});
-        assert_eq!(describe_cc_tool("Glob", &args), "Find **/*.rs");
-        assert_eq!(
-            describe_cc_tool("Glob", &serde_json::json!({})),
-            "Find files"
-        );
-    }
-
-    #[test]
-    fn test_describe_cc_tool_grep() {
-        let args = serde_json::json!({"pattern": "TODO"});
-        assert_eq!(describe_cc_tool("Grep", &args), "Search 'TODO'");
-    }
-
-    #[test]
-    fn test_describe_cc_tool_bash() {
-        let args = serde_json::json!({"command": "cargo test"});
-        assert_eq!(describe_cc_tool("Bash", &args), "Run cargo test");
-        // Multiline: picks first non-empty line
-        let args2 = serde_json::json!({"command": "\n  git status\necho done"});
-        assert_eq!(describe_cc_tool("Bash", &args2), "Run git status");
-        assert_eq!(
-            describe_cc_tool("Bash", &serde_json::json!({})),
-            "Run command"
-        );
-    }
-
-    #[test]
-    fn test_describe_cc_tool_bash_truncates() {
-        let long_cmd = "x".repeat(100);
-        let args = serde_json::json!({"command": long_cmd});
-        let result = describe_cc_tool("Bash", &args);
-        assert!(result.starts_with("Run "));
-        assert!(result.ends_with("..."));
-    }
-
-    #[test]
-    fn test_describe_cc_tool_web_fetch() {
-        let args = serde_json::json!({"url": "https://example.com/api/data?q=1"});
-        assert_eq!(
-            describe_cc_tool("WebFetch", &args),
-            "Fetch https://example.com"
-        );
-    }
-
-    #[test]
-    fn test_describe_cc_tool_web_search() {
-        let args = serde_json::json!({"query": "rust lifetimes"});
-        assert_eq!(
-            describe_cc_tool("WebSearch", &args),
-            "Search 'rust lifetimes'"
-        );
-    }
-
-    #[test]
-    fn test_describe_cc_tool_agent() {
-        let args = serde_json::json!({"description": "Find all TODO comments"});
-        assert_eq!(describe_cc_tool("Agent", &args), "Find all TODO comments");
-        assert_eq!(
-            describe_cc_tool("Agent", &serde_json::json!({})),
-            "Run agent"
-        );
-    }
-
-    #[test]
-    fn test_describe_cc_tool_skill() {
-        let args = serde_json::json!({"skill": "commit"});
-        assert_eq!(describe_cc_tool("Skill", &args), "Run skill: commit");
-    }
-
-    #[test]
-    fn test_describe_cc_tool_unknown() {
-        assert_eq!(
-            describe_cc_tool("CustomTool", &serde_json::json!({})),
-            "CustomTool"
-        );
-    }
-
-    #[test]
-    fn migrate_top_level_prompts_to_triggers() {
-        let dir = std::env::temp_dir().join("lucidos_test_migrate_prompts");
-        let _ = std::fs::remove_dir_all(&dir);
-        let prompts_dir = dir.join("data/prompts");
-        std::fs::create_dir_all(&prompts_dir).unwrap();
-        std::fs::write(
-            prompts_dir.join("sleep-reminder.md"),
-            "---\nname: Sleep\n---\nGo to bed.",
-        )
-        .unwrap();
-        std::fs::write(prompts_dir.join("notes.txt"), "not a markdown file").unwrap();
-
-        migrate_prompts_to_intents(&dir);
-
-        // .md moved into triggers/{stem}/
-        assert!(dir
-            .join("data/triggers/sleep-reminder/sleep-reminder.md")
-            .exists());
-        // non-.md left behind
-        assert!(prompts_dir.join("notes.txt").exists());
-        // prompts dir still exists (not empty due to notes.txt)
-        assert!(prompts_dir.exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn migrate_app_prompts_to_intents() {
-        let dir = std::env::temp_dir().join("lucidos_test_migrate_app_prompts");
-        let _ = std::fs::remove_dir_all(&dir);
-        let app_prompts = dir.join("data/apps/my-app/prompts");
-        std::fs::create_dir_all(&app_prompts).unwrap();
-        std::fs::write(
-            app_prompts.join("workflow.md"),
-            "---\nname: Workflow\n---\nDo things.",
-        )
-        .unwrap();
-
-        migrate_prompts_to_intents(&dir);
-
-        // prompts/ renamed to intents/
-        assert!(dir.join("data/apps/my-app/intents/workflow.md").exists());
-        assert!(!app_prompts.exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn migrate_skips_if_already_done() {
-        let dir = std::env::temp_dir().join("lucidos_test_migrate_idempotent");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        // Already-migrated state: intents/ exists, prompts/ also exists with a file
-        let app_intents = dir.join("data/apps/my-app/intents");
-        let app_prompts = dir.join("data/apps/my-app/prompts");
-        std::fs::create_dir_all(&app_intents).unwrap();
-        std::fs::create_dir_all(&app_prompts).unwrap();
-        std::fs::write(app_prompts.join("old.md"), "old").unwrap();
-        std::fs::write(app_intents.join("new.md"), "new").unwrap();
-
-        migrate_prompts_to_intents(&dir);
-
-        // prompts/ NOT overwritten — intents/ already existed
-        assert!(app_prompts.exists());
-        assert!(app_intents.join("new.md").exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn migrate_empty_prompts_dir_removed() {
-        let dir = std::env::temp_dir().join("lucidos_test_migrate_empty_prompts");
-        let _ = std::fs::remove_dir_all(&dir);
-        let prompts_dir = dir.join("data/prompts");
-        std::fs::create_dir_all(&prompts_dir).unwrap();
-        std::fs::write(
-            prompts_dir.join("only.md"),
-            "---\nname: Only\n---\nContent.",
-        )
-        .unwrap();
-
-        migrate_prompts_to_intents(&dir);
-
-        // File moved, dir should be empty and removed
-        assert!(!prompts_dir.exists());
-        assert!(dir.join("data/triggers/only/only.md").exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// On a fresh workspace (no .gitignore), the file is created with all
-    /// engine-managed entries — that's the first-boot path that has been
-    /// shipping for years. Helper preserves that exact behavior.
-    #[test]
-    fn ensure_workspace_gitignore_creates_file_with_all_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let changed =
-            ensure_workspace_gitignore_entries(dir.path()).expect("ensure ok");
-        assert!(changed, "fresh workspace must report changed=true");
-        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        for entry in WORKSPACE_GITIGNORE_ENTRIES {
-            assert!(
-                content.lines().any(|l| l.trim() == *entry),
-                "missing entry {entry:?} in: {content}"
-            );
-        }
-    }
-
-    /// The legacy two-line `.gitignore` (`.lucidos/\ndata/postgres/\n`) is
-    /// what every existing user's workspace looks like today. Adding a new
-    /// engine-managed entry like `data/blobs/` must self-heal: append the
-    /// missing line, leave the existing ones alone (no churn in git).
-    #[test]
-    fn ensure_workspace_gitignore_appends_missing_entry_to_legacy_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".gitignore"), ".lucidos/\ndata/postgres/\n").unwrap();
-        let changed =
-            ensure_workspace_gitignore_entries(dir.path()).expect("ensure ok");
-        assert!(changed, "legacy file missing data/blobs/ must report changed=true");
-        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        // Legacy lines preserved verbatim — line equality matters for git diff stability.
-        assert!(content.starts_with(".lucidos/\ndata/postgres/\n"));
-        assert!(content.lines().any(|l| l.trim() == "data/blobs/"));
-    }
-
-    /// When every engine-managed entry is already present, the helper is a
-    /// pure no-op: returns `false`, doesn't rewrite the file. Without this
-    /// invariant every engine startup would re-touch the file and re-commit
-    /// it to the artifacts repo.
-    #[test]
-    fn ensure_workspace_gitignore_noop_when_all_entries_present() {
-        let dir = tempfile::tempdir().unwrap();
-        // Trailing-line variation + manually added user entries — must
-        // be preserved without mutation.
-        let original = ".lucidos/\ndata/postgres/\ndata/blobs/\nmy-secret.env\n";
-        std::fs::write(dir.path().join(".gitignore"), original).unwrap();
-        let changed =
-            ensure_workspace_gitignore_entries(dir.path()).expect("ensure ok");
-        assert!(!changed, "all entries present must report changed=false");
-        let after = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert_eq!(after, original, "file must not be rewritten when no-op");
-    }
-
-    /// Edge case: file exists but has no trailing newline. Appending must
-    /// add one before the new entry so the result stays parseable.
-    #[test]
-    fn ensure_workspace_gitignore_inserts_missing_trailing_newline() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".gitignore"), ".lucidos/\ndata/postgres/").unwrap();
-        ensure_workspace_gitignore_entries(dir.path()).expect("ensure ok");
-        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert!(content.contains(".lucidos/\ndata/postgres/\ndata/blobs/\n"));
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

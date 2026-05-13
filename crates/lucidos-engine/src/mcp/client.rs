@@ -9,7 +9,7 @@ use crate::engine::thread_events::ActorMode;
 
 /// Returns the MCP `client_info.name` value to use for a given actor mode.
 /// MCP servers log this name to identify the calling client.
-pub fn mcp_client_name(mode: ActorMode) -> &'static str {
+fn mcp_client_name(mode: ActorMode) -> &'static str {
     match mode {
         ActorMode::Agent => "Lucidos Agent",
         ActorMode::Engine => "Lucidos Engine",

@@ -2,7 +2,10 @@ pub mod condition;
 pub mod config;
 pub mod replay;
 
-pub use config::{validate_script_extension, TriggerConfig, TriggerRun};
+pub use config::{
+    is_valid_trigger_slug, slugify_trigger_name, slugify_trigger_name_with_fallback,
+    validate_script_extension, TriggerConfig, TriggerRun,
+};
 pub use replay::{replay_trigger_events, TriggerEventRow};
 
 use std::collections::HashMap;
@@ -42,6 +45,7 @@ mod tests {
         TriggerConfig {
             id: id.to_string(),
             name: format!("Trigger {}", id),
+            slug: format!("trigger-{}", id),
             schedule: vec![],
             timezone: "UTC".to_string(),
             run: TriggerRun::Script {
@@ -132,11 +136,11 @@ mod tests {
         let cron_trigger = TriggerConfig {
             id: "cron-only".to_string(),
             name: "Cron Only".to_string(),
+            slug: "cron-only".to_string(),
             schedule: vec!["0 0 8 * * *".to_string()],
             timezone: "UTC".to_string(),
             run: TriggerRun::Intent {
                 intent: "do something".to_string(),
-                knowhow: vec![],
             },
             on: None,
             condition: None,

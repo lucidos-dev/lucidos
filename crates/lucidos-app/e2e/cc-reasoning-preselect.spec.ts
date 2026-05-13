@@ -4,6 +4,7 @@ import {
   sendMessage, waitForCCToStart, waitForActionPanel, dismissCCSession,
   waitForActiveSession, waitAndClick, waitForVisibleElement,
 } from './helpers';
+import { clearAllThreads } from './db-helpers';
 
 /**
  * Bug: when a user selects reasoning effort before starting a CC session
@@ -17,6 +18,7 @@ import {
 
 test.describe('CC reasoning effort pre-session selection', () => {
   test.beforeEach(async ({ page }) => {
+    clearAllThreads();
     await assertHealthy(page);
   });
 

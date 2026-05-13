@@ -25,6 +25,11 @@ const textExts = [
 /** Extensions that have a rendered view and can toggle to source. */
 export const RENDERABLE_EXTS = ['md', 'html', 'htm', 'csv', 'svg', 'slides'];
 
+/** Last `/`-separated segment of `path`, or `''` for empty / trailing-slash input. */
+export function basename(path: string): string {
+  return path.split('/').pop() || '';
+}
+
 interface Props {
   path: string;
   /** Skip mounting in the inactive dual-rendered layout — otherwise both
@@ -53,7 +58,11 @@ export function FilePreviewInline({ path, layout }: Props) {
         {!imageExts.includes(ext) && ext !== 'pdf' && !videoExts.includes(ext) && !audioExts.includes(ext) && !textExts.includes(ext) && (
           <div class="empty-state">
             <p>Preview not available for <strong>.{ext}</strong> files</p>
-            <a href={url} download>Download file</a>
+            {/* Bare `<a download>` desugars to `download={true}`, which Preact
+                 serializes as `download="true"` — browser would save as `true`.
+                 Empty `basename` (e.g. trailing slash) falls back to the URL /
+                 Content-Disposition, which is the intent of bare `download`. */}
+            <a href={url} download={basename(path)}>Download file</a>
           </div>
         )}
       </div>
@@ -125,8 +134,8 @@ function KnowhowSuggestions({ missingId }: { missingId: string }) {
   }
   if (loadable.status !== 'loaded') return null;
 
-  const basename = missingId.split('/').pop() ?? missingId;
-  const matches = loadable.data.filter(k => k.id === basename || k.id.endsWith(`/${basename}`));
+  const tail = basename(missingId);
+  const matches = loadable.data.filter(k => k.id === tail || k.id.endsWith(`/${tail}`));
   if (matches.length === 0) return null;
 
   return (

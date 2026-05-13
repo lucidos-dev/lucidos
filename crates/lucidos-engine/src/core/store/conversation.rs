@@ -50,6 +50,8 @@ impl EventStore {
                     current_images.clear();
                 }
                 "Thinking" => {
+                    // Legacy payload fields — kept for old DB rows. New
+                    // emissions carry these on ContextCaptured.
                     let context_tokens = event
                         .payload
                         .get("context_tokens")
@@ -68,23 +70,8 @@ impl EventStore {
                         context_tokens,
                         context_messages,
                         trimmed,
+                        tool_called_event_id: None,
                     });
-                }
-                "ContextTokensMeasured" => {
-                    if let Some(input_tokens) = event
-                        .payload
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as usize)
-                    {
-                        if let Some(step) = current_steps
-                            .iter_mut()
-                            .rev()
-                            .find(|s| s.description == "Requesting")
-                        {
-                            step.context_tokens = Some(input_tokens);
-                        }
-                    }
                 }
                 "MemorySearched" => {
                     let has_results = event
@@ -100,6 +87,7 @@ impl EventStore {
                         context_tokens: None,
                         context_messages: None,
                         trimmed: None,
+                        tool_called_event_id: None,
                     });
                 }
                 "ToolCalled" => {
@@ -111,6 +99,7 @@ impl EventStore {
                         context_tokens: None,
                         context_messages: None,
                         trimmed: None,
+                        tool_called_event_id: Some(event.id.to_string()),
                     });
                 }
                 "ToolResult" => {
@@ -118,7 +107,7 @@ impl EventStore {
                         .payload
                         .get("success")
                         .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
+                        .unwrap_or(true);
 
                     if let Some(last_step) = current_steps.last_mut() {
                         last_step.success = success;

@@ -400,7 +400,7 @@ pub(super) async fn get_app_versions(
 
     let app_path = format!("data/apps/{}", app_id);
 
-    match git_log_for_path(&state.workspace_path, &app_path, limit, skip, false) {
+    match git_log_for_path(&state.workspace_path, &app_path, limit, skip, false).await {
         Ok((versions, has_more)) => Json(serde_json::json!({
             "versions": versions,
             "has_more": has_more,
@@ -441,11 +441,11 @@ pub(super) async fn restore_app_version(
         .into_iter()
         .collect();
 
-    // Restore files from the historical commit
-    let output = std::process::Command::new("git")
+    let output = tokio::process::Command::new("git")
         .current_dir(&state.workspace_path)
         .args(["checkout", &commit_hash, "--", &git_tree_path])
-        .output();
+        .output()
+        .await;
 
     match output {
         Ok(out) if out.status.success() => {
@@ -521,7 +521,7 @@ pub(super) async fn restore_app_version(
 }
 
 /// Run `git log` for a path, returning commits that touched it.
-fn git_log_for_path(
+async fn git_log_for_path(
     workspace: &std::path::Path,
     path: &str,
     limit: usize,
@@ -530,7 +530,7 @@ fn git_log_for_path(
 ) -> Result<(Vec<GitVersion>, bool), Box<dyn std::error::Error + Send + Sync>> {
     let fetch_count = limit + 1;
 
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = tokio::process::Command::new("git");
     cmd.current_dir(workspace)
         .arg("log")
         .arg(format!("--max-count={}", fetch_count))
@@ -543,7 +543,7 @@ fn git_log_for_path(
 
     cmd.arg("--").arg(path);
 
-    let output = cmd.output()?;
+    let output = cmd.output().await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -603,13 +603,13 @@ fn parse_git_log_line(line: &str) -> Option<GitVersion> {
     })
 }
 
-pub(super) fn get_git_history_with_paths(
+pub(super) async fn get_git_history_with_paths(
     workspace: &std::path::Path,
     prefix: &str,
     limit: usize,
     offset: usize,
 ) -> Result<(Vec<GitVersion>, bool), Box<dyn std::error::Error + Send + Sync>> {
-    git_log_for_path(workspace, prefix, limit, offset, true)
+    git_log_for_path(workspace, prefix, limit, offset, true).await
 }
 
 pub(super) async fn submit_app_capture(

@@ -299,7 +299,6 @@ impl McpManager {
         }
         Some((server_id.to_string(), tool_name.to_string()))
     }
-
 }
 
 /// Convert an MCP tool to a Lucidos ToolDefinition with namespaced name.

@@ -1,3 +1,6 @@
+use crate::engine::tools::bash::{
+    BG_DEFAULT_TIMEOUT_SECS, BG_MAX_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS,
+};
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
@@ -141,17 +144,27 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::READ_FILE.to_string(),
-            description: "Read the contents of a file in the workspace. Supports text files and images (.png, .jpg, .jpeg, .gif, .webp — displayed visually). SVGs are returned as text. Max image size: 5 MB. Text files >50KB are returned in chunks: the response ends with the exact `offset=` to pass on the next call to continue reading. Don't re-read content you've already seen.".to_string(),
+            description: "Read the contents of a file in the workspace. Supports text files and images (.png, .jpg, .jpeg, .gif, .webp — displayed visually). SVGs are returned as text. Max image size: 5 MB. Text files >50KB are returned in chunks: the response ends with the exact `offset=` to pass on the next call to continue reading. Don't re-read content you've already seen.\n\nReads inside .zip and .lucidos-plugin archives transparently — point `path` past the archive segment, e.g. `artifacts/plugins/foo.lucidos-plugin/apps/x/index.html`. To inspect a small section of a long file use `start_line` + `line_count` instead of pulling the whole thing or shelling out to run_python.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path under data/ (e.g., artifacts/notes.md, apps/my-app/ui/main/index.html)"
+                        "description": "Relative path under data/ (e.g., artifacts/notes.md, apps/my-app/ui/main/index.html). May traverse a .zip or .lucidos-plugin segment to read an entry inside the archive (e.g. artifacts/plugins/foo.lucidos-plugin/apps/x/index.html)."
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Byte offset to start reading from (default 0). Use the `offset=` value from the previous truncated response to read the next chunk. Text files only."
+                        "description": "Byte offset to start reading from (default 0). Use the `offset=` value from the previous truncated response to read the next chunk. Text files only. Ignored when `start_line` is set."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based line to start reading from. Combine with `line_count` to read a specific range without pulling the whole file. Text files only."
+                    },
+                    "line_count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Number of lines to read starting from `start_line` (default: read to end). Use small values (e.g. 5–50) when you only need to inspect a known location."
                     }
                 },
                 "required": ["path"]
@@ -251,14 +264,18 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::RUN_BASH.to_string(),
-            description: "Run system commands (curl, wget, git, jq, system tools). \
+            description: format!(
+                "Run system commands (curl, wget, git, jq, system tools). \
                 Do NOT use for creating or editing files in data/ — use run_python for that. \
                 If you need to commit changes made by bash, use git add + git commit with a descriptive message. \
-                Stdout and stderr returned (truncated to 100KB). Timeout: 60s default, 300s max. \
-                Environment variables injected automatically: CRED_{NAME} for api_key/bearer/basic credentials, \
-                CRED_{NAME}_USERNAME and CRED_{NAME}_PASSWORD for password credentials, \
-                OAUTH_{PROVIDER}_ACCESS_TOKEN and OAUTH_{PROVIDER}_EMAIL for connected OAuth accounts \
-                (tokens are auto-refreshed). Provider/name is uppercased with hyphens/spaces/dots replaced by underscores.".to_string(),
+                Stdout and stderr returned (truncated to 100KB). Timeout: {DEFAULT_TIMEOUT_SECS}s default, {MAX_TIMEOUT_SECS}s max. \
+                Bump `timeout_secs` to {MAX_TIMEOUT_SECS} for cargo/npm builds, full-repo greps, large `git log`/`git blame`, \
+                or any command you expect to run >30s — the {DEFAULT_TIMEOUT_SECS}s default will kill them mid-stream and waste a turn retrying. \
+                Environment variables injected automatically: CRED_{{NAME}} for api_key/bearer/basic credentials, \
+                CRED_{{NAME}}_USERNAME and CRED_{{NAME}}_PASSWORD for password credentials, \
+                OAUTH_{{PROVIDER}}_ACCESS_TOKEN and OAUTH_{{PROVIDER}}_EMAIL for connected OAuth accounts \
+                (tokens are auto-refreshed). Provider/name is uppercased with hyphens/spaces/dots replaced by underscores."
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -268,10 +285,69 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default: 60, max: 300)"
+                        "description": format!("Timeout in seconds (default: {DEFAULT_TIMEOUT_SECS}, max: {MAX_TIMEOUT_SECS})")
                     }
                 },
                 "required": ["command"]
+            }),
+        },
+        ToolDefinition {
+            name: tn::RUN_BASH_BACKGROUND.to_string(),
+            description: format!(
+                "Spawn a long-running shell command in the background and return a task_id immediately. \
+                Use whenever the command may exceed run_bash's {MAX_TIMEOUT_SECS}s sync ceiling — long HTTP polls, builds, scrapers, npm/cargo installs, repo-wide migrations. \
+                Drain output incrementally with bash_output(task_id); cancel with bash_kill(task_id). \
+                Default timeout {BG_DEFAULT_TIMEOUT_SECS}s, max {BG_MAX_TIMEOUT_SECS}s — the child is killed when the timeout fires. \
+                NEVER hand-roll `for i in range(...): time.sleep(...)` polling loops in run_python — use this trio instead. \
+                Same env-var injection as run_bash (CRED_*, OAUTH_*)."
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute (passed to /bin/sh -c)."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": format!("Wall-clock seconds before the watchdog kills the child (default: {BG_DEFAULT_TIMEOUT_SECS}, max: {BG_MAX_TIMEOUT_SECS}).")
+                    }
+                },
+                "required": ["command"]
+            }),
+        },
+        ToolDefinition {
+            name: tn::BASH_OUTPUT.to_string(),
+            description: "Fetch incremental stdout/stderr from a background task created by run_bash_background. \
+                Returns only output emitted since the previous bash_output call (drain semantics) — call repeatedly to follow a stream. \
+                When the task finishes, returns the final tail with finished=true: STOP polling at this point — subsequent calls fall back to the event store and return the FULL final stdout/stderr again, which wastes context. \
+                exit_code is null while the task is running, after a watchdog timeout (timed_out=true), and after bash_kill (killed=true)."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "task_id returned by run_bash_background."
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDefinition {
+            name: tn::BASH_KILL.to_string(),
+            description: "Cancel a running background bash task spawned via run_bash_background. \
+                No-op if the task already finished. Use when the user asks to stop a long-running job or when the task has already produced enough output to act on."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "task_id returned by run_bash_background."
+                    }
+                },
+                "required": ["task_id"]
             }),
         },
         ToolDefinition {
@@ -303,7 +379,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::GREP_FILES.to_string(),
-            description: "Search file contents using a regex (Rust regex crate syntax). Searches artifacts/, apps/, knowhow/, triggers/. Skips binary files. Prefer this over run_bash with rg/grep — it's structured and respects workspace ignore rules.".to_string(),
+            description: "Search file contents using a regex (Rust regex crate syntax). Searches artifacts/, apps/, knowhow/, triggers/. Skips binary files. Prefer this over run_bash with rg/grep — it's structured and respects workspace ignore rules. Lines longer than 300 chars are truncated with `…` (PDF text dumps and unwrapped JSON commonly trip this), and the total returned text is capped at ~50 KB — narrow with `path_glob` if you hit `truncated: true` and need more detail.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -355,7 +431,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::DELETE_FILE.to_string(),
-            description: "Delete a file from the workspace (can be recovered from git history)".to_string(),
+            description: "Delete a file from the workspace (recoverable from git history). Refuses plugin-owned paths; the error tells you the owning plugin id — call uninstall_plugin with that id instead so the user sees a confirm panel before deletion.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -372,8 +448,17 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: tn::RELOAD_PROXY_MODULES.to_string(),
+            description: "Re-scan `data/auth-modules/` and reload every WASM signer module. Use after dropping a new or updated `<name>.wasm` (and optional `<name>.manifest.json` sidecar) into that directory — the new modules become available to the proxy pipeline immediately, without restarting the engine. Returns the list of modules now loaded so you can confirm what's available. Note: `install_plugin` auto-reloads when the plugin ships `auth-modules/` files; this tool is only needed for hand-placed modules.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
             name: tn::PROXY_REQUEST.to_string(),
-            description: "Call a backend configured in `data/config/apis.json` through the engine proxy. Prefer this over `http_request` whenever the API has a proxy entry — the credential is resolved by the engine and never appears in the tool args, the tool transcript, or any logs. Returns the raw response body for 2xx; for non-2xx returns `HTTP Error N: ...`. The proxy `name` indexes into `apis.json`; `path` is appended to the configured `base_url`. This tool refuses proxies configured with `credential_bundle` auth — those are script-only (use `lucidos proxy <name> --credentials` from `run_python` or `run_bash`).".to_string(),
+            description: "Call a backend configured in `data/config/apis.json` through the engine proxy. Prefer this over `http_request` whenever the API has a proxy entry — the credential is resolved by the engine and never appears in the tool args, the tool transcript, or any logs. Returns the raw response body for 2xx; for non-2xx returns `HTTP Error N: ...`. The proxy `name` indexes into `apis.json`; `path` is appended to the configured `base_url`. Auth pipeline supports static credentials (bearer/api_key/basic/query_param), HMAC signing, script-handshake login flows, and per-request WASM signer modules — the engine handles authentication transparently.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -529,7 +614,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     },
                     "run": {
                         "type": "object",
-                        "description": "What to execute. Either { type: 'intent', intent: '...', knowhow: ['lucidos-ops/release-process', 'system-knowhow/best-practices'] } for LLM intents (one sentence in the user's voice — keep procedure out, put it in knowhow), or { type: 'script', path: 'name/run.py' } for scripts. Knowhow ids are the path under data/knowhow/ WITHOUT the .md suffix INCLUDING any subdirectory (so data/knowhow/lucidos-ops/release-process.md → 'lucidos-ops/release-process', NOT 'release-process'). Prefix engine-shipped reference docs with 'system-knowhow/'. Verify with list_files data/knowhow/ before saving — the engine rejects unknown ids."
+                        "description": "What to execute. Either { type: 'intent', intent: '...' } for LLM intents (one sentence in the user's voice — keep procedure out of the intent), or { type: 'script', path: 'name/run.py' } for scripts. If the LLM judges a procedure relevant at fire time, it calls `load_knowhow` itself — same as in chat. There is no per-trigger knowhow allow-list to configure here."
                     },
                     "cron": cron_schema(false),
                     "on_event": {
@@ -577,7 +662,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     },
                     "run": {
                         "type": "object",
-                        "description": "Change what to execute. { type: 'intent', intent: '...', knowhow: ['lucidos-ops/release-process', 'system-knowhow/best-practices'] } or { type: 'script', path: '...' }. Knowhow ids are paths under data/knowhow/ without .md INCLUDING any subdirectory (data/knowhow/lucidos-ops/release-process.md → 'lucidos-ops/release-process'). Prefix engine-shipped reference docs with 'system-knowhow/'. Save fails if any id doesn't resolve."
+                        "description": "Change what to execute. { type: 'intent', intent: '...' } or { type: 'script', path: '...' }. If the LLM judges a procedure relevant at fire time, it calls `load_knowhow` itself — same as in chat. There is no per-trigger knowhow allow-list to configure here."
                     },
                     "cron": cron_schema(true),
                     "on_event": {
@@ -850,7 +935,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::REQUEST_CREDENTIAL.to_string(),
-            description: "Request API credentials from the user via a secure modal dialog. NEVER accept credentials pasted in chat — always use this tool. The user enters the credential in a popup (not in chat), keeping it secure and out of the event log.".to_string(),
+            description: "Request API credentials from the user via a secure modal dialog. NEVER accept credentials pasted in chat — always use this tool. The user enters the credential in a popup (not in chat), keeping it secure and out of the event log. Call this for ONE credential at a time and wait for it to resolve before requesting the next — issuing multiple credential requests in parallel stacks modals and forces the user to history-navigate between them.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1170,7 +1255,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::RUN_THREAD.to_string(),
-            description: "Start a new Lucidos thread to handle a subtask independently. The child thread runs its own agentic loop with full tool access. When it completes, a callback automatically resumes THIS thread with the child's result (including its final response text) — you do NOT need to poll or check on it. You can spawn multiple child threads in parallel; each will report back independently when done. When a child reports back, review its result — if it's incomplete or unsatisfactory, you can spawn another run_thread with a refined prompt to get a better answer. Use for non-code tasks (research, analysis, drafting). For code tasks, use run_claude instead.".to_string(),
+            description: "Start a new Lucidos thread to handle a subtask. Default behavior (relation=\"sub\") is a sub-thread: it runs its own agentic loop with full tool access, and when it completes a callback automatically resumes THIS thread with the sub-thread's result (including its final response text) — you do NOT need to poll. You can spawn multiple sub-threads in parallel; each reports back independently. When a sub-thread reports back, review its result — if it's incomplete, spawn another run_thread with a refined prompt. Pass relation=\"top\" instead when the spawn is for the user to read later (research/report) and you do NOT need the result yourself; the spawned thread runs as an independent top-level thread and never reports back. Use for non-code tasks (research, analysis, drafting). For code tasks, use run_claude instead.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1181,6 +1266,11 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     "title": {
                         "type": "string",
                         "description": "Optional short descriptive title (3-6 words) for the thread. When provided, the system will not auto-generate a title. Recommended so the thread list is meaningful at a glance."
+                    },
+                    "relation": {
+                        "type": "string",
+                        "enum": ["sub", "top"],
+                        "description": "How the spawned thread relates to this one. 'sub' (default): when the spawned thread finishes, this thread automatically resumes with its result — use for delegated subtasks whose answer you need. 'top': fire-and-forget — the spawned thread runs independently as a top-level thread; this thread does not resume when it finishes. Use when the spawn is for the user to look at later, not for you."
                     }
                 },
                 "required": ["prompt"]
@@ -1188,7 +1278,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::RUN_CLAUDE.to_string(),
-            description: "Run Claude Code to edit source code. ONLY use this when the user explicitly asks to modify code (Lucidos or an external repo). Never use this for workspace tasks like web scraping, file manipulation, data processing, or anything the native tools can handle — use browser_open, web_search, http_request, run_python, read_file, write_file, etc. instead.\n\nSpawning returns immediately; when the CC session ends, a callback automatically resumes THIS thread with the child's final response text — you do NOT need to poll or check on it. For PARALLEL work, issue multiple run_claude calls in one response and they spawn concurrently, each reporting back independently. For SEQUENTIAL pipelines (where step N depends on step N-1's outcome — e.g., build → harden → e2e, stopping on first failure), spawn ONE run_claude and end the turn; the next step runs only after the callback resumes you. Never batch sequential spawns in one response — that defeats the dependency. Always inspect the child's final response text to determine pass/fail before acting on it or emitting milestones — the spawn ack is not a result.\n\nBEFORE CALLING: identify which repo the work targets.\n- Editing Lucidos itself (engine/UI under the Lucidos source tree) → omit `repo`.\n- Prompt mentions any external path, repo name, or sibling-directory work → call `manage_repositories` with `action='list'`, find the matching registered repo, and pass `repo=<name>`. Without this the session runs in the Lucidos worktree and edits land in the wrong place even if the prompt uses absolute paths — absolute paths in the prompt are NOT a substitute for the `repo` parameter.\n- Target repo isn't registered → ask the user to register it (or register it yourself with `manage_repositories action='add'` if you know the path) before spawning.\n- Ambiguous → ask one question: 'which repo should this run in?' before calling.\n\nIf Rust backend files are changed, Lucidos shows the user a toast suggesting a restart — the user must manually trigger the rebuild and restart for backend changes to take effect (do NOT promise that changes will be live shortly). Frontend (TypeScript/CSS) changes are picked up automatically.".to_string(),
+            description: "Run Claude Code to edit source code. ONLY use this when the user explicitly asks to modify code (Lucidos or an external repo). Never use this for workspace tasks like web scraping, file manipulation, data processing, or anything the native tools can handle — use browser_open, web_search, http_request, run_python, read_file, write_file, etc. instead.\n\nDefault behavior (relation=\"sub\") is a sub-thread: spawning returns immediately; when the CC session ends, a callback automatically resumes THIS thread with the sub-thread's final response text — you do NOT need to poll. For PARALLEL work, issue multiple run_claude calls in one response and they spawn concurrently, each reporting back independently. For SEQUENTIAL pipelines (where step N depends on step N-1's outcome — e.g., build → harden → e2e, stopping on first failure), spawn ONE run_claude and end the turn; the next step runs only after the callback resumes you. Never batch sequential spawns in one response — that defeats the dependency. Always inspect the sub-thread's final response text to determine pass/fail before acting on it or emitting milestones — the spawn ack is not a result.\n\nPass relation=\"top\" instead when the user asks for a piece of work to happen in its own thread that they will follow themselves (e.g. 'do this in a separate thread' / 'spawn a CC session for this and I'll check in later'). The spawned CC session runs as an independent top-level thread and will NOT report back to this conversation.\n\nSAME WORKSPACE ONLY. `run_claude` always spawns in the CURRENT workspace — there is no workspace parameter. When the user asks for the work to land in a different workspace ('do this in dev', 'fix it in personal', 'send to work', 'run in another workspace'), use `lucidos spawn-thread --to <ws> --cc ...` via `run_bash` instead — that is the only cross-workspace path. The `repo` parameter below selects a repo within THIS workspace's registry; it is NOT a workspace selector, and a `repo` name that happens to match another workspace's name will silently resolve here.\n\nBEFORE CALLING: identify which repo the work targets.\n- Editing Lucidos itself (engine/UI under the Lucidos source tree) → omit `repo`.\n- Prompt mentions any external path, repo name, or sibling-directory work → call `manage_repositories` with `action='list'`, find the matching registered repo, and pass `repo=<name>`. Without this the session runs in the Lucidos worktree and edits land in the wrong place even if the prompt uses absolute paths — absolute paths in the prompt are NOT a substitute for the `repo` parameter.\n- Target repo isn't registered → ask the user to register it (or register it yourself with `manage_repositories action='add'` if you know the path) before spawning.\n- Ambiguous → ask one question: 'which repo should this run in?' before calling.\n\nIf Rust backend files are changed, Lucidos shows the user a toast suggesting a restart — the user must manually trigger the rebuild and restart for backend changes to take effect (do NOT promise that changes will be live shortly). Frontend (TypeScript/CSS) changes are picked up automatically.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1198,7 +1288,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     },
                     "repo": {
                         "type": "string",
-                        "description": "Repository ID or name from manage_repositories. REQUIRED whenever the work targets anything outside the Lucidos source tree — without it the session runs in Lucidos's worktree and edits go to the wrong directory even if the prompt uses absolute paths. Omit ONLY when editing Lucidos itself."
+                        "description": "Repository ID or name from manage_repositories — resolved in the CURRENT workspace's repo registry. NOT a workspace selector: to target another workspace, use `lucidos spawn-thread --to <ws> --cc` via `run_bash` instead (this tool always spawns in the current workspace). REQUIRED whenever the work targets anything outside the Lucidos source tree — without it the session runs in this workspace's Lucidos worktree and edits go to the wrong directory even if the prompt uses absolute paths. Omit ONLY when editing Lucidos itself."
                     },
                     "allowed_tools": {
                         "type": "string",
@@ -1220,6 +1310,11 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                     "title": {
                         "type": "string",
                         "description": "Optional short descriptive title (3-6 words) for the spawned CC thread. When provided, the system will not auto-generate a title. Recommended so the thread list is meaningful at a glance."
+                    },
+                    "relation": {
+                        "type": "string",
+                        "enum": ["sub", "top"],
+                        "description": "How the spawned CC session relates to this thread. 'sub' (default): when the CC session ends, this thread automatically resumes with its result — use for delegated coding subtasks whose outcome you need. 'top': fire-and-forget — the CC session runs independently as a top-level thread; this thread does not resume when it finishes. Use when the user asks for the work to happen in a separate thread they will follow themselves."
                     }
                 },
                 "required": ["prompt"]
@@ -1317,17 +1412,13 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::INSTALL_PLUGIN.to_string(),
-            description: "Install a Lucidos plugin from a git URL or a local .lucidos-plugin archive. A plugin is a coherent bundle of workspace content (apps, knowhow, triggers, scripts) that another author shipped. Files extract under data/ and become indistinguishable from anything you'd author yourself. Source detection: a GitHub tree URL like 'https://github.com/owner/repo/tree/branch/subpath' is treated as a monorepo install (clones the repo at that branch, uses subpath as the plugin root). A plain git URL or .git URL is cloned at the default branch. A path ending in '.lucidos-plugin' is unpacked locally. If install would overwrite existing files, the call fails with the conflict list — re-run with overwrite=true to proceed (used by both fresh installs over your own files and by the update flow).".to_string(),
+            description: "Stage a Lucidos plugin install for the user to confirm in a panel. A plugin is a coherent bundle of workspace content (apps, knowhow, triggers, scripts) that another author shipped. Source detection: a GitHub tree URL like 'https://github.com/owner/repo/tree/branch/subpath' is a monorepo install (clones the repo at that branch, uses subpath as the plugin root). A plain git URL or .git URL is cloned at the default branch. A path ending in '.lucidos-plugin' is unpacked locally. The user sees a confirm panel with the file list, source, and any overwrites — do NOT chat-ask the user about overwrites or repeat what the panel will show. After this call, do NOT respond about the install or claim it succeeded; the panel resolves it on Confirm/Cancel and emits the appropriate event. The next user message will tell you whether the install happened.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
                         "description": "GitHub tree URL (e.g., 'https://github.com/lucidos-dev/plugins/tree/main/browser-learning'), a plain git URL, or an absolute path to a .lucidos-plugin file."
-                    },
-                    "overwrite": {
-                        "type": "boolean",
-                        "description": "Allow overwriting existing files under data/. Default: false. Set true when the user has confirmed they want a re-install or update."
                     }
                 },
                 "required": ["source"]
@@ -1362,16 +1453,30 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::UNINSTALL_PLUGIN.to_string(),
-            description: "Mark a plugin uninstalled. v1 is GUIDE-ONLY: it emits a PluginUninstalled event and tells the user which paths to delete. It does NOT remove files from data/ — some may have been edited since install or shared with another plugin. Offer to delete them in a follow-up using delete_file once the user confirms.".to_string(),
+            description: "Stage a Lucidos plugin uninstall for the user to confirm in a panel. Resolves `id` against the plugin id, the manifest name, OR an `apps/<dir>` folder name installed by the plugin (case-insensitive, dash/underscore/whitespace-insensitive — \"No role playing\", \"no-role-playing\", and \"anti-sycophancy-critique\" all resolve to the same plugin). On exact match, looks up the install record, partitions the recorded files into still-on-disk vs already-missing, and shows the user a confirm panel listing what will be deleted. On multiple matches, returns an error listing the candidates so you can re-call with the exact id. Do NOT chat-ask which files to delete — the panel surfaces them. Do NOT manually delete_file the listed paths; the panel's Confirm button removes them atomically + reloads WASM signers if needed (and delete_file refuses plugin-owned paths anyway). After this call, do NOT respond about the uninstall or claim files were removed; the panel resolves it on Confirm/Cancel and emits the appropriate event. The next user message will tell you the outcome.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "The plugin id to uninstall (e.g. 'browser-learning')."
+                        "description": "Plugin id, manifest name, or app folder installed by the plugin (e.g. 'browser-learning', 'Browser Learning', or 'browser-learning' app dir). Case- and dash/underscore/whitespace-insensitive."
                     }
                 },
                 "required": ["id"]
+            }),
+        },
+        ToolDefinition {
+            name: tn::DISMISS_FROM_CONTEXT.to_string(),
+            description: "Drop a prior tool result or child-thread completion from your future resume context. Use when you're done with that information and want to keep your context lean across long pipelines. Pass the event_id from prior history: tool blocks show `evt-<uuid>` as the tool_use_id, and ChildThreadCompleted blocks include an `event_id: <uuid>` line. Either form is accepted.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "event_id": {
+                        "type": "string",
+                        "description": "Event id of the ToolCalled or ChildThreadCompleted event to dismiss. Accepts either the bare UUID (hyphenated or simple) or the `evt-<uuid>` form rendered as tool_use_id in tool blocks."
+                    }
+                },
+                "required": ["event_id"]
             }),
         },
     ]
@@ -1403,13 +1508,19 @@ pub fn get_save_thread_image_tool() -> ToolDefinition {
 pub fn get_image_generation_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::GENERATE_IMAGE.to_string(),
-        description: "Generate a new image or edit an existing image. For generation, provide a prompt describing the desired image. For editing, also specify input_images to modify. The current image provider may only support one input image — if you provide multiple and it's not supported, you'll get an error asking the user to pick one.".to_string(),
+        description: "SYNTHESIZES a new image, or edits an existing image. Returns image bytes — never text. \
+            This is NOT a vision/analysis tool: do NOT call it to 'describe', 'analyze', 'summarize', \
+            'transcribe', or 'tell me what's in' an image. To describe an image already in the conversation, \
+            just describe it directly in your reply — you can see it natively. \
+            Provide `prompt` describing the desired output image. To edit an existing image, also pass \
+            `input_images`. The current image provider may only support one input image — if you provide \
+            multiple and it's not supported, the call fails with an error asking the user to pick one.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "What to generate, or how to edit the input image(s). Be descriptive."
+                    "description": "Describes the image to be synthesized (or how to edit input_images). Must describe a desired output picture, NOT instructions like 'describe this image' — that wastes a generation call and returns a meaningless image."
                 },
                 "input_images": {
                     "type": "array",
@@ -1520,34 +1631,5 @@ pub fn get_mcp_tools() -> Vec<ToolDefinition> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn send_notification_schema_exposes_optional_app_id() {
-        let tool = get_notification_tool();
-        let props = tool
-            .parameters
-            .get("properties")
-            .expect("schema must have properties");
-        let app_id = props
-            .get("app_id")
-            .expect("send_notification must expose app_id so the LLM can deep-link the push");
-        assert_eq!(
-            app_id.get("type").and_then(|v| v.as_str()),
-            Some("string"),
-            "app_id must be a string"
-        );
-        let required = tool
-            .parameters
-            .get("required")
-            .and_then(|v| v.as_array())
-            .expect("schema must have required array");
-        let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(
-            !required_names.contains(&"app_id"),
-            "app_id must be optional, got required: {:?}",
-            required_names
-        );
-    }
-}
+#[path = "tools_tests.rs"]
+mod tests;

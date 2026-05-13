@@ -30,6 +30,7 @@ pub(super) fn lost_followups_to_orphans(
                 spawning_event_id: None,
                 images: input.images,
                 origin: None,
+                kind: crate::engine::InjectedPromptKind::UserText,
             })
         })
         .collect()

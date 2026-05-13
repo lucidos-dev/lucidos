@@ -6,7 +6,6 @@ const SECTION_TRANSITION_EVENTS: &[(&str, &str)] = &[
 
 const CC_ONLY_EVENTS: &[&str] = &[
     "SessionStarted",
-    "SessionRecovered",
     "SessionEnded",
     "CodingAgentTextStreamed",
     "CodingAgentToolCalled",
@@ -221,6 +220,34 @@ fn every_persisted_event_is_classified() {
             "Persisted event '{}' is not classified",
             event_type
         );
+    }
+}
+
+// 1b. Every persisted event type must resolve through `resolve_transition`
+// without falling into the "_ => violation('Unknown event type')" arm.
+// Without this, adding a new ThreadEvent variant to `all_persisted_event_types`
+// + `classify_event` is silently insufficient: emit_or_log swallows the error
+// and the event never lands in the events table.
+#[test]
+fn every_persisted_event_resolves_in_lifecycle() {
+    for event_type in all_persisted_event_types() {
+        for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
+            let result = resolve_transition(
+                event_type,
+                thread_type,
+                ArchiveState::Archived,
+                true,
+            );
+            if let Err(err) = &result {
+                assert!(
+                    !err.reason.contains("Unknown event type"),
+                    "'{}' on {:?} hits the catch-all 'Unknown event type' arm — \
+                     add it to the no_change list (or a more specific arm) in \
+                     thread_lifecycle.rs::resolve_transition",
+                    event_type, thread_type
+                );
+            }
+        }
     }
 }
 
@@ -1364,4 +1391,14 @@ fn start_running_setters_are_in_last_activity_events() {
             }
         }
     }
+}
+
+#[test]
+fn child_thread_completed_is_start_class() {
+    assert_eq!(
+        classify_event("ChildThreadCompleted"),
+        Some(EventClass::Start),
+        "ChildThreadCompleted is an exchange-starter — its render is the rich card \
+         (see docs/plans/2026-05-12-child-completion-card-design.md)"
+    );
 }

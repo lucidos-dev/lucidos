@@ -11,6 +11,11 @@ pub struct Notification {
     pub id: Uuid,
     pub task_id: Option<Uuid>,
     pub app_id: Option<String>,
+    /// Originating thread, when the notification has one. Drives the inbox
+    /// modal's "Open thread" button. Engine sets this from `link_thread` —
+    /// the same value that powers push deep-linking and presence-based push
+    /// suppression.
+    pub thread_id: Option<Uuid>,
     pub title: String,
     pub message: String,
     pub read: bool,
@@ -29,6 +34,7 @@ impl NotificationStore {
                 id UUID PRIMARY KEY,
                 task_id UUID,
                 app_id TEXT,
+                thread_id UUID,
                 title TEXT NOT NULL,
                 message TEXT NOT NULL,
                 read BOOLEAN DEFAULT false,
@@ -69,8 +75,10 @@ impl NotificationStore {
         message: &str,
         task_id: Option<Uuid>,
         app_id: Option<&str>,
+        thread_id: Option<Uuid>,
     ) -> Result<Notification, sqlx::Error> {
-        Self::insert_with_timestamp(pool, title, message, task_id, app_id, Utc::now()).await
+        Self::insert_with_timestamp(pool, title, message, task_id, app_id, thread_id, Utc::now())
+            .await
     }
 
     /// Insert a notification with a custom timestamp (for backdating)
@@ -80,19 +88,21 @@ impl NotificationStore {
         message: &str,
         task_id: Option<Uuid>,
         app_id: Option<&str>,
+        thread_id: Option<Uuid>,
         created_at: DateTime<Utc>,
     ) -> Result<Notification, sqlx::Error> {
         let id = Uuid::new_v4();
 
         sqlx::query(
             r#"
-            INSERT INTO notifications (id, task_id, app_id, title, message, read, created_at)
-            VALUES ($1, $2, $3, $4, $5, false, $6)
+            INSERT INTO notifications (id, task_id, app_id, thread_id, title, message, read, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, false, $7)
             "#,
         )
         .bind(id)
         .bind(task_id)
         .bind(app_id)
+        .bind(thread_id)
         .bind(title)
         .bind(message)
         .bind(created_at)
@@ -103,6 +113,7 @@ impl NotificationStore {
             id,
             task_id,
             app_id: app_id.map(|s| s.to_string()),
+            thread_id,
             title: title.to_string(),
             message: message.to_string(),
             read: false,
@@ -136,7 +147,7 @@ impl NotificationStore {
             (true, Some(ts)) => {
                 sqlx::query_as::<_, Notification>(
                     r#"
-                    SELECT id, task_id, app_id, title, message, read, created_at
+                    SELECT id, task_id, app_id, thread_id, title, message, read, created_at
                     FROM notifications
                     WHERE read = false AND created_at < $1
                     ORDER BY created_at DESC
@@ -151,7 +162,7 @@ impl NotificationStore {
             (true, None) => {
                 sqlx::query_as::<_, Notification>(
                     r#"
-                    SELECT id, task_id, app_id, title, message, read, created_at
+                    SELECT id, task_id, app_id, thread_id, title, message, read, created_at
                     FROM notifications
                     WHERE read = false
                     ORDER BY created_at DESC
@@ -165,7 +176,7 @@ impl NotificationStore {
             (false, Some(ts)) => {
                 sqlx::query_as::<_, Notification>(
                     r#"
-                    SELECT id, task_id, app_id, title, message, read, created_at
+                    SELECT id, task_id, app_id, thread_id, title, message, read, created_at
                     FROM notifications
                     WHERE created_at < $1
                     ORDER BY created_at DESC
@@ -180,7 +191,7 @@ impl NotificationStore {
             (false, None) => {
                 sqlx::query_as::<_, Notification>(
                     r#"
-                    SELECT id, task_id, app_id, title, message, read, created_at
+                    SELECT id, task_id, app_id, thread_id, title, message, read, created_at
                     FROM notifications
                     ORDER BY created_at DESC
                     LIMIT $1
@@ -201,7 +212,7 @@ impl NotificationStore {
     ) -> Result<Vec<Notification>, sqlx::Error> {
         sqlx::query_as::<_, Notification>(
             r#"
-            SELECT id, task_id, app_id, title, message, read, created_at
+            SELECT id, task_id, app_id, thread_id, title, message, read, created_at
             FROM notifications
             WHERE created_at <= $1
             ORDER BY created_at DESC
@@ -252,7 +263,7 @@ impl NotificationStore {
     ) -> Result<Option<Notification>, sqlx::Error> {
         sqlx::query_as::<_, Notification>(
             r#"
-            SELECT id, task_id, app_id, title, message, read, created_at
+            SELECT id, task_id, app_id, thread_id, title, message, read, created_at
             FROM notifications
             WHERE id = $1
             "#,

@@ -7,7 +7,7 @@ pub mod tool_names;
 pub mod tools;
 pub mod vertex;
 
-pub use image::{ImageProvider, ImageSize, OpenAiImageProvider, VertexImagenProvider};
+pub use image::{ImageProvider, ImageSize};
 pub use openai::OpenAiProvider;
 pub use provider::{ContentBlock, LlmProvider, Message, MessageContent, TokenCallback, ToolCall};
 pub use routing::RoutingProvider;

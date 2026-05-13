@@ -21,11 +21,11 @@ import {
 } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
 import type { ChatRequestBody } from '../../api/types';
-import { API_BASE, submitChat, cancelChat, cancelClaudeCode } from '../../api/client';
+import { API_BASE, submitChat, cancelChat, stopClaudeCode } from '../../api/client';
 import { getDisconnectedMsg } from './connection';
 import { getDeviceId } from './devices';
 import { handleEvent, makeOptimisticThreadState, type StoredEvent } from '../thread-events';
-import { pushThreadNavState } from './thread-navigation';
+import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
 import { scrollToBottom } from '../../components/chat/scrollState';
 import { refreshThreadEvents } from './thread-loading';
 import { isTauri } from '../../utils/platform';
@@ -306,7 +306,23 @@ export async function sendMessage(
     await submitChat(body);
     schedulePendingCleanup(threadId, eventId);
   } catch (error: unknown) {
-    removePendingMessage(threadId, eventId);
+    // Raw new sends create the thread optimistically (`threadBeforeSend`
+    // snapshot is undefined). When submitChat fails the engine has no record
+    // of it — leaving the row in `threadMap` would render a phantom in the
+    // Active drawer that vanishes on refresh. Drop the row, drop nav entries
+    // pointing at it (so Back/Forward can't restore a phantom), and unfocus.
+    // Established threads (active follow-up, draft promotion) keep their row;
+    // their content predates this send and only the pending entry is rolled
+    // back.
+    if (threadBeforeSend === undefined) {
+      const next = new Map(threadMap.value);
+      next.delete(threadId);
+      threadMap.value = next;
+      removeThreadNavEntries(threadId);
+      if (focusedThreadId.value === threadId) setFocusedThread(null);
+    } else {
+      removePendingMessage(threadId, eventId);
+    }
     showToast(`Failed to send message: ${errorDetail(error)}`, 'error');
   }
 }
@@ -323,7 +339,7 @@ export async function cancelCurrentExchange(threadId?: string): Promise<boolean>
   try {
     const thread = tid ? threadMap.value.get(tid) : undefined;
     if (thread?.meta.channel === 'claude_code') {
-      await cancelClaudeCode(undefined, tid);
+      await stopClaudeCode(undefined, tid);
     } else {
       await cancelChat(tid);
     }

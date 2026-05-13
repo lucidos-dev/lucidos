@@ -17,96 +17,25 @@
 
 use super::*;
 
-use crate::core::{AuthType, Credential, CredentialStore};
+use crate::api::proxy_pipeline_config::{LayerConfig, PipelineConfig};
+use crate::core::{Credential, CredentialStore};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderName, Method};
 use std::collections::HashMap;
 use std::path::Path as FsPath;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Per-API config entry from `data/config/apis.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub base_url: String,
+    /// Pipeline of `AuthLayer` impls applied in order on every outbound
+    /// request. The legacy single-variant `ProxyAuth` shape is upgraded
+    /// to a pipeline at engine startup by
+    /// `proxy_migration::migrate_apis_json_if_needed`.
     #[serde(default)]
-    pub auth: Option<ProxyAuth>,
-}
-
-/// Auth block — names credentials in the engine credential store and tells
-/// the proxy how to attach them to outgoing requests.
-///
-/// Serialized in `apis.json` with serde's `tag = "type"`, so each variant
-/// gets its own JSON shape:
-/// - `{"type": "bearer", "credential": "..."}`
-/// - `{"type": "api_key", "credential": "...", "header": "X-API-Key"}`
-/// - `{"type": "basic", "credential": "..."}`
-///
-/// Unknown `type` values are rejected at config-load time (typos in
-/// `apis.json` fail fast instead of silently producing 401s at request time).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ProxyAuth {
-    Bearer {
-        /// `service_name` in the credential store.
-        credential: String,
-    },
-    ApiKey {
-        credential: String,
-        /// Optional header name override (default `Authorization`). Useful
-        /// for services that expect e.g. `X-API-Key`.
-        #[serde(default)]
-        header: Option<String>,
-    },
-    Basic {
-        credential: String,
-    },
-    /// Inject the credential as a URL query parameter (e.g. Helius's
-    /// `?api-key=...` shape). The credential value is URL-encoded and
-    /// appended to the existing query string (or starts a new one).
-    QueryParam {
-        credential: String,
-        /// URL query parameter name to inject (e.g. `"api-key"` for Helius).
-        param_name: String,
-    },
-    /// Sign each request with HMAC over its query string. Used by exchanges
-    /// like Binance: an API key (`key_credential`) is sent in `key_header`,
-    /// and a secret (`secret_credential`) signs the canonical query string.
-    /// If `timestamp_param` is set, the current millis-since-epoch is added
-    /// to the query before signing (Binance algorithm).
-    HmacSigned {
-        /// `service_name` in the credential store; auth_value goes into
-        /// `key_header`.
-        key_credential: String,
-        /// `service_name` in the credential store; auth_value used as the
-        /// HMAC secret.
-        secret_credential: String,
-        /// Header name for the API key. Default `"X-API-KEY"`. Set to
-        /// `"X-MBX-APIKEY"` for Binance.
-        #[serde(default = "default_key_header")]
-        key_header: String,
-        algorithm: HmacAlgorithm,
-        signed_payload: HmacSignedPayload,
-        /// Query-string parameter name for the signature. Default
-        /// `"signature"`.
-        #[serde(default = "default_signature_param")]
-        signature_param: String,
-        /// If set, current millis-since-epoch is injected as this query
-        /// param BEFORE signing (Binance algorithm). Omit for APIs that
-        /// don't need timestamping.
-        #[serde(default)]
-        timestamp_param: Option<String>,
-    },
-    /// Return the named credentials' values to the caller as a JSON map,
-    /// for libraries (e.g. `pcomfortcloud`) that perform their own login
-    /// flow. Never injected into outgoing HTTP requests; only callable via
-    /// `GET /api/v1/proxy-credentials/<name>` (CLI: `lucidos proxy <name>
-    /// --credentials`). The `proxy_request` LLM tool refuses this mode so
-    /// raw credentials never reach the model.
-    CredentialBundle {
-        /// `service_name`s in the credential store. The bundle endpoint
-        /// returns a JSON object keyed by these names.
-        credentials: Vec<String>,
-    },
+    pub auth: Option<PipelineConfig>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,20 +52,20 @@ pub enum HmacSignedPayload {
     QueryString,
 }
 
-fn default_signature_param() -> String {
-    "signature".to_string()
-}
-
-fn default_key_header() -> String {
-    "X-API-KEY".to_string()
-}
-
 pub type ProxyConfigMap = HashMap<String, ProxyConfig>;
 
 const PROXY_CONFIG_REL_PATH: &str = "data/config/apis.json";
 
 /// Shared client — pooled, no proxy, accepts self-signed certs (for local
 /// HTTP backends). Mirrors `dev_proxy::CLIENT` so behavior is consistent.
+///
+/// `redirect(Policy::none())`: signed proxy requests must NOT auto-follow
+/// redirects. reqwest would replay the original Authorization header /
+/// signed query against whatever host upstream points us at — leaking
+/// credentials to a hostile target, or producing an invalid signature
+/// for the redirect URL. Engine-side handling lives in
+/// `forward_with_redirects`: same-host hops re-run the pipeline against
+/// the new path/query; cross-host hops return 502.
 static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     reqwest::Client::builder()
         .no_proxy()
@@ -145,6 +74,7 @@ static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|
         .pool_idle_timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("failed to build proxy reqwest client")
 });
@@ -158,7 +88,28 @@ pub fn load_proxy_config(workspace_path: &FsPath) -> Result<ProxyConfigMap, Stri
     }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    serde_json::from_str(&content).map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
+    let configs: ProxyConfigMap = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+    // Walk the pipeline of every provider — validate any ScriptHandshake
+    // layer's script path before the engine can be tricked into running an
+    // out-of-workspace file. Catches malicious / sloppy `apis.json` edits
+    // at startup instead of waiting for the first request.
+    for (name, cfg) in &configs {
+        let Some(pipeline_cfg) = cfg.auth.as_ref() else {
+            continue;
+        };
+        for layer in &pipeline_cfg.pipeline {
+            if let LayerConfig::ScriptHandshake { script, .. } = layer {
+                if has_traversal(script) || script.starts_with('/') || script.starts_with('\\') {
+                    return Err(format!(
+                        "proxy '{}' script path '{}' must be relative under the workspace (no '..', no leading '/' or '\\\\')",
+                        name, script
+                    ));
+                }
+            }
+        }
+    }
+    Ok(configs)
 }
 
 /// Hop-by-hop headers per RFC 7230 §6.1 — must not be forwarded.
@@ -202,35 +153,6 @@ pub fn filter_request_headers(headers: &HeaderMap) -> HeaderMap {
         }
     }
     filtered
-}
-
-/// Build the auth header `(name, value)` from credential type + value.
-/// Returns `None` for credential types that don't translate to a single header
-/// (e.g. `EmailPassword`, `OauthClient`).
-pub fn build_auth_header(
-    auth_type: AuthType,
-    auth_value: &str,
-    header_override: Option<&str>,
-) -> Option<(HeaderName, HeaderValue)> {
-    use base64::Engine as _;
-    let header_name_str = header_override.unwrap_or("Authorization");
-    let header_name = HeaderName::from_bytes(header_name_str.as_bytes()).ok()?;
-    match auth_type {
-        AuthType::Bearer => {
-            let value = HeaderValue::from_str(&format!("Bearer {}", auth_value)).ok()?;
-            Some((header_name, value))
-        }
-        AuthType::ApiKey => {
-            let value = HeaderValue::from_str(auth_value).ok()?;
-            Some((header_name, value))
-        }
-        AuthType::Basic => {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(auth_value);
-            let value = HeaderValue::from_str(&format!("Basic {}", encoded)).ok()?;
-            Some((header_name, value))
-        }
-        AuthType::Password | AuthType::EmailPassword | AuthType::OauthClient => None,
-    }
 }
 
 /// Reject `..` traversal segments and backslashes in the proxy path. Without
@@ -294,35 +216,6 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// Take an existing query string, optionally append `&<timestamp_param>=<now_ms>`,
-/// then compute HMAC over the result and append `&<signature_param>=<hex>`.
-/// Returns the final query string (no leading `?`).
-///
-/// `now_ms` is passed in so tests are deterministic. Production callers pass
-/// `chrono::Utc::now().timestamp_millis() as u64`.
-pub(crate) fn sign_query_string(
-    initial_query: &str,
-    secret: &[u8],
-    algorithm: HmacAlgorithm,
-    timestamp_param: Option<&str>,
-    signature_param: &str,
-    now_ms: u64,
-) -> String {
-    let mut query = initial_query.to_string();
-    if let Some(ts_param) = timestamp_param {
-        if !query.is_empty() {
-            query.push('&');
-        }
-        query.push_str(&format!("{}={}", ts_param, now_ms));
-    }
-    let sig = compute_hmac_hex(algorithm, secret, query.as_bytes());
-    if !query.is_empty() {
-        query.push('&');
-    }
-    query.push_str(&format!("{}={}", signature_param, sig));
-    query
-}
-
 /// Resolve config name → ProxyConfig. Returns 404 if name not configured.
 pub(crate) async fn resolve_proxy_target(
     workspace_path: &FsPath,
@@ -336,37 +229,11 @@ pub(crate) async fn resolve_proxy_target(
     ))
 }
 
-/// Resolve the credential for a config (if any). Returns 502 if the named
-/// credential is missing OR has an empty `auth_value` — both leave the
-/// proxy unable to inject usable auth, and silently sending `Bearer ` would
-/// just produce a confusing upstream 401.
-pub(crate) async fn resolve_credential(
-    pool: &sqlx::PgPool,
-    auth: &ProxyAuth,
-) -> Result<Credential, (StatusCode, String)> {
-    let name = match auth {
-        ProxyAuth::Bearer { credential }
-        | ProxyAuth::ApiKey { credential, .. }
-        | ProxyAuth::Basic { credential } => credential.as_str(),
-        ProxyAuth::QueryParam { .. }
-        | ProxyAuth::HmacSigned { .. }
-        | ProxyAuth::CredentialBundle { .. } => {
-            // These variants are dispatched directly inside `apply_auth` (or, for
-            // CredentialBundle, the dedicated handler) and never reach here.
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "resolve_credential called for an auth variant that does not use a single credential header".to_string(),
-            ));
-        }
-    };
-    fetch_required_credential(pool, name).await
-}
-
 /// Look up a single credential by service name, mapping missing/empty/db
 /// failures to the same `(StatusCode, String)` error shape every auth path
 /// uses. The single source of truth for "this credential must exist and be
 /// non-empty, or the proxy can't proceed".
-async fn fetch_required_credential(
+pub(crate) async fn fetch_required_credential(
     pool: &sqlx::PgPool,
     name: &str,
 ) -> Result<Credential, (StatusCode, String)> {
@@ -401,150 +268,6 @@ pub(crate) async fn lookup_credential_value(
         .map(|c| c.auth_value)
 }
 
-/// Resolved pieces every auth-injection step needs at request build time —
-/// the final URL (with any query-param injection already applied), an
-/// optional header tuple to attach, and a redacted form of the URL safe
-/// for use in log lines (so credentials embedded in the query string don't
-/// leak via `[Proxy LLM] GET ... → ?api-key=SECRET`).
-pub struct ResolvedAuth {
-    pub url: String,
-    pub log_url: String,
-    pub header: Option<(HeaderName, HeaderValue)>,
-}
-
-/// Apply an auth config to a base URL+path+query, returning the final URL
-/// and optional auth header. Header-style auth (`Bearer`, `ApiKey`, `Basic`)
-/// leaves the URL alone and returns the header. URL-style auth (`QueryParam`)
-/// folds the credential into the URL and returns no header. The
-/// `credential_bundle` variant is request-time invalid (it's only callable
-/// via the dedicated `/api/v1/proxy-credentials/:name` endpoint) and returns
-/// 400 here.
-pub(crate) async fn apply_auth(
-    pool: &sqlx::PgPool,
-    auth: Option<&ProxyAuth>,
-    base_url: &str,
-    path: &str,
-    query: Option<&str>,
-) -> Result<ResolvedAuth, (StatusCode, String)> {
-    let url = build_target_url(base_url, path, query);
-    let Some(auth) = auth else {
-        return Ok(ResolvedAuth {
-            log_url: url.clone(),
-            url,
-            header: None,
-        });
-    };
-    match auth {
-        ProxyAuth::Bearer { .. } | ProxyAuth::ApiKey { .. } | ProxyAuth::Basic { .. } => {
-            let cred = resolve_credential(pool, auth).await?;
-            let header_override = match auth {
-                ProxyAuth::ApiKey { header, .. } => header.as_deref(),
-                _ => None,
-            };
-            let header = build_auth_header(cred.auth_type, &cred.auth_value, header_override);
-            Ok(ResolvedAuth {
-                log_url: url.clone(),
-                url,
-                header,
-            })
-        }
-        ProxyAuth::QueryParam {
-            credential,
-            param_name,
-        } => {
-            let value = lookup_credential_value(pool, credential).await?;
-            let url_with_cred = append_query_param(&url, param_name, &value);
-            // Logged URL replaces the credential value with `REDACTED` so it
-            // doesn't leak into engine logs or aggregations.
-            let log_url = append_query_param(&url, param_name, "REDACTED");
-            Ok(ResolvedAuth {
-                url: url_with_cred,
-                log_url,
-                header: None,
-            })
-        }
-        ProxyAuth::HmacSigned {
-            key_credential,
-            secret_credential,
-            key_header,
-            algorithm,
-            signed_payload: HmacSignedPayload::QueryString,
-            signature_param,
-            timestamp_param,
-        } => {
-            apply_hmac_signed(
-                pool,
-                base_url,
-                path,
-                query,
-                key_credential,
-                secret_credential,
-                key_header,
-                *algorithm,
-                signature_param,
-                timestamp_param.as_deref(),
-            )
-            .await
-        }
-        ProxyAuth::CredentialBundle { .. } => Err((
-            StatusCode::BAD_REQUEST,
-            "credential_bundle proxies do not inject HTTP auth; use GET /api/v1/proxy-credentials/<name>".to_string(),
-        )),
-    }
-}
-
-/// Sign the request's query string with HMAC and return the final URL plus
-/// the API-key header. Lifted out of `apply_auth`'s match so that arm reads
-/// as one dispatch instead of forty lines of inline logic.
-#[allow(clippy::too_many_arguments)]
-async fn apply_hmac_signed(
-    pool: &sqlx::PgPool,
-    base_url: &str,
-    path: &str,
-    query: Option<&str>,
-    key_credential: &str,
-    secret_credential: &str,
-    key_header: &str,
-    algorithm: HmacAlgorithm,
-    signature_param: &str,
-    timestamp_param: Option<&str>,
-) -> Result<ResolvedAuth, (StatusCode, String)> {
-    let key = lookup_credential_value(pool, key_credential).await?;
-    let secret = lookup_credential_value(pool, secret_credential).await?;
-    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-    let signed_query = sign_query_string(
-        query.unwrap_or(""),
-        secret.as_bytes(),
-        algorithm,
-        timestamp_param,
-        signature_param,
-        now_ms,
-    );
-    let url = build_target_url(base_url, path, Some(&signed_query));
-    let header_name = HeaderName::from_bytes(key_header.as_bytes()).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("invalid key_header '{}': {}", key_header, e),
-        )
-    })?;
-    let header_value = HeaderValue::from_str(&key).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "credential '{}' is not a valid HTTP header value: {}",
-                key_credential, e
-            ),
-        )
-    })?;
-    // Signature is the HMAC output (a hex digest) — knowing it reveals
-    // nothing about the secret, so it's safe to log alongside the URL.
-    Ok(ResolvedAuth {
-        log_url: url.clone(),
-        url,
-        header: Some((header_name, header_value)),
-    })
-}
-
 /// Forward a request to the configured upstream and return the upstream
 /// response (headers + body + status). Pure with respect to AppState: takes
 /// only the data it needs, so the integration tests can spin up a tiny axum
@@ -559,7 +282,7 @@ pub async fn forward_request(
     target_url: &str,
     log_url: &str,
     request_headers: HeaderMap,
-    auth: Option<(HeaderName, HeaderValue)>,
+    auth_headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
 ) -> Response {
     let req_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
@@ -579,7 +302,7 @@ pub async fn forward_request(
         // Pass raw bytes so non-ASCII header values (rare but valid) survive.
         builder = builder.header(name.as_str(), value.as_bytes());
     }
-    if let Some((name, value)) = auth {
+    for (name, value) in &auth_headers {
         builder = builder.header(name.as_str(), value.as_bytes());
     }
     if !body.is_empty() {
@@ -644,55 +367,85 @@ pub(super) async fn proxy_handler_root(
     proxy_handle_inner(state, name, String::new(), req).await
 }
 
-/// Pure logic for the credential-bundle endpoint — given a resolved config
-/// and a pool, produce the JSON map (or an HTTP error). Lifted out of the
-/// handler so the variant guard is testable without a full `AppState`.
-pub(crate) async fn build_credential_bundle(
-    pool: &sqlx::PgPool,
-    config: &ProxyConfig,
-    name: &str,
-) -> Result<serde_json::Map<String, serde_json::Value>, (StatusCode, String)> {
-    let credentials = match &config.auth {
-        Some(ProxyAuth::CredentialBundle { credentials }) => credentials,
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("proxy '{}' is not configured as credential_bundle", name),
-            ));
-        }
-    };
-    let mut out = serde_json::Map::with_capacity(credentials.len());
-    for cred_name in credentials {
-        let value = lookup_credential_value(pool, cred_name).await?;
-        out.insert(cred_name.clone(), serde_json::Value::String(value));
-    }
-    Ok(out)
+/// Re-scan `<workspace>/data/auth-modules/` and atomically swap the
+/// engine's compiled-module map. Returns the sorted list of module names
+/// now loaded. Shared by:
+///  - the HTTP `POST /api/v1/proxy-modules/reload` endpoint,
+///  - the `reload_proxy_modules` LLM tool,
+///  - the post-install reload triggered when `install_plugin` writes any
+///    `auth-modules/` content.
+///
+/// In-flight pipeline runs holding an `Arc<CompiledModule>` finish on the
+/// old module; new runs see the new map.
+pub(crate) async fn reload_proxy_modules_into(
+    engine: &crate::engine::LucidosEngine,
+    workspace_path: &FsPath,
+) -> Result<Vec<String>, String> {
+    let dir = workspace_path.join("data/auth-modules");
+    let new_modules =
+        crate::api::proxy_wasm_signer::load_wasm_modules(&dir, engine.wasm_engine())?;
+    let mut names: Vec<String> = new_modules.keys().cloned().collect();
+    names.sort();
+    *engine.proxy_modules().write().await = new_modules;
+    log!(
+        "[Proxy] reloaded WASM auth modules ({}): {:?}",
+        names.len(),
+        names
+    );
+    Ok(names)
 }
 
-/// Axum handler: `GET /api/v1/proxy-credentials/:name`.
-///
-/// Returns a JSON object `{"<service_name>": "<auth_value>", ...}` for
-/// proxies configured with `auth.type == "credential_bundle"`. For other
-/// proxy types (or missing proxies), returns 4xx. The credential value
-/// never goes through the LLM path — this endpoint is only reachable
-/// directly (CLI, scripts).
-pub(super) async fn proxy_credentials_handler(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Response {
-    let config = match resolve_proxy_target(&state.workspace_path, &name).await {
-        Ok(c) => c,
-        Err((status, msg)) => return (status, msg).into_response(),
-    };
-    match build_credential_bundle(&state.pool, &config, &name).await {
-        Ok(map) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            serde_json::Value::Object(map).to_string(),
-        )
-            .into_response(),
-        Err((status, msg)) => (status, msg).into_response(),
+/// Axum handler: `POST /api/v1/proxy-modules/reload` — re-scan the WASM
+/// auth modules directory and swap the engine's compiled-module map
+/// atomically. Returns the names now available so the caller (HTTP or
+/// LLM tool) can confirm what's loaded.
+pub(super) async fn proxy_modules_reload(State(state): State<AppState>) -> Response {
+    match reload_proxy_modules_into(&state.engine, &state.workspace_path).await {
+        Ok(names) => Json(serde_json::json!({"loaded": names})).into_response(),
+        Err(e) => {
+            log!("[Proxy] reload of WASM auth modules failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("reload failed: {e}"),
+            )
+                .into_response()
+        }
     }
+}
+
+/// Maximum total HTTP hops (initial request + redirects) we'll follow on a
+/// signed proxy request. Five is the same cap reqwest's default redirect
+/// policy uses, but we enforce it ourselves so the auth pipeline gets a
+/// chance to re-run on each hop instead of reqwest replaying the original
+/// signature against whatever the upstream redirects to.
+const MAX_REDIRECT_HOPS: usize = 5;
+
+/// True for the 30x statuses we follow.
+fn is_redirect_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+/// Lowercased host of the URL, or `None` if the URL doesn't parse / has
+/// no host. Used to decide whether a redirect target is "the same host"
+/// the original request was bound to.
+fn host_of(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+}
+
+/// Resolve a `Location` header value (relative or absolute) against the
+/// URL we just hit, returning the absolute target URL.
+fn resolve_redirect_location(current_url: &str, location: &str) -> Option<reqwest::Url> {
+    let base = reqwest::Url::parse(current_url).ok()?;
+    base.join(location).ok()
 }
 
 async fn proxy_handle_inner(
@@ -723,27 +476,211 @@ async fn proxy_handle_inner(
         }
     };
 
-    let resolved = match apply_auth(
-        &state.pool,
-        config.auth.as_ref(),
-        &config.base_url,
-        &path,
-        query.as_deref(),
-    )
-    .await
+    match dispatch_proxy_request(&state.engine, &name, &config, method, path, query, headers, body)
+        .await
     {
-        Ok(r) => r,
-        Err((status, msg)) => return (status, msg).into_response(),
+        Ok(resp) => resp,
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+/// Top-level proxy dispatch — exposed so the `proxy_request` LLM tool can
+/// share the same code path as the HTTP handler. Builds the per-request
+/// pipeline, forwards (with same-host redirect re-signing), and on 401
+/// from upstream invalidates opted-in caches and re-runs the SAME layers
+/// (the cache invalidation is what changes between attempts).
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_proxy_request(
+    engine: &Arc<crate::engine::LucidosEngine>,
+    name: &str,
+    config: &ProxyConfig,
+    method: Method,
+    path: String,
+    query: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, (StatusCode, String)> {
+    // Build layers once. The 401-retry path reuses the same layers and
+    // just calls invalidate_cache on the opted-in ones — re-fetching
+    // every credential and re-instantiating WASM signers would be wasted
+    // work.
+    let layers = build_pipeline_layers(engine, name, config).await?;
+
+    let (response, outcome) =
+        forward_with_redirects(name, &config.base_url, &layers, &method, &path, query.as_deref(), &headers, &body).await?;
+
+    if !crate::api::proxy_pipeline::pipeline_should_retry(&layers, &outcome, response.status()) {
+        return Ok(response);
+    }
+    crate::api::proxy_pipeline::pipeline_invalidate_for_retry(&layers, &outcome).await;
+    let (response, _) =
+        forward_with_redirects(name, &config.base_url, &layers, &method, &path, query.as_deref(), &headers, &body).await?;
+    Ok(response)
+}
+
+/// Build the per-request layer pipeline from a `ProxyConfig`. No-op when
+/// `config.auth` is `None` (returns an empty `Vec`).
+async fn build_pipeline_layers(
+    engine: &Arc<crate::engine::LucidosEngine>,
+    name: &str,
+    config: &ProxyConfig,
+) -> Result<Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>>, (StatusCode, String)> {
+    let Some(pipeline_cfg) = config.auth.as_ref() else {
+        return Ok(Vec::new());
     };
-    forward_request(
-        method,
-        &resolved.url,
-        &resolved.log_url,
-        headers,
-        resolved.header,
-        body,
-    )
-    .await
+    // Snapshot the module map and drop the read guard before the (async)
+    // credential lookups inside `build_pipeline`. Holding the guard
+    // across DB IO would let a slow lookup block the
+    // `proxy_modules_reload` writer (tokio's RwLock is write-preferring,
+    // so a queued writer also parks new readers). Values are
+    // `Arc<CompiledModule>` — cloning the map is N Arc bumps.
+    let modules_snapshot = engine.proxy_modules().read().await.clone();
+    let ctx = crate::api::proxy_pipeline_builder::PipelineBuildContext {
+        pool: engine.pool().clone(),
+        workspace_path: Arc::new(engine.workspace_path().to_path_buf()),
+        token_cache: engine.proxy_token_cache_arc(),
+        proxy_name: name,
+        proxy_modules: &modules_snapshot,
+        wasm_engine: engine.wasm_engine().clone(),
+    };
+    crate::api::proxy_pipeline_builder::build_pipeline(pipeline_cfg, &ctx).await
+}
+
+/// Build the layer pipeline + forward + follow same-host redirects (re-
+/// running the same `layers` on each hop (HMAC layers sign over the
+/// per-hop query, QueryParam appends to the URL — re-running gets the
+/// per-hop URL right, while sharing the layers means the script-handshake
+/// cache-hit on hop 1 stays a hit on hop 2). Cross-host redirects are
+/// refused with 502.
+///
+/// Returns the final response and the `PipelineOutcome` from the first
+/// hop (which is what the 401-retry decision inspects).
+#[allow(clippy::too_many_arguments)]
+async fn forward_with_redirects(
+    name: &str,
+    base_url: &str,
+    layers: &[Arc<dyn crate::api::proxy_auth_layer::AuthLayer>],
+    method: &Method,
+    initial_path: &str,
+    initial_query: Option<&str>,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<(Response, crate::api::proxy_pipeline::PipelineOutcome), (StatusCode, String)> {
+    // Auth is bound to the initial host — cross-host redirects later are
+    // refused with 502.
+    let initial_url = build_target_url(base_url, initial_path, initial_query);
+    let initial_host = host_of(&initial_url).ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("proxy '{name}' base_url has no host (cannot bind auth to upstream)"),
+        )
+    })?;
+
+    let mut current_path = initial_path.to_string();
+    let mut current_query: Option<String> = initial_query.map(|s| s.to_string());
+    let mut first_outcome: Option<crate::api::proxy_pipeline::PipelineOutcome> = None;
+    let mut hops = 0usize;
+
+    loop {
+        let target_url = build_target_url(base_url, &current_path, current_query.as_deref());
+
+        let outcome =
+            crate::api::proxy_pipeline::run_pipeline(layers, method, &target_url, &[], body)
+                .await?;
+
+        let body_for_send = outcome.replace_body.clone().unwrap_or_else(|| body.clone());
+        let auth_headers: Vec<(HeaderName, HeaderValue)> = outcome
+            .headers
+            .iter()
+            .filter_map(|(n, v)| HeaderValue::from_str(v).ok().map(|v| (n.clone(), v)))
+            .collect();
+        // Final URL for this hop = target + pipeline-added query params,
+        // URL-encoded. Layers return raw values; engine handles encoding.
+        let final_url = merge_query_params(&target_url, &outcome.query);
+
+        let response = forward_request(
+            method.clone(),
+            &final_url,
+            &outcome.log_url,
+            headers.clone(),
+            auth_headers,
+            body_for_send,
+        )
+        .await;
+
+        if first_outcome.is_none() {
+            first_outcome = Some(outcome);
+        }
+
+        if !is_redirect_status(response.status()) {
+            return Ok((response, first_outcome.unwrap()));
+        }
+
+        if hops >= MAX_REDIRECT_HOPS - 1 {
+            log!(
+                "[Proxy] {} hit redirect-hop cap ({}); refusing to follow further",
+                name,
+                MAX_REDIRECT_HOPS
+            );
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("proxy '{name}' redirect chain exceeded {MAX_REDIRECT_HOPS} hops"),
+            ));
+        }
+
+        let Some(location) = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+        else {
+            return Ok((response, first_outcome.unwrap()));
+        };
+        let target = resolve_redirect_location(&final_url, &location).ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("proxy '{name}' upstream returned redirect with unparseable Location: {location}"),
+            )
+        })?;
+        let target_host = target
+            .host_str()
+            .map(|h| h.to_ascii_lowercase())
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("proxy '{name}' upstream redirected to a Location with no host: {location}"),
+                )
+            })?;
+        if target_host != initial_host {
+            log!(
+                "[Proxy] {} returned redirect to {} but auth was bound to {} — refused",
+                name,
+                target_host,
+                initial_host
+            );
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("proxy '{name}' redirected to a different host ({target_host}); refusing to re-sign for an unconfigured upstream"),
+            ));
+        }
+        current_path = target.path().trim_start_matches('/').to_string();
+        current_query = target.query().map(|q| q.to_string());
+        hops += 1;
+    }
+}
+
+/// Append `pairs` (already URL-decoded values) to `url`'s query string,
+/// URL-encoding values along the way. The pipeline's `QueryParamLayer`
+/// publishes a `log_url_replacement` output with the credential redacted;
+/// the runner aggregates that into `PipelineOutcome.log_url`. So this
+/// function is concerned only with the FORWARDED URL — it must inject
+/// real values, never `REDACTED`.
+fn merge_query_params(url: &str, pairs: &[(String, String)]) -> String {
+    let mut out = url.to_string();
+    for (k, v) in pairs {
+        out = append_query_param(&out, k, v);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -846,43 +783,8 @@ mod tests {
         assert!(!out.contains_key("referer"));
     }
 
-    // ---- Auth header building ---------------------------------------------
-
-    #[test]
-    fn bearer_builds_authorization_header() {
-        let (n, v) = build_auth_header(AuthType::Bearer, "tok-xyz", None).unwrap();
-        assert_eq!(n.as_str(), "authorization");
-        assert_eq!(v.to_str().unwrap(), "Bearer tok-xyz");
-    }
-
-    #[test]
-    fn api_key_default_authorization_header() {
-        let (n, v) = build_auth_header(AuthType::ApiKey, "raw-key", None).unwrap();
-        assert_eq!(n.as_str(), "authorization");
-        assert_eq!(v.to_str().unwrap(), "raw-key");
-    }
-
-    #[test]
-    fn api_key_custom_header_override() {
-        let (n, v) = build_auth_header(AuthType::ApiKey, "raw-key", Some("X-API-Key")).unwrap();
-        assert_eq!(n.as_str(), "x-api-key");
-        assert_eq!(v.to_str().unwrap(), "raw-key");
-    }
-
-    #[test]
-    fn basic_auth_base64_encodes_user_password() {
-        let (n, v) = build_auth_header(AuthType::Basic, "alice:s3cret", None).unwrap();
-        assert_eq!(n.as_str(), "authorization");
-        // base64("alice:s3cret") = "YWxpY2U6czNjcmV0"
-        assert_eq!(v.to_str().unwrap(), "Basic YWxpY2U6czNjcmV0");
-    }
-
-    #[test]
-    fn unsupported_auth_types_return_none() {
-        assert!(build_auth_header(AuthType::EmailPassword, "x", None).is_none());
-        assert!(build_auth_header(AuthType::OauthClient, "x", None).is_none());
-        assert!(build_auth_header(AuthType::Password, "x", None).is_none());
-    }
+    // Auth header building (Bearer/ApiKey/Basic) moved to AuthLayer impls
+    // — see proxy_static_layers tests for equivalent coverage.
 
     // ---- Path traversal ---------------------------------------------------
 
@@ -898,6 +800,60 @@ mod tests {
     fn has_traversal_flags_backslashes() {
         assert!(has_traversal("foo\\..\\bar"));
         assert!(has_traversal("a\\b"));
+    }
+
+    // ---- Redirect helpers --------------------------------------------
+
+    #[test]
+    fn host_of_extracts_lowercased_host() {
+        assert_eq!(
+            host_of("https://API.Example.com/path"),
+            Some("api.example.com".to_string())
+        );
+        assert_eq!(
+            host_of("http://localhost:8080/x"),
+            Some("localhost".to_string())
+        );
+    }
+
+    #[test]
+    fn host_of_returns_none_for_unparseable_url() {
+        assert!(host_of("not a url").is_none());
+    }
+
+    #[test]
+    fn resolve_redirect_handles_absolute_target() {
+        let url = resolve_redirect_location(
+            "https://example.com/a/b",
+            "https://example.com/c/d?q=1",
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "https://example.com/c/d?q=1");
+    }
+
+    #[test]
+    fn resolve_redirect_handles_relative_target() {
+        let url = resolve_redirect_location("https://example.com/a/b", "/c/d").unwrap();
+        assert_eq!(url.as_str(), "https://example.com/c/d");
+    }
+
+    #[test]
+    fn resolve_redirect_handles_protocol_relative_target() {
+        let url = resolve_redirect_location("https://example.com/a", "//other.com/x").unwrap();
+        assert_eq!(url.as_str(), "https://other.com/x");
+    }
+
+    #[test]
+    fn is_redirect_status_covers_30x_we_follow() {
+        assert!(is_redirect_status(StatusCode::MOVED_PERMANENTLY));
+        assert!(is_redirect_status(StatusCode::FOUND));
+        assert!(is_redirect_status(StatusCode::SEE_OTHER));
+        assert!(is_redirect_status(StatusCode::TEMPORARY_REDIRECT));
+        assert!(is_redirect_status(StatusCode::PERMANENT_REDIRECT));
+        // 304 is not really a redirect — we don't follow.
+        assert!(!is_redirect_status(StatusCode::NOT_MODIFIED));
+        assert!(!is_redirect_status(StatusCode::OK));
+        assert!(!is_redirect_status(StatusCode::BAD_GATEWAY));
     }
 
     #[test]
@@ -1019,56 +975,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hmac_query_string_appends_timestamp_then_signature() {
-        let signed = sign_query_string(
-            "symbol=BTCUSDT&side=BUY",
-            b"secret",
-            HmacAlgorithm::Sha256,
-            Some("timestamp"),
-            "signature",
-            1_700_000_000_000,
-        );
-        assert!(
-            signed.starts_with("symbol=BTCUSDT&side=BUY&timestamp=1700000000000&signature="),
-            "got: {}",
-            signed
-        );
-        let sig_part = signed.rsplit("signature=").next().unwrap();
-        assert_eq!(sig_part.len(), 64, "sha256 hex should be 64 chars");
-    }
-
-    #[test]
-    fn hmac_query_string_skips_timestamp_when_unset() {
-        let signed = sign_query_string(
-            "a=1&b=2",
-            b"secret",
-            HmacAlgorithm::Sha256,
-            None,
-            "signature",
-            1_700_000_000_000,
-        );
-        assert!(signed.starts_with("a=1&b=2&signature="), "got: {}", signed);
-        assert!(!signed.contains("timestamp="));
-    }
-
-    #[test]
-    fn hmac_query_string_handles_empty_initial_query() {
-        let signed = sign_query_string(
-            "",
-            b"secret",
-            HmacAlgorithm::Sha256,
-            Some("timestamp"),
-            "signature",
-            1_700_000_000_000,
-        );
-        // No leading `&` when the initial query was empty.
-        assert!(
-            signed.starts_with("timestamp=1700000000000&signature="),
-            "got: {}",
-            signed
-        );
-    }
+    // Query-string assembly (sign_query_string) used to live here as a
+    // standalone helper; with HmacSignedLayer doing the assembly inline,
+    // the equivalent tests now live in proxy_hmac_layer (sign_with*).
 
     #[test]
     fn hmac_signature_matches_binance_known_example() {
@@ -1111,8 +1020,18 @@ mod tests {
         assert!(sonos.auth.is_none());
     }
 
+    // Legacy `auth.type` (Bearer/ApiKey/Basic/QueryParam/HmacSigned/
+    // ScriptHandshake) parsing tests + ScriptHandshake-cache integration
+    // were deleted with the legacy `ProxyAuth` enum. Equivalent coverage:
+    //   - on-disk pipeline shape: proxy_pipeline_config tests
+    //   - per-layer behavior: proxy_static_layers / proxy_hmac_layer /
+    //     proxy_script_layer / proxy_wasm_signer tests
+    //   - 401 retry decision: proxy_pipeline retry-truth-table tests
+    //   - removed credential_bundle: proxy_migration negative-guard test
+    //   - upgrade migration of legacy apis.json: proxy_migration tests
+
     #[test]
-    fn load_config_parses_auth_block() {
+    fn load_config_parses_pipeline_shape_with_static_credential_layer() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().join("data/config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
@@ -1121,249 +1040,63 @@ mod tests {
             r#"{
                 "comfort": {
                     "base_url": "https://accsmart.panasonic.com",
-                    "auth": {
-                        "type": "bearer",
-                        "credential": "comfort-cloud"
-                    }
+                    "auth": {"pipeline": [
+                        {"type": "static_credential", "kind": "bearer", "credential": "comfort-cloud"}
+                    ]}
                 }
             }"#,
         )
         .unwrap();
         let cfg = load_proxy_config(tmp.path()).unwrap();
         let comfort = cfg.get("comfort").unwrap();
-        match comfort.auth.as_ref().unwrap() {
-            ProxyAuth::Bearer { credential } => assert_eq!(credential, "comfort-cloud"),
-            other => panic!("expected Bearer, got {:?}", other),
-        }
+        let pipeline = comfort.auth.as_ref().unwrap();
+        assert_eq!(pipeline.pipeline.len(), 1);
     }
 
     #[test]
-    fn load_config_rejects_unknown_auth_type() {
+    fn load_config_rejects_unknown_layer_type_in_pipeline() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().join("data/config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::fs::write(
             cfg_dir.join("apis.json"),
-            r#"{"foo": {"base_url": "https://x", "auth":
-                {"type": "bearrer", "credential": "foo-key"}}}"#,
+            r#"{"foo": {"base_url": "https://x", "auth": {"pipeline": [
+                {"type": "bearrer", "credential": "k"}
+            ]}}}"#,
         )
         .unwrap();
-        // Typo `bearrer` must surface at config-load time, not silently parse
-        // as some default.
+        // Typo `bearrer` must surface at config-load time.
         assert!(load_proxy_config(tmp.path()).is_err());
     }
 
     #[test]
-    fn load_config_parses_hmac_signed_auth() {
+    fn load_config_rejects_script_handshake_with_traversal_path_in_pipeline() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().join("data/config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::fs::write(
             cfg_dir.join("apis.json"),
-            r#"{"binance": {"base_url": "https://api.binance.com", "auth": {
-                "type": "hmac_signed",
-                "key_credential": "binance-key",
-                "secret_credential": "binance-secret",
-                "key_header": "X-MBX-APIKEY",
-                "algorithm": "sha256",
-                "signed_payload": "query_string",
-                "signature_param": "signature",
-                "timestamp_param": "timestamp"
-            }}}"#,
-        )
-        .unwrap();
-        let cfg = load_proxy_config(tmp.path()).unwrap();
-        match cfg.get("binance").unwrap().auth.as_ref().unwrap() {
-            ProxyAuth::HmacSigned {
-                key_credential,
-                secret_credential,
-                key_header,
-                algorithm,
-                signed_payload,
-                signature_param,
-                timestamp_param,
-            } => {
-                assert_eq!(key_credential, "binance-key");
-                assert_eq!(secret_credential, "binance-secret");
-                assert_eq!(key_header, "X-MBX-APIKEY");
-                assert_eq!(*algorithm, HmacAlgorithm::Sha256);
-                assert_eq!(*signed_payload, HmacSignedPayload::QueryString);
-                assert_eq!(signature_param, "signature");
-                assert_eq!(timestamp_param.as_deref(), Some("timestamp"));
-            }
-            other => panic!("expected HmacSigned, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn load_config_hmac_signed_uses_defaults_for_optional_fields() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg_dir = tmp.path().join("data/config");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(
-            cfg_dir.join("apis.json"),
-            r#"{"x": {"base_url": "https://x", "auth": {
-                "type": "hmac_signed",
-                "key_credential": "k",
-                "secret_credential": "s",
-                "algorithm": "sha512",
-                "signed_payload": "query_string"
-            }}}"#,
-        )
-        .unwrap();
-        let cfg = load_proxy_config(tmp.path()).unwrap();
-        match cfg.get("x").unwrap().auth.as_ref().unwrap() {
-            ProxyAuth::HmacSigned {
-                key_header,
-                algorithm,
-                signature_param,
-                timestamp_param,
-                ..
-            } => {
-                assert_eq!(key_header, "X-API-KEY");
-                assert_eq!(*algorithm, HmacAlgorithm::Sha512);
-                assert_eq!(signature_param, "signature");
-                assert!(timestamp_param.is_none());
-            }
-            other => panic!("expected HmacSigned, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn load_config_rejects_invalid_hmac_algorithm() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg_dir = tmp.path().join("data/config");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(
-            cfg_dir.join("apis.json"),
-            r#"{"x": {"base_url": "https://x", "auth": {
-                "type": "hmac_signed",
-                "key_credential": "k",
-                "secret_credential": "s",
-                "algorithm": "md5",
-                "signed_payload": "query_string"
-            }}}"#,
+            r#"{"x": {"base_url": "https://x", "auth": {"pipeline": [
+                {"type": "script_handshake", "credential": "x", "script": "../../../etc/passwd"}
+            ]}}}"#,
         )
         .unwrap();
         assert!(load_proxy_config(tmp.path()).is_err());
     }
 
     #[test]
-    fn load_config_parses_credential_bundle_auth() {
+    fn load_config_rejects_script_handshake_with_absolute_path_in_pipeline() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().join("data/config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::fs::write(
             cfg_dir.join("apis.json"),
-            r#"{"comfort_creds": {"base_url": "", "auth": {
-                "type": "credential_bundle",
-                "credentials": ["comfort_username", "comfort_password"]
-            }}}"#,
+            r#"{"x": {"base_url": "https://x", "auth": {"pipeline": [
+                {"type": "script_handshake", "credential": "x", "script": "/etc/passwd"}
+            ]}}}"#,
         )
         .unwrap();
-        let cfg = load_proxy_config(tmp.path()).unwrap();
-        match cfg.get("comfort_creds").unwrap().auth.as_ref().unwrap() {
-            ProxyAuth::CredentialBundle { credentials } => {
-                assert_eq!(
-                    credentials,
-                    &vec![
-                        "comfort_username".to_string(),
-                        "comfort_password".to_string(),
-                    ]
-                );
-            }
-            other => panic!("expected CredentialBundle, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn load_config_credential_bundle_allows_empty_base_url() {
-        // Bundle proxies don't make HTTP requests, so base_url is meaningless
-        // and the schema should still parse with an empty string.
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg_dir = tmp.path().join("data/config");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(
-            cfg_dir.join("apis.json"),
-            r#"{"x": {"base_url": "", "auth": {"type": "credential_bundle", "credentials": ["a"]}}}"#,
-        )
-        .unwrap();
-        assert!(load_proxy_config(tmp.path()).is_ok());
-    }
-
-    #[tokio::test]
-    async fn build_credential_bundle_rejects_non_bundle_config() {
-        // Lazy pool — the helper short-circuits before touching the DB.
-        let pool = sqlx::PgPool::connect_lazy("postgres://invalid").expect("lazy pool");
-        let config = ProxyConfig {
-            base_url: "https://x".to_string(),
-            auth: Some(ProxyAuth::Bearer {
-                credential: "x".to_string(),
-            }),
-        };
-        let err = build_credential_bundle(&pool, &config, "x")
-            .await
-            .expect_err("non-bundle config should error");
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(err.1.contains("credential_bundle"));
-    }
-
-    #[tokio::test]
-    async fn build_credential_bundle_rejects_unauthenticated_config() {
-        let pool = sqlx::PgPool::connect_lazy("postgres://invalid").expect("lazy pool");
-        let config = ProxyConfig {
-            base_url: "https://x".to_string(),
-            auth: None,
-        };
-        let err = build_credential_bundle(&pool, &config, "x")
-            .await
-            .expect_err("unauthenticated config should error");
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn load_config_parses_query_param_auth() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg_dir = tmp.path().join("data/config");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(
-            cfg_dir.join("apis.json"),
-            r#"{"helius": {"base_url": "https://mainnet.helius-rpc.com", "auth":
-                {"type": "query_param", "credential": "helius-key", "param_name": "api-key"}}}"#,
-        )
-        .unwrap();
-        let cfg = load_proxy_config(tmp.path()).unwrap();
-        match cfg.get("helius").unwrap().auth.as_ref().unwrap() {
-            ProxyAuth::QueryParam {
-                credential,
-                param_name,
-            } => {
-                assert_eq!(credential, "helius-key");
-                assert_eq!(param_name, "api-key");
-            }
-            other => panic!("expected QueryParam, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn load_config_parses_header_override() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg_dir = tmp.path().join("data/config");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(
-            cfg_dir.join("apis.json"),
-            r#"{"foo": {"base_url": "https://x", "auth":
-                {"type": "api_key", "credential": "foo-key", "header": "X-API-Key"}}}"#,
-        )
-        .unwrap();
-        let cfg = load_proxy_config(tmp.path()).unwrap();
-        match cfg.get("foo").unwrap().auth.as_ref().unwrap() {
-            ProxyAuth::ApiKey { credential, header } => {
-                assert_eq!(credential, "foo-key");
-                assert_eq!(header.as_deref(), Some("X-API-Key"));
-            }
-            other => panic!("expected ApiKey, got {:?}", other),
-        }
+        assert!(load_proxy_config(tmp.path()).is_err());
     }
 
     #[test]
@@ -1400,8 +1133,11 @@ mod tests {
     async fn spawn_recording_upstream(status: u16, body: &'static str) -> (String, RecordSlot) {
         let slot: RecordSlot = Arc::new(Mutex::new(None));
         let slot_clone = slot.clone();
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown_from_handler = shutdown.clone();
         let app = Router::new().fallback(any(move |req: axum::extract::Request| {
             let slot = slot_clone.clone();
+            let shutdown = shutdown_from_handler.clone();
             async move {
                 let method = req.method().to_string();
                 let path = req.uri().path().to_string();
@@ -1422,6 +1158,7 @@ mod tests {
                     body: req_body,
                     headers,
                 });
+                shutdown.notify_one();
                 (
                     StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
                     body.to_string(),
@@ -1432,7 +1169,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    shutdown.notified().await;
+                })
+                .await
+                .unwrap();
         });
         (format!("http://{}", addr), slot)
     }
@@ -1453,7 +1195,7 @@ mod tests {
             &url,
             &url,
             HeaderMap::new(),
-            None,
+            Vec::new(),
             Bytes::copy_from_slice(body.as_bytes()),
         )
         .await;
@@ -1499,7 +1241,7 @@ mod tests {
             ("Referer", "https://engine.local/"),
             ("X-Keep-Me", "yes"),
         ]);
-        let _ = forward_request(Method::GET, &url, &url, headers, None, Bytes::new()).await;
+        let _ = forward_request(Method::GET, &url, &url, headers, Vec::new(), Bytes::new()).await;
         let recorded = slot.lock().unwrap().clone().unwrap();
         let observed: Vec<&str> = recorded.headers.iter().map(|(n, _)| n.as_str()).collect();
         assert!(!observed.iter().any(|n| n.eq_ignore_ascii_case("cookie")));
@@ -1516,7 +1258,7 @@ mod tests {
         let (base, slot) = spawn_recording_upstream(200, "ok").await;
         let url = format!("{}/x", base);
         let headers = hm(&[("Host", "engine.example.com")]);
-        let _ = forward_request(Method::GET, &url, &url, headers, None, Bytes::new()).await;
+        let _ = forward_request(Method::GET, &url, &url, headers, Vec::new(), Bytes::new()).await;
         let recorded = slot.lock().unwrap().clone().unwrap();
         let host = recorded
             .headers
@@ -1530,42 +1272,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injects_bearer_auth_header() {
+    async fn forwards_arbitrary_auth_headers_to_upstream() {
+        // Smoke-tests forward_request's auth_headers parameter. The actual
+        // header construction lives in BearerLayer / ApiKeyLayer (with
+        // their own tests); this confirms forward_request actually puts
+        // them on the wire.
         let (base, slot) = spawn_recording_upstream(200, "ok").await;
         let url = format!("{}/x", base);
-        let auth = build_auth_header(AuthType::Bearer, "tok-xyz", None);
-        let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), auth, Bytes::new()).await;
+        let auth_vec: Vec<(HeaderName, HeaderValue)> = vec![
+            (
+                HeaderName::from_static("authorization"),
+                HeaderValue::from_static("Bearer tok-xyz"),
+            ),
+            (
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_static("secret-key"),
+            ),
+        ];
+        let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), auth_vec, Bytes::new())
+            .await;
         let recorded = slot.lock().unwrap().clone().unwrap();
         let authz = recorded
             .headers
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case("authorization"))
-            .map(|(_, v)| v.as_str())
-            .expect("authorization header missing");
-        assert_eq!(authz, "Bearer tok-xyz");
-    }
-
-    #[tokio::test]
-    async fn injects_api_key_with_custom_header() {
-        let (base, slot) = spawn_recording_upstream(200, "ok").await;
-        let url = format!("{}/x", base);
-        let auth = build_auth_header(AuthType::ApiKey, "secret-key", Some("X-API-Key"));
-        let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), auth, Bytes::new()).await;
-        let recorded = slot.lock().unwrap().clone().unwrap();
+            .map(|(_, v)| v.as_str());
         let key = recorded
             .headers
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case("x-api-key"))
-            .map(|(_, v)| v.as_str())
-            .expect("x-api-key header missing");
-        assert_eq!(key, "secret-key");
+            .map(|(_, v)| v.as_str());
+        assert_eq!(authz, Some("Bearer tok-xyz"));
+        assert_eq!(key, Some("secret-key"));
     }
 
     #[tokio::test]
     async fn forwards_query_param_auth_to_upstream() {
         let (base, slot) = spawn_recording_upstream(200, "ok").await;
         let url = append_query_param(&format!("{}/v1/items", base), "api-key", "secret-123");
-        let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), None, Bytes::new()).await;
+        let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), Vec::new(), Bytes::new()).await;
         let recorded = slot.lock().unwrap().clone().unwrap();
         assert_eq!(recorded.path, "/v1/items");
         assert_eq!(recorded.query, "api-key=secret-123");
@@ -1579,7 +1324,7 @@ mod tests {
             "api-key",
             "secret-123",
         );
-        let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), None, Bytes::new()).await;
+        let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), Vec::new(), Bytes::new()).await;
         let recorded = slot.lock().unwrap().clone().unwrap();
         assert_eq!(recorded.query, "limit=10&api-key=secret-123");
     }
@@ -1588,9 +1333,75 @@ mod tests {
     async fn upstream_5xx_passes_through() {
         let (base, _slot) = spawn_recording_upstream(503, "down").await;
         let url = format!("{}/x", base);
-        let resp = forward_request(Method::GET, &url, &url, HeaderMap::new(), None, Bytes::new()).await;
+        let resp = forward_request(Method::GET, &url, &url, HeaderMap::new(), Vec::new(), Bytes::new()).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body_text(resp).await, "down");
+    }
+
+    /// Spawn an upstream that responds with `status` + `Location` header.
+    /// Used by Phase-8 redirect tests below.
+    async fn spawn_redirecting_upstream(status: u16, location: &'static str) -> String {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown_from_handler = shutdown.clone();
+        let app = Router::new().route(
+            "/*path",
+            any(move || {
+                let location = location;
+                let shutdown = shutdown_from_handler.clone();
+                async move {
+                    let mut resp = (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::FOUND),
+                        "redirect",
+                    )
+                        .into_response();
+                    resp.headers_mut().insert(
+                        axum::http::header::LOCATION,
+                        HeaderValue::from_str(location).unwrap(),
+                    );
+                    shutdown.notify_one();
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    shutdown.notified().await;
+                })
+                .await
+                .unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+
+    #[tokio::test]
+    async fn forward_request_does_not_auto_follow_30x() {
+        // The shared CLIENT sets `redirect(Policy::none())` so signed
+        // proxy requests never silently follow upstream redirects without
+        // re-running the auth pipeline. Verify by pointing forward_request
+        // at a 302 upstream and asserting we get the 302 back instead of
+        // the redirect target's body.
+        let base = spawn_redirecting_upstream(302, "https://example.invalid/never-fetched").await;
+        let url = format!("{}/start", base);
+        let resp = forward_request(
+            Method::GET,
+            &url,
+            &url,
+            HeaderMap::new(),
+            Vec::new(),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://example.invalid/never-fetched")
+        );
     }
 
     #[tokio::test]
@@ -1603,7 +1414,7 @@ mod tests {
             "http://127.0.0.1:1/nope",
             "http://127.0.0.1:1/nope",
             HeaderMap::new(),
-            None,
+            Vec::new(),
             Bytes::new(),
         )
         .await;

@@ -3,6 +3,109 @@ use super::EventStore;
 use crate::core::EventRow;
 use chrono::{DateTime, Utc};
 
+/// Number of recent (ToolCalled, ToolResult) pairs reconstructed verbatim as
+/// `Message::Blocks(...)` pairs on resume — see
+/// [`build_resume_tool_blocks_with_skip_ids`]. `load_knowhow` results are
+/// pinned regardless of N.
+pub(crate) const RESUME_VERBATIM_TOOL_TAIL: usize = 3;
+
+/// Tool names whose results survive the N-most-recent window. `load_knowhow`
+/// returns reference material (a procedure body) that doesn't decay across
+/// turns, so multi-step orchestrators keep their recipe across callback
+/// resumes.
+const PINNED_TOOL_NAMES: &[&str] = &[crate::llm::tool_names::LOAD_KNOWHOW];
+
+/// Stable synthetic `tool_use_id` used by
+/// [`build_resume_tool_blocks_with_skip_ids`] to pair the reconstructed
+/// `ToolUse` and `ToolResult` blocks. Same event id → same synthetic id
+/// across resumes (deterministic, idempotent).
+///
+/// Renders the full 32-hex-char simple-form UUID (`evt-<32 hex>`). The
+/// `dismiss_from_context` tool handler accepts this form (and the bare
+/// hyphenated/simple UUID) so the LLM can pass any tool-block id from
+/// history directly back to dismiss without truncation guessing.
+fn synthesize_tool_use_id(tool_called_event_id: &uuid::Uuid) -> String {
+    format!("evt-{}", tool_called_event_id.simple())
+}
+
+/// Format a persisted `ChildThreadCompleted` event row as the `[CHILD THREAD
+/// COMPLETED]` user-channel block the parent LLM sees in its conversation
+/// history. Shared by [`build_session_messages`] (projects every typed
+/// completion at LLM call setup) and the agentic loop's wake-from-child
+/// injection drain (projects a single event inline as the next user
+/// message). Both paths produce identical text.
+pub fn format_child_thread_completed_block(event: &EventRow) -> String {
+    use crate::engine::thread_events::ChildCompletionStatus;
+
+    let child_thread_id = event
+        .payload
+        .get("child_thread_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let title = event
+        .payload
+        .get("child_thread_title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // Exhaustive match against the typed enum so a new ChildCompletionStatus
+    // variant becomes a compile error here, not a silent fall-through to
+    // bare "completed".
+    let status = match serde_json::from_value::<ChildCompletionStatus>(
+        event
+            .payload
+            .get("status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    ) {
+        Ok(ChildCompletionStatus::Success) => "completed (success)",
+        Ok(ChildCompletionStatus::Failure) => "completed (failure)",
+        Ok(ChildCompletionStatus::NoChanges) => "completed (no changes)",
+        Ok(ChildCompletionStatus::Canceled) => "canceled (user stop)",
+        Err(_) => "completed",
+    };
+    let summary = event
+        .payload
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let pending_change_ids: Vec<String> = event
+        .payload
+        .get("pending_change_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let pending_section = if pending_change_ids.is_empty() {
+        "none".to_string()
+    } else {
+        pending_change_ids.join(", ")
+    };
+    let title_line = if title.is_empty() {
+        String::new()
+    } else {
+        format!("\nTitle: {}", title)
+    };
+    let summary_section = if summary.is_empty() {
+        String::new()
+    } else {
+        format!("\nSummary: {}", summary)
+    };
+    // The event_id (not child_thread_id) is what dismiss_from_context
+    // accepts as the lookup key — surface it so the LLM can pass it back
+    // verbatim without inventing a synthetic prefix.
+    format!(
+        "[CHILD THREAD COMPLETED] {} {}\nevent_id: {}{}\nPending changes: {}{}\n\
+         Note: phrases like \"session can finish\" or \"## Session Summary\" in \
+         the summary describe the child subprocess only — if you were following \
+         a multi-step procedure, continue with the next step. Otherwise use \
+         run_thread to refine.",
+        child_thread_id, status, event.id, title_line, pending_section, summary_section
+    )
+}
+
 /// Build session messages from a list of events (pure function, no DB access).
 ///
 /// Interruption semantics:
@@ -28,11 +131,28 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
     let mut current_request_event_id: Option<String> = None;
     let mut current_thread_id: Option<String> = None;
 
+    // `ContextDismissed` records (emitted by the agent's `dismiss_from_context`
+    // tool) ask the projection to drop the corresponding history entry on every
+    // future read. The set is collected up-front so dismissals can land out of
+    // order relative to the dismissed event itself — emitting a dismissal
+    // before its target is still respected.
+    let dismissed_event_ids = collect_dismissed_event_ids(events);
+
     // Helper: extract thread_id from the event column
     let get_thread_id =
         |event: &EventRow| -> Option<String> { event.thread_id.map(|uuid| uuid.to_string()) };
 
     for event in events {
+        // Skip dismissed entries before any per-event handling so accumulated
+        // text buffers / pending steps stay untouched. Today this only fires
+        // for `ChildThreadCompleted` (`ToolCalled` + `ToolResult` skipping
+        // happens at the resume helper level so the projection can still show
+        // step rows in the UI).
+        if event.event_type == "ChildThreadCompleted"
+            && dismissed_event_ids.contains(&event.id.to_string())
+        {
+            continue;
+        }
         match event.event_type.as_str() {
             "MessageReceived" | "UserMessage" => {
                 // Flush any accumulated streaming text as a response
@@ -189,6 +309,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     context_tokens,
                     context_messages,
                     trimmed,
+                    tool_called_event_id: None,
                 });
                 pending_events.push(ResponseEvent::Step {
                     description: "Requesting".to_string(),
@@ -199,30 +320,6 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     context_messages,
                     trimmed,
                 });
-            }
-            "ContextTokensMeasured" => {
-                // Skip if no prior Thinking step (events out of order).
-                if let Some(input_tokens) = event
-                    .payload
-                    .get("input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                {
-                    if let Some(step) = pending_steps
-                        .iter_mut()
-                        .rev()
-                        .find(|s| s.description == "Requesting")
-                    {
-                        step.context_tokens = Some(input_tokens);
-                    }
-                    if let Some(ResponseEvent::Step { context_tokens, .. }) = pending_events
-                        .iter_mut()
-                        .rev()
-                        .find(|e| matches!(e, ResponseEvent::Step { description, .. } if description == "Requesting"))
-                    {
-                        *context_tokens = Some(input_tokens);
-                    }
-                }
             }
             "MemorySearched" => {
                 let has_results = event
@@ -253,6 +350,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     context_tokens: None,
                     context_messages: None,
                     trimmed: None,
+                    tool_called_event_id: None,
                 });
                 pending_events.push(ResponseEvent::Step {
                     description: desc.to_string(),
@@ -307,6 +405,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     context_tokens: None,
                     context_messages: None,
                     trimmed: None,
+                    tool_called_event_id: Some(event.id.to_string()),
                 });
                 pending_events.push(ResponseEvent::Step {
                     description,
@@ -323,7 +422,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     .payload
                     .get("success")
                     .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
+                    .unwrap_or(true); // missing field = legacy or pre-Phase-0; bias to success
 
                 if let Some(last_step) = pending_steps.last_mut() {
                     last_step.success = success;
@@ -656,6 +755,33 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     }
                 }
             }
+            "ChildThreadCompleted" => {
+                // Render the typed event as a user-channel block so the parent's
+                // resume LLM sees a clearly-attributed structured callback in
+                // its conversation history. Replaces the pre-Phase-4 prose
+                // `[Child thread completed]` UserPromptInjected which used to
+                // arrive on the parent thread carrying the same info.
+                let content = format_child_thread_completed_block(event);
+
+                messages.push(SessionMessage {
+                    role: "user".to_string(),
+                    content,
+                    created_at: event.created,
+                    channel: None,
+                    steps: vec![],
+                    images: vec![],
+                    user_image_hashes: vec![],
+                    image_description: None,
+                    completed: None,
+                    canceled: false,
+                    aborted: false,
+                    text_chunks: vec![],
+                    events: vec![],
+                    request_event_id: None,
+                    event_id: Some(event.id.to_string()),
+                    thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                });
+            }
             _ => {}
         }
     }
@@ -830,6 +956,231 @@ impl EventStore {
 
         Ok(build_session_messages(&events))
     }
+}
+
+/// One reconstructed `(ToolCalled, ToolResult)` pair, with the originating
+/// `ToolCalled` event id preserved so the caller can deduplicate the
+/// stringified `[tools: ...]` summary on the same assistant turn.
+///
+/// `result.is_none()` marks a synthetic stub for an orphan `ToolCalled` —
+/// the originating call has no matching `ToolResult` event in the stream
+/// (engine crash mid-tool, projection race, etc.). The builder still emits
+/// both messages so every assistant `tool_use` block has a paired user
+/// `tool_result` block on the wire — the alternative (silently dropping the
+/// pair) yields a Claude API 400.
+struct ResumeToolPair {
+    tool_called_event_id: uuid::Uuid,
+    tool_name: String,
+    args: serde_json::Value,
+    /// `None` when the matching `ToolResult` event is missing — emit a
+    /// synthetic `[tool result unavailable: orphaned]` stub on the wire.
+    result: Option<String>,
+}
+
+/// Synthetic stub body for orphan `ToolCalled` events (no matching
+/// `ToolResult` row). Same wording as the agentic-loop pre-flight stubs in
+/// [`crate::engine::context::validate_tool_use_pairing`] so the LLM sees a
+/// consistent signal regardless of which layer caught the gap.
+pub(crate) const ORPHAN_TOOL_RESULT_STUB: &str = "[tool result unavailable: orphaned]";
+
+/// Walk events chronologically, pairing every `ToolCalled` with its matching
+/// `ToolResult` and surfacing any leftover `ToolCalled` as an orphan
+/// (`result == None`). Each call reserves a slot in chronological position
+/// so the downstream N-window logic sees the same ordering whether a slot
+/// is paired or orphaned. Never silently drops — see
+/// `engine/context.rs::validate_tool_use_pairing` for why.
+fn collect_tool_pairs_chronological(events: &[EventRow]) -> Vec<ResumeToolPair> {
+    let mut slots: Vec<ResumeToolPair> = Vec::new();
+    // Pending pairings: (slot_index, tool_name) — name is duplicated here so
+    // the rposition match doesn't have to dereference into `slots`.
+    let mut pending: Vec<(usize, String)> = Vec::new();
+
+    for event in events {
+        match event.event_type.as_str() {
+            "ToolCalled" => {
+                let tool_name = event
+                    .payload
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let args = event
+                    .payload
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                let slot_idx = slots.len();
+                slots.push(ResumeToolPair {
+                    tool_called_event_id: event.id,
+                    tool_name: tool_name.clone(),
+                    args,
+                    result: None,
+                });
+                pending.push((slot_idx, tool_name));
+            }
+            "ToolResult" => {
+                let result_name = event
+                    .payload
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                // Pair with the most recent pending ToolCalled of the same
+                // name. If names don't match (legacy events, racing tools),
+                // fall back to the most recent pending entry — same forgiving
+                // rule build_session_messages applies via `last_mut()`.
+                let idx = pending
+                    .iter()
+                    .rposition(|(_, n)| n == result_name)
+                    .or_else(|| pending.len().checked_sub(1));
+                if let Some(i) = idx {
+                    let (slot_idx, _) = pending.remove(i);
+                    let result = event
+                        .payload
+                        .get("result")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if let Some(slot) = slots.get_mut(slot_idx) {
+                        slot.result = Some(result);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // `slots` is already in chronological call order. Any slot whose
+    // `result` is still `None` is an orphan — surfaced as a synthetic stub
+    // by `build_resume_tool_blocks_with_skip_ids`.
+    slots
+}
+
+/// Partition resume pairs into (pinned, tail) — the shared step both the
+/// resume-block builder and the skip-set builder need. Pinned pairs survive
+/// regardless of N (see [`PINNED_TOOL_NAMES`]); tail is the last N non-pinned
+/// pairs in chronological order.
+fn select_pinned_and_tail<'a>(
+    pairs: &'a [ResumeToolPair],
+    n: usize,
+) -> (Vec<&'a ResumeToolPair>, Vec<&'a ResumeToolPair>) {
+    let mut pinned: Vec<&ResumeToolPair> = Vec::new();
+    let mut others: Vec<&ResumeToolPair> = Vec::new();
+    for p in pairs {
+        if PINNED_TOOL_NAMES.contains(&p.tool_name.as_str()) {
+            pinned.push(p);
+        } else {
+            others.push(p);
+        }
+    }
+    let tail_start = others.len().saturating_sub(n);
+    let tail: Vec<&ResumeToolPair> = others[tail_start..].to_vec();
+    (pinned, tail)
+}
+
+/// Return `(ToolCalled.event_id, tool_name)` for every `ToolCalled` whose
+/// matching `ToolResult` is missing in `events`. Single source of truth for
+/// the orphan-detection rule used both by the resume builder (which emits
+/// synthetic stubs in the LLM messages payload) and the startup recovery
+/// sweep (which writes a synthetic `ToolResult` event to settle the orphan).
+pub(crate) fn find_orphan_tool_called_ids(events: &[EventRow]) -> Vec<(uuid::Uuid, String)> {
+    collect_tool_pairs_chronological(events)
+        .into_iter()
+        .filter(|p| p.result.is_none())
+        .map(|p| (p.tool_called_event_id, p.tool_name))
+        .collect()
+}
+
+/// Walk every `ContextDismissed` event in the stream and collect the set of
+/// dismissed event ids. The agent emits these via the `dismiss_from_context`
+/// tool — see `engine/tools/mod.rs::execute_dismiss_from_context`. The
+/// resume helper consults this set to drop both `(ToolCalled, ToolResult)`
+/// pairs (matched on the `ToolCalled.id`) and `ChildThreadCompleted` blocks.
+fn collect_dismissed_event_ids(events: &[EventRow]) -> std::collections::HashSet<String> {
+    let mut dismissed = std::collections::HashSet::new();
+    for event in events {
+        if event.event_type == "ContextDismissed" {
+            if let Some(id) = event
+                .payload
+                .get("dismissed_event_id")
+                .and_then(|v| v.as_str())
+            {
+                dismissed.insert(id.to_string());
+            }
+        }
+    }
+    dismissed
+}
+
+/// Reconstruct verbatim `(ToolUse, ToolResult)` `Message` pairs for the most
+/// recent N tool calls — and the set of `ToolCalled` event ids those pairs
+/// derive from, so callers can skip the same tools in their stringified
+/// history summaries to avoid double-billing.
+///
+/// `load_knowhow` results are pinned: any pair where `tool_name == "load_knowhow"`
+/// is included regardless of where it falls in the N-most-recent ordering.
+/// Other tools follow the N window (most recent N kept, older dropped — they
+/// keep their `[tools: ...]` summary in stringified history).
+///
+/// `ContextDismissed` records: any tool pair whose `tool_called_event_id`
+/// appears in the dismissed set is dropped from BOTH the rebuilt blocks and
+/// the skip set — the latter so the stringified `[tools: ...]` summary also
+/// stops rendering for the dismissed tool (the agent asked for the entry to
+/// be gone, not just shrunk).
+///
+/// Output ordering: pinned pairs first (chronological), then tail pairs
+/// (chronological). Each pair emits an assistant `ToolUse` block followed by
+/// a user `ToolResult` block, matching the wire shape Anthropic and OpenAI
+/// providers expect.
+///
+/// Single-pass: events are walked once and partitioned once — the previous
+/// split between `build_resume_tool_blocks` and a separate
+/// `build_resume_tool_emitted_event_ids` did both twice per resume.
+pub(crate) fn build_resume_tool_blocks_with_skip_ids(
+    events: &[EventRow],
+    n: usize,
+) -> (Vec<crate::llm::Message>, std::collections::HashSet<String>) {
+    let pairs = collect_tool_pairs_chronological(events);
+    let dismissed = collect_dismissed_event_ids(events);
+    let pairs: Vec<ResumeToolPair> = pairs
+        .into_iter()
+        .filter(|p| !dismissed.contains(&p.tool_called_event_id.to_string()))
+        .collect();
+    if pairs.is_empty() {
+        return (Vec::new(), std::collections::HashSet::new());
+    }
+    let (pinned, tail) = select_pinned_and_tail(&pairs, n);
+
+    let total = pinned.len() + tail.len();
+    let mut messages: Vec<crate::llm::Message> = Vec::with_capacity(total * 2);
+    let mut skip_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(total);
+    for p in pinned.into_iter().chain(tail.into_iter()) {
+        skip_ids.insert(p.tool_called_event_id.to_string());
+        let id = synthesize_tool_use_id(&p.tool_called_event_id);
+        messages.push(crate::llm::Message {
+            role: "assistant".to_string(),
+            content: crate::llm::MessageContent::Blocks(vec![crate::llm::ContentBlock::ToolUse {
+                id: id.clone(),
+                name: p.tool_name.clone(),
+                input: p.args.clone(),
+            }]),
+        });
+        // Orphans (`result: None`) emit a synthetic stub so every assistant
+        // tool_use block has its paired user tool_result on the wire.
+        // Anthropic 400s otherwise — see thread b101c3d7 repro.
+        let content = p
+            .result
+            .clone()
+            .unwrap_or_else(|| ORPHAN_TOOL_RESULT_STUB.to_string());
+        messages.push(crate::llm::Message {
+            role: "user".to_string(),
+            content: crate::llm::MessageContent::Blocks(vec![crate::llm::ContentBlock::ToolResult {
+                tool_use_id: id,
+                content,
+            }]),
+        });
+    }
+    (messages, skip_ids)
 }
 
 #[cfg(test)]

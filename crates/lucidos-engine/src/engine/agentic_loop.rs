@@ -11,9 +11,39 @@ use super::context::{estimate_message_chars, trim_context_if_needed};
 use super::types::*;
 use super::LucidosEngine;
 
+/// Race a tool execution future against the per-thread cancel token. On
+/// cancel, returns `Err("Error: canceled by user")` so the agent loop's
+/// `tool_use → tool_result` pairing invariant survives — every emitted
+/// `ToolCalled` gets a matching `ToolResult` (with `success: false`)
+/// even when the work is aborted mid-await. The outer loop's pre-iter
+/// `is_cancelled()` then emits `ResponseCanceled` on the next iteration.
+///
+/// `biased` poll order means cancel ALWAYS wins when the token is already
+/// cancelled — without it, an instantly-ready tool result could race with
+/// a pending cancel and leak one extra iteration past the user's Stop.
+///
+/// For subprocess-spawning tools (`run_python`, `run_bash`, MCP), this is
+/// only half the fix: the inner future being dropped here must also tear
+/// down the OS child, which requires `kill_on_drop(true)` on the
+/// `tokio::process::Command`. Without that, dropping the future leaks the
+/// child process even though the agent loop unblocks.
+pub(super) async fn run_tool_with_cancel<F>(
+    fut: F,
+    cancel_token: &CancellationToken,
+) -> super::tools::ToolOutcome
+where
+    F: std::future::Future<Output = super::tools::ToolOutcome>,
+{
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => Err("Error: canceled by user".to_string()),
+        r = fut => r,
+    }
+}
+
 /// Build the tool list for intent sub-loops.
 /// Notification tools must be included explicitly — they're not in get_default_tools().
-fn build_intent_tools() -> Vec<ToolDefinition> {
+pub(super) fn build_intent_tools() -> Vec<ToolDefinition> {
     let mut tools: Vec<_> = get_default_tools()
         .into_iter()
         .filter(|t| t.name != tn::EXECUTE_INTENT)
@@ -48,6 +78,78 @@ pub(super) fn derive_call_key(tool_name: &str, args: &serde_json::Value) -> Stri
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+/// One sentinel-prefixed tool result, parsed: which transient `ThreadEvent`
+/// to broadcast to the frontend, and (when not `None`) what to substitute
+/// into the LLM-visible tool result so the model cannot read the raw JSON
+/// and act on it as if the call returned synchronously. `redacted_text:
+/// None` means "emit the event but leave the tool result alone" — the
+/// EmailConfirm tool already has a description that explains the modal
+/// flow correctly, so its raw payload is harmless to the model.
+pub(super) struct SentinelMatch {
+    pub label: &'static str,
+    pub event: super::thread_events::ThreadEvent,
+    pub redacted_text: Option<String>,
+}
+
+/// Inspect a tool result for any front-end confirm-flow sentinel and, if one
+/// matches, return the transient event to emit + the LLM-facing replacement
+/// text (or `None` to leave the LLM's view of the result unchanged).
+pub(super) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
+    use super::thread_events::ThreadEvent;
+    use super::tools::credentials::CREDENTIAL_REQUEST_PREFIX;
+    use super::tools::plugins::{
+        PLUGIN_INSTALL_REQUEST_PREFIX, PLUGIN_UNINSTALL_REQUEST_PREFIX,
+    };
+
+    type SentinelEntry = (
+        &'static str,
+        &'static str,
+        fn(String) -> ThreadEvent,
+        Option<&'static str>,
+    );
+    let entries: &[SentinelEntry] = &[
+        (
+            CREDENTIAL_REQUEST_PREFIX,
+            "[AgenticLoop] CredentialRequest",
+            |payload| ThreadEvent::CredentialRequest { payload },
+            Some("Credential request modal shown to the user. Wait for them to enter the credential or cancel — do not chat-ask for the same value; the modal resolves the request."),
+        ),
+        (
+            PLUGIN_INSTALL_REQUEST_PREFIX,
+            "[AgenticLoop] PluginInstallRequest",
+            |payload| ThreadEvent::PluginInstallRequest { payload },
+            Some("Install panel shown to the user. Wait for them to click Confirm or Cancel — do not chat-ask about overwrites and do not claim the install succeeded; the panel resolves it and the next user message will tell you the outcome."),
+        ),
+        (
+            PLUGIN_UNINSTALL_REQUEST_PREFIX,
+            "[AgenticLoop] PluginUninstallRequest",
+            |payload| ThreadEvent::PluginUninstallRequest { payload },
+            Some("Uninstall panel shown to the user. Wait for them to click Confirm or Cancel — do not chat-ask which files to delete and do not claim files were removed; the panel resolves it and the next user message will tell you the outcome."),
+        ),
+        (
+            "[EMAIL_CONFIRM]",
+            "[AgenticLoop] EmailConfirmRequest",
+            |payload| ThreadEvent::EmailConfirmRequest { payload },
+            None,
+        ),
+    ];
+
+    for &(prefix, label, ctor, redacted) in entries {
+        if !text.starts_with(prefix) {
+            continue;
+        }
+        let after = &text[prefix.len()..];
+        let rel_start = after.find('{')?;
+        let payload = after[rel_start..].to_string();
+        return Some(SentinelMatch {
+            label,
+            event: ctor(payload),
+            redacted_text: redacted.map(str::to_string),
+        });
+    }
+    None
 }
 
 /// Check if buffered text has reached a renderable boundary.
@@ -179,36 +281,7 @@ pub(super) async fn ensure_terminator_emitted(
     request_event_id: Uuid,
     channel: Option<crate::engine::thread_events::EventChannel>,
 ) {
-    let has_terminator: bool = match sqlx::query_scalar(
-        "SELECT EXISTS(\
-            SELECT 1 FROM events \
-            WHERE aggregate_id = $1 \
-              AND event_type = ANY($3::text[]) \
-              AND payload->>'request_event_id' = $2\
-        )",
-    )
-    .bind(thread_id.to_string())
-    .bind(request_event_id.to_string())
-    .bind(crate::engine::thread_events::ThreadEvent::TERMINATOR_EVENT_TYPES)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            // Fail open: assume no terminator and let the defensive emit
-            // run. A phantom abort is much better than silently leaving
-            // the UI stuck on "running" because the DB hiccupped.
-            crate::log!(
-                "[AgenticLoop] terminator-existence query failed for request {} on thread {}: {}",
-                request_event_id,
-                thread_id,
-                e
-            );
-            false
-        }
-    };
-
-    if has_terminator {
+    if crate::engine::thread_events::has_terminator_for(pool, thread_id, request_event_id).await {
         return;
     }
 
@@ -217,24 +290,80 @@ pub(super) async fn ensure_terminator_emitted(
         request_event_id,
         thread_id
     );
-    bus.emit_or_log(
-        crate::engine::event_bus::BusEvent::Thread {
-            thread_id,
-            event: crate::engine::thread_events::ThreadEvent::ResponseAborted {
-                text: String::new(),
-                images: vec![],
-                model: None,
-                reasoning_effort: None,
-            },
-            meta: crate::engine::thread_events::EventMeta {
-                request_event_id: Some(request_event_id),
-                channel,
-                ..crate::engine::thread_events::EventMeta::NONE
-            },
+    crate::engine::thread_events::emit_response_aborted(
+        bus,
+        thread_id,
+        crate::engine::thread_events::AbortCause::ProcessKilled,
+        String::new(),
+        vec![],
+        None,
+        None,
+        crate::engine::thread_events::EventMeta {
+            request_event_id: Some(request_event_id),
+            channel,
+            ..crate::engine::thread_events::EventMeta::NONE
         },
         "[AgenticLoop] ResponseAborted (defensive — no terminator emitted)",
     )
     .await;
+}
+
+/// Static parts of a ContextCaptured event built once by `chat::process`
+/// before the loop starts: section list (system + memory + history + …),
+/// the tool list, and the model id. The loop appends a dynamic
+/// `Conversation` section per iteration sized from the current `messages`.
+///
+/// `capture_body` mirrors `PreferenceStore::capture_context` — read once at
+/// build time and threaded through so the loop can fill the dynamic
+/// `Conversation` section's body when the user has the preference on.
+/// Without this, the body stayed `None` even with capture on, and the
+/// modal misleadingly showed "Body not captured (capture_context off)".
+pub(crate) struct ContextCaptureSeed<'a> {
+    pub sections: &'a [crate::engine::ContextSection],
+    pub tools: &'a [String],
+    pub model: &'a str,
+    pub capture_body: bool,
+}
+
+/// Render the in-flight `messages` array as a compact text body for the
+/// `Conversation` section's persisted content. Each message is prefixed with
+/// its role; tool calls/results are summarized inline so the dump stays
+/// readable rather than dumping raw JSON. Caller truncates with
+/// `truncate_head_tail` when over the persistence cap.
+fn serialize_messages_for_capture(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for msg in messages {
+        out.push_str(&format!("[{}]\n", msg.role));
+        match &msg.content {
+            MessageContent::Text(s) => out.push_str(s),
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text } => out.push_str(text),
+                        ContentBlock::ToolUse { name, input, id } => {
+                            out.push_str(&format!(
+                                "\n[tool_use {} id={} input={}]",
+                                name, id, input
+                            ));
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
+                            out.push_str(&format!(
+                                "\n[tool_result id={} content={}]",
+                                tool_use_id, content
+                            ));
+                        }
+                        ContentBlock::Image { .. } => out.push_str("\n[image]"),
+                    }
+                }
+            }
+        }
+        out.push_str("\n\n");
+    }
+    out
 }
 
 impl LucidosEngine {
@@ -266,6 +395,7 @@ impl LucidosEngine {
         // existence check on the success path. The check has no functional
         // index and would walk every event in long-lived threads otherwise.
         terminator_emitted: &mut bool,
+        capture_seed: ContextCaptureSeed<'_>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         // EventMeta for this request — all persisted events in this cycle share the same context
         let meta = crate::engine::thread_events::EventMeta {
@@ -277,6 +407,7 @@ impl LucidosEngine {
         let model_str = model_override.unwrap_or(self.llm.default_model());
         let effective_model = (!model_str.is_empty()).then(|| model_str.to_string());
         let effective_effort = reasoning_effort.map(|s| s.to_string());
+        let capture_window = super::context::context_window_for(capture_seed.model);
 
         let mut iterations = 0;
         let mut images: Vec<String> = Vec::new(); // Track screenshots created during this request
@@ -292,21 +423,19 @@ impl LucidosEngine {
         loop {
             iterations += 1;
             if cancel_token.is_cancelled() {
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::ResponseCanceled {
-                                text: String::new(),
-                                images: images.clone(),
-                                model: effective_model.clone(),
-                                reasoning_effort: effective_effort.clone(),
-                            },
-                            meta: meta.clone(),
-                        },
-                        "[AgenticLoop] ResponseCanceled (cancel pre-iter)",
-                    )
-                    .await;
+                crate::engine::thread_events::emit_response_canceled(
+                    &self.event_bus,
+                    &self.pool,
+                    thread_id,
+                    crate::engine::thread_events::CancelCause::UserStop,
+                    String::new(),
+                    images.clone(),
+                    effective_model.clone(),
+                    effective_effort.clone(),
+                    meta.clone(),
+                    "[AgenticLoop] ResponseCanceled (cancel pre-iter)",
+                )
+                .await;
                 *terminator_emitted = true;
                 return Ok(ProcessResult {
                     response: String::new(),
@@ -364,9 +493,6 @@ impl LucidosEngine {
                                 "Context: {} tokens, {} messages{}",
                                 context_tokens, context_messages, trimmed_str
                             ),
-                            context_tokens: Some(context_tokens),
-                            context_messages: Some(context_messages),
-                            trimmed: if trimmed { Some(true) } else { None },
                         },
                         meta: meta.clone(),
                     },
@@ -496,16 +622,19 @@ impl LucidosEngine {
                         }
                     }
                     drop(persist_tx);
-                    self.event_bus.emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::ResponseCanceled {
-                                text: partial.clone(), images: images.clone(), model: effective_model.clone(), reasoning_effort: effective_effort.clone(),
-                            },
-                            meta: meta.clone(),
-                        },
+                    crate::engine::thread_events::emit_response_canceled(
+                        &self.event_bus,
+                        &self.pool,
+                        thread_id,
+                        crate::engine::thread_events::CancelCause::UserStop,
+                        partial.clone(),
+                        images.clone(),
+                        effective_model.clone(),
+                        effective_effort.clone(),
+                        meta.clone(),
                         "[AgenticLoop] ResponseCanceled",
-                    ).await;
+                    )
+                    .await;
                     *terminator_emitted = true;
                     return Ok(ProcessResult {
                         response: partial,
@@ -520,22 +649,84 @@ impl LucidosEngine {
                 }
             };
 
-            // None for providers that don't report `usage` (OpenAI, Gemini) —
-            // the chars/4 estimate stands.
-            if let Some(input_tokens) = response.input_tokens {
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::ContextTokensMeasured {
-                                input_tokens,
-                            },
-                            meta: meta.clone(),
+            // `usage` only when the provider reported it (Anthropic);
+            // OpenAI/Gemini stay None and the chars/4 estimate stands.
+            //
+            // Sections describe the prompt-time breakdown (system + memory
+            // + history + … + user message). All non-system sections are
+            // already concatenated into messages[0].content, so summing
+            // them and `context_chars` would double-count. The Conversation
+            // section instead carries the *delta* — bytes added by the
+            // tool loop on iter 2+ — so the section list sums to the live
+            // total: system_prompt + context_chars.
+            let static_total: usize =
+                capture_seed.sections.iter().map(|s| s.char_count).sum();
+            let system_chars: usize = capture_seed
+                .sections
+                .iter()
+                .find(|s| s.name == "System Instructions")
+                .map(|s| s.char_count)
+                .unwrap_or(0);
+            let bundled_total = static_total - system_chars;
+            let conversation_extra = context_chars.saturating_sub(bundled_total);
+            // When `capture_body` is on, fill the Conversation body so the
+            // modal shows what was actually sent (assistant text + tool I/O
+            // accumulated by the loop). Capped at SECTION_PERSIST_MAX (8 KB
+            // — same cap chat::process applies to other section bodies) to
+            // keep large tool outputs from bloating every events row.
+            const CONVERSATION_PERSIST_MAX: usize = 8_000;
+            let conversation_body = capture_seed
+                .capture_body
+                .then(|| {
+                    let serialized = serialize_messages_for_capture(messages);
+                    if serialized.len() > CONVERSATION_PERSIST_MAX {
+                        super::context::truncate_head_tail(
+                            &serialized,
+                            CONVERSATION_PERSIST_MAX,
+                        )
+                    } else {
+                        serialized
+                    }
+                });
+            let conversation = crate::engine::ContextSection {
+                name: "Conversation".to_string(),
+                content: conversation_body,
+                char_count: conversation_extra,
+            };
+            let estimated_total_tokens: usize = (system_chars + context_chars) / 4;
+            let iter_sections: Vec<_> = capture_seed
+                .sections
+                .iter()
+                .cloned()
+                .chain(std::iter::once(conversation))
+                .collect();
+            let usage = response.input_tokens.map(|input_tokens| {
+                crate::engine::ApiUsage {
+                    input_tokens,
+                    output_tokens: response.output_tokens.unwrap_or(0),
+                    cache_read_tokens: response.cache_read_tokens.unwrap_or(0),
+                    cache_creation_tokens: response.cache_creation_tokens.unwrap_or(0),
+                }
+            });
+            self.event_bus
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::Thread {
+                        thread_id,
+                        event: crate::engine::thread_events::ThreadEvent::ContextCaptured {
+                            producer: crate::engine::ContextProducer::MainLlm,
+                            model: capture_seed.model.to_string(),
+                            context_window: capture_window,
+                            sections: iter_sections,
+                            tools: capture_seed.tools.to_vec(),
+                            estimated_total_tokens,
+                            usage,
+                            trimmed,
                         },
-                        "[AgenticLoop] ContextTokensMeasured",
-                    )
-                    .await;
-            }
+                        meta: meta.clone(),
+                    },
+                    "[AgenticLoop] ContextCaptured",
+                )
+                .await;
 
             // Final flush — send any remaining buffered text and persist remainder
             let (flush_text, remaining_to_persist) = {
@@ -940,6 +1131,11 @@ impl LucidosEngine {
                 // Persist + broadcast ToolCalled. Capture the event_id so spawn-style
                 // tools (run_thread, run_claude) can record which tool call triggered
                 // the spawn — this becomes the new thread's `spawning_event_id`.
+                // Mask any postgres password the LLM hardcoded into a `bash`
+                // command (or other tool) before persisting; see
+                // `core::redact_postgres_secrets_in_json`.
+                let mut redacted_args = tool_call.arguments.clone();
+                crate::core::redact_postgres_secrets_in_json(&mut redacted_args);
                 let tool_called_event_id = self
                     .event_bus
                     .emit_for_id(crate::engine::event_bus::BusEvent::Thread {
@@ -947,14 +1143,15 @@ impl LucidosEngine {
                         event: crate::engine::thread_events::ThreadEvent::ToolCalled {
                             name: tool_call.name.clone(),
                             description: self.describe_tool(&tool_call.name, &tool_call.arguments),
-                            args: tool_call.arguments.clone(),
+                            args: redacted_args,
                         },
                         meta: meta.clone(),
                     })
                     .await;
 
                 // Check read cache first for read_file
-                let result = if tool_call.name == tn::READ_FILE {
+                let outcome: crate::engine::tools::ToolOutcome = if tool_call.name == tn::READ_FILE
+                {
                     let path = tool_call
                         .arguments
                         .get("path")
@@ -966,10 +1163,10 @@ impl LucidosEngine {
                             iterations,
                             MAX_ITERATIONS
                         );
-                        cached.clone()
+                        Ok(cached.clone())
                     } else {
-                        let r = self
-                            .execute_tool(
+                        let r = run_tool_with_cancel(
+                            self.execute_tool(
                                 &tool_call.name,
                                 &tool_call.arguments,
                                 extraction_ctx,
@@ -977,10 +1174,12 @@ impl LucidosEngine {
                                 device_id,
                                 cancel_token,
                                 thread_id,
-                            )
-                            .await;
-                        if !r.starts_with("Error:") {
-                            read_cache.insert(path.to_string(), r.clone());
+                            ),
+                            cancel_token,
+                        )
+                        .await;
+                        if let Ok(ref text) = r {
+                            read_cache.insert(path.to_string(), text.clone());
                         }
                         r
                     }
@@ -995,20 +1194,40 @@ impl LucidosEngine {
                     )
                     .await
                 {
-                    r
+                    // handle_special_tool still returns `String`; lift via
+                    // the legacy `Error:` prefix until its sites are
+                    // migrated to typed `Err`.
+                    crate::engine::tools::lift_legacy_string(r)
                 } else {
-                    self.execute_tool(
-                        &tool_call.name,
-                        &tool_call.arguments,
-                        extraction_ctx,
-                        request_id,
-                        device_id,
+                    // run_python / run_bash / http_request / mcp__* and friends
+                    // dispatch through here. These are the tools that can park
+                    // for minutes on a hung subprocess or a no-timeout reqwest
+                    // client, so the cancel-aware wrapper is mandatory: dropping
+                    // the inner future on cancel SIGKILLs the OS child (via
+                    // `kill_on_drop(true)` on the Command) and lets the outer
+                    // loop iterate to its pre-iter `is_cancelled()` check, which
+                    // emits ResponseCanceled. Without the wrapper, a
+                    // `urllib.request.urlopen()` with no timeout ignored cancel
+                    // forever and the thread stayed `running` until the engine
+                    // restarted.
+                    run_tool_with_cancel(
+                        self.execute_tool(
+                            &tool_call.name,
+                            &tool_call.arguments,
+                            extraction_ctx,
+                            request_id,
+                            device_id,
+                            cancel_token,
+                            thread_id,
+                        ),
                         cancel_token,
-                        thread_id,
                     )
                     .await
                 };
-                let is_error = result.starts_with("Error:");
+                let (result, is_error) = match outcome {
+                    Ok(text) => (text, false),
+                    Err(text) => (text, true),
+                };
 
                 // Invalidate read cache on write/edit
                 if (tool_call.name == tn::WRITE_FILE || tool_call.name == tn::EDIT_FILE)
@@ -1057,7 +1276,7 @@ impl LucidosEngine {
 
                 // Extract generated image base64 from tool result (if present)
                 let mut tool_result_images: Vec<String> = vec![];
-                let tool_result_text;
+                let mut tool_result_text;
                 if let Some(rest) = result.strip_prefix("[GENERATED_IMAGE:") {
                     if let Some(end_bracket) = rest.find("]\n") {
                         let image_b64 = &rest[..end_bracket];
@@ -1078,6 +1297,21 @@ impl LucidosEngine {
                     tool_result_text = result.clone();
                 }
 
+                // Front-end confirm-flow sentinels (credentials, plugin install,
+                // plugin uninstall, email confirm): emit the transient
+                // ThreadEvent that drives the panel/modal, and — for sentinels
+                // whose raw JSON would mislead the LLM (install/uninstall let
+                // it parse `overwrites` and chat-ask, see git history) —
+                // replace tool_result_text so the model only sees a one-line
+                // wait notice. EmailConfirm passes through unredacted because
+                // its tool description already explains the modal flow.
+                let sentinel_event = match_sentinel(&tool_result_text).map(|m| {
+                    if let Some(redacted) = m.redacted_text {
+                        tool_result_text = redacted;
+                    }
+                    (m.label, m.event)
+                });
+
                 // Persist + broadcast ToolResult
                 self.event_bus
                     .emit_or_log(
@@ -1087,12 +1321,28 @@ impl LucidosEngine {
                                 name: tool_call.name.clone(),
                                 result: crate::core::sanitize_for_jsonb(&tool_result_text),
                                 images: tool_result_images,
+                                success: !is_error,
                             },
                             meta: meta.clone(),
                         },
                         "[AgenticLoop] ToolResult",
                     )
                     .await;
+
+                if let Some((label, event)) = sentinel_event {
+                    use crate::engine::event_bus::BusEvent;
+                    use crate::engine::thread_events::EventMeta;
+                    self.event_bus
+                        .emit_or_log(
+                            BusEvent::Thread {
+                                thread_id,
+                                event,
+                                meta: EventMeta::NONE,
+                            },
+                            label,
+                        )
+                        .await;
+                }
 
                 if is_error {
                     had_errors = true;
@@ -1108,47 +1358,6 @@ impl LucidosEngine {
                         iterations,
                         MAX_ITERATIONS
                     );
-                }
-
-                // Send credential request as a dedicated SSE event so frontend can show inline form
-                if result.starts_with(crate::engine::tools::credentials::CREDENTIAL_REQUEST_PREFIX)
-                {
-                    if let Some(json_start) = result.find('{') {
-                        let payload = result[json_start..].to_string();
-                        self.event_bus
-                            .emit_or_log(
-                                crate::engine::event_bus::BusEvent::Thread {
-                                    thread_id,
-                                    event:
-                                        crate::engine::thread_events::ThreadEvent::CredentialRequest {
-                                            payload,
-                                        },
-                                    meta: crate::engine::thread_events::EventMeta::NONE,
-                                },
-                                "[AgenticLoop] CredentialRequest",
-                            )
-                            .await;
-                    }
-                }
-
-                // Send email confirm request as SSE event so frontend can show confirmation modal
-                if result.starts_with("[EMAIL_CONFIRM]") {
-                    if let Some(json_start) = result.find('{') {
-                        let payload = result[json_start..].to_string();
-                        self.event_bus
-                            .emit_or_log(
-                                crate::engine::event_bus::BusEvent::Thread {
-                                    thread_id,
-                                    event:
-                                        crate::engine::thread_events::ThreadEvent::EmailConfirmRequest {
-                                            payload,
-                                        },
-                                    meta: crate::engine::thread_events::EventMeta::NONE,
-                                },
-                                "[AgenticLoop] EmailConfirmRequest",
-                            )
-                            .await;
-                    }
                 }
 
                 // Send push notification request SSE event to trigger browser permission
@@ -1287,6 +1496,50 @@ impl LucidosEngine {
                     injected_prompts.push(prompt);
                 }
                 for prompt in injected_prompts {
+                    match &prompt.kind {
+                        super::InjectedPromptKind::WakeFromChild {
+                            child_thread_id: child_id,
+                            child_completed_event_id,
+                        } => {
+                            crate::log!(
+                                "[Inject] Wake-from-child {} (event {}) into active parent {}",
+                                child_id,
+                                child_completed_event_id,
+                                thread_id
+                            );
+                            let row = match self
+                                .event_store
+                                .get_event_by_id(*child_completed_event_id)
+                                .await
+                            {
+                                Ok(Some(r)) => r,
+                                Ok(None) => {
+                                    crate::log!(
+                                        "[Inject] Wake-from-child event {} missing in DB; skipping projection",
+                                        child_completed_event_id
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    crate::log!(
+                                        "[Inject] Failed to load wake-from-child event {}: {}; skipping projection",
+                                        child_completed_event_id,
+                                        e
+                                    );
+                                    continue;
+                                }
+                            };
+                            let block =
+                                crate::core::store::format_child_thread_completed_block(&row);
+                            messages.push(Message {
+                                role: "user".to_string(),
+                                content: MessageContent::Text(block),
+                            });
+                            continue;
+                        }
+                        super::InjectedPromptKind::UserText => {}
+                    }
+
                     crate::log!(
                         "[Inject] Mid-flight {:?} prompt injected into thread {}: {}",
                         prompt.mode,
@@ -1387,843 +1640,14 @@ impl LucidosEngine {
         }
     }
 
-    /// Handle tool calls that need special processing outside of `execute_tool`.
-    /// Returns `Some(result)` if the tool was handled, `None` if it should fall through
-    /// to `execute_tool()`.
-    async fn handle_special_tool(
-        &self,
-        tool_name: &str,
-        tool_args: &serde_json::Value,
-        thread_id: Uuid,
-        user_images: Option<&[crate::api::ChatImage]>,
-        device_id: Option<&str>,
-        // Event_id of the just-emitted ToolCalled event. Forwarded as
-        // `spawning_event_id` for spawn-style tools (run_thread, run_claude)
-        // so the new thread can be traced back to the exact tool call that
-        // started it.
-        tool_called_event_id: Option<Uuid>,
-    ) -> Option<String> {
-        if tool_name == tn::REFRESH_FILE {
-            let path = tool_args["path"].as_str().unwrap_or("");
-            self.event_bus
-                .emit_or_log(
-                    crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::RefreshFile {
-                            path: path.to_string(),
-                        },
-                        meta: crate::engine::thread_events::EventMeta::NONE,
-                    },
-                    "[AgenticLoop] RefreshFile",
-                )
-                .await;
-            Some(format!("File preview refreshed for {}", path))
-        } else if tool_name == tn::CAPTURE_APP || tool_name == tn::REFRESH_APP {
-            let app_id = tool_args
-                .get("app_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            if tool_name == tn::REFRESH_APP {
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::RefreshAppUI {
-                                app_id: app_id.clone(),
-                            },
-                            meta: crate::engine::thread_events::EventMeta::NONE,
-                        },
-                        "[AgenticLoop] RefreshAppUI (refresh_app tool)",
-                    )
-                    .await;
-            }
-
-            let skip_capture = tool_args
-                .get("skip_capture")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            if skip_capture {
-                Some("App UI refreshed.".to_string())
-            } else {
-                if tool_name == tn::REFRESH_APP {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-
-                let request_id = Uuid::new_v4().to_string();
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                {
-                    let mut captures = self.pending_captures.lock().unwrap();
-                    captures.insert(request_id.clone(), tx);
-                }
-
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::CaptureAppUI {
-                                app_id: app_id.clone(),
-                                request_id: request_id.clone(),
-                            },
-                            meta: crate::engine::thread_events::EventMeta::NONE,
-                        },
-                        "[AgenticLoop] CaptureAppUI",
-                    )
-                    .await;
-
-                Some(
-                    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
-                        Ok(Ok(capture)) => {
-                            format!(
-                                "[APP_CAPTURE:{}]\nDOM snapshot:\n{}",
-                                capture.screenshot, capture.dom
-                            )
-                        }
-                        Ok(Err(_)) => {
-                            "Error: Capture failed — the frontend channel was dropped.".to_string()
-                        }
-                        Err(_) => {
-                            let mut captures = self.pending_captures.lock().unwrap();
-                            captures.remove(&request_id);
-                            "Error: Capture timed out (10s) — the frontend could not open or capture the app UI.".to_string()
-                        }
-                    },
-                )
-            }
-        } else if tool_name == tn::RUN_CLAUDE {
-            let prompt = tool_args["prompt"].as_str().unwrap_or("");
-            if prompt.is_empty() {
-                Some("Error: prompt is required".to_string())
-            } else {
-                let repo_id = match tool_args["repo"].as_str().filter(|s| !s.is_empty()) {
-                    Some(repo_param) => match crate::core::repositories::RepositoryStore::resolve(
-                        &self.pool, repo_param,
-                    )
-                    .await
-                    {
-                        Ok(Some(repo)) => Some(repo.id.to_string()),
-                        Ok(None) => {
-                            return Some(format!("Error: Repository '{}' not found. Use manage_repositories with action 'list' to see registered repositories.", repo_param));
-                        }
-                        Err(e) => {
-                            return Some(format!("Error: Failed to look up repository: {}", e));
-                        }
-                    },
-                    None => None,
-                };
-
-                // Absent `images` → forward the current message's images (default).
-                // Present (even empty) → caller has explicitly chosen the selection.
-                let resolved_images: Option<Vec<crate::api::ChatImage>> = match tool_args
-                    .get("images")
-                {
-                    Some(serde_json::Value::Array(arr)) => {
-                        let refs: Vec<String> = arr
-                            .iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect();
-                        if refs.len() != arr.len() {
-                            return Some("Error: `images` entries must be strings".to_string());
-                        }
-                        let events = match self
-                            .event_store
-                            .get_thread_events(&thread_id.to_string())
-                            .await
-                        {
-                            Ok(evts) => evts,
-                            Err(e) => {
-                                return Some(format!("Error: Failed to load thread events: {}", e))
-                            }
-                        };
-                        match crate::engine::tools::image::resolve_thread_image_refs(&self.workspace_path, &events, &refs)
-                        {
-                            Ok(imgs) => Some(imgs),
-                            Err(e) => return Some(format!("Error: {}", e)),
-                        }
-                    }
-                    _ => None,
-                };
-
-                let caller_title = tool_args["title"].as_str();
-                let images = resolved_images
-                    .as_deref()
-                    .or(user_images)
-                    .map(<[crate::api::ChatImage]>::to_vec);
-                Some(
-                    match self
-                        .spawn_agent_thread(crate::engine::claude_code::SpawnAgentThreadParams {
-                            prompt: prompt.to_string(),
-                            user_images: images,
-                            device_id: device_id.map(str::to_string),
-                            parent_thread_id: Some(thread_id),
-                            spawning_event_id: tool_called_event_id,
-                            repo_id,
-                            caller_title: caller_title.map(str::to_string),
-                        })
-                        .await
-                    {
-                        Ok(cc_thread_id) => {
-                            format!(
-                                "Claude Code session started in a new thread (thread_id: {}). \
-                             Tell the user you've started a new thread to work on this and include \
-                             a link: [Open thread](thread:{})",
-                                cc_thread_id, cc_thread_id
-                            )
-                        }
-                        Err(e) => format!("Error: Failed to start Claude Code: {}", e),
-                    },
-                )
-            }
-        } else if tool_name == tn::RUN_THREAD {
-            let prompt = tool_args["prompt"].as_str().unwrap_or("");
-            if prompt.is_empty() {
-                Some("Error: prompt is required".to_string())
-            } else {
-                Some(
-                    match LucidosEngine::check_thread_recursion_guard(&self.pool, thread_id).await {
-                        Err(guard_err) => format!("Error: {}", guard_err),
-                        Ok(_) => {
-                            let child_thread_id = uuid::Uuid::new_v4();
-                            // Without this the spawned loop defaults to LUCIDOS_MODEL
-                            // instead of the user's chat-mode preference.
-                            let (chat_model, chat_effort) =
-                                crate::core::PreferenceStore::user_chat_settings(&self.pool).await;
-                            // Emit MessageReceived eagerly BEFORE spawning the background task.
-                            // This ensures the parent's active_children_count is incremented
-                            // immediately, preventing a race where the parent completes
-                            // (ResponseGenerated → "review") before children register.
-                            // origin=None lets `make_message_received` synthesize a
-                            // structured ParentThread origin from `mode + parent_thread_id`,
-                            // which downstream consumers need to attribute the spawn to
-                            // the parent agent run.
-                            let eager_result = self
-                                .event_bus
-                                .emit(crate::engine::event_bus::BusEvent::Thread {
-                                    thread_id: child_thread_id,
-                                    event: crate::engine::chat::make_message_received(
-                                        &self.workspace_path,
-                                        prompt,
-                                        None,
-                                        None,
-                                        None,
-                                        Some(thread_id),
-                                        tool_called_event_id,
-                                        crate::engine::thread_events::ActorMode::Agent,
-                                        chat_model.as_deref(),
-                                        chat_effort.as_deref(),
-                                        None,
-                                    ),
-                                    meta: crate::engine::thread_events::EventMeta {
-                                        channel: Some(
-                                            crate::engine::thread_events::EventChannel::Chat,
-                                        ),
-                                        ..crate::engine::thread_events::EventMeta::NONE
-                                    },
-                                })
-                                .await;
-                            match eager_result {
-                                Ok(Some(emit)) => {
-                                    let origin_id = emit.event_id;
-                                    let caller_title = tool_args["title"].as_str();
-                                    match self.spawn_thread(
-                                        prompt,
-                                        Some(thread_id),
-                                        tool_called_event_id,
-                                        child_thread_id,
-                                        Some(origin_id),
-                                        caller_title,
-                                        chat_model,
-                                        chat_effort,
-                                    ) {
-                                    Ok(cid) => format!(
-                                        "Thread started (thread_id: {}). When the child thread finishes, \
-                                         this conversation will automatically resume with its results — \
-                                         you don't need to check on it. Continue with other work or tell \
-                                         the user you've delegated this subtask: [Open thread](thread:{})",
-                                        cid, cid
-                                    ),
-                                    Err(e) => format!("Error starting thread: {}", e),
-                                }
-                                }
-                                Ok(None) => {
-                                    "Error: MessageReceived emit returned no result".to_string()
-                                }
-                                Err(e) => format!("Error starting thread: {}", e),
-                            }
-                        }
-                    },
-                )
-            }
-        } else if let Some((server_id, mcp_tool_name)) =
-            crate::mcp::McpManager::parse_mcp_tool_name(tool_name)
-        {
-            let (auto_approve, server_name) = {
-                let statuses = self.mcp_manager.list_servers().await.unwrap_or_default();
-                let server = statuses.iter().find(|s| s.id == server_id);
-                (
-                    server.map(|s| s.auto_approve).unwrap_or(false),
-                    server
-                        .map(|s| s.name.clone())
-                        .unwrap_or_else(|| server_id.clone()),
-                )
-            };
-
-            let approved = if auto_approve {
-                true
-            } else {
-                let consent_request_id = uuid::Uuid::new_v4().to_string();
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                {
-                    let mut pending = self.pending_mcp_consent.lock().unwrap();
-                    pending.insert(consent_request_id.clone(), tx);
-                }
-
-                let args_summary = serde_json::to_string_pretty(tool_args)
-                    .unwrap_or_else(|_| tool_args.to_string());
-                let args_summary = if args_summary.len() > 500 {
-                    format!(
-                        "{}...",
-                        &args_summary[..args_summary.floor_char_boundary(500)]
-                    )
-                } else {
-                    args_summary
-                };
-
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::McpConsentRequest {
-                                data: serde_json::json!({
-                                    "request_id": consent_request_id,
-                                    "server_name": server_name,
-                                    "tool_name": mcp_tool_name,
-                                    "arguments_summary": args_summary,
-                                })
-                                .to_string(),
-                            },
-                            meta: crate::engine::thread_events::EventMeta::NONE,
-                        },
-                        "[AgenticLoop] McpConsentRequest",
-                    )
-                    .await;
-
-                match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-                    Ok(Ok(allowed)) => allowed,
-                    Ok(Err(_)) => false,
-                    Err(_) => {
-                        let mut pending = self.pending_mcp_consent.lock().unwrap();
-                        pending.remove(&consent_request_id);
-                        false
-                    }
-                }
-            };
-
-            Some(if approved {
-                match self
-                    .mcp_manager
-                    .call_tool(&server_id, &mcp_tool_name, tool_args.clone())
-                    .await
-                {
-                    Ok((result, _, _)) => result,
-                    Err(e) => format!("Error: MCP tool call failed: {}", e),
-                }
-            } else {
-                format!(
-                    "Error: User denied MCP tool call '{}' on '{}'",
-                    mcp_tool_name, server_name
-                )
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Run an isolated agentic loop for intent execution.
-    /// This is a simplified version of run_agentic_loop with its own system prompt,
-    /// no conversation history, and all tools except execute_intent (no recursion).
-    /// Returns only the final response text.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_intent_loop(
-        &self,
-        system_prompt: &str,
-        task: &str,
-        request_id: Uuid,
-        extraction_ctx: &str,
-        device_id: Option<&str>,
-        cancel_token: &CancellationToken,
-        thread_id: Uuid,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let tools = build_intent_tools();
-
-        let mut messages = vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text(format!("Task: {}", task)),
-        }];
-
-        const MAX_INTENT_ITERATIONS: usize = 100;
-        let mut iterations = 0;
-        let mut last_tool_call: Option<(String, String)> = None;
-        let mut consecutive_same_call = 0;
-
-        loop {
-            iterations += 1;
-
-            if cancel_token.is_cancelled() {
-                return Ok("Intent execution canceled.".to_string());
-            }
-
-            if iterations > MAX_INTENT_ITERATIONS {
-                return Ok("Intent execution reached iteration limit.".to_string());
-            }
-
-            // Trim context if needed
-            let message_budget = 400_000; // ~100k tokens budget for intent sub-loops
-            trim_context_if_needed(&mut messages, message_budget);
-
-            // Call LLM with no streaming (sub-loop doesn't stream text to frontend)
-            let response = self
-                .llm
-                .chat(
-                    messages.clone(),
-                    tools.clone(),
-                    None, // no model override — use default
-                    Some(system_prompt),
-                    None, // no token streaming callback
-                    None, // no reasoning effort override
-                )
-                .await?;
-
-            // No tool calls → final answer
-            if response.tool_calls.is_empty() {
-                return Ok(response.content.unwrap_or_else(|| "Done.".to_string()));
-            }
-
-            // Build assistant message with tool_use blocks
-            let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
-            if let Some(ref text) = response.content {
-                assistant_blocks.push(ContentBlock::Text { text: text.clone() });
-            }
-            for tc in &response.tool_calls {
-                assistant_blocks.push(ContentBlock::ToolUse {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    input: tc.arguments.clone(),
-                });
-            }
-            messages.push(Message {
-                role: "assistant".to_string(),
-                content: MessageContent::Blocks(assistant_blocks),
-            });
-
-            // Circuit breaker for consecutive duplicate calls
-            if response.tool_calls.len() == 1 {
-                let tc = &response.tool_calls[0];
-                let call_key = derive_call_key(&tc.name, &tc.arguments);
-                let current_call = (tc.name.clone(), call_key);
-                if Some(&current_call) == last_tool_call.as_ref() {
-                    consecutive_same_call += 1;
-                } else {
-                    consecutive_same_call = 1;
-                    last_tool_call = Some(current_call);
-                }
-
-                if consecutive_same_call >= 4 {
-                    // Force break — add tool results and stop
-                    let result_blocks: Vec<ContentBlock> = response
-                        .tool_calls
-                        .iter()
-                        .map(|tc| ContentBlock::ToolResult {
-                            tool_use_id: tc.id.clone(),
-                            content: "STOP: Repeated tool call. Give your final answer now."
-                                .to_string(),
-                        })
-                        .collect();
-                    messages.push(Message {
-                        role: "user".to_string(),
-                        content: MessageContent::Blocks(result_blocks),
-                    });
-                    continue;
-                }
-            } else {
-                consecutive_same_call = 0;
-                last_tool_call = None;
-            }
-
-            // Execute each tool call
-            let mut result_blocks: Vec<ContentBlock> = Vec::new();
-            for tc in &response.tool_calls {
-                // Emit ToolCalled via bus. Capture the event_id so spawn-style tools
-                // can record it as the spawning_event_id of the new thread.
-                let tool_called_event_id = self
-                    .event_bus
-                    .emit_for_id(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ToolCalled {
-                            name: tc.name.clone(),
-                            description: self.describe_tool(&tc.name, &tc.arguments),
-                            args: tc.arguments.clone(),
-                        },
-                        meta: crate::engine::thread_events::EventMeta::NONE,
-                    })
-                    .await;
-
-                let result = if let Some(r) = self
-                    .handle_special_tool(
-                        &tc.name,
-                        &tc.arguments,
-                        thread_id,
-                        None,
-                        device_id,
-                        tool_called_event_id,
-                    )
-                    .await
-                {
-                    r
-                } else {
-                    self.execute_tool(
-                        &tc.name,
-                        &tc.arguments,
-                        extraction_ctx,
-                        request_id,
-                        device_id,
-                        cancel_token,
-                        thread_id,
-                    )
-                    .await
-                };
-
-                // Emit ToolResult via bus
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::ToolResult {
-                                name: tc.name.clone(),
-                                result: crate::core::sanitize_for_jsonb(&result),
-                                images: vec![],
-                            },
-                            meta: crate::engine::thread_events::EventMeta::NONE,
-                        },
-                        "[IntentLoop] ToolResult",
-                    )
-                    .await;
-
-                result_blocks.push(ContentBlock::ToolResult {
-                    tool_use_id: tc.id.clone(),
-                    content: result,
-                });
-            }
-
-            messages.push(Message {
-                role: "user".to_string(),
-                content: MessageContent::Blocks(result_blocks),
-            });
-        }
-    }
 }
+
+#[path = "agentic_loop_special_tool.rs"]
+mod special_tool;
 
 #[cfg(test)]
-mod should_flush_tests {
-    use super::{is_bad_image_description, should_flush};
-
-    // --- Paragraph breaks ---
-
-    #[test]
-    fn flushes_on_double_newline() {
-        assert!(should_flush("Hello world\n\n"));
-    }
-
-    #[test]
-    fn no_flush_on_single_newline() {
-        assert!(!should_flush("Hello world\n"));
-    }
-
-    #[test]
-    fn no_flush_mid_paragraph() {
-        assert!(!should_flush("Hello world"));
-    }
-
-    #[test]
-    fn flushes_on_multiple_paragraphs() {
-        assert!(should_flush("First paragraph.\n\nSecond paragraph.\n\n"));
-    }
-
-    // --- Code fence close ---
-
-    #[test]
-    fn flushes_on_code_fence_close() {
-        assert!(should_flush("```rust\nfn main() {}\n```\n"));
-    }
-
-    #[test]
-    fn no_flush_on_code_fence_open() {
-        assert!(!should_flush("```rust\n"));
-    }
-
-    #[test]
-    fn no_flush_on_code_fence_without_trailing_newline() {
-        assert!(!should_flush("```rust\ncode\n```"));
-    }
-
-    // --- Heading after newline ---
-
-    #[test]
-    fn flushes_on_heading_followed_by_newline() {
-        assert!(should_flush("Some text\n## Heading\n"));
-    }
-
-    #[test]
-    fn flushes_on_h1_followed_by_newline() {
-        assert!(should_flush("Intro\n# Title\n"));
-    }
-
-    #[test]
-    fn no_flush_on_heading_without_trailing_newline() {
-        assert!(!should_flush("Some text\n## Heading"));
-    }
-
-    #[test]
-    fn flushes_on_first_line_heading() {
-        // A complete heading line should always flush
-        assert!(should_flush("# Title\n"));
-    }
-
-    // --- Horizontal rules ---
-
-    #[test]
-    fn flushes_on_dash_horizontal_rule() {
-        assert!(should_flush("Some text\n---\n"));
-    }
-
-    #[test]
-    fn flushes_on_asterisk_horizontal_rule() {
-        assert!(should_flush("Some text\n***\n"));
-    }
-
-    #[test]
-    fn no_flush_on_partial_horizontal_rule() {
-        assert!(!should_flush("Some text\n---"));
-    }
-
-    // --- Edge cases ---
-
-    #[test]
-    fn no_flush_on_empty_string() {
-        assert!(!should_flush(""));
-    }
-
-    #[test]
-    fn no_flush_on_whitespace_only() {
-        assert!(!should_flush("   "));
-    }
-
-    #[test]
-    fn no_flush_on_single_char() {
-        assert!(!should_flush("a"));
-    }
-
-    #[test]
-    fn flushes_long_text_ending_with_paragraph_break() {
-        let mut text = "A".repeat(5000);
-        text.push_str("\n\n");
-        assert!(should_flush(&text));
-    }
-
-    #[test]
-    fn no_flush_on_long_text_without_boundary() {
-        let text = "A".repeat(5000);
-        assert!(!should_flush(&text));
-    }
-
-    // --- Combinations ---
-
-    #[test]
-    fn flushes_code_block_then_paragraph() {
-        assert!(should_flush("```\ncode\n```\n\nNext paragraph\n\n"));
-    }
-
-    #[test]
-    fn flushes_heading_in_middle_of_text() {
-        assert!(should_flush("First part\n## Section\n"));
-    }
-
-    // --- List items (should NOT flush) ---
-
-    #[test]
-    fn no_flush_on_list_item() {
-        assert!(!should_flush("- item 1\n"));
-    }
-
-    #[test]
-    fn no_flush_on_numbered_list() {
-        assert!(!should_flush("1. item\n"));
-    }
-
-    // --- is_bad_image_description ---
-
-    #[test]
-    fn rejects_gemini_no_image_response() {
-        assert!(is_bad_image_description(
-            "Please provide the images you would like me to describe. I do not see any images attached to your message."
-        ));
-    }
-
-    #[test]
-    fn rejects_contraction_variant() {
-        assert!(is_bad_image_description(
-            "I don't see any images in the message."
-        ));
-    }
-
-    #[test]
-    fn rejects_no_image_provided() {
-        assert!(is_bad_image_description(
-            "No image was provided for analysis."
-        ));
-    }
-
-    #[test]
-    fn accepts_valid_description() {
-        assert!(!is_bad_image_description(
-            "A screenshot of a calendar invitation showing a meeting titled 'Standup' on March 17, 2026 at 09:00-09:15."
-        ));
-    }
-
-    #[test]
-    fn accepts_ocr_description() {
-        assert!(!is_bad_image_description(
-            "The image shows a document with the text: 'Møte med Alex, 14. mars kl 10:00-11:00'"
-        ));
-    }
-}
-
-#[cfg(test)]
-mod intent_loop_tools_tests {
-    use crate::llm::tool_names as tn;
-
-    /// Intent sub-loops must include notification tools so intents can send
-    /// notifications. Regression test for: send_notification silently fails
-    /// when called from execute_intent because the tool wasn't in the tool list.
-    #[test]
-    fn intent_loop_tools_include_send_notification() {
-        let tools = super::build_intent_tools();
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            names.contains(&tn::SEND_NOTIFICATION),
-            "Intent loop tools must include send_notification, got: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn intent_loop_tools_include_read_notifications() {
-        let tools = super::build_intent_tools();
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            names.contains(&tn::READ_NOTIFICATIONS),
-            "Intent loop tools must include read_notifications, got: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn intent_loop_tools_exclude_execute_intent() {
-        let tools = super::build_intent_tools();
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            !names.contains(&tn::EXECUTE_INTENT),
-            "Intent loop tools must NOT include execute_intent (no recursion)"
-        );
-    }
-}
-
-#[cfg(test)]
-mod derive_call_key_tests {
-    use super::derive_call_key;
-    use crate::llm::tool_names as tn;
-    use serde_json::json;
-
-    #[test]
-    fn run_bash_buckets_by_first_token() {
-        let key = derive_call_key(tn::RUN_BASH, &json!({ "command": "git status" }));
-        assert_eq!(key, "git");
-    }
-
-    #[test]
-    fn run_bash_trims_leading_whitespace() {
-        let key = derive_call_key(tn::RUN_BASH, &json!({ "command": "  git  add ." }));
-        assert_eq!(key, "git");
-    }
-
-    #[test]
-    fn run_bash_empty_command_falls_back_to_tool_name() {
-        let key = derive_call_key(tn::RUN_BASH, &json!({ "command": "" }));
-        assert_eq!(key, tn::RUN_BASH);
-    }
-
-    #[test]
-    fn run_bash_whitespace_only_command_falls_back_to_tool_name() {
-        let key = derive_call_key(tn::RUN_BASH, &json!({ "command": "   " }));
-        assert_eq!(key, tn::RUN_BASH);
-    }
-
-    #[test]
-    fn run_bash_missing_command_falls_back_to_tool_name() {
-        let key = derive_call_key(tn::RUN_BASH, &json!({}));
-        assert_eq!(key, tn::RUN_BASH);
-    }
-
-    #[test]
-    fn run_bash_distinct_commands_bucket_separately() {
-        let git = derive_call_key(tn::RUN_BASH, &json!({ "command": "git status" }));
-        let cargo = derive_call_key(tn::RUN_BASH, &json!({ "command": "cargo test" }));
-        let ls = derive_call_key(tn::RUN_BASH, &json!({ "command": "ls -la" }));
-        assert_eq!(git, "git");
-        assert_eq!(cargo, "cargo");
-        assert_eq!(ls, "ls");
-        assert_ne!(git, cargo);
-        assert_ne!(cargo, ls);
-    }
-
-    #[test]
-    fn run_bash_same_prefix_buckets_together() {
-        let a = derive_call_key(tn::RUN_BASH, &json!({ "command": "git status" }));
-        let b = derive_call_key(tn::RUN_BASH, &json!({ "command": "git add ." }));
-        let c = derive_call_key(tn::RUN_BASH, &json!({ "command": "git commit -m x" }));
-        assert_eq!(a, "git");
-        assert_eq!(b, "git");
-        assert_eq!(c, "git");
-    }
-
-    #[test]
-    fn read_file_keys_by_path_unchanged() {
-        let key = derive_call_key(tn::READ_FILE, &json!({ "path": "src/main.rs" }));
-        assert_eq!(key, "src/main.rs");
-    }
-
-    #[test]
-    fn web_search_keys_by_query_unchanged() {
-        let key = derive_call_key(tn::WEB_SEARCH, &json!({ "query": "rust async" }));
-        assert_eq!(key, "rust async");
-    }
-
-    #[test]
-    fn non_run_bash_with_command_arg_does_not_bucket_by_command() {
-        // Sanity: only run_bash is special-cased. A different tool that happens
-        // to carry a `command` arg falls through to the path/url/query lookup.
-        let key = derive_call_key(tn::READ_FILE, &json!({ "command": "git status" }));
-        assert_eq!(key, "");
-    }
-
-    #[test]
-    fn non_run_bash_without_known_arg_returns_empty() {
-        let key = derive_call_key(tn::LIST_FILES, &json!({}));
-        assert_eq!(key, "");
-    }
-}
+#[path = "agentic_loop_unit_tests.rs"]
+mod unit_tests;
 
 #[cfg(test)]
 #[path = "agentic_loop_tests.rs"]

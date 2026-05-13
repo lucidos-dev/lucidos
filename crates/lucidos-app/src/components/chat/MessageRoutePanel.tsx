@@ -45,12 +45,12 @@ export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
   if (userEvent.type === 'CredentialRequested' || userEvent.type === 'McpConsentRequested') {
     return undefined;
   }
-  // Engine-emitted events (SessionRecovered, CodingAgentPromptSent, TriggerStarted, ChangeProposed)
+  // Engine-emitted events (ContinuationStarted, CodingAgentPromptSent, TriggerStarted, ChangeProposed)
   // carry origin directly — surface it so the popover can render the Engine variant.
   if ('origin' in userEvent && userEvent.origin) {
     return userEvent.origin as MessageOrigin;
   }
-  // SessionRecovered triggered by the user clicking Continue stamps the device
+  // ContinuationStarted triggered by the user clicking Continue stamps the device
   // on `EventMeta.actor` (the chip reads it for the "You" label) but leaves
   // `origin` empty — fall back so the popover matches the chip.
   if ('actor' in userEvent && userEvent.actor) {
@@ -76,7 +76,7 @@ export function resolveThreadLinkTitle(
   return origin.thread_id;
 }
 
-/** Branch + ccSessionId come from `SessionStarted` (or `SessionRecovered`), which fire
+/** Branch + ccSessionId come from `SessionStarted` (or `ContinuationStarted`), which fire
  *  once per CC process spawn — not per user message. A follow-up exchange within an
  *  existing CC session has no SessionStarted in its own steps, so we walk the full thread
  *  up to this exchange's user event and track the most recent branch-defining event.
@@ -111,7 +111,7 @@ export function executorExtras(
       // prior session's repo_id when the current SessionStarted lacks one
       // (legacy events from before the engine always stamped repo_id).
       repoId = event.repo_id;
-    } else if (event.type === 'SessionRecovered' && event.branch) {
+    } else if (event.type === 'ContinuationStarted' && event.branch) {
       branch = event.branch;
     }
     if (seq === lastSeq) break;
@@ -124,7 +124,13 @@ export function executorExtras(
     if (event.type === 'CodingAgentSettingsChanged') {
       if (event.permission_mode) permissionMode = event.permission_mode;
     } else if (event.type === 'Thinking') {
+      // Legacy DB rows — ContextCaptured below overrides when present.
       if (typeof event.context_tokens === 'number') contextTokens = event.context_tokens;
+      if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;
+    } else if (event.type === 'ContextCaptured') {
+      // Prefer real input_tokens; fall back to the chars/4 estimate.
+      const tokens = event.usage?.input_tokens ?? event.estimated_total_tokens;
+      if (typeof tokens === 'number') contextTokens = tokens;
       if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;
     }
   }

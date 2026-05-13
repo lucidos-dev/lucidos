@@ -3661,6 +3661,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             &brief,
             Some(task_id),
             Some("morning-brief"),
+            None,
             morning_time,
         )
         .await?;

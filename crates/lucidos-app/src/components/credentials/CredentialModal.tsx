@@ -4,6 +4,8 @@ import { closeCredentialForm, submitCredential } from '../../store/actions/crede
 import { loadedOr } from '../../store/types';
 import type { AuthType, CredentialInfo, CredentialRequest } from '../../store/types';
 import { Dropdown } from '../shared/Dropdown';
+import { isMobile } from '../../utils/viewport';
+import { pickCredentialAutofocus } from './credentialAutofocus';
 
 export function CredentialModal() {
   const form = activeInlineForm.value;
@@ -59,15 +61,11 @@ function CredentialFormInner({ editing, request, existingCred }: CredentialFormI
   const clientSecretRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (request) {
-      if (selectedAuthType === 'password') {
-        usernameRef.current?.focus();
-      } else if (selectedAuthType === 'oauth_client') {
-        clientIdRef.current?.focus();
-      } else {
-        authValueRef.current?.focus();
-      }
-    }
+    if (!request) return;
+    const target = pickCredentialAutofocus(selectedAuthType, isMobile());
+    if (target === 'username') usernameRef.current?.focus();
+    else if (target === 'clientId') clientIdRef.current?.focus();
+    else if (target === 'authValue') authValueRef.current?.focus();
   }, [request, selectedAuthType]);
 
   const isEmailPassword = selectedAuthType === 'email_password';

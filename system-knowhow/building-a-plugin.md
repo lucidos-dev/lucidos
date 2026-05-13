@@ -17,6 +17,7 @@ A plugin is one bundle other workspaces install as a single unit. Use it only wh
 | A standalone knowhow file | Knowhow file, paste it into `data/knowhow/` -- knowhow is already portable |
 | An app + the knowhow it relies on + the trigger that drives it | Plugin -- the pieces only make sense together |
 | A self-healing browser-skills loop (write-side knowhow + read-side reflection knowhow that a trigger calls) | Plugin -- canonical example, see `lucidos-dev/plugins/browser-learning` |
+| A WASM auth signer (`<name>.wasm` + `<name>.manifest.json`) and the apis.json snippet that calls it | Plugin -- ship the signer in `auth-modules/` and use the `setup` field to walk the user through wiring `apis.json` + credentials at install time. See `system-knowhow/building-an-auth-handshake.md` for the signer ABI. |
 | Engine defaults every workspace should always have | Not a plugin -- belongs in `system-knowhow/` |
 
 The distinguishing test: removing any one file from the bundle would leave the others non-functional or actively misleading. If the files don't cohere, ship them separately.
@@ -32,7 +33,7 @@ A plugin is a published artifact other workspaces install -- get the shape right
 
 ## Plugin layout
 
-A plugin is a directory containing `manifest.toml` at the root plus a subset of four content directories. The directories mirror `data/` one-to-one -- whatever lives at `<plugin>/<dir>/...` lands at `<workspace>/data/<dir>/...` at install time.
+A plugin is a directory containing `manifest.toml` at the root plus a subset of five content directories. The directories mirror `data/` one-to-one -- whatever lives at `<plugin>/<dir>/...` lands at `<workspace>/data/<dir>/...` at install time.
 
 ```
 my-plugin/
@@ -41,7 +42,12 @@ my-plugin/
   knowhow/               # optional, mirrors data/knowhow/
   triggers/              # optional, mirrors data/triggers/
   scripts/               # optional, mirrors data/scripts/
+  auth-modules/          # optional, mirrors data/auth-modules/
+                         #   ship `<name>.wasm` + optional `<name>.manifest.json` sidecar;
+                         #   install auto-reloads the proxy WASM signer map
 ```
+
+The `manifest.json` sidecar carries only WASM-host metadata (`secret_handles`, `body_mode`, `capabilities`). The engine never auto-loads provider config from it — `data/config/apis.json` is the single source of truth for proxy entries. Plugins that ship a signer should include the matching `apis.json` snippet in the manifest's `setup` field so the install-time LLM walks the user through pasting it into `data/config/apis.json` and registering the credential.
 
 Validation rules enforced at install (`core/plugins.rs::validate_tree` and `validate_archive_entry_path`). Any failure rejects the archive before any file is written:
 
@@ -50,8 +56,8 @@ Validation rules enforced at install (`core/plugins.rs::validate_tree` and `vali
 - `id` matches `[a-z0-9-]+`, non-empty, max 64 chars. Uppercase, underscore, dot all reject.
 - `version` parses as semver.
 - `source`, when present, looks like a git remote: starts with `https://`, `http://`, `git@`, or ends in `.git`. Bare strings, `file://` URLs, and `.lucidos-plugin` paths are not valid. `source` is optional -- omit it for archive-only plugins shared peer-to-peer (Slack drop, USB stick, attachment). `update_plugin` and `check_plugin_updates` will refuse a sourceless plugin with an explanatory error, but install and uninstall work fine.
-- Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, scripts}`. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (auto-injected by macOS Finder when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed.
-- At least one of `apps/`, `knowhow/`, `triggers/`, `scripts/` exists with at least one file. An empty `knowhow/` directory passes the top-level check but fails as `EmptyTree`.
+- Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, scripts, auth-modules}`. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (auto-injected by macOS Finder when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed.
+- At least one of `apps/`, `knowhow/`, `triggers/`, `scripts/`, `auth-modules/` exists with at least one file. An empty `knowhow/` directory passes the top-level check but fails as `EmptyTree`.
 - Hidden files (any path component starting with `.`) are silently skipped during the file walk -- `.DS_Store`, editor swap files, and friends do not get installed.
 - No archive entry uses `..` or absolute paths (`/`, `\`) -- zip-slip protection.
 
@@ -63,7 +69,7 @@ Four required fields, two optional. Unknown extra fields are accepted and round-
 
 | Field | Required | Type | Notes |
 |---|---|---|---|
-| `id` | yes | string | `[a-z0-9-]+`, max 64 chars. Used as the install-record key, the event `aggregate_id`, and the argument to `update_plugin` / `uninstall_plugin`. |
+| `id` | yes | string | `[a-z0-9-]+`, max 64 chars. Used as the install-record key, the event `aggregate_id`, and the canonical argument to `update_plugin` / `uninstall_plugin`. (`uninstall_plugin` also accepts the manifest `name` or any `apps/<dir>` folder name the plugin owns, case-insensitive — picks one if unambiguous, otherwise lists candidates.) |
 | `version` | yes | string | Semver (`MAJOR.MINOR.PATCH`). `0.1.0`, `1.4.2-beta.1` both parse. |
 | `name` | yes | string | Human-friendly title shown in install/uninstall messages. |
 | `description` | yes | string | One-line summary. Free text. If your plugin pairs well with a cron trigger, mention it here (e.g. "Ask Lucidos to set up a daily reflection trigger after install") so the install-time LLM offers to wire one up -- see "What doesn't belong in a plugin" below. |
@@ -81,6 +87,24 @@ source = "https://github.com/lucidos-dev/plugins/tree/main/browser-learning"
 ```
 
 The `source` may be the GitHub tree URL the user copied from the address bar -- the install tool parses it back into a git remote + branch + subpath. For a single-repo plugin, use the bare git URL.
+
+## Install confirmation panel
+
+`install_plugin` (and `update_plugin`) never write directly to `data/`. The engine fetches + validates into a staged temp dir, then surfaces a confirmation panel in the Lucidos UI -- same content-pane surface as a credential request. The panel shows:
+
+- The plugin name + version + description from the manifest
+- The `source` (git URL or archive path) and `source_type` (git / archive)
+- Every `data/`-relative path the install will write (overwrites called out separately in yellow)
+- The `setup` field rendered as markdown, if present
+
+The user clicks **Confirm** (writes files, emits `PluginInstalled`, auto-reloads WASM signers if any `auth-modules/` files were touched) or **Cancel** (drops staging, emits `PluginInstallCanceled`). Until they click, no bytes hit `data/`.
+
+What this means for plugin authors:
+
+- **Lead with `name` and `description`.** They render at the top of the panel. A vague description ("Self-healing site knowhow for browser automation. Agents emit observations during tasks…") gives the user enough to decide; a single word ("browser-skills") doesn't.
+- **Use `setup` for wiring instructions the LLM should run after install.** It renders as markdown in the panel so the user sees the steps before confirming, and the same text comes back to the LLM as the install tool result so the agent can offer to chain through them.
+- **Updates inherit the same panel.** `update_plugin` re-fetches the source and routes through the same staging path -- the user reviews the new version's file list (added/changed/removed -- well, "would overwrite" for changed) before any bytes are written.
+- **Staged installs expire after 1 hour.** A panel left open longer is silently discarded; the user has to re-call `install_plugin`. Engine restarts also drop in-flight stagings (the staged temp dir is gone). Don't author flows that expect the panel to sit open for a full day.
 
 ## What doesn't belong in a plugin
 

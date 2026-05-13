@@ -41,6 +41,8 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:title-generation', label: 'Title generation', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:title-generation' },
   { id: 'models:image-description', label: 'Image description', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:image-description' },
   { id: 'models:memory-context', label: 'Memory & context', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:memory-context' },
+  { id: 'models:debugging', label: 'Debugging', subview: 'models', path: 'Settings → Models', anchor: 'models:debugging' },
+  { id: 'models:capture-context', label: 'Capture context per step', subview: 'models', path: 'Settings → Models → Debugging', anchor: 'models:capture-context' },
   { id: 'models:region', label: 'Region', subview: 'models', path: 'Settings → Models → Vertex AI', anchor: 'models:region' },
 
   // Appearance subview

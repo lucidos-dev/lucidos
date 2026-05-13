@@ -82,6 +82,15 @@ pub struct LlmResponse {
     /// chars/4 estimate (which over-counts base64 image bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u32>,
+    /// Cache-write token count (Anthropic-only). `None` on providers without
+    /// prompt caching. Together with `cache_read_tokens` lets the modal show
+    /// hit/miss rate so the user can see why a turn was cheap or expensive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    /// Cache-read token count (Anthropic-only). `None` on providers without
+    /// prompt caching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
     /// Total characters of thinking text. High value with empty content
     /// distinguishes "thought hard then gave up" from "said nothing".
     #[serde(default, skip_serializing_if = "Option::is_none")]

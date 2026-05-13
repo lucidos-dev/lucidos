@@ -240,6 +240,8 @@ impl LucidosEngine {
             return Err("Provide either json_path + new_value or old_string + new_string".into());
         };
 
+        let _repo_guard = self.lock_workspace_repo().await;
+
         std::fs::write(&full_path, &new_content)
             .map_err(|e| format!("Failed to write file: {}", e))?;
 
@@ -284,6 +286,143 @@ fn image_media_type(ext: &str) -> Option<&'static str> {
     }
 }
 
+/// Lowercased file extension via `Path::extension`, or `""` if none.
+fn lowercase_extension(path: &str) -> String {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+/// File-name suffixes that `read_file` treats as a virtual directory: a path that traverses
+/// past such a segment is unzipped on the fly so the LLM can read entries without dropping
+/// to `run_python` + `zipfile`. `.lucidos-plugin` reuses the canonical constant in
+/// `core::plugins` so the literal lives in one place.
+const ARCHIVE_SUFFIXES: &[&str] = &[crate::core::plugins::PLUGIN_ARCHIVE_EXT, ".zip"];
+
+/// Hard ceiling on the uncompressed size of a single zip entry the archive branch will
+/// decompress into memory. Defends against zip-bombs (small `.lucidos-plugin` carrying a
+/// huge entry that decompresses to multi-GB). Generous vs. real plugin file sizes.
+pub(crate) const READ_FILE_FROM_ARCHIVE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Slice text content by 1-based line range. `start_line == 0` is treated as `1`.
+/// `line_count == None` reads to end. If `start_line` is past the file, returns `""`.
+/// Lines are split on `\n`; the joined result uses `\n` between lines (no trailing
+/// newline added). The function does not append slice metadata — callers compose that.
+pub(crate) fn slice_lines(content: &str, start_line: usize, line_count: Option<usize>) -> String {
+    let start_line = start_line.max(1);
+    let take = line_count.unwrap_or(usize::MAX);
+    let mut iter = content.split('\n').skip(start_line - 1).take(take);
+    let Some(first) = iter.next() else {
+        return String::new();
+    };
+    let mut out = String::from(first);
+    for line in iter {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
+}
+
+/// If `data_path` traverses *into* a `.lucidos-plugin` or `.zip` segment (i.e. there is at
+/// least one path component after the archive), split into `(archive_data_path, inner_path)`.
+/// Returns `None` for plain paths and for archives with no inner path (so the caller can still
+/// read the archive bytes themselves). The first matching segment wins — nested archives are
+/// not transparently traversed.
+pub(crate) fn split_archive_path(data_path: &str) -> Option<(String, String)> {
+    // Fast path: 99% of read_file calls hit a non-archive path. Skip the segment walk
+    // and the Vec allocation if no archive suffix appears anywhere.
+    if !ARCHIVE_SUFFIXES.iter().any(|s| data_path.contains(s)) {
+        return None;
+    }
+    let segments: Vec<&str> = data_path.split('/').collect();
+    for (i, seg) in segments.iter().enumerate() {
+        if i + 1 >= segments.len() {
+            break;
+        }
+        if ARCHIVE_SUFFIXES.iter().any(|s| seg.ends_with(s)) {
+            let archive = segments[..=i].join("/");
+            let inner = segments[i + 1..].join("/");
+            // Trailing slash like `foo.zip/` splits to ["foo.zip", ""] — treat as no inner.
+            if inner.is_empty() {
+                return None;
+            }
+            return Some((archive, inner));
+        }
+    }
+    None
+}
+
+/// Pull `start_line` / `line_count` from the LLM's `read_file` args. Returns `None` when the
+/// caller didn't ask for line slicing; otherwise `Some((start_line, line_count))` where a
+/// missing `start_line` defaults to `1` and a missing `line_count` means "to end of file".
+pub(crate) fn line_window_from_args(
+    args: &serde_json::Value,
+) -> Option<(usize, Option<usize>)> {
+    let start = args
+        .get("start_line")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let count = args
+        .get("line_count")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    match (start, count) {
+        (None, None) => None,
+        (s, c) => Some((s.unwrap_or(1), c)),
+    }
+}
+
+/// Read a single entry from a zip archive at `archive_path` as UTF-8 text. Errors carry the
+/// inner name so the LLM can correct typos without re-listing the archive. Inner names are
+/// validated against the same zip-slip policy `extract_zip` uses, so `..`/leading-`/`/`\`/
+/// empty names are rejected before the lookup. The uncompressed entry size is checked
+/// against `max_uncompressed` before decompression — protects against zip-bombs.
+pub(crate) fn read_text_from_zip(
+    archive_path: &std::path::Path,
+    inner_path: &str,
+    max_uncompressed: u64,
+) -> Result<String, String> {
+    use std::io::Read as _;
+    crate::core::plugins::validate_archive_entry_path(inner_path)
+        .map_err(|e| format!("rejected zip entry '{}': {}", inner_path, e))?;
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("open archive {}: {}", archive_path.display(), e))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("read archive: {}", e))?;
+    let mut entry = zip
+        .by_name(inner_path)
+        .map_err(|e| format!("zip entry '{}' not found: {}", inner_path, e))?;
+    let size = entry.size();
+    if size > max_uncompressed {
+        return Err(format!(
+            "zip entry '{}' too large: uncompressed size {} bytes exceeds cap of {} bytes",
+            inner_path, size, max_uncompressed
+        ));
+    }
+    let mut buf = String::new();
+    entry
+        .read_to_string(&mut buf)
+        .map_err(|e| format!("read entry '{}': {}", inner_path, e))?;
+    Ok(buf)
+}
+
+/// If `inner_path` looks like a binary file by extension, return a clear short-circuit
+/// message for the archive branch — `read_text_from_zip` would otherwise fail with an
+/// opaque "stream did not contain valid UTF-8" error. Returns `None` for text-shaped
+/// inner paths so the archive branch keeps reading them as text.
+pub(crate) fn archive_entry_unsupported_message(inner_path: &str) -> Option<String> {
+    if !crate::core::is_binary_extension(&lowercase_extension(inner_path)) {
+        return None;
+    }
+    Some(format!(
+        "[Binary entry '{}' inside archive — read_file inside zip/.lucidos-plugin \
+         supports text only. Install the plugin or extract the archive first to \
+         inspect binary contents.]",
+        inner_path
+    ))
+}
+
 /// Parse a `[IMAGE_CONTENT:type]\n<base64>` sentinel produced by `read_file` for image files.
 /// Returns `(media_type, base64_data)` if matched, `None` otherwise. Single source of truth
 /// for the format; both the agentic loop (which lifts the bytes into an LLM image block) and
@@ -318,20 +457,55 @@ impl LucidosEngine {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             "read_file" => {
+                let raw_path = args["path"].as_str().unwrap_or("");
+
+                // Archive traversal: a path like
+                // `artifacts/plugins/foo.lucidos-plugin/apps/x/index.html` reads the named
+                // entry out of the zip on the fly, so the LLM doesn't need to drop to
+                // `run_python` + `zipfile` just to peek inside.
+                if let Some((archive_data_path, inner)) = split_archive_path(raw_path) {
+                    // Binary inner entries (images, PDFs, nested archives) would crash
+                    // read_text_from_zip's UTF-8 decode — short-circuit with an actionable
+                    // message instead of a confusing stream error. Image/PDF support
+                    // inside archives is intentionally out of scope.
+                    if let Some(msg) = archive_entry_unsupported_message(&inner) {
+                        return Ok(msg);
+                    }
+                    let (_archive_norm, archive_full) =
+                        match self.resolve_data_path(&archive_data_path) {
+                            Ok(p) => p,
+                            Err(e) => return Ok(format!("Error: {}", e)),
+                        };
+                    if !archive_full.exists() {
+                        return Ok(format!(
+                            "[FILE NOT FOUND] archive '{}' does not exist",
+                            archive_data_path
+                        ));
+                    }
+                    let content = match read_text_from_zip(
+                        &archive_full,
+                        &inner,
+                        READ_FILE_FROM_ARCHIVE_MAX_BYTES,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => return Err(format!("reading from archive: {}", e).into()),
+                    };
+                    let display_path = format!("{}/{}", archive_data_path, inner);
+                    let sliced = match line_window_from_args(args) {
+                        Some((start, count)) => slice_lines(&content, start, count),
+                        None => content,
+                    };
+                    return Ok(sanitize_file_content_for_llm(sliced, &display_path, 0));
+                }
+
                 let (data_path, full_path) =
-                    match self.resolve_data_path(args["path"].as_str().unwrap_or("")) {
+                    match self.resolve_data_path(raw_path) {
                         Ok(p) => p,
                         Err(e) => return Ok(format!("Error: {}", e)),
                     };
                 let path = data_path.as_str();
 
-                // Check if it's a binary file by extension
-                let extension = std::path::Path::new(path)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-
+                let extension = lowercase_extension(path);
                 let is_binary = crate::core::is_binary_extension(&extension);
 
                 if is_binary {
@@ -398,7 +572,7 @@ impl LucidosEngine {
                         } else if let Some(media_type) = image_media_type(&extension) {
                             let size = match std::fs::metadata(&full_path) {
                                 Ok(m) => m.len(),
-                                Err(e) => return Ok(format!("Error reading image file: {}", e)),
+                                Err(e) => return Err(format!("reading image file: {}", e).into()),
                             };
                             if size > IMAGE_MAX_BYTES {
                                 let mb = size as f64 / (1024.0 * 1024.0);
@@ -413,7 +587,7 @@ impl LucidosEngine {
                                             .encode(&bytes);
                                         Ok(format!("[IMAGE_CONTENT:{}]\n{}", media_type, b64))
                                     }
-                                    Err(e) => Ok(format!("Error reading image file: {}", e)),
+                                    Err(e) => Err(format!("reading image file: {}", e).into()),
                                 }
                             }
                         } else {
@@ -429,12 +603,22 @@ impl LucidosEngine {
                     }
                 } else {
                     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let line_window = line_window_from_args(args);
                     match std::fs::read_to_string(&full_path) {
-                        Ok(content) => Ok(sanitize_file_content_for_llm(content, path, offset)),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            Ok(format!("Error reading file: file not found: {}", path))
+                        Ok(content) => {
+                            // The slice is its own chunk, so sanitize from offset 0.
+                            let (text, sanitize_offset) = match line_window {
+                                Some((start, count)) => {
+                                    (slice_lines(&content, start, count), 0)
+                                }
+                                None => (content, offset),
+                            };
+                            Ok(sanitize_file_content_for_llm(text, path, sanitize_offset))
                         }
-                        Err(e) => Ok(format!("Error reading file: {}", e)),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            Err(format!("reading file: file not found: {}", path).into())
+                        }
+                        Err(e) => Err(format!("reading file: {}", e).into()),
                     }
                 }
             }
@@ -474,6 +658,8 @@ impl LucidosEngine {
                         path
                     ));
                 }
+
+                let _repo_guard = self.lock_workspace_repo().await;
 
                 // Create parent directories and write
                 if let Some(parent) = full_path.parent() {
@@ -565,7 +751,7 @@ impl LucidosEngine {
                 // list_artifacts already walks all browsable data/ directories
                 let all_files = match self.artifact_manager.list_artifacts() {
                     Ok(files) => files,
-                    Err(e) => return Ok(format!("Error listing files: {}", e)),
+                    Err(e) => return Err(format!("listing files: {}", e).into()),
                 };
 
                 Ok(all_files.join("\n"))
@@ -664,6 +850,8 @@ impl LucidosEngine {
 
                 let file_exists = dst_path.exists();
 
+                let _repo_guard = self.lock_workspace_repo().await;
+
                 // Create parent directories
                 if let Some(parent) = dst_path.parent() {
                     std::fs::create_dir_all(parent)
@@ -722,6 +910,29 @@ impl LucidosEngine {
                 if !full_path.exists() {
                     return Ok(format!("[NO ACTION NEEDED] File '{}' does not exist (may have been deleted already).", path));
                 }
+
+                // Plugin-owned files route through uninstall_plugin so the
+                // user's confirm panel always fires and the registry stays
+                // in sync with disk.
+                match crate::engine::tools::plugins::find_plugin_owning_file(&self.pool, path).await {
+                    Ok(Some(owner)) => {
+                        return Ok(format!(
+                            "Error: Cannot delete '{}': it belongs to installed plugin '{}' (\"{}\"). \
+Use uninstall_plugin('{}') instead — the panel confirms with the user before any files are deleted, \
+and emits the PluginUninstalled event so the registry stays in sync.",
+                            path, owner.plugin_id, owner.plugin_name, owner.plugin_id
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Ok(format!(
+                            "Error: Cannot delete '{}': failed to check plugin ownership: {}",
+                            path, e
+                        ));
+                    }
+                }
+
+                let _repo_guard = self.lock_workspace_repo().await;
 
                 // Delete and commit via appropriate manager
                 let commit_msg = args
@@ -1077,5 +1288,294 @@ mod tests {
         let result = json_set_value(&mut doc, "", new_val.clone());
         assert!(result.is_ok());
         assert_eq!(doc, new_val);
+    }
+
+    // --- slice_lines ------------------------------------------------------
+
+    #[test]
+    fn slice_lines_full_content_when_unbounded() {
+        assert_eq!(slice_lines("a\nb\nc", 1, None), "a\nb\nc");
+    }
+
+    #[test]
+    fn slice_lines_inclusive_range() {
+        assert_eq!(slice_lines("a\nb\nc\nd\ne", 2, Some(2)), "b\nc");
+    }
+
+    #[test]
+    fn slice_lines_clamps_at_eof() {
+        assert_eq!(slice_lines("a\nb", 1, Some(100)), "a\nb");
+    }
+
+    #[test]
+    fn slice_lines_past_eof_returns_empty() {
+        assert_eq!(slice_lines("a\nb", 100, Some(1)), "");
+    }
+
+    #[test]
+    fn slice_lines_zero_count_returns_empty() {
+        assert_eq!(slice_lines("a\nb\nc", 1, Some(0)), "");
+    }
+
+    #[test]
+    fn slice_lines_treats_zero_start_as_one() {
+        assert_eq!(slice_lines("a\nb\nc", 0, Some(2)), "a\nb");
+    }
+
+    #[test]
+    fn slice_lines_single_line_no_trailing_newline() {
+        assert_eq!(slice_lines("only", 1, None), "only");
+        assert_eq!(slice_lines("only", 1, Some(1)), "only");
+    }
+
+    // --- split_archive_path -----------------------------------------------
+
+    #[test]
+    fn split_archive_path_lucidos_plugin() {
+        assert_eq!(
+            split_archive_path("artifacts/plugins/foo-0.1.0.lucidos-plugin/apps/x/index.html"),
+            Some((
+                "artifacts/plugins/foo-0.1.0.lucidos-plugin".to_string(),
+                "apps/x/index.html".to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn split_archive_path_zip() {
+        assert_eq!(
+            split_archive_path("artifacts/imports/bundle.zip/data.json"),
+            Some((
+                "artifacts/imports/bundle.zip".to_string(),
+                "data.json".to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn split_archive_path_no_inner_returns_none() {
+        // Just the archive itself — caller wants the bytes, not unzip semantics.
+        assert_eq!(
+            split_archive_path("artifacts/plugins/foo.lucidos-plugin"),
+            None
+        );
+        assert_eq!(split_archive_path("artifacts/foo.zip"), None);
+    }
+
+    #[test]
+    fn split_archive_path_regular_path_returns_none() {
+        assert_eq!(split_archive_path("artifacts/notes.md"), None);
+        assert_eq!(split_archive_path("apps/foo/index.html"), None);
+    }
+
+    #[test]
+    fn split_archive_path_first_archive_wins_for_nested() {
+        // We don't recurse into nested archives; first-match wins.
+        assert_eq!(
+            split_archive_path("artifacts/a.zip/b.zip/c.txt"),
+            Some(("artifacts/a.zip".to_string(), "b.zip/c.txt".to_string()))
+        );
+    }
+
+    // --- read_text_from_zip -----------------------------------------------
+
+    #[test]
+    fn read_text_from_zip_returns_entry_content() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("test.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("inner/hello.txt", opts).unwrap();
+        zw.write_all(b"hello world").unwrap();
+        zw.finish().unwrap();
+
+        let got =
+            read_text_from_zip(&zip_path, "inner/hello.txt", READ_FILE_FROM_ARCHIVE_MAX_BYTES)
+                .unwrap();
+        assert_eq!(got, "hello world");
+    }
+
+    #[test]
+    fn read_text_from_zip_rejects_oversized_entry() {
+        // Zip-bomb defense: an inner entry whose uncompressed size exceeds the cap
+        // is rejected before we allocate the buffer for it. Test uses a tiny cap so
+        // the fixture stays small.
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("big.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("big.txt", opts).unwrap();
+        zw.write_all(&vec![b'x'; 200]).unwrap();
+        zw.finish().unwrap();
+
+        let err = read_text_from_zip(&zip_path, "big.txt", 100).unwrap_err();
+        assert!(
+            err.contains("too large") || err.contains("exceeds"),
+            "oversized entry must be rejected with a size hint, got: {}",
+            err
+        );
+        // Cap is reported so the LLM knows the limit.
+        assert!(err.contains("100"), "error should mention the cap, got: {}", err);
+    }
+
+    // --- line_window_from_args -------------------------------------------
+
+    #[test]
+    fn line_window_none_when_no_args() {
+        assert_eq!(line_window_from_args(&serde_json::json!({})), None);
+        assert_eq!(
+            line_window_from_args(&serde_json::json!({"path": "x"})),
+            None
+        );
+    }
+
+    #[test]
+    fn line_window_start_only_defaults_count_to_open() {
+        assert_eq!(
+            line_window_from_args(&serde_json::json!({"start_line": 5})),
+            Some((5, None))
+        );
+    }
+
+    #[test]
+    fn line_window_count_only_defaults_start_to_one() {
+        assert_eq!(
+            line_window_from_args(&serde_json::json!({"line_count": 3})),
+            Some((1, Some(3)))
+        );
+    }
+
+    #[test]
+    fn line_window_both_args() {
+        assert_eq!(
+            line_window_from_args(&serde_json::json!({"start_line": 10, "line_count": 4})),
+            Some((10, Some(4)))
+        );
+    }
+
+    #[test]
+    fn archive_entry_unsupported_text_extensions_return_none() {
+        for inner in [
+            "apps/x/index.html",
+            "knowhow/notes.md",
+            "manifest.toml",
+            "scripts/run.sh",
+            "no-extension-file",
+        ] {
+            assert_eq!(
+                archive_entry_unsupported_message(inner),
+                None,
+                "text-shaped inner path '{}' should not short-circuit",
+                inner
+            );
+        }
+    }
+
+    #[test]
+    fn archive_entry_unsupported_binary_extensions_return_message() {
+        for (inner, hint) in [
+            ("icon.png", "binary"),
+            ("doc.pdf", "binary"),
+            ("apps/foo/screenshot.jpg", "binary"),
+            ("nested.zip", "binary"),
+        ] {
+            let msg = archive_entry_unsupported_message(inner)
+                .unwrap_or_else(|| panic!("'{}' should short-circuit with a message", inner));
+            assert!(
+                msg.contains(hint),
+                "message for '{}' should mention '{}', got: {}",
+                inner,
+                hint,
+                msg
+            );
+            // Must mention the inner path so the LLM knows what was rejected.
+            assert!(
+                msg.contains(inner),
+                "message for '{}' should name the entry, got: {}",
+                inner,
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn read_text_from_zip_rejects_empty_inner_path() {
+        // Empty inner names are rejected by validate_archive_entry_path itself
+        // (see core::plugins::tests::rejects_empty_path), surfaced here via the
+        // shared "rejected zip entry" wrapper.
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("test.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("a.txt", opts).unwrap();
+        zw.write_all(b"a").unwrap();
+        zw.finish().unwrap();
+
+        let err = read_text_from_zip(&zip_path, "", READ_FILE_FROM_ARCHIVE_MAX_BYTES).unwrap_err();
+        assert!(
+            err.contains("rejected") && err.contains("unsafe"),
+            "empty inner must surface the validation error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn read_text_from_zip_rejects_zip_slip_inner_path() {
+        // Zip-slip defense: an inner path with `..` or a leading slash must be rejected
+        // before we even hash-lookup the entry, matching what extract_zip enforces.
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("test.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("a.txt", opts).unwrap();
+        zw.write_all(b"a").unwrap();
+        zw.finish().unwrap();
+
+        for bad in ["../a.txt", "/etc/passwd", "foo/../../etc/passwd", "\\windows"] {
+            let err = read_text_from_zip(&zip_path, bad, READ_FILE_FROM_ARCHIVE_MAX_BYTES)
+                .unwrap_err();
+            assert!(
+                err.contains("unsafe"),
+                "rejected `{}` must surface the validation error (not a generic \
+                 'not found'), got: {}",
+                bad,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn read_text_from_zip_missing_entry_errors() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("test.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("a.txt", opts).unwrap();
+        zw.write_all(b"a").unwrap();
+        zw.finish().unwrap();
+
+        let err =
+            read_text_from_zip(&zip_path, "missing.txt", READ_FILE_FROM_ARCHIVE_MAX_BYTES)
+                .unwrap_err();
+        assert!(
+            err.contains("missing.txt"),
+            "error should name the missing entry, got: {}",
+            err
+        );
     }
 }

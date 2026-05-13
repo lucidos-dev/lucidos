@@ -20,6 +20,11 @@ pub const PREF_VERTEX_REGION: &str = "vertex_region";
 // Image generation model (also written by frontend Settings UI)
 pub const PREF_IMAGE_MODEL: &str = "image_model";
 
+// When off, ContextCaptured still fires per LLM call but section
+// bodies are dropped — only the name + char_count survives. Defaults
+// to "true" to preserve historical behavior.
+pub const PREF_CAPTURE_CONTEXT: &str = "capture_context";
+
 /// Store for managing user preferences in the database
 pub struct PreferenceStore;
 
@@ -176,6 +181,23 @@ impl PreferenceStore {
         Ok(result)
     }
 
+    /// Read the per-step context-capture toggle. Defaults to `true` when
+    /// unset or on DB error so existing workspaces keep capturing.
+    pub async fn capture_context(pool: &PgPool) -> bool {
+        match Self::get(pool, PREF_CAPTURE_CONTEXT).await {
+            Ok(Some(v)) => v != "false",
+            Ok(None) => true,
+            Err(e) => {
+                log!(
+                    "[Preferences] Failed to read {}: {}",
+                    PREF_CAPTURE_CONTEXT,
+                    e
+                );
+                true
+            }
+        }
+    }
+
     /// Read the user's chat model + reasoning effort preferences for code
     /// paths that originate a chat without an explicit user request
     /// (spawn_thread, process_trigger). DB errors are logged and treated as
@@ -197,6 +219,25 @@ impl PreferenceStore {
             });
         (model, effort)
     }
+
+    /// Resolve the (model, effort) pair stamped on a chat exchange when the
+    /// caller didn't fully specify them. Caller-provided values take
+    /// precedence; missing values fall back to the user's chat preferences.
+    /// Skips the DB read entirely when both are already set.
+    pub async fn resolve_chat_overrides(
+        pool: &PgPool,
+        model_override: Option<String>,
+        effort_override: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        if model_override.is_some() && effort_override.is_some() {
+            return (model_override, effort_override);
+        }
+        let (pref_model, pref_effort) = Self::user_chat_settings(pool).await;
+        (
+            model_override.or(pref_model),
+            effort_override.or(pref_effort),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +256,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capture_context_defaults_to_true_when_unset() {
+        let (pool, db_name) = setup_test_db().await;
+        assert!(PreferenceStore::capture_context(&pool).await);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn capture_context_returns_false_when_disabled() {
+        let (pool, db_name) = setup_test_db().await;
+        PreferenceStore::set(&pool, PREF_CAPTURE_CONTEXT, "false")
+            .await
+            .unwrap();
+        assert!(!PreferenceStore::capture_context(&pool).await);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn capture_context_returns_true_when_explicitly_true() {
+        let (pool, db_name) = setup_test_db().await;
+        PreferenceStore::set(&pool, PREF_CAPTURE_CONTEXT, "true")
+            .await
+            .unwrap();
+        assert!(PreferenceStore::capture_context(&pool).await);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
     async fn user_chat_settings_returns_stored_values() {
         let (pool, db_name) = setup_test_db().await;
         PreferenceStore::set(&pool, PREF_CHAT_MODEL, "claude-opus-4-7[1m]")
@@ -226,6 +297,70 @@ mod tests {
         let (model, effort) = PreferenceStore::user_chat_settings(&pool).await;
         assert_eq!(model.as_deref(), Some("claude-opus-4-7[1m]"));
         assert_eq!(effort.as_deref(), Some("max"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    async fn seed_chat_prefs(pool: &PgPool, model: &str, effort: &str) {
+        PreferenceStore::set(pool, PREF_CHAT_MODEL, model)
+            .await
+            .unwrap();
+        PreferenceStore::set(pool, PREF_CHAT_REASONING_EFFORT, effort)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolve_chat_overrides_falls_back_to_prefs_when_none() {
+        let (pool, db_name) = setup_test_db().await;
+        seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
+        let (model, effort) =
+            PreferenceStore::resolve_chat_overrides(&pool, None, None).await;
+        assert_eq!(model.as_deref(), Some("claude-opus-4-7[1m]"));
+        assert_eq!(effort.as_deref(), Some("xhigh"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_chat_overrides_keeps_explicit_caller_values() {
+        let (pool, db_name) = setup_test_db().await;
+        seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
+        let (model, effort) = PreferenceStore::resolve_chat_overrides(
+            &pool,
+            Some("claude-sonnet-4-6".to_string()),
+            Some("medium".to_string()),
+        )
+        .await;
+        assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(effort.as_deref(), Some("medium"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_chat_overrides_mixes_caller_and_prefs() {
+        let (pool, db_name) = setup_test_db().await;
+        seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
+        let (model, effort) = PreferenceStore::resolve_chat_overrides(
+            &pool,
+            Some("claude-sonnet-4-6".to_string()),
+            None,
+        )
+        .await;
+        assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(effort.as_deref(), Some("xhigh"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_chat_overrides_returns_none_when_no_caller_no_prefs() {
+        let (pool, db_name) = setup_test_db().await;
+        let (model, effort) =
+            PreferenceStore::resolve_chat_overrides(&pool, None, None).await;
+        assert_eq!(model, None);
+        assert_eq!(effort, None);
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

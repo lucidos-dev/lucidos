@@ -5,13 +5,13 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, pinnedApps } from '../store';
+import { panelOverlay, pinnedApps, appsList, triggers } from '../store';
 import { loadApps } from './apps';
 import { loadTriggers } from './triggers';
 import { loadArtifacts } from './artifacts';
 
-const RECENTS_KEY = 'lucidos-search-recents';
-const NAV_KEY = 'lucidos-nav-history';
+export const RECENTS_KEY = 'lucidos-search-recents';
+export const NAV_KEY = 'lucidos-nav-history';
 
 /** Process a raw SSE message for entity reference updates. */
 export function processSSEForReferences(type: string, data: Record<string, unknown>): void {
@@ -59,6 +59,16 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     // File events
     case 'ArtifactImported':
       loadArtifacts();
+      break;
+    // Plugin install/uninstall lands files under apps/, knowhow/, triggers/,
+    // scripts/, auth-modules/. Only refresh lists the user has already
+    // loaded — eagerly populating caches the user hasn't asked for is pure
+    // network + render waste. Knowhow has no list view; scripts/auth-modules
+    // don't surface.
+    case 'PluginInstalled':
+    case 'PluginUninstalled':
+      if (appsList.value.status === 'loaded') loadApps();
+      if (triggers.value.status === 'loaded') loadTriggers();
       break;
     // Thread title events
     case 'ThreadEvent':

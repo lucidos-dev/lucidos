@@ -1,36 +1,19 @@
 use super::*;
 
-use crate::core::knowhow::{format_missing_knowhow_message, missing_knowhow_ids};
 use crate::core::PreferenceStore;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
-use crate::triggers::{validate_script_extension, TriggerConfig, TriggerRun};
-
-/// Reject when an intent trigger references knowhow ids that don't resolve to a
-/// file. Without this, a typo or missing subdirectory prefix silently strips the
-/// knowhow at run time and the LLM never sees its instructions.
-fn validate_intent_knowhow(state: &AppState, run: &TriggerRun) -> Result<(), String> {
-    let TriggerRun::Intent { knowhow, .. } = run else {
-        return Ok(());
-    };
-    if knowhow.is_empty() {
-        return Ok(());
-    }
-    let missing = missing_knowhow_ids(
-        &state.engine.knowhow_dirs(),
-        state.engine.system_knowhow_dir(),
-        knowhow,
-    );
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format_missing_knowhow_message(&missing))
-    }
-}
+use crate::triggers::{
+    is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
+    TriggerConfig, TriggerRun,
+};
 
 #[derive(Serialize)]
 pub struct TriggerInfo {
     pub id: String,
     pub name: String,
+    /// Stable kebab-case slug. Directory segment for per-trigger know-how at
+    /// `data/triggers/{slug}/knowhow/`.
+    pub slug: String,
     pub cron_expressions: Vec<String>,
     pub timezone: String,
     pub paused: bool,
@@ -65,6 +48,7 @@ impl TriggerInfo {
         Self {
             id: config.id.clone(),
             name: config.name.clone(),
+            slug: config.slug.clone(),
             cron_expressions: config.schedule.clone(),
             timezone: config.timezone.clone(),
             paused: config.paused,
@@ -106,6 +90,11 @@ pub struct HistoricalTriggersResponse {
 pub struct CreateTriggerCronRequest {
     pub name: String,
     pub run: serde_json::Value,
+    /// Stable kebab-case slug for the trigger. Directory segment for
+    /// per-trigger know-how at `data/triggers/{slug}/knowhow/`. Optional —
+    /// derived from `name` (with UUID fallback) when omitted.
+    #[serde(default)]
+    pub slug: Option<String>,
     #[serde(default)]
     pub cron_expressions: Vec<String>,
     #[serde(default)]
@@ -153,6 +142,10 @@ pub struct UpdateTriggerCronRequest {
     pub app_id: Option<Option<String>>,
     #[serde(default)]
     pub go_to_review: Option<bool>,
+    /// Optional slug edit (e.g. trigger renamed). Validated against
+    /// [`is_valid_trigger_slug`] — invalid values reject the request with 400.
+    #[serde(default)]
+    pub slug: Option<String>,
 }
 
 /// Deserialize a field that can be absent, null, or a value.
@@ -163,6 +156,40 @@ where
     T: Deserialize<'de>,
 {
     Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+/// Validate a slug submitted in a `TriggerUpdated` request. Trims whitespace
+/// then runs [`is_valid_trigger_slug`]; returns the trimmed value on success.
+/// Pure helper, exposed for unit tests.
+pub(crate) fn validate_update_slug(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if !is_valid_trigger_slug(trimmed) {
+        return Err(format!(
+            "Invalid slug '{}': must be 1-64 chars of [a-z0-9-], starting and ending with [a-z0-9]",
+            trimmed
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Resolve the slug for a new trigger: validate an explicit submission, or
+/// derive from `name` (UUID-shortened fallback when name slugifies to empty).
+/// Pure helper, exposed for unit tests.
+pub(crate) fn resolve_create_slug(
+    explicit: Option<&str>,
+    name: &str,
+    trigger_id: &str,
+) -> Result<String, String> {
+    if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        if !is_valid_trigger_slug(s) {
+            return Err(format!(
+                "Invalid slug '{}': must be 1-64 chars of [a-z0-9-], starting and ending with [a-z0-9]",
+                s
+            ));
+        }
+        return Ok(s.to_string());
+    }
+    Ok(slugify_trigger_name_with_fallback(name, trigger_id))
 }
 
 #[derive(Deserialize)]
@@ -229,11 +256,6 @@ pub(super) async fn create_trigger(
         }
     }
 
-    // Validate referenced knowhow ids resolve to files
-    if let Err(e) = validate_intent_knowhow(&state, &run) {
-        return ApiResult::err(e);
-    }
-
     // Validate: at least one of cron or on_event must be provided
     let has_cron = !request.cron_expressions.is_empty();
     let on_event = request
@@ -273,9 +295,17 @@ pub(super) async fn create_trigger(
         Err(e) => return ApiResult::err(format!("Failed to serialize 'run': {}", e)),
     };
     let trigger_id_str = Uuid::new_v4().to_string();
+
+    // Slug: explicit (validated) or derived from name (UUID fallback).
+    let slug = match resolve_create_slug(request.slug.as_deref(), name, &trigger_id_str) {
+        Ok(s) => s,
+        Err(e) => return ApiResult::err(e),
+    };
+
     let mut payload = serde_json::json!({
         "trigger_id": trigger_id_str,
         "name": name,
+        "slug": slug,
         "schedule": cron_expressions,
         "timezone": timezone,
         "run": run_value,
@@ -347,9 +377,6 @@ pub(super) async fn update_trigger(
                         return ApiResult::err(e);
                     }
                 }
-                if let Err(e) = validate_intent_knowhow(&state, &parsed_run) {
-                    return ApiResult::err(e);
-                }
             }
             Err(_) => return ApiResult::err("Invalid 'run' field"),
         }
@@ -405,6 +432,12 @@ pub(super) async fn update_trigger(
     }
     if let Some(v) = request.go_to_review {
         update_payload["go_to_review"] = serde_json::json!(v);
+    }
+    if let Some(slug_raw) = request.slug.as_ref() {
+        match validate_update_slug(slug_raw) {
+            Ok(slug) => update_payload["slug"] = serde_json::json!(slug),
+            Err(e) => return ApiResult::err(e),
+        }
     }
 
     // Ensure trigger still has at least one firing mechanism after update
@@ -471,4 +504,85 @@ pub(super) async fn delete_trigger(
     }
 
     ApiResult::ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Slug resolution at the create boundary ---
+
+    #[test]
+    fn resolve_create_slug_accepts_explicit_valid() {
+        let slug = resolve_create_slug(Some("send-daily-summary"), "Anything", "uuid").unwrap();
+        assert_eq!(slug, "send-daily-summary");
+    }
+
+    #[test]
+    fn resolve_create_slug_derives_from_name_when_omitted() {
+        let slug = resolve_create_slug(None, "Send Daily Summary", "uuid-1234").unwrap();
+        assert_eq!(slug, "send-daily-summary");
+    }
+
+    #[test]
+    fn resolve_create_slug_derives_from_name_when_blank() {
+        // Whitespace-only treated like absent.
+        let slug = resolve_create_slug(Some("   "), "Send Daily Summary", "uuid").unwrap();
+        assert_eq!(slug, "send-daily-summary");
+    }
+
+    #[test]
+    fn resolve_create_slug_falls_back_to_uuid_when_name_empty_after_slugify() {
+        let slug = resolve_create_slug(None, "!!!", "abcdef-1234-5678").unwrap();
+        assert_eq!(slug, "trigger-abcdef12");
+    }
+
+    #[test]
+    fn resolve_create_slug_rejects_explicit_invalid() {
+        let err = resolve_create_slug(Some("Bad Slug"), "Anything", "uuid").unwrap_err();
+        assert!(err.contains("Invalid slug"));
+    }
+
+    // --- Slug edits at the update boundary ---
+
+    #[test]
+    fn validate_update_slug_accepts_well_formed() {
+        assert_eq!(
+            validate_update_slug("renamed-trigger").unwrap(),
+            "renamed-trigger"
+        );
+        // Trims whitespace.
+        assert_eq!(validate_update_slug("  abc  ").unwrap(), "abc");
+    }
+
+    #[test]
+    fn validate_update_slug_rejects_invalid() {
+        let err = validate_update_slug("Has Spaces").unwrap_err();
+        assert!(err.contains("Invalid slug"));
+        let err = validate_update_slug("-leading").unwrap_err();
+        assert!(err.contains("Invalid slug"));
+    }
+
+    // --- Request shape: slug field deserializes ---
+
+    #[test]
+    fn create_request_accepts_slug_field() {
+        let req: CreateTriggerCronRequest = serde_json::from_value(serde_json::json!({
+            "name": "Test",
+            "run": { "type": "intent", "intent": "x" },
+            "slug": "test-slug",
+            "cron_expressions": ["0 0 8 * * *"],
+        }))
+        .unwrap();
+        assert_eq!(req.slug.as_deref(), Some("test-slug"));
+    }
+
+    #[test]
+    fn update_request_accepts_slug_field() {
+        let req: UpdateTriggerCronRequest = serde_json::from_value(serde_json::json!({
+            "slug": "renamed-trigger",
+        }))
+        .unwrap();
+        assert_eq!(req.slug.as_deref(), Some("renamed-trigger"));
+    }
 }

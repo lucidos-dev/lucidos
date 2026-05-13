@@ -73,6 +73,8 @@ class SdkError extends Error {
 
 Read, write, and manage files in the workspace `data/` directory.
 
+> **Paths are relative to `data/`, not `data/artifacts/`.** App code lives in `apps/{id}/`, but app *data* must be written under `artifacts/` explicitly — e.g. `artifacts/{app-id}/data.json`. Omitting the prefix gives a 404 `SdkError` from `read` and a silent failure from `write`.
+
 ```ts
 lucidos.data.read(path: string): Promise<string>
 lucidos.data.write(path: string, content: string): Promise<WriteResult>
@@ -233,7 +235,7 @@ interface ProxyClient {
 }
 ```
 
-`auth.type` is `bearer`, `api_key`, or `basic`. `auth.credential` is the `service_name` already in the engine credential store. Omit `auth` for unauthenticated backends (e.g. local services).
+Authentication is configured per-API and applied server-side — the iframe never sees credentials, and the URL pattern (`/api/v1/proxy/<name>/<path>`) is identical regardless of auth mode. See `system-knowhow/lucidos-cli.md` § `lucidos proxy` for the full `apis.json` schema (bearer / api_key / basic / query_param / hmac_signed / script_handshake). Omit `auth` for unauthenticated backends (e.g. local services).
 
 ### Examples
 
@@ -416,6 +418,7 @@ interface Thread {
 ```ts
 lucidos.ui.applyPreferences(): Promise<void>
 lucidos.ui.navigate(target: string, params?: Record<string, string>): Promise<void>
+lucidos.ui.startThread(opts?: { prompt?: string }): Promise<void>
 lucidos.ui.confirm(options: ConfirmOptions): Promise<boolean>
 lucidos.ui.Select.create(opts: SelectCreateOptions): SelectInstance
 lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
@@ -431,6 +434,22 @@ lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
 |--------|--------|-------------|
 | `thread` | `id` | Focus a specific thread |
 | `app` | `id` | Open an app UI |
+| `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()` — it's the typed wrapper around this target. |
+
+### Starting a fresh chat with a prefilled prompt
+
+`lucidos.ui.startThread()` opens a new chat thread. If you pass a `prompt`, it lands in the compose textarea **prefilled** — the user reviews, edits, and clicks Send. It is never auto-submitted, so the user always stays in control of what gets sent on their behalf.
+
+```js
+// "Set this up for me" button — pops a fresh chat with a ready-to-send prompt.
+document.querySelector('#setup-trigger').addEventListener('click', () => {
+  lucidos.ui.startThread({
+    prompt: 'Create a daily 9am trigger that summarizes my unread email.',
+  });
+});
+```
+
+Call with no arguments (`lucidos.ui.startThread()`) to just open a blank fresh chat — equivalent to the user pressing the "new thread" shortcut.
 
 ### Confirmation dialogs
 

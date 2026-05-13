@@ -412,6 +412,7 @@ pub(crate) async fn catchup_and_ff_to_main(
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     let _merge_guard = MERGE_MUTEX.lock().await;
 
+    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
     for attempt in 1..=3 {
         catchup_with_main(worktree_path).await?;
 
@@ -438,11 +439,19 @@ pub(crate) async fn catchup_and_ff_to_main(
                         e
                     );
                 }
+                last_err = Some(e);
             }
         }
     }
 
-    Err("Fast-forward merge to main failed after 3 retries.".into())
+    Err(format!(
+        "Fast-forward merge to main failed after 3 retries: {}",
+        last_err
+            .as_ref()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    )
+    .into())
 }
 
 /// Catch up in the merge worktree, then fast-forward main to the temp branch.
@@ -459,6 +468,7 @@ pub(crate) async fn ff_merge_to_main(
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     let _merge_guard = MERGE_MUTEX.lock().await;
 
+    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
     for attempt in 1..=3 {
         catchup_with_main(Path::new(wt_path)).await?;
 
@@ -488,6 +498,7 @@ pub(crate) async fn ff_merge_to_main(
                         e
                     );
                 }
+                last_err = Some(e);
             }
         }
     }
@@ -495,7 +506,14 @@ pub(crate) async fn ff_merge_to_main(
     // All retries exhausted -- clean up
     let _ = git_cmd(&["worktree", "remove", "--force", wt_path], repo_root).await;
     let _ = git_cmd(&["branch", "-D", temp_branch], repo_root).await;
-    Err("Fast-forward merge to main failed after 3 retries.".into())
+    Err(format!(
+        "Fast-forward merge to main failed after 3 retries: {}",
+        last_err
+            .as_ref()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    )
+    .into())
 }
 
 /// Check if an `origin` remote exists in the repository.

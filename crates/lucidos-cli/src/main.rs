@@ -17,6 +17,9 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod ask_user_question_hook;
+mod cc_bash_guard;
+mod cc_edit_preread;
+mod cc_read_coerce;
 mod cc_stop_reminder;
 mod data;
 mod data_store;
@@ -87,6 +90,28 @@ enum Command {
     /// Hidden; not for direct invocation.
     #[command(name = "cc-stop-reminder", hide = true)]
     CcStopReminder,
+    /// PreToolUse hook subcommand invoked by Claude Code via .lucidos/cc-settings.json
+    /// for every Bash tool call. Refuses kill patterns that would catch sibling CC
+    /// subprocesses by accident (e.g. `ps | grep cargo | xargs kill` matches every
+    /// claude argv). Reads the hook payload from stdin; exits 2 + stderr to block.
+    /// Hidden; not for direct invocation.
+    #[command(name = "cc-bash-guard", hide = true)]
+    CcBashGuard,
+    /// PreToolUse hook subcommand invoked by Claude Code via .lucidos/cc-settings.json
+    /// for every Read tool call. Coerces string-typed `offset` / `limit` fields to
+    /// numbers via `updatedInput`, working around a model habit that otherwise
+    /// trips CC's input validator. No-op (silent) when the input is already
+    /// well-shaped. Hidden; not for direct invocation.
+    #[command(name = "cc-read-coerce", hide = true)]
+    CcReadCoerce,
+    /// PreToolUse hook subcommand invoked by Claude Code via .lucidos/cc-settings.json
+    /// for every Edit tool call. Asks the engine whether the target file has
+    /// been Read in this thread; if not, returns `permissionDecision: "deny"`
+    /// with an instruction to Read first. Prevents the "File has not been read
+    /// yet" loop the model otherwise gets stuck in. Hidden; not for direct
+    /// invocation.
+    #[command(name = "cc-edit-preread", hide = true)]
+    CcEditPreread,
     /// POST a new chat or Claude Code thread to another (or this same) Lucidos
     /// workspace. Defaults caller_* fields from $LUCIDOS_WORKSPACE,
     /// $LUCIDOS_THREAD_ID, $LUCIDOS_EVENT_ID. With `--parent`, emits
@@ -127,15 +152,6 @@ pub(crate) struct ProxyCliArgs {
     /// Exit non-zero on HTTP 4xx/5xx and suppress the body (`curl --fail`).
     #[arg(long = "fail")]
     pub(crate) fail: bool,
-    /// Fetch the credential bundle for a `credential_bundle`-typed proxy.
-    /// Prints the JSON map (`{"<service_name>": "<value>", ...}`) to stdout.
-    /// Cannot be combined with HTTP-shape flags (`-X`, `-d`, `-i`, `-H`,
-    /// `--fail`, `--data-stdin`).
-    #[arg(
-        long = "credentials",
-        conflicts_with_all = ["method", "data", "data_stdin", "include", "fail", "headers"],
-    )]
-    pub(crate) credentials: bool,
 }
 
 /// Wire-format actor mode accepted by `--mode`. Typed enum so clap rejects
@@ -155,6 +171,15 @@ impl CliMode {
             CliMode::Engine => "engine",
         }
     }
+}
+
+/// Wire-format relation accepted by `--relation`. `sub` = same-workspace
+/// parent-with-callback (the spawned thread reports back when it
+/// finishes); `top` = independent top-level thread, no callback.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum CliRelation {
+    Sub,
+    Top,
 }
 
 #[derive(Args)]
@@ -190,10 +215,18 @@ pub(crate) struct SpawnThreadArgs {
     /// Override the upstream actor mode. Defaults to "agent".
     #[arg(long, value_enum, default_value_t = CliMode::Agent)]
     pub(crate) mode: CliMode,
-    /// Same-workspace parent-with-callback spawn. Emits `parent_thread_id` /
-    /// `spawning_event_id` instead of `caller_*` fields. The receiving thread
-    /// will call back to the parent on completion. Requires `--to` to resolve
-    /// to the same workspace as `$LUCIDOS_WORKSPACE` (else error).
+    /// Relationship of the spawned thread to the calling thread.
+    /// `sub` = same-workspace parent-with-callback (the spawned thread
+    /// reports back when it finishes — emits `parent_thread_id` /
+    /// `spawning_event_id`). `top` = independent top-level thread, no
+    /// callback (emits `caller_*` fields). `sub` requires `--to` to
+    /// resolve to the same workspace as `$LUCIDOS_WORKSPACE`. When
+    /// omitted, defaults to `top` so existing cross-workspace recipes
+    /// keep their fire-and-forget behavior.
+    #[arg(long, value_enum, conflicts_with = "parent")]
+    pub(crate) relation: Option<CliRelation>,
+    /// DEPRECATED — alias for `--relation sub`. Same-workspace
+    /// parent-with-callback spawn. Will be removed in a future release.
     #[arg(long)]
     pub(crate) parent: bool,
     /// Use `http://` instead of `https://`. Test-only. Hidden from --help.
@@ -377,6 +410,15 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             cc_stop_reminder::run()?;
             Ok(0)
         }
+        Command::CcBashGuard => cc_bash_guard::run(),
+        Command::CcReadCoerce => {
+            cc_read_coerce::run()?;
+            Ok(0)
+        }
+        Command::CcEditPreread => {
+            cc_edit_preread::run()?;
+            Ok(0)
+        }
         Command::SpawnThread(args) => {
             spawn_thread::run(args)?;
             Ok(0)
@@ -400,7 +442,6 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     body,
                     include: args.include,
                     fail: args.fail,
-                    credentials: args.credentials,
                 },
             )
         }

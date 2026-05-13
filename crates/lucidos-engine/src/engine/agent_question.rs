@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::engine::agent_recovery::ANSWERED_AFTER_IDLE_REASON;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
-    AnswerKind, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+    AnswerKind, EventChannel, EventMeta, MessageOrigin, QuestionOption, ThreadEvent,
 };
 use crate::engine::{AgentSession, LucidosEngine};
 
@@ -51,27 +51,34 @@ pub async fn resolve_pending_question_as_canceled(
     }
 }
 
-/// Find the `tool_use_id` of the latest unresolved `UserQuestionAsked` for
-/// `thread_id`, if any. One round-trip — the LEFT JOIN filters out questions
-/// that already have a matching answer.
-pub async fn lookup_pending_question_tool_use_id(
-    pool: &sqlx::PgPool,
+const PENDING_QUESTION_SQL: &str = "SELECT q.payload->>'tool_use_id' \
+     FROM events q \
+     LEFT JOIN events a ON a.thread_id = q.thread_id \
+          AND a.event_type = 'UserQuestionAnswered' \
+          AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
+     WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
+     ORDER BY q.sequence DESC LIMIT 1";
+
+const ACTIVE_QUESTION_SQL: &str = "SELECT q.payload->>'tool_use_id' \
+     FROM events q \
+     LEFT JOIN events a ON a.thread_id = q.thread_id \
+          AND a.event_type = 'UserQuestionAnswered' \
+          AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
+     WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
+       AND NOT EXISTS ( \
+         SELECT 1 FROM events t \
+         WHERE t.thread_id = q.thread_id \
+           AND t.sequence > q.sequence \
+           AND t.event_type = ANY($2::text[]) \
+       ) \
+     ORDER BY q.sequence DESC LIMIT 1";
+
+fn unwrap_tool_use_id_row(
+    result: Result<Option<(String,)>, sqlx::Error>,
     thread_id: Uuid,
 ) -> Option<String> {
-    let result: Result<Option<(String,)>, _> = sqlx::query_as(
-        "SELECT q.payload->>'tool_use_id' \
-         FROM events q \
-         LEFT JOIN events a ON a.thread_id = q.thread_id \
-              AND a.event_type = 'UserQuestionAnswered' \
-              AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
-         WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
-         ORDER BY q.sequence DESC LIMIT 1",
-    )
-    .bind(thread_id)
-    .fetch_optional(pool)
-    .await;
-    let row = match result {
-        Ok(r) => r,
+    match result {
+        Ok(row) => row.map(|(t,)| t).filter(|t| !t.is_empty()),
         Err(e) => {
             // Don't silently treat a DB outage as "no pending question" —
             // that would let the user's free-form text spawn a brand-new CC
@@ -81,10 +88,54 @@ pub async fn lookup_pending_question_tool_use_id(
                 thread_id,
                 e
             );
-            return None;
+            None
         }
-    };
-    row.map(|(t,)| t).filter(|t| !t.is_empty())
+    }
+}
+
+/// Find the `tool_use_id` of the latest unanswered `UserQuestionAsked` for
+/// `thread_id`, if any. One round-trip — the LEFT JOIN filters out questions
+/// that already have a matching answer.
+///
+/// "Unanswered" here means literally "no `UserQuestionAnswered` row exists".
+/// A question whose surrounding turn was terminated (engine restart, cancel,
+/// failure, idle) still counts — `archive_thread` and the CC stop endpoint
+/// rely on this to cancel-stamp the QuestionCard so its answer buttons render
+/// disabled rather than dangling clickable on an archived/stopped thread.
+/// Use `lookup_active_question_tool_use_id` instead when you only want
+/// questions whose turn is still in flight.
+pub async fn lookup_pending_question_tool_use_id(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Option<String> {
+    let result = sqlx::query_as::<_, (String,)>(PENDING_QUESTION_SQL)
+        .bind(thread_id)
+        .fetch_optional(pool)
+        .await;
+    unwrap_tool_use_id_row(result, thread_id)
+}
+
+/// Same as `lookup_pending_question_tool_use_id`, but also excludes questions
+/// whose surrounding turn was terminated (see
+/// `ThreadEvent::QUESTION_ORPHANING_EVENT_TYPES`) before any answer landed.
+///
+/// Used by the chat::process FreeText fast-path: an engine restart while a
+/// question was on-screen leaves the question "unanswered" forever, but
+/// routing the user's next typed follow-up to it as a `FreeText` answer means
+/// `MessageReceived` is never emitted and the typed message vanishes from
+/// the timeline. The terminator filter prevents that — typed text after
+/// `ResponseAborted`/`Canceled`/`Failed`/`CodingAgentIdled` starts a fresh
+/// follow-up instead.
+pub async fn lookup_active_question_tool_use_id(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Option<String> {
+    let result = sqlx::query_as::<_, (String,)>(ACTIVE_QUESTION_SQL)
+        .bind(thread_id)
+        .bind(ThreadEvent::QUESTION_ORPHANING_EVENT_TYPES)
+        .fetch_optional(pool)
+        .await;
+    unwrap_tool_use_id_row(result, thread_id)
 }
 
 /// Look up whether `(thread_id, tool_use_id)` has a `UserQuestionAsked` and
@@ -113,6 +164,68 @@ async fn find_pending_question(
     .fetch_optional(engine.pool())
     .await?;
     Ok(row.map(|(already_answered,)| already_answered))
+}
+
+/// Validate a user-supplied answer against the question's option list and
+/// `multi_select` flag. Pure function; the surrounding I/O lives in
+/// `answer_pending_question`.
+///
+/// - `MultiSelected` requires at least one id OR non-empty `text`. Every id
+///   must exist in `options`, and the question must be marked `multi_select`.
+///   The `text` field carries freetext typed in the prompt textarea while the
+///   question was on screen — the prompt-row Submit button folds it in.
+/// - `Selected`/`FreeText`/`Canceled` are unrestricted here — the existing
+///   pre-validation (option lookup on the hook side) covers their well-formedness.
+pub(crate) fn validate_answer(
+    answer: &AnswerKind,
+    options: &[QuestionOption],
+    multi_select: bool,
+) -> Result<(), String> {
+    let AnswerKind::MultiSelected { option_ids, text } = answer else {
+        return Ok(());
+    };
+    let has_text = text.as_deref().is_some_and(|t| !t.is_empty());
+    if option_ids.is_empty() && !has_text {
+        return Err("MultiSelected requires at least one option_id or non-empty text".into());
+    }
+    if !multi_select {
+        return Err("MultiSelected answer for single-select question".into());
+    }
+    let known: std::collections::HashSet<&str> =
+        options.iter().map(|o| o.id.as_str()).collect();
+    for id in option_ids {
+        if !known.contains(id.as_str()) {
+            return Err(format!("MultiSelected contains unknown option_id: {id}"));
+        }
+    }
+    Ok(())
+}
+
+/// Look up `(options, multi_select)` for the most recent `UserQuestionAsked`
+/// matching `tool_use_id` on `thread_id`. Returns the parsed pair so the
+/// validator can run against the canonical persisted shape.
+async fn lookup_question_options(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+) -> Result<Option<(Vec<QuestionOption>, bool)>, sqlx::Error> {
+    let row: Option<(serde_json::Value, Option<bool>)> = sqlx::query_as(
+        "SELECT COALESCE(payload->'options', '[]'::jsonb), \
+                (payload->>'multi_select')::bool \
+         FROM events \
+         WHERE thread_id = $1 AND event_type = 'UserQuestionAsked' \
+           AND payload->>'tool_use_id' = $2 \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .bind(tool_use_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(opts_json, multi)| {
+        let options: Vec<QuestionOption> =
+            serde_json::from_value(opts_json).unwrap_or_default();
+        (options, multi.unwrap_or(false))
+    }))
 }
 
 /// Persist the user's answer and wake the PreToolUse hook blocked on this
@@ -149,6 +262,32 @@ pub async fn answer_pending_question(
         Err(e) => {
             log!(
                 "[CCQuestion] DB lookup failed for {}/{}: {}",
+                thread_id,
+                tool_use_id,
+                e
+            );
+            return AnswerResult::Conflict("Database lookup failed".into());
+        }
+    }
+
+    // Validate the answer shape against the persisted question. The pending
+    // lookup above guarantees the question exists, so a `None` here is a
+    // race we treat as a conflict for symmetry with the answered-already arm.
+    match lookup_question_options(engine.pool(), thread_id, &tool_use_id).await {
+        Ok(Some((options, multi_select))) => {
+            if let Err(msg) = validate_answer(&answer, &options, multi_select) {
+                return AnswerResult::Conflict(msg);
+            }
+        }
+        Ok(None) => {
+            return AnswerResult::Conflict(format!(
+                "Question {} on thread {} disappeared before validation",
+                tool_use_id, thread_id
+            ));
+        }
+        Err(e) => {
+            log!(
+                "[CCQuestion] DB lookup for question options failed {}/{}: {}",
                 thread_id,
                 tool_use_id,
                 e
@@ -250,7 +389,7 @@ pub async fn answer_pending_question(
 ///
 /// `AnswerKind::Canceled` is the engine-internal sentinel used by
 /// `archive_thread` to resolve a pending question card before tearing the
-/// thread down — resuming there would race the subsequent `cancel_agent`
+/// thread down — resuming there would race the subsequent `stop_agent`
 /// call.
 ///
 /// Returns `true` when `ContinueSignal` was emitted, `false` when a live
@@ -302,6 +441,129 @@ mod tests {
     use crate::test_support::{setup_test_db, teardown_test_db};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32};
 
+    fn opt(id: &str, label: &str) -> QuestionOption {
+        QuestionOption {
+            id: id.into(),
+            label: label.into(),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn validate_answer_accepts_selected_and_freetext_and_canceled() {
+        let opts = vec![opt("opt-0", "A"), opt("opt-1", "B")];
+        // Single-select question accepts Selected/FreeText/Canceled.
+        assert!(validate_answer(
+            &AnswerKind::Selected { option_id: "opt-0".into() },
+            &opts,
+            false
+        )
+        .is_ok());
+        assert!(validate_answer(
+            &AnswerKind::FreeText { text: "x".into() },
+            &opts,
+            false
+        )
+        .is_ok());
+        assert!(validate_answer(&AnswerKind::Canceled, &opts, false).is_ok());
+
+        // Multi-select question accepts the same fall-throughs (single Selected
+        // is allowed — equivalent to MultiSelected with one id).
+        assert!(validate_answer(
+            &AnswerKind::Selected { option_id: "opt-0".into() },
+            &opts,
+            true
+        )
+        .is_ok());
+        assert!(validate_answer(&AnswerKind::Canceled, &opts, true).is_ok());
+    }
+
+    #[test]
+    fn validate_answer_accepts_multi_selected_with_known_ids() {
+        let opts = vec![opt("opt-0", "A"), opt("opt-1", "B"), opt("opt-2", "C")];
+        let answer = AnswerKind::MultiSelected {
+            option_ids: vec!["opt-0".into(), "opt-2".into()],
+            text: None,
+        };
+        assert!(validate_answer(&answer, &opts, true).is_ok());
+    }
+
+    #[test]
+    fn validate_answer_accepts_multi_selected_with_only_text() {
+        // Prompt-row Submit folds typed text into MultiSelected even when
+        // no toggles are active. Empty option_ids + non-empty text is valid.
+        let opts = vec![opt("opt-0", "A")];
+        let answer = AnswerKind::MultiSelected {
+            option_ids: vec![],
+            text: Some("just text".into()),
+        };
+        assert!(validate_answer(&answer, &opts, true).is_ok());
+    }
+
+    #[test]
+    fn validate_answer_accepts_multi_selected_with_ids_and_text() {
+        let opts = vec![opt("opt-0", "A"), opt("opt-1", "B")];
+        let answer = AnswerKind::MultiSelected {
+            option_ids: vec!["opt-0".into()],
+            text: Some("plus this".into()),
+        };
+        assert!(validate_answer(&answer, &opts, true).is_ok());
+    }
+
+    #[test]
+    fn validate_answer_rejects_empty_multi_selected() {
+        let opts = vec![opt("opt-0", "A")];
+        let answer = AnswerKind::MultiSelected {
+            option_ids: vec![],
+            text: None,
+        };
+        let err = validate_answer(&answer, &opts, true).expect_err("must reject empty");
+        assert!(
+            err.contains("at least one"),
+            "error must mention requirement; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_answer_rejects_multi_selected_with_only_empty_text() {
+        // Empty string is still empty — must be rejected like no text at all.
+        let opts = vec![opt("opt-0", "A")];
+        let answer = AnswerKind::MultiSelected {
+            option_ids: vec![],
+            text: Some(String::new()),
+        };
+        assert!(validate_answer(&answer, &opts, true).is_err());
+    }
+
+    #[test]
+    fn validate_answer_rejects_unknown_multi_selected_id() {
+        let opts = vec![opt("opt-0", "A")];
+        let answer = AnswerKind::MultiSelected {
+            option_ids: vec!["opt-0".into(), "opt-99".into()],
+            text: None,
+        };
+        let err = validate_answer(&answer, &opts, true).expect_err("must reject unknown id");
+        assert!(
+            err.contains("opt-99"),
+            "error must surface the unknown id; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_answer_rejects_multi_selected_for_single_select_question() {
+        let opts = vec![opt("opt-0", "A")];
+        let answer = AnswerKind::MultiSelected {
+            option_ids: vec!["opt-0".into()],
+            text: None,
+        };
+        let err = validate_answer(&answer, &opts, false).expect_err("single-select rejects multi");
+        assert!(
+            err.contains("single-select"),
+            "error must explain mismatch; got {err:?}"
+        );
+    }
+
+
     fn cc_meta() -> EventMeta {
         EventMeta {
             channel: Some(EventChannel::CodingAgent),
@@ -317,9 +579,8 @@ mod tests {
             is_waiting: !process_exited,
             has_changes: false,
             requires_restart: false,
-            auto_apply: false,
-            discard: false,
-            cancel: Arc::new(tokio::sync::Notify::new()),
+            pending_stop: None,
+            stop: Arc::new(tokio::sync::Notify::new()),
             interrupt: Arc::new(tokio::sync::Notify::new()),
             idle_notify: Arc::new(tokio::sync::Notify::new()),
             apply_now_in_progress: false,
@@ -461,7 +722,7 @@ mod tests {
     }
 
     /// `archive_thread` calls `answer_pending_question(.., Canceled)` to
-    /// resolve the question card right before `cancel_agent`.
+    /// resolve the question card right before `stop_agent`.
     /// A `ContinueSignal` here would race the imminent SessionEnded and
     /// spawn a fresh subprocess for a thread the user just archived.
     #[tokio::test]
@@ -484,5 +745,141 @@ mod tests {
 
         pool.close().await;
         teardown_test_db(&db_name).await;
+    }
+
+    async fn emit_user_question(bus: &EventBus, thread_id: Uuid, tool_use_id: &str) {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::UserQuestionAsked {
+                tool_use_id: tool_use_id.into(),
+                cc_session_id: "sid-test".into(),
+                question: "Pick one".into(),
+                options: vec![opt("opt-0", "A")],
+                worktree_path: None,
+                multi_select: false,
+            },
+            meta: cc_meta(),
+        })
+        .await
+        .expect("UserQuestionAsked emit")
+        .expect("UserQuestionAsked persisted");
+    }
+
+    /// Baseline: an unanswered question with nothing after it is returned by
+    /// both lookup variants — the turn is still in flight.
+    #[tokio::test]
+    async fn both_lookups_return_question_when_unanswered_and_no_terminator() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        emit_user_question(&bus, thread_id, "toolu-pending").await;
+
+        assert_eq!(
+            lookup_pending_question_tool_use_id(&pool, thread_id).await.as_deref(),
+            Some("toolu-pending"),
+            "broad lookup must return the live unanswered question"
+        );
+        assert_eq!(
+            lookup_active_question_tool_use_id(&pool, thread_id).await.as_deref(),
+            Some("toolu-pending"),
+            "active-only lookup must return the live unanswered question"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Drives both regression tests below. Seeds the question, emits the
+    /// caller's chosen terminator, and asserts that:
+    ///   - the active-only lookup skips the orphaned question (so
+    ///     `chat::process`'s FreeText fast-path doesn't consume the user's
+    ///     next typed follow-up as a `FreeText` answer — without this the
+    ///     typed text vanishes from the timeline);
+    ///   - the broad lookup STILL returns it (so `archive_thread` and the
+    ///     CC stop endpoint can still cancel-stamp the QuestionCard, which
+    ///     otherwise leaves clickable answer buttons dangling on the
+    ///     archived thread).
+    async fn assert_terminator_orphans_only_active_lookup<F, Fut>(
+        tool_use_id: &str,
+        emit_terminator: F,
+    ) where
+        F: FnOnce(EventBus, Uuid) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        emit_user_question(&bus, thread_id, tool_use_id).await;
+        emit_terminator(bus, thread_id).await;
+
+        let active = lookup_active_question_tool_use_id(&pool, thread_id).await;
+        assert!(
+            active.is_none(),
+            "orphaned question must not intercept follow-ups via active lookup, got {active:?}"
+        );
+        assert_eq!(
+            lookup_pending_question_tool_use_id(&pool, thread_id).await.as_deref(),
+            Some(tool_use_id),
+            "broad lookup must still surface the orphan so archive can cancel-stamp the card"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Engine-restart-style abort: the user's "Restarted" exchange in the UI
+    /// is paired with this `ResponseAborted` row in the DB.
+    #[tokio::test]
+    async fn response_aborted_orphans_only_active_lookup() {
+        assert_terminator_orphans_only_active_lookup(
+            "toolu-orphaned-aborted",
+            |bus, thread_id| async move {
+                crate::engine::thread_events::emit_response_aborted(
+                    &bus,
+                    thread_id,
+                    crate::engine::thread_events::AbortCause::EngineShutdown,
+                    String::new(),
+                    vec![],
+                    None,
+                    None,
+                    cc_meta(),
+                    "[test] engine_shutdown",
+                )
+                .await;
+            },
+        )
+        .await;
+    }
+
+    /// `CodingAgentIdled` boundary: the synthetic idle the engine-restart
+    /// sweep emits alongside the abort. Filtering on idled too means an
+    /// unanswered question can't intercept follow-ups even if only the idle
+    /// boundary made it to the DB.
+    #[tokio::test]
+    async fn coding_agent_idled_orphans_only_active_lookup() {
+        assert_terminator_orphans_only_active_lookup("toolu-orphaned-idle", |bus, thread_id| async move {
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::CodingAgentIdled {
+                    has_changes: false,
+                    is_external_repo: false,
+                    requires_restart: false,
+                    cc_session_id: None,
+                    agent: crate::runtime::AgentKind::ClaudeCode,
+                    reason: Some("engine_restart_interrupt".into()),
+                    worktree_path: None,
+                    worktree_head_sha: None,
+                },
+                meta: cc_meta(),
+            })
+            .await
+            .expect("CodingAgentIdled emit")
+            .expect("CodingAgentIdled persisted");
+        })
+        .await;
     }
 }

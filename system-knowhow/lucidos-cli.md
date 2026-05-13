@@ -146,7 +146,7 @@ Call a backend configured in `data/config/apis.json` through the engine. The eng
 - **`basic`** — `Authorization: Basic <base64(auth_value)>`. The credential's `auth_value` should already be `user:password`. `{"type": "basic", "credential": "<service_name>"}`
 - **`query_param`** — appends `?<param_name>=<auth_value>` to the request URL. Used for APIs (e.g. Helius) that take the key as a query parameter. `{"type": "query_param", "credential": "<service_name>", "param_name": "api-key"}`
 - **`hmac_signed`** — signs each request with HMAC over the query string. Used for APIs (e.g. Binance) that require per-request signing. Optional `timestamp_param` injects the current millis-since-epoch as a query parameter before signing. Optional `key_header` (default `X-API-KEY`) carries the API key. `signature_param` (default `signature`) names the resulting signature parameter. `algorithm` is `sha256` or `sha512`. `signed_payload` is `query_string`. `{"type": "hmac_signed", "key_credential": "binance-key", "secret_credential": "binance-secret", "key_header": "X-MBX-APIKEY", "algorithm": "sha256", "signed_payload": "query_string", "signature_param": "signature", "timestamp_param": "timestamp"}`
-- **`credential_bundle`** — does NOT inject anything into outgoing HTTP. Exposes the credentials over a sibling endpoint, fetched with `lucidos proxy <name> --credentials` (see below). Used for libraries that perform their own login flow (e.g. `pcomfortcloud` for Panasonic heatpumps). `{"type": "credential_bundle", "credentials": ["comfort_username", "comfort_password"]}`
+- **`script_handshake`** — for APIs that need a multi-step login (POST creds, get a session token / multi-header response, refresh on a schedule). Engine spawns a per-API Python script you write under `data/scripts/auth/<api>.py`, caches the resulting headers in memory, refreshes on `expires_in` or on upstream 401. `{"type": "script_handshake", "credential": "<service_name>", "script": "scripts/auth/<api>.py"}`. The credential can be of any type; the script reads it as `CRED_<NAME>_USERNAME` + `CRED_<NAME>_PASSWORD` for `password`, or `CRED_<NAME>` for the others — same convention as `run_python` / `run_bash`. Optional `"oauth_providers": ["google", ...]` injects each listed provider's connected access token (auto-refreshed) as `OAUTH_<UPPER>_ACCESS_TOKEN` in the script's env. Missing-provider failure is a clear 502 naming the provider, so the user knows which `connect_oauth_account` to run. See `system-knowhow/building-an-auth-handshake.md` for the full guide and worked Comfort Cloud + Firebase examples.
 
 `auth.credential` (singular variants) and `auth.credentials` / `auth.key_credential` / `auth.secret_credential` (multi-credential variants) reference `service_name`s already in the engine credential store (the same store `request_credential` writes to). Entries without an `auth` block forward unauthenticated — useful for local services like Sonos.
 
@@ -174,26 +174,7 @@ lucidos proxy sonos /zones --fail
 
 Output is the response body on **stdout**. With `--include`, the status line and headers are prepended to stdout (curl convention — single stream). With `--fail`, the body is suppressed and a one-line `lucidos proxy: HTTP <code>` summary is written to stderr instead. Transport errors (DNS failure, connection refused, …) print to stderr (`lucidos: ...`) and exit non-zero. Exit codes mirror curl: `0` on success (including 4xx/5xx by default), `22` when `--fail` and the response is 4xx/5xx, `1` on transport failure.
 
-#### Credential bundle retrieval (`--credentials`)
-
-For `credential_bundle` proxies, use `--credentials` instead of an HTTP path. The engine returns a JSON map keyed by the credential service names listed in the proxy config:
-
-```bash
-lucidos proxy comfort_creds --credentials
-# → {"comfort_username":"user@example.com","comfort_password":"…"}
-```
-
-Use this in scripts that hand the credentials to a library doing its own login (e.g. `pcomfortcloud` for Panasonic heatpumps):
-
-```python
-import json, subprocess
-bundle = json.loads(subprocess.check_output(
-    ["lucidos", "proxy", "comfort_creds", "--credentials"]
-))
-client = pcomfortcloud.Session(bundle["comfort_username"], bundle["comfort_password"])
-```
-
-`--credentials` cannot be combined with `-X`, `-d`, `-i`, `-H`, `--fail`, `--data-stdin`, or a request path. The `proxy_request` LLM tool refuses `credential_bundle` proxies — raw credentials never reach the model.
+`script_handshake`-typed proxies look identical to the caller — `lucidos proxy comfort-cloud /devices/list` — because the engine runs the configured login script transparently and attaches the resulting headers. See `system-knowhow/building-an-auth-handshake.md` for authoring the script.
 
 #### When to use which
 

@@ -5,6 +5,8 @@ import { AppUiEditModal } from '../apps/AppUiEditModal';
 import { NewAppModal } from '../apps/NewAppModal';
 import { TriggerDetails } from '../triggers/TriggerDetails';
 import { EmailConfirmModal } from '../email/EmailConfirmModal';
+import { PluginInstallPanel } from '../plugins/PluginInstallPanel';
+import { PluginUninstallPanel } from '../plugins/PluginUninstallPanel';
 
 export function InlineForm() {
   const form = activeInlineForm.value;
@@ -27,5 +29,7 @@ export function InlineForm() {
     case 'new-app': return <NewAppModal />;
     case 'trigger': return <TriggerDetails key={form.taskId ?? 'new'} />;
     case 'email-confirm': return <EmailConfirmModal />;
+    case 'plugin-install': return <PluginInstallPanel />;
+    case 'plugin-uninstall': return <PluginUninstallPanel />;
   }
 }

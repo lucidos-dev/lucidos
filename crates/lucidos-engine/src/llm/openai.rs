@@ -879,6 +879,8 @@ impl OpenAiProvider {
             stop_reason: None,
             output_tokens: None,
             input_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
             thinking_chars: None,
         }
     }

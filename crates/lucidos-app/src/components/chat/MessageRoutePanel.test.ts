@@ -62,15 +62,15 @@ describe('resolveOrigin', () => {
     expect(resolveOrigin(exch(ev))).toBeUndefined();
   });
 
-  it('extracts engine origin from SessionRecovered events', () => {
+  it('extracts engine origin from ContinuationStarted events', () => {
     const ev: StoredEvent = {
-      type: 'SessionRecovered',
+      type: 'ContinuationStarted',
       branch: 'claude-code/x',
-      origin: { kind: 'engine', reason: { kind: 'session_recovered' } },
+      origin: { kind: 'engine', reason: { kind: 'continuation_started' } },
     };
     expect(resolveOrigin(exch(ev))).toEqual({
       kind: 'engine',
-      reason: { kind: 'session_recovered' },
+      reason: { kind: 'continuation_started' },
     });
   });
 
@@ -107,8 +107,8 @@ describe('resolveOrigin', () => {
     });
   });
 
-  it('returns undefined when SessionRecovered has no origin field set (legacy DB row)', () => {
-    const ev: StoredEvent = { type: 'SessionRecovered', branch: 'x' };
+  it('returns undefined when ContinuationStarted has no origin field set (legacy DB row)', () => {
+    const ev: StoredEvent = { type: 'ContinuationStarted', branch: 'x' };
     expect(resolveOrigin(exch(ev))).toBeUndefined();
   });
 
@@ -117,9 +117,9 @@ describe('resolveOrigin', () => {
   // but until this fix forgot to mirror it onto the variant's `origin` field —
   // the popover then read `event.origin`, found nothing, and rendered
   // "Unknown" alongside the "You" chip.
-  it('falls back to the actor on SessionRecovered when origin is missing (user-clicked Continue)', () => {
+  it('falls back to the actor on ContinuationStarted when origin is missing (user-clicked Continue)', () => {
     const ev: StoredEvent = {
-      type: 'SessionRecovered',
+      type: 'ContinuationStarted',
       branch: '',
       actor: { kind: 'device', device_id: 'dev-ios', label: 'iOS Safari PWA' },
     };
@@ -357,8 +357,8 @@ describe('executorExtras', () => {
     expect(extras.ccSessionId).toBe('s1');
   });
 
-  it('reads branch from SessionRecovered (engine restart resumes a CC session)', () => {
-    const recovered = stamp(0, { type: 'SessionRecovered', branch: 'recovered-branch' });
+  it('reads branch from ContinuationStarted (engine restart resumes a CC session)', () => {
+    const recovered = stamp(0, { type: 'ContinuationStarted', branch: 'recovered-branch' });
     const followUp = stamp(60, { type: 'MessageReceived', text: 'continue' });
     const exchange: Exchange = { userEvent: followUp, userSeq: 5, steps: [] };
     const events = new Map<number, StoredEvent>([[1, recovered], [5, followUp]]);

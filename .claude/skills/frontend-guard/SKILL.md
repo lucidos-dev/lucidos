@@ -31,8 +31,8 @@ Use these — never hardcode the raw values:
 | `--z-dropdown` | `100` | Dropdowns, picker menus |
 | `--z-sticky` | `200` | Sticky headers, drawer overlays |
 | `--z-drawer` | `300` | Side drawers |
-| `--z-modal` | `2000` | Modal overlays |
 | `--z-control-panel` | `2200` | Floating header items (brand, route panel, collapsed thread actions) |
+| `--z-modal` | `2300` | Modal overlays — sits above the header so the dim backdrop blocks it |
 | `--z-toast` | `2400` | Toast notifications (must sit above `.restart-overlay` at `--z-control-panel + 100`) |
 | `--z-tooltip` | `10000` | Tooltips |
 

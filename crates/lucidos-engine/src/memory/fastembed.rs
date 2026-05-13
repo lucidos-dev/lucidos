@@ -22,7 +22,7 @@ pub struct FastEmbedProvider {
 
 /// Configured embedding model identifier (env: `LUCIDOS_EMBEDDING_MODEL`).
 /// Falls back to `DEFAULT_MODEL` when unset. See accepted values in `resolve_model`.
-pub(crate) fn model_id_from_env() -> String {
+fn model_id_from_env() -> String {
     std::env::var("LUCIDOS_EMBEDDING_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
 }
 
@@ -45,7 +45,7 @@ impl FastEmbedProvider {
         Self::with_model(&model_id_from_env())
     }
 
-    pub fn with_model(id: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    fn with_model(id: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (model, dimensions) = resolve_model(id)?;
         let options = InitOptions::new(model).with_show_download_progress(true);
         let model = TextEmbedding::try_new(options)?;
@@ -105,44 +105,6 @@ impl EmbeddingProvider for FastEmbedProvider {
 mod tests {
     use super::*;
 
-    fn shared_provider() -> &'static FastEmbedProvider {
-        crate::test_util::shared_embedder()
-    }
-
-    #[tokio::test]
-    async fn test_embed_single_text() {
-        let provider = shared_provider();
-        let embedding = provider.embed("hello world").await.unwrap();
-
-        assert_eq!(embedding.len(), provider.dimensions());
-        assert!(embedding.iter().any(|&x| x != 0.0));
-    }
-
-    #[tokio::test]
-    async fn test_embed_batch() {
-        let provider = shared_provider();
-        let embeddings = provider.embed_batch(&["hello", "world"]).await.unwrap();
-
-        assert_eq!(embeddings.len(), 2);
-        assert_eq!(embeddings[0].len(), provider.dimensions());
-    }
-
-    #[tokio::test]
-    async fn test_similar_texts_have_similar_embeddings() {
-        let provider = shared_provider();
-        let emb1 = provider.embed("sales report for Q4").await.unwrap();
-        let emb2 = provider.embed("quarterly sales analysis").await.unwrap();
-        let emb3 = provider.embed("chocolate cake recipe").await.unwrap();
-
-        let sim_related = crate::memory::cosine_similarity(&emb1, &emb2);
-        let sim_unrelated = crate::memory::cosine_similarity(&emb1, &emb3);
-
-        assert!(
-            sim_related > sim_unrelated,
-            "Related texts should be more similar"
-        );
-    }
-
     #[test]
     fn test_resolve_model_known_ids() {
         assert_eq!(resolve_model(MODEL_BGE_SMALL_EN).unwrap().1, 384);
@@ -164,12 +126,56 @@ mod tests {
         );
     }
 
+    // The tests below exercise the real fastembed model. They download
+    // ~465 MB from huggingface.co on first run, so they're gated behind the
+    // `real-embedder-tests` Cargo feature to keep default `cargo test`
+    // offline. Run with:
+    //     cargo test -p lucidos-engine --features real-embedder-tests
+
+    #[cfg(feature = "real-embedder-tests")]
+    #[tokio::test]
+    async fn test_embed_single_text() {
+        let provider = crate::test_util::shared_embedder();
+        let embedding = provider.embed("hello world").await.unwrap();
+
+        assert_eq!(embedding.len(), provider.dimensions());
+        assert!(embedding.iter().any(|&x| x != 0.0));
+    }
+
+    #[cfg(feature = "real-embedder-tests")]
+    #[tokio::test]
+    async fn test_embed_batch() {
+        let provider = crate::test_util::shared_embedder();
+        let embeddings = provider.embed_batch(&["hello", "world"]).await.unwrap();
+
+        assert_eq!(embeddings.len(), 2);
+        assert_eq!(embeddings[0].len(), provider.dimensions());
+    }
+
+    #[cfg(feature = "real-embedder-tests")]
+    #[tokio::test]
+    async fn test_similar_texts_have_similar_embeddings() {
+        let provider = crate::test_util::shared_embedder();
+        let emb1 = provider.embed("sales report for Q4").await.unwrap();
+        let emb2 = provider.embed("quarterly sales analysis").await.unwrap();
+        let emb3 = provider.embed("chocolate cake recipe").await.unwrap();
+
+        let sim_related = crate::memory::cosine_similarity(&emb1, &emb2);
+        let sim_unrelated = crate::memory::cosine_similarity(&emb1, &emb3);
+
+        assert!(
+            sim_related > sim_unrelated,
+            "Related texts should be more similar"
+        );
+    }
+
     /// Norwegian synonyms ("bil"/"kjøretøy" both mean "vehicle") must encode close
     /// together in the embedding space — required for cross-language semantic
     /// search. Threshold 0.7 is empirically conservative for MultilingualE5Small.
+    #[cfg(feature = "real-embedder-tests")]
     #[tokio::test]
     async fn test_norwegian_synonyms_have_high_similarity() {
-        let provider = shared_provider();
+        let provider = crate::test_util::shared_embedder();
         let bil = provider.embed("bil").await.unwrap();
         let kjoretoy = provider.embed("kjøretøy").await.unwrap();
 
@@ -185,9 +191,10 @@ mod tests {
     /// containing "kjøretøy" / "service" above unrelated Norwegian text.
     /// Thread search ranks by the same cosine similarity, so this is the
     /// property the search depends on.
+    #[cfg(feature = "real-embedder-tests")]
     #[tokio::test]
     async fn test_bil_verksted_query_matches_norwegian_vehicle_service_thread() {
-        let provider = shared_provider();
+        let provider = crate::test_util::shared_embedder();
 
         let embeddings = provider
             .embed_batch(&[

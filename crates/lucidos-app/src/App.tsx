@@ -6,7 +6,9 @@ import { Drawer } from './components/layout/Drawer';
 import { MobileSwipeContainer } from './components/layout/MobileSwipeContainer';
 import { ConfirmDialog } from './components/shared/ConfirmDialog';
 import { ImagePopup } from './components/shared/ImagePopup';
+import { LandscapeLock } from './components/shared/LandscapeLock';
 import { MessageRoutePanel } from './components/chat/MessageRoutePanel';
+import { StepDetailModal } from './components/chat/StepDetailModal';
 import { ScaleModal } from './components/shared/ScaleModal';
 import { ThreadDrawer } from './components/drawer/ThreadDrawer';
 import { DrawerDivider } from './components/layout/DrawerDivider';
@@ -44,15 +46,7 @@ export function App() {
         <MobileSwipeContainer />
       </div>
 
-      {/* Landscape lock — CSS-only; visible only on phones in landscape */}
-      <div class="landscape-lock" role="alert">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <rect x="6" y="2" width="12" height="20" rx="2" />
-          <path d="M3 14a9 9 0 0 1 9-9" />
-          <polyline points="3 9 3 14 8 14" />
-        </svg>
-        <p>Please rotate your device to portrait</p>
-      </div>
+      <LandscapeLock />
 
       {/* Overlays -- rendered outside the split layout */}
       <FileSearchModal />
@@ -61,6 +55,7 @@ export function App() {
       <ImagePopup />
       <MessageRoutePanel />
       <ConfirmDialog />
+      <StepDetailModal />
       <ScaleModal />
       <NotificationsModal />
       <SearchEverywhere />

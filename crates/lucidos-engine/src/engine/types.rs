@@ -38,11 +38,36 @@ pub struct ProcessResult {
 /// thread appears active but nobody reads the injection channel.
 pub type OrphanedInjection = super::InjectedPrompt;
 
+/// `content` is `Option` so the modal can render section *shape* (name +
+/// `char_count`) without persisting the body when the `capture_context`
+/// preference is off. Old DB rows always have content and deserialize as
+/// `Some(_)`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextSection {
     pub name: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     pub char_count: usize,
+}
+
+/// CC can't expose its system prompt body or tool schemas via the
+/// stream-json envelope, only their token cost — the frontend uses this
+/// discriminant to know whether to expect a section breakdown body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextProducer {
+    MainLlm,
+    ClaudeCode,
+}
+
+/// `cache_*_tokens` are Anthropic-only (zero elsewhere). `output_tokens`
+/// may be zero on a snapshot emitted mid-stream before the final delta.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct ApiUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_creation_tokens: u32,
 }
 
 /// Result of an App UI capture from the frontend
@@ -81,6 +106,28 @@ pub struct CcCommandsResult {
     pub current_reasoning_effort: Option<String>,
 }
 
+/// Why `stop_agent` fired the stop signal. Read by the run_session loop's
+/// stop arm to decide whether to emit `ResponseCanceled` (only `UserStop`
+/// does — the others have their own lifecycle terminator), and by the
+/// post-loop cleanup to drive Apply / Discard side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// User clicked the Cancel/Stop button on an in-flight CC turn. Emits
+    /// `ResponseCanceled(UserStop)` if CC was actively working; nothing if
+    /// CC had already gone idle (race window — previous turn already done).
+    UserStop,
+    /// User clicked Apply Now — the resulting change auto-applies after
+    /// cleanup. Post-loop reads this to set `ProcessResult.auto_apply=true`.
+    /// `ChangeApplied` is the terminator; no `ResponseCanceled`.
+    Apply,
+    /// User clicked Discard — branch is deleted instead of proposed.
+    /// `ChangeDiscarded` is the terminator; no `ResponseCanceled`.
+    Discard,
+    /// User clicked Archive — `ThreadArchived` is the terminator; no
+    /// `ResponseCanceled`.
+    Archive,
+}
+
 /// State for a single active coding-agent session.
 ///
 /// **Single agent per thread.** The owning HashMap is keyed by `Uuid` (thread_id)
@@ -93,10 +140,22 @@ pub struct AgentSession {
     pub is_waiting: bool,
     pub has_changes: bool,
     pub requires_restart: bool,
-    pub auto_apply: bool,
-    /// When true, changes are discarded (branch deleted) instead of proposed.
-    pub discard: bool,
-    pub cancel: std::sync::Arc<tokio::sync::Notify>,
+    /// Reason the most recent `stop_agent` call fired, or `None` when the
+    /// session has never been stopped (or the stop signal came from the
+    /// engine-shutdown direct-notify path, which sets `shutting_down` instead).
+    /// Set by `stop_agent` BEFORE `stop.notify_one()`; read by the run_session
+    /// stop arm to decide whether to suppress `ResponseCanceled`, and by the
+    /// post-loop cleanup to drive `Apply` / `Discard` side effects. Stays
+    /// mutually exclusive by construction — three `bool` fields here used to
+    /// drift apart and the `auto_apply || discard || archiving` shape was a
+    /// repeated source of bugs.
+    pub pending_stop: Option<StopReason>,
+    /// Generic stop signal for the run_session loop. Fired by `stop_agent` for
+    /// every user-driven termination (Cancel, Apply, Discard, Archive) and by
+    /// the engine shutdown timeout. The stop arm reads `pending_stop` and
+    /// `shutting_down` to decide what (if anything) to emit — only a real
+    /// `UserStop` on an actively-working CC produces `ResponseCanceled`.
+    pub stop: std::sync::Arc<tokio::sync::Notify>,
     /// Interrupt signal — sends control_request:interrupt to stop current work
     /// without killing the session (like pressing Esc in Claude Code terminal).
     pub interrupt: std::sync::Arc<tokio::sync::Notify>,

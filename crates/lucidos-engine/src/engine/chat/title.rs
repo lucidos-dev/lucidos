@@ -44,9 +44,27 @@ pub(crate) fn decide_title_path(
     }
 }
 
-/// Build the LLM prompt for thread title generation.
-/// Truncates message to 1000 chars and image description to 300 chars.
-fn build_title_prompt(message: &str, image_description: Option<&str>) -> String {
+/// Title-generation instruction. Lives in the system message so it
+/// stays out of the model's "thing to summarize" — keeps the model
+/// from emitting the instruction text itself as the title on garbled
+/// input (e.g. "Generate Very Short Conversation Title").
+const TITLE_SYSTEM_PROMPT: &str = "Generate a very short title (3-6 words) for the user's conversation. \
+     Title by what the user wants to do or know IN THIS THREAD — the action, \
+     question, or topic of their request. If the message references another \
+     thread, document, or example only as context (e.g. to fix a bug found there), \
+     do not title by that referenced material's subject. \
+     If the message contains a human-readable identifier the user will \
+     recognize later — a case number, ticket key (e.g. JIRA-123), reference \
+     code, or serial/registration number — include it verbatim in the title. \
+     Do NOT include opaque identifiers like UUIDs, hex hashes, or long \
+     random strings; use the matching human name instead (e.g. the plugin's \
+     name, not its install id). \
+     Return ONLY the title text, nothing else. No quotes.";
+
+/// Build the user message for thread title generation — the conversation
+/// body, no instruction. Truncates message to 1000 chars and image
+/// description to 300 chars.
+fn build_title_user_content(message: &str, image_description: Option<&str>) -> String {
     let truncated: String = strip_thread_reference_links(message)
         .chars()
         .take(1000)
@@ -57,19 +75,7 @@ fn build_title_prompt(message: &str, image_description: Option<&str>) -> String 
     } else {
         String::new()
     };
-    format!(
-        "Generate a very short title (3-6 words) for this conversation. \
-         Title by what the user wants to do or know IN THIS THREAD — the action, \
-         question, or topic of their request. If the message references another \
-         thread, document, or example only as context (e.g. to fix a bug found there), \
-         do not title by that referenced material's subject. \
-         If the message contains an identifier the user will recognize \
-         later — a case number, ticket key (e.g. JIRA-123), reference code, \
-         or serial/registration number — include it verbatim in the title. \
-         Return ONLY the title text, nothing else. No quotes.\n\n\
-         Conversation:\n{}{}",
-        truncated, image_context
-    )
+    format!("{}{}", truncated, image_context)
 }
 
 /// Generate a short title (3-6 words) for a new thread using Flash.
@@ -81,16 +87,27 @@ pub(crate) async fn generate_thread_title(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use crate::llm::provider::{LlmProvider, Message, MessageContent};
 
-    let prompt = build_title_prompt(message, image_description);
+    let user_content = build_title_user_content(message, image_description);
     let messages = vec![Message {
         role: "user".to_string(),
-        content: MessageContent::Text(prompt),
+        content: MessageContent::Text(user_content),
     }];
     let response = provider
-        .chat(messages, vec![], None, None, None, Some("none"))
+        .chat(
+            messages,
+            vec![],
+            None,
+            Some(TITLE_SYSTEM_PROMPT),
+            None,
+            Some("none"),
+        )
         .await?;
     let title = response.content.ok_or("No title returned")?;
-    Ok(title.trim().to_string())
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("LLM returned empty title".into());
+    }
+    Ok(title)
 }
 
 /// Generate a thread title via LLM and emit it as a ThreadTitleGenerated event.
@@ -147,52 +164,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn title_prompt_text_only() {
-        let prompt = build_title_prompt("legg inn denne i familiekalenderen", None);
-        assert!(prompt.contains("legg inn denne i familiekalenderen"));
-        assert!(!prompt.contains("Attached image description"));
+    fn user_content_text_only() {
+        let body = build_title_user_content("legg inn denne i familiekalenderen", None);
+        assert!(body.contains("legg inn denne i familiekalenderen"));
+        assert!(!body.contains("Attached image description"));
     }
 
     #[test]
-    fn title_prompt_includes_image_description() {
-        let prompt = build_title_prompt(
+    fn user_content_includes_image_description() {
+        let body = build_title_user_content(
             "legg inn denne i familiekalenderen",
             Some("A movie ticket for Super Mario Galaxy Filmen at ODEON"),
         );
-        assert!(prompt.contains("legg inn denne i familiekalenderen"));
-        assert!(prompt
+        assert!(body.contains("legg inn denne i familiekalenderen"));
+        assert!(body
             .contains("Attached image description: A movie ticket for Super Mario Galaxy Filmen"));
     }
 
     #[test]
-    fn title_prompt_truncates_message_to_1000_chars() {
+    fn user_content_truncates_message_to_1000_chars() {
         let long_msg = "a".repeat(1500);
-        let prompt = build_title_prompt(&long_msg, None);
-        // The message portion should be 1000 chars, not 1500
-        let marker = "Conversation:\n";
-        let after_marker = &prompt[prompt.find(marker).unwrap() + marker.len()..];
-        assert_eq!(after_marker.len(), 1000);
+        let body = build_title_user_content(&long_msg, None);
+        // The whole user-message body is just the (truncated) message — no
+        // instruction preamble, no marker — so its length equals the cap.
+        assert_eq!(body.chars().count(), 1000);
     }
 
     #[test]
-    fn title_prompt_truncates_image_description_to_300_chars() {
+    fn user_content_truncates_image_description_to_300_chars() {
         let long_desc = "b".repeat(500);
-        let prompt = build_title_prompt("hello", Some(&long_desc));
+        let body = build_title_user_content("hello", Some(&long_desc));
         let marker = "Attached image description: ";
-        let after_marker = &prompt[prompt.find(marker).unwrap() + marker.len()..];
+        let after_marker = &body[body.find(marker).unwrap() + marker.len()..];
         assert_eq!(after_marker.len(), 300);
     }
 
     /// Simulates the summary format that suggest_title builds from messages
-    /// with image descriptions — the LLM prompt should contain both text and image context.
+    /// with image descriptions — both text and image context must reach the LLM.
     #[test]
-    fn title_prompt_with_suggest_title_summary_format() {
+    fn user_content_with_suggest_title_summary_format() {
         // This mirrors the summary format built by suggest_title in api/threads.rs
         let summary = "legg inn denne i familiekalenderen\n[Attached image: A movie ticket for Super Mario Galaxy Filmen]\n---\nKino med Emil! La meg legge det inn.";
-        let prompt = build_title_prompt(summary, None);
-        assert!(prompt.contains("Super Mario Galaxy Filmen"));
-        assert!(prompt.contains("familiekalenderen"));
-        assert!(prompt.contains("Kino med Emil"));
+        let body = build_title_user_content(summary, None);
+        assert!(body.contains("Super Mario Galaxy Filmen"));
+        assert!(body.contains("familiekalenderen"));
+        assert!(body.contains("Kino med Emil"));
     }
 
     /// A thread reference pasted via the copy-ref button arrives as
@@ -200,48 +216,67 @@ mod tests {
     /// The link's *visible* text is the referenced thread's title — exactly
     /// what biases the LLM into reusing it. Strip both forms before titling.
     #[test]
-    fn title_prompt_strips_thread_reference_link_text() {
+    fn user_content_strips_thread_reference_link_text() {
         let msg = "Fix this bug from [Misplaced section: AI Memory and Context Redundancy](thread:1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff)";
-        let prompt = build_title_prompt(msg, None);
+        let body = build_title_user_content(msg, None);
         assert!(
-            !prompt.contains("Misplaced section"),
-            "referenced thread title must not leak into the LLM prompt:\n{}",
-            prompt
+            !body.contains("Misplaced section"),
+            "referenced thread title must not leak into the LLM input:\n{}",
+            body
         );
-        assert!(prompt.contains("Fix this bug"));
-        assert!(prompt.contains("[referenced thread]"));
+        assert!(body.contains("Fix this bug"));
+        assert!(body.contains("[referenced thread]"));
     }
 
     #[test]
-    fn title_prompt_strips_workspace_qualified_thread_reference() {
+    fn user_content_strips_workspace_qualified_thread_reference() {
         let msg = "Apply the pattern from [Some Other Thread Title](thread:dev/1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff) here";
-        let prompt = build_title_prompt(msg, None);
-        assert!(!prompt.contains("Some Other Thread Title"));
-        assert!(prompt.contains("Apply the pattern"));
-        assert!(prompt.contains("[referenced thread]"));
+        let body = build_title_user_content(msg, None);
+        assert!(!body.contains("Some Other Thread Title"));
+        assert!(body.contains("Apply the pattern"));
+        assert!(body.contains("[referenced thread]"));
     }
 
     #[test]
-    fn title_prompt_emphasizes_intent_over_referenced_topic() {
-        // The prompt itself must instruct the LLM to title by the user's
+    fn system_prompt_emphasizes_intent_over_referenced_topic() {
+        // The system prompt must instruct the LLM to title by the user's
         // intent in this thread, not by referenced material's subject.
-        let prompt = build_title_prompt("anything", None);
-        assert!(prompt.to_lowercase().contains("this thread"));
-        assert!(prompt.to_lowercase().contains("referenc"));
+        let lower = TITLE_SYSTEM_PROMPT.to_lowercase();
+        assert!(lower.contains("this thread"));
+        assert!(lower.contains("referenc"));
     }
 
     #[test]
-    fn title_prompt_instructs_to_include_identifiers() {
+    fn system_prompt_instructs_to_include_identifiers() {
         // Pin breadth — the instruction must not collapse to dev-tickets only.
-        let prompt = build_title_prompt("anything", None);
-        let lower = prompt.to_lowercase();
+        let lower = TITLE_SYSTEM_PROMPT.to_lowercase();
         assert!(lower.contains("identifier"));
-        assert!(prompt.contains("JIRA-123"));
+        assert!(TITLE_SYSTEM_PROMPT.contains("JIRA-123"));
         let non_dev_examples = ["case", "reference", "registration", "serial"];
         assert!(
             non_dev_examples.iter().any(|w| lower.contains(w)),
             "prompt must include at least one non-developer identifier example, got:\n{}",
-            prompt
+            TITLE_SYSTEM_PROMPT
+        );
+    }
+
+    #[test]
+    fn system_prompt_excludes_opaque_identifiers() {
+        // Real production case: a "please install this plugin" message carried
+        // a 32-char hex install_id, which the LLM dutifully pasted into the
+        // title ("Install plugin 410b5e1a6b2b40d0b7c28b09f32e2178"). The
+        // identifier instruction must explicitly steer the model away from
+        // opaque IDs and toward the human name.
+        let lower = TITLE_SYSTEM_PROMPT.to_lowercase();
+        assert!(
+            lower.contains("human-readable"),
+            "prompt must scope identifiers to human-readable ones, got:\n{}",
+            TITLE_SYSTEM_PROMPT
+        );
+        assert!(
+            lower.contains("uuid") && lower.contains("hash"),
+            "prompt must call out UUIDs and hashes as opaque, got:\n{}",
+            TITLE_SYSTEM_PROMPT
         );
     }
 
@@ -280,5 +315,39 @@ mod tests {
     fn decide_returns_images_for_multiple_attachments_only() {
         assert_eq!(decide_title_path("", None, 2), TitleDecision::Images);
         assert_eq!(decide_title_path("", None, 5), TitleDecision::Images);
+    }
+
+    /// The user-facing message sent to the LLM must contain ONLY the
+    /// conversation text — no instruction, no meta-vocabulary. Anything
+    /// from the system prompt that leaks into the user message gives the
+    /// model something to echo back as the title on garbled input.
+    #[test]
+    fn user_content_excludes_instruction_vocabulary() {
+        let body = build_title_user_content(
+            "The instr rhat ids should be in title is a little much here",
+            None,
+        );
+        let lower = body.to_lowercase();
+        // Distinctive phrases from TITLE_SYSTEM_PROMPT only — avoid
+        // generic words like "identifier" or "this thread" that real
+        // users plausibly type, which would false-positive if the test
+        // input were widened.
+        for forbidden in [
+            "generate",
+            "very short",
+            "3-6 words",
+            "conversation:",
+            "return only",
+            "jira-123",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "user-facing content must not contain instruction phrase {:?}, got:\n{}",
+                forbidden,
+                body
+            );
+        }
+        // The conversation body itself is preserved.
+        assert!(body.contains("instr rhat ids"));
     }
 }

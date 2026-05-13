@@ -33,13 +33,13 @@ describe('MessageOrigin type', () => {
 });
 
 describe('ThreadEvent — engine-stamped event variants', () => {
-  it('SessionRecovered carries optional origin', () => {
+  it('ContinuationStarted carries optional origin', () => {
     const e: ThreadEvent = {
-      type: 'SessionRecovered',
+      type: 'ContinuationStarted',
       branch: 'claude-code/x',
-      origin: { kind: 'engine', reason: { kind: 'session_recovered' } },
+      origin: { kind: 'engine', reason: { kind: 'continuation_started' } },
     };
-    if (e.type === 'SessionRecovered') expect(e.origin?.kind).toBe('engine');
+    if (e.type === 'ContinuationStarted') expect(e.origin?.kind).toBe('engine');
   });
 
   it('ChangeProposed carries optional origin', () => {

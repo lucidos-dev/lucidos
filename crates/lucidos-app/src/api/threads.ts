@@ -1,4 +1,4 @@
-import { API_BASE, ApiError, json } from './client';
+import { API_BASE, ApiError, json, mutatingFetch, throwIfNotOk } from './client';
 import type { ThreadSection, ThreadInitiator } from '../store/thread-events';
 
 export interface ThreadInfo {
@@ -62,50 +62,35 @@ export async function fetchThreads(focusedThreadId?: string): Promise<ThreadsRes
     return json(`${API_BASE}/api/threads${params}`);
 }
 
-export async function saveThread(threadId: string): Promise<void> {
-    const res = await fetch(`${API_BASE}/api/threads/save`, {
+async function postThreadAction(path: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
+    const res = await mutatingFetch(`${API_BASE}/api/threads/${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ thread_id: threadId }),
+        body: JSON.stringify(body),
+        signal,
     });
-    if (!res.ok) throw new ApiError(res.status, 'Failed to save thread');
+    await throwIfNotOk(res);
+    return res;
+}
+
+export async function saveThread(threadId: string): Promise<void> {
+    await postThreadAction('save', { thread_id: threadId });
 }
 
 export async function unsaveThread(threadId: string): Promise<void> {
-    const res = await fetch(`${API_BASE}/api/threads/unsave`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ thread_id: threadId }),
-    });
-    if (!res.ok) throw new ApiError(res.status, 'Failed to unsave thread');
+    await postThreadAction('unsave', { thread_id: threadId });
 }
 
 export async function archiveThread(threadId: string): Promise<void> {
-    const res = await fetch(`${API_BASE}/api/threads/archive`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ thread_id: threadId }),
-    });
-    if (!res.ok) throw new ApiError(res.status, 'Failed to archive thread');
+    await postThreadAction('archive', { thread_id: threadId });
 }
 
 export async function renameThread(threadId: string, title: string): Promise<void> {
-    const res = await fetch(`${API_BASE}/api/threads/rename`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ thread_id: threadId, title }),
-    });
-    if (!res.ok) throw new ApiError(res.status, 'Failed to rename thread');
+    await postThreadAction('rename', { thread_id: threadId, title });
 }
 
 export async function suggestTitle(threadId: string, signal?: AbortSignal): Promise<string> {
-    const res = await fetch(`${API_BASE}/api/threads/suggest-title`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ thread_id: threadId }),
-        signal,
-    });
-    if (!res.ok) throw new ApiError(res.status, 'Failed to suggest title');
+    const res = await postThreadAction('suggest-title', { thread_id: threadId }, signal);
     const data = await res.json();
     return data.title;
 }

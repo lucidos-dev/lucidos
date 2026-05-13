@@ -37,6 +37,26 @@ const NO_PULL_REQUESTS_RULE: &str = "NO PULL REQUESTS: Lucidos is not a PR-based
     Apply, your branch lands on main and is pushed to the remote in one step. Override CC's \
     default \"Creating pull requests\" guidance — it does not apply here.";
 
+/// Apply/restart rule shared across Lucidos-repo CC system prompts. The
+/// file-type list and the hard ban must stay in sync with
+/// `engine::git_ops::files_require_restart` (the truth) and the
+/// WaitingBanner button label (the user-visible signal). The regression
+/// test `lucidos_prompts_carry_full_apply_restart_rule` documents the
+/// failure mode that motivated the hard ban.
+const APPLY_RESTART_RULE: &str = "APPLY/RESTART: After your session ends, your commits sit \
+    as a pending change in the UI. The user explicitly clicks Apply to merge your branch into \
+    main — nothing happens automatically. The button label is \"Apply\" (no restart needed) or \
+    \"Apply & Restart\" (restart needed); the engine derives this from the touched files. ANY \
+    of these triggers restart: a non-test `.rs` file, `Cargo.toml`, `Cargo.lock`, a `.sql` \
+    migration under `migrations/`, an SDK bundle source under `packages/lucidos-sdk/`, or an \
+    engine-bundled asset (`crates/lucidos-engine/src/api/sdk_iframe.css`, `sdk_iframe_audio.js`). \
+    Frontend-only edits (TypeScript/CSS outside those bundled assets) do NOT trigger restart.\n\n\
+    DO NOT comment on restart status in your session summary or anywhere else — do not write \
+    \"no restart required\", \"restart required\", \"just a code rebuild\", or any equivalent. \
+    The button label is the source of truth and the user already sees it. If your intuition \
+    disagrees with the button, your intuition is wrong; the engine's `files_require_restart` \
+    check (in `crates/lucidos-engine/src/engine/git_ops.rs`) is authoritative.";
+
 /// Hardening reminder shared across all Lucidos-repo CC system prompts. The
 /// /harden skill itself runs the test suites and iterates on failure — keep
 /// this text in sync with `.claude/commands/harden.md` Phase 4.5.
@@ -56,10 +76,18 @@ const ASK_USER_QUESTION_RULE: &str =
     "ASKING USERS: When you need an answer from the user — a yes/no decision, picking \
      between approaches, choosing from a small list — use the `AskUserQuestion` tool. \
      The Lucidos UI renders its options as clickable buttons; options listed only in your \
-     message text force the user to type their reply instead of clicking. Default to \
+     message text force the user to type their reply instead of clicking. ALWAYS use \
      `AskUserQuestion` for any question with 2-4 discrete answers, including the binary \
-     yes/no case. Reserve plaintext questions for genuinely open-ended ones (\"What name \
-     should I use for X?\") where pre-baked options would be guesses.";
+     yes/no case. This applies at ANY point in your reply, not just the end — mid-stream \
+     checkpoints (\"does the framing look right so far?\", \"is this the right direction \
+     before I continue?\", \"should I keep going with approach A?\") and end-of-turn \
+     confirmations (\"does this look complete?\", \"did I miss anything?\", \"should I \
+     proceed with approach A?\") all become buttons, not plaintext, even when they trail \
+     a long markdown answer. The trigger is question-shape (yes/no, A vs B, pick-from-list), \
+     not position in the message. If you find yourself typing a question mark and then \
+     waiting for the user to answer, stop and route it through `AskUserQuestion`. Reserve \
+     plaintext questions for genuinely open-ended ones (\"What name should I use for X?\") \
+     where pre-baked options would be guesses.";
 
 /// Permission allowlist rule shared across all CC system prompts.
 /// Lucidos passes `--allowedTools` when spawning CC, which overrides settings.json
@@ -108,13 +136,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          (`./scripts/web-dev.sh -w e2e-test -b`), then run tests (`./scripts/e2e.sh` for full \
          API + browser, or `./scripts/e2e-api.sh` / `./scripts/e2e-browser.sh` for one suite). \
          All commands run from your worktree directory.\n\n\
-         APPLY/RESTART: After your session ends, your commits sit as a pending change in the UI. \
-         The user explicitly clicks Apply to merge your branch into main — nothing happens \
-         automatically. If any Rust source files (.rs, Cargo.toml, Cargo.lock) or SQL migrations \
-         were modified, the apply emits a restart-required toast; the user clicks Restart, which \
-         rebuilds and restarts the engine. You do NOT need to tell the user about either button \
-         — both are explicit clicks they already see in the UI. Frontend (TypeScript/CSS) \
-         changes are picked up after Apply without a rebuild.\n\n\
+         {apply_restart}\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. If you abandoned an approach and took a different one, the old \
          edits may still be in the working tree. Discard them with `git checkout -- <file>`. \
@@ -137,6 +159,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
         no_pull_requests = NO_PULL_REQUESTS_RULE,
+        apply_restart = APPLY_RESTART_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         process_safety = process_safety_rule(true),
@@ -204,12 +227,7 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          2. Run `git diff` to check for uncommitted changes\n\
          3. If the work looks complete, clean up and finish\n\
          4. If incomplete, continue where you left off\n\n\
-         APPLY/RESTART: After your session ends, your commits sit as a pending change in the UI. \
-         The user explicitly clicks Apply to merge your branch into main. If any Rust source \
-         files (.rs, Cargo.toml, Cargo.lock) or SQL migrations were modified, the apply emits a \
-         restart-required toast; the user clicks Restart, which rebuilds and restarts the engine. \
-         You do NOT need to tell the user about either button — both are explicit clicks they \
-         already see in the UI. Frontend (TypeScript/CSS) changes are picked up after Apply.\n\n\
+         {apply_restart}\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Discard unintentional changes with `git checkout -- <file>`.\n\n\
          COMMANDS: Never use /cpa — it is for the main working tree only. \
@@ -223,6 +241,7 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
         no_pull_requests = NO_PULL_REQUESTS_RULE,
+        apply_restart = APPLY_RESTART_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         process_safety = process_safety_rule(true),
@@ -361,6 +380,27 @@ mod tests {
                 prompt.contains("AskUserQuestion"),
                 "{label} must nudge CC to use AskUserQuestion for choice-shaped questions",
             );
+            assert!(
+                !prompt.to_lowercase().contains("default to `askuserquestion`"),
+                "{label} must keep the AskUserQuestion rule as an unconditional imperative \
+                 — softer phrasing (\"default to\") let CC slip back to plaintext for \
+                 yes/no questions trailing a long markdown answer",
+            );
+            assert!(
+                prompt.contains("does this look complete"),
+                "{label} must include a concrete end-of-turn checkpoint example — the \
+                 abstract rule alone wasn't enough; CC needs to see the failure case \
+                 spelled out",
+            );
+            assert!(
+                prompt.contains("mid-stream"),
+                "{label} must keep the mid-stream concept — end-only examples let CC \
+                 keep slipping plaintext yes/no questions in the middle of long answers \
+                 (\"does the framing look right so far?\"). Pinning the concept word \
+                 (not a specific example phrase) lets future rewrites reword the \
+                 examples freely, but fails loudly if mid-stream coverage gets dropped \
+                 entirely",
+            );
         }
     }
 
@@ -371,5 +411,70 @@ mod tests {
         let prompt = worktree_system_prompt("feature/x", "dev");
         assert!(prompt.contains("/harden"), "Lucidos prompt must keep /harden guidance");
         assert!(prompt.contains("/cpa"), "Lucidos prompt must keep /cpa guidance");
+    }
+
+    /// Both Lucidos-repo prompts must carry the full APPLY/RESTART rule. Past
+    /// failure mode: a model paraphrased the file-type list (dropped `.rs`)
+    /// and added "No restart required" to its session summary while the UI
+    /// button said "Apply & Restart". The rule must (a) name every file type
+    /// that triggers restart, so a future edit can't quietly narrow the list,
+    /// and (b) ban the specific phrases the model used, so even if it drops
+    /// the rule from its mental model it can't write the wrong claim.
+    #[test]
+    fn lucidos_prompts_carry_full_apply_restart_rule() {
+        let cases: &[(&str, String)] = &[
+            (
+                "worktree_system_prompt",
+                worktree_system_prompt("feature/x", "dev"),
+            ),
+            (
+                "recovery_system_prompt",
+                recovery_system_prompt("feature/x", "dev"),
+            ),
+        ];
+        // Match `engine::git_ops::files_require_restart`. If you add a
+        // new trigger there, add it to APPLY_RESTART_RULE and to this
+        // list. Use the same string the rule uses (full paths for the
+        // bundled assets) so a paraphrase that drops the path also fails.
+        let required_file_types = [
+            "`.rs`",
+            "`Cargo.toml`",
+            "`Cargo.lock`",
+            // `.sql` alone would pass even if a paraphrase claimed
+            // "any `.sql` file triggers restart"; the engine only
+            // checks `.sql` files under `migrations/`. Pin the full
+            // qualifier so a paraphrase that drops the scope fails.
+            "`.sql` migration under `migrations/`",
+            "`packages/lucidos-sdk/`",
+            "`crates/lucidos-engine/src/api/sdk_iframe.css`",
+            "sdk_iframe_audio.js",
+        ];
+        let banned_phrases = [
+            "\"no restart required\"",
+            "\"restart required\"",
+            "\"just a code rebuild\"",
+        ];
+        for (label, prompt) in cases {
+            for needle in required_file_types {
+                assert!(
+                    prompt.contains(needle),
+                    "{label} must name `{needle}` (paraphrasing forbidden)",
+                );
+            }
+            for needle in banned_phrases {
+                assert!(
+                    prompt.contains(needle),
+                    "{label} must ban the phrase {needle}",
+                );
+            }
+            assert!(
+                prompt.contains("button label is the source of truth"),
+                "{label} must name the button as authoritative",
+            );
+            assert!(
+                prompt.contains("files_require_restart"),
+                "{label} must point at the engine function (`files_require_restart`)",
+            );
+        }
     }
 }

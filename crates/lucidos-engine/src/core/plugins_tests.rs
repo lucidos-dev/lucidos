@@ -243,6 +243,21 @@ fn rejects_empty_tree() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn validates_tree_with_only_auth_modules() {
+    let dir = tmpdir("authonly");
+    fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
+    let am = dir.join("auth-modules");
+    fs::create_dir_all(&am).unwrap();
+    fs::write(am.join("acme.wasm"), b"\0asm").unwrap();
+    fs::write(am.join("acme.manifest.json"), "{}").unwrap();
+    let (_, planned) = validate_tree(&dir).unwrap();
+    let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
+    assert!(paths.contains(&"auth-modules/acme.wasm"));
+    assert!(paths.contains(&"auth-modules/acme.manifest.json"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // --- validate_archive_entry_path (zip-slip) ---
 
 #[test]
@@ -272,6 +287,16 @@ fn rejects_absolute_windows() {
 #[test]
 fn accepts_safe_relative() {
     assert!(validate_archive_entry_path("knowhow/a.md").is_ok());
+}
+
+#[test]
+fn rejects_empty_path() {
+    // Empty inner names produce an opaque "not found" downstream — reject at the
+    // validator instead of expecting every caller to add a separate guard.
+    assert!(matches!(
+        validate_archive_entry_path(""),
+        Err(ValidationError::UnsafePath(_))
+    ));
 }
 
 // --- plan_files / detect_conflicts ---

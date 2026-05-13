@@ -279,6 +279,80 @@ pub(super) async fn query_hardened(
 }
 
 #[derive(Deserialize)]
+pub(super) struct CcEditPrereadQuery {
+    pub thread_id: String,
+    pub file_path: String,
+}
+
+#[derive(Serialize)]
+struct CcEditPrereadResponse {
+    /// True iff this thread has a prior `CodingAgentToolCalled` for `Read`
+    /// or `Write` against `file_path`. The hook treats this as "CC's
+    /// internal Edit pre-read tracking will accept this Edit" and allows
+    /// the call through. False means the next Edit will be rejected by CC
+    /// — the hook then preempts that with a clearer deny.
+    has_recent_read: bool,
+}
+
+/// GET /api/internal/cc-edit-preread?thread_id=<uuid>&file_path=<abs-path>
+///
+/// Invoked by the lucidos-cli `cc-edit-preread` PreToolUse hook from inside
+/// a CC subprocess every time CC's Edit tool fires. The hook turns a
+/// `false` response into a `permissionDecision: "deny"` with an explicit
+/// "Read first, then retry Edit" reason, so the model is forced into the
+/// correct loop instead of bouncing off CC's internal `<tool_use_error>
+/// File has not been read yet</tool_use_error>` message.
+///
+/// Read state lives in the events table (we track every CC tool call as
+/// `CodingAgentToolCalled`), so the lookup survives engine restart and
+/// session resume — same boundary as CC's own session tracking. We
+/// include `Write` because CC accepts an Edit on a file it has just
+/// Written (creating implies knowing the content). We deliberately do
+/// not include `Edit` itself: a prior failed Edit would otherwise
+/// satisfy the check and bypass the loop we're trying to break.
+pub(super) async fn cc_edit_preread_check(
+    State(state): State<AppState>,
+    Query(q): Query<CcEditPrereadQuery>,
+) -> impl IntoResponse {
+    let thread_id = match Uuid::parse_str(&q.thread_id) {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid thread_id").into_response(),
+    };
+
+    let row: Result<Option<bool>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM events \
+             WHERE thread_id = $1 \
+               AND event_type = 'CodingAgentToolCalled' \
+               AND payload->>'name' IN ('Read', 'Write') \
+               AND payload->'args'->>'file_path' = $2 \
+         )",
+    )
+    .bind(thread_id)
+    .bind(&q.file_path)
+    .fetch_optional(state.engine.pool())
+    .await;
+
+    let has_recent_read = match row {
+        Ok(Some(b)) => b,
+        Ok(None) => false,
+        Err(e) => {
+            crate::log!(
+                "[CcEditPreread] DB lookup failed for thread {} path {}: {} — falling back to allow to avoid blocking on engine error",
+                thread_id,
+                q.file_path,
+                e
+            );
+            // Fail open: don't turn a transient DB error into a hard deny
+            // for every Edit. CC's own internal check is still authoritative.
+            true
+        }
+    };
+
+    Json(CcEditPrereadResponse { has_recent_read }).into_response()
+}
+
+#[derive(Deserialize)]
 pub(super) struct CommitMadeRequest {
     pub thread_id: String,
     pub sha: String,
@@ -684,11 +758,30 @@ struct AskUserQuestionResponse {
     answers: serde_json::Value,
 }
 
+/// Per-question tool_use_id used in `UserQuestionAsked` / `UserQuestionAnswered`.
+/// CC sends one outer `tool_use_id` per `AskUserQuestion` call regardless of how
+/// many questions are inside; the engine renders them sequentially (one card on
+/// screen at a time) and needs a unique key per individual question for the wait
+/// registry, the answered-already crash-recovery lookup, and the partial unique
+/// index on `events_user_question_answered_unique`. Synthesizing
+/// `{outer}#q{i}` keeps each card independent without touching the DB schema.
+fn synth_question_id(outer: &str, index: usize) -> String {
+    format!("{outer}#q{index}")
+}
+
 /// POST /api/internal/ask-user-question — invoked by the lucidos-cli
 /// `ask-user-question-hook` subcommand from inside a CC subprocess when CC
-/// fires the `AskUserQuestion` PreToolUse hook. Long-polls until the user
-/// answers (or returns immediately if a prior `UserQuestionAnswered` already
-/// exists for this `tool_use_id`, for crash recovery).
+/// fires the `AskUserQuestion` PreToolUse hook.
+///
+/// CC's tool schema accepts 1–4 questions per call. Lucidos renders them
+/// **one at a time** so the user only ever sees a single question card on
+/// screen — see `synth_question_id` for the per-question key scheme.
+/// The handler walks the question list sequentially: register a waiter for
+/// question `i`, fast-path return any prior `UserQuestionAnswered` from a
+/// pre-restart session, otherwise emit `UserQuestionAsked` and long-poll
+/// until the user picks. Once every question has an answer (or one was
+/// canceled and we short-circuit), the combined `{question_text: label}`
+/// map goes back to CC as a single tool result — CC sees one tool call.
 pub(super) async fn ask_user_question(
     State(state): State<AppState>,
     Json(body): Json<AskUserQuestionRequest>,
@@ -698,33 +791,58 @@ pub(super) async fn ask_user_question(
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid thread_id").into_response(),
     };
 
-    // Register the waiter FIRST. If the lookup ran first and the user
-    // answered between lookup and register, the broadcast send would find no
-    // subscriber and the hook would block forever on `recv`. Registering
-    // first guarantees the wake either lands in the channel buffer (caught by
-    // `recv`) or fires before we get here (caught by the lookup below).
-    let mut waiter = state
-        .engine
-        .question_wait_registry
-        .register(&body.tool_use_id)
-        .await;
+    let parser_input = serde_json::json!({ "questions": body.questions });
+    let parsed = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
+    if parsed.is_empty() {
+        // CC sent zero questions — return an empty answers map; CC will read
+        // the tool result and decide what to do (typically: reissue with a
+        // real question). We deliberately don't 400 because the hook
+        // protocol doesn't model errors — a non-200 leaves CC stuck. Log
+        // because a misbehaving CC could otherwise flood this silently.
+        crate::log!(
+            "[AskUserQuestion] CC sent zero questions for {thread_id}/{}",
+            body.tool_use_id
+        );
+        return Json(AskUserQuestionResponse {
+            questions: body.questions,
+            answers: serde_json::Value::Object(serde_json::Map::new()),
+        })
+        .into_response();
+    }
 
-    // Crash-recovery fast path: user already answered this tool_use_id while
-    // the previous engine instance was alive.
-    let prior_answer =
-        match lookup_existing_answer(state.engine.pool(), thread_id, &body.tool_use_id).await {
-            Ok(opt) => opt,
+    let session_id = body.session_id.clone();
+    let outer_tool_use_id = body.tool_use_id.clone();
+    let total = parsed.len();
+    let mut answer_kinds: Vec<serde_json::Value> = Vec::with_capacity(total);
+    let mut first_canceled_index: Option<usize> = None;
+    for (i, q) in parsed.into_iter().enumerate() {
+        let sub_id = synth_question_id(&body.tool_use_id, i);
+
+        // Register FIRST. If the lookup ran first and the user answered
+        // between lookup and register, the broadcast send would find no
+        // subscriber and we'd block forever on `recv`. Registering first
+        // guarantees the wake either lands in the channel buffer (caught by
+        // `recv`) or fires before we get here (caught by the lookup below).
+        let mut waiter = state.engine.question_wait_registry.register(&sub_id).await;
+
+        // Crash-recovery fast path: user already answered this question on
+        // the previous engine instance.
+        match lookup_existing_answer(state.engine.pool(), thread_id, &sub_id).await {
+            Ok(Some(prior)) => {
+                state.engine.question_wait_registry.forget(&sub_id).await;
+                let canceled = is_canceled_answer(&prior);
+                answer_kinds.push(prior);
+                if canceled {
+                    first_canceled_index = Some(i);
+                    break;
+                }
+                continue;
+            }
+            Ok(None) => {}
             Err(e) => {
-                state
-                    .engine
-                    .question_wait_registry
-                    .forget(&body.tool_use_id)
-                    .await;
+                state.engine.question_wait_registry.forget(&sub_id).await;
                 crate::log!(
-                    "[AskUserQuestion] DB lookup failed for {}/{}: {}",
-                    thread_id,
-                    body.tool_use_id,
-                    e
+                    "[AskUserQuestion] DB lookup failed for {thread_id}/{sub_id}: {e}"
                 );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -732,116 +850,122 @@ pub(super) async fn ask_user_question(
                 )
                     .into_response();
             }
-        };
-    if let Some(answer_kind_json) = prior_answer {
-        state
-            .engine
-            .question_wait_registry
-            .forget(&body.tool_use_id)
-            .await;
-        let answers = answer_kind_to_hook_answers(&answer_kind_json, &body.questions);
-        return Json(AskUserQuestionResponse {
-            questions: body.questions,
-            answers,
-        })
-        .into_response();
-    }
+        }
 
-    // Translate hook's questions[0] into engine's singular (question, options)
-    // shape using the existing parser. Parser input shape is { questions: [...] }.
-    let parser_input = serde_json::json!({ "questions": body.questions });
-    let (question, options) =
-        crate::engine::agent_session::parse_ask_user_question_input(&parser_input);
-
-    // Skip emit if a UserQuestionAsked already exists for this tool_use_id —
-    // we are re-entering after engine restart and the UI still has the card open.
-    let already_asked =
-        match user_question_already_asked(state.engine.pool(), thread_id, &body.tool_use_id).await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                state
-                    .engine
-                    .question_wait_registry
-                    .forget(&body.tool_use_id)
-                    .await;
-                crate::log!(
-                    "[AskUserQuestion] DB lookup failed for {}/{}: {}",
+        // Skip emit if a UserQuestionAsked already exists for this sub_id —
+        // we are re-entering after engine restart and the card is still open.
+        let already_asked =
+            match user_question_already_asked(state.engine.pool(), thread_id, &sub_id).await {
+                Ok(b) => b,
+                Err(e) => {
+                    state.engine.question_wait_registry.forget(&sub_id).await;
+                    crate::log!(
+                        "[AskUserQuestion] DB lookup failed for {thread_id}/{sub_id}: {e}"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "DB lookup for prior UserQuestionAsked failed",
+                    )
+                        .into_response();
+                }
+            };
+        if !already_asked {
+            if let Err(e) = state
+                .engine
+                .event_bus
+                .emit(BusEvent::Thread {
                     thread_id,
-                    body.tool_use_id,
-                    e
+                    event: ThreadEvent::UserQuestionAsked {
+                        tool_use_id: sub_id.clone(),
+                        cc_session_id: session_id.clone(),
+                        question: q.question,
+                        options: q.options,
+                        worktree_path: None,
+                        multi_select: q.multi_select,
+                    },
+                    meta: EventMeta::NONE,
+                })
+                .await
+            {
+                state.engine.question_wait_registry.forget(&sub_id).await;
+                crate::log!(
+                    "[AskUserQuestion] Failed to emit UserQuestionAsked for {thread_id}/{sub_id}: {e}"
                 );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "DB lookup for prior UserQuestionAsked failed",
+                    "Failed to persist UserQuestionAsked",
+                )
+                    .into_response();
+            }
+        }
+
+        // Block until UserQuestionAnswered fires (no timeout — same as MCP permission).
+        let payload = match waiter.recv().await {
+            Ok(p) => p,
+            Err(_) => {
+                state.engine.question_wait_registry.forget(&sub_id).await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "wait registry channel closed",
                 )
                     .into_response();
             }
         };
-    if !already_asked {
-        if let Err(e) = state
-            .engine
-            .event_bus
-            .emit(BusEvent::Thread {
-                thread_id,
-                event: ThreadEvent::UserQuestionAsked {
-                    tool_use_id: body.tool_use_id.clone(),
-                    cc_session_id: body.session_id,
-                    question,
-                    options,
-                    worktree_path: None,
-                },
-                meta: EventMeta::NONE,
-            })
-            .await
-        {
-            state
-                .engine
-                .question_wait_registry
-                .forget(&body.tool_use_id)
-                .await;
-            crate::log!(
-                "[AskUserQuestion] Failed to emit UserQuestionAsked for {}/{}: {}",
-                thread_id,
-                body.tool_use_id,
-                e
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to persist UserQuestionAsked",
-            )
-                .into_response();
+        state.engine.question_wait_registry.forget(&sub_id).await;
+
+        let canceled = is_canceled_answer(&payload.answers);
+        answer_kinds.push(payload.answers);
+        if canceled {
+            // User canceled mid-multi-question. Don't render any more cards;
+            // `build_hook_answers` pads the rest with `(canceled)` so CC sees
+            // the cancel for every remaining question.
+            first_canceled_index = Some(i);
+            break;
         }
     }
 
-    // 4. Block until UserQuestionAnswered fires (no timeout — same as MCP permission).
-    let payload = match waiter.recv().await {
-        Ok(p) => p,
-        Err(_) => {
+    // Persist Canceled markers for any sub_ids the loop short-circuited past.
+    // Without this, an engine restart between the cancel and CC processing the
+    // hook result would re-fire the hook, the per-question crash-recovery
+    // lookup would see no answer for the trailing sub_ids, and we'd re-emit
+    // UserQuestionAsked for cards the user already implicitly canceled.
+    if let Some(canceled_at) = first_canceled_index {
+        for j in (canceled_at + 1)..total {
+            let remaining_sub = synth_question_id(&outer_tool_use_id, j);
             state
                 .engine
-                .question_wait_registry
-                .forget(&body.tool_use_id)
+                .event_bus
+                .emit_or_log(
+                    BusEvent::Thread {
+                        thread_id,
+                        event: ThreadEvent::UserQuestionAnswered {
+                            tool_use_id: remaining_sub,
+                            answer: crate::engine::thread_events::AnswerKind::Canceled,
+                        },
+                        meta: EventMeta {
+                            channel: Some(EventChannel::CodingAgent),
+                            ..EventMeta::NONE
+                        },
+                    },
+                    "[AskUserQuestion] cancel padding for remaining sub_id",
+                )
                 .await;
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "wait registry channel closed",
-            )
-                .into_response();
         }
-    };
-    state
-        .engine
-        .question_wait_registry
-        .forget(&body.tool_use_id)
-        .await;
+    }
 
-    let answers = answer_kind_to_hook_answers(&payload.answers, &body.questions);
+    let answers = build_hook_answers(&answer_kinds, &body.questions);
     Json(AskUserQuestionResponse {
         questions: body.questions,
         answers,
     })
     .into_response()
+}
+
+/// True when an `AnswerKind` JSON object has `kind == "Canceled"`. Used to
+/// short-circuit the multi-question loop: once any question is canceled, we
+/// stop emitting further cards and let `build_hook_answers` pad the rest.
+fn is_canceled_answer(answer_kind: &serde_json::Value) -> bool {
+    answer_kind.get("kind").and_then(|k| k.as_str()) == Some("Canceled")
 }
 
 /// Look up the most recent `UserQuestionAnswered` for `tool_use_id` and return
@@ -887,50 +1011,82 @@ async fn user_question_already_asked(
     .await
 }
 
-/// Convert an `AnswerKind` JSON value (`{"kind": "Selected", "option_id": "opt-0"}`
-/// etc.) into CC's expected hook output shape `{question_text: chosen_label}`.
-/// Looks up the label from the original CC `questions` JSON. Falls back to the
-/// option_id / text on lookup miss. `Canceled` produces a `(canceled)` marker
-/// answer rather than an empty object — empty `{}` causes CC's model to read
-/// the question as unanswered and re-invoke the tool in a loop.
-fn answer_kind_to_hook_answers(
+/// Look up the label for a synthesized option_id (`opt-N`) from a specific
+/// question's options array. `question_index` is the 0-based position of the
+/// question in CC's outer `questions` array — option ids restart at `opt-0`
+/// per question (see `parse_one_question` in `agent_session::parsing`), so
+/// we need to know which question's options to consult. Falls back to the
+/// bare `opt_id` on miss so the model sees a recognizable error rather than
+/// a silent drop.
+fn lookup_option_label(
+    opt_id: &str,
+    cc_questions: &serde_json::Value,
+    question_index: usize,
+) -> String {
+    opt_id
+        .strip_prefix("opt-")
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(|idx| {
+            cc_questions
+                .as_array()
+                .and_then(|arr| arr.get(question_index))
+                .and_then(|q| q.get("options"))
+                .and_then(|opts| opts.as_array())
+                .and_then(|opts| opts.get(idx))
+                .and_then(|opt| opt.get("label"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| opt_id.to_string())
+}
+
+/// Convert one `AnswerKind` JSON value (`{"kind": "Selected", ...}` etc.)
+/// into the hook's per-question answer string. Looks up labels from the
+/// `question_index`-th question's options. Falls back to the option_id /
+/// text on lookup miss. `Canceled` produces a `(canceled)` marker rather
+/// than an empty string — an empty answer causes CC's model to read the
+/// question as unanswered and re-invoke the tool in a loop.
+///
+/// `MultiSelected` joins the resolved labels with `", "` — CC's `answers`
+/// schema is `additionalProperties: string`, so the joined form is the right
+/// shape for the model to read back as multiple chosen options. When the
+/// payload also carries a non-empty `text` (freetext typed in the prompt
+/// textarea while the question was on screen), it joins on the same `", "`
+/// after the labels — CC sees one comma-joined answer.
+fn answer_kind_to_hook_value(
     answer_kind: &serde_json::Value,
     cc_questions: &serde_json::Value,
+    question_index: usize,
 ) -> serde_json::Value {
-    let question_text = cc_questions
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|q| q.get("question"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("(unknown question)")
-        .to_string();
-
     let kind = answer_kind
         .get("kind")
         .and_then(|k| k.as_str())
         .unwrap_or("");
-    let value = match kind {
+    match kind {
         "Selected" => {
             let opt_id = answer_kind
                 .get("option_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let label = opt_id
-                .strip_prefix("opt-")
-                .and_then(|n| n.parse::<usize>().ok())
-                .and_then(|idx| {
-                    cc_questions
-                        .as_array()
-                        .and_then(|arr| arr.first())
-                        .and_then(|q| q.get("options"))
-                        .and_then(|opts| opts.as_array())
-                        .and_then(|opts| opts.get(idx))
-                        .and_then(|opt| opt.get("label"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
+            serde_json::Value::String(lookup_option_label(opt_id, cc_questions, question_index))
+        }
+        "MultiSelected" => {
+            let mut parts: Vec<String> = answer_kind
+                .get("option_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|id| lookup_option_label(id, cc_questions, question_index))
+                        .collect()
                 })
-                .unwrap_or_else(|| opt_id.to_string());
-            serde_json::Value::String(label)
+                .unwrap_or_default();
+            if let Some(text) = answer_kind.get("text").and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    parts.push(text.to_string());
+                }
+            }
+            serde_json::Value::String(parts.join(", "))
         }
         "FreeText" => answer_kind
             .get("text")
@@ -938,9 +1094,54 @@ fn answer_kind_to_hook_answers(
             .unwrap_or(serde_json::Value::String(String::new())),
         "Canceled" => serde_json::Value::String("(canceled)".to_string()),
         _ => serde_json::Value::String(format!("(unknown answer kind: {})", kind)),
-    };
+    }
+}
 
-    serde_json::json!({ question_text: value })
+/// Build the combined `{question_text: answer_label}` map CC expects in the
+/// hook tool result. Walks every question CC originally sent, pairing it
+/// with the corresponding collected answer (by index). When a question has
+/// no collected answer yet — the loop short-circuited on cancellation — we
+/// emit `(canceled)` for that question. Same reason as the per-question
+/// Canceled branch above: an empty/missing entry would make CC's model read
+/// the question as unanswered and retry the whole tool call.
+///
+/// CC's hook output schema is a JSON object keyed by question text, which
+/// implicitly assumes unique texts across the call. A duplicate text would
+/// silently overwrite the prior answer, dropping it on the floor — same UX
+/// failure mode as the bug this whole feature fixes (CC sees fewer answers
+/// than questions and "re-asks"). We disambiguate duplicates with a
+/// `" (#i)"` suffix where `i` is the 1-based question index. CC won't
+/// recognize the suffixed key against its outgoing tool input, but every
+/// answer is at least carried — and the log makes it visible.
+fn build_hook_answers(
+    answer_kinds: &[serde_json::Value],
+    cc_questions: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(arr) = cc_questions.as_array() else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    let mut map = serde_json::Map::with_capacity(arr.len());
+    for (i, q) in arr.iter().enumerate() {
+        let raw_text = q
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unknown question)")
+            .to_string();
+        let key = if map.contains_key(&raw_text) {
+            crate::log!(
+                "[AskUserQuestion] duplicate question text in CC tool input — disambiguating with suffix: {raw_text:?}"
+            );
+            format!("{raw_text} (#{})", i + 1)
+        } else {
+            raw_text
+        };
+        let value = match answer_kinds.get(i) {
+            Some(ans) => answer_kind_to_hook_value(ans, cc_questions, i),
+            None => serde_json::Value::String("(canceled)".to_string()),
+        };
+        map.insert(key, value);
+    }
+    serde_json::Value::Object(map)
 }
 
 #[cfg(test)]
@@ -957,17 +1158,35 @@ mod ask_user_question_tests {
         }])
     }
 
+    fn three_questions() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "question": "Fav color?",
+                "options": [{"label": "Red"}, {"label": "Blue"}],
+            },
+            {
+                "question": "Fav animal?",
+                "options": [{"label": "Cat"}, {"label": "Dog"}],
+            },
+            {
+                "question": "Pick all toppings",
+                "multiSelect": true,
+                "options": [{"label": "Cheese"}, {"label": "Olives"}],
+            },
+        ])
+    }
+
     #[test]
     fn selected_answer_resolves_to_label() {
         let answer = serde_json::json!({"kind": "Selected", "option_id": "opt-1"});
-        let out = answer_kind_to_hook_answers(&answer, &questions());
+        let out = build_hook_answers(&[answer], &questions());
         assert_eq!(out, serde_json::json!({"Fav color?": "Blue"}));
     }
 
     #[test]
     fn free_text_passes_through() {
         let answer = serde_json::json!({"kind": "FreeText", "text": "purple"});
-        let out = answer_kind_to_hook_answers(&answer, &questions());
+        let out = build_hook_answers(&[answer], &questions());
         assert_eq!(out, serde_json::json!({"Fav color?": "purple"}));
     }
 
@@ -976,15 +1195,191 @@ mod ask_user_question_tests {
         // Empty `{}` would be read as "unanswered" by CC's model, causing an
         // infinite re-invocation loop. The marker terminates the call.
         let answer = serde_json::json!({"kind": "Canceled"});
-        let out = answer_kind_to_hook_answers(&answer, &questions());
+        let out = build_hook_answers(&[answer], &questions());
         assert_eq!(out, serde_json::json!({"Fav color?": "(canceled)"}));
     }
 
     #[test]
     fn missing_label_falls_back_to_option_id() {
         let answer = serde_json::json!({"kind": "Selected", "option_id": "opt-9"});
-        let out = answer_kind_to_hook_answers(&answer, &questions());
+        let out = build_hook_answers(&[answer], &questions());
         assert_eq!(out, serde_json::json!({"Fav color?": "opt-9"}));
+    }
+
+    #[test]
+    fn multi_selected_joins_labels_with_comma_space() {
+        let answer = serde_json::json!({
+            "kind": "MultiSelected",
+            "option_ids": ["opt-0", "opt-1"]
+        });
+        let out = build_hook_answers(&[answer], &questions());
+        assert_eq!(out, serde_json::json!({"Fav color?": "Red, Blue"}));
+    }
+
+    #[test]
+    fn multi_selected_unknown_id_falls_back_to_id() {
+        // Mirrors single-Selected fallback — keeps the error visible to the
+        // model rather than silently dropping it.
+        let answer = serde_json::json!({
+            "kind": "MultiSelected",
+            "option_ids": ["opt-0", "opt-9"]
+        });
+        let out = build_hook_answers(&[answer], &questions());
+        assert_eq!(out, serde_json::json!({"Fav color?": "Red, opt-9"}));
+    }
+
+    #[test]
+    fn multi_selected_single_id_yields_one_label() {
+        let answer = serde_json::json!({
+            "kind": "MultiSelected",
+            "option_ids": ["opt-1"]
+        });
+        let out = build_hook_answers(&[answer], &questions());
+        assert_eq!(out, serde_json::json!({"Fav color?": "Blue"}));
+    }
+
+    #[test]
+    fn multi_selected_with_text_appends_after_labels() {
+        // Prompt-row Submit folded the textarea contents into the answer.
+        let answer = serde_json::json!({
+            "kind": "MultiSelected",
+            "option_ids": ["opt-0", "opt-1"],
+            "text": "and also purple",
+        });
+        let out = build_hook_answers(&[answer], &questions());
+        assert_eq!(out, serde_json::json!({"Fav color?": "Red, Blue, and also purple"}));
+    }
+
+    #[test]
+    fn multi_selected_with_only_text_yields_just_text() {
+        // No toggles — answer collapses to the freetext alone.
+        let answer = serde_json::json!({
+            "kind": "MultiSelected",
+            "option_ids": [],
+            "text": "freeform answer",
+        });
+        let out = build_hook_answers(&[answer], &questions());
+        assert_eq!(out, serde_json::json!({"Fav color?": "freeform answer"}));
+    }
+
+    #[test]
+    fn multi_selected_with_empty_text_omits_trailing_separator() {
+        // Empty `text` must NOT add a trailing ", " — the separator only
+        // appears between non-empty parts.
+        let answer = serde_json::json!({
+            "kind": "MultiSelected",
+            "option_ids": ["opt-0"],
+            "text": "",
+        });
+        let out = build_hook_answers(&[answer], &questions());
+        assert_eq!(out, serde_json::json!({"Fav color?": "Red"}));
+    }
+
+    // ---- multi-question coverage (build_hook_answers + per-question label lookup) ----
+
+    #[test]
+    fn build_hook_answers_pairs_each_question_with_its_own_options() {
+        // Per-question option ids restart at opt-0; the lookup must consult
+        // the matching question's options array, not always questions[0].
+        let answers = vec![
+            serde_json::json!({"kind": "Selected", "option_id": "opt-1"}),
+            serde_json::json!({"kind": "Selected", "option_id": "opt-0"}),
+            serde_json::json!({
+                "kind": "MultiSelected",
+                "option_ids": ["opt-0", "opt-1"],
+            }),
+        ];
+        let out = build_hook_answers(&answers, &three_questions());
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "Fav color?": "Blue",
+                "Fav animal?": "Cat",
+                "Pick all toppings": "Cheese, Olives",
+            })
+        );
+    }
+
+    #[test]
+    fn build_hook_answers_pads_missing_answers_with_canceled_marker() {
+        // Loop short-circuited on cancel after Q1 answered. Q2 + Q3 must
+        // surface as `(canceled)` — never empty/missing keys, which CC reads
+        // as "unanswered" and retries the whole tool call.
+        let answers = vec![serde_json::json!({"kind": "Selected", "option_id": "opt-0"})];
+        let out = build_hook_answers(&answers, &three_questions());
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "Fav color?": "Red",
+                "Fav animal?": "(canceled)",
+                "Pick all toppings": "(canceled)",
+            })
+        );
+    }
+
+    #[test]
+    fn build_hook_answers_handles_zero_questions() {
+        let out = build_hook_answers(&[], &serde_json::json!([]));
+        assert_eq!(out, serde_json::json!({}));
+    }
+
+    #[test]
+    fn lookup_option_label_uses_question_index_not_first() {
+        // Direct test of the helper to guard against a regression to the
+        // "always read questions[0]" bug — labels in Q2 should resolve via
+        // questions[1].options.
+        let questions = three_questions();
+        assert_eq!(
+            lookup_option_label("opt-1", &questions, 1),
+            "Dog",
+            "must look up Q2's options[1], not Q1's"
+        );
+        assert_eq!(
+            lookup_option_label("opt-0", &questions, 2),
+            "Cheese",
+            "must look up Q3's options[0]"
+        );
+    }
+
+    #[test]
+    fn synth_question_id_format_is_outer_hash_q_index() {
+        // The hash separator + `q` prefix must stay stable — the wait
+        // registry, the per-question UserQuestionAsked emit, and the
+        // crash-recovery answer lookup all key on this exact string.
+        assert_eq!(synth_question_id("toolu_xyz", 0), "toolu_xyz#q0");
+        assert_eq!(synth_question_id("toolu_xyz", 12), "toolu_xyz#q12");
+    }
+
+    #[test]
+    fn is_canceled_answer_only_matches_explicit_canceled_kind() {
+        assert!(is_canceled_answer(&serde_json::json!({"kind": "Canceled"})));
+        assert!(!is_canceled_answer(
+            &serde_json::json!({"kind": "Selected", "option_id": "opt-0"})
+        ));
+        assert!(!is_canceled_answer(&serde_json::json!({})));
+        assert!(!is_canceled_answer(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn build_hook_answers_disambiguates_duplicate_question_texts() {
+        // CC's hook output is keyed by question text. If CC sends two
+        // questions with identical text, a naive `Map::insert` would
+        // overwrite the first answer — same UX failure as the bug this
+        // feature fixes. Disambiguate with `" (#i)"` so every answer is
+        // carried back to CC.
+        let dupe_questions = serde_json::json!([
+            {"question": "Pick one", "options": [{"label": "A"}]},
+            {"question": "Pick one", "options": [{"label": "B"}]},
+        ]);
+        let answers = vec![
+            serde_json::json!({"kind": "Selected", "option_id": "opt-0"}),
+            serde_json::json!({"kind": "Selected", "option_id": "opt-0"}),
+        ];
+        let out = build_hook_answers(&answers, &dupe_questions);
+        let obj = out.as_object().expect("object");
+        assert_eq!(obj.len(), 2, "both answers must survive — got {out}");
+        assert_eq!(obj.get("Pick one"), Some(&serde_json::json!("A")));
+        assert_eq!(obj.get("Pick one (#2)"), Some(&serde_json::json!("B")));
     }
 }
 

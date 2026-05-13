@@ -141,6 +141,7 @@ async fn user_prompt_injected_does_not_collide_with_optimistic_id() {
         spawning_event_id: None,
         images: None,
         origin: None,
+        kind: crate::engine::InjectedPromptKind::UserText,
     };
 
     emit_user_prompt_injected_event(&bus, thread_id, &base_meta, &prompt).await;
@@ -216,6 +217,7 @@ async fn ensure_terminator_emitted_recovers_silent_exit() {
             name: "edit_file".into(),
             result: "ok".into(),
             images: vec![],
+            success: true,
         },
         meta: meta.clone(),
     })
@@ -327,6 +329,7 @@ async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
             name: "edit_file".into(),
             result: "ok".into(),
             images: vec![],
+            success: true,
         },
         meta: current_meta.clone(),
     })
@@ -348,6 +351,112 @@ async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
         Some(current_origin.to_string().as_str()),
         "guard must emit a ResponseAborted for the current request, ignoring earlier completed exchanges"
     );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression: `/api/restart` pre-emits `ResponseAborted{actor: device}` for
+/// the in-flight chat thread, then `force_evict_chat_thread` cancels its
+/// token. The agentic loop's cancel branches fire moments later. Without
+/// the dedup gate inside `emit_response_canceled`, the loop's emit lands
+/// on top of the pre-emitted abort and the timeline shows both
+/// "You — Restarted" AND "You — Canceled the response" stacked together.
+/// The gate must read the request_event_id off `meta`, find the prior
+/// terminator, and skip its own emit.
+#[tokio::test]
+async fn emit_response_canceled_is_idempotent_when_terminator_exists_for_request() {
+    use crate::engine::thread_events::{emit_response_canceled, AbortCause, CancelCause};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let origin_id = Uuid::new_v4();
+    let meta = anchor_request(&bus, thread_id, origin_id, "fix the bug").await;
+
+    // Pre-emit the boundary abort (mirroring `/api/restart`).
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseAborted {
+            text: String::new(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+            cause: AbortCause::EngineShutdown,
+        },
+        meta: meta.clone(),
+    })
+    .await
+    .expect("pre-emit ResponseAborted");
+
+    // Loop's cancel branch fires after the token is cancelled.
+    emit_response_canceled(
+        &bus,
+        &pool,
+        thread_id,
+        CancelCause::UserStop,
+        String::new(),
+        vec![],
+        None,
+        None,
+        meta,
+        "[Test] cancel branch",
+    )
+    .await;
+
+    let canceled_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ResponseCanceled'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert_eq!(
+        canceled_count, 0,
+        "emit_response_canceled must skip when a terminator already exists for the request"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// Counterpart: with no prior terminator, the cancel emit must land. Guards
+/// against a future refactor that hard-codes the skip and silently breaks
+/// the user-clicks-Stop flow.
+#[tokio::test]
+async fn emit_response_canceled_lands_when_no_prior_terminator() {
+    use crate::engine::thread_events::{emit_response_canceled, CancelCause};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let origin_id = Uuid::new_v4();
+    let meta = anchor_request(&bus, thread_id, origin_id, "fix the bug").await;
+
+    emit_response_canceled(
+        &bus,
+        &pool,
+        thread_id,
+        CancelCause::UserStop,
+        "partial reply".into(),
+        vec![],
+        None,
+        None,
+        meta,
+        "[Test] user stop",
+    )
+    .await;
+
+    let canceled_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ResponseCanceled'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert_eq!(canceled_count, 1, "emit must land when no prior terminator exists");
 
     teardown_test_db(&db_name).await;
 }

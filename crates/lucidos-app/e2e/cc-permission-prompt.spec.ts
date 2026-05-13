@@ -84,10 +84,15 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       expect(respBody.allowed).toBe(true);
 
       // The SAME panel flips in place — the answered body lives inside the
-      // same initiator panel, no new divider materialized for the click.
+      // same initiator panel, no new divider materialized for the click. The
+      // picked button keeps its semantic styling with a check; the rejected
+      // ones are disabled and struck through.
       const answered = panel.locator('.initiator-body .cc-permission-body-answered').first();
       await expect(answered).toBeVisible({ timeout: 10_000 });
-      await expect(answered.locator('.cc-permission-allowed-badge')).toBeVisible();
+      const picked = answered.locator('button.cc-permission-btn-picked');
+      await expect(picked).toHaveText(/Allow once/);
+      await expect(picked).toBeDisabled();
+      await expect(answered.locator('button.cc-permission-btn-rejected', { hasText: /^Deny$/ })).toBeDisabled();
 
       // Both events landed in the DB and are persisted.
       await expect.poll(
@@ -163,7 +168,10 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
 
       const answered = panel.locator('.initiator-body .cc-permission-body-answered').first();
       await expect(answered).toBeVisible({ timeout: 10_000 });
-      await expect(answered.locator('.cc-permission-denied-badge')).toBeVisible();
+      const picked = answered.locator('button.cc-permission-btn-picked');
+      await expect(picked).toHaveText(/Deny/);
+      await expect(picked).toBeDisabled();
+      await expect(answered.locator('button.cc-permission-btn-rejected', { hasText: /^Allow once$/ })).toBeDisabled();
     } finally {
       if (promptResponse) {
         await promptResponse.catch(() => undefined);

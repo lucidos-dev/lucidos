@@ -50,7 +50,6 @@ pub struct JsonRpcResponse {
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
-    pub data: Option<serde_json::Value>,
 }
 
 /// MCP `initialize` request params.
@@ -77,7 +76,6 @@ pub struct ClientInfo {
 pub struct InitializeResult {
     #[serde(rename = "protocolVersion")]
     pub protocol_version: String,
-    pub capabilities: Option<serde_json::Value>,
     #[serde(rename = "serverInfo")]
     pub server_info: Option<ServerInfo>,
 }

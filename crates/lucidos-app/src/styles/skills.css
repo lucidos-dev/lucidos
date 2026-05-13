@@ -10,10 +10,6 @@
     opacity: 0.55;
 }
 
-.trigger-disabled > .list-row-actions > .action-btn:not(.trigger-toggle-btn) {
-    opacity: 0.55;
-}
-
 .trigger-cron-list {
     list-style: none;
     margin: 0.125rem 0 0;
@@ -150,7 +146,7 @@
     margin-top: 0.25rem;
 }
 
-/* Removable string list in trigger form (cron expressions, knowhow ids) */
+/* Removable string list in trigger form (cron expressions) */
 .removable-list {
     list-style: none;
     margin: 0 0 0.375rem;
@@ -185,19 +181,6 @@
     font-family: var(--font-ui);
     font-size: 0.625rem;
     color: var(--text-muted);
-}
-
-.knowhow-id {
-    font-family: var(--font-ui);
-    font-size: 0.75rem;
-    color: var(--text-primary);
-}
-
-.knowhow-id.invalid {
-    color: var(--accent-red);
-    text-decoration: line-through;
-    text-decoration-color: var(--accent-red);
-    text-decoration-thickness: 1px;
 }
 
 .removable-input-row {

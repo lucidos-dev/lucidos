@@ -27,7 +27,7 @@ import { handleEventWithAgg } from './aggregate-test-helper';
 import { statusLabel, isActive } from '../exchange-status';
 import { displaySection } from '../../generated/thread-lifecycle';
 import { getEventToggleState, getCollapsedVisibleEvents } from '../event-rendering';
-import { effectiveThreadStatus } from '../store';
+import { effectiveThreadStatus, isThreadQuiescent } from '../store';
 
 const TS = '2026-04-17T00:00:00Z';
 
@@ -1210,15 +1210,15 @@ describe('Flow: Recovery CC session', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Flow 12b: Recovery via SessionRecovered (auto-recovery of interrupted sessions)
+// Flow 12b: Recovery via ContinuationStarted (auto-recovery of interrupted sessions)
 // ---------------------------------------------------------------------------
-describe('Flow: SessionRecovered recovery', () => {
-  it('SessionRecovered acts as exchange boundary, thread shows CC content', () => {
+describe('Flow: ContinuationStarted recovery', () => {
+  it('ContinuationStarted acts as exchange boundary, thread shows CC content', () => {
     const { map, id } = makeThread();
 
-    // Recovery session: SessionRecovered for auto-recovered interrupted sessions
+    // Recovery session: ContinuationStarted for auto-recovered interrupted sessions
     insertEvents(map, id, [
-      { type: 'SessionRecovered', branch: 'claude-code/20260318-122816' },
+      { type: 'ContinuationStarted', branch: 'claude-code/20260318-122816' },
       { type: 'SessionStarted', session_id: 'cc-1', branch: 'claude-code/20260318-122816' },
       { type: 'CodingAgentToolCalled', name: 'Read', args: {} },
       { type: 'CodingAgentToolResult', name: 'Read', result: 'ok' },
@@ -1229,15 +1229,15 @@ describe('Flow: SessionRecovered recovery', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
-    // SessionRecovered is the user event (system-initiated, no user message)
-    expect(exchanges[0].userEvent.type).toBe('SessionRecovered');
+    // ContinuationStarted is the user event (system-initiated, no user message)
+    expect(exchanges[0].userEvent.type).toBe('ContinuationStarted');
     expect(exchangeUserMessage(exchanges[0])).toBe('Resumed after engine restart');
     expect(exchangeUserChannel(exchanges[0])).toBe('claude_code');
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
     expect(exchangeResponseText(exchanges[0])).toContain('Reviewed and continuing.');
   });
 
-  it('SessionRecovered in existing thread (with prior messages) creates new exchange', () => {
+  it('ContinuationStarted in existing thread (with prior messages) creates new exchange', () => {
     const { map, id } = makeThread();
 
     // Original thread with a completed exchange
@@ -1249,7 +1249,7 @@ describe('Flow: SessionRecovered recovery', () => {
       { type: 'ResponseGenerated' },
       { type: 'CodingAgentIdled', has_changes: true },
       // Engine restart → auto-recovery of interrupted session
-      { type: 'SessionRecovered', branch: 'claude-code/20260318-122816' },
+      { type: 'ContinuationStarted', branch: 'claude-code/20260318-122816' },
       { type: 'SessionStarted', session_id: 'cc-recovery', branch: 'claude-code/20260318-122816' },
       { type: 'CodingAgentTextStreamed', text: 'Continuing work.' },
       { type: 'ResponseGenerated' },
@@ -1259,15 +1259,15 @@ describe('Flow: SessionRecovered recovery', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
     expect(exchanges[0].userEvent.type).toBe('MessageReceived');
-    expect(exchanges[1].userEvent.type).toBe('SessionRecovered');
+    expect(exchanges[1].userEvent.type).toBe('ContinuationStarted');
     expect(exchangeStatus(exchanges[1], '', true)).toBe('done');
   });
 
-  it('SessionRecovered that completes with SessionEnded shows Done', () => {
+  it('ContinuationStarted that completes with SessionEnded shows Done', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
-      { type: 'SessionRecovered', branch: 'claude-code/20260318' },
+      { type: 'ContinuationStarted', branch: 'claude-code/20260318' },
       { type: 'SessionStarted', session_id: 'cc-1' },
       { type: 'CodingAgentTextStreamed', text: 'Nothing to do.' },
       { type: 'ResponseGenerated' },
@@ -1392,6 +1392,73 @@ describe('Flow: Edge cases', () => {
     // MemorySearched step should have queries as detail
     const memStep = stepEvents[0] as { detail?: string };
     expect(memStep.detail).toBe('birthday, date of birth');
+  });
+
+  it('ToolResult content is attached to the matching step (LLM tools)', () => {
+    const { map, id } = makeThread();
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'List files' },
+      { type: 'ToolCalled', name: 'list_files', args: { path: '.' } },
+      { type: 'ToolResult', name: 'list_files', result: 'a.txt\nb.txt' },
+      { type: 'ResponseGenerated' },
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    const stepEvents = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as Array<{ description: string; result?: string }>;
+    expect(stepEvents).toHaveLength(1);
+    expect(stepEvents[0].result).toBe('a.txt\nb.txt');
+  });
+
+  it('CodingAgentToolResult content is paired by tool_use_id and attached to the matching step', () => {
+    const { map, id } = makeThread();
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'Run a command' },
+      { type: 'CodingAgentUserMessageSent', text: 'Run a command' },
+      { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'ls' }, tool_use_id: 'tu-1' },
+      { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'pwd' }, tool_use_id: 'tu-2' },
+      // Out-of-order results — pairing must follow tool_use_id, not arrival order
+      { type: 'CodingAgentToolResult', name: 'Bash', result: '/home/user', tool_use_id: 'tu-2' },
+      { type: 'CodingAgentToolResult', name: 'Bash', result: 'a.txt\nb.txt', tool_use_id: 'tu-1' },
+      { type: 'CodingAgentIdled' },
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    const stepEvents = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as Array<{ description: string; tool_use_id?: string; result?: string }>;
+    const tu1 = stepEvents.find(s => s.tool_use_id === 'tu-1');
+    const tu2 = stepEvents.find(s => s.tool_use_id === 'tu-2');
+    expect(tu1?.result).toBe('a.txt\nb.txt');
+    expect(tu2?.result).toBe('/home/user');
+  });
+
+  it('ContextAssembled attaches assembled-prompt context to subsequent steps in the exchange', () => {
+    const { map, id } = makeThread();
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'Search my notes' },
+      {
+        type: 'ContextAssembled',
+        sections: [
+          { name: 'System Instructions', content: 'You are a helpful assistant.', char_count: 28 },
+          { name: 'User Message', content: 'Search my notes', char_count: 15 },
+        ],
+        tools: ['search_memory', 'read_file'],
+        model: 'claude-opus-4-7',
+        total_chars: 43,
+      },
+      { type: 'MemorySearched', results: 3, queries: ['notes'] },
+      { type: 'ResponseGenerated' },
+    ] as Array<ThreadEvent & { created?: string }>);
+
+    const exchanges = getExchanges(map, id);
+    const stepEvents = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as Array<{ description: string; context?: { sections: Array<{ name: string }>; tools: string[]; model: string; total_chars: number } }>;
+    expect(stepEvents).toHaveLength(1);
+    expect(stepEvents[0].context).toBeDefined();
+    expect(stepEvents[0].context?.sections.map(s => s.name)).toEqual(['System Instructions', 'User Message']);
+    expect(stepEvents[0].context?.tools).toEqual(['search_memory', 'read_file']);
+    expect(stepEvents[0].context?.model).toBe('claude-opus-4-7');
+    expect(stepEvents[0].context?.total_chars).toBe(43);
   });
 
   it('exchange with only TextStreamed and no tools shows response without steps', () => {
@@ -1766,8 +1833,10 @@ describe('MUST TEST 2: CC cancel mid-work', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    expect(exchanges).toHaveLength(1);
-    expect(exchangeStatus(exchanges[0], '', true)).toBe('canceled');
+    // 1: original CC reply (status canceled), 2: ResponseCanceled boundary panel
+    expect(exchanges).toHaveLength(2);
+    expect(exchangeStatus(exchanges[0], '', false)).toBe('canceled');
+    expect(exchanges[1].userEvent.type).toBe('ResponseCanceled');
     expect(map.get(id)!.meta.status).toBe('idle');
   });
 
@@ -1782,8 +1851,10 @@ describe('MUST TEST 2: CC cancel mid-work', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    expect(exchanges).toHaveLength(1);
-    expect(exchangeStatus(exchanges[0], '', true)).toBe('canceled');
+    // 1: original CC reply (status canceled), 2: ResponseCanceled boundary panel
+    expect(exchanges).toHaveLength(2);
+    expect(exchangeStatus(exchanges[0], '', false)).toBe('canceled');
+    expect(exchanges[1].userEvent.type).toBe('ResponseCanceled');
     // Response text comes from CodingAgentTextStreamed, not ResponseCanceled
     expect(exchangeResponseText(exchanges[0])).toBe('Starting to work... Almost done.');
   });
@@ -1869,7 +1940,8 @@ describe('Flow: CC follow-up stopped by user', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    expect(exchanges).toHaveLength(2);
+    // 1: first reply (done), 2: follow-up (canceled), 3: cancel boundary panel
+    expect(exchanges).toHaveLength(3);
 
     // First exchange: completed normally → "Done"
     expect(exchangeUserMessage(exchanges[0])).toBe('Fix the bug');
@@ -1878,8 +1950,11 @@ describe('Flow: CC follow-up stopped by user', () => {
 
     // Second exchange (follow-up): user hit stop → "Canceled"
     expect(exchangeUserMessage(exchanges[1])).toBe('Also fix tests');
-    expect(exchangeStatus(exchanges[1], '', true)).toBe('canceled');
-    expect(getLabel(exchanges[1], '', true)).toBe('Canceled');
+    expect(exchangeStatus(exchanges[1], '', false)).toBe('canceled');
+    expect(getLabel(exchanges[1], '', false)).toBe('Canceled');
+
+    // Third exchange: ResponseCanceled boundary panel — 'You — Canceled the response'
+    expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
 
     // Thread: still "Waiting" because CC is alive (last event is CodingAgentIdled)
     expect(map.get(id)!.meta.status).toBe('waiting');
@@ -1901,9 +1976,11 @@ describe('Flow: CC follow-up stopped by user', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    expect(exchanges).toHaveLength(2);
-    expect(exchangeStatus(exchanges[1], '', true)).toBe('canceled');
-    expect(getLabel(exchanges[1], '', true)).toBe('Canceled');
+    // 1: first reply (done), 2: follow-up (canceled), 3: cancel boundary panel
+    expect(exchanges).toHaveLength(3);
+    expect(exchangeStatus(exchanges[1], '', false)).toBe('canceled');
+    expect(getLabel(exchanges[1], '', false)).toBe('Canceled');
+    expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
   });
 });
 
@@ -3506,9 +3583,11 @@ describe('Flow: MissingHardeningDetected', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    expect(exchanges).toHaveLength(2);
-    expect(exchanges[1].userEvent.type).toBe('MissingHardeningDetected');
-    expect(exchangeUserMessage(exchanges[1])).toBe('Lucidos Engine — Hardening');
+    // 1: original CC reply, 2: ResponseCanceled boundary, 3: MissingHardeningDetected
+    expect(exchanges).toHaveLength(3);
+    expect(exchanges[1].userEvent.type).toBe('ResponseCanceled');
+    expect(exchanges[2].userEvent.type).toBe('MissingHardeningDetected');
+    expect(exchangeUserMessage(exchanges[2])).toBe('Lucidos Engine — Hardening');
   });
 
   it('MissingHardeningDetected clears CC waiting state (no stale Apply/Discard buttons)', () => {
@@ -3830,7 +3909,7 @@ describe('Bug: aborted CC session (engine restart) should be in inbox for review
       { type: 'CodingAgentToolCalled', name: 'Edit', args: {}, created: t(-110000) },
       { type: 'ResponseAborted', created: t(-100000) },
       // Engine restart → recovery CC session picks up
-      { type: 'SessionRecovered', created: t(-50000) },
+      { type: 'ContinuationStarted', created: t(-50000) },
       { type: 'SessionStarted', session_id: 's2', created: t(-49000) },
       // Recovery sends a continuation prompt → sets running
       { type: 'CodingAgentPromptSent', text: 'The engine restarted...', created: t(-48000) },
@@ -5112,5 +5191,76 @@ describe('chat follow-up while parent loop still running', () => {
     // below ↳"). E2 (last, with full response) → 'done'.
     expect(exchangeStatus(exchanges[0], '', /* isLast */ false, false, false, /* threadIdle */ true)).toBe('interrupted');
     expect(exchangeStatus(exchanges[1], '', /* isLast */ true, false, false, /* threadIdle */ true)).toBe('done');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CC mid-flight injection followed by AskUserQuestion: when the engine
+// emits CodingAgentPromptSent for a queued user message but CC pauses on a
+// new AskUserQuestion before consuming it, the prior exchange's Thinking
+// step has nothing to resolve it (CC's resume events will attach to the
+// new UserQuestionAsked exchange, not the queued message's exchange).
+// `waiting_for_user_answer` must therefore behave like `idle` for the
+// trailing-spinner cleanup.
+// ---------------------------------------------------------------------------
+describe('CC waiting_for_user_answer: trailing Thinking cleanup in non-last exchange', () => {
+  it('strips stranded CodingAgentPromptSent Thinking when CC paused on AskUserQuestion', () => {
+    const { map, id } = makeThread('cc-strand-1', 'idle');
+
+    insertEvents(map, id, [
+      // E1: user starts CC turn that ends with an AskUserQuestion.
+      { type: 'MessageReceived', text: 'help with auth design', channel: 'claude_code', mode: 'human' } as any,
+      { type: 'SessionStarted', session_id: 'cc-1', branch: 'claude-code/test' },
+      { type: 'CodingAgentTextStreamed', text: 'Initial analysis…' },
+      // E2 starter: AskUserQuestion. CC paused.
+      { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: 'cc-1', question: 'Pick approach:', options: [{ id: 'opt-0', label: 'A' }] },
+      { type: 'UserQuestionAnswered', tool_use_id: 'tu-1', answer: { kind: 'Selected', option_id: 'opt-0' } },
+      { type: 'CodingAgentPromptSent', text: '' },
+      { type: 'CodingAgentToolResult', name: '', result: 'opt-0', tool_use_id: 'tu-1' },
+      // CC starts streaming its answer to E2's question…
+      { type: 'CodingAgentTextStreamed', text: 'Pipeline accepted. Next:' },
+      // …but a follow-up user message lands mid-flight (E3 starter).
+      // The chat fast-path orders MessageReceived BEFORE the queued
+      // CodingAgentPromptSent (run_session.rs flushes text first, then sends
+      // input, then emits CodingAgentPromptSent — the engine's emit comes
+      // after the MR by 10s of milliseconds).
+      { type: 'MessageReceived', text: 'A provider can impl just some layers?', channel: 'claude_code', mode: 'human' } as any,
+      { type: 'CodingAgentPromptSent', text: 'A provider can impl just some layers?' },
+      // CC, still on its prior iteration, asks a NEW AskUserQuestion (E4
+      // starter) before ever consuming the queued message. CC will
+      // process the queued message AFTER the user answers this new
+      // question — those future events will attach to E4, not E3, so
+      // E3's CodingAgentPromptSent Thinking is stranded.
+      { type: 'UserQuestionAsked', tool_use_id: 'tu-2', cc_session_id: 'cc-1', question: 'Next decision:', options: [{ id: 'opt-0', label: 'X' }] },
+    ]);
+
+    // UserQuestionAsked moves the thread to waiting_for_user_answer, which
+    // isThreadQuiescent treats as an output-paused state for spinner cleanup.
+    expect(map.get(id)!.meta.status).toBe('waiting_for_user_answer');
+    const threadIdle = isThreadQuiescent(map.get(id)!.meta.status);
+    expect(threadIdle).toBe(true);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(4);
+    expect(exchanges[2].userEvent.type).toBe('MessageReceived');
+    expect(exchanges[3].userEvent.type).toBe('UserQuestionAsked');
+
+    // E2 (AskUserQuestion exchange) and E3 (mid-flight MR) both have a
+    // stranded resume-marker / queued-prompt Thinking from CodingAgentPromptSent.
+    // Both are non-last and must be cleaned up.
+    const isPendingThinking = (e: { type: string; description?: string; success?: boolean | null }) =>
+      e.type === 'step' && e.description === 'Thinking' && e.success === null;
+
+    const e2Events = exchangeResponseEvents(exchanges[1], 0, /* isLast */ false, threadIdle);
+    expect(e2Events.filter(isPendingThinking)).toHaveLength(0);
+
+    const e3Events = exchangeResponseEvents(exchanges[2], 0, /* isLast */ false, threadIdle);
+    expect(e3Events.filter(isPendingThinking)).toHaveLength(0);
+
+    // Sanity: with the pre-fix threadIdle (idle only), E3's Thinking was
+    // stranded. Proves the test exercises the new branch and isn't passing
+    // because the bug never existed.
+    const e3WithoutFix = exchangeResponseEvents(exchanges[2], 0, /* isLast */ false, /* threadIdle */ false);
+    expect(e3WithoutFix.filter(isPendingThinking).length).toBeGreaterThan(0);
   });
 });

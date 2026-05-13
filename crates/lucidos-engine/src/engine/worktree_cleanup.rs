@@ -54,6 +54,7 @@
 //! - Anything outside the workspace's `.lucidos/worktrees/` directory.
 //!   `prune_path` validates the path before any `remove_dir_all`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -66,6 +67,33 @@ use crate::engine::agent_session::resume::THREAD_WORKTREE_ID_LEN;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::git_ops::{git_cmd, has_branch_commits, worktrees_dir};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
+use crate::engine::types::AgentSession;
+
+/// `last_activity_age` lies across long `AskUserQuestion` waits — CC is alive
+/// on stdin but emits no events. Probing `agent_sessions` is the only reliable
+/// liveness signal. Trait-erased so tests can fake without building a real
+/// `AgentSession`.
+#[async_trait::async_trait]
+pub trait ActiveThreads: Send + Sync {
+    async fn is_active(&self, thread_id: Uuid) -> bool;
+}
+
+pub struct AgentSessionsActiveThreads {
+    sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
+}
+
+impl AgentSessionsActiveThreads {
+    pub fn new(sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>) -> Self {
+        Self { sessions }
+    }
+}
+
+#[async_trait::async_trait]
+impl ActiveThreads for AgentSessionsActiveThreads {
+    async fn is_active(&self, thread_id: Uuid) -> bool {
+        self.sessions.lock().await.contains_key(&thread_id)
+    }
+}
 
 /// Re-export of the canonical deterministic worktree path builder so callers
 /// outside `engine::agent_session` (HTTP API handlers, this module) can
@@ -150,11 +178,17 @@ pub struct WorktreeCleanup {
     /// Tier 0 needs `pending_for_thread`; constructed per-worker so the
     /// `spawn` signature stays pool-only.
     changes: crate::core::changes_projection::ChangesProjection,
+    active_threads: Arc<dyn ActiveThreads>,
 }
 
 impl WorktreeCleanup {
     /// Build a worker with production defaults (15-minute cycle, 20 GB soft / 5 GB hard free-disk thresholds).
-    pub fn new(pool: PgPool, bus: Arc<EventBus>, workspace_root: PathBuf) -> Self {
+    pub fn new(
+        pool: PgPool,
+        bus: Arc<EventBus>,
+        workspace_root: PathBuf,
+        active_threads: Arc<dyn ActiveThreads>,
+    ) -> Self {
         let changes = crate::core::changes_projection::ChangesProjection::new(pool.clone());
         Self {
             pool,
@@ -167,6 +201,7 @@ impl WorktreeCleanup {
             large_footprint_bytes: LARGE_FOOTPRINT_BYTES,
             alerts: Mutex::new(AlertState::default()),
             changes,
+            active_threads,
         }
     }
 
@@ -177,8 +212,9 @@ impl WorktreeCleanup {
         pool: PgPool,
         bus: Arc<EventBus>,
         workspace_root: PathBuf,
+        active_threads: Arc<dyn ActiveThreads>,
     ) -> tokio::task::JoinHandle<()> {
-        let worker = Self::new(pool, bus, workspace_root);
+        let worker = Self::new(pool, bus, workspace_root, active_threads);
         tokio::spawn(async move { worker.run_loop().await })
     }
 
@@ -254,8 +290,28 @@ impl WorktreeCleanup {
 
             match lookup_thread_by_short(&self.pool, &short).await {
                 Some(thread_id) => {
+                    // Footprint accounting MUST stay above the active-session
+                    // skip below — `inventory_worktrees` counts active worktrees
+                    // too, and the disk-low alert's "Lucidos uses X GB" framing
+                    // breaks if a live session's bytes silently disappear.
                     lucidos_footprint_bytes =
                         lucidos_footprint_bytes.saturating_add(pre_size);
+
+                    // A live CC subprocess parked on `AskUserQuestion` emits
+                    // no events while the user thinks, so `last_activity_age`
+                    // crosses the tier-0 grace and we'd `git branch -D` the
+                    // branch out from under it — destroying the recorded
+                    // `branch_name` on the live session and silently breaking
+                    // end-of-turn `ChangeProposed`. Skip every tier here; the
+                    // next cleanup cycle picks up where this one left off
+                    // once the session ends.
+                    if self.active_threads.is_active(thread_id).await {
+                        log!(
+                            "[WorktreeCleanup] skipping thread {} — live agent session active",
+                            thread_id
+                        );
+                        continue;
+                    }
 
                     if let Some(age) = last_activity_age(&self.pool, thread_id).await {
                         if age >= zero_info_grace {
@@ -567,6 +623,7 @@ impl WorktreeCleanup {
                     message,
                     task_id: None,
                     app_id: None,
+                    thread_id: None,
                 }),
                 &format!("[WorktreeCleanup] {} NotificationCreated", log_tag),
             )

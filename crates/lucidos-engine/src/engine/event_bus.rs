@@ -6,14 +6,12 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::Serialize;
 use sqlx::PgPool;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
-use crate::core::store::LegacyInitiator;
-use crate::engine::thread_events::{ActorMode, EventMeta, MessageOrigin, ThreadEvent};
-use crate::engine::thread_lifecycle::{self, resolve_transition, ArchiveState, ThreadType};
+use crate::engine::thread_events::{ChildCompletionStatus, EventMeta, ThreadEvent};
+use crate::engine::thread_lifecycle::{self, ArchiveState, ThreadType};
 
 /// DB row from thread_summaries for child-to-parent fan-out:
 /// (parent_thread_id, is_cc, title, first_message, parent_callback_sent).
@@ -23,7 +21,8 @@ type ChildSummaryRow = (Option<Uuid>, bool, Option<String>, Option<String>, bool
 /// thread goes 'waiting' iff the CC session left pending changes to review,
 /// otherwise 'idle'. CodingAgentIdled binds the value as $2 (it's also being
 /// written in the same query); the rest read the stored cc_has_changes.
-const STATUS_FROM_CC_HAS_CHANGES: &str = "CASE WHEN cc_has_changes THEN 'waiting' ELSE 'idle' END";
+pub(super) const STATUS_FROM_CC_HAS_CHANGES: &str =
+    "CASE WHEN cc_has_changes THEN 'waiting' ELSE 'idle' END";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,6 +48,9 @@ pub struct EmittedEvent {
 }
 
 /// Typed union of all aggregate events.
+// `Thread` carries a fat `ThreadEvent` payload; boxing would touch every emit
+// site for a marginal cache win on a struct that's already cheap to clone.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum BusEvent {
     /// Thread-scoped event (persisted or transient, determined by event.is_persisted()).
@@ -61,461 +63,9 @@ pub enum BusEvent {
     System(SystemEvent),
 }
 
-/// System events — broadcast to SSE, selectively persisted.
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "type", content = "data")]
-pub enum SystemEvent {
-    NotificationCreated {
-        id: String,
-        title: String,
-        message: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        task_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        app_id: Option<String>,
-    },
-    NotificationRead {
-        id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    NotificationsAllRead {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    PreferencesChanged {
-        key: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        value: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    MemoryRebuildProgress {
-        processed: usize,
-        total: usize,
-        percent: usize,
-    },
-    ChangesUpdated {
-        pending: Vec<crate::core::changes::Change>,
-        applied: Vec<crate::core::changes::Change>,
-        total_pending: usize,
-        restart_required: bool,
-    },
-    BackupProgress {
-        phase: String,
-        progress: usize,
-        total: usize,
-    },
-    BackupCompleted {
-        filename: String,
-        size_bytes: u64,
-    },
-    BackupFailed {
-        error: String,
-    },
-    RecoveryProgress {
-        completed: usize,
-        total: usize,
-    },
-    Toast {
-        message: String,
-        level: String,
-    },
-    ArtifactImported {
-        artifact_path: String,
-        source_type: String,
-        source_detail: String,
-        commit_hash: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        summary: Option<String>,
-    },
-    TriggerCreated {
-        trigger_id: String,
-        payload: serde_json::Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    TriggerUpdated {
-        trigger_id: String,
-        payload: serde_json::Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    TriggerDeleted {
-        trigger_id: String,
-        payload: serde_json::Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    TriggerEnabled {
-        trigger_id: String,
-        payload: serde_json::Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    TriggerDisabled {
-        trigger_id: String,
-        payload: serde_json::Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    TriggerExecuted {
-        trigger_id: String,
-        payload: serde_json::Value,
-    },
-    /// Domain event emitted via emit_event (e.g. SlideTextEdited, SleepImported).
-    /// Persisted through EventBus with the inner `event_type` as the stored event type.
-    /// Broadcast so the trigger subscriber can fire matching event-based triggers.
-    /// `depth` tracks event-trigger recursion (A fires trigger → emits event → fires trigger…).
-    /// `transient: true` skips the events table write — used for high-churn
-    /// coordination signals (heartbeats, presenter↔remote state) that should
-    /// reach SSE consumers but don't belong in the audit log.
-    DomainEvent {
-        event_type: String,
-        payload: serde_json::Value,
-        #[serde(skip_serializing)]
-        depth: u32,
-        #[serde(skip_serializing)]
-        transient: bool,
-    },
-    AppCreated {
-        app_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    AppUpdated {
-        app_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    AppDeleted {
-        app_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    ArtifactCreated {
-        artifact_path: String,
-        commit: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        source: Option<String>,
-    },
-    ArtifactUpdated {
-        artifact_path: String,
-        commit: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        source: Option<String>,
-    },
-    ArtifactDeleted {
-        artifact_path: String,
-        commit: String,
-    },
-    LanguageSet {
-        language: String,
-    },
-    TimezoneSet {
-        timezone: String,
-    },
-    RepositoryImported {
-        url: String,
-        branch: String,
-        destination: String,
-        file_count: usize,
-        skipped_count: usize,
-        commit: String,
-        files: Vec<String>,
-    },
-    TriggerCompleted {
-        trigger_id: String,
-        trigger_name: String,
-        result_summary: String,
-    },
-    ChangeDiscarded {
-        change_id: String,
-    },
-    /// A device started focusing on a thread. Transient — projection lives in
-    /// the `thread_presence` table. Used by notification suppression so a
-    /// thread-scoped notification doesn't buzz the device already viewing it.
-    ThreadFocused {
-        thread_id: Uuid,
-        device_id: String,
-    },
-    /// A device stopped focusing on a thread (visibility hidden, blur, switch,
-    /// or unload). Transient — removes the projection row.
-    ThreadUnfocused {
-        thread_id: Uuid,
-        device_id: String,
-    },
-    /// A plugin was installed (or updated — overwrite=true reuses this variant).
-    /// `manifest` carries the full parsed manifest so future fields are additive.
-    /// `files` are paths under `data/` so a future tracked-uninstall can derive
-    /// ownership without a schema change.
-    PluginInstalled {
-        manifest: serde_json::Value,
-        files: Vec<String>,
-        installed_at: String,
-        source_type: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    /// A plugin was marked uninstalled. Guide-only in v1 — files stay until the
-    /// LLM (or user) deletes them. Listed `files` is what was installed; some
-    /// may have been edited or shared with another plugin.
-    PluginUninstalled {
-        id: String,
-        version: String,
-        files: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    /// Compose state on a thread changed (text, images, or mode). Broadcast
-    /// to SSE for cross-device sync; intentionally NOT persisted to the events
-    /// table — the `thread_summaries` row holds the current state, and
-    /// keystroke history isn't audit-worthy. Receivers reconcile via the
-    /// `origin_device_id` echo check + "don't clobber my focused textarea"
-    /// guard described in `docs/plans/2026-05-03-threads-as-drafts-design.md`.
-    ThreadComposeChanged {
-        id: Uuid,
-        text: String,
-        /// Content-addressed sha256 hashes of compose-draft image blobs.
-        /// Cross-device sync transmits ~80 bytes per attached image instead
-        /// of inflating each base64 payload over SSE on every keystroke.
-        #[serde(default)]
-        image_hashes: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        mode: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        origin_device_id: Option<String>,
-    },
-}
-
-impl SystemEvent {
-    /// Build an ArtifactCreated or ArtifactUpdated event based on whether the file existed.
-    pub fn artifact_change(
-        file_exists: bool,
-        artifact_path: String,
-        commit: String,
-        source: Option<String>,
-    ) -> Self {
-        if file_exists {
-            Self::ArtifactUpdated {
-                artifact_path,
-                commit,
-                source,
-            }
-        } else {
-            Self::ArtifactCreated {
-                artifact_path,
-                commit,
-                source,
-            }
-        }
-    }
-
-    pub fn is_persisted(&self) -> bool {
-        matches!(
-            self,
-            |Self::NotificationCreated { .. }| Self::PreferencesChanged { .. }
-                | Self::ArtifactImported { .. }
-                | Self::ArtifactCreated { .. }
-                | Self::ArtifactUpdated { .. }
-                | Self::ArtifactDeleted { .. }
-                | Self::RepositoryImported { .. }
-                | Self::TriggerCreated { .. }
-                | Self::TriggerUpdated { .. }
-                | Self::TriggerDeleted { .. }
-                | Self::TriggerEnabled { .. }
-                | Self::TriggerDisabled { .. }
-                | Self::TriggerExecuted { .. }
-                | Self::TriggerCompleted { .. }
-                | Self::LanguageSet { .. }
-                | Self::TimezoneSet { .. }
-                | Self::ChangeDiscarded { .. }
-                | Self::DomainEvent {
-                    transient: false,
-                    ..
-                }
-                | Self::PluginInstalled { .. }
-                | Self::PluginUninstalled { .. }
-        )
-    }
-
-    pub fn event_type(&self) -> &'static str {
-        match self {
-            Self::NotificationCreated { .. } => "NotificationCreated",
-            Self::NotificationRead { .. } => "NotificationRead",
-            Self::NotificationsAllRead { .. } => "NotificationsAllRead",
-            Self::PreferencesChanged { .. } => "PreferencesChanged",
-            Self::MemoryRebuildProgress { .. } => "MemoryRebuildProgress",
-            Self::ChangesUpdated { .. } => "ChangesUpdated",
-            Self::BackupProgress { .. } => "BackupProgress",
-            Self::BackupCompleted { .. } => "BackupCompleted",
-            Self::BackupFailed { .. } => "BackupFailed",
-            Self::RecoveryProgress { .. } => "RecoveryProgress",
-            Self::Toast { .. } => "Toast",
-            Self::ArtifactImported { .. } => "ArtifactImported",
-            Self::TriggerCreated { .. } => "TriggerCreated",
-            Self::TriggerUpdated { .. } => "TriggerUpdated",
-            Self::TriggerDeleted { .. } => "TriggerDeleted",
-            Self::TriggerEnabled { .. } => "TriggerEnabled",
-            Self::TriggerDisabled { .. } => "TriggerDisabled",
-            Self::TriggerExecuted { .. } => "TriggerExecuted",
-            Self::AppCreated { .. } => "AppCreated",
-            Self::AppUpdated { .. } => "AppUpdated",
-            Self::AppDeleted { .. } => "AppDeleted",
-            Self::DomainEvent { .. } => "DomainEvent",
-            Self::ArtifactCreated { .. } => "ArtifactCreated",
-            Self::ArtifactUpdated { .. } => "ArtifactUpdated",
-            Self::ArtifactDeleted { .. } => "ArtifactDeleted",
-            Self::LanguageSet { .. } => "LanguageSet",
-            Self::TimezoneSet { .. } => "TimezoneSet",
-            Self::RepositoryImported { .. } => "RepositoryImported",
-            Self::TriggerCompleted { .. } => "TriggerCompleted",
-            Self::ChangeDiscarded { .. } => "ChangeDiscarded",
-            Self::ThreadFocused { .. } => "ThreadFocused",
-            Self::ThreadUnfocused { .. } => "ThreadUnfocused",
-            Self::PluginInstalled { .. } => "PluginInstalled",
-            Self::PluginUninstalled { .. } => "PluginUninstalled",
-            Self::ThreadComposeChanged { .. } => "ThreadComposeChanged",
-        }
-    }
-
-    /// Wire-format `type` names that the engine emits as system frames
-    /// (every `SystemEvent` variant plus the `ThreadEvent` wrapper). The
-    /// `emit_event` HTTP API rejects these so untrusted apps cannot forge
-    /// frames such as a fake `NotificationCreated`. Keep in sync with the
-    /// `SystemEvent` enum — the `reserved_type_names_match_event_type`
-    /// test catches drift.
-    pub const RESERVED_TYPE_NAMES: &'static [&'static str] = &[
-        "NotificationCreated",
-        "NotificationRead",
-        "NotificationsAllRead",
-        "PreferencesChanged",
-        "MemoryRebuildProgress",
-        "ChangesUpdated",
-        "BackupProgress",
-        "BackupCompleted",
-        "BackupFailed",
-        "RecoveryProgress",
-        "Toast",
-        "ArtifactImported",
-        "TriggerCreated",
-        "TriggerUpdated",
-        "TriggerDeleted",
-        "TriggerEnabled",
-        "TriggerDisabled",
-        "TriggerExecuted",
-        "AppCreated",
-        "AppUpdated",
-        "AppDeleted",
-        "DomainEvent",
-        "ArtifactCreated",
-        "ArtifactUpdated",
-        "ArtifactDeleted",
-        "LanguageSet",
-        "TimezoneSet",
-        "RepositoryImported",
-        "TriggerCompleted",
-        "ChangeDiscarded",
-        "ThreadFocused",
-        "ThreadUnfocused",
-        "PluginInstalled",
-        "PluginUninstalled",
-        "ThreadComposeChanged",
-        "ThreadEvent",
-    ];
-
-    pub fn is_reserved_type_name(name: &str) -> bool {
-        Self::RESERVED_TYPE_NAMES.contains(&name)
-    }
-
-    pub fn aggregate(&self) -> &str {
-        match self {
-            Self::NotificationCreated { .. }
-            | Self::NotificationRead { .. }
-            | Self::NotificationsAllRead { .. } => "notification",
-            Self::PreferencesChanged { .. }
-            | Self::LanguageSet { .. }
-            | Self::TimezoneSet { .. } => "preference",
-            Self::ChangesUpdated { .. } | Self::ChangeDiscarded { .. } => "change",
-            Self::MemoryRebuildProgress { .. }
-            | Self::BackupProgress { .. }
-            | Self::BackupCompleted { .. }
-            | Self::BackupFailed { .. }
-            | Self::RecoveryProgress { .. }
-            | Self::Toast { .. } => "ops",
-            Self::ArtifactImported { .. }
-            | Self::ArtifactCreated { .. }
-            | Self::ArtifactUpdated { .. }
-            | Self::ArtifactDeleted { .. }
-            | Self::RepositoryImported { .. } => "artifact",
-            Self::TriggerCreated { .. }
-            | Self::TriggerUpdated { .. }
-            | Self::TriggerDeleted { .. }
-            | Self::TriggerEnabled { .. }
-            | Self::TriggerDisabled { .. }
-            | Self::TriggerExecuted { .. }
-            | Self::TriggerCompleted { .. } => "trigger",
-            Self::AppCreated { .. } | Self::AppUpdated { .. } | Self::AppDeleted { .. } => "app",
-            Self::DomainEvent { .. } => "domain",
-            Self::ThreadFocused { .. } | Self::ThreadUnfocused { .. } => "presence",
-            Self::PluginInstalled { .. } | Self::PluginUninstalled { .. } => "plugin",
-            Self::ThreadComposeChanged { .. } => "thread",
-        }
-    }
-
-    pub fn aggregate_id(&self) -> String {
-        match self {
-            Self::NotificationCreated { id, .. } | Self::NotificationRead { id, .. } => id.clone(),
-            Self::ArtifactImported { artifact_path, .. }
-            | Self::ArtifactCreated { artifact_path, .. }
-            | Self::ArtifactUpdated { artifact_path, .. }
-            | Self::ArtifactDeleted { artifact_path, .. } => artifact_path.clone(),
-            Self::RepositoryImported { destination, .. } => destination.clone(),
-            Self::TriggerCreated { trigger_id, .. }
-            | Self::TriggerUpdated { trigger_id, .. }
-            | Self::TriggerDeleted { trigger_id, .. }
-            | Self::TriggerEnabled { trigger_id, .. }
-            | Self::TriggerDisabled { trigger_id, .. }
-            | Self::TriggerExecuted { trigger_id, .. } => trigger_id.clone(),
-            Self::TriggerCompleted { trigger_id, .. } => trigger_id.clone(),
-            Self::AppCreated { app_id, .. }
-            | Self::AppUpdated { app_id, .. }
-            | Self::AppDeleted { app_id, .. } => app_id.clone(),
-            Self::DomainEvent { event_type, .. } => event_type.clone(),
-            Self::ChangeDiscarded { change_id } => change_id.clone(),
-            Self::ThreadFocused { thread_id, .. } | Self::ThreadUnfocused { thread_id, .. } => {
-                thread_id.to_string()
-            }
-            // Raw manifest is nested one layer in — see `InstalledRecord` for the path.
-            Self::PluginInstalled { manifest, .. } => manifest
-                .get("manifest")
-                .and_then(|m| m.get("id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            Self::PluginUninstalled { id, .. } => id.clone(),
-            Self::ThreadComposeChanged { id, .. } => id.to_string(),
-            _ => "global".into(),
-        }
-    }
-
-    pub fn to_payload(&self) -> serde_json::Value {
-        match self {
-            Self::TriggerCreated { payload, .. }
-            | Self::TriggerUpdated { payload, .. }
-            | Self::TriggerDeleted { payload, .. }
-            | Self::TriggerEnabled { payload, .. }
-            | Self::TriggerDisabled { payload, .. }
-            | Self::TriggerExecuted { payload, .. }
-            | Self::DomainEvent { payload, .. } => payload.clone(),
-            _ => serde_json::to_value(self).unwrap_or_default(),
-        }
-    }
-}
+#[path = "event_bus_system_event.rs"]
+mod system_event;
+pub use system_event::SystemEvent;
 
 impl EmittedEvent {
     /// Convert to SSE-compatible JSON string.
@@ -580,12 +130,16 @@ pub struct EmitResult {
     pub seq: i64,
 }
 
-/// Sent when a child thread completes and needs to notify its parent.
+/// Wake-up signal the child→parent fan-in fires when a child thread reaches
+/// a terminal event. The typed `ChildThreadCompleted` row on the parent's
+/// history holds all semantic content; this struct carries only the
+/// identifiers needed to drive the parent's run-loop entry and stamp the
+/// resulting response panel's `request_event_id`.
 #[derive(Debug)]
 pub struct ParentCallback {
     pub parent_thread_id: Uuid,
     pub child_thread_id: Uuid,
-    pub callback_text: String,
+    pub child_completed_event_id: Uuid,
 }
 
 /// Trait for emitting domain events. Extracted from `EventBus` to allow
@@ -932,17 +486,19 @@ impl EventBus {
     /// Decrements the parent's `active_children_count` and, for completion events,
     /// sends a callback message with results.
     async fn notify_parent_if_child(&self, child_thread_id: Uuid, event: &ThreadEvent) {
-        // Terminal events that mean a child is done (decrement counter).
-        // Canceled/Aborted children didn't complete — no callback, but still done.
-        // Transient SessionEnded reasons (StaleResume) are mid-retry: they must
-        // not decrement the parent counter or fire the completion callback, or
-        // the real CodingAgentIdled that lands seconds later would be orphaned.
+        // Cancel = user-driven, terminal. Abort splits on `AbortCause::is_transient`:
+        // EngineShutdown / RecoveryAfterRestart are mid-retry (no decrement, no
+        // callback — the resumed child's eventual idle would be orphaned);
+        // SafetyNet / ProcessKilled / Unknown are terminal (decrement so the
+        // parent doesn't display as Active forever, but no card — the user
+        // already sees the child's error state). Same `is_transient` shape as
+        // `SessionEnded { reason }` below.
         let is_terminal = match event {
             ThreadEvent::CodingAgentIdled { .. }
             | ThreadEvent::ResponseGenerated { .. }
             | ThreadEvent::ResponseFailed { .. }
-            | ThreadEvent::ResponseCanceled { .. }
-            | ThreadEvent::ResponseAborted { .. } => true,
+            | ThreadEvent::ResponseCanceled { .. } => true,
+            ThreadEvent::ResponseAborted { cause, .. } => !cause.is_transient(),
             ThreadEvent::SessionEnded { reason } => !reason.is_transient(),
             _ => false,
         };
@@ -979,9 +535,11 @@ impl EventBus {
 
         // CC sessions can terminate without ever emitting CodingAgentIdled or
         // SessionEnded — e.g. the user cancels and the session sits archived,
-        // leaving only ResponseCanceled/ResponseAborted as terminal signals. The
-        // `!callback_already_sent` guard collapses multiple terminal events for
-        // the same child to a single decrement.
+        // leaving only ResponseCanceled (or a terminal-cause ResponseAborted
+        // from a SafetyNet / ProcessKilled crash) as the signal. The
+        // `!callback_already_sent` guard collapses multiple terminal events
+        // for the same child to a single decrement. Transient aborts (engine
+        // shutdown, recovery) already early-returned via `is_terminal`.
         let should_decrement = if is_cc {
             matches!(event, ThreadEvent::CodingAgentIdled { .. })
                 || (!callback_already_sent
@@ -1001,18 +559,35 @@ impl EventBus {
                     | ThreadEvent::SessionEnded { .. }
             )
         };
-        // Completion events (not cancel/abort) trigger a callback to the parent
-        // and surface the parent to inbox. For CC children, SessionEnded also
-        // counts when no prior callback was sent — handles CC sessions that end
-        // without ever idling (crash, shutdown, user-ended).
+        // Completion events trigger a callback to the parent (typed
+        // ChildThreadCompleted on the parent thread) and surface the parent
+        // to inbox. ResponseCanceled is included so the parent sees a
+        // "Canceled" card and the LLM learns the child was stopped.
+        // ResponseAborted is NOT — the user already sees the child's error
+        // state (SafetyNet/ProcessKilled), and engine-shutdown aborts are
+        // transient (and were filtered out above). For CC children,
+        // SessionEnded also counts when no prior callback was sent — handles
+        // CC sessions that end without ever idling.
         let should_callback = matches!(
             (is_cc, event),
             (true, ThreadEvent::CodingAgentIdled { .. })
                 | (false, ThreadEvent::ResponseGenerated { .. })
                 | (_, ThreadEvent::ResponseFailed { .. })
+                | (_, ThreadEvent::ResponseCanceled { .. })
         ) || (is_cc
             && !callback_already_sent
             && matches!(event, ThreadEvent::SessionEnded { .. }));
+
+        // Decrement-only paths must still mark the child or a follow-up event
+        // (CodingAgentIdled, SessionEnded) re-decrements via the
+        // `!callback_already_sent` gate above. The should_callback path marks
+        // after the typed-event emit succeeds; abort never emits, so mark here.
+        // Non-CC chat children emit exactly one terminator per request (the
+        // agentic loop's `has_terminator` guard), so they need no marker; CC
+        // children can have multiple terminal events for the same turn.
+        let mark_callback_for_terminal_abort = should_decrement
+            && is_cc
+            && matches!(event, ThreadEvent::ResponseAborted { .. });
 
         if should_decrement || should_callback {
             self.update_parent_after_child_terminal(
@@ -1023,18 +598,7 @@ impl EventBus {
             .await;
         }
 
-        // For CC cancel/abort the should_callback path doesn't fire (we don't
-        // want to tell the parent LLM "your child was canceled" — that's UI
-        // noise the user already sees). But we still need to mark the callback
-        // as sent so a subsequent CodingAgentIdled or SessionEnded for the
-        // same child doesn't decrement again.
-        if should_decrement
-            && is_cc
-            && matches!(
-                event,
-                ThreadEvent::ResponseCanceled { .. } | ThreadEvent::ResponseAborted { .. }
-            )
-        {
+        if mark_callback_for_terminal_abort {
             self.mark_parent_callback_sent(child_thread_id).await;
         }
 
@@ -1046,7 +610,10 @@ impl EventBus {
             .or_else(|| first_msg.map(|m| m.chars().take(80).collect()))
             .unwrap_or_else(|| "unknown task".into());
 
-        // Fetch the child thread's last response text to include in callback
+        // Fetch the child thread's last response text — becomes the
+        // `summary` field on the typed event (and the failure-error path
+        // overrides it below). 2000-char cap mirrors the previous prose
+        // path's truncation.
         let last_response: Option<String> = sqlx::query_scalar(
             "SELECT payload->>'text' FROM events \
              WHERE aggregate_id = $1 AND event_type = 'ResponseGenerated' \
@@ -1065,52 +632,143 @@ impl EventBus {
             None
         });
 
-        let status = match event {
+        // Per-status caps differ deliberately: success / no-changes / canceled
+        // summaries come from a real ResponseGenerated.text (or partial text)
+        // the orchestrator may want most of (2000 chars). Failure summaries
+        // come from ResponseFailed.error which is often a panic / stack trace
+        // and should never dominate the parent's context — re-cap to 200 chars
+        // (matching the pre-Phase-4 prose path) before truncation.
+        const SUCCESS_SUMMARY_CAP: usize = 2000;
+        const FAILURE_SUMMARY_CAP: usize = 200;
+        let (status, summary, cap) = match event {
             ThreadEvent::CodingAgentIdled {
                 has_changes: true, ..
-            } => "completed with proposed changes",
+            } => (
+                ChildCompletionStatus::Success,
+                last_response.clone().unwrap_or_default(),
+                SUCCESS_SUMMARY_CAP,
+            ),
             ThreadEvent::CodingAgentIdled {
                 has_changes: false, ..
-            } => "completed (no changes)",
-            ThreadEvent::ResponseGenerated { .. } => "completed",
-            ThreadEvent::ResponseFailed { error } => {
-                let truncated = &error[..error.floor_char_boundary(200)];
-                self.mark_parent_callback_sent(child_thread_id).await;
-                return self.send_parent_callback(
-                    parent_id,
-                    child_thread_id,
-                    &format!(
-                        "[Child thread failed] Thread \"{}\" (id: {}) failed: {}",
-                        label, child_thread_id, truncated
-                    ),
-                );
-            }
-            _ => "finished",
+            } => (
+                ChildCompletionStatus::NoChanges,
+                last_response.clone().unwrap_or_default(),
+                SUCCESS_SUMMARY_CAP,
+            ),
+            ThreadEvent::ResponseGenerated { .. } => (
+                ChildCompletionStatus::Success,
+                last_response.clone().unwrap_or_default(),
+                SUCCESS_SUMMARY_CAP,
+            ),
+            ThreadEvent::ResponseFailed { error } => (
+                ChildCompletionStatus::Failure,
+                error.clone(),
+                FAILURE_SUMMARY_CAP,
+            ),
+            // User-driven cancel — surface to parent so the LLM learns the
+            // child was stopped (and the UI shows a Canceled card). Pull the
+            // partial-stream text from ResponseCanceled itself; falling back
+            // to last_response would surface a *prior* turn's text and read
+            // as if the canceled turn had completed.
+            ThreadEvent::ResponseCanceled { text, .. } => (
+                ChildCompletionStatus::Canceled,
+                text.clone(),
+                SUCCESS_SUMMARY_CAP,
+            ),
+            // Defensive: any other terminal event slipping through still
+            // produces a typed completion so the parent isn't left waiting.
+            _ => (
+                ChildCompletionStatus::Success,
+                last_response.clone().unwrap_or_default(),
+                SUCCESS_SUMMARY_CAP,
+            ),
         };
 
-        let result_section = if let Some(response) = last_response {
-            let max_len = 2000;
-            let truncated = &response[..response.floor_char_boundary(max_len)];
-            let suffix = if response.len() > max_len {
-                "… (truncated)"
+        let summary = {
+            if summary.len() > cap {
+                let cut = summary.floor_char_boundary(cap);
+                let mut s = summary[..cut].to_string();
+                s.push_str("… (truncated)");
+                s
             } else {
-                ""
-            };
-            format!("\n\nResult:\n{}{}", truncated, suffix)
-        } else {
-            String::new()
+                summary
+            }
         };
 
-        let callback_text = format!(
-            "[Child thread completed] Thread \"{}\" (id: {}) {}.\
-             \nPhrases like \"session can finish\" or \"## Session Summary\" describe \
-             the child subprocess only — if you were following a multi-step procedure, \
-             continue with the next step. Otherwise use run_thread to refine.{}",
-            label, child_thread_id, status, result_section
-        );
+        // Look up which proposed changes the child left in `pending` state.
+        // CC chats that ended with `has_changes: true` typically have one;
+        // chat children and `no_changes` idles have zero. Failures are
+        // reported with `pending_change_ids = []` regardless because the
+        // worktree state isn't reviewable.
+        let pending_change_ids: Vec<String> = if matches!(status, ChildCompletionStatus::Failure) {
+            Vec::new()
+        } else {
+            self.changes_projection
+                .pending_for_thread(child_thread_id)
+                .await
+                .into_iter()
+                .map(|c| c.id.to_string())
+                .collect()
+        };
+
+        // Emit the typed source-of-truth event onto the parent thread BEFORE
+        // marking the callback sent — that ordering means a crash in between
+        // re-fires this whole path on next visit instead of leaving the parent
+        // permanently silent. `EventMeta::NONE` because this fan-in is engine
+        // orchestration, not user/agent actor.
+        let typed_event = ThreadEvent::ChildThreadCompleted {
+            child_thread_id,
+            child_thread_title: Some(label.clone()),
+            status,
+            summary,
+            pending_change_ids,
+        };
+        // Box::pin here because `emit_or_log → emit → notify_parent_if_child`
+        // is the recursion the compiler flags — the emitted ChildThreadCompleted
+        // for the parent will itself walk back through `notify_parent_if_child`
+        // (which immediately exits because ChildThreadCompleted isn't a
+        // terminal event), but the type-level cycle still needs indirection.
+        //
+        // If the typed-event emit failed, we MUST NOT mark the callback as
+        // sent or fire the wake-up kick — telling the parent's resume path
+        // to attribute its response to a non-persisted event would have the
+        // parent's UI displaying a phantom card. Returning here means the
+        // next terminal event (or recovery sweep) gets another shot at the
+        // typed emit; for chat children whose ResponseGenerated fires
+        // exactly once that means a permanent miss, accepted as the lesser
+        // evil vs. the phantom-event case.
+        let emit_result = match Box::pin(self.emit(BusEvent::Thread {
+            thread_id: parent_id,
+            event: typed_event,
+            meta: EventMeta::NONE,
+        }))
+        .await
+        {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                crate::log!(
+                    "[FanOut] ChildThreadCompleted emit returned None for parent {}; \
+                     skipping wake-up kick — see notify_parent_if_child error path.",
+                    parent_id
+                );
+                return;
+            }
+            Err(e) => {
+                crate::log!(
+                    "[FanOut] Failed to emit ChildThreadCompleted for parent {}: {}; \
+                     skipping wake-up kick — driving the parent against a non-persisted \
+                     event would attribute its response to a phantom card. Next terminal \
+                     event (if any) retries; for chat children with one-shot \
+                     ResponseGenerated this means a permanent miss.",
+                    parent_id,
+                    e
+                );
+                return;
+            }
+        };
 
         self.mark_parent_callback_sent(child_thread_id).await;
-        self.send_parent_callback(parent_id, child_thread_id, &callback_text);
+        self.send_parent_callback(parent_id, child_thread_id, emit_result.event_id);
     }
 
     /// Combined into one round-trip + one broadcast so subscribers see the
@@ -1189,12 +847,12 @@ impl EventBus {
         &self,
         parent_thread_id: Uuid,
         child_thread_id: Uuid,
-        callback_text: &str,
+        child_completed_event_id: Uuid,
     ) {
         if let Err(e) = self.parent_callback_tx.send(ParentCallback {
             parent_thread_id,
             child_thread_id,
-            callback_text: callback_text.to_string(),
+            child_completed_event_id,
         }) {
             crate::log!(
                 "[FanOut] Failed to send parent callback for child {}: {}",
@@ -1258,730 +916,6 @@ impl EventBus {
         Ok(())
     }
 
-    // ---- Thread projection ----
-
-    /// Returns side-effect events to emit after the main transaction commits.
-    ///
-    /// Structure: Step 1 runs metadata updates (the match statement).
-    /// Step 2 validates and applies section transitions via the lifecycle contract.
-    /// This ensures upsert events create the row before the contract checks it.
-    async fn update_thread_projection(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        thread_id: Uuid,
-        event: &ThreadEvent,
-        meta: &EventMeta,
-    ) -> Result<Vec<BusEvent>, Box<dyn std::error::Error + Send + Sync>> {
-        // Step 1: Run metadata updates
-        let match_side_effects: Vec<BusEvent> = match event {
-            // Thread start events — upsert the summary row
-            ThreadEvent::MessageReceived { text, parent_thread_id, spawning_event_id, mode, .. } => {
-                let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("chat");
-                // Map ActorMode to the legacy two-state `initiator` column:
-                // Human → "user", Agent | Engine → "system". The column was
-                // never tri-state; promoting it would require a migration and
-                // a frontend type change. See `LegacyInitiator` in
-                // core/store/threads.rs for the matching read path.
-                let msg_initiator = match mode {
-                    ActorMode::Human => LegacyInitiator::User.as_str(),
-                    ActorMode::Agent | ActorMode::Engine => LegacyInitiator::System.as_str(),
-                };
-                // Compute child depth and inherit initiator from parent —
-                // a non-Human parent forces "system" on its descendants.
-                let (child_depth, initiator) = if let Some(pid) = parent_thread_id {
-                    let parent_row: Option<(i32, String)> = sqlx::query_as(
-                        "SELECT COALESCE(depth, 0), initiator FROM thread_summaries WHERE thread_id = $1"
-                    )
-                    .bind(pid)
-                    .fetch_optional(&mut **tx)
-                    .await?;
-                    match parent_row {
-                        Some((d, init)) if init == "system" => (d + 1, "system"),
-                        Some((d, _)) => (d + 1, msg_initiator),
-                        None => (1, msg_initiator),
-                    }
-                } else {
-                    (0, msg_initiator)
-                };
-                sqlx::query(
-                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, parent_thread_id, spawning_event_id, depth, status, last_revived_at, state)
-                       VALUES ($1, $2, $3, $6, NOW(), NOW(), 1, $4, $7, $5, 'running', NOW(), 'active')
-                       ON CONFLICT (thread_id) DO UPDATE
-                       SET last_activity = NOW(),
-                           message_count = thread_summaries.message_count + 1,
-                           status = 'running',
-                           last_revived_at = NOW(),
-                           state = 'active',
-                           first_message = COALESCE(thread_summaries.first_message, EXCLUDED.first_message),
-                           -- composing → active: the actual send's channel wins
-                           -- (the lagged compose-mode source must not survive the
-                           -- transition). Active follow-ups already passed the
-                           -- continuity check, so 'chat' fall-through covers
-                           -- legacy rows missing an explicit assertion.
-                           source = CASE
-                               WHEN thread_summaries.state = 'composing' THEN EXCLUDED.source
-                               WHEN thread_summaries.source = 'chat' THEN EXCLUDED.source
-                               ELSE thread_summaries.source
-                           END,
-                           compose_text = '',
-                           compose_images = '[]'::jsonb,
-                           compose_mode = NULL
-                       -- Defense in depth: refuse to resurrect a discarded thread if a
-                       -- stale MessageReceived slips past the API-layer guard.
-                       WHERE thread_summaries.state != 'discarded'"#,
-                )
-                .bind(thread_id)
-                .bind(text)
-                .bind(source)
-                .bind(parent_thread_id)
-                .bind(child_depth)
-                .bind(initiator)
-                .bind(spawning_event_id)
-                .execute(&mut **tx)
-                .await?;
-
-                // If this message has a parent, increment the parent's active_children_count.
-                // Parents are always Chat threads — CC threads are always children.
-                if let Some(pid) = parent_thread_id {
-                    sqlx::query(
-                        "UPDATE thread_summaries SET active_children_count = active_children_count + 1, \
-                         total_children_count = total_children_count + 1 WHERE thread_id = $1"
-                    )
-                    .bind(pid)
-                    .execute(&mut **tx)
-                    .await?;
-                }
-
-                Vec::new()
-            }
-            // CC session lifecycle — session start/recovery don't update last_activity
-            // (the first real activity event will set it).
-            ThreadEvent::SessionStarted { .. } | ThreadEvent::SessionRecovered { .. } => {
-                let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("claude_code");
-                // Extract repo_id from SessionStarted; SessionRecovered has no repo_id.
-                let session_repo_id = match &event {
-                    ThreadEvent::SessionStarted { repo_id, .. } => repo_id.as_deref(),
-                    _ => None,
-                };
-                sqlx::query(
-                    r#"INSERT INTO thread_summaries (thread_id, source, is_cc, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id, state)
-                       VALUES ($1, $2, TRUE, NOW(), NOW(), 0, 'running', NOW(), $3, 'active')
-                       ON CONFLICT (thread_id) DO UPDATE
-                       SET is_cc = TRUE, source = $2,
-                           initiator = COALESCE(thread_summaries.initiator, 'unknown'),
-                           -- Existing value wins: a thread's repo is locked at first SessionStarted.
-                           -- The chat handler enforces that follow-ups can't pick a different repo,
-                           -- but defend the projection so any drift (legacy data, replay) doesn't
-                           -- silently flip the thread to a different repo's skill set.
-                           cc_repo_id = COALESCE(thread_summaries.cc_repo_id, $3),
-                           state = 'active',
-                           compose_text = '',
-                           compose_images = '[]'::jsonb,
-                           compose_mode = NULL
-                       -- Defense in depth (see MessageReceived above for rationale).
-                       WHERE thread_summaries.state != 'discarded'"#,
-                )
-                .bind(thread_id)
-                .bind(source)
-                .bind(session_repo_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::TriggerStarted { trigger_id, trigger_name, go_to_review, .. } => {
-                let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("trigger");
-                sqlx::query(
-                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, status, last_revived_at, trigger_id, trigger_name, trigger_go_to_review, state)
-                       VALUES ($1, $2, $3, 'system', NOW(), NOW(), 1, 'running', NOW(), $4, $5, $6, 'active')
-                       ON CONFLICT (thread_id) DO UPDATE
-                       SET last_activity = NOW(),
-                           message_count = thread_summaries.message_count + 1,
-                           status = 'running',
-                           last_revived_at = NOW(),
-                           state = 'active',
-                           trigger_id = COALESCE(thread_summaries.trigger_id, EXCLUDED.trigger_id),
-                           trigger_name = COALESCE(thread_summaries.trigger_name, EXCLUDED.trigger_name)
-                       -- Defense in depth (see MessageReceived above for rationale).
-                       WHERE thread_summaries.state != 'discarded'"#,
-                )
-                .bind(thread_id)
-                .bind(trigger_name.as_deref())
-                .bind(source)
-                .bind(trigger_id.as_str())
-                .bind(trigger_name.as_deref())
-                .bind(*go_to_review)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-
-            // Activity events — update last_activity + status
-            ThreadEvent::ResponseGenerated { .. } => {
-                // Normal completion — go idle (or waiting if CC has pending changes).
-                sqlx::query(&format!(
-                    "UPDATE thread_summaries SET last_activity = NOW(), has_response = TRUE, \
-                     status = {STATUS_FROM_CC_HAS_CHANGES} WHERE thread_id = $1"
-                ))
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ResponseAborted { .. } => {
-                // System interruption — same red error indicator as ResponseFailed,
-                // unless a CC session left pending changes (changes dot wins).
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), has_response = TRUE, \
-                     status = CASE WHEN cc_has_changes THEN 'waiting' ELSE 'failed' END \
-                     WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::CodingAgentIdled { has_changes, requires_restart, is_external_repo, .. } => {
-                // CC session idled — SET (not OR) cc_has_changes from payload.
-                // CodingAgentIdled is the authoritative snapshot of the session's state.
-                // After apply/discard, the session emits has_changes=false to clear the flag.
-                // Set has_response = TRUE so the thread appears in get_recent_threads
-                // (CC threads don't go through ResponseGenerated, so this is the CC equivalent).
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
-                     has_response = TRUE, \
-                     cc_has_changes = $2, \
-                     cc_requires_restart = $3, \
-                     cc_is_external_repo = $4, \
-                     status = CASE WHEN $2 THEN 'waiting' ELSE 'idle' END \
-                     WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .bind(has_changes)
-                .bind(requires_restart)
-                .bind(is_external_repo)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ChangeApplied {
-                change_id,
-                requires_restart,
-                commits,
-                pre_merge_sha,
-                post_merge_sha,
-                ..
-            } => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
-                     cc_has_changes = FALSE, cc_requires_restart = FALSE, \
-                     cc_is_external_repo = FALSE, cc_applying = FALSE, \
-                     status = 'idle' \
-                     WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                crate::core::changes_projection::ChangesProjection::write_applied(
-                    tx,
-                    change_id,
-                    *requires_restart,
-                    commits,
-                    pre_merge_sha.as_deref(),
-                    post_merge_sha.as_deref(),
-                )
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ChangeDiscarded { change_id, .. } => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
-                     cc_has_changes = FALSE, cc_requires_restart = FALSE, \
-                     cc_is_external_repo = FALSE, cc_applying = FALSE, \
-                     status = 'idle' \
-                     WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                crate::core::changes_projection::ChangesProjection::write_status(
-                    tx, change_id, "discarded",
-                )
-                .await?;
-                Vec::new()
-            }
-
-            // Message count increment + activity (CC user messages and mid-flight injections)
-            ThreadEvent::CodingAgentUserMessageSent { .. }
-            | ThreadEvent::UserPromptInjected { .. } => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), message_count = message_count + 1, status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-
-            // Title events
-            ThreadEvent::ThreadTitleGenerated { title } | ThreadEvent::ThreadTitleRenamed { title } => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET title = $2 WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .bind(title)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-
-            // Save/unsave
-            ThreadEvent::ThreadSaved => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET is_saved = TRUE WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ThreadUnsaved => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET is_saved = FALSE WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-
-            ThreadEvent::ThreadArchived => {
-                // Clear is_saved so display priority doesn't keep the row in
-                // Saved (is_saved=true wins over state='archived').
-                sqlx::query(
-                    "UPDATE thread_summaries SET status = 'idle', \
-                     state = 'archived', \
-                     is_saved = FALSE, \
-                     cc_has_changes = FALSE, cc_requires_restart = FALSE, \
-                     cc_is_external_repo = FALSE, cc_applying = FALSE, \
-                     active_children_count = 0, total_children_count = 0 \
-                     WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ThreadStarted { mode, .. } => {
-                // Compose-time thread creation — the row appears in
-                // `thread_summaries` with `state='composing'` so the frontend
-                // can render it as a draft via cross-device SSE. Default
-                // initiator is `user` since only humans open compose. Source
-                // mirrors the user's chosen mode so a draft that auto-archives
-                // before being sent still surfaces with the correct channel
-                // pill. Send events later re-assert source via the
-                // `source = 'chat'`-keyed CASE in MessageReceived.
-                let source = if mode == "claude_code" { "claude_code" } else { "chat" };
-                sqlx::query(
-                    r#"INSERT INTO thread_summaries
-                        (thread_id, initiator, source, created_at, last_activity, message_count,
-                         state, compose_mode, status)
-                       VALUES ($1, 'user', $3, NOW(), NOW(), 0, 'composing', $2, 'idle')
-                       ON CONFLICT (thread_id) DO NOTHING"#,
-                )
-                .bind(thread_id)
-                .bind(mode)
-                .bind(source)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ThreadDiscarded { .. } => {
-                // Terminal transition. Only valid from `composing` — the
-                // state-machine guard at the API boundary already rejected
-                // discard from active/archived, so this UPDATE is safe to run
-                // without re-checking. Compose fields are wiped so a stale
-                // SSE replay can't show ghost text.
-                sqlx::query(
-                    "UPDATE thread_summaries SET state = 'discarded', \
-                     compose_text = '', compose_images = '[]'::jsonb, compose_mode = NULL \
-                     WHERE thread_id = $1 AND state = 'composing'",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-
-            // Events that update status but no other metadata.
-            ThreadEvent::ResponseCanceled { .. } => {
-                // User canceled — go idle (or waiting if pending changes).
-                // Set has_response so the thread appears in history (a canceled
-                // response is still a response — the user should see the thread).
-                sqlx::query(&format!(
-                    "UPDATE thread_summaries SET has_response = TRUE, \
-                     status = {STATUS_FROM_CC_HAS_CHANGES} WHERE thread_id = $1"
-                ))
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ResponseFailed { .. } => {
-                // Failed response — distinct from 'waiting' (which means CC has
-                // changes to review) so the UI can render an error indicator.
-                // Set has_response so the thread stays visible.
-                sqlx::query(
-                    "UPDATE thread_summaries SET has_response = TRUE, status = 'failed' WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::SessionEnded { reason } => {
-                // Transient reasons (StaleResume) are mid-retry — the chat
-                // handler is about to spawn a fresh session within the same
-                // request. Flipping to terminal here would render the exchange
-                // as "Aborted" until the retry's SessionStarted lands.
-                if !reason.is_transient() {
-                    sqlx::query(&format!(
-                        "UPDATE thread_summaries SET has_response = TRUE, \
-                         status = {STATUS_FROM_CC_HAS_CHANGES} WHERE thread_id = $1"
-                    ))
-                    .bind(thread_id)
-                    .execute(&mut **tx)
-                    .await?;
-                }
-                Vec::new()
-            }
-            ThreadEvent::TriggerCompleted { .. } => {
-                // Trigger run done — go idle. Set has_response so the thread
-                // appears in get_recent_threads (which filters has_response=TRUE).
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), has_response = TRUE, status = 'idle' WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ChangeProposed {
-                change_id,
-                description,
-                files,
-                requires_restart,
-                commit_sha,
-                branch_name,
-                repo_root,
-                hardened,
-                incomplete,
-                ..
-            } => {
-                // CodingAgentIdled already set status='waiting' if the session idled;
-                // mid-session commits keep status='running'. Only the flag changes.
-                sqlx::query(
-                    "UPDATE thread_summaries SET cc_has_changes = TRUE WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                use crate::core::changes_projection::ChangesProjection;
-                if change_id.is_empty() && commit_sha.is_some() {
-                    ChangesProjection::write_proposed_per_commit(
-                        tx,
-                        branch_name,
-                        description.as_deref(),
-                        *requires_restart,
-                    )
-                    .await?;
-                } else if !change_id.is_empty() {
-                    ChangesProjection::write_proposed_aggregate(
-                        tx,
-                        change_id,
-                        thread_id,
-                        branch_name,
-                        repo_root,
-                        description.as_deref(),
-                        files,
-                        *requires_restart,
-                        *hardened,
-                        *incomplete,
-                    )
-                    .await?;
-                }
-                Vec::new()
-            }
-            ThreadEvent::MergeConflictDetected { .. } => {
-                // Merge conflict — mark as applying.
-                sqlx::query(
-                    "UPDATE thread_summaries SET cc_applying = TRUE WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ChangeApplyFailed { .. } => {
-                // Apply failed — clear applying flag, stay waiting.
-                sqlx::query(
-                    "UPDATE thread_summaries SET cc_applying = FALSE WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::CodingAgentPromptSent { text, .. } => {
-                // Empty prompt = no agent intent → no status change. Real prompts
-                // always carry text (user follow-up audit trail, automated CC
-                // sessions). The contract in `status_transitions()` reflects this
-                // exception.
-                if !text.is_empty() {
-                    sqlx::query(
-                        "UPDATE thread_summaries SET status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
-                    )
-                    .bind(thread_id)
-                    .execute(&mut **tx)
-                    .await?;
-                }
-                Vec::new()
-            }
-            ThreadEvent::ContinueSignal { .. } => {
-                // Continuation start event — bump last_activity and flip status
-                // back to running so the thread surfaces in the recents list as
-                // soon as the dispatcher emits the spawn. The contract's
-                // status_transitions table sets Running too; we emit the SQL
-                // here so the timestamp moves alongside it.
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
-                     status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ToolCalled { .. }
-            | ThreadEvent::ToolResult { .. }
-            | ThreadEvent::TextStreamed { .. }
-            | ThreadEvent::Thinking { .. }
-            | ThreadEvent::CodingAgentTextStreamed { .. }
-            | ThreadEvent::CodingAgentToolCalled { .. }
-            | ThreadEvent::CodingAgentToolResult { .. } => {
-                // Update last_activity so the thread list timestamp stays current during
-                // long-running agentic responses. Without this, the timestamp only
-                // advances on discrete lifecycle events, not during streaming.
-                //
-                // Also bump status back to 'running' if the projection drifted to a
-                // non-running state (e.g. CC emitted a mid-session `Result` that the
-                // engine treated as idle, then continued working). `last_revived_at`
-                // is gated by CASE rather than set unconditionally — sibling UPDATEs
-                // for one-shot transitions (`ContinueSignal`, etc.) refresh it every
-                // time, but activity events fire many times per turn and would
-                // constantly reshuffle IN PROGRESS sort order if treated the same
-                // way. Mirrors `status_transitions()` for these event types — see
-                // `thread_lifecycle.rs`.
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
-                     last_revived_at = CASE WHEN status != 'running' THEN NOW() \
-                                            ELSE last_revived_at END, \
-                     status = 'running' \
-                     WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            // Both CC AskUserQuestion and CC permission prompts pause the
-            // exchange on user input — surface in REVIEW. AskUserQuestion kills
-            // the CC subprocess; the permission prompt keeps it alive while
-            // its MCP stdio server blocks on the engine's HTTP response. The
-            // projection treats them identically: status flips to
-            // 'waiting_for_user_answer' on the request and back to 'running'
-            // on the resolution.
-            ThreadEvent::UserQuestionAsked { .. }
-            | ThreadEvent::CodingAgentPermissionRequest { .. } => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
-                     status = 'waiting_for_user_answer' WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::UserQuestionAnswered { .. }
-            | ThreadEvent::CodingAgentPermissionResolved { .. } => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
-                     status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ChangeReverted { change_id, .. } => {
-                crate::core::changes_projection::ChangesProjection::write_status(
-                    tx, change_id, "reverted",
-                )
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ChangeHardened { change_id, .. } => {
-                crate::core::changes_projection::ChangesProjection::write_hardened(tx, change_id)
-                    .await?;
-                Vec::new()
-            }
-            ThreadEvent::MergeResolutionStarted {
-                change_id,
-                worktree_path,
-                temp_branch,
-            } => {
-                crate::core::changes_projection::ChangesProjection::write_merge_started(
-                    tx,
-                    change_id,
-                    worktree_path,
-                    temp_branch,
-                )
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::MergeResolutionCleared { change_id } => {
-                crate::core::changes_projection::ChangesProjection::write_merge_cleared(
-                    tx, change_id,
-                )
-                .await?;
-                Vec::new()
-            }
-            // Events that don't affect thread_summaries metadata or status.
-            // Exhaustive match — adding a new ThreadEvent variant forces you to decide
-            // whether it needs a projection update. Never use `_ =>` here.
-            ThreadEvent::MemorySearched { .. }
-            | ThreadEvent::CredentialRequested { .. }
-            | ThreadEvent::McpConsentRequested { .. }
-            // Transient events (never persisted, never reach this function)
-            | ThreadEvent::TextStreaming { .. }
-            | ThreadEvent::Retrying { .. }
-            | ThreadEvent::PreambleCompleting
-            | ThreadEvent::CredentialRequest { .. }
-            | ThreadEvent::EmailConfirmRequest { .. }
-            | ThreadEvent::PushNotificationRequest
-            | ThreadEvent::McpConsentRequest { .. }
-            | ThreadEvent::RefreshFile { .. }
-            | ThreadEvent::RefreshAppUI { .. }
-            | ThreadEvent::CaptureAppUI { .. }
-            | ThreadEvent::NavigationRequested { .. }
-            | ThreadEvent::CodingAgentThreadSpawned { .. }
-            | ThreadEvent::ChildrenCountChanged { .. }
-            | ThreadEvent::MissingHardeningDetected { .. }
-            | ThreadEvent::CodingAgentSettingsChanged { .. }
-            // Passive bookkeeping for the background cleanup worker
-            // (Phase 10.2). Persisted to the events stream for audit /
-            // debugging but produces no projection side effects.
-            | ThreadEvent::WorktreeCleaned { .. }
-            // ImageUploaded is a per-thread audit fact for content-addressed
-            // blob uploads. Persisted for audit + cross-device prefetch hint
-            // via SSE; no projection side effects (no status change, no
-            // section transition, no last_activity bump).
-            | ThreadEvent::ImageUploaded { .. }
-            | ThreadEvent::ContextTokensMeasured { .. } => Vec::new(),
-        };
-
-        // Step 2: Validate and apply section transition via the lifecycle contract.
-        // This runs after metadata updates so upsert events have created the row.
-        let thread_type = Self::get_thread_type(tx, &thread_id).await;
-        let current = Self::get_current_section(tx, &thread_id).await;
-        let (depth, source, trigger_go_to_review): (i32, Option<String>, bool) = sqlx::query_as(
-            "SELECT COALESCE(depth, 0), source, COALESCE(trigger_go_to_review, FALSE) \
-             FROM thread_summaries WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .unwrap_or(None)
-        .unwrap_or((0, None, false));
-        // Trigger executions run unattended — don't surface in REVIEW. But
-        // user followups on trigger threads ARE attended (latest start =
-        // MessageReceived), and triggers with `go_to_review=true` opt back in
-        // for reports/alerts the user is meant to read.
-        let is_top_level = if depth > 0 {
-            false
-        } else if source.as_deref() != Some("trigger") || trigger_go_to_review {
-            true
-        } else {
-            let latest_start: Option<String> = sqlx::query_scalar(
-                "SELECT event_type FROM events WHERE aggregate_id = $1::text \
-                 AND event_type IN ('TriggerStarted', 'MessageReceived') \
-                 ORDER BY sequence DESC LIMIT 1",
-            )
-            .bind(thread_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-            latest_start.as_deref() == Some("MessageReceived")
-        };
-        match resolve_transition(event.event_type(), thread_type, current, is_top_level) {
-            Ok(mut transition) => {
-                // CodingAgentIdled(has_changes=false) after apply/discard is a housekeeping
-                // event — the section is already 'inbox' so setting it again is redundant.
-                // When section is Default (first idle with no changes), let the transition
-                // through so the thread surfaces in REVIEW — the user needs to know the
-                // CC session completed.
-                if matches!(
-                    event,
-                    ThreadEvent::CodingAgentIdled {
-                        has_changes: false,
-                        ..
-                    }
-                ) && current == ArchiveState::Inbox
-                {
-                    transition.new_section = None;
-                }
-                Self::apply_transition(tx, thread_id, &transition).await?;
-            }
-            Err(v) => {
-                crate::log!("[EventBus] {}", v);
-                return Err(Box::new(v));
-            }
-        }
-        Ok(match_side_effects)
-    }
-
-    // ---- System projection ----
-
-    async fn update_system_projection(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        event_id: Uuid,
-        event: &SystemEvent,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        match event {
-            SystemEvent::NotificationCreated {
-                id,
-                title,
-                message,
-                task_id,
-                app_id,
-            } => {
-                let notification_id = Uuid::parse_str(id).unwrap_or(event_id);
-                let task_uuid = task_id.as_ref().and_then(|s| Uuid::parse_str(s).ok());
-                sqlx::query(
-                    "INSERT INTO notifications (id, task_id, app_id, title, message, read, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, false, NOW())"
-                )
-                .bind(notification_id)
-                .bind(task_uuid)
-                .bind(app_id.as_deref())
-                .bind(title)
-                .bind(message)
-                .execute(&mut **tx)
-                .await?;
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
 }
 
 #[async_trait]
@@ -2041,3 +975,6 @@ impl EventBusEmitter for MockEventBus {
 #[cfg(test)]
 #[path = "event_bus_tests.rs"]
 mod tests;
+
+#[path = "event_bus_projection.rs"]
+mod projection;

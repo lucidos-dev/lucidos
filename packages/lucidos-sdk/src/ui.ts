@@ -113,6 +113,23 @@ export const ui = {
   },
 
   /**
+   * Open a fresh chat thread, optionally prefilling the compose textarea.
+   * The user must click Send — this never auto-submits. If the user is on
+   * an app/trigger/settings panel it closes the overlay first; if a thread
+   * is focused it drops the focus so the compose lands on a new thread.
+   */
+  startThread(opts?: { prompt?: string }): Promise<void> {
+    const params: Record<string, string> = {};
+    if (opts && opts.prompt !== undefined) {
+      if (typeof opts.prompt !== 'string') {
+        return Promise.reject(new TypeError('opts.prompt must be a string'));
+      }
+      if (opts.prompt.length > 0) params.prompt = opts.prompt;
+    }
+    return ui.navigate('new-chat', params);
+  },
+
+  /**
    * Show a confirmation dialog rendered by the host shell (above all app
    * content, themed by the user's preferences). Resolves to `true` on OK
    * and `false` on Cancel / Esc / backdrop click. If another confirm is

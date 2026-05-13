@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { exchangeResponseEvents, exchangeStatus, exchangeSteps, type Exchange } from '../thread-events';
+import { exchangeResponseEvents, exchangeStatus, exchangeSteps, type AnswerKind, type Exchange, type ThreadEvent, type ThreadMeta, type ThreadState } from '../thread-events';
 import type { StoredEvent } from '../thread-events';
+import { findPendingMultiSelectQuestion, computeSubmitMultiCount } from '../../components/chat/PromptInput';
 
 function step(seq: number, event: Partial<StoredEvent> & { type: string }): { seq: number; event: StoredEvent } {
   return { seq, event: event as StoredEvent };
@@ -12,6 +13,32 @@ function exchange(steps: Array<{ seq: number; event: StoredEvent }>): Exchange {
     userSeq: 0,
     steps,
   };
+}
+
+function buildThreadState(events: ThreadEvent[]): ThreadState {
+  const map = new Map<number, ThreadEvent>();
+  events.forEach((ev, i) => map.set(i + 1, ev));
+  const meta: ThreadMeta = {
+    id: 'thread-1',
+    title: 'Test',
+    channel: 'claude_code',
+    initiator: 'user',
+    saved: false,
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+    status: 'waiting_for_user_answer',
+    ccHasChanges: false,
+    ccRequiresRestart: false,
+    ccIsExternalRepo: false,
+    ccApplying: false,
+    lastRevivedAt: '',
+    messageCount: 1,
+    section: 'archived',
+    activeChildrenCount: 0,
+    totalChildrenCount: 0,
+    state: 'active',
+  };
+  return { meta, events: map, streamingBuffer: '', eventsLoaded: true, eventsLoadFailed: false, lastDbSeq: events.length, pendingUserMessages: [] };
 }
 
 describe('exchangeStatus + spinner behavior around UserQuestionAsked', () => {
@@ -89,5 +116,113 @@ describe('exchangeStatus + spinner behavior around UserQuestionAsked', () => {
     const lastStep = steps[steps.length - 1];
     expect(lastStep.description).toBe('Thinking');
     expect(lastStep.success).toBeNull();
+  });
+});
+
+describe('AnswerKind discriminated union', () => {
+  it('includes MultiSelected with option_ids', () => {
+    const a: AnswerKind = { kind: 'MultiSelected', option_ids: ['opt-0', 'opt-1'] };
+    expect(a.kind).toBe('MultiSelected');
+    if (a.kind === 'MultiSelected') {
+      expect(a.option_ids).toHaveLength(2);
+      expect(a.option_ids[0]).toBe('opt-0');
+    }
+  });
+
+  it('MultiSelected accepts optional text alongside option_ids', () => {
+    // Mirrors the Rust `text: Option<String>` field. The prompt-row Submit
+    // bundles the textarea contents into the answer when a multi-select
+    // question is pending.
+    const a: AnswerKind = { kind: 'MultiSelected', option_ids: ['opt-0'], text: 'plus this' };
+    if (a.kind === 'MultiSelected') {
+      expect(a.text).toBe('plus this');
+    }
+    const b: AnswerKind = { kind: 'MultiSelected', option_ids: [], text: 'just text' };
+    if (b.kind === 'MultiSelected') {
+      expect(b.option_ids).toHaveLength(0);
+      expect(b.text).toBe('just text');
+    }
+  });
+});
+
+describe('findPendingMultiSelectQuestion', () => {
+  it('returns the toolUseId of the latest unanswered multi-select question', () => {
+    const thread = buildThreadState([
+      { type: 'MessageReceived', text: 'go', channel: 'claude_code' } as ThreadEvent,
+      { type: 'SessionStarted', session_id: 'sess', branch: '' } as ThreadEvent,
+      {
+        type: 'UserQuestionAsked',
+        tool_use_id: 'tu_pending',
+        cc_session_id: 'sess',
+        question: 'Pick all that apply:',
+        options: [{ id: 'opt-0', label: 'A' }, { id: 'opt-1', label: 'B' }],
+        multi_select: true,
+      } as ThreadEvent,
+    ]);
+    expect(findPendingMultiSelectQuestion(thread)).toEqual({ toolUseId: 'tu_pending' });
+  });
+
+  it('returns null when the multi-select question is already answered', () => {
+    const thread = buildThreadState([
+      { type: 'MessageReceived', text: 'go', channel: 'claude_code' } as ThreadEvent,
+      { type: 'SessionStarted', session_id: 'sess', branch: '' } as ThreadEvent,
+      {
+        type: 'UserQuestionAsked',
+        tool_use_id: 'tu_done',
+        cc_session_id: 'sess',
+        question: 'Pick:',
+        options: [{ id: 'opt-0', label: 'A' }],
+        multi_select: true,
+      } as ThreadEvent,
+      {
+        type: 'UserQuestionAnswered',
+        tool_use_id: 'tu_done',
+        answer: { kind: 'MultiSelected', option_ids: ['opt-0'] },
+      } as ThreadEvent,
+    ]);
+    expect(findPendingMultiSelectQuestion(thread)).toBeNull();
+  });
+
+  it('ignores single-select questions (those answer through the card directly)', () => {
+    const thread = buildThreadState([
+      { type: 'MessageReceived', text: 'go', channel: 'claude_code' } as ThreadEvent,
+      { type: 'SessionStarted', session_id: 'sess', branch: '' } as ThreadEvent,
+      {
+        type: 'UserQuestionAsked',
+        tool_use_id: 'tu_single',
+        cc_session_id: 'sess',
+        question: 'Pick one:',
+        options: [{ id: 'opt-0', label: 'A' }],
+        multi_select: false,
+      } as ThreadEvent,
+    ]);
+    expect(findPendingMultiSelectQuestion(thread)).toBeNull();
+  });
+
+  it('returns null for an undefined thread (focused thread missing from map)', () => {
+    expect(findPendingMultiSelectQuestion(undefined)).toBeNull();
+  });
+});
+
+describe('computeSubmitMultiCount', () => {
+  it('returns 0 when no toggles and no text — Submit reads bare', () => {
+    expect(computeSubmitMultiCount(0, '')).toBe(0);
+  });
+
+  it('counts toggled options', () => {
+    expect(computeSubmitMultiCount(2, '')).toBe(2);
+  });
+
+  it('counts a typed custom answer as +1 when no options are toggled', () => {
+    expect(computeSubmitMultiCount(0, 'something')).toBe(1);
+  });
+
+  it('counts toggled options + the typed custom answer', () => {
+    expect(computeSubmitMultiCount(2, 'something')).toBe(3);
+  });
+
+  it('treats whitespace-only text as empty so the count matches what submit will send', () => {
+    expect(computeSubmitMultiCount(0, '   \n\t')).toBe(0);
+    expect(computeSubmitMultiCount(2, '   ')).toBe(2);
   });
 });
