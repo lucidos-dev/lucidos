@@ -702,19 +702,29 @@ impl EventBus {
         .unwrap_or((0, None, false));
         // Trigger executions run unattended — don't surface in REVIEW. But
         // user followups on trigger threads ARE attended (latest start =
-        // MessageReceived), and triggers with `go_to_review=true` opt back in
-        // for reports/alerts the user is meant to read.
+        // user-driven MessageReceived), and triggers with `go_to_review=true`
+        // opt back in for reports/alerts the user is meant to read.
+        //
+        // Engine- and agent-driven `MessageReceived` events MUST NOT count as
+        // a user follow-up — they're automated. The mode filter defaults to
+        // Human to mirror `default_mode_human` on `ThreadEvent::MessageReceived`,
+        // so legacy rows persisted before the field existed still read as
+        // user messages.
         let is_top_level = if depth > 0 {
             false
         } else if source.as_deref() != Some("trigger") || trigger_go_to_review {
             true
         } else {
+            let human = ActorMode::Human.as_str();
             let latest_start: Option<String> = sqlx::query_scalar(
                 "SELECT event_type FROM events WHERE aggregate_id = $1::text \
-                 AND event_type IN ('TriggerStarted', 'MessageReceived') \
+                 AND (event_type = 'TriggerStarted' \
+                      OR (event_type = 'MessageReceived' \
+                          AND COALESCE(payload->>'mode', $2) = $2)) \
                  ORDER BY sequence DESC LIMIT 1",
             )
             .bind(thread_id)
+            .bind(human)
             .fetch_optional(&mut **tx)
             .await?;
             latest_start.as_deref() == Some("MessageReceived")

@@ -156,12 +156,11 @@ pub(super) async fn read_app_source(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
 ) -> Response {
-    let app_id = &app_id;
-    if !is_valid_id(app_id) {
+    if !is_valid_id(&app_id) {
         return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
     }
 
-    match state.app_manager.read_app_source(app_id) {
+    match state.app_manager.read_app_source(&app_id) {
         Ok(files) => {
             let entries: Vec<serde_json::Value> = files
                 .into_iter()
@@ -184,8 +183,7 @@ pub(super) async fn write_app_source(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let app_id = &app_id;
-    if !is_valid_id(app_id) {
+    if !is_valid_id(&app_id) {
         return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
     }
 
@@ -208,13 +206,13 @@ pub(super) async fn write_app_source(
     }
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
-    match state.app_manager.write_app_source(app_id, &files) {
+    match state.app_manager.write_app_source(&app_id, &files) {
         Ok(commit) => {
             if let Err(e) = state
                 .engine
                 .event_bus
                 .emit(BusEvent::System(SystemEvent::AppUpdated {
-                    app_id: app_id.to_string(),
+                    app_id: app_id.clone(),
                     name: None,
                     actor,
                 }))
@@ -244,9 +242,7 @@ pub(super) async fn serve_app_ui(
     Path(app_id): Path<String>,
     Query(query): Query<AppCommitQuery>,
 ) -> Response {
-    let app_id = &app_id;
-
-    if !is_valid_id(app_id) {
+    if !is_valid_id(&app_id) {
         return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
     }
 
@@ -271,7 +267,7 @@ pub(super) async fn serve_app_ui(
         };
     }
 
-    let ui_path = state.app_manager.get_app_path(app_id);
+    let ui_path = state.app_manager.get_app_path(&app_id);
 
     if !ui_path.exists() {
         return (StatusCode::NOT_FOUND, "App UI not found").into_response();

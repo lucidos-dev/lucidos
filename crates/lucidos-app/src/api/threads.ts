@@ -1,5 +1,5 @@
 import { API_BASE, ApiError, json, mutatingFetch, throwIfNotOk } from './client';
-import type { ThreadSection, ThreadInitiator } from '../store/thread-events';
+import type { ThreadSection, ThreadInitiator, ThreadAggregate } from '../store/thread-events';
 
 export interface ThreadInfo {
   thread_id: string;
@@ -134,8 +134,6 @@ export type ThreadEventRow = {
   created: string;
   event_id: string;
 };
-
-import type { ThreadAggregate } from '../store/thread-events';
 
 /** Wraps `events[]` with `currentAggregate` so the historical-replay path
  *  applies meta from a fetched snapshot — same source-of-truth model as live

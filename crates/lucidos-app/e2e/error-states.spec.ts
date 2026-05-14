@@ -206,8 +206,8 @@ test.describe('Resume after restart — boundary panels', () => {
     }
   });
 
-  test('Continue button hides after a SessionRecovered lands', async ({ page }) => {
-    // Same shape as the engine-abort test, but with a trailing SessionRecovered
+  test('Continue button hides after a ContinuationStarted lands', async ({ page }) => {
+    // Same shape as the engine-abort test, but with a trailing ContinuationStarted
     // — the AbortPanel must render WITHOUT the Continue button.
     const threadId = randomUUID();
     const userMsgId = randomUUID();
@@ -233,7 +233,7 @@ test.describe('Resume after restart — boundary panels', () => {
         `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count, cc_has_changes, cc_requires_restart, cc_is_external_repo) VALUES ('${threadId}', 'Resumed e2e', 'chat', '${t2}', 1, false, false, 'idle', 'archived', false, 0, false, false, false)`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${userMsgId}', 'MessageReceived', '{"text":"hi","channel":"chat"}'::jsonb, '${t0}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${abortedId}', 'ResponseAborted', '${abortedPayload}'::jsonb, '${t1}', 'thread', '${threadId}', '${threadId}')`,
-        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${recoveredId}', 'SessionRecovered', '${recoveredPayload}'::jsonb, '${t2}', 'thread', '${threadId}', '${threadId}')`,
+        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${recoveredId}', 'ContinuationStarted', '${recoveredPayload}'::jsonb, '${t2}', 'thread', '${threadId}', '${threadId}')`,
       ].join(';\n'));
 
       await page.addInitScript((tid: string) => {
@@ -245,7 +245,7 @@ test.describe('Resume after restart — boundary panels', () => {
       const exchanges = page.locator('.chat-exchange:visible');
       await expect(exchanges).toHaveCount(3, { timeout: 10_000 });
       // The abort boundary's Continue button must NOT render once a
-      // SessionRecovered exists later in the thread.
+      // ContinuationStarted exists later in the thread.
       const abortExchange = exchanges.nth(1);
       await expect(abortExchange.getByRole('button', { name: 'Continue' })).toHaveCount(0);
       // The resume exchange shows the device-attributed initiator.
@@ -260,7 +260,7 @@ test.describe('Resume after restart — boundary panels', () => {
     }
   });
 
-  test('SessionRecovered with engine note: subline counts tool entries', async ({ page }) => {
+  test('ContinuationStarted with engine note: subline counts tool entries', async ({ page }) => {
     const threadId = randomUUID();
     const userMsgId = randomUUID();
     const abortedId = randomUUID();
@@ -293,7 +293,7 @@ test.describe('Resume after restart — boundary panels', () => {
     const injectedPayload = JSON.stringify({
       text: noteText,
       mode: 'engine',
-      origin: { kind: 'engine', reason: { kind: 'session_recovered' } },
+      origin: { kind: 'engine', reason: { kind: 'continuation_started' } },
       request_event_id: recoveredId,
     });
 
@@ -302,7 +302,7 @@ test.describe('Resume after restart — boundary panels', () => {
         `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count, cc_has_changes, cc_requires_restart, cc_is_external_repo) VALUES ('${threadId}', 'Engine note e2e', 'chat', '${t3}', 1, false, false, 'idle', 'archived', false, 0, false, false, false)`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${userMsgId}', 'MessageReceived', '{"text":"hi","channel":"chat"}'::jsonb, '${t0}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${abortedId}', 'ResponseAborted', '${abortedPayload}'::jsonb, '${t1}', 'thread', '${threadId}', '${threadId}')`,
-        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${recoveredId}', 'SessionRecovered', '${recoveredPayload}'::jsonb, '${t2}', 'thread', '${threadId}', '${threadId}')`,
+        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${recoveredId}', 'ContinuationStarted', '${recoveredPayload}'::jsonb, '${t2}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${injectedId}', 'UserPromptInjected', '${injectedPayload}'::jsonb, '${t3}', 'thread', '${threadId}', '${threadId}')`,
       ].join(';\n'));
 

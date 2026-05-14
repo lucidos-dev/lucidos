@@ -76,29 +76,19 @@ pub(super) async fn cleanup_worktree(
         ));
     }
 
+    if req.tier == 2 && is_worktree_dirty(&worktree).await {
+        return Err((
+            StatusCode::CONFLICT,
+            "Worktree has uncommitted changes — use tier 3 to force-remove".to_string(),
+        ));
+    }
+
     let (freed_bytes, branch_deleted) = match req.tier {
         1 => {
             let freed = prune_build_artifacts(&worktree).unwrap_or(0);
             (freed, false)
         }
-        2 => {
-            if is_worktree_dirty(&worktree).await {
-                return Err((
-                    StatusCode::CONFLICT,
-                    "Worktree has uncommitted changes — use tier 3 to force-remove".to_string(),
-                ));
-            }
-            let outcome = remove_worktree_and_optionally_delete_branch(&worktree, None)
-                .await
-                .ok_or_else(|| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to remove worktree".to_string(),
-                    )
-                })?;
-            (outcome.freed_bytes, outcome.branch_deleted)
-        }
-        3 => {
+        2 | 3 => {
             let outcome = remove_worktree_and_optionally_delete_branch(&worktree, None)
                 .await
                 .ok_or_else(|| {

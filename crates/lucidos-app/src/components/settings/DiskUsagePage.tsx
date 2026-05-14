@@ -75,7 +75,6 @@ async function runCleanup(threadId: string, tier: 1 | 2 | 3): Promise<{ tier: nu
   return res.json();
 }
 
-
 interface PressureLabel {
   text: string;
   cls: string;

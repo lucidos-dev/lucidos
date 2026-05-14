@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.9.6 — 2026-05-14
+
+### Fixed
+- **Triggers:** only human `MessageReceived` events promote a trigger thread to REVIEW; engine-driven follow-ups no longer falsely resurrect/re-route trigger threads (event_bus_projection now filters by `mode = human`).
+- **Title generation:** reject LLM titles that echo the system instruction back as the title.
+- **Commit hook:** match engine TLS scheme so per-commit `ChangeProposed` fires reliably (was using wrong scheme on HTTPS-only engines).
+- **Release script:** harden `-c FILE` mode and the deleted-files drift check; use `printf` instead of `echo` for grep input to avoid word-splitting on changelog bullets.
+- **E2E:** rename test `event_type` `SessionRecovered` → `ContinuationStarted` to match the post-v0.9.5 event rename.
+
+### Changed
+- **Cleanup:** complete `app_id` rebind cleanup; lift dirty check out of merged arm.
+- **Harden:** project-wide harden pass; tighten projection SQL comment around `ActorMode::Human`; drop commit-SHA references from title echo-validator comments.
 ## v0.9.5 — 2026-05-13
 
 ### Added

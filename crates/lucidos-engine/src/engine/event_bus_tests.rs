@@ -3448,6 +3448,93 @@ async fn trigger_followup_response_goes_to_review() {
     teardown_test_db(&db_name).await;
 }
 
+#[tokio::test]
+async fn engine_message_received_does_not_promote_trigger_thread_to_review() {
+    // Regression: an event-fired trigger without `go_to_review: true` surfaced
+    // in REVIEW because the engine emitted a `MessageReceived` (mode=engine)
+    // carrying the triggering-event payload right after `TriggerStarted`. The
+    // section-routing check (`event_bus_projection.rs`) compared the latest
+    // start event without filtering by mode, so the engine-driven message
+    // counted as a user follow-up. Only `mode=human` MessageReceived events
+    // count as user follow-ups; engine/agent messages must not promote the
+    // thread out of HISTORY.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::TriggerStarted {
+            trigger_id: "t-event".into(),
+            trigger_name: Some("dashboard re-gen".into()),
+            prompt: None,
+            invocation: Some(crate::engine::thread_events::TriggerInvocation::Event {
+                event_type: "MorningLogged".into(),
+                event_id: None,
+            }),
+            origin: None,
+            go_to_review: false,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Trigger),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "## Triggering Event\n\n```json\n{\"date\":\"2026-05-11\"}\n```".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Engine,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Trigger),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "Dashboard regenerated.".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let section: String =
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        section, "archived",
+        "trigger thread without go_to_review must stay in HISTORY even when an engine-driven MessageReceived was emitted on it"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 #[test]
 fn message_received_destructures_parent_thread_id() {
     // Verify that MessageReceived with parent_thread_id is correctly

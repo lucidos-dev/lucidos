@@ -61,6 +61,34 @@ const TITLE_SYSTEM_PROMPT: &str = "Generate a very short title (3-6 words) for t
      name, not its install id). \
      Return ONLY the title text, nothing else. No quotes.";
 
+/// True when the LLM echoed the system-prompt instruction back as the
+/// title instead of generating one. Production case: thread
+/// 8c3b5619 — user typed "Release", gemini-3-flash-preview returned
+/// "Generate conversation title". Routing the instruction through
+/// `system_instruction` instead of the user message reduces echo rate
+/// but does not eliminate it: with near-empty user content, the model
+/// still latches onto the most prominent thing in its context, which
+/// on Vertex includes the system instruction. Patterns are distinctive
+/// enough not to false-positive on real titles ("Movie title
+/// brainstorming", "Generated report for Q4").
+fn is_prompt_echo(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    const ECHO_PATTERNS: &[&str] = &[
+        "conversation title",
+        "very short title",
+        "very short conversation",
+        "3-6 word",
+        "title for the conversation",
+        "title for this conversation",
+    ];
+    if ECHO_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    // "Generate <noun>" almost never starts a real human title;
+    // "generated" (adjective) is a different word and stays allowed.
+    lower.trim_start().starts_with("generate ")
+}
+
 /// Build the user message for thread title generation — the conversation
 /// body, no instruction. Truncates message to 1000 chars and image
 /// description to 300 chars.
@@ -106,6 +134,9 @@ pub(crate) async fn generate_thread_title(
     let title = title.trim().to_string();
     if title.is_empty() {
         return Err("LLM returned empty title".into());
+    }
+    if is_prompt_echo(&title) {
+        return Err(format!("LLM echoed title prompt: {:?}", title).into());
     }
     Ok(title)
 }
@@ -315,6 +346,40 @@ mod tests {
     fn decide_returns_images_for_multiple_attachments_only() {
         assert_eq!(decide_title_path("", None, 2), TitleDecision::Images);
         assert_eq!(decide_title_path("", None, 5), TitleDecision::Images);
+    }
+
+    /// Real string returned by gemini-3-flash-preview in production for
+    /// thread 8c3b5619-c35c-4120-b47d-1a5701b70a14. The user typed the
+    /// single word "Release"; with no intent to summarize, the model
+    /// echoed the system-instruction phrasing ("Generate a very short
+    /// title for the user's conversation") back as the title. Routing
+    /// the instruction through `system_instruction` reduces but does
+    /// not eliminate this — the validator has to catch it at the output.
+    #[test]
+    fn echo_detected_for_observed_production_string() {
+        assert!(is_prompt_echo("Generate conversation title"));
+    }
+
+    #[test]
+    fn echo_detected_for_known_paraphrases() {
+        assert!(is_prompt_echo("Generate Very Short Conversation Title"));
+        assert!(is_prompt_echo("conversation title"));
+        assert!(is_prompt_echo("Conversation Title Preference Analysis"));
+        assert!(is_prompt_echo("Very Short Title For Conversation"));
+        assert!(is_prompt_echo("Generate a title (3-6 words)"));
+    }
+
+    /// The previous detector's failure mode was a bare "title" substring
+    /// rejecting legitimate titles like "Movie title brainstorming" — pin
+    /// those so the current detector cannot regress to that pattern.
+    #[test]
+    fn echo_not_detected_for_real_titles() {
+        assert!(!is_prompt_echo("Fix auth handshake bug"));
+        assert!(!is_prompt_echo("Family calendar event"));
+        assert!(!is_prompt_echo("Movie title brainstorming"));
+        assert!(!is_prompt_echo("Conversation analysis tips"));
+        assert!(!is_prompt_echo("Generated report for Q4"));
+        assert!(!is_prompt_echo("Release notes for v2.1"));
     }
 
     /// The user-facing message sent to the LLM must contain ONLY the

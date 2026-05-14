@@ -18,7 +18,7 @@ export interface ComposeDraft {
 
 /** Stable reference returned by `getDraft` when no entry exists, so renders
  *  that read-then-iterate can't accidentally write to the shared default. */
-export const EMPTY_DRAFT: ComposeDraft = Object.freeze({
+const EMPTY_DRAFT: ComposeDraft = Object.freeze({
   text: '',
   image_hashes: [],
   mode: null,

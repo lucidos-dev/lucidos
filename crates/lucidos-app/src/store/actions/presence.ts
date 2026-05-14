@@ -52,7 +52,7 @@ function syncPresence(): void {
   const threadId = focusedThreadId.value;
   if (!threadId) {
     // Nothing focused — if we previously reported focus, send an explicit unfocus.
-    if (lastReported?.focused && lastReported.threadId) {
+    if (lastReported?.focused) {
       postPresence(lastReported.threadId, false);
     }
     lastReported = null;

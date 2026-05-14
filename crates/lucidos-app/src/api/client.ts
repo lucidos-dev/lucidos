@@ -13,7 +13,7 @@ import type {
 } from './types';
 import type { AuthType, Notification, OAuthAccountInfo, PinnedAppEntry, App, TriggerRun, HistoricalTriggerInfo } from '../store/types';
 import type { RepoDiff, DiffFile } from '../store/store';
-import type { AnswerKind } from '../store/thread-events';
+import type { AnswerKind, PersistScope } from '../store/thread-events';
 import { lucidos } from '@lucidos/sdk';
 
 export const API_BASE = '';
@@ -704,7 +704,6 @@ export async function postAppCapture(
 }
 
 // --- MCP Consent ---
-import type { PersistScope } from '../store/thread-events';
 
 export async function postMcpConsent(
   requestId: string,
