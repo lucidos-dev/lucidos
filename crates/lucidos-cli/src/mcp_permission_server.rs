@@ -1,6 +1,6 @@
 //! MCP stdio server invoked by CC as `--permission-prompt-tool mcp__lucidos_perm__approve`.
 //! Forwards each permission request to the parent engine's
-//! `/api/internal/permission-prompt` endpoint and returns the user's decision
+//! `/api/v1/internal/permission-prompt` endpoint and returns the user's decision
 //! (or denial on timeout/error) as an MCP `text` content block.
 
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ pub fn run() -> Result<(), BoxError> {
     let workspace = resolve_from_env()?;
     let thread_id = std::env::var("LUCIDOS_THREAD_ID")
         .map_err(|_| "LUCIDOS_THREAD_ID env var required for permission-prompt server")?;
-    let endpoint = format!("{}/api/internal/permission-prompt", workspace.base_url());
+    let endpoint = format!("{}/api/v1/internal/permission-prompt", workspace.base_url());
 
     let client = permission_prompt_client()?;
 

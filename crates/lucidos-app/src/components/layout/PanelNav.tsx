@@ -11,9 +11,9 @@ export function HamburgerButton() {
   return (
     <button
       class={`icon-btn header-icon hamburger-panel${isOpen ? ' open' : ''}`}
-      onClick={() => {
+      onClick={(e) => {
         if (isOpen) closeDrawer();
-        else openDrawer();
+        else openDrawer(e.currentTarget as HTMLElement);
       }}
       aria-label={isOpen ? 'Close menu' : 'Open menu'}
       data-tooltip={isOpen ? 'Close menu' : 'Open menu'}

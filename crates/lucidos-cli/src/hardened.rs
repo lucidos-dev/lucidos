@@ -81,7 +81,7 @@ pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, Bo
 pub(crate) fn cmd_mark(ws: &Workspace) -> Result<(), BoxError> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
     let (repo_root, branch, head_sha) = git_context(&cwd)?;
-    let url = format!("{}/api/internal/mark-hardened", ws.base_url());
+    let url = format!("{}/api/v1/internal/mark-hardened", ws.base_url());
     let body = serde_json::json!({
         "repo_root": repo_root.to_string_lossy(),
         "branch_name": branch,
@@ -108,7 +108,7 @@ pub(crate) fn cmd_mark(ws: &Workspace) -> Result<(), BoxError> {
 pub(crate) fn query_state(ws: &Workspace) -> Result<HardenedState, BoxError> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
     let (repo_root, branch, _head_sha) = git_context(&cwd)?;
-    let url = format!("{}/api/internal/hardened-state", ws.base_url());
+    let url = format!("{}/api/v1/internal/hardened-state", ws.base_url());
     let resp = http_client()?
         .get(&url)
         .query(&[

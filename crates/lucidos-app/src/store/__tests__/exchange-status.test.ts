@@ -1,29 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
   exchangeStatus,
-  type Exchange,
   type StoredEvent,
-  type SequencedEvent,
 } from '../thread-events';
-
-/** Helper to build an Exchange from a user event + step events. */
-function makeExchange(
-  userEvent: StoredEvent,
-  steps: Array<{ seq: number; event: StoredEvent }> = [],
-): Exchange {
-  return {
-    userEvent,
-    userSeq: 0,
-    steps,
-  };
-}
+import { makeExchange, step } from './fixtures';
 
 function msg(text = 'hi'): StoredEvent {
   return { type: 'MessageReceived', text };
-}
-
-function step(seq: number, event: StoredEvent): SequencedEvent {
-  return { seq, event };
 }
 
 describe('exchangeStatus — full branch coverage', () => {
@@ -50,7 +33,7 @@ describe('exchangeStatus — full branch coverage', () => {
   // exchange and rendered as "⚙ System — Response interrupted" with a
   // misleading Continue panel. Now it emits `ResponseCanceled` (with the
   // user actor) so the exchange stays whole and reads "Canceled" — even
-  // when the cancel landed before the CC subprocess produced any output.
+  // when the cancel landed before the Claude Code subprocess produced any output.
   it('returns "canceled" for CC exchange canceled during startup (no SessionStarted yet)', () => {
     const exchange = makeExchange(msg(), [
       step(1, { type: 'ResponseCanceled' }),

@@ -21,6 +21,8 @@ pub struct HmacSignedLayer {
 }
 
 impl HmacSignedLayer {
+    // Plain field-by-field constructor; a builder would mirror the struct shape
+    // without simplifying anything at the proxy-pipeline construction site.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         namespace: String,

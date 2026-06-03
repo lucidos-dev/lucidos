@@ -154,7 +154,7 @@ describe('PanelOverlay discriminated union', () => {
 
     it('clears the saved trigger list scroll when a trigger form closes', () => {
       localStorage.setItem('lucidos-scroll-content-triggers', '500');
-      panelOverlay.value = { type: 'form', form: { type: 'trigger', taskId: 't1' } };
+      panelOverlay.value = { type: 'form', form: { type: 'trigger', triggerId: 't1' } };
 
       closeInlineForm();
 
@@ -229,7 +229,7 @@ describe('PanelOverlay discriminated union', () => {
 
 describe('overlaysEqual (via statesEqual)', () => {
   function makeNav(overlay: PanelOverlay = null): NavEntry {
-    return { menuItem: 'files' as const, settingsSubview: 'main' as const, overlay };
+    return { menuItem: 'files' as const, settingsSubview: 'main' as const, overlay, wipPreviewThreadId: null };
   }
 
   it('both null → equal', () => {

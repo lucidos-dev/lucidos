@@ -42,7 +42,7 @@ function seedStuckThread(suffix: string): { threadId: string } {
   const now = new Date().toISOString();
 
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count, cc_has_changes, cc_requires_restart, cc_is_external_repo) VALUES ('${threadId}', 'E2E Stuck No Changes ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'E2E Stuck No Changes ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, false, false, false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"test","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'ResponseGenerated', '{"text":"Done.","images":[]}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'CodingAgentIdled', '{"has_changes":false,"is_external_repo":false,"requires_restart":false}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
@@ -56,10 +56,10 @@ test.describe('CC stuck-in-waiting regression', () => {
     await assertHealthy(page);
     // Clean up stale waiting CC threads from previous tests to avoid
     // Done banners from old sessions interfering with these tests.
-    psql("UPDATE thread_summaries SET status = 'idle', archive_state = 'archived' WHERE status = 'waiting' AND is_cc = true");
+    psql("UPDATE thread_summaries SET status = 'idle', archive_state = 'archived' WHERE status = 'waiting' AND is_coding_agent = true");
   });
 
-  test('apply change moves thread from Review to History', async ({ page }) => {
+  test('apply change moves thread from Review to Archive', async ({ page }) => {
     const suffix = `apply-exits-review-${Date.now()}`;
     const { threadId, changeId, branch, file } = createCCThreadWithChange('E2E Stuck Waiting', suffix);
 
@@ -126,7 +126,7 @@ test.describe('CC stuck-in-waiting regression', () => {
     }
   });
 
-  test('applied thread stays in History after page reload', async ({ page }) => {
+  test('applied thread stays in Archive after page reload', async ({ page }) => {
     const suffix = `apply-survives-reload-${Date.now()}`;
     const { threadId, changeId, branch, file } = createCCThreadWithChange('E2E Stuck Waiting', suffix);
 

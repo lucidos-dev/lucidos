@@ -12,6 +12,10 @@ const FIX_INVOCATION_SQL: &str =
 const RENAME_TRIGGER_RUN_TEXT_TO_INTENT_SQL: &str =
     include_str!("../migrations/20260429213500_rename_trigger_run_text_to_intent.sql");
 
+const MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL: &str = include_str!(
+    "../migrations/20260516195912_migrate_trigger_on_to_subscription_list.sql"
+);
+
 /// Which payload field naming a `TriggerStarted` row uses.
 #[derive(Clone, Copy)]
 enum StartedShape {
@@ -358,6 +362,31 @@ async fn insert_event_with_payload(pool: &PgPool, event_type: &str, payload: Val
     id
 }
 
+/// `insert_event_with_payload` but with an explicit `created_offset_secs`
+/// relative to NOW (positive = older). Used by orphan-condition migration
+/// tests that need a TriggerUpdated row to land strictly after a
+/// TriggerCreated row regardless of test scheduling jitter.
+async fn insert_event_with_created_offset(
+    pool: &PgPool,
+    event_type: &str,
+    payload: Value,
+    created_offset_secs: i64,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO events (id, event_type, payload, created)
+           VALUES ($1, $2, $3, NOW() - make_interval(secs => $4))"#,
+    )
+    .bind(id)
+    .bind(event_type)
+    .bind(payload)
+    .bind(created_offset_secs as f64)
+    .execute(pool)
+    .await
+    .expect("insert event");
+    id
+}
+
 async fn run_payload_of(pool: &PgPool, event_id: Uuid) -> Value {
     sqlx::query_scalar::<_, Value>("SELECT payload->'run' FROM events WHERE id = $1")
         .bind(event_id)
@@ -532,6 +561,263 @@ async fn rename_trigger_run_text_to_intent_is_idempotent() {
     assert_eq!(
         run_payload_of(&pool, event_id).await,
         json!({ "type": "intent", "intent": "Original", "knowhow": [] }),
+        "running the migration multiple times must converge to the same result",
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+async fn on_payload_of(pool: &PgPool, event_id: Uuid) -> Value {
+    sqlx::query_scalar::<_, Value>(
+        "SELECT COALESCE(payload->'on', 'null'::jsonb) FROM events WHERE id = $1",
+    )
+    .bind(event_id)
+    .fetch_one(pool)
+    .await
+    .expect("read on payload")
+}
+
+async fn has_top_level_condition(pool: &PgPool, event_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT payload ? 'condition' FROM events WHERE id = $1")
+        .bind(event_id)
+        .fetch_one(pool)
+        .await
+        .expect("read condition presence")
+}
+
+#[tokio::test]
+async fn migrate_on_string_with_sibling_condition_becomes_one_entry_array() {
+    let (pool, db_name) = setup_test_db().await;
+
+    let event_id = insert_event_with_payload(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": "11111111-1111-1111-1111-111111111111",
+            "name": "Sleep nudge",
+            "on": "OuraSleepImported",
+            "condition": { "sleep_score": { "$lt": 70 } },
+        }),
+    )
+    .await;
+
+    sqlx::raw_sql(MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL)
+        .execute(&pool)
+        .await
+        .expect("run migration");
+
+    assert_eq!(
+        on_payload_of(&pool, event_id).await,
+        json!([{
+            "event_type": "OuraSleepImported",
+            "condition": { "sleep_score": { "$lt": 70 } }
+        }]),
+    );
+    assert!(
+        !has_top_level_condition(&pool, event_id).await,
+        "top-level condition key must be removed after migration"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn migrate_on_string_without_condition_becomes_one_entry_array_no_condition() {
+    let (pool, db_name) = setup_test_db().await;
+
+    let event_id = insert_event_with_payload(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": "22222222-2222-2222-2222-222222222222",
+            "name": "Simple event trigger",
+            "on": "EmailReceived",
+        }),
+    )
+    .await;
+
+    sqlx::raw_sql(MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL)
+        .execute(&pool)
+        .await
+        .expect("run migration");
+
+    assert_eq!(
+        on_payload_of(&pool, event_id).await,
+        json!([{ "event_type": "EmailReceived" }]),
+        "no sibling condition → entry omits condition (skip_serializing_if = Option::is_none)"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn migrate_already_array_shape_untouched() {
+    let (pool, db_name) = setup_test_db().await;
+
+    let canonical = json!([
+        { "event_type": "A", "condition": { "x": 1 } },
+        { "event_type": "B" }
+    ]);
+    let event_id = insert_event_with_payload(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": "33333333-3333-3333-3333-333333333333",
+            "name": "Already migrated",
+            "on": canonical.clone(),
+        }),
+    )
+    .await;
+
+    sqlx::raw_sql(MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL)
+        .execute(&pool)
+        .await
+        .expect("run migration");
+
+    assert_eq!(on_payload_of(&pool, event_id).await, canonical);
+
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn migrate_orphan_condition_update_folds_into_prior_single_subscription() {
+    let (pool, db_name) = setup_test_db().await;
+
+    let trigger_id = "44444444-4444-4444-4444-444444444444";
+
+    // Prior config in the legacy single-string shape — step 1 of the
+    // migration rewrites this into an array first.
+    let created_id = insert_event_with_created_offset(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": trigger_id,
+            "name": "Sleep nudge",
+            "on": "OuraSleepImported",
+        }),
+        60,
+    )
+    .await;
+
+    let orphan_update_id = insert_event_with_created_offset(
+        &pool,
+        "TriggerUpdated",
+        json!({
+            "trigger_id": trigger_id,
+            "condition": { "sleep_score": { "$lt": 70 } },
+        }),
+        30,
+    )
+    .await;
+
+    sqlx::raw_sql(MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL)
+        .execute(&pool)
+        .await
+        .expect("run migration");
+
+    assert_eq!(
+        on_payload_of(&pool, created_id).await,
+        json!([{ "event_type": "OuraSleepImported" }]),
+        "TriggerCreated with bare `on` string becomes a one-entry array",
+    );
+    assert_eq!(
+        on_payload_of(&pool, orphan_update_id).await,
+        json!([{
+            "event_type": "OuraSleepImported",
+            "condition": { "sleep_score": { "$lt": 70 } }
+        }]),
+        "Orphan condition-only update folds into the prior subscription's entry",
+    );
+    assert!(
+        !has_top_level_condition(&pool, orphan_update_id).await,
+        "orphan condition key must be gone after migration"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn migrate_orphan_condition_update_dropped_when_no_single_prior() {
+    // Prior config is multi-subscription, so the orphan condition can't be
+    // folded into one entry; the legacy reader silently ignored it for this
+    // shape too. Migration must drop the key without touching subscriptions.
+    let (pool, db_name) = setup_test_db().await;
+
+    let trigger_id = "55555555-5555-5555-5555-555555555555";
+
+    insert_event_with_created_offset(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": trigger_id,
+            "name": "Multi-sub",
+            "on": [
+                { "event_type": "A", "condition": { "a": 1 } },
+                { "event_type": "B", "condition": { "b": 2 } }
+            ],
+        }),
+        60,
+    )
+    .await;
+
+    let orphan_update_id = insert_event_with_created_offset(
+        &pool,
+        "TriggerUpdated",
+        json!({
+            "trigger_id": trigger_id,
+            "condition": { "stale": true },
+        }),
+        30,
+    )
+    .await;
+
+    sqlx::raw_sql(MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL)
+        .execute(&pool)
+        .await
+        .expect("run migration");
+
+    assert_eq!(
+        on_payload_of(&pool, orphan_update_id).await,
+        json!(null),
+        "orphan update without a foldable prior keeps its absent `on`",
+    );
+    assert!(
+        !has_top_level_condition(&pool, orphan_update_id).await,
+        "orphan condition key must be dropped even when not folded"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn migrate_on_to_subscription_list_is_idempotent() {
+    let (pool, db_name) = setup_test_db().await;
+
+    let event_id = insert_event_with_payload(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": "66666666-6666-6666-6666-666666666666",
+            "name": "Sleep nudge",
+            "on": "OuraSleepImported",
+            "condition": { "sleep_score": { "$lt": 70 } },
+        }),
+    )
+    .await;
+
+    for _ in 0..3 {
+        sqlx::raw_sql(MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL)
+            .execute(&pool)
+            .await
+            .expect("run migration");
+    }
+
+    assert_eq!(
+        on_payload_of(&pool, event_id).await,
+        json!([{
+            "event_type": "OuraSleepImported",
+            "condition": { "sleep_score": { "$lt": 70 } }
+        }]),
         "running the migration multiple times must converge to the same result",
     );
 

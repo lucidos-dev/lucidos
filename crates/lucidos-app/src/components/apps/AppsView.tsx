@@ -6,6 +6,7 @@ import {
   openEditApp,
 } from '../../store/actions/apps';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { LoadableError } from '../shared/LoadableError';
 import { AppRow } from './AppCard';
 
 export function AppsView() {
@@ -15,7 +16,7 @@ export function AppsView() {
     return (
       <div class="content-view active">
         <div class="list-rows">
-          <div class="empty-state error-text">Failed to load apps: {loadable.error}</div>
+          <LoadableError noun="apps" error={loadable.error} />
         </div>
       </div>
     );
@@ -41,7 +42,7 @@ export function AppsView() {
             app={app}
             onOpen={() => openApp(app)}
             onEdit={() => openEditApp(app.id)}
-            onDelete={() => confirmDeleteApp(app.id, app.name)}
+            onDelete={() => void confirmDeleteApp(app.id, app.name)}
           />
         ))}
         <div class="list-row-add-card" onClick={createNewApp}>

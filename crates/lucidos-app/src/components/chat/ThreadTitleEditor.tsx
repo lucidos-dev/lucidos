@@ -2,10 +2,26 @@ import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { renameThread, suggestTitle } from '../../api/threads';
 import { showToast } from '../../store/store';
 import { autoResizeTextarea } from '../../utils/dom';
+import { errorDetail } from '../../utils/errorDetail';
 
 interface Props {
   threadId: string;
   title: string;
+}
+
+/** Trim and validate a candidate rename. Returns the value to POST, or null
+ *  to skip. `isDirty` distinguishes "user typed something" from a pure-blur
+ *  no-op — without it, a blur after a mid-edit ThreadTitleGenerated would
+ *  POST the stale editValueRef.current (still holding the pre-SSE title)
+ *  back to /api/v1/threads/rename and overwrite the new title. */
+export function normalizeRename(
+  newValue: string,
+  currentTitle: string,
+  isDirty: boolean,
+): string | null {
+  const trimmed = newValue.trim();
+  if (!isDirty || !trimmed || trimmed === currentTitle) return null;
+  return trimmed;
 }
 
 export function ThreadTitleEditor({ threadId, title }: Props) {
@@ -21,6 +37,10 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
   // onBlur reads this synchronously to avoid stale-closure / async-batching
   // issues with editValue.
   const editValueRef = useRef(title);
+  // Set on first onInput, cleared on startEditing/Escape. save() consults it
+  // so a blur fired after the user opened the editor without typing — common
+  // when the title prop just changed via SSE — short-circuits before POSTing.
+  const dirtyRef = useRef(false);
 
   useEffect(() => {
     if (!editing) setEditValue(title);
@@ -76,6 +96,7 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
     setSuggesting(true);
     setEditValue(title);
     editValueRef.current = title;
+    dirtyRef.current = false;
     setEditing(true);
     inputRef.current?.focus();
     inputRef.current?.select();
@@ -93,16 +114,16 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
     if (savingRef.current) return;
     savingRef.current = true;
     try {
-      const trimmed = newTitle.trim();
-      if (!trimmed || trimmed === title) {
+      const next = normalizeRename(newTitle, title, dirtyRef.current);
+      if (next === null) {
         setEditing(false);
         return;
       }
       try {
-        await renameThread(threadId, trimmed);
+        await renameThread(threadId, next);
         setEditing(false);
-      } catch {
-        showToast('Failed to rename thread', 'error');
+      } catch (err) {
+        showToast(`Failed to rename thread: ${errorDetail(err)}`, 'error');
       }
     } finally {
       savingRef.current = false;
@@ -112,17 +133,23 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      save(editValueRef.current);
+      void save(editValueRef.current);
     } else if (e.key === 'Escape') {
+      // Cancel. With data-escape-self, the central Escape policy leaves this
+      // input focused so this target-phase handler runs and reverts the edit.
+      // editValueRef is reset to the original title too, so a blur that races
+      // this (focus leaving as the editor closes) normalizes to a no-op save.
       e.preventDefault();
-      // Reset the ref so the blur-fired save becomes a no-op (trimmed === title).
+      dirtyRef.current = false;
       editValueRef.current = title;
       setEditing(false);
     }
   }, [save, title]);
 
   const acceptSuggestion = useCallback(() => {
-    if (suggestion) save(suggestion);
+    if (!suggestion) return;
+    dirtyRef.current = true;
+    void save(suggestion);
   }, [suggestion, save]);
 
   return (
@@ -147,9 +174,15 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
           const value = (e.target as HTMLInputElement).value;
           setEditValue(value);
           editValueRef.current = value;
+          dirtyRef.current = true;
         }}
         onKeyDown={handleKeyDown}
-        onBlur={editing ? () => save(editValueRef.current) : undefined}
+        onBlur={editing ? () => void save(editValueRef.current) : undefined}
+        // Opt out of the global "Esc defocuses" gesture (dispatchEscape): a
+        // blur here commits the rename, so letting the central policy blur on
+        // Escape would SAVE instead of cancel. With this marker, focus stays
+        // put and handleKeyDown's Escape branch reverts the edit.
+        data-escape-self
         tabIndex={editing ? 0 : -1}
       />
       {editing && (

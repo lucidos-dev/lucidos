@@ -21,7 +21,7 @@ async function setupIdleCCThread(page: Page) {
 async function mockActiveSession(page: Page) {
   let modelOverride: string | null = null;
 
-  await page.route('**/api/claude-code/commands*', async (route) => {
+  await page.route('**/api/v1/claude-code/commands*', async (route) => {
     const response = await route.fetch();
     const body = await response.json();
     body.has_active_session = true;
@@ -35,7 +35,7 @@ async function mockActiveSession(page: Page) {
     });
   });
 
-  await page.route('**/api/claude-code/control', async (route) => {
+  await page.route('**/api/v1/claude-code/control', async (route) => {
     const postData = route.request().postDataJSON();
     if (postData?.request?.subtype === 'set_model') {
       modelOverride = postData.request.model;

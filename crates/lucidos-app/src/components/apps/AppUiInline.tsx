@@ -1,5 +1,5 @@
 import { useRef, useLayoutEffect, useState } from 'preact/hooks';
-import { currentApp, appPseudoFullscreen, appRefreshKey } from '../../store/store';
+import { currentApp, appPseudoFullscreen, appRefreshKey, showToast } from '../../store/store';
 import { getAppFrameSrc, exitPseudoFullscreen } from '../../store/actions/apps';
 import { ExitFullscreenIcon } from '../shared/icons';
 import { viewportIsMobile } from '../../utils/viewport';
@@ -28,7 +28,14 @@ function AppFrame({ src, refreshing }: { src: string; refreshing: boolean }) {
     const iframe = iframeRef.current;
     if (!iframe) return;
     if (lastSrcRef.current === src) return;
-    navigateAppIframe(iframe, src);
+    // Skip lastSrcRef update on failure so the next render retries against a
+    // freshly-mounted iframe rather than thinking the URL is already in place.
+    // Stable key dedups the toast across rapid app switches that re-fire the
+    // effect against a still-detaching iframe — one error sticks instead of N.
+    if (!navigateAppIframe(iframe, src)) {
+      showToast('Failed to navigate app frame: iframe has no browsing context', 'error', { key: 'app-iframe-nav-failed' });
+      return;
+    }
     lastSrcRef.current = src;
   }, [src]);
 

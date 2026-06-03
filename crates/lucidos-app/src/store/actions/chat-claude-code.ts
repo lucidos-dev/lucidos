@@ -5,7 +5,8 @@ import {
   discardingCCThreadIds,
   changes,
 } from '../store';
-import { applyNow, applyChange, answerCCQuestion as apiAnswerCCQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
+import { loadedOr } from '../types';
+import { applyNow, applyChange, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
 import type { AnswerKind } from '../thread-events';
 import { scrollToBottom } from '../../components/chat/scrollState';
 import { changeToastMessage } from './thread-sync';
@@ -39,7 +40,9 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
     await applyNow(threadId);
   } catch (e) {
     if (e instanceof ApiError && e.httpCode === 409) {
-      showToast('Already applying', 'info', { spinning: true });
+      // Re-key under the existing applying toast so the new info replaces the
+      // initial spinner instead of stacking a second one beside it.
+      showToast('Already applying', 'info', { key: `applying-${threadId}`, spinning: true });
       // Don't clear immediately — apply is genuinely in progress on the backend.
       // Safety timeout: if no SSE resolution event (ChangeApplied/ChangeApplyFailed)
       // arrives within 60s (e.g., SSE reconnection gap), clear the stuck state.
@@ -54,8 +57,12 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
       return;
     }
     if (e instanceof ApiError && e.httpCode === 404) {
-      // No live CC session — fall back to applying pending changes directly
-      const pending = changes.value.filter(c => c.thread_id === threadId && c.status === 'pending');
+      // No live Claude Code session — fall back to applying pending changes directly.
+      // `loadedOr([])` treats not-loaded / loading / failed as "no rows to act
+      // on"; the follow-up SSE refresh will re-render with the right state.
+      const pending = loadedOr(changes.value, []).filter(
+        c => c.thread_id === threadId && c.status === 'pending',
+      );
       if (pending.length > 0) {
         try {
           for (const c of pending) {
@@ -103,9 +110,13 @@ export async function handleDiscardCCChanges(threadId: string): Promise<void> {
   }
 }
 
-/** Answer a CC `AskUserQuestion`. Returns true on success, false on 409
- *  (stale or duplicate). Toasts and re-throws on other errors. */
-export async function answerCCQuestion(
+/** Answer a pending question card on a thread. Returns true on success,
+ *  false on 409 (stale or duplicate). Toasts and returns false on other
+ *  errors — callers branch on the boolean, none rely on a throw.
+ *  Used for both CC's `AskUserQuestion` and the chat agent's
+ *  `ask_user_question` — the QuestionCard component is agent-agnostic and
+ *  the backend dispatches on the originating event's channel. */
+export async function answerThreadQuestion(
   threadId: string,
   toolUseId: string,
   answer: AnswerKind,
@@ -115,7 +126,7 @@ export async function answerCCQuestion(
   // scrolledUp=true and the streaming continuation never auto-scrolls.
   scrollToBottom();
   try {
-    return await apiAnswerCCQuestion(threadId, toolUseId, answer);
+    return await apiAnswerThreadQuestion(threadId, toolUseId, answer);
   } catch (err) {
     const detail = err instanceof ApiError ? err.reason : 'unknown error';
     showToast(`Failed to send answer: ${detail}`, 'error');

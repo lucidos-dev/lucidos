@@ -27,16 +27,19 @@ function buildThreadState(events: ThreadEvent[]): ThreadState {
     createdAt: '2026-01-01T00:00:00Z',
     updatedAt: '2026-01-01T00:00:00Z',
     status: 'waiting_for_user_answer',
-    ccHasChanges: false,
-    ccRequiresRestart: false,
-    ccIsExternalRepo: false,
-    ccApplying: false,
+    codingAgentProposed: false,
+    codingAgentRequiresRestart: false,
+    codingAgentIsExternalRepo: false,
+    codingAgentApplying: false,
+    codingAgentHasDiff: false,
     lastRevivedAt: '',
     messageCount: 1,
     section: 'archived',
     activeChildrenCount: 0,
     totalChildrenCount: 0,
+    blockingDescendantCount: 0, attentionDescendantCount: 0,
     state: 'active',
+    latestTodoList: null,
   };
   return { meta, events: map, streamingBuffer: '', eventsLoaded: true, eventsLoadFailed: false, lastDbSeq: events.length, pendingUserMessages: [] };
 }

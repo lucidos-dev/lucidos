@@ -49,6 +49,18 @@ test.describe('App iframe mount — single fetch on open', () => {
     fixture.cleanup();
   });
 
+  // Seed `app-window-open` in localStorage BEFORE navigation; loadApps()'s
+  // restore branch (apps.ts) then sets panelOverlay to {type:'app-ui',app:…}
+  // on boot, mounting the iframe via AppUiInline. There is no `?app=<id>`
+  // URL parameter — app deep-linking goes through the structured `tap` flow
+  // (notification-deeplink.ts) which requires a notification id, so the
+  // restore path is the cleanest hook to exercise the real mount path.
+  async function openAppOnLoad(page: import('@playwright/test').Page): Promise<void> {
+    await page.addInitScript((id) => {
+      localStorage.setItem('app-window-open', id);
+    }, APP_ID);
+  }
+
   test('opening an app via deep-link triggers exactly one sdk-prefs.js fetch from the iframe', async ({ page }) => {
     // Bucket requests by the document that initiated them. The parent's
     // FOUC fetch and the iframe's theme fetch both hit the same URL — only
@@ -60,10 +72,11 @@ test.describe('App iframe mount — single fetch on open', () => {
       fetchesByFrame.set(frameUrl, (fetchesByFrame.get(frameUrl) ?? 0) + 1);
     });
 
-    // Deep-link flow opens the app via openAppById, which mounts the iframe
-    // in both desktop and mobile layouts. The user only sees one — the
-    // hidden one is wasted bandwidth + a duplicate device-scoped fetch.
-    await page.goto(`/?app=${APP_ID}`);
+    // Restore-on-load mounts the iframe via the active layout only — the
+    // mount-discipline bug this test guards against is the inactive layout
+    // also creating an iframe and double-fetching sdk-prefs.js.
+    await openAppOnLoad(page);
+    await page.goto('/');
 
     const iframeLoc = page.locator('iframe[data-role="app-ui-frame"]:visible');
     await expect(iframeLoc).toBeVisible({ timeout: 10_000 });
@@ -82,7 +95,8 @@ test.describe('App iframe mount — single fetch on open', () => {
   });
 
   test('opening an app via deep-link mounts exactly one app iframe', async ({ page }) => {
-    await page.goto(`/?app=${APP_ID}`);
+    await openAppOnLoad(page);
+    await page.goto('/');
     await expect(
       page.locator('iframe[data-role="app-ui-frame"]:visible'),
     ).toBeVisible({ timeout: 10_000 });

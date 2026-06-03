@@ -1,5 +1,17 @@
 import { marked } from 'marked';
+import type { Tokens } from 'marked';
 import { COPY_ICON, escapeHtmlAttr } from './markedConfig';
+
+// Inline renderer for renderMarkdownInline — overrides `link` to drop the
+// <a> wrapper while preserving any nested inline markdown (e.g. **bold**
+// inside link text). Two reasons: (1) the helper's outputs nest inside
+// <button>, where <a> is an invalid interactive-in-interactive descendant;
+// (2) discarding href also neutralizes javascript:-scheme URLs from LLM-
+// supplied text.
+const inlineLinkStripRenderer = new marked.Renderer();
+inlineLinkStripRenderer.link = function({ tokens }: Tokens.Link): string {
+  return this.parser.parseInline(tokens);
+};
 
 // Unique marker prefix for copy block boundaries (survives marked processing)
 const COPY_MARKER = 'LUCIDOS_COPY_BLOCK';
@@ -105,4 +117,23 @@ export function renderMarkdown(md: string): string {
     }
   );
   return html;
+}
+
+/** Phrasing-content-only variant of renderMarkdown — wraps `marked.parseInline`
+ *  so the output is safe to nest inside elements that forbid flow content
+ *  *or interactive descendants* (e.g. `<button>` or `<span>`). Inline markdown
+ *  (bold, italic, code, soft breaks) renders; block constructs (paragraphs,
+ *  lists, code fences, tables) appear as their literal source text; markdown
+ *  links render as their label text only — see `inlineLinkStripRenderer`.
+ *  Use this for short LLM-supplied snippets like AskUserQuestion option
+ *  descriptions.
+ *
+ *  `breaks: true` is passed locally so a future edit to markedConfig.ts's
+ *  global options can't silently turn newlines back into spaces. */
+export function renderMarkdownInline(md: string): string {
+  return (marked.parseInline(md, {
+    async: false,
+    breaks: true,
+    renderer: inlineLinkStripRenderer,
+  }) as string).replace(DANGEROUS_TAG, (match) => escapeHtmlAttr(match));
 }

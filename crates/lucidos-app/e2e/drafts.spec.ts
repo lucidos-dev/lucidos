@@ -45,6 +45,18 @@ async function clickThreadNav(page: Page, ariaLabel: 'Previous thread' | 'Next t
   }
 }
 
+/** Click "Discard draft" and accept the confirm. Discarding an unsent draft is
+ *  destructive, so the confirm is tied to the ACTION — it now appears whether
+ *  the discard is triggered by this button or by the close-cascade shortcut. */
+async function discardDraftViaButton(page: Page): Promise<void> {
+  if (!await clickVisibleElement(page, 'button[aria-label="Discard draft"]')) {
+    throw new Error('Discard button not visible');
+  }
+  const ok = page.locator('.confirm-dialog .confirm-btn-ok:visible').first();
+  await expect(ok).toBeVisible({ timeout: 5_000 });
+  await ok.click();
+}
+
 test.describe('Per-thread drafts', () => {
   test.beforeEach(async ({ page }) => {
     clearAllThreads();
@@ -139,8 +151,7 @@ test.describe('Per-thread drafts', () => {
     // skipped that entry and jumped to whatever was navigated before it.
     const { promptInput, activeId } = await startThreadThenCompose(page, 'discard-back', 'soon to be discarded');
 
-    const didClick = await clickVisibleElement(page, 'button[aria-label="Discard draft"]');
-    if (!didClick) throw new Error('Discard button not visible');
+    await discardDraftViaButton(page);
     const cleared = await waitForVisibleInput(page);
     await expect(cleared).toHaveValue('', { timeout: 5_000 });
 
@@ -148,6 +159,23 @@ test.describe('Per-thread drafts', () => {
     await expect(back).toBeEnabled({ timeout: 5_000 });
     await back.click();
     await expect(promptInput).toHaveAttribute('data-thread-id', activeId, { timeout: 5_000 });
+  });
+
+  test('Discard draft can be canceled — the draft survives the confirm', async ({ page }) => {
+    // The confirm lives on the action, so it appears for the button too;
+    // canceling it must leave the typed draft exactly as it was.
+    await startThreadThenCompose(page, 'discard-cancel', 'keep this draft');
+
+    if (!await clickVisibleElement(page, 'button[aria-label="Discard draft"]')) {
+      throw new Error('Discard button not visible');
+    }
+    const cancel = page.locator('.confirm-dialog .confirm-btn-cancel:visible').first();
+    await expect(cancel).toBeVisible({ timeout: 5_000 });
+    await cancel.click();
+
+    // Draft text is untouched.
+    const stillThere = await waitForVisibleInput(page);
+    await expect(stillThere).toHaveValue('keep this draft', { timeout: 5_000 });
   });
 
   test('existing thread → New → type → Back lands on the existing thread, Forward returns to the draft', async ({ page }) => {
@@ -312,9 +340,8 @@ test.describe('Per-thread drafts', () => {
     const restored = await waitForVisibleInput(page);
     await expect(restored).toHaveValue('about to be discarded', { timeout: 5_000 });
 
-    // Click Discard
-    const didClick = await clickVisibleElement(page, 'button[aria-label="Discard draft"]');
-    if (!didClick) throw new Error('Discard button not visible');
+    // Click Discard and accept the confirm
+    await discardDraftViaButton(page);
 
     // Textarea is empty
     const cleared = await waitForVisibleInput(page);
@@ -341,11 +368,11 @@ test.describe('Per-thread drafts', () => {
     const discardBtn = page.locator('button[aria-label="Discard draft"]:visible');
     await expect(discardBtn).toHaveCount(1);
 
-    // Click Discard — for an active thread, clears the in-progress text/images but
-    // keeps the thread intact. Must not attempt to delete the thread server-side
-    // (which would 409 with "thread is active — use archive instead").
-    const didClick = await clickVisibleElement(page, 'button[aria-label="Discard draft"]');
-    if (!didClick) throw new Error('Discard button not visible');
+    // Click Discard (and accept the confirm) — for an active thread, clears the
+    // in-progress text/images but keeps the thread intact. Must not attempt to
+    // delete the thread server-side (which would 409 with "thread is active —
+    // use archive instead").
+    await discardDraftViaButton(page);
 
     const cleared = await waitForVisibleInput(page);
     await expect(cleared).toHaveValue('', { timeout: 5_000 });

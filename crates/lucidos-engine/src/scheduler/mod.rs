@@ -12,6 +12,8 @@
 
 pub mod notifications;
 pub mod push;
+#[cfg(feature = "e2e-test-hooks")]
+pub mod push_test_log;
 #[cfg(test)]
 mod tasks;
 pub mod user_tasks;
@@ -21,7 +23,10 @@ pub use push::{PushSubscription, PushSubscriptionStore};
 
 use crate::api::SharedEngine;
 use crate::core::PreferenceStore;
-use crate::triggers::{replay_trigger_events, TriggerConfig, TriggerEventRow, TriggerRun};
+use crate::triggers::{
+    replay_trigger_events, replay_trigger_group_events, TriggerConfig, TriggerEventRow,
+    TriggerGroup, TriggerGroupEventRow, TriggerRun,
+};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -32,10 +37,19 @@ use tokio_cron_scheduler::{Job, JobScheduler};
 /// Grace period for missed task execution (applies to both startup catch-up and late wake)
 const MISSED_TASK_GRACE_MINUTES: i64 = 60;
 
-/// Namespace UUID for deriving trigger UUIDs via v5 (SHA-1).
+/// Days of `last_seen_at` inactivity after which a push-enabled device gets
+/// auto-disabled. Tuned to skip biweekly-use devices while catching obvious
+/// PWA-reinstall ghosts.
+const STALE_DEVICE_DAYS: i64 = 30;
+
+/// Namespace UUID for deriving trigger UUIDs via v5 (SHA-1). The byte
+/// sequence spells the historical "cognos-trigger-n" — DO NOT change it;
+/// the bytes are part of the v5 hash input, so every trigger UUID derived
+/// from a `trigger_id` string depends on this exact namespace. Renaming the
+/// product to Lucidos doesn't get to invalidate persisted trigger ids.
 const TRIGGER_UUID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
     0x63, 0x6f, 0x67, 0x6e, 0x6f, 0x73, 0x2d, 0x74, 0x72, 0x69, 0x67, 0x67, 0x65, 0x72, 0x2d, 0x6e,
-]); // "lucidos-trigger-n"
+]); // "cognos-trigger-n" — frozen for v5 namespace stability; see doc above.
 
 /// Derive a deterministic UUID from a trigger ID string (uuid v5 / SHA-1).
 pub(crate) fn trigger_id_to_uuid(trigger_id: &str) -> uuid::Uuid {
@@ -61,6 +75,10 @@ pub struct SchedulerManager {
     /// up-to-date via EventBus subscription. Source of truth for trigger
     /// listing — replaces DB queries to trigger_crons table.
     trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
+    /// In-memory trigger groups, rebuilt from events on startup and kept
+    /// up-to-date via EventBus subscription. Source of truth for the panel's
+    /// "Group" sections.
+    trigger_groups: Arc<std::sync::RwLock<HashMap<String, TriggerGroup>>>,
 }
 
 impl SchedulerManager {
@@ -80,6 +98,7 @@ impl SchedulerManager {
 
         // Share the same trigger_configs Arc as the engine
         let trigger_configs = engine.trigger_configs.clone();
+        let trigger_groups = engine.trigger_groups.clone();
 
         Ok(Self {
             scheduler,
@@ -89,6 +108,7 @@ impl SchedulerManager {
             backup_job_id: None,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             trigger_configs,
+            trigger_groups,
         })
     }
 
@@ -98,20 +118,21 @@ impl SchedulerManager {
         self.register_system_tasks().await?;
 
         // Migrate legacy trigger_crons table to events (idempotent)
-        self.migrate_db_triggers_to_events().await;
+        self.migrate_db_triggers_to_events().await?;
 
         // Replay trigger lifecycle events to rebuild in-memory state
         self.replay_triggers_from_events().await;
+
+        // Replay trigger-group lifecycle events into the parallel registry.
+        // Groups don't schedule anything, but the panel reads this registry to
+        // render the collapsible sections.
+        self.replay_trigger_groups_from_events().await;
 
         // Fix stale placeholder trigger prompts (one-time, idempotent)
         self.migrate_stale_trigger_prompts().await;
 
         // Register all enabled triggers from in-memory state
         self.register_triggers_from_configs().await?;
-
-        // Seed default triggers shipped with the engine (idempotent — uses a
-        // fixed marker preference so we never re-seed once the user deletes them).
-        self.seed_default_triggers().await;
 
         // Subscribe to EventBus for live trigger CRUD updates
         self.start_trigger_event_subscriber();
@@ -150,13 +171,52 @@ impl SchedulerManager {
         self.scheduler.add(health_job).await?;
         log!("[Scheduler] Registered system task: task_health_monitor");
 
+        // Daily 3am local: disable push on devices not seen in 30 days. Catches
+        // phantom subscriptions left behind by PWA reinstalls whose Apple/Google
+        // endpoint never returned 410 (so the per-fan-out 410 cleanup never ran).
+        // Disable-not-delete: zero data loss, fully reversible from Settings, no
+        // event spam beyond one DevicePushChanged per actually-flipped row.
+        let engine_prune = self.engine.clone();
+        let pool_prune = self.pool.clone();
+        let prune_job = Job::new_async("0 0 3 * * *", move |_uuid, _lock| {
+            let engine = engine_prune.clone();
+            let pool = pool_prune.clone();
+            Box::pin(async move {
+                disable_push_on_stale_devices(engine, pool, STALE_DEVICE_DAYS).await;
+            })
+        })?;
+        self.scheduler.add(prune_job).await?;
+        log!("[Scheduler] Registered system task: disable_push_on_stale_devices (daily 3am, >{}d)", STALE_DEVICE_DAYS);
+
+        // Also run once at startup so accumulated stale rows get caught
+        // immediately after deploy without waiting for the first 3am tick.
+        // Awaited inline (not spawned) so a shutdown mid-prune can't emit
+        // DevicePushChanged events into a tearing-down EventBus — the work
+        // is bounded (one SELECT plus one UPDATE per stale row).
+        disable_push_on_stale_devices(self.engine.clone(), self.pool.clone(), STALE_DEVICE_DAYS)
+            .await;
+
         Ok(())
     }
 
     /// Migrate legacy `trigger_crons` table rows to event-sourced TriggerCreated events.
     /// Idempotent: skips if trigger events already exist or the table does not exist.
     /// After successful migration, drops the legacy table.
-    async fn migrate_db_triggers_to_events(&self) {
+    ///
+    /// Per-query errors propagate so a DB failure aborts startup loudly
+    /// instead of leaving the legacy table in place with no events emitted.
+    ///
+    /// DEPRECATED — landed 2026-04-06 (commit 02515f4d9). Dead-on-arrival for any
+    /// install created after that date (the `trigger_crons` table never exists).
+    /// Removal blocked on confirming every live install has started up at least
+    /// once since the migration shipped; once verified, drop this function, its
+    /// call site in `start()`, and the `ScheduledTrigger*` event aliases in
+    /// `triggers/replay.rs`. Safe target: drop after the next major release that
+    /// requires a fresh install (or after telemetry confirms zero workspaces
+    /// retain the legacy table).
+    async fn migrate_db_triggers_to_events(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         async fn drop_legacy_trigger_crons(pool: &PgPool) {
             if let Err(e) = sqlx::query("DROP TABLE IF EXISTS trigger_crons")
                 .execute(pool)
@@ -179,11 +239,10 @@ impl SchedulerManager {
             )",
         )
         .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        .await?;
 
         if !table_exists {
-            return;
+            return Ok(());
         }
 
         // Check if TriggerCreated events already exist (idempotency)
@@ -191,12 +250,11 @@ impl SchedulerManager {
             "SELECT COUNT(*) FROM events WHERE event_type = 'TriggerCreated' AND aggregate = 'trigger'"
         )
         .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+        .await?;
 
         if event_count > 0 {
             drop_legacy_trigger_crons(&self.pool).await;
-            return;
+            return Ok(());
         }
 
         // Read all rows from legacy table
@@ -204,15 +262,11 @@ impl SchedulerManager {
             "SELECT id, name, skill_id, args, cron_expressions, timezone, enabled, last_run FROM trigger_crons ORDER BY created_at ASC"
         )
         .fetch_all(&self.pool)
-        .await
-        .unwrap_or_else(|e| {
-            log!("[Scheduler] Failed to read trigger_crons for migration: {}", e);
-            vec![]
-        });
+        .await?;
 
         if rows.is_empty() {
             drop_legacy_trigger_crons(&self.pool).await;
-            return;
+            return Ok(());
         }
 
         let count = rows.len();
@@ -277,6 +331,7 @@ impl SchedulerManager {
         {
             log!("[Scheduler] Failed to drop trigger_crons table: {}", e);
         }
+        Ok(())
     }
 
     /// Replay trigger lifecycle events from the events table to rebuild in-memory state.
@@ -322,6 +377,47 @@ impl SchedulerManager {
         }
     }
 
+    /// Replay trigger-group lifecycle events from the events table to rebuild
+    /// the in-memory registry. Symmetric with `replay_triggers_from_events`.
+    async fn replay_trigger_groups_from_events(&self) {
+        let rows = sqlx::query_as::<_, (String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
+            "SELECT event_type, payload, created FROM events
+             WHERE aggregate = 'trigger_group'
+             ORDER BY sequence ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            log!("[Scheduler] Failed to replay trigger_group events: {}", e);
+            vec![]
+        });
+
+        let event_rows: Vec<TriggerGroupEventRow> = rows
+            .into_iter()
+            .map(|(event_type, payload, created)| TriggerGroupEventRow {
+                event_type,
+                payload,
+                created,
+            })
+            .collect();
+
+        let count = event_rows.len();
+        let groups = replay_trigger_group_events(event_rows);
+        let total = groups.len();
+        {
+            let mut g = self.trigger_groups.write().unwrap();
+            *g = groups;
+        }
+
+        if count > 0 {
+            log!(
+                "[Scheduler] Replayed {} trigger_group events → {} groups",
+                count,
+                total
+            );
+        }
+    }
+
     /// Migrate triggers whose prompt text is a stale placeholder like `"Run trigger ..."` or `"Run skill ..."`.
     ///
     /// The legacy DB migration set all trigger prompts to a placeholder which is
@@ -329,6 +425,13 @@ impl SchedulerManager {
     /// the trigger's display name to prompt file frontmatter names.
     ///
     /// Idempotent: only matches triggers whose text starts with `"Run skill "` or `"Run trigger "`.
+    ///
+    /// DEPRECATED — landed 2026-04-07 (commit d32b2a518). Dead-on-arrival for any
+    /// install created after that date (no triggers ever carry the stale placeholder).
+    /// Removal blocked on confirming every live install has started up at least
+    /// once since the fix shipped. Safe to drop together with
+    /// `migrate_db_triggers_to_events` once telemetry confirms zero workspaces
+    /// still hold the placeholder prompts.
     async fn migrate_stale_trigger_prompts(&self) {
         use crate::engine::event_bus::{BusEvent, SystemEvent};
 
@@ -484,6 +587,7 @@ impl SchedulerManager {
     fn start_trigger_event_subscriber(&self) {
         let mut rx = self.engine.event_bus.subscribe();
         let trigger_configs = self.trigger_configs.clone();
+        let trigger_groups = self.trigger_groups.clone();
         let tracked_tasks = self.tracked_tasks.clone();
         let engine = self.engine.clone();
         let pool = self.pool.clone();
@@ -537,6 +641,25 @@ impl SchedulerManager {
                                     )
                                     .await;
                                 }
+                                SystemEvent::TriggerGroupCreated {
+                                    group_id, payload, ..
+                                }
+                                | SystemEvent::TriggerGroupRenamed {
+                                    group_id, payload, ..
+                                }
+                                | SystemEvent::TriggerGroupReordered {
+                                    group_id, payload, ..
+                                }
+                                | SystemEvent::TriggerGroupDeleted {
+                                    group_id, payload, ..
+                                } => {
+                                    handle_trigger_group_event(
+                                        se.event_type(),
+                                        group_id,
+                                        payload,
+                                        &trigger_groups,
+                                    );
+                                }
                                 SystemEvent::DomainEvent {
                                     event_type,
                                     payload,
@@ -558,20 +681,21 @@ impl SchedulerManager {
                                 _ => {}
                             }
                         }
-                        // Allow a curated subset of ThreadEvents to fire triggers.
-                        // Today only `UserQuestionAsked` is in the allowlist (consumed
-                        // by the seeded push-notification trigger). Adding more events
-                        // here is the explicit opt-in needed to avoid every CC tool
-                        // call invoking the trigger matcher.
+                        // Forward ThreadEvents to the trigger matcher unless they
+                        // are per-token streaming (see
+                        // `ThreadEvent::is_per_token_streaming`). Blocklist
+                        // semantics — a workspace can `on_event:` any persisted
+                        // ThreadEvent by default; new lifecycle and per-action
+                        // variants are triggerable automatically. High-cardinality
+                        // per-action variants (ToolCalled, CodingAgentToolCalled, …)
+                        // flow through; workspaces scope them with `condition:`
+                        // filters.
                         if let crate::engine::event_bus::BusEvent::Thread {
                             thread_id, event, ..
                         } = &emitted.typed
                         {
                             use crate::engine::thread_events::EventMeta;
-                            if matches!(
-                                event,
-                                crate::engine::thread_events::ThreadEvent::UserQuestionAsked { .. }
-                            ) {
+                            if !event.is_per_token_streaming() {
                                 let payload = event.to_payload(&EventMeta::NONE);
                                 handle_domain_event(
                                     event.event_type(),
@@ -597,102 +721,6 @@ impl SchedulerManager {
                 }
             }
         });
-    }
-
-    /// Default triggers ship with a fresh workspace. Each marker is recorded
-    /// in the `preferences` table so deletion sticks (re-seeding never
-    /// resurrects a trigger the user removed).
-    async fn seed_default_triggers(&self) {
-        use crate::engine::event_bus::{BusEvent, SystemEvent};
-
-        const SEED_MARKER_PREFIX: &str = "seeded_trigger:";
-
-        // (marker_id, name, on_event, intent_text)
-        // Marker ids are stable identifiers; never change once shipped.
-        const DEFAULTS: &[(&str, &str, &str, &str)] = &[(
-            "cc-question-push",
-            "Notify on Claude question",
-            "UserQuestionAsked",
-            // The triggering event payload arrives appended to the user
-            // message under a `## Triggering Event` JSON block (built by
-            // `build_trigger_user_message`) — instruct the LLM to read the
-            // `question` field from there rather than relying on template
-            // substitution (none exists in the engine).
-            "Send a push notification. Use 'Claude is asking' as the title \
-                 and the value of the triggering event's `question` field as the message.",
-        )];
-
-        let mut timezone: Option<String> = None;
-        for (marker_id, name, on_event, intent_text) in DEFAULTS {
-            let pref_key = format!("{}{}", SEED_MARKER_PREFIX, marker_id);
-            let already_seeded = PreferenceStore::get(&self.pool, &pref_key)
-                .await
-                .ok()
-                .flatten()
-                .is_some();
-            if already_seeded {
-                continue;
-            }
-
-            // Read timezone lazily on the first defaulted trigger we actually seed.
-            let tz = match &timezone {
-                Some(t) => t.clone(),
-                None => {
-                    let t = PreferenceStore::get(&self.pool, "timezone")
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| "UTC".to_string());
-                    timezone = Some(t.clone());
-                    t
-                }
-            };
-            let trigger_id_str = uuid::Uuid::new_v4().to_string();
-            let payload = serde_json::json!({
-                "trigger_id": trigger_id_str,
-                "name": name,
-                "schedule": Vec::<String>::new(),
-                "timezone": tz,
-                "on": on_event,
-                "run": serde_json::to_value(TriggerRun::Intent {
-                    intent: intent_text.to_string(),
-                }).unwrap(),
-            });
-
-            if let Err(e) = self
-                .engine
-                .event_bus
-                .emit(BusEvent::System(SystemEvent::TriggerCreated {
-                    trigger_id: trigger_id_str.clone(),
-                    payload,
-                    actor: None,
-                }))
-                .await
-            {
-                log!(
-                    "[Scheduler] Failed to seed default trigger '{}': {}",
-                    marker_id,
-                    e
-                );
-                continue;
-            }
-            if let Err(e) = PreferenceStore::set(&self.pool, &pref_key, &trigger_id_str).await {
-                // Marker write failed — next startup would re-seed (creating a
-                // duplicate). Log loudly so the user sees this in the log.
-                log!(
-                    "[Scheduler] WARN: failed to record seed marker for '{}': {}. \
-                      Future startups may re-create this trigger.",
-                    marker_id,
-                    e
-                );
-            } else {
-                log!(
-                    "[Scheduler] Seeded default trigger '{}' ({})",
-                    marker_id,
-                    trigger_id_str
-                );
-            }
-        }
     }
 
     /// List all trigger configs from in-memory state.
@@ -858,9 +886,104 @@ use task_runner::{
     TrackedTask,
 };
 
+/// Apply a trigger-group lifecycle event to the in-memory registry. Groups
+/// don't schedule anything, so this is just a write to the shared map. Called
+/// from the EventBus subscriber so every connected SSE consumer (and the
+/// engine's own registry) converges on the same state.
+///
+/// The `create` and `rename` helpers in
+/// [`crate::engine::trigger_group_writes`] also call this synchronously,
+/// under [`crate::engine::LucidosEngine::trigger_group_write_lock`], so the
+/// case-insensitive unique-name invariant survives concurrent requests — the
+/// broadcast subscriber's apply happens too late for that. The reorder
+/// handler (`POST /trigger-groups/reorder`) also calls this synchronously
+/// after each emit, because callers expect a follow-up `GET /trigger-groups`
+/// to reflect the new ordering. Delete still rides only on the broadcast
+/// subscriber today (no read-after-write API contract on delete); if one is
+/// added, route it through this same function as well.
+pub(crate) fn handle_trigger_group_event(
+    event_type: &str,
+    group_id: &str,
+    payload: &serde_json::Value,
+    trigger_groups: &Arc<std::sync::RwLock<HashMap<String, TriggerGroup>>>,
+) {
+    match event_type {
+        "TriggerGroupCreated" => {
+            if let Ok(group) = TriggerGroup::from_created_payload(payload, chrono::Utc::now()) {
+                let mut g = trigger_groups.write().unwrap();
+                g.insert(group_id.to_string(), group);
+            }
+        }
+        "TriggerGroupRenamed" => {
+            let mut g = trigger_groups.write().unwrap();
+            if let Some(group) = g.get_mut(group_id) {
+                group.apply_renamed_payload(payload);
+            }
+        }
+        "TriggerGroupReordered" => {
+            let mut g = trigger_groups.write().unwrap();
+            if let Some(group) = g.get_mut(group_id) {
+                group.apply_reordered_payload(payload);
+            }
+        }
+        "TriggerGroupDeleted" => {
+            let mut g = trigger_groups.write().unwrap();
+            g.remove(group_id);
+        }
+        _ => {}
+    }
+}
+
 mod backup;
 use backup::run_scheduled_backup;
 pub(crate) use backup::{run_backup, BackupGuard};
+
+/// Flip `push_enabled` to false on every device whose `last_seen_at` is older
+/// than `cutoff_days`. Devices already disabled are filtered at the SELECT
+/// layer so a re-run produces no events. Engine-internal: emits `actor: None`.
+pub(crate) async fn disable_push_on_stale_devices(
+    engine: SharedEngine,
+    pool: PgPool,
+    cutoff_days: i64,
+) {
+    use crate::engine::event_bus::{BusEvent, SystemEvent};
+
+    let stale = match crate::core::DeviceStore::list_stale_push_enabled(&pool, cutoff_days).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            log!("[Scheduler] disable_push_on_stale_devices: list failed: {}", e);
+            return;
+        }
+    };
+    if stale.is_empty() {
+        return;
+    }
+    log!("[Scheduler] Disabling push on {} stale device(s) (>{}d)", stale.len(), cutoff_days);
+
+    for device_id in stale {
+        match crate::core::DeviceStore::set_push_enabled(&pool, &device_id, false).await {
+            Ok(true) => {
+                engine
+                    .event_bus
+                    .emit_or_log(
+                        BusEvent::System(SystemEvent::DevicePushChanged {
+                            device_id: device_id.clone(),
+                            push_enabled: false,
+                            actor: None,
+                        }),
+                        "[Scheduler] DevicePushChanged (stale)",
+                    )
+                    .await;
+            }
+            Ok(false) => {
+                // Disappeared between SELECT and UPDATE — benign race.
+            }
+            Err(e) => {
+                log!("[Scheduler] set_push_enabled({}) failed: {}", device_id, e);
+            }
+        }
+    }
+}
 
 /// Try to find a script matching a trigger name by keyword overlap.
 ///

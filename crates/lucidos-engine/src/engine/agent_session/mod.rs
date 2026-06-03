@@ -1,7 +1,8 @@
 mod apply_now;
 mod cc_spawn_coalesce;
-mod commit_hook;
+pub(crate) mod coding_agent_kind;
 mod external_edits;
+pub(crate) mod external_watchdog;
 mod io_helpers;
 mod lifecycle;
 mod node_modules_setup;
@@ -17,12 +18,19 @@ pub(crate) mod spawn_dispatcher;
 pub(crate) use cc_spawn_coalesce::{
     combine_messages, queued_to_orphans, CcSpawnCoalescer, LeaderElection, QueuedMessage,
 };
+pub(crate) use coding_agent_kind::{
+    classify_resolved_folder, resolve_folder_input, CodingAgentKind, FolderClassification,
+};
 
+pub(crate) use apply_now::probe_merge_conflicts;
 pub(crate) use external_edits::git_head_sha as external_edits_for_recovery_head_sha;
-pub(crate) use parsing::parse_ask_user_question_inputs;
+pub(crate) use parsing::{parse_ask_user_question_inputs, question_text};
 pub(crate) use prompts::build_merge_prompt;
 pub(crate) use reconstruct::prepend_reconstruction;
-pub(crate) use resume::{change_description_fallback, latest_originating_event_id, lookup_latest_cc_session_id};
+pub(crate) use resume::{
+    change_description_fallback, latest_originating_event_id, lookup_latest_cc_session_id,
+    CC_ORIGINATING_EVENT_TYPES, CHAT_ORIGINATING_EVENT_TYPES,
+};
 
 // Test-only re-exports — non-test callers reach these via super::* inside agent_session.
 #[cfg(test)]

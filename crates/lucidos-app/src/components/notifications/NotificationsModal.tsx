@@ -1,18 +1,16 @@
 import { useCallback } from 'preact/hooks';
 import {
   notifications,
-  unreadCount,
   notificationsModalOpen,
   notificationModalDetail,
   appsList,
   showToast,
 } from '../../store/store';
-import {
-  getNotification,
-  markNotificationRead,
-} from '../../api/client';
 import { openApp } from '../../store/actions/apps';
-import { resetViewDedup, loadNotifications } from '../../store/actions/notifications';
+import {
+  closeNotificationsModal,
+  navigateToNotification,
+} from '../../store/actions/notifications';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { formatNotificationDate } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
@@ -20,7 +18,6 @@ import { linkifyPaths } from '../../utils/linkifyPaths';
 import { loadedOr } from '../../store/types';
 import { ModalOverlay } from '../shared/ModalOverlay';
 import { ChevronLeftIcon, ChevronRightIcon, CloseIcon } from '../shared/icons';
-import { errorDetail } from '../../utils/errorDetail';
 import { resolveLinkedApp } from './resolveLinkedApp';
 
 export function NotificationsModal() {
@@ -28,10 +25,7 @@ export function NotificationsModal() {
   const detail = notificationModalDetail.value;
 
   const close = useCallback(() => {
-    notificationsModalOpen.value = false;
-    notificationModalDetail.value = null;
-    resetViewDedup();
-    loadNotifications();
+    closeNotificationsModal();
   }, []);
 
   if (!isOpen || !detail) return null;
@@ -41,30 +35,10 @@ export function NotificationsModal() {
   const hasPrev = currentIndex > 0;
   const hasNext = currentIndex >= 0 && currentIndex < items.length - 1;
 
-  async function navigate(index: number) {
+  function navigate(index: number) {
     const target = items[index];
     if (!target) return;
-    try {
-      const [, full] = await Promise.all([
-        markNotificationRead(target.id),
-        getNotification(target.id),
-      ]);
-      if (full) {
-        notificationModalDetail.value = full;
-        const current = notifications.value;
-        if (current.status === 'loaded') {
-          notifications.value = {
-            status: 'loaded',
-            data: current.data.map((n) => n.id === target.id ? { ...n, read: true } : n),
-          };
-        }
-        if (!target.read && unreadCount.value > 0) {
-          unreadCount.value = unreadCount.value - 1;
-        }
-      }
-    } catch (error) {
-      showToast('Failed to load notification: ' + errorDetail(error), 'error');
-    }
+    void navigateToNotification(target.id);
   }
 
   const linked = resolveLinkedApp(detail.app_id, appsList.value);
@@ -81,7 +55,9 @@ export function NotificationsModal() {
   function handleOpenThread() {
     if (!detail?.thread_id) return;
     close();
-    focusThreadOrBootstrap(detail.thread_id);
+    focusThreadOrBootstrap(detail.thread_id, {
+      targetEventId: detail.event_id ?? null,
+    });
   }
 
   function handleBodyClick(e: MouseEvent) {
@@ -122,7 +98,7 @@ export function NotificationsModal() {
           <span class="notifications-modal-title">
             <span class="trigger-icon">{linked.kind === 'linked' && linked.app.icon ? linked.app.icon : '\u{1F4CB}'}</span>
             {linked.kind === 'linked' ? (
-              <a class="accent-link" onClick={handleOpenApp}>{detail.title}</a>
+              <button type="button" class="accent-link" onClick={handleOpenApp}>{detail.title}</button>
             ) : (
               detail.title
             )}

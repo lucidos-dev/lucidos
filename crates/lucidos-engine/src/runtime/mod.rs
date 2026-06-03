@@ -6,7 +6,7 @@ pub mod lucidos_cli;
 pub mod python;
 
 pub use agent_runtime::{
-    AgentEvent, AgentInput, AgentKind, AgentRuntime, ControlRequest, RunningAgent, SpawnArgs,
+    AgentEvent, AgentInput, CodingAgent, AgentRuntime, ControlRequest, RunningAgent, SpawnArgs,
 };
 pub use browser::{BrowserLogins, BrowserRuntime, HeadlessBlocklist};
 pub use claude_code::ClaudeCodeRuntime;

@@ -2,7 +2,9 @@ use crate::core::Step;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-// Re-export types from core::store for backwards compatibility
+// Re-exported so callers can use the bare names through `engine::*`
+// (chained via `engine/mod.rs::pub use types::*`). Engine code references
+// `ConversationSnapshot` etc. directly without the `core::` path.
 pub use crate::core::{ConversationMessage, ConversationSnapshot, SessionMessage};
 
 pub use crate::api::AppContext;
@@ -26,9 +28,8 @@ pub struct ProcessResult {
     /// Whether the user requested auto-apply before the session ended
     #[serde(skip)]
     pub auto_apply: bool,
-    /// Injections that arrived via inject_prompt() after the agentic loop exited
-    /// but before the ThreadGuard dropped. Must be re-submitted as follow-up
-    /// messages by the caller.
+    /// Injections orphaned by the loop-exit / guard-drop race — caller
+    /// must re-submit them as follow-up messages.
     #[serde(skip)]
     pub orphaned_injections: Vec<OrphanedInjection>,
 }
@@ -48,6 +49,53 @@ pub struct ContextSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     pub char_count: usize,
+    /// API role this section is sent under. Defaults to "user" for backward
+    /// compat with persisted ContextCaptured events from before this change —
+    /// every previous section was actually part of either the system prompt
+    /// (System Instructions) or the user message; the system row gets
+    /// migrated by name in the viewer fallback.
+    #[serde(default = "default_context_role")]
+    pub role: ContextRole,
+    /// Inner-group label used by the viewer to nest sections within the
+    /// user-message role. None for system-role sections, prior-message rows,
+    /// and legacy events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// API role bucket a `ContextSection` belongs to. Mirrors the three buckets
+/// in the LLM API call: the system prompt, prior messages (verbatim resume
+/// tool blocks), and this turn's user message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextRole {
+    System,
+    PriorMessage,
+    User,
+}
+
+fn default_context_role() -> ContextRole {
+    ContextRole::User
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_section_legacy_payload_deserializes_with_default_role_and_no_group() {
+        // Pre-change ContextCaptured events have no `role` or `group` fields.
+        // They must still deserialize cleanly: `role` defaults to `User`, and
+        // `group` stays `None`.
+        let json = r#"{"name":"X","char_count":42}"#;
+        let section: ContextSection =
+            serde_json::from_str(json).expect("legacy payload must deserialize");
+        assert_eq!(section.name, "X");
+        assert_eq!(section.char_count, 42);
+        assert!(section.content.is_none());
+        assert_eq!(section.role, ContextRole::User);
+        assert!(section.group.is_none());
+    }
 }
 
 /// CC can't expose its system prompt body or tool schemas via the
@@ -72,20 +120,41 @@ pub struct ApiUsage {
 
 /// Result of an App UI capture from the frontend
 pub struct CaptureResult {
-    pub screenshot: String, // base64 PNG
+    pub screenshot: String, // base64-encoded image (JPEG from html2canvas; format sniffed downstream)
     pub dom: String,        // condensed DOM text
 }
 
 /// A user message sent to a running Claude Code session, with optional image attachments.
-/// `origin_event_id` is the UUID of the already-emitted `MessageReceived` event — used
-/// to re-process lost follow-ups without emitting a duplicate exchange boundary.
+/// `origin_event_id` is the UUID of the already-emitted `MessageReceived` (or other
+/// exchange-starter like `ChildThreadCompleted`) event — used to re-process lost
+/// follow-ups without emitting a duplicate exchange boundary.
 pub struct AgentUserInput {
     pub text: String,
     pub images: Option<Vec<crate::api::ChatImage>>,
-    /// UUID of the MessageReceived event already emitted by chat.rs before routing.
-    /// Set for user follow-ups routed via the fast-path; None for auto-harden and
-    /// other internally-generated messages.
+    /// UUID of the exchange-starter event already emitted before routing
+    /// (`MessageReceived` for user follow-ups; `ChildThreadCompleted` for
+    /// child-wake follow-ups). `None` for auto-harden and other internally
+    /// generated messages where no caller-side event exists.
     pub origin_event_id: Option<uuid::Uuid>,
+    /// What kind of input this is. CC's `run_session` reads this to decide
+    /// whether to emit `CodingAgentPromptSent` — `User` does, `WakeFromChild`
+    /// doesn't (the `ChildThreadCompleted` event already on the parent's
+    /// history is the exchange-starter; emitting another start event would
+    /// split the response into a duplicate exchange).
+    pub kind: AgentInputKind,
+}
+
+/// Discriminates a user-typed follow-up from an engine-synthesized child-wake.
+/// CC's `run_session` and the chat fast-paths use this to suppress duplicate
+/// exchange-starter events for wakes (`ChildThreadCompleted` is the start).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentInputKind {
+    /// User-typed follow-up. Emit `CodingAgentPromptSent` as the audit trail.
+    User,
+    /// Engine-synthesized wake from a completed child thread. Suppress
+    /// `CodingAgentPromptSent` so the response groups under
+    /// `ChildThreadCompleted` (the real exchange-starter).
+    WakeFromChild,
 }
 
 /// Cached CC slash commands (builtin + skill).
@@ -133,7 +202,7 @@ pub enum StopReason {
 /// **Single agent per thread.** The owning HashMap is keyed by `Uuid` (thread_id)
 /// alone, so a thread can only host one live agent backend at a time. When a
 /// second backend (Codex) is wired in, this constraint must be relaxed —
-/// re-key as `(Uuid, AgentKind)` and store `agent_kind: AgentKind` on this
+/// re-key as `(Uuid, CodingAgent)` and store `agent_kind: CodingAgent` on this
 /// struct so callers can disambiguate.
 pub struct AgentSession {
     pub msg_tx: tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
@@ -168,16 +237,16 @@ pub struct AgentSession {
     /// Set to true when the CC process exits. Checked by `apply_now_inner`
     /// after waking from `idle_notify` to detect CC death vs normal idle.
     pub process_exited: bool,
-    /// Path to the worktree this CC session is working in.
+    /// Path to the worktree this Claude Code session is working in.
     pub worktree_path: Option<std::path::PathBuf>,
-    /// Branch name this CC session is working on.
+    /// Branch name this Claude Code session is working on.
     pub branch_name: Option<String>,
     /// Root of the repo (for git operations during apply).
     pub repo_root: Option<std::path::PathBuf>,
     /// Claude Code's session ID (from the "system" init event).
     /// Used for `--resume` on follow-ups and engine restart.
     pub cc_session_id: Option<String>,
-    /// Epoch millis of the last event received from this CC session.
+    /// Epoch millis of the last event received from this Claude Code session.
     /// Used by `apply_now` for liveness-based timeout instead of fixed wall-clock.
     pub last_event_at: std::sync::Arc<std::sync::atomic::AtomicI64>,
     /// Set during engine shutdown so CC cleanup emits SessionEnded with
@@ -185,7 +254,7 @@ pub struct AgentSession {
     /// instead of "Done" for engine-interrupted exchanges.
     pub shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by `abort_in_flight_for_restart` when it pre-emits a `ResponseAborted`
-    /// on `/api/restart` for this thread. The run_session loop's Result-classify
+    /// on `/api/v1/restart` for this thread. The run_session loop's Result-classify
     /// and safety-net paths read this flag and skip their own terminal emit so
     /// the user only sees ONE "Response interrupted" panel (with the device
     /// actor) instead of two (one device, one system). Without this flag, CC's
@@ -218,6 +287,15 @@ pub struct AgentSession {
     /// because the previous turn's Result triggers `agent_cancel.cancel()`
     /// while CC is still processing the new prompt.
     pub pending_followups: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Paired ToolCalled / ToolResult counter, mirrored from the local
+    /// counter inside `run_session`. Read by the external watchdog
+    /// (`external_watchdog::tick`) — which lives outside `run_session`'s
+    /// `select!` and cannot see local variables. The in-loop watchdog still
+    /// reads the local copy; both observe the same `Arc<AtomicI32>` so the
+    /// value can't drift. > 0 means a tool is mid-execution (Bash, Read,
+    /// AskUserQuestion, …) — legitimate silence, no fire from either
+    /// watchdog.
+    pub tools_in_flight: std::sync::Arc<std::sync::atomic::AtomicI32>,
 }
 
 impl AgentSession {
@@ -248,7 +326,7 @@ pub enum ApplyStatus {
     /// Hardening recovery session was spawned. The change will auto-apply
     /// after hardening completes — `review_thread_id` points at it.
     Hardening,
-    /// Merge conflict — a CC session was spawned (`conflict_thread_id`)
+    /// Merge conflict — a Claude Code session was spawned (`conflict_thread_id`)
     /// or an in-place merge failed and the original session stays alive.
     Conflict,
 }

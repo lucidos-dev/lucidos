@@ -33,18 +33,65 @@ struct HookPayload {
     tool_input: Value,
 }
 
-/// Coerce string-typed integer values for the known integer-typed Read
-/// fields (`offset`, `limit`) to numbers in place. Returns `(input, mutated)`
-/// — `mutated` is true iff at least one field was rewritten. Non-numeric
-/// strings, missing fields, and already-numeric values pass through
-/// unchanged so CC's own validator surfaces real errors normally.
+/// Parse `"[N]"` or `"[N, M]"` (with arbitrary whitespace). Returns
+/// `Some((start, end))` where `end` is `None` for the single-element form.
+fn parse_range_string(s: &str) -> Option<(u64, Option<u64>)> {
+    let inner = s.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let mut parts = inner.split(',').map(str::trim);
+    let start = parts.next()?.parse::<u64>().ok()?;
+    let end = match parts.next() {
+        None => None,
+        Some(s) => Some(s.parse::<u64>().ok()?),
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    if end.is_some_and(|e| e < start) {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// If `input[key]` is a numeric string, rewrite it as a JSON number and
+/// return true. Non-numeric strings, missing keys, and existing numbers
+/// pass through unchanged so CC's validator still surfaces real errors.
+fn coerce_numeric_string(input: &mut Value, key: &str) -> bool {
+    let Some(s) = input.get(key).and_then(Value::as_str) else {
+        return false;
+    };
+    let Ok(n) = s.parse::<u64>() else { return false };
+    input[key] = Value::from(n);
+    true
+}
+
+/// Coerce string-typed integer values for `offset` and `limit` to numbers.
+/// Returns `(input, mutated)`. Non-numeric strings, missing fields, and
+/// already-numeric values pass through unchanged.
+///
+/// Two shapes are coerced for `offset`:
+///   1. Pure numeric string: `"123"` → `123`.
+///   2. Range string: `"[start]"` → `offset=start`; `"[start, end]"` →
+///      `offset=start, limit=end-start+1` (only when no explicit `limit`
+///      was supplied — an explicit limit overrides the derived one).
+///
+/// For `limit`, only the numeric string shape is recognised; a range
+/// string in `limit` has no obvious meaning, so it passes through.
 pub(crate) fn coerce(mut input: Value) -> (Value, bool) {
-    let mut mutated = false;
-    for key in ["offset", "limit"] {
-        let Some(field) = input.get(key) else { continue };
-        let Some(s) = field.as_str() else { continue };
-        let Ok(n) = s.parse::<u64>() else { continue };
-        input[key] = Value::from(n);
+    let mut mutated = coerce_numeric_string(&mut input, "offset");
+    if !mutated {
+        if let Some(s) = input.get("offset").and_then(Value::as_str) {
+            if let Some((start, end)) = parse_range_string(s) {
+                input["offset"] = Value::from(start);
+                if let Some(end) = end {
+                    if !input.get("limit").is_some_and(|v| v.is_number()) {
+                        input["limit"] = Value::from(end - start + 1);
+                    }
+                }
+                mutated = true;
+            }
+        }
+    }
+    if coerce_numeric_string(&mut input, "limit") {
         mutated = true;
     }
     (input, mutated)
@@ -170,6 +217,87 @@ mod tests {
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
         assert_eq!(parsed["hookSpecificOutput"]["updatedInput"], coerced);
+    }
+
+    #[test]
+    fn range_string_offset_becomes_numeric_start_and_derives_limit() {
+        let input = json!({"file_path": "/tmp/x", "offset": "[497, 532]"});
+        let (out, mutated) = coerce(input);
+        assert!(mutated);
+        assert_eq!(out["offset"], json!(497));
+        assert_eq!(out["limit"], json!(36));
+    }
+
+    #[test]
+    fn range_string_offset_keeps_explicit_limit() {
+        // Explicit limit overrides the derived one — model is allowed to
+        // override and we don't second-guess contradictory shapes.
+        let input = json!({"file_path": "/tmp/x", "offset": "[235, 260]", "limit": 30});
+        let (out, mutated) = coerce(input);
+        assert!(mutated);
+        assert_eq!(out["offset"], json!(235));
+        assert_eq!(out["limit"], json!(30));
+    }
+
+    #[test]
+    fn single_element_range_string_offset_is_coerced() {
+        let input = json!({"file_path": "/tmp/x", "offset": "[200]", "limit": 100});
+        let (out, mutated) = coerce(input);
+        assert!(mutated);
+        assert_eq!(out["offset"], json!(200));
+        assert_eq!(out["limit"], json!(100));
+    }
+
+    #[test]
+    fn single_element_range_string_offset_no_limit_keeps_no_limit() {
+        let input = json!({"file_path": "/tmp/x", "offset": "[200]"});
+        let (out, mutated) = coerce(input);
+        assert!(mutated);
+        assert_eq!(out["offset"], json!(200));
+        assert!(out.get("limit").is_none());
+    }
+
+    #[test]
+    fn range_string_with_inverted_bounds_passes_through() {
+        // end < start is meaningless; let CC's validator surface it.
+        let input = json!({"file_path": "/tmp/x", "offset": "[60, 1]"});
+        let (out, mutated) = coerce(input.clone());
+        assert!(!mutated);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn range_string_with_extra_elements_passes_through() {
+        let input = json!({"file_path": "/tmp/x", "offset": "[1, 2, 3]"});
+        let (out, mutated) = coerce(input.clone());
+        assert!(!mutated);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn range_string_with_whitespace_is_coerced() {
+        let input = json!({"file_path": "/tmp/x", "offset": "[ 100 , 200 ]"});
+        let (out, mutated) = coerce(input);
+        assert!(mutated);
+        assert_eq!(out["offset"], json!(100));
+        assert_eq!(out["limit"], json!(101));
+    }
+
+    #[test]
+    fn range_string_with_non_numeric_components_passes_through() {
+        let input = json!({"file_path": "/tmp/x", "offset": "[a, b]"});
+        let (out, mutated) = coerce(input.clone());
+        assert!(!mutated);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn range_string_on_limit_passes_through() {
+        // Range on limit has no obvious meaning; only numeric-string coercion applies.
+        let input = json!({"file_path": "/tmp/x", "limit": "[10, 20]"});
+        let (out, mutated) = coerce(input.clone());
+        assert!(!mutated);
+        assert_eq!(out, input);
     }
 
     #[test]

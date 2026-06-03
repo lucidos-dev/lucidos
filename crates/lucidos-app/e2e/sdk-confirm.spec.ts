@@ -43,12 +43,20 @@ test.describe('SDK lucidos.ui.confirm — host renders modal, returns Promise<bo
   });
 
   async function setupIframe(page: import('@playwright/test').Page) {
-    // Open the app via the real deep-link flow — this mounts the host's Preact
-    // tree (so <ConfirmDialog /> can render) and renders the app iframe with
-    // its data-role="app-ui-frame" attribute the host listener whitelists.
-    // Both SplitLayout (desktop) and MobileSwipeContainer (mobile) render an
-    // iframe simultaneously; pick the visible one.
-    await page.goto(`/?app=${APP_ID}`);
+    // Open the app via the real restore-on-load path — this mounts the host's
+    // Preact tree (so <ConfirmDialog /> can render) and renders the app iframe
+    // with its data-role="app-ui-frame" attribute the host listener whitelists.
+    // Seeding `app-window-open` in localStorage BEFORE navigation triggers
+    // loadApps()'s restore branch (apps.ts), which sets panelOverlay to
+    // {type:'app-ui',app:<this id>}. Both SplitLayout (desktop) and
+    // MobileSwipeContainer (mobile) render an iframe simultaneously; pick the
+    // visible one. There is no `?app=<id>` URL parameter — app deep-linking
+    // goes through the structured `tap` flow (notification-deeplink.ts) which
+    // requires a notification id, so the restore path is the cleanest hook.
+    await page.addInitScript((id) => {
+      localStorage.setItem('app-window-open', id);
+    }, APP_ID);
+    await page.goto('/');
     const iframeLoc = page.locator('iframe[data-role="app-ui-frame"]:visible');
     await expect(iframeLoc).toBeVisible({ timeout: 10000 });
     const appFrame = page.frameLocator('iframe[data-role="app-ui-frame"]:visible');
@@ -111,6 +119,16 @@ test.describe('SDK lucidos.ui.confirm — host renders modal, returns Promise<bo
       (window as unknown as { runConfirm: (o: unknown) => Promise<boolean> }).runConfirm({ message: 'Continue?', okLabel: 'Yes' })
     );
     await expect(page.locator('.confirm-dialog')).toBeVisible();
+    // Drive focus onto the host OK button explicitly: in the full Playwright
+    // suite the host occasionally fails to take focus from the just-mounted app
+    // iframe in time for the dialog's useEffect to land .focus() on the OK
+    // button. Without focus on a host element, page.keyboard.press('Enter')
+    // routes to the iframe document and the host never sees the keystroke, so
+    // the confirm Promise hangs to the 60s SDK timeout. (`message: 'Continue?'`
+    // with no `danger:true` renders the default variant — class
+    // `confirm-btn-ok-default`, not `confirm-btn-ok` — so target the stable
+    // `confirm-btn`/onClick contract instead of the variant-conditional class.)
+    await page.locator('.confirm-dialog button.confirm-btn').last().focus();
     await page.keyboard.press('Enter');
     expect(await resultPromise).toBe(true);
   });

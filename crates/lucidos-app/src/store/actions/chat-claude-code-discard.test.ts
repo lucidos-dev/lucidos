@@ -22,7 +22,7 @@ const discardCCChanges = vi.fn(async () => {});
 vi.mock('../../api/client', () => ({
   applyNow: vi.fn(),
   applyChange: vi.fn(),
-  answerCCQuestion: vi.fn(),
+  answerThreadQuestion: vi.fn(),
   discardCCChanges,
   sendControlRequest: vi.fn(),
   ApiError: class extends Error {},

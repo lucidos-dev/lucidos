@@ -27,9 +27,10 @@ export async function registerCurrentDevice(): Promise<void> {
   try {
     await apiRegisterDevice(deviceId, navigator.userAgent);
   } catch (e) {
-    // Startup probe — runs on every page load. A toast on every transient
-    // backend hiccup would be too noisy; the device retries on next reload,
-    // and user-facing features that need a registered device (push, per-device
+    // Telemetry carve-out (.claude/rules/frontend.md): startup probe runs on
+    // every page load without user intent. A toast on every transient backend
+    // hiccup would be too noisy; the device retries on next reload, and
+    // user-facing features that need a registered device (push, per-device
     // prefs) surface their own toasts when they fail.
     console.warn('[Devices] Failed to register device:', e);
   }

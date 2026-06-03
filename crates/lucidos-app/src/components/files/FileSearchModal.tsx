@@ -16,16 +16,6 @@ function sourceBadgeLabel(source: FileSearchResult['source']): string {
   return source === 'workspace' ? 'W' : source === 'repo' ? 'R' : 'C';
 }
 
-/** Open the file search modal and focus the input within the current call stack.
- *  Must be called synchronously from a user gesture (touch/click) for iOS to
- *  open the keyboard. Preact signals render synchronously, so after setting
- *  fileSearchOpen the input is visible and focusable immediately. */
-export function openFileSearch(): void {
-  fileSearchOpen.value = true;
-  const input = document.querySelector<HTMLInputElement>('[data-role="file-search-input"]');
-  if (input) input.focus({ preventScroll: true });
-}
-
 export function FileSearchModal() {
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(-1);
@@ -67,15 +57,20 @@ export function FileSearchModal() {
 
   const isRepo = repoSource.value !== null;
   const primarySource = isRepo ? repoFiles.value : artifacts.value;
-  const anyLoaded = primarySource.status === 'loaded' || changes.value.length > 0;
-  const failed = primarySource.status === 'failed';
+  // CC change files contribute when `loaded`. A `failed` changes signal
+  // bubbles up to the modal's failed state only when no other source has
+  // loaded — otherwise the modal still functions on what's available.
+  const ccChanges = loadedOr(changes.value, []);
+  const ccChangesFailed = changes.value.status === 'failed';
+  const anyLoaded = primarySource.status === 'loaded' || ccChanges.length > 0;
+  const failed = primarySource.status === 'failed' || (ccChangesFailed && !anyLoaded);
 
   const workspacePaths = isRepo ? [] : loadedOr(artifacts.value, []);
   const repoPaths = isRepo ? loadedOr(repoFiles.value, []) : [];
   const diffFiles = isRepo && repoDiff.value.status === 'loaded'
     ? repoDiff.value.data.files.map(f => ({ path: f.path, status: f.status }))
     : [];
-  const ccChangeFiles = changes.value.flatMap(c =>
+  const ccChangeFiles = ccChanges.flatMap(c =>
     c.files.map(f => ({ path: f })),
   );
 

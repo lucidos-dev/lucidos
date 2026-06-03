@@ -1,0 +1,105 @@
+/* ─── Shared modal overlay base ─── */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: var(--z-modal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: modal-in var(--duration-fast) ease;
+}
+
+/* Restart overlay — blocks interaction while engine restarts.
+   z-index above --z-control-panel so the header (.pane-header-brand,
+   .collapsed-thread-actions, .message-route-panel all sit at 2200) is
+   covered by the dim overlay and its buttons aren't clickable through.
+   .toast-container sits a step higher so the restart toast stays visible. */
+.restart-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-control-panel) + 100);
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: not-allowed;
+    -webkit-user-select: none;
+    user-select: none;
+    animation: modal-in var(--duration-normal) ease-out;
+}
+
+/* Reduced motion: disable non-essential transitions globally */
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* Shared "fetching…" placeholder marker. Lets a loading row look distinct
+ * from a "loaded with zero items" row without each component growing its own
+ * keyframes block. */
+@keyframes loading-pulse {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 0.85; }
+}
+.loading-skeleton {
+    font-style: italic;
+    opacity: 0.7;
+    animation: loading-pulse 1.4s ease-in-out infinite;
+}
+
+/* Mini spinner — small inline spinning ring for "in progress" indicators */
+.mini-spinner {
+    --spinner-color: var(--text-secondary);
+    display: inline-block;
+    width: 0.75rem;
+    height: 0.75rem;
+    animation: spin 1.2s linear infinite;
+    vertical-align: middle;
+    flex-shrink: 0;
+    border: var(--spinner-weight) solid var(--spinner-color);
+    border-top-color: transparent;
+    border-radius: 50%;
+    box-sizing: border-box;
+}
+
+/* Centered loading spinner — full-width centered ring for view/panel loading states */
+.loading-spinner {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 3rem 0;
+    width: 100%;
+}
+
+.loading-spinner::after {
+    --spinner-color: var(--text-secondary);
+    content: '';
+    display: block;
+    width: 1.5rem;
+    height: 1.5rem;
+    border: var(--spinner-weight) solid var(--spinner-color);
+    border-top-color: transparent;
+    border-radius: 50%;
+    box-sizing: border-box;
+    animation: spin 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .list-row,
+    .list-row-add-card,
+    .action-btn,
+    .dropdown-trigger,
+    .dropdown-option,
+    .icon-btn {
+        transition: none;
+    }
+
+    .progress-bar-fill {
+        transition: none;
+    }
+
+    .mini-spinner,
+    .loading-spinner::after {
+        animation: none;
+    }
+}

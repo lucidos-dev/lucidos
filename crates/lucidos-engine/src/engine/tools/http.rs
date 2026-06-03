@@ -3,6 +3,20 @@ use super::bulk_limits::{bulk_threshold_error, BulkContext, MAX_BULK_BYTES};
 use crate::core::oauth::{self, provider_for_url};
 use crate::core::{AuthType, CredentialStore, OAuthStore};
 use crate::engine::event_bus::{BusEvent, SystemEvent};
+use std::time::Duration;
+
+/// Per-request timeout for the `http_request` LLM tool. A server that accepts
+/// the connection and never responds would otherwise pin the agent loop until
+/// the surrounding turn is canceled; 15s matches `tools/web.rs`. The retry
+/// loop multiplies this against `MAX_RETRIES` for the upper bound.
+const HTTP_TOOL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Build the reqwest client used by `execute_http_tool`. Extracted so the
+/// timeout is set in one place and tests can verify the timeout fires against
+/// a hung server without depending on the full tool surface.
+pub(crate) fn build_http_tool_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder().timeout(timeout).build()
+}
 
 impl LucidosEngine {
     pub(crate) async fn execute_http_tool(
@@ -118,8 +132,18 @@ impl LucidosEngine {
             None
         };
 
-        // Build and send request with retry for transient errors
-        let client = reqwest::Client::new();
+        // Build and send request with retry for transient errors. A per-request
+        // timeout bounds each attempt — without one, a server that accepts the
+        // connection and never responds would pin the agent loop indefinitely.
+        let client = match build_http_tool_client(HTTP_TOOL_REQUEST_TIMEOUT) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(format!(
+                    "Error: failed to build HTTP client for http_request: {}",
+                    e
+                ));
+            }
+        };
         const MAX_RETRIES: u32 = 3;
         let mut status: u16 = 0;
         let mut body_text = String::new();
@@ -330,5 +354,66 @@ impl LucidosEngine {
                 body_text.chars().take(500).collect::<String>()
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for `harden-engine-tools-http-no-timeout`. Before the
+    /// fix, `execute_http_tool` built its reqwest client with
+    /// `Client::new()` (no timeout); a peer that accepted the TCP connection
+    /// and never wrote a response would pin the agent loop until the turn
+    /// was canceled.
+    ///
+    /// We exercise `build_http_tool_client` directly with a short timeout
+    /// against a `TcpListener` that accepts the connection and never writes
+    /// — the production code path uses the same builder, just with the
+    /// 15s `HTTP_TOOL_REQUEST_TIMEOUT`. The assertion: the request errors
+    /// out within twice the configured timeout and the error reports a
+    /// timeout. The test itself must finish well under a second so it can
+    /// run inline with the rest of the unit suite.
+    #[tokio::test]
+    async fn build_http_tool_client_times_out_against_hung_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept connections but never write a response — the client must
+        // bail itself. We hold each accepted stream in a sleeping task so the
+        // OS doesn't see a graceful close (which would surface as `Connection
+        // reset` / `IncompleteMessage` instead of a timeout).
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let timeout = Duration::from_millis(200);
+        let client = build_http_tool_client(timeout).expect("client builds");
+        let start = std::time::Instant::now();
+        let result = client.get(format!("http://{}/", addr)).send().await;
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("hung server must surface as Err");
+        assert!(
+            err.is_timeout(),
+            "expected timeout error, got: {:?}",
+            err
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "timeout fired but took {:?} — should be near {:?}",
+            elapsed,
+            timeout
+        );
+    }
+
+    /// A client built without a timeout would have no `Instant::now()` upper
+    /// bound and `.timeout()` defaults to none. We assert the builder we ship
+    /// returns Ok so the production path can rely on it.
+    #[test]
+    fn build_http_tool_client_returns_ok_for_real_timeout() {
+        assert!(build_http_tool_client(HTTP_TOOL_REQUEST_TIMEOUT).is_ok());
     }
 }

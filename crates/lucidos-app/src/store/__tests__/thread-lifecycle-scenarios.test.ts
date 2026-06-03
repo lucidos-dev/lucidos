@@ -13,7 +13,7 @@ import type { ThreadState, ThreadMeta, ThreadStatus } from '../thread-events';
 import {
   displaySection,
   isSectionLegal,
-  resolveActions,
+  availableThreadActions,
   EVENT_CLASSIFICATION,
   type ArchiveState,
   type ThreadType,
@@ -80,12 +80,15 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
           section: 'archived',
           activeChildrenCount: 0,
           totalChildrenCount: 0,
-          ccHasChanges: false,
-          ccRequiresRestart: false,
-          ccIsExternalRepo: false,
-          ccApplying: false,
+          blockingDescendantCount: 0, attentionDescendantCount: 0,
+          codingAgentProposed: false,
+          codingAgentRequiresRestart: false,
+          codingAgentIsExternalRepo: false,
+          codingAgentApplying: false,
+          codingAgentHasDiff: false,
           lastRevivedAt: '',
           state: 'active',
+          latestTodoList: null,
         };
 
         const thread: ThreadState = {
@@ -147,6 +150,7 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
               step.expected.is_saved || false,
               false,
               hasPendingChanges,
+              false,
             );
             expect(display, `step ${i} (${step.emit}): expected display='${step.expected.display_section}'`).toBe(step.expected.display_section);
           }
@@ -156,8 +160,14 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
             const status = thread.meta.status;
             const storedSection = (step.expected.stored_section || 'archived') as ArchiveState;
             const threadType = scenario.thread_type as ThreadType;
-            const isSaved = step.expected.is_saved || false;
-            const actions = resolveActions(threadType, status, storedSection, hasPendingChanges, isSaved);
+            // These scenarios cover the no-blocking-descendants axis only; the
+            // `descendants_block_archive` dimension is exercised exhaustively
+            // by the cross-validation contract (see generated/cross-validation*).
+            // Scenarios assert the CLOSE set (archive/apply/discard); the
+            // Save/Unsave toggle and draft layer postdate these fixtures, so
+            // filter them out of the comparison.
+            const actions = availableThreadActions(threadType, status, storedSection, hasPendingChanges, false, false, false)
+              .filter((a) => a === 'archive' || a === 'apply' || a === 'discard');
             expect(actions, `step ${i} (${step.emit}): actions`).toEqual(step.expected.expected_actions);
           }
         }
@@ -198,15 +208,15 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
   describe('Negative: illegal section transitions', () => {
     it('displaySection never returns review for stored=default (no pending changes)', () => {
       for (const status of ['idle', 'running', 'waiting'] as const) {
-        const display = displaySection('archived', status, false, false, false);
+        const display = displaySection('archived', status, false, false, false, false);
         expect(display).not.toBe('review');
       }
     });
 
     it('running status maps to active when not saved, saved when saved (save overrides)', () => {
       for (const stored of ['archived', 'inbox'] as const) {
-        expect(displaySection(stored, 'running', false, false, false)).toBe('active');
-        expect(displaySection(stored, 'running', true, false, false)).toBe('saved');
+        expect(displaySection(stored, 'running', false, false, false, false)).toBe('active');
+        expect(displaySection(stored, 'running', true, false, false, false)).toBe('saved');
       }
     });
 
@@ -225,7 +235,7 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
       // Only the idle thread without active children should display as 'review'.
       // Running threads and threads with active children display as 'running'/'waiting'.
       const count = threads.filter(t =>
-        displaySection(t.section, t.status, t.saved, t.hasActiveChildren, false) === 'review'
+        displaySection(t.section, t.status, t.saved, t.hasActiveChildren, false, false) === 'review'
       ).length;
       expect(count).toBe(1);
     });

@@ -50,7 +50,7 @@ What each piece does — include only what you need:
 
 **Theme integration is opt-in.** An app that omits both `<script src="/api/v1/sdk-prefs.js">` and `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` gets no `data-theme` attribute, no CSS variables, and no Lucidos default styling — the engine never auto-injects either tag. This is the right choice for apps that ship their own complete visual identity (charts, games, embedded third-party UIs).
 
-Apps using `lucidos._capture()` don't need to include `html2canvas` — the SDK loads it on demand from `/api/static/html2canvas.min.js`.
+Apps using `lucidos._capture()` don't need to include `html2canvas` — the SDK loads it on demand from `/api/v1/static/html2canvas.min.js`.
 
 External-host apps point `baseUrl` at the Lucidos instance:
 
@@ -139,6 +139,10 @@ await lucidos.data.edit('artifacts/habits/data.json', [
 // Get a URL for embedding in HTML
 const src = lucidos.data.url('artifacts/screenshots/latest.png');
 ```
+
+### `url` and app-bundled assets
+
+`lucidos.data.url(path)` normally returns a `/data/...` URL, which always serves from the live workspace. When the SDK is loaded inside an app iframe (`/app/<id>/...`) and `path` points at the app's own bundled folder (`apps/<id>/<rest>`), it instead returns a `/app/<id>/<rest>` URL and carries over `?thread_id=` or `?commit=` from the iframe. This makes JS-set asset URLs (e.g. `img.src = lucidos.data.url('apps/my-app/icon.png')`) load correctly in WIP-preview and historical views — without it, the engine's HTML rewriter only covers markup `src` / `href` attributes and JS-set sources silently 404 against the live workspace. Cross-app references (`apps/<other>/...`) and non-app paths (`artifacts/...`, `knowhow/...`) keep the `/data/` route unchanged.
 
 ## lucidos.events — Event Store
 
@@ -264,54 +268,139 @@ const data = await res.json();
 
 If the iframe needs an external API the workspace doesn't have a proxy entry for, add one to `data/config/apis.json` rather than embedding the credential in the app.
 
+## lucidos.oauth — OAuth Token Access
+
+Fetch a short-lived OAuth access token for a connected provider, for in-browser SDKs that need a bearer token in JavaScript (e.g. the Spotify Web Playback SDK). The engine looks up the connected account, refreshes the token if it's expired or expiring within 60s, and returns ONLY the access token — the refresh token never leaves the engine.
+
+```ts
+lucidos.oauth.getAccessToken(provider: string): Promise<AccessToken>
+
+interface AccessToken {
+  accessToken: string;
+  expiresAt: Date | null;  // null when the upstream provider didn't include an expiry
+}
+```
+
+### When to use
+
+- **You need a bearer token in the iframe**: a third-party SDK like `Spotify.Player` calls a `getOAuthToken` callback expecting a raw token string. There is no other way to hand it the credential — `lucidos.proxy(...)` can't help because the SDK initiates the request itself, not through your code.
+- **You are NOT making ordinary HTTP calls to the upstream API**: for those, use `lucidos.proxy(<provider>).fetch(...)` instead — the engine attaches the bearer header server-side and the iframe never sees the token. Only fall back to `getAccessToken` when something forces you to hand a raw token to in-browser code.
+
+### Example — Spotify Web Playback SDK
+
+```js
+const player = new Spotify.Player({
+  name: 'My Sonos App',
+  getOAuthToken: async (cb) => {
+    const tok = await lucidos.oauth.getAccessToken('spotify');
+    cb(tok.accessToken);
+  },
+  volume: 0.5,
+});
+await player.connect();
+```
+
+The SDK calls `getOAuthToken` on first init and again when it detects the token has expired — each call hits the engine, which refreshes from the stored refresh token if needed.
+
+### Errors
+
+- `404` — the provider is not connected for this workspace. Ask the user to connect it via the OAuth account settings (or through the LLM `connect_oauth_account` tool).
+- `502` — the engine could not refresh the token (missing client credentials, upstream rejected the refresh, network failure).
+
+### Security note
+
+The refresh token, client_id, client_secret, and PKCE state stay on the server. The iframe receives ONLY the short-lived access token, scoped to the connected account. Apps therefore must NOT cache the access token in `localStorage` / `sessionStorage` — re-call `getAccessToken` whenever you need a fresh one (the engine handles caching and refresh).
+
 ## lucidos.triggers — Scheduled Tasks
 
 CRUD operations for cron-based and event-based triggers.
 
 ```ts
 lucidos.triggers.list(): Promise<Trigger[]>
-lucidos.triggers.create(trigger: CreateTrigger): Promise<Trigger>
-lucidos.triggers.update(id: string, trigger: UpdateTrigger): Promise<Trigger>
-lucidos.triggers.delete(id: string): Promise<void>
+lucidos.triggers.create(trigger: CreateTrigger): Promise<ApiResult>
+lucidos.triggers.update(id: string, trigger: UpdateTrigger): Promise<ApiResult>
+lucidos.triggers.delete(id: string): Promise<ApiResult>
 ```
 
 ### Types
 
 ```ts
 type TriggerRun =
-  | { type: 'intent'; intent: string; knowhow: string[] }
+  | { type: 'intent'; intent: string }
   | { type: 'script'; path: string };
+
+// One event the trigger listens for, with an optional payload filter scoped
+// to that event. A trigger may carry several entries — it fires when an
+// incoming event matches *any* entry's event_type AND that entry's
+// condition (if set) evaluates true against the payload. Conditions are
+// per-entry so different events with different payload shapes never
+// constrain each other.
+interface EventSubscription {
+  event_type: string;
+  condition?: Record<string, unknown>;
+}
 
 interface Trigger {
   id: string;
   name: string;
-  run: TriggerRun;
   cron_expressions: string[];
-  enabled: boolean;
-  on_event?: string;
-  condition?: Record<string, unknown>;
-  created_at: string;
-  last_run_at?: string;
-  next_run_at?: string;
+  timezone: string;
+  paused: boolean;
+  last_run?: string;
+  next_run?: string;
+  run: TriggerRun;
+  // Event subscriptions. Empty for schedule-only triggers; the engine omits
+  // the field rather than emitting `[]`, so readers must tolerate absence.
+  on?: EventSubscription[];
 }
 
 interface CreateTrigger {
   name: string;
   run: TriggerRun;
   cron_expressions: string[];
-  on_event?: string;
-  condition?: Record<string, unknown>;
+  on?: EventSubscription[];
+  /** Optional *trigger group* id; omit for ungrouped. */
+  group_id?: string;
 }
 
 interface UpdateTrigger {
   name?: string;
   run?: TriggerRun;
   cron_expressions?: string[];
-  enabled?: boolean;
-  on_event?: string | null;
-  condition?: Record<string, unknown> | null;
+  paused?: boolean;
+  // Full replacement for the subscription list. Send the complete new set —
+  // there is no partial edit. Pass `[]` to clear all subscriptions.
+  on?: EventSubscription[];
+  /** Move into a group (string id), clear membership (null), or leave it
+   *  unchanged (absent). */
+  group_id?: string | null;
+}
+
+interface ApiResult {
+  success: boolean;
+  error?: string;
 }
 ```
+
+### Subscribing to multiple events from one trigger
+
+Pass several entries in `on` when one workflow should react to more than one event type:
+
+```js
+await lucidos.triggers.create({
+  name: 'Important inbound nudge',
+  run: { type: 'intent', intent: 'Summarize what just happened and ping me.' },
+  cron_expressions: [],
+  on: [
+    { event_type: 'MessageReceived', condition: { from: 'partner' } },
+    { event_type: 'EmailReceived',   condition: { from: 'boss@example.com' } },
+  ],
+});
+```
+
+Each entry's `condition` only applies to its own `event_type` — the `from: 'partner'` filter on `MessageReceived` does NOT block `EmailReceived` from firing on its own filter.
+
+Trigger groups are user-visible folders shown in the triggers panel. Pure organizational labels — they have no schedule, run no code, and don't coordinate firing. Apps that organize the triggers they create can pass `group_id` to `create` / `update`; the engine validates the id against the workspace's group registry and rejects unknown values. The SDK does not expose group CRUD today — group management lives behind the engine's HTTP and LLM-tool surfaces.
 
 ## lucidos.apps — App Management
 
@@ -357,7 +446,7 @@ type Preferences = Record<string, string>;
 |-----|--------|-------------|
 | `theme` | `dark`, `light`, `system` | UI theme |
 | `font-family` | `monospace`, `system`, `inter`, `jetbrains-mono`, `ibm-plex-mono` | Font |
-| `ui-scale` | `100`, `113`, `125` (or `small`, `medium`, `large`) | Scale |
+| `ui-scale` | Number in 12.5% steps from 75 to 200 (`75`, `87.5`, `100`, `112.5`, `125`, `137.5`, `150`, `162.5`, `175`, `187.5`, `200`); or the legacy strings `small` / `medium` / `large` (= `100` / `112.5` / `125`). Off-grid numbers snap to the nearest valid step. | Scale |
 
 ## lucidos.notifications — Notification Center
 
@@ -375,14 +464,50 @@ lucidos.notifications.markAllRead(): Promise<void>
 ### Types
 
 ```ts
+type NavigateTarget =
+  | 'files' | 'apps' | 'triggers' | 'changes' | 'notifications'
+  | 'settings' | 'app' | 'file' | 'trigger' | 'thread'
+  | 'new-app' | 'new-trigger' | 'new-chat' | 'url';
+
+interface NavigateUi {
+  target: NavigateTarget;
+  settings_view?: 'devices' | 'accounts' | 'backup' | 'memory' | 'repositories';
+  app_id?: string;
+  file_path?: string;
+  id?: string;
+  url?: string;
+  event_id?: string;
+  prompt?: string;
+}
+
+/** What a notification tap does. `modal` opens the inbox modal showing the
+ *  message body. `none` marks the row read with no navigation (passive
+ *  pushes — "OAuth completed"). `navigate` delegates to the same router the
+ *  `navigate_ui` LLM tool uses; `to` is its arg shape. Every kind marks the
+ *  source notification read on tap. */
+type Tap =
+  | { kind: 'modal' }
+  | { kind: 'none' }
+  | { kind: 'navigate'; to: NavigateUi };
+
 interface Notification {
   id: string;
   task_id?: string;
   app_id?: string;
+  /** Originating thread, when the notification has one. Drives the inbox
+   *  modal's "Open thread" button. */
+  thread_id?: string;
+  /** Specific event UUID inside `thread_id` that raised this notification —
+   *  the §4 in-app matrix uses it to silently mark-read when the user is
+   *  looking at the source event. Distinct from `tap.to.event_id` (which
+   *  is the scroll-and-pulse target when the tap navigates to a thread). */
+  event_id?: string;
   title: string;
   message: string;
   created_at: string;
   read: boolean;
+  /** What happens on tap. See `Tap`. Default `{kind:'modal'}` when absent. */
+  tap?: Tap;
 }
 
 interface NotificationListResult {
@@ -392,26 +517,145 @@ interface NotificationListResult {
 }
 ```
 
+### Tap shapes — examples
+
+The SDK only exposes `list` / `markRead` / `markAllRead` for reading the inbox. Creating a notification from app code goes through the engine HTTP API directly (`POST /api/v1/notifications` — same wire shape the `lucidos notify` CLI and the `send_notification` LLM tool produce):
+
+```js
+// Default: open the inbox modal showing the message body.
+await fetch('/api/v1/notifications', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    title: 'Daily summary',
+    message: 'Here is your summary…',
+    tap: { kind: 'modal' },
+  }),
+});
+
+// Passive: mark read on display, no navigation. Use for "OAuth completed",
+// "Build succeeded" — the push IS the message.
+await fetch('/api/v1/notifications', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    title: 'OAuth completed',
+    message: 'Google account connected.',
+    tap: { kind: 'none' },
+  }),
+});
+
+// Navigate to a panel.
+await fetch('/api/v1/notifications', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    title: '5 changes ready to apply',
+    message: 'Review the Changes panel.',
+    tap: { kind: 'navigate', to: { target: 'changes' } },
+  }),
+});
+
+// Navigate to a thread, optionally scroll-and-pulse a specific event row.
+await fetch('/api/v1/notifications', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    title: 'Claude is asking',
+    message: 'Permission needed.',
+    thread_id: 't-9',
+    event_id: 'e-7',
+    tap: { kind: 'navigate', to: { target: 'thread', id: 't-9', event_id: 'e-7' } },
+  }),
+});
+
+// Navigate to an app's UI.
+await fetch('/api/v1/notifications', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    title: 'Habit tracker reminder',
+    message: 'Tap to log today.',
+    app_id: 'habit-tracker',
+    tap: { kind: 'navigate', to: { target: 'app', app_id: 'habit-tracker' } },
+  }),
+});
+```
+
+From scripts (Python/bash), use the `lucidos notify` CLI — it constructs the same body. From LLM threads, use the `send_notification` tool.
+
 ## lucidos.threads — Thread Management
 
 ```ts
-lucidos.threads.list(): Promise<Thread[]>
-lucidos.threads.search(query: string): Promise<Thread[]>
+lucidos.threads.list(opts?: ThreadsListOptions): Promise<ThreadSummary[]>
+lucidos.threads.count(opts?: Omit<ThreadsListOptions, 'limit'>): Promise<number>
 ```
+
+`list()` calls `GET /api/v1/threads/list` and returns a newest-first array of `ThreadSummary` rows from the projection. `count()` calls `GET /api/v1/threads/count` and resolves to the integer count under the same filter — cheaper on big workspaces than reading `(await list()).length`.
+
+Same canonical surface as the `lucidos threads list` / `lucidos threads count` CLI and the `list_threads` / `count_threads` LLM tools. Use this when an app needs to render or react to thread state (counts, status indicators) without subscribing to the full SSE stream.
 
 ### Types
 
 ```ts
-interface Thread {
-  id: string;
+interface ThreadsListOptions {
+  /** true → only threads where the agentic loop is mid-flow
+   *  (status 'running' or 'waiting_for_user_answer'). false → invert.
+   *  Omit → no filter. Note: 'waiting' is NOT active — it means CC has
+   *  stopped and proposed changes the user must act on. */
+  active?: boolean;
+  /** Comma-separated source filter: 'chat', 'trigger', 'claude_code'. */
+  source?: string;
+  /** Server clamps to 1..=1000 (default 100). */
+  limit?: number;
+}
+
+/** Projected snapshot of a thread's metadata, derived from the event
+ *  stream by the `thread_summaries` projection. */
+interface ThreadSummary {
+  thread_id: string;
   title: string;
-  source: string;
+  channel: string;
+  initiator: 'user' | 'system';
+  created_at: string;
   last_activity: string;
   message_count: number;
-  is_saved: boolean;
-  has_response: boolean;
+  /** 'inbox' | 'archived' — stored in thread_summaries.archive_state. */
+  section: string;
+  active_children_count: number;
+  total_children_count: number;
+  /** 'idle' | 'running' | 'waiting' | 'failed' | 'waiting_for_user_answer'. */
+  status: string;
+  coding_agent_has_diff: boolean;
+  coding_agent_proposed: boolean;
+  coding_agent_requires_restart: boolean;
+  coding_agent_is_external_repo: boolean;
+  coding_agent_applying: boolean;
+  last_revived_at: string | null;
+  parent_thread_id?: string | null;
+  parent_thread_title?: string | null;
+  trigger_id?: string | null;
+  trigger_name?: string | null;
+  cc_repo_id?: string | null;
+  cc_repo_name?: string | null;
+  /** Compose state machine — `composing` | `active` | `discarded`. The
+   *  archive flag is on the separate `section` field; an archived thread
+   *  carries `state: 'active'` and `section: 'archived'`. */
+  state: 'composing' | 'active' | 'discarded';
+  compose_text: string;
+  compose_images: string[];
+  compose_mode?: 'lucidos' | 'claude_code' | null;
 }
 ```
+
+### When to use which
+
+| Want to … | Use |
+|---|---|
+| Render a list of threads in an app UI | `lucidos.threads.list()` |
+| Show "N active threads" badge | `lucidos.threads.count({ active: true })` |
+| React to thread state changes in real time | Subscribe to `lucidos.sse` instead |
+| Spawn a new thread from an app | `lucidos.ui.startThread({ prompt })` |
 
 ## lucidos.ui — UI Control
 

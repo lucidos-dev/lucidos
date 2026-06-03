@@ -1,10 +1,11 @@
 import type { ComponentChildren } from 'preact';
 import { signal } from '@preact/signals';
 import { useEffect, useState } from 'preact/hooks';
-import { API_BASE, mutatingFetch, throwIfNotOk } from '../../api/client';
+import { API, mutatingFetch, throwIfNotOk } from '../../api/client';
 import { showConfirm, showToast } from '../../store/store';
 import { toFailed, type Loadable } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { LoadableError } from '../shared/LoadableError';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatBytes } from '../../utils/formatBytes';
@@ -37,7 +38,7 @@ const summary = signal<Loadable<DiskSummary>>({ status: 'not-loaded' });
 async function loadSummary(): Promise<void> {
   summary.value = { status: 'loading' };
   try {
-    const res = await fetch(`${API_BASE}/api/disk-usage/summary`);
+    const res = await fetch(`${API}/disk-usage/summary`);
     await throwIfNotOk(res);
     summary.value = { status: 'loaded', data: (await res.json()) as DiskSummary };
   } catch (e) {
@@ -48,7 +49,7 @@ async function loadSummary(): Promise<void> {
 async function loadInventory(): Promise<void> {
   inventory.value = { status: 'loading' };
   try {
-    const res = await fetch(`${API_BASE}/api/disk-usage/worktrees`);
+    const res = await fetch(`${API}/disk-usage/worktrees`);
     await throwIfNotOk(res);
     const body = (await res.json()) as InventoryResponse;
     inventory.value = { status: 'loaded', data: body.worktrees };
@@ -61,7 +62,7 @@ async function loadInventory(): Promise<void> {
 
 async function runCleanup(threadId: string, tier: 1 | 2 | 3): Promise<{ tier: number; freed_bytes: number; branch_deleted: boolean } | null> {
   const res = await mutatingFetch(
-    `${API_BASE}/api/disk-usage/worktrees/${threadId}/cleanup`,
+    `${API}/disk-usage/worktrees/${threadId}/cleanup`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -208,7 +209,7 @@ function WorktreeRowView({
 
   async function handleRemove() {
     if (!(await showConfirm(
-      `Remove worktree for "${title}"? Build artifacts and its on-disk files will be deleted. Branch is kept if it has unmerged commits.`,
+      `Remove worktree for "${title}"? Its on-disk files (including any build artifacts) will be deleted. Branch is kept if it has unmerged commits.`,
       'Remove',
     ))) {
       return;
@@ -277,8 +278,8 @@ export function DiskUsagePage() {
   const showSummarySpinner = useDelayedLoading(summaryLoadable);
 
   useEffect(() => {
-    if (loadable.status === 'not-loaded') loadInventory();
-    if (summaryLoadable.status === 'not-loaded') loadSummary();
+    if (loadable.status === 'not-loaded') void loadInventory();
+    if (summaryLoadable.status === 'not-loaded') void loadSummary();
   }, []);
 
   if (loadable.status === 'failed') {
@@ -286,7 +287,7 @@ export function DiskUsagePage() {
       <div class="settings-section">
         <div class="settings-section-title">Disk usage</div>
         <div class="list-rows">
-          <div class="empty-state error-text">Failed to load disk usage: {loadable.error}</div>
+          <LoadableError noun="disk usage" error={loadable.error} />
         </div>
       </div>
     );

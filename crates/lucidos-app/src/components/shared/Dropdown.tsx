@@ -1,10 +1,15 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { isTauri } from '../../utils/platform';
 import { hidePanelWebview, showPanelWebview } from '../../utils/tauri';
+import { useDismissOnOutside, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 
 export interface DropdownOption {
   value: string;
   label: string;
+  /** Non-selectable section header. Renders dimmer + ignores click / keyboard
+   *  select. Use to group options inside a flat list (e.g. compose-view scope
+   *  picker grouping Lucidos / external repos / apps). */
+  disabled?: boolean;
 }
 
 interface DropdownProps {
@@ -19,8 +24,30 @@ interface DropdownProps {
   freeText?: boolean;
 }
 
+/** Walk `options` from `start` in direction `step` (±1), skipping any
+ *  `disabled` entries (section headers). Used by ArrowDown/Up + the initial
+ *  focus seed so navigation never lands stuck on a header. Returns `start`
+ *  if no enabled option exists in the chosen direction — caller's clamp
+ *  keeps focus where it was. */
+function nextEnabledIndex(options: DropdownOption[], start: number, step: 1 | -1): number {
+  const len = options.length;
+  if (len === 0) return -1;
+  let i = start + step;
+  while (i >= 0 && i < len) {
+    if (!options[i].disabled) return i;
+    i += step;
+  }
+  return start;
+}
+
 export function Dropdown({ options, value, onChange, disabled, placeholder, class: className, filterable, freeText }: DropdownProps) {
-  const [open, setOpen] = useState(false);
+  // Anchor element when open, null when closed. `useAnchoredPosition` reacts
+  // to anchor changes via its effect deps — no separate `open` flag needed.
+  // The menu uses `position: fixed` so it escapes any `overflow: hidden`
+  // ancestor (notably `.mobile-swipe-pane` on mobile, where an
+  // `absolute`-positioned menu was clipped at the pane edge regardless of
+  // placement direction).
+  const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const [filter, setFilter] = useState('');
   const [focusedIndex, setFocusedIndex] = useState(-1);
   const [draft, setDraft] = useState(value);
@@ -33,6 +60,8 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
   const lastCommittedRef = useRef(value);
   const selected = options.find((o) => o.value === value);
   const showFilter = filterable || freeText;
+  const open = anchor !== null;
+  const pos = useAnchoredPosition(anchor, menuRef);
 
   // Sync draft when external value changes (and we're not actively editing)
   useEffect(() => {
@@ -58,19 +87,16 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
     setDraftValue(trimmed || lastCommittedRef.current);
   }
 
+  // Trigger button and menu both live inside the wrapper ref, so it acts as
+  // both panel and anchor — re-clicking the trigger is "inside" and routes
+  // through its own onClick toggle. The Tauri panel-webview hide/show stays
+  // as its own effect, scoped to the same open-gate.
+  useDismissOnOutside(open, ref, null, closeDropdown);
+
   useEffect(() => {
-    if (!open) return;
-    if (isTauri()) hidePanelWebview();
-    function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        closeDropdown();
-      }
-    }
-    document.addEventListener('click', handleClick);
-    return () => {
-      document.removeEventListener('click', handleClick);
-      if (isTauri()) showPanelWebview();
-    };
+    if (!open || !isTauri()) return;
+    hidePanelWebview();
+    return () => showPanelWebview();
   }, [open]);
 
   useEffect(() => {
@@ -93,15 +119,24 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
     : options;
 
   function closeDropdown() {
-    setOpen(false);
+    setAnchor(null);
     setFilter('');
     setFocusedIndex(-1);
   }
 
   function openDropdown() {
-    setOpen(true);
+    if (!ref.current) return;
+    setAnchor(ref.current);
     const currentIdx = options.findIndex((o) => o.value === value);
-    setFocusedIndex(currentIdx);
+    // Seed at the saved value, or — when missing/stale or pointing at a
+    // disabled row (stale scope that collides with a section header after
+    // a re-group) — the first enabled option. Without the disabled-skip,
+    // focus could land on a header and ArrowDown would silently dead-key.
+    if (currentIdx < 0 || options[currentIdx]?.disabled) {
+      setFocusedIndex(nextEnabledIndex(options, -1, +1));
+    } else {
+      setFocusedIndex(currentIdx);
+    }
   }
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -116,14 +151,14 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
       if (!open) {
         openDropdown();
       } else {
-        setFocusedIndex(i => Math.min(i + 1, filtered.length - 1));
+        setFocusedIndex(i => nextEnabledIndex(filtered, i, +1));
       }
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
       if (!open) {
         openDropdown();
       } else {
-        setFocusedIndex(i => Math.max(i - 1, 0));
+        setFocusedIndex(i => nextEnabledIndex(filtered, i, -1));
       }
     } else if (e.key === 'Enter' || (e.key === ' ' && !showFilter)) {
       if (!open) {
@@ -133,7 +168,9 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
       }
       e.preventDefault();
       if (focusedIndex >= 0 && focusedIndex < filtered.length) {
-        const picked = filtered[focusedIndex].value;
+        const focused = filtered[focusedIndex];
+        if (focused.disabled) return;
+        const picked = focused.value;
         if (freeText) commit(picked); else onChange(picked);
         closeDropdown();
         inputRef.current?.blur();
@@ -157,18 +194,22 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
             value={draft}
             disabled={disabled}
             placeholder={placeholder}
-            onFocus={() => { if (!disabled) { setFilter(''); setOpen(true); } }}
+            onFocus={() => { if (!disabled && ref.current) { setFilter(''); setAnchor(ref.current); } }}
             onBlur={() => commit()}
             onInput={(e) => {
               const v = (e.target as HTMLInputElement).value;
               setDraftValue(v);
               setFilter(v);
               setFocusedIndex(-1);
-              if (!open) setOpen(true);
+              if (!open && ref.current) setAnchor(ref.current);
             }}
             onKeyDown={handleKeyDown}
           />
-          <span class="dropdown-chevron" onClick={() => { if (!disabled) setOpen(!open); }}>{open ? '\u25B4' : '\u25BE'}</span>
+          <span class="dropdown-chevron" onClick={() => {
+            if (disabled) return;
+            if (open) closeDropdown();
+            else if (ref.current) setAnchor(ref.current);
+          }}>{open ? '▴' : '▾'}</span>
         </div>
       ) : (
         <button
@@ -190,11 +231,22 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
               <span key={o.value} aria-hidden="true">{o.label}</span>
             ))}
           </span>
-          <span class="dropdown-chevron">{open ? '\u25B4' : '\u25BE'}</span>
+          <span class="dropdown-chevron">{open ? '▴' : '▾'}</span>
         </button>
       )}
-      {open && (
-        <div class="dropdown-menu" ref={menuRef}>
+      {anchor && (
+        <div
+          class="dropdown-menu"
+          ref={menuRef}
+          style={pos
+            ? {
+                position: 'fixed',
+                top: `${pos.top}px`,
+                left: `${pos.left}px`,
+                minWidth: `${anchor.getBoundingClientRect().width}px`,
+              }
+            : { visibility: 'hidden' }}
+        >
           {filterable && !freeText && (
             <input
               ref={filterRef}
@@ -212,9 +264,10 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
           {filtered.map((o, i) => (
             <div
               key={o.value}
-              class={`dropdown-option${o.value === value ? ' active' : ''}${i === focusedIndex ? ' focused' : ''}`}
+              class={`dropdown-option${o.value === value ? ' active' : ''}${i === focusedIndex ? ' focused' : ''}${o.disabled ? ' dropdown-option-header' : ''}`}
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
+                if (o.disabled) return;
                 if (freeText) commit(o.value); else onChange(o.value);
                 closeDropdown();
                 inputRef.current?.blur();

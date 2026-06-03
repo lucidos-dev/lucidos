@@ -22,13 +22,13 @@ skipped is the bar.
 ## Iteration tip — never block on long e2e commands
 
 Do NOT block on long e2e commands with `sleep + tail`. Spawn them with
-the Bash tool's `run_in_background: true` and poll with `BashOutput`.
+the Bash tool's `run_in_background: true` and poll with `TaskOutput`.
 That's per-session, doesn't time out at 10 minutes, and lets you keep
 working while the suite runs.
 
 ## Polling long-running tasks — `<retrieval_status>timeout</retrieval_status>` is NOT failure
 
-When polling a still-running task with `TaskOutput` (or `BashOutput`),
+When polling a still-running task with `TaskOutput`,
 `<retrieval_status>timeout</retrieval_status>` paired with `<status>running</status>`
 means "no new output within the retrieval window" — the underlying task is
 fine. Don't tear it down, restart it, or tight-loop re-poll: each immediate

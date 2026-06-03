@@ -76,7 +76,6 @@ pub(super) fn build_user_content_with_images(
             let Ok(bytes) = std::fs::read(&blob.path) else {
                 continue;
             };
-            use base64::Engine as _;
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             total_image_bytes += data.len();
             history_blocks.push(ContentBlock::Image {

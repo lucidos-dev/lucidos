@@ -43,7 +43,7 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
     }).replace(/'/g, "''");
 
     psql([
-      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count) VALUES ('${threadId}', 'CC Question E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Question E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${msgEventId}', 'MessageReceived', '{"text":"start","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${sessionStartedId}', 'SessionStarted', '{"session_id":"sess-e2e"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${questionEventId}', 'UserQuestionAsked', '${payload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
@@ -76,6 +76,9 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await expect(pendingBody).toBeVisible();
       await expect(pendingBody).toContainText(`Yes ${suffix}`);
       await expect(pendingBody).toContainText(`No ${suffix}`);
+      // Mode pill: single-select cards announce "Pick one" before any click,
+      // so the user knows the card commits on the first option.
+      await expect(pendingBody.locator('.cc-question-mode-badge-single')).toContainText('Pick one');
 
       // Click the second option.
       await pendingBody.locator('.cc-question-option').nth(1).click();
@@ -140,7 +143,7 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
     // Two separate UserQuestionAsked events in the same CC turn (MP1) — each
     // should be its own divider panel, not coalesced.
     psql([
-      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count) VALUES ('${threadId}', 'CC Multi Question E2E ${suffix}', 'claude_code', '${stamp(0)}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Multi Question E2E ${suffix}', 'claude_code', '${stamp(0)}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"do stuff","channel":"claude_code"}'::jsonb, '${stamp(0)}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'SessionStarted', '{"session_id":"sess-multi-e2e"}'::jsonb, '${stamp(10)}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'UserQuestionAsked', '${payload1}'::jsonb, '${stamp(20)}', 'thread', '${threadId}', '${threadId}')`,
@@ -205,7 +208,7 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
     }).replace(/'/g, "''");
 
     psql([
-      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count) VALUES ('${threadId}', 'CC Multi Select E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Multi Select E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"start","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'SessionStarted', '{"session_id":"sess-multi-e2e"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'UserQuestionAsked', '${payload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
@@ -225,6 +228,9 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
         .first();
       await expect(panel).toBeVisible({ timeout: 10_000 });
       const pendingBody = panel.locator(`.cc-question-body[data-tool-use-id="${toolUseId}"]`).first();
+      // Mode pill: multi-select cards announce "Pick one or more" up front so
+      // the user doesn't assume single-select and miss extra picks.
+      await expect(pendingBody.locator('.cc-question-mode-badge-multi')).toContainText('Pick one or more');
 
       // Submit lives in the prompt action row now (PromptInput.tsx) — there's
       // one prompt rendered per layout (desktop + mobile both mount), so scope
@@ -294,7 +300,7 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
     // true` keeps the row visible in the drawer — `get_recent_threads` filters
     // out idle threads with no response, so the seed must claim a response.
     psql([
-      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count) VALUES ('${threadId}', 'CC Cancel Question E2E ${suffix}', 'claude_code', '${stamp(0)}', 1, false, true, 'idle', 'inbox', true, 0)`,
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Cancel Question E2E ${suffix}', 'claude_code', '${stamp(0)}', 1, false, true, 'idle', 'inbox', true, 0)`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"start","channel":"claude_code"}'::jsonb, '${stamp(0)}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'SessionStarted', '{"session_id":"sess-cancel-e2e"}'::jsonb, '${stamp(10)}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'UserQuestionAsked', '${payload}'::jsonb, '${stamp(20)}', 'thread', '${threadId}', '${threadId}')`,
@@ -321,9 +327,10 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       // All options dimmed; nothing selected.
       await expect(answered.locator('.cc-question-option-selected')).toHaveCount(0);
       await expect(answered.locator('.cc-question-option-dimmed')).toHaveCount(2);
-      // Canceled badge is the explicit signal — assert via class, not text,
-      // so the assertion survives copy edits.
-      await expect(answered.locator('.cc-question-canceled-badge')).toBeVisible();
+      // Cancel renders as a disabled red Cancel button styled like the picked
+      // permission affordance — assert via class, not text, so the assertion
+      // survives copy edits.
+      await expect(answered.locator('.cc-question-cancel-picked')).toBeVisible();
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,

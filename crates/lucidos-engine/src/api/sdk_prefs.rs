@@ -53,9 +53,14 @@ const SDK_PREFS_JS: &str = r##"(function() {
   d.style.setProperty("--font-ui", FONTS[fontKey] || FONTS.monospace);
   var scale = localStorage.getItem("lucidos-ui-scale");
   if (scale) {
-    var legacy = { small: "100%", medium: "113%", large: "125%" };
-    var value = legacy[scale] || (/^\d+$/.test(scale) ? scale + "%" : null);
-    if (value) d.style.setProperty("--user-ui-scale", value);
+    // Mirrors clampUiScale in preferences.ts — keep (75, 200, 12.5) in sync.
+    var legacy = { small: 100, medium: 112.5, large: 125 };
+    var n = legacy[scale];
+    if (n === undefined) n = parseFloat(scale);
+    if (!isNaN(n)) {
+      var snapped = Math.min(200, Math.max(75, Math.round(n / 12.5) * 12.5));
+      d.style.setProperty("--user-ui-scale", snapped + "%");
+    }
   }
 })();"##;
 

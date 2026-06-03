@@ -52,6 +52,16 @@ elif [ -t 1 ]; then
     echo "Tail log:  tail -f $ENGINE_LOG"
     echo "Stop:      ./scripts/stop.sh -w $WORKSPACE"
 else
-    # Spawned by restart API — wait for engine to avoid orphaning
-    wait $ENGINE_PID
+    # Spawned by restart API — keep web-dev.sh alive while the engine is
+    # alive so the spawned process isn't orphaned. Prefer waiting on the
+    # supervisor (our direct child, survives engine restarts); fall back
+    # to polling the pidfile when start_engine reused an existing engine
+    # and didn't spawn a fresh supervisor.
+    if [ -n "${ENGINE_SUPERVISOR_PID:-}" ]; then
+        wait "$ENGINE_SUPERVISOR_PID"
+    else
+        while [ -s "$ENGINE_PIDFILE" ] && kill -0 "$(cat "$ENGINE_PIDFILE")" 2>/dev/null; do
+            sleep 5
+        done
+    fi
 fi

@@ -81,7 +81,7 @@ vi.mock('../../utils/platform', () => ({
 import {
   focusedThreadId,
   threadMap,
-  selectedRepoId,
+  selectedScope,
   connectionStatus,
 } from '../store';
 import { sendMessage } from './chat';
@@ -96,7 +96,7 @@ const mockedRemoveThreadNavEntries = vi.mocked(removeThreadNavEntries);
 beforeEach(() => {
   threadMap.value = new Map();
   focusedThreadId.value = null;
-  selectedRepoId.value = '';
+  selectedScope.value = { kind: 'lucidos' };
   connectionStatus.value = 'connected';
   mockedSubmitChat.mockReset();
   mockedRemoveThreadNavEntries.mockReset();
@@ -118,12 +118,15 @@ function makeActiveThread(id: string, overrides: Partial<ThreadState['meta']> = 
       section: 'archived',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
-      ccHasChanges: false,
-      ccRequiresRestart: false,
-      ccIsExternalRepo: false,
-      ccApplying: false,
+      blockingDescendantCount: 0, attentionDescendantCount: 0,
+      codingAgentProposed: false,
+      codingAgentRequiresRestart: false,
+      codingAgentIsExternalRepo: false,
+      codingAgentApplying: false,
+      codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
+      latestTodoList: null,
       ...overrides,
     },
     events: new Map(),

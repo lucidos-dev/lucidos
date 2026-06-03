@@ -17,10 +17,18 @@ impl LucidosEngine {
                 }
 
                 let mut all_articles: Vec<String> = Vec::new();
-                let client = reqwest::Client::builder()
+                let client = match reqwest::Client::builder()
                     .timeout(Duration::from_secs(15))
                     .build()
-                    .unwrap_or_default();
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Ok(format!(
+                            "Error: failed to build HTTP client for fetch_news: {}",
+                            e
+                        ));
+                    }
+                };
 
                 let gdelt_url = format!(
                     "https://api.gdeltproject.org/api/v2/doc/doc?query={}&mode=artlist&maxrecords={}&format=json&sort=datedesc",

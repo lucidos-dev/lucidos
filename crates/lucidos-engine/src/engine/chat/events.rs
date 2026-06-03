@@ -206,7 +206,15 @@ pub(super) fn format_relative_age(duration: chrono::Duration) -> String {
     format!("{}d ago", days)
 }
 
-/// Emit ResponseFailed to close a dangling exchange and return an error.
+/// Emit `ResponseFailed` to close a dangling exchange. Returns `Ok(())` on
+/// successful emit; `Err` only when the bus itself failed.
+///
+/// **Emit-only contract.** The caller must return `Ok(ProcessResult{
+/// response: String::new(), … })` from its fast-path so the outer
+/// `api::chat` handler does NOT emit a second `ResponseFailed` from its
+/// own `Err`-branch. Returning `Err` here would double-emit because the
+/// terminator has already landed via this function.
+///
 /// Used when a session/thread disappears between the existence check and the
 /// channel send (TOCTOU window in the follow-up fast-paths).
 pub(super) async fn emit_routing_failure(
@@ -215,7 +223,7 @@ pub(super) async fn emit_routing_failure(
     error: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::engine::thread_events::EventMeta;
-    if let Err(e) = bus
+    match bus
         .emit(crate::engine::event_bus::BusEvent::Thread {
             thread_id,
             event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
@@ -225,13 +233,18 @@ pub(super) async fn emit_routing_failure(
         })
         .await
     {
-        log!(
-            "[Chat] Failed to emit ResponseFailed for thread {}: {}",
-            thread_id,
-            e
-        );
+        Ok(_) => Ok(()),
+        Err(e) => {
+            log!(
+                "[Chat] Failed to emit ResponseFailed for thread {}: {} — outer \
+                 handler will emit its own ResponseFailed since the routing \
+                 terminator never landed",
+                thread_id,
+                e,
+            );
+            Err(e)
+        }
     }
-    Err(error.into())
 }
 
 #[cfg(test)]
@@ -289,6 +302,7 @@ mod origin_invariants {
         let origin = MessageOrigin::Api {
             user_agent: Some("curl/8".into()),
             mode: ActorMode::Human,
+            source_thread_id: None,
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
@@ -312,6 +326,7 @@ mod origin_invariants {
         let origin = MessageOrigin::Api {
             user_agent: Some("MyApp/1.0".into()),
             mode: ActorMode::Agent,
+            source_thread_id: None,
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
@@ -338,6 +353,7 @@ mod origin_invariants {
         let origin = MessageOrigin::Api {
             user_agent: Some("ScriptRunner/2.0".into()),
             mode: ActorMode::Engine,
+            source_thread_id: None,
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
@@ -361,6 +377,7 @@ mod origin_invariants {
         let origin = MessageOrigin::Api {
             user_agent: None,
             mode: ActorMode::Agent,
+            source_thread_id: None,
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
@@ -480,7 +497,7 @@ mod origin_invariants {
         );
         assert!(
             res.is_err(),
-            "ParentThread origin must reject mode that doesn't match the carried field"
+            "ThreadLink origin must reject mode that doesn't match the carried field"
         );
     }
 
@@ -684,7 +701,7 @@ mod tests {
         let tid = Uuid::new_v4();
 
         let result = emit_routing_failure(&mock, tid, "session gone").await;
-        assert!(result.is_err());
+        assert!(result.is_ok(), "successful emit must return Ok");
 
         let events = mock.emitted_events();
         assert_eq!(events.len(), 1, "must emit exactly one event");
@@ -704,34 +721,50 @@ mod tests {
         }
     }
 
+    /// `emit_routing_failure` must return `Ok` after a successful emit so
+    /// the chat handler chain doesn't double-emit. The outer `api::chat`
+    /// handler catches every `Err` from `process_message` and emits its own
+    /// `ResponseFailed` — an `Err` here would land a second terminator on
+    /// top of the one this function already emitted.
     #[tokio::test]
-    async fn routing_failure_returns_error_with_message() {
+    async fn routing_failure_returns_ok_after_emit() {
         let mock = MockEventBus::new();
         let tid = Uuid::new_v4();
-
-        let err = emit_routing_failure(
-            &mock,
-            tid,
-            "Thread ended while routing message. Please try again.",
-        )
-        .await
-        .unwrap_err();
+        let result = emit_routing_failure(&mock, tid, "session gone").await;
+        assert!(
+            result.is_ok(),
+            "successful emit must return Ok so the outer handler doesn't double-emit \
+             ResponseFailed for the same terminator"
+        );
+        let events = mock.emitted_events();
         assert_eq!(
-            err.to_string(),
-            "Thread ended while routing message. Please try again."
+            events.len(),
+            1,
+            "must emit exactly one ResponseFailed and then yield to the caller — \
+             the caller is responsible for returning Ok(ProcessResult) so the api \
+             layer's Err-branch emit doesn't run a second time"
         );
     }
 
     #[tokio::test]
-    async fn routing_failure_emits_even_when_bus_fails() {
+    async fn routing_failure_returns_err_only_when_bus_fails() {
         let mock = MockEventBus::new();
         *mock.fail_with.lock().unwrap() = Some("db down".into());
         let tid = Uuid::new_v4();
-
-        // Should still return Err (the routing error), not the bus error
         let result = emit_routing_failure(&mock, tid, "session gone").await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), "session gone");
+        assert!(
+            result.is_err(),
+            "bus-emit failure is a real engine error — caller's outer handler \
+             SHOULD emit its own ResponseFailed in that case (the in-flight \
+             routing terminator never landed, so no double-emit risk)"
+        );
+        // The error message must surface the bus failure, not the original
+        // routing-message — the upper layers log on Err and the bus failure
+        // is the more actionable diagnostic.
+        assert!(
+            result.unwrap_err().to_string().contains("db down"),
+            "bus-emit Err must propagate so post-mortem can find the bus cause",
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,8 @@
-import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, SETTINGS_NAV_ITEMS, triggers, appsList, parseRepoPath, repoPending, selectedChange } from '../../store/store';
+import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, SETTINGS_NAV_ITEMS, triggers, appsList, parseRepoPath, repoPending, selectedChange, wipPreviewThreadId, threadMap } from '../../store/store';
 import type { ThreadChannel, InlineForm } from '../../store/store';
 import { loadedOr } from '../../store/types';
 import { formatChannel } from '../../utils/formatChannel';
+import { PENDING_TITLE_PLACEHOLDER } from '../../store/thread-events';
 
 const menuLabels: Record<string, string> = {
   files: 'Files', apps: 'Apps', triggers: 'Triggers',
@@ -18,9 +19,9 @@ export const CHANNEL_OPTIONS: { value: ThreadChannel; label: string }[] = [
 function getFormTitle(form: InlineForm): string {
   switch (form.type) {
     case 'trigger': {
-      if (!form.taskId) return 'New Trigger';
-      const task = loadedOr(triggers.value, []).find(t => t.id === form.taskId);
-      return task?.name || 'Trigger';
+      if (!form.triggerId) return 'New Trigger';
+      const trigger = loadedOr(triggers.value, []).find(t => t.id === form.triggerId);
+      return trigger?.name || 'Trigger';
     }
     case 'app-edit': {
       const app = loadedOr(appsList.value, []).find(s => s.id === form.appId);
@@ -46,7 +47,17 @@ export function getContentTitle(): string {
   const active = activeMenuItem.value;
 
   if (overlay?.type === 'form') return getFormTitle(form!);
-  if (overlay?.type === 'app-ui') return overlay.app.name;
+  if (overlay?.type === 'app-ui') {
+    const wipTid = wipPreviewThreadId.value;
+    if (wipTid) {
+      const wipTitle = threadMap.value.get(wipTid)?.meta.title;
+      if (wipTitle && wipTitle !== PENDING_TITLE_PLACEHOLDER) {
+        return `${overlay.app.name} (WIP by ${wipTitle})`;
+      }
+      if (wipTitle) return `${overlay.app.name} (WIP)`;
+    }
+    return overlay.app.name;
+  }
   if (overlay?.type === 'file-preview') {
     const fileName = overlay.path.split('/').pop() || '';
     const desc = getDiffDescription();

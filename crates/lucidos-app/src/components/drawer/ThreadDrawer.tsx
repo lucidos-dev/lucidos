@@ -1,17 +1,19 @@
+import { Fragment } from 'preact';
 import type { ComponentChildren } from 'preact';
 import { useRef, useEffect, useCallback } from 'preact/hooks';
+import { memo } from 'preact/compat';
 import { signal } from '@preact/signals';
-import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, threadsLoaded, splitRatio, ThreadChannel, ALL_CHANNELS, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, draftsViewActive } from '../../store/store';
+import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, draftsViewActive } from '../../store/store';
+import { threadPassesChannelFilter } from '../../store/threadFilter';
 import { navigateToPane } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
-import { loadOlderThreads, ensureThreadInMap } from '../../store/actions/thread-loading';
+import { loadOlderThreads, reloadAfterFilterChange, ensureThreadInMap } from '../../store/actions/thread-loading';
+import { threadFilterActive } from '../../store/threadFilterActive';
 import { ThreadStatusIcon, resolveVisualStatus } from '../shared/ThreadStatusIcon';
 import { CopyThreadRefButton } from '../shared/CopyThreadRefButton';
-import { byRecent, byReviewOrder } from '../../store/thread-events';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
-import { draftIsEmpty, getDraft } from '../../store/composeDrafts';
-import { displaySection } from '../../generated/thread-lifecycle';
-import type { ArchiveState, DisplaySection } from '../../generated/thread-lifecycle';
+import { getDraft } from '../../store/composeDrafts';
+import type { DisplaySection } from '../../generated/thread-lifecycle';
 
 type DrawerSectionName = DisplaySection | 'new';
 import { formatChannel } from '../../utils/formatChannel';
@@ -23,7 +25,10 @@ import { useScrollMemory } from '../../hooks/useScrollMemory';
 import { isMobile } from '../../utils/viewport';
 import type { ThreadSearchResult } from '../../api/threads';
 
-const VALID_CHANNELS: ReadonlySet<string> = new Set<string>(ALL_CHANNELS);
+// `threadPassesChannelFilter` lives in `store/threadFilter.ts` (shared with the
+// infinite-scroll cursor in `thread-loading.ts`); re-exported here so existing
+// importers (and tests) keep their path.
+export { threadPassesChannelFilter };
 
 /** Currently keyboard-highlighted thread ID in the drawer. */
 const highlightedThreadId = signal<string | null>(null);
@@ -37,9 +42,25 @@ export function selectHighlighted() {
     const searchResult = threadSearchResults.value;
     if (threadSearchQuery.value.trim().length > 0 && searchResult.status === 'loaded') {
         const match = searchResult.data.find((r: ThreadSearchResult) => r.thread_id === id);
-        if (match) ensureThreadInMap(match);
+        if (match) void ensureThreadInMap(match);
     }
     focusThread(id);
+}
+
+/** Collapse (`collapse: true`) or expand (`collapse: false`) the highlighted
+ *  thread's family. No-op (returns false) when no thread is highlighted, the
+ *  highlighted thread has no children (no chevron), or the family is already
+ *  in the requested state. The caller uses the return value to decide whether
+ *  to consume the keystroke. */
+function setHighlightedFamilyCollapse(collapse: boolean): boolean {
+    const id = highlightedThreadId.value;
+    if (!id) return false;
+    const thread = threadMap.value.get(id);
+    if (!thread || thread.meta.totalChildrenCount === 0) return false;
+    const isCollapsed = collapsedFamilies.value.has(id);
+    if (isCollapsed === collapse) return false;
+    toggleFamilyCollapse(id);
+    return true;
 }
 
 export function moveHighlight(delta: number) {
@@ -83,6 +104,13 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
         } else if (e.key === 'Enter') {
             e.preventDefault();
             selectHighlighted();
+        } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+            // Only intercept when the highlighted row is a parent — otherwise
+            // let the default keystroke through (no row has anything to do
+            // with horizontal arrow keys).
+            if (setHighlightedFamilyCollapse(e.key === 'ArrowLeft')) {
+                e.preventDefault();
+            }
         }
     }, []);
 
@@ -106,78 +134,17 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     );
 }
 
-export type ThreadSections = {
-    review: ThreadState[];
-    active: ThreadState[];
-    saved: ThreadState[];
-    archive: ThreadState[];
-    statusMap: Map<string, ThreadStatus>;
-    /** Saved threads that would be in 'review' if not saved. Powers the
-     *  saved-section badge — surfaces what saved-overrides-routing hides. */
-    savedReviewCount: number;
-};
 
-/** Group threads into drawer sections. Section membership is purely a function
- *  of thread state — see displaySection() in the lifecycle contract. Composing
- *  and discarded threads are excluded from the four lifecycle sections; the
- *  caller surfaces composing threads in the New section instead. */
-export function categorizeThreads(threads: ThreadState[]): ThreadSections {
-    const out: ThreadSections = {
-        review: [], active: [], saved: [], archive: [],
-        statusMap: new Map(),
-        savedReviewCount: 0,
-    };
-    for (const t of threads) {
-        if (t.meta.state === 'composing' || t.meta.state === 'discarded') continue;
-        const status = effectiveThreadStatus(t);
-        out.statusMap.set(t.meta.id, status);
-        const display = getThreadDisplaySection(t);
-        switch (display) {
-            case 'active': out.active.push(t); break;
-            case 'review': out.review.push(t); break;
-            case 'saved': out.saved.push(t); break;
-            case 'archive': out.archive.push(t); break;
-        }
-        if (display === 'saved'
-            && displaySection(t.meta.section as ArchiveState, status, false, t.meta.activeChildrenCount > 0, t.meta.ccHasChanges) === 'review') {
-            out.savedReviewCount++;
-        }
-    }
-    return out;
-}
+// Section priority for family-aware routing. Lower = higher priority. Active
+// outranks review: any running descendant keeps the family under Active even
+// when a sibling has a real CTA (codingAgentProposed / waiting_for_user_answer
+// / failed) — the CTA still renders inline on the child row. The reverse
+// (review beating active) drags a still-working family out of Active the
+// moment an idle child's displaySection falls through to 'review'.
 
-/** New section rows. Empty composing rows are filtered out — POST/DELETE
- *  races, SSE skeletons from a peer's ThreadStarted with no follow-up
- *  compose change, and failed local discards leave server-side rows whose
- *  only UI surface would be a placeholder "Empty draft" title. */
-export function composingThreads(threads: ReadonlyMap<string, ThreadState>): ThreadState[] {
-    const out: ThreadState[] = [];
-    for (const t of threads.values()) {
-        if (t.meta.state === 'composing' && threadHasUnsentDraft(t)) out.push(t);
-    }
-    out.sort((a, b) => b.meta.updatedAt.localeCompare(a.meta.updatedAt));
-    return out;
-}
-
-/** Drafts view rows: composing threads with content + active threads with
- *  follow-up content. Discarded skipped (stale compose fields lingering on
- *  tombstoned rows must not resurface). Composing (new) ahead of follow-ups,
- *  most recent first within each group. */
-export function draftThreads(threads: ReadonlyMap<string, ThreadState>): ThreadState[] {
-    const out: ThreadState[] = [];
-    for (const t of threads.values()) {
-        if (t.meta.state === 'discarded') continue;
-        if (threadHasUnsentDraft(t)) out.push(t);
-    }
-    out.sort((a, b) => {
-        const aNew = a.meta.state === 'composing' ? 0 : 1;
-        const bNew = b.meta.state === 'composing' ? 0 : 1;
-        if (aNew !== bNew) return aNew - bNew;
-        return byRecent(a, b);
-    });
-    return out;
-}
-
+import { categorizeThreads, composingThreads, computeFamilyDecorations, computeFamilyGraph, computeFamilyKeys, computeFamilySections, depthStyle, draftThreads, filterByTopThread, hasCollapsedAncestor, nestByParent, threadHasUnsentDraft } from './family-graph';
+import type { FamilyDecorations, FamilyGraph, NestedThread, ThreadSections } from './family-graph';
+export * from './family-graph';
 function ThreadList() {
     const containerRef = useRef<HTMLDivElement>(null);
     const portalRef = useRef<HTMLDivElement>(null);
@@ -190,44 +157,70 @@ function ThreadList() {
     const composingList = filter.size === 0 ? [] : composingThreads(threadMap.value);
 
     let categorized: ThreadSections;
+    let familyGraph: FamilyGraph = { byId: new Map(), rootByThread: new Map() };
+    let decorations: FamilyDecorations = { routedByThread: new Map(), liftedRoots: new Set() };
     if (hydrated) {
         const triggerSelection = selectedTriggerIds.value;
         const repoSelection = selectedRepoIds.value;
-        const allThreads = Array.from(threadMap.value.values()).filter(t => {
-            const ch = t.meta.channel;
-            const channelOk = filter.has(ch as ThreadChannel) || !VALID_CHANNELS.has(ch);
-            if (!channelOk) return false;
-            if (ch === 'trigger' && triggerSelection.size > 0) {
-                return t.meta.triggerId != null && triggerSelection.has(t.meta.triggerId);
-            }
-            if (ch === 'claude_code' && repoSelection.size > 0) {
-                return t.meta.repoId != null && repoSelection.has(t.meta.repoId);
-            }
-            return true;
-        });
-        categorized = categorizeThreads(allThreads);
-
-        const byRevived = (a: ThreadState, b: ThreadState) =>
-            (b.meta.lastRevivedAt || b.meta.createdAt).localeCompare(a.meta.lastRevivedAt || a.meta.createdAt);
-        categorized.review.sort(byReviewOrder);
-        categorized.active.sort(byRevived);
-        categorized.saved.sort(byRecent);
-        categorized.archive.sort(byRecent);
+        const appSelection = selectedAppIds.value;
+        // Filter at top-thread scope so a family is shown iff its top-thread
+        // passes — a per-thread filter would drop sub-threads while the
+        // parent row still advertised them via meta.totalChildrenCount.
+        // Share the same graph across routing, sort keys, decorations, and
+        // the collapse filter; rebuilding it for the filtered subset would
+        // double the per-render parent-walk cost.
+        //
+        // When a trigger/repo/app sub-selection is active, switch to any-member
+        // matching: the repo/app/trigger is a property of a specific CC thread,
+        // not its (often chat/trigger) top-thread, so a CC thread in the
+        // selected repo/app must surface with its family even when the root's
+        // channel is filtered out.
+        const subSelectionActive =
+            triggerSelection.size > 0 || repoSelection.size > 0 || appSelection.size > 0;
+        const unfilteredArr = Array.from(threadMap.value.values());
+        familyGraph = computeFamilyGraph(unfilteredArr);
+        const allThreads = filterByTopThread(unfilteredArr, familyGraph, t =>
+            threadPassesChannelFilter(t, filter, triggerSelection, repoSelection, appSelection),
+            subSelectionActive,
+        );
+        const familySections = computeFamilySections(allThreads, familyGraph);
+        categorized = categorizeThreads(allThreads, familyGraph, familySections);
+        decorations = computeFamilyDecorations(allThreads, familyGraph, familySections);
+        const familyKeys = computeFamilyKeys(allThreads, familyGraph);
+        const byFamilyRevived = (a: ThreadState, b: ThreadState) =>
+            familyKeys.get(b.meta.id)!.revivedKey.localeCompare(familyKeys.get(a.meta.id)!.revivedKey);
+        const byFamilyRecent = (a: ThreadState, b: ThreadState) =>
+            familyKeys.get(b.meta.id)!.recentKey.localeCompare(familyKeys.get(a.meta.id)!.recentKey);
+        const byFamilyReview = (a: ThreadState, b: ThreadState) => {
+            const ka = familyKeys.get(a.meta.id)!;
+            const kb = familyKeys.get(b.meta.id)!;
+            if (ka.reviewTier !== kb.reviewTier) return ka.reviewTier - kb.reviewTier;
+            return kb.recentKey.localeCompare(ka.recentKey);
+        };
+        categorized.review.sort(byFamilyReview);
+        categorized.active.sort(byFamilyRevived);
+        categorized.saved.sort(byFamilyRecent);
+        categorized.archive.sort(byFamilyRecent);
     } else {
         categorized = {
             review: [], active: [], saved: [], archive: [],
             statusMap: new Map(),
-            savedReviewCount: 0,
+            savedAttentionCount: 0,
         };
     }
-    const { review, active, saved, archive, statusMap, savedReviewCount } = categorized;
+    const { review, active, saved, archive, statusMap, savedAttentionCount } = categorized;
 
-    const sections: { name: DrawerSectionName; threads: ThreadState[] }[] = [
-        { name: 'new', threads: composingList },
-        { name: 'review', threads: review },
-        { name: 'active', threads: active },
-        { name: 'saved', threads: saved },
-        { name: 'archive', threads: archive },
+    // Drop descendants of collapsed families. The parent itself stays visible
+    // (FamilyToggleRow lets the user re-expand).
+    const collapsedFamiliesSet = collapsedFamilies.value;
+    const filterCollapsed = (nested: NestedThread[]) =>
+        nested.filter(n => !hasCollapsedAncestor(n.thread.meta.id, collapsedFamiliesSet, familyGraph));
+    const sections: { name: DrawerSectionName; threads: NestedThread[] }[] = [
+        { name: 'new', threads: nestByParent(composingList) },
+        { name: 'review', threads: filterCollapsed(nestByParent(review)) },
+        { name: 'active', threads: filterCollapsed(nestByParent(active)) },
+        { name: 'saved', threads: filterCollapsed(nestByParent(saved)) },
+        { name: 'archive', threads: filterCollapsed(nestByParent(archive)) },
     ];
 
     const sectionDefs = sections
@@ -236,7 +229,7 @@ function ThreadList() {
             name: s.name,
             ids: [
                 `__section_${s.name}`,
-                ...s.threads.map(t => t.meta.id),
+                ...s.threads.map(n => n.thread.meta.id),
             ],
         }));
 
@@ -245,30 +238,41 @@ function ThreadList() {
     const flatIds: string[] = [];
     for (const s of sections) {
         if (collapsed.has(s.name)) continue;
-        flatIds.push(...s.threads.map(t => t.meta.id));
+        flatIds.push(...s.threads.map(n => n.thread.meta.id));
     }
     const flatKey = flatIds.join(',');
     useEffect(() => { navigableIds.value = flatIds; }, [flatKey]);
 
     useFlipTransitions(containerRef, portalRef, sectionDefs, filter);
 
-    // Reset pagination when channel, trigger, or repo filter changes —
-    // different filter = different cursor space.
+    // When the channel / trigger / repo / app filter changes, re-arm pagination
+    // AND eagerly fetch the first page of matching threads. A different filter
+    // is a different cursor space, and the matches may be entirely outside the
+    // loaded window (e.g. a repo whose threads are all archived) — relying on
+    // the IntersectionObserver sentinel alone strands the user on "No threads"
+    // because it's suppressed while Archive is collapsed and only re-fires when
+    // threadHasMore flips. `reloadAfterFilterChange` makes population
+    // deterministic. The prevRef guard suppresses the mount run (no fetch on
+    // first render; the initial window load + the observer cover that case).
     const currentTriggers = selectedTriggerIds.value;
     const currentRepos = selectedRepoIds.value;
+    const currentApps = selectedAppIds.value;
     const prevFilterRef = useRef(filter);
     const prevTriggersRef = useRef(currentTriggers);
     const prevReposRef = useRef(currentRepos);
+    const prevAppsRef = useRef(currentApps);
     useEffect(() => {
         if (prevFilterRef.current !== filter
             || prevTriggersRef.current !== currentTriggers
-            || prevReposRef.current !== currentRepos) {
+            || prevReposRef.current !== currentRepos
+            || prevAppsRef.current !== currentApps) {
             prevFilterRef.current = filter;
             prevTriggersRef.current = currentTriggers;
             prevReposRef.current = currentRepos;
-            threadHasMore.value = true;
+            prevAppsRef.current = currentApps;
+            void reloadAfterFilterChange();
         }
-    }, [filter, currentTriggers, currentRepos]);
+    }, [filter, currentTriggers, currentRepos, currentApps]);
 
     // Infinite scroll: observe a sentinel at the bottom of the list.
     // loadOlderThreads self-guards against concurrent calls.
@@ -280,8 +284,8 @@ function ThreadList() {
 
         const observer = new IntersectionObserver(
             (entries) => {
-                if (entries[0]?.isIntersecting && shouldLoadOlderOnIntersection(collapsedSections.value)) {
-                    loadOlderThreads();
+                if (entries[0]?.isIntersecting && shouldLoadOlderOnIntersection(collapsedSections.value, threadFilterActive.value)) {
+                    void loadOlderThreads();
                 }
             },
             { root: sentinel.closest('.thread-drawer-list'), threshold: 0 },
@@ -307,13 +311,46 @@ function ThreadList() {
                 {sections.map(s => {
                     if (s.threads.length === 0) return null;
                     const title = s.name.charAt(0).toUpperCase() + s.name.slice(1);
-                    const reviewBadge = s.name === 'saved' ? savedReviewCount : 0;
+                    const attentionBadge = s.name === 'saved' ? savedAttentionCount : 0;
                     const isNew = s.name === 'new';
                     return (
-                        <DrawerSection key={s.name} sectionKey={s.name} title={title} reviewBadge={reviewBadge}>
-                            {s.threads.map(t => isNew
-                                ? <ComposingThreadRow key={t.meta.id} thread={t} />
-                                : <ThreadRow key={t.meta.id} threadId={t.meta.id} status={statusMap.get(t.meta.id)!} />)}
+                        <DrawerSection key={s.name} sectionKey={s.name} title={title} attentionBadge={attentionBadge}>
+                            {s.threads.map(n => {
+                                if (isNew) {
+                                    return <ComposingThreadRow key={n.thread.meta.id} thread={n.thread} depth={n.depth} />;
+                                }
+                                const id = n.thread.meta.id;
+                                const root = familyGraph.rootByThread.get(id);
+                                const familyIsLifted = root !== undefined && decorations.liftedRoots.has(root);
+                                const isRoot = root === id;
+                                const naturalSection = getThreadDisplaySection(n.thread);
+                                const routedSection = decorations.routedByThread.get(id);
+                                const isLiftedParent = familyIsLifted && isRoot;
+                                const isResponsibleChild = familyIsLifted && !isRoot && naturalSection === routedSection;
+                                const totalChildren = n.thread.meta.totalChildrenCount;
+                                const activeChildren = n.thread.meta.activeChildrenCount;
+                                const isCollapsed = collapsedFamiliesSet.has(id);
+                                return (
+                                    <Fragment key={id}>
+                                        <ThreadRow
+                                            threadId={id}
+                                            status={statusMap.get(id)!}
+                                            depth={n.depth}
+                                            isLiftedParent={isLiftedParent}
+                                            isResponsibleChild={isResponsibleChild}
+                                        />
+                                        {totalChildren > 0 && (
+                                            <FamilyToggleRow
+                                                parentId={id}
+                                                depth={n.depth + 1}
+                                                totalChildren={totalChildren}
+                                                activeChildren={activeChildren}
+                                                isCollapsed={isCollapsed}
+                                            />
+                                        )}
+                                    </Fragment>
+                                );
+                            })}
                         </DrawerSection>
                     );
                 })}
@@ -332,29 +369,49 @@ function ThreadList() {
 }
 
 const COLLAPSED_KEY = 'lucidos-drawer-collapsed';
+const COLLAPSED_FAMILIES_KEY = 'lucidos-drawer-collapsed-families';
 
-function loadCollapsed(): Set<string> {
+function loadStringSet(key: string): Set<string> {
     try {
-        const raw = localStorage.getItem(COLLAPSED_KEY);
+        const raw = localStorage.getItem(key);
         return raw ? new Set(JSON.parse(raw)) : new Set();
     } catch { return new Set(); }
 }
 
-function saveCollapsed(set: Set<string>) {
-    localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...set]));
+function saveStringSet(key: string, set: Set<string>) {
+    localStorage.setItem(key, JSON.stringify([...set]));
 }
 
 /** Shared collapsed state so ThreadList can read it for navigableIds. */
-const collapsedSections = signal(loadCollapsed());
+const collapsedSections = signal(loadStringSet(COLLAPSED_KEY));
+
+/** Per-family collapse state keyed by parent thread id. Mirrors the
+ *  `collapsedSections` precedent: localStorage-backed, per-device, not
+ *  event-sourced. */
+const collapsedFamilies = signal(loadStringSet(COLLAPSED_FAMILIES_KEY));
+
+export function toggleFamilyCollapse(threadId: string) {
+    const next = new Set(collapsedFamilies.value);
+    if (next.has(threadId)) next.delete(threadId);
+    else next.add(threadId);
+    collapsedFamilies.value = next;
+    saveStringSet(COLLAPSED_FAMILIES_KEY, next);
+}
 
 // Skip pagination when Archive is collapsed: collapsing shrinks the list, pops the
 // sentinel into view, and would silently bloat the count badge on every toggle.
 // Archive is the bottom section and the one that absorbs paginated older threads.
-export function shouldLoadOlderOnIntersection(collapsed: ReadonlySet<string>): boolean {
-    return !collapsed.has('archive');
+//
+// Exception: when a filter is active, yield to it. A trigger/repo/app filter
+// whose matches are all archived can ONLY land in the Archive section, so
+// blocking pagination there would strand the user on "No threads" — the whole
+// point of selecting the facet. The badge-bloat case the guard protects against
+// is the unfiltered view, where `filterActive` is false and the block stands.
+export function shouldLoadOlderOnIntersection(collapsed: ReadonlySet<string>, filterActive: boolean): boolean {
+    return filterActive || !collapsed.has('archive');
 }
 
-function DrawerSection({ sectionKey, title, children, reviewBadge = 0 }: { sectionKey: string; title: string; children: ComponentChildren; reviewBadge?: number }) {
+function DrawerSection({ sectionKey, title, children, attentionBadge = 0 }: { sectionKey: string; title: string; children: ComponentChildren; attentionBadge?: number }) {
     const collapsed = collapsedSections.value.has(sectionKey);
 
     const toggle = () => {
@@ -362,7 +419,7 @@ function DrawerSection({ sectionKey, title, children, reviewBadge = 0 }: { secti
         if (collapsed) next.delete(sectionKey);
         else next.add(sectionKey);
         collapsedSections.value = next;
-        saveCollapsed(next);
+        saveStringSet(COLLAPSED_KEY, next);
     };
 
     return (
@@ -373,9 +430,9 @@ function DrawerSection({ sectionKey, title, children, reviewBadge = 0 }: { secti
                  role="button"
                  aria-expanded={!collapsed}>
                 {title}
-                {reviewBadge > 0 && (
-                    <span class="section-review-badge" data-tooltip="Saved threads in review">
-                        {reviewBadge}
+                {attentionBadge > 0 && (
+                    <span class="section-attention-badge" data-tooltip="Saved threads that need attention">
+                        {attentionBadge}
                     </span>
                 )}
             </div>
@@ -384,7 +441,7 @@ function DrawerSection({ sectionKey, title, children, reviewBadge = 0 }: { secti
     );
 }
 
-export function ComposingThreadRow({ thread, onAfterClick }: { thread: ThreadState; onAfterClick?: () => void }) {
+export function ComposingThreadRow({ thread, depth = 0, onAfterClick }: { thread: ThreadState; depth?: number; onAfterClick?: () => void }) {
     const isFocused = focusedThreadId.value === thread.meta.id;
     const isHighlighted = highlightedThreadId.value === thread.meta.id;
     const classes = ['list-row', 'thread-row', 'compose-draft-row'];
@@ -393,7 +450,7 @@ export function ComposingThreadRow({ thread, onAfterClick }: { thread: ThreadSta
     const modeLabel = getDraft(thread.meta.id).mode === 'claude_code' ? 'Claude Code' : 'Lucidos';
 
     return (
-        <div data-flip-id={thread.meta.id}>
+        <div data-flip-id={thread.meta.id} style={depthStyle(depth)} class={depth > 0 ? 'thread-row-wrap is-nested' : 'thread-row-wrap'}>
             <div class={classes.join(' ')}
                  data-thread-nav={thread.meta.id}
                  onClick={() => {
@@ -417,7 +474,7 @@ export function ComposingThreadRow({ thread, onAfterClick }: { thread: ThreadSta
     );
 }
 
-interface ThreadRowData {
+interface ThreadRowContentProps {
     id: string;
     title: string;
     channel: string;
@@ -426,77 +483,158 @@ interface ThreadRowData {
     exchangeCount: number;
     totalChildren: number;
     activeChildren: number;
-    ccHasChanges: boolean;
+    codingAgentProposed: boolean;
     needsReview: boolean;
     hasDraft: boolean;
+    isFocused: boolean;
+    isHighlighted: boolean;
+    /** Set when this row is the root of a lifted family — its own natural
+     *  section is lower-priority than where the family was routed. Drives the
+     *  demoted-parent styling so the row reads as "I'm here under protest". */
+    isLiftedParent?: boolean;
+    /** Set when this row is a non-root descendant whose natural section
+     *  matches the routed section, inside a lifted family — i.e. the row that
+     *  earned the lift. Drives the bright accent rail. */
+    isResponsibleChild?: boolean;
     onClick: () => void;
 }
 
-function ThreadRowContent({ data }: { data: ThreadRowData }) {
-    const hasChildren = data.totalChildren > 0;
-    const hasActiveChildren = data.activeChildren > 0;
-    const doneCount = data.totalChildren - data.activeChildren;
+function ThreadRowContentImpl(props: ThreadRowContentProps) {
+    const hasActiveChildren = props.activeChildren > 0;
 
     const classes = ['list-row', 'thread-row'];
-    if (focusedThreadId.value === data.id) classes.push('thread-row-focused');
-    if (highlightedThreadId.value === data.id) classes.push('thread-row-highlighted');
-    if (data.needsReview) classes.push('thread-row-review');
+    if (props.isFocused) classes.push('thread-row-focused');
+    if (props.isHighlighted) classes.push('thread-row-highlighted');
+    if (props.needsReview) classes.push('thread-row-review');
+    if (props.isLiftedParent) classes.push('thread-row-lifted-parent');
+    if (props.isResponsibleChild) classes.push('thread-row-lifted-child');
 
     return (
         <div class={classes.join(' ')}
-             data-thread-nav={data.id}
-             onClick={data.onClick}>
-            <ThreadStatusIcon status={resolveVisualStatus(data.status, hasActiveChildren, data.ccHasChanges)} />
+             data-thread-nav={props.id}
+             onClick={props.onClick}>
+            <ThreadStatusIcon status={resolveVisualStatus(props.status, hasActiveChildren, props.codingAgentProposed)} />
             <div class="thread-row-left">
                 <span class="thread-row-title-row">
-                    <span class="thread-row-title">{data.title}</span>
-                    {data.hasDraft && <span class="draft-indicator" data-tooltip="Has unsent draft">Draft</span>}
+                    <span class="thread-row-title">{props.title}</span>
+                    {props.hasDraft && <span class="draft-indicator" data-tooltip="Has unsent draft">Draft</span>}
                 </span>
-                {(data.exchangeCount > 1 || hasChildren) && (
-                    <span class={`thread-row-meta${hasChildren ? ' thread-row-children-progress' : ''}`}>
-                        {data.exchangeCount > 1 && `${data.exchangeCount} exchanges`}
-                        {data.exchangeCount > 1 && hasChildren && ' · '}
-                        {hasChildren && `${doneCount}/${data.totalChildren} done`}
-                    </span>
+                {props.exchangeCount > 1 && (
+                    <span class="thread-row-meta">{props.exchangeCount} exchanges</span>
                 )}
             </div>
             <div class="thread-row-right">
-                <span class="thread-row-time">{data.timestamp}</span>
-                <span class={`label message-channel-tag${data.channel === 'error_unknown_channel' ? ' channel-error' : ''}`}>{formatChannel(data.channel)}</span>
+                <span class="thread-row-time">{props.timestamp}</span>
+                <span class={`label message-channel-tag${props.channel === 'error_unknown_channel' ? ' channel-error' : ''}`}>{formatChannel(props.channel)}</span>
                 <span class="thread-row-actions">
-                    <CopyThreadRefButton threadId={data.id} title={data.title} stopPropagation extraClass="thread-row-action" />
+                    <CopyThreadRefButton threadId={props.id} title={props.title} stopPropagation extraClass="thread-row-action" />
                 </span>
             </div>
         </div>
     );
 }
 
-function threadHasUnsentDraft(thread: ThreadState | undefined): boolean {
-    if (!thread) return false;
-    return !draftIsEmpty(getDraft(thread.meta.id));
+/** Skip the render when nothing the row paints has changed. Drawer flushes
+ *  fire on every SSE event in the workspace — without memo, all 100+ visible
+ *  rows re-execute their render function and reconcile their VDOM even when
+ *  only one thread's state moved. `onClick` is intentionally excluded from
+ *  the equality check: the closure changes per parent render, but it always
+ *  closes over the same threadId, so a "stale" reference still does the
+ *  right thing. */
+const ThreadRowContent = memo(ThreadRowContentImpl, (prev, next) =>
+    prev.id === next.id
+    && prev.title === next.title
+    && prev.channel === next.channel
+    && prev.status === next.status
+    && prev.timestamp === next.timestamp
+    && prev.exchangeCount === next.exchangeCount
+    && prev.totalChildren === next.totalChildren
+    && prev.activeChildren === next.activeChildren
+    && prev.codingAgentProposed === next.codingAgentProposed
+    && prev.needsReview === next.needsReview
+    && prev.hasDraft === next.hasDraft
+    && prev.isFocused === next.isFocused
+    && prev.isHighlighted === next.isHighlighted
+    && prev.isLiftedParent === next.isLiftedParent
+    && prev.isResponsibleChild === next.isResponsibleChild
+);
+
+/** Disclosure bar rendered under a parent row. On its own row (not inline on
+ *  the parent) so same-depth siblings render identically regardless of which
+ *  ones happen to have grandchildren. */
+function FamilyToggleRow({ parentId, depth, totalChildren, activeChildren, isCollapsed }: {
+    parentId: string;
+    depth: number;
+    totalChildren: number;
+    activeChildren: number;
+    isCollapsed: boolean;
+}) {
+    const doneCount = totalChildren - activeChildren;
+    // Visible label reads as a fraction ("1/1 sub-threads done"); aria reads as
+    // a bare count, so it stays smart-plural ("Show 1 sub-thread").
+    const progressLabel = `${doneCount}/${totalChildren} sub-threads done`;
+    const a11yCount = `${totalChildren} sub-thread${totalChildren === 1 ? '' : 's'}`;
+    return (
+        <div class="thread-row-wrap is-nested family-toggle-wrap" style={depthStyle(depth)}>
+            <button
+                type="button"
+                class={`family-toggle${isCollapsed ? ' is-collapsed' : ''}`}
+                onClick={() => toggleFamilyCollapse(parentId)}
+                aria-label={isCollapsed ? `Show ${a11yCount}` : `Hide ${a11yCount}`}
+                aria-expanded={!isCollapsed}>
+                <span class="family-toggle-glyph" aria-hidden="true">{isCollapsed ? '▸' : '▾'}</span>
+                <span class="family-toggle-progress">{progressLabel}</span>
+            </button>
+        </div>
+    );
 }
 
-export function ThreadRow({ threadId, status, onAfterClick }: { threadId: string; status: ThreadStatus; onAfterClick?: () => void }) {
+// Reading composeDrafts here would fan a re-render to every visible ThreadRow
+// per keystroke — the lag this signal was added to prevent.
+
+export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isResponsibleChild, onAfterClick }: {
+    threadId: string;
+    status: ThreadStatus;
+    depth?: number;
+    isLiftedParent?: boolean;
+    isResponsibleChild?: boolean;
+    onAfterClick?: () => void;
+}) {
+    // Signal reads stay here so each row's subscription set is narrow: the
+    // row re-renders on threadMap / focusedThreadId / highlightedThreadId /
+    // draftPresentThreadIds, but the memo on ThreadRowContent below short-
+    // circuits when none of the primitives it derives actually changed —
+    // turning a per-flush N-row VDOM storm into one render per moved row.
     const thread = threadMap.value.get(threadId);
     if (!thread) return null;
     const { meta } = thread;
+    const isFocused = focusedThreadId.value === meta.id;
+    const isHighlighted = highlightedThreadId.value === meta.id;
+    const hasDraft = threadHasUnsentDraft(thread);
+
+    const wrapClasses = ['thread-row-wrap'];
+    if (depth > 0) wrapClasses.push('is-nested');
 
     return (
-        <div data-flip-id={meta.id}>
-            <ThreadRowContent data={{
-                id: meta.id,
-                title: threadDisplayTitle(thread),
-                channel: meta.channel,
-                status,
-                timestamp: formatMessageTimestamp(meta.updatedAt),
-                exchangeCount: meta.messageCount,
-                totalChildren: meta.totalChildrenCount,
-                activeChildren: meta.activeChildrenCount,
-                ccHasChanges: meta.ccHasChanges,
-                needsReview: meta.section === 'inbox' && status !== 'running',
-                hasDraft: threadHasUnsentDraft(thread),
-                onClick: () => { focusThread(meta.id); onAfterClick?.(); },
-            }} />
+        <div data-flip-id={meta.id} style={depthStyle(depth)} class={wrapClasses.join(' ')}>
+            <ThreadRowContent
+                id={meta.id}
+                title={threadDisplayTitle(thread)}
+                channel={meta.channel}
+                status={status}
+                timestamp={formatMessageTimestamp(meta.updatedAt)}
+                exchangeCount={meta.messageCount}
+                totalChildren={meta.totalChildrenCount}
+                activeChildren={meta.activeChildrenCount}
+                codingAgentProposed={meta.codingAgentProposed}
+                needsReview={meta.section === 'inbox' && status !== 'running'}
+                hasDraft={hasDraft}
+                isFocused={isFocused}
+                isHighlighted={isHighlighted}
+                isLiftedParent={isLiftedParent}
+                isResponsibleChild={isResponsibleChild}
+                onClick={() => { focusThread(meta.id); onAfterClick?.(); }}
+            />
         </div>
     );
 }
@@ -565,21 +703,25 @@ function SearchResultRow({ result }: { result: ThreadSearchResult }) {
     // Prefer live status from threadMap (SSE-updated), fall back to API result
     const status: ThreadStatus = liveThread ? effectiveThreadStatus(liveThread) : (result.status as ThreadStatus);
     const section = liveThread?.meta.section ?? result.section;
+    const isFocused = focusedThreadId.value === result.thread_id;
+    const isHighlighted = highlightedThreadId.value === result.thread_id;
 
     return (
-        <ThreadRowContent data={{
-            id: result.thread_id,
-            title: result.title,
-            channel: result.channel,
-            status,
-            timestamp: formatMessageTimestamp(result.last_activity),
-            exchangeCount: result.message_count,
-            totalChildren: liveThread?.meta.totalChildrenCount ?? 0,
-            activeChildren: liveThread?.meta.activeChildrenCount ?? 0,
-            ccHasChanges: liveThread?.meta.ccHasChanges ?? false,
-            needsReview: section === 'inbox' && status !== 'running',
-            hasDraft: threadHasUnsentDraft(liveThread),
-            onClick: () => { ensureThreadInMap(result); focusThread(result.thread_id); },
-        }} />
+        <ThreadRowContent
+            id={result.thread_id}
+            title={result.title}
+            channel={result.channel}
+            status={status}
+            timestamp={formatMessageTimestamp(result.last_activity)}
+            exchangeCount={result.message_count}
+            totalChildren={liveThread?.meta.totalChildrenCount ?? 0}
+            activeChildren={liveThread?.meta.activeChildrenCount ?? 0}
+            codingAgentProposed={liveThread?.meta.codingAgentProposed ?? false}
+            needsReview={section === 'inbox' && status !== 'running'}
+            hasDraft={threadHasUnsentDraft(liveThread)}
+            isFocused={isFocused}
+            isHighlighted={isHighlighted}
+            onClick={() => { void ensureThreadInMap(result); focusThread(result.thread_id); }}
+        />
     );
 }

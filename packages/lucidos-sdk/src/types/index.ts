@@ -4,10 +4,10 @@
 
 export type { WriteResult, UploadResult, EditOperation } from '../data';
 export type { LucidosEvent, EventQuery } from '../events';
-export type { Trigger, CreateTrigger, UpdateTrigger, TriggerRun } from '../triggers';
+export type { Trigger, CreateTrigger, UpdateTrigger, TriggerRun, EventSubscription } from '../triggers';
 export type { Preferences } from '../preferences';
-export type { Notification, NotificationListResult } from '../notifications';
+export type { Notification, NotificationListResult, Tap, NavigateUi, NavigateTarget } from '../notifications';
 export type { App } from '../apps';
-export type { Thread } from '../threads';
+export type { ThreadSummary, ThreadsListOptions } from '../threads';
 export type { SseEvent, SseThreadEvent, SseSystemEvent } from '../sse';
 export type { SelectOption, SelectCreateOptions, SelectInstance } from '../select';

@@ -2,12 +2,60 @@ use super::super::process_helpers::{
     build_system_knowhow_section, build_trigger_knowhow_section, build_trigger_started_event,
     classify_or_fallback, summarize_or_fallback, TriggerContext, ENGINE_RESTART_RULE,
 };
+use super::{build_capture_sections, build_loaded_knowhow_block};
 use crate::core::knowhow::KnowhowSummary;
+use crate::engine::loaded_knowhow::LoadedKnowhow;
 use crate::engine::thread_events::{
     EngineReason, EventChannel, MessageOrigin, ThreadEvent, TriggerInvocation,
 };
+use crate::engine::ContextRole;
 use crate::memory::QueryClassification;
 use std::future::pending;
+
+/// Helper to invoke `build_capture_sections` with mostly empty context
+/// strings so individual tests only fill in what they care about. Returns
+/// the produced sections; tests filter/index by name.
+#[allow(clippy::too_many_arguments)]
+fn run_build(
+    system_prompt: &str,
+    profile_context: &str,
+    file_list_context: &str,
+    credentials_context: &str,
+    email_accounts_context: &str,
+    oauth_context: &str,
+    memory_context: &str,
+    history_context: &str,
+    app_context_section: &str,
+    file_context_section: &str,
+    url_context_section: &str,
+    mcp_stopped_context: &str,
+    setup_reminder: &str,
+    thread_depth_context: &str,
+    user_message: &str,
+    loaded: &[LoadedKnowhow],
+    resume: &[crate::llm::Message],
+) -> Vec<crate::engine::ContextSection> {
+    build_capture_sections(
+        system_prompt,
+        profile_context,
+        file_list_context,
+        credentials_context,
+        email_accounts_context,
+        oauth_context,
+        memory_context,
+        history_context,
+        app_context_section,
+        file_context_section,
+        url_context_section,
+        mcp_stopped_context,
+        setup_reminder,
+        thread_depth_context,
+        user_message,
+        loaded,
+        resume,
+        false,
+    )
+}
 
 /// After Phase 1 of the trigger-knowhow-discovery refactor, `TriggerContext`
 /// no longer carries `knowhow_ids` or `event_payload`. The synthetic
@@ -257,5 +305,361 @@ fn engine_restart_rule_still_blocks_post_restart_promises() {
     assert!(
         ENGINE_RESTART_RULE.contains("check back later"),
         "rule must still ban `check back later` promises:\n{ENGINE_RESTART_RULE}"
+    );
+}
+
+/// Phase 3.1: every turn after the first must inject a `[LOADED KNOWHOW]`
+/// block listing the docs `load_knowhow` brought in earlier in the thread.
+/// The block lives in the user message so the LLM sees it on every turn —
+/// Phase 4 stubs the resume tool blocks for `load_knowhow` so the same body
+/// isn't sent twice.
+#[test]
+fn loaded_knowhow_block_emits_doc_bodies_verbatim() {
+    // doc.body is already the formatted [SYSTEM-KNOWHOW: <name>] block
+    // produced by core::knowhow::load_one_knowhow_section. The function
+    // must push it verbatim — re-wrapping would double-nest markers and
+    // mismatch id-vs-name (id is the file id, name is the doc's display
+    // name from frontmatter).
+    let docs = vec![
+        LoadedKnowhow {
+            id: "alpha".into(),
+            body: "[SYSTEM-KNOWHOW: Alpha Doc]\nBody A\n[END SYSTEM-KNOWHOW]".into(),
+        },
+        LoadedKnowhow {
+            id: "beta".into(),
+            body: "[KNOW-HOW: Beta Doc]\nBody B\n[END KNOW-HOW]".into(),
+        },
+    ];
+    let s = build_loaded_knowhow_block(&docs).expect("non-empty docs produce a block");
+    assert!(
+        s.starts_with("[LOADED KNOWHOW]"),
+        "block must open with the [LOADED KNOWHOW] marker:\n{s}"
+    );
+    assert!(
+        s.ends_with("[END LOADED KNOWHOW]"),
+        "block must close with the [END LOADED KNOWHOW] marker:\n{s}"
+    );
+    // Bodies pass through verbatim — no re-wrapping with [SYSTEM-KNOWHOW: <id>].
+    assert!(s.contains("[SYSTEM-KNOWHOW: Alpha Doc]"));
+    assert!(s.contains("[KNOW-HOW: Beta Doc]"));
+    assert!(s.contains("Body A"));
+    assert!(s.contains("Body B"));
+    // The id must NOT appear as an outer marker — that would mean re-wrapping.
+    assert!(
+        !s.contains("[SYSTEM-KNOWHOW: alpha]"),
+        "must not re-wrap with id as outer marker:\n{s}"
+    );
+    assert!(
+        !s.contains("[SYSTEM-KNOWHOW: beta]"),
+        "must not re-wrap with id as outer marker:\n{s}"
+    );
+    // Header guidance is present so the LLM knows how to treat the section.
+    assert!(
+        s.contains("Treat their guidance as authoritative"),
+        "header guidance missing from block:\n{s}"
+    );
+}
+
+/// Empty loaded set must not produce a section — pushing an empty-string part
+/// would put a stray double-newline pair into the user message.
+#[test]
+fn loaded_knowhow_block_returns_none_for_empty_docs() {
+    assert!(build_loaded_knowhow_block(&[]).is_none());
+}
+
+/// Phase 5.1: every base section must carry the API role + inner-tier
+/// group the viewer needs to render the new two-layer grouping. Empty
+/// content is filtered out so this test fills every slot to exercise the
+/// full `labeled` array.
+#[test]
+fn build_capture_sections_tags_existing_sections_with_role_and_group() {
+    let sections = run_build(
+        "sys",
+        "profile",
+        "files",
+        "creds",
+        "emails",
+        "oauth",
+        "memory",
+        "history",
+        "app",
+        "file",
+        "url",
+        "mcp-stopped",
+        "setup-reminder",
+        "depth",
+        "user msg",
+        &[],
+        &[],
+    );
+    let by_name = |n: &str| {
+        sections
+            .iter()
+            .find(|s| s.name == n)
+            .cloned()
+            .unwrap_or_else(|| panic!("section {n} missing"))
+    };
+
+    assert_eq!(by_name("System Instructions").role, ContextRole::System);
+    assert_eq!(by_name("System Instructions").group, None);
+
+    assert_eq!(by_name("User Profile").role, ContextRole::User);
+    assert_eq!(
+        by_name("User Profile").group,
+        Some("Identity & profile".to_string())
+    );
+
+    // Spot-check one row from every inner tier the viewer renders.
+    assert_eq!(
+        by_name("File List").group,
+        Some("Workspace inventory".to_string())
+    );
+    assert_eq!(
+        by_name("Credentials").group,
+        Some("Workspace inventory".to_string())
+    );
+    assert_eq!(
+        by_name("Email Accounts").group,
+        Some("Workspace inventory".to_string())
+    );
+    assert_eq!(
+        by_name("OAuth").group,
+        Some("Workspace inventory".to_string())
+    );
+    assert_eq!(
+        by_name("Long-term Memory").group,
+        Some("Memory & history".to_string())
+    );
+    assert_eq!(
+        by_name("Conversation History").group,
+        Some("Memory & history".to_string())
+    );
+    assert_eq!(
+        by_name("App Context").group,
+        Some("Active context".to_string())
+    );
+    assert_eq!(
+        by_name("File Context").group,
+        Some("Active context".to_string())
+    );
+    assert_eq!(
+        by_name("URL Context").group,
+        Some("Active context".to_string())
+    );
+    assert_eq!(
+        by_name("Stopped MCP Servers").group,
+        Some("System notices".to_string())
+    );
+    assert_eq!(
+        by_name("Setup Reminder").group,
+        Some("System notices".to_string())
+    );
+    assert_eq!(
+        by_name("Thread Depth").group,
+        Some("System notices".to_string())
+    );
+    assert_eq!(
+        by_name("User Message").group,
+        Some("The request".to_string())
+    );
+}
+
+/// Phase 5.1: empty bodies must be filtered out — the viewer must not
+/// render zero-char rows for sections that don't apply this turn.
+#[test]
+fn build_capture_sections_filters_empty_sections() {
+    let sections = run_build(
+        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &[], &[],
+    );
+    let names: Vec<_> = sections.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["System Instructions", "User Message"]);
+}
+
+/// Phase 5.2: each loaded knowhow doc gets its own collapsible row under
+/// the "Loaded knowhow" inner group. Char count reflects the body so the
+/// viewer's budget bar stays honest even when capture_body is false.
+#[test]
+fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
+    let docs = vec![
+        LoadedKnowhow {
+            id: "doc-a".into(),
+            body: "BODY A".into(),
+        },
+        LoadedKnowhow {
+            id: "doc-b".into(),
+            body: "BODY BBBB".into(),
+        },
+    ];
+    let sections = run_build(
+        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &docs, &[],
+    );
+
+    let knowhow: Vec<_> = sections
+        .iter()
+        .filter(|s| s.group.as_deref() == Some("Loaded knowhow"))
+        .collect();
+    assert_eq!(knowhow.len(), 2, "one row per loaded doc");
+    assert_eq!(knowhow[0].name, "knowhow: doc-a");
+    assert_eq!(knowhow[1].name, "knowhow: doc-b");
+    assert!(knowhow.iter().all(|s| s.role == ContextRole::User));
+    // char_count is real (capture_body is false so content is None, but
+    // the viewer's budget bar reads char_count, not the body).
+    assert_eq!(knowhow[0].char_count, "BODY A".chars().count());
+    assert_eq!(knowhow[1].char_count, "BODY BBBB".chars().count());
+    assert!(knowhow.iter().all(|s| s.content.is_none()));
+}
+
+/// Phase 5.3: each `(ToolUse, ToolResult)` pair from `resume_tool_blocks`
+/// becomes its own row under the `PriorMessage` role. Tool name + JSON
+/// args preview live in the row name so the viewer can show what call the
+/// pair represents without expanding it.
+#[test]
+fn build_capture_sections_emits_one_row_per_resume_tool_pair() {
+    use crate::llm::{ContentBlock, Message, MessageContent};
+    let resume = vec![
+        Message {
+            role: "assistant".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "id1".into(),
+                name: "query_events".into(),
+                input: serde_json::json!({"limit": 5}),
+                thought_signature: None,
+            }]),
+        },
+        Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "id1".into(),
+                content: "[]".into(),
+            }]),
+        },
+        Message {
+            role: "assistant".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "id2".into(),
+                name: "load_knowhow".into(),
+                input: serde_json::json!({"id": "x"}),
+                thought_signature: None,
+            }]),
+        },
+        Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "id2".into(),
+                content: "BODY".into(),
+            }]),
+        },
+    ];
+    let sections = run_build(
+        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &[], &resume,
+    );
+
+    let prior: Vec<_> = sections
+        .iter()
+        .filter(|s| s.role == ContextRole::PriorMessage)
+        .collect();
+    assert_eq!(prior.len(), 2, "one row per resume pair");
+    assert!(prior.iter().any(|s| s.name == "ToolUse: query_events"));
+    assert!(prior.iter().any(|s| s.name == "ToolUse: load_knowhow"));
+    assert!(prior.iter().all(|s| s.group.is_none()));
+    // capture_body=false so bodies are dropped; char_count still reflects
+    // the assembled "ToolUse: …\n\nToolResult:\n…" body so the viewer's
+    // prior-messages budget stays accurate.
+    assert!(prior.iter().all(|s| s.content.is_none()));
+    assert!(prior.iter().all(|s| s.char_count > 0));
+}
+
+/// Capturing a body honors the `capture_body` flag: rows get full bodies
+/// (truncated at SECTION_PERSIST_MAX) when on, `None` when off. The
+/// truncation cap itself is exercised by the existing types::tests; this
+/// test just guards the on/off wiring through the new free function.
+#[test]
+fn build_capture_sections_honors_capture_body_flag() {
+    let docs = vec![LoadedKnowhow {
+        id: "doc".into(),
+        body: "BODY".into(),
+    }];
+    let on = build_capture_sections(
+        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "user", &docs, &[], true,
+    );
+    let off = build_capture_sections(
+        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "user", &docs, &[], false,
+    );
+    let sys_on = on.iter().find(|s| s.name == "System Instructions").unwrap();
+    let sys_off = off.iter().find(|s| s.name == "System Instructions").unwrap();
+    assert_eq!(sys_on.content.as_deref(), Some("sys"));
+    assert!(sys_off.content.is_none());
+    let kh_on = on.iter().find(|s| s.name == "knowhow: doc").unwrap();
+    let kh_off = off.iter().find(|s| s.name == "knowhow: doc").unwrap();
+    assert_eq!(kh_on.content.as_deref(), Some("BODY"));
+    assert!(kh_off.content.is_none());
+}
+
+/// The chat-agent prompt must nudge use of `ask_user_question` for
+/// choice-shaped questions (yes/no, A vs B, "what next?" follow-up menus)
+/// — symmetric with the CC-side `chat_style_prompts_nudge_use_of_ask_user_question`
+/// test in `agent_session::prompts`. Without this nudge the chat agent
+/// reads ACTION FIRST as a blanket "don't ask the user anything" rule and
+/// falls back to plaintext bullet lists for next-step alternatives — the
+/// exact failure pattern the rule was added to prevent.
+#[test]
+fn chat_prompt_nudges_use_of_ask_user_question() {
+    let rule = super::ASK_USER_QUESTION_RULE;
+    assert!(
+        rule.contains("ask_user_question"),
+        "chat ASK_USER_QUESTION_RULE must name the tool (lowercase snake_case — \
+         that's the actual chat-side tool name)",
+    );
+    assert!(
+        rule.contains("2-4 discrete answers"),
+        "chat ASK_USER_QUESTION_RULE must pin the trigger criteria (2-4 \
+         discrete answers); softer phrasing let the LLM keep slipping into \
+         plaintext for genuine choice-shaped questions",
+    );
+    assert!(
+        rule.contains("mid-stream"),
+        "chat ASK_USER_QUESTION_RULE must keep the mid-stream concept — \
+         end-only examples let the chat agent slip plaintext yes/no questions \
+         into the middle of long answers (mirrors the CC-side assertion in \
+         `chat_style_prompts_nudge_use_of_ask_user_question`)",
+    );
+    assert!(
+        rule.contains("what next"),
+        "chat ASK_USER_QUESTION_RULE must include the concrete \"what next?\" \
+         follow-up-menu example — that's the exact failure pattern in personal \
+         workspace threads where the agent emits markdown bullets instead of \
+         buttons",
+    );
+    assert!(
+        rule.contains("ACTION FIRST"),
+        "chat ASK_USER_QUESTION_RULE must explicitly carve itself out of \
+         ACTION FIRST — without the carve-out the two rules fight and the \
+         LLM defaults to silence on next-step alternatives",
+    );
+    assert!(
+        rule.contains("NEVER parallel-call"),
+        "chat ASK_USER_QUESTION_RULE must forbid parallel-calling \
+         `ask_user_question` alongside other tools (see the parallel CC rule \
+         in `agent_session::prompts::ASK_USER_QUESTION_RULE`)",
+    );
+    // Three observed Opus 4.7 leaks in personal (4bc99ec8, ba1b4ef1,
+    // 66638f55) emitted `<ask_user_question>…</ask_user_question>` as
+    // literal assistant text instead of a tool call. The rule must name
+    // that exact failure mode so the next prompt edit can't silently drop
+    // the anti-pattern callout.
+    assert!(
+        rule.contains("<ask_user_question"),
+        "chat ASK_USER_QUESTION_RULE must show the forbidden literal tag \
+         (`<ask_user_question`) — the model has emitted wrapper-tag text \
+         instead of a real tool call multiple times on Opus 4.7 max effort, \
+         and only naming the exact tag string makes the rule self-evident \
+         to the model when it next debates the format",
+    );
+    assert!(
+        rule.contains("INVOKE AS A TOOL CALL ONLY") || rule.contains("never write the tag as text"),
+        "chat ASK_USER_QUESTION_RULE must carry the anti-inline-tag clause \
+         (header `INVOKE AS A TOOL CALL ONLY — NEVER WRITE THE TAG AS TEXT`) \
+         — without it the rule only nudges *when* to ask, not *how*, and \
+         Opus 4.7 keeps inventing `<ask_user_question>` wrappers",
     );
 }

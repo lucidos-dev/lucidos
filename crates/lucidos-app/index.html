@@ -67,9 +67,16 @@
         d.style.setProperty('--font-ui', FONTS[fontKey] || FONTS.monospace);
         var scale = localStorage.getItem('lucidos-ui-scale');
         if (scale) {
-          var legacy = { small: '100%', medium: '113%', large: '125%' };
-          var value = legacy[scale] || (/^\d+$/.test(scale) ? scale + '%' : null);
-          if (value) d.style.setProperty('--user-ui-scale', value);
+          // Snap to the 12.5% grid (see UI_SCALE_STEP) so a pre-grid saved
+          // value like "115" doesn't paint at 115% for one frame before the
+          // app boots, re-clamps to 112.5%, and re-paints — visible flash.
+          var legacy = { small: 100, medium: 112.5, large: 125 };
+          var n = legacy[scale];
+          if (n === undefined) n = parseFloat(scale);
+          if (!isNaN(n)) {
+            var snapped = Math.min(200, Math.max(75, Math.round(n / 12.5) * 12.5));
+            d.style.setProperty('--user-ui-scale', snapped + '%');
+          }
         }
 
         // Always-on theme-flash telemetry: POST breadcrumbs to engine.log so
@@ -90,7 +97,7 @@
             });
             // keepalive=true so the POST survives a navigation away (pageshow
             // breadcrumbs in particular can fire just before a route swap).
-            fetch('/api/internal/client-log', {
+            fetch('/api/v1/internal/client-log', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: body,

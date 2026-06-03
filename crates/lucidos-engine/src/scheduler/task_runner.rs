@@ -494,6 +494,35 @@ async fn register_and_track(
 /// are still stored but won't fire additional triggers.
 const MAX_EVENT_TRIGGER_DEPTH: u32 = 3;
 
+/// Why an incoming event must not fan out to event-triggers. Returned by
+/// [`event_trigger_skip_reason`] so the decision is unit-testable without a
+/// full engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventTriggerSkip {
+    /// The engine is mid shutdown/restart. The terminator events emitted during
+    /// cleanup (`ResponseAborted{EngineShutdown}`, `CodingAgentIdled`,
+    /// `SessionEnded`) reach this dispatcher, but a trigger script's
+    /// `lucidos ...` callback would hit the HTTP API being torn down →
+    /// connection-refused → the script dies → spurious "<trigger> failed" push.
+    ShuttingDown,
+    /// Recursion cap for event chains (A→B→A…). The event is still stored, it
+    /// just won't fire further triggers.
+    MaxDepth,
+}
+
+/// Decide whether an event at `depth` should skip event-trigger dispatch.
+/// Shutdown takes precedence over the depth cap so the log reflects the real
+/// reason during a restart.
+fn event_trigger_skip_reason(is_shutting_down: bool, depth: u32) -> Option<EventTriggerSkip> {
+    if is_shutting_down {
+        Some(EventTriggerSkip::ShuttingDown)
+    } else if depth >= MAX_EVENT_TRIGGER_DEPTH {
+        Some(EventTriggerSkip::MaxDepth)
+    } else {
+        None
+    }
+}
+
 /// Handle a domain event from the EventBus — fire matching event-based triggers.
 ///
 /// `origin_thread_id` is the thread the firing event lives in (only set for
@@ -514,13 +543,23 @@ pub(super) async fn handle_domain_event(
     engine: &SharedEngine,
     pool: &PgPool,
 ) {
-    if depth >= MAX_EVENT_TRIGGER_DEPTH {
-        crate::log!(
-            "[Scheduler] Event '{}' at depth {} — skipping triggers to prevent recursion",
-            event_type,
-            depth
-        );
-        return;
+    match event_trigger_skip_reason(engine.is_shutting_down(), depth) {
+        Some(EventTriggerSkip::ShuttingDown) => {
+            crate::log!(
+                "[Scheduler] Engine shutting down — not firing triggers for event '{}'",
+                event_type
+            );
+            return;
+        }
+        Some(EventTriggerSkip::MaxDepth) => {
+            crate::log!(
+                "[Scheduler] Event '{}' at depth {} — skipping triggers to prevent recursion",
+                event_type,
+                depth
+            );
+            return;
+        }
+        None => {}
     }
 
     let matching = {
@@ -556,6 +595,7 @@ pub(super) async fn handle_domain_event(
             let invocation = crate::engine::thread_events::TriggerInvocation::Event {
                 event_type: event_type.clone(),
                 event_id: source_event_id,
+                thread_id: origin_thread_id,
             };
             let inner = user_tasks::EVENT_TRIGGER_DEPTH.scope(
                 next_depth,
@@ -608,7 +648,7 @@ async fn detach_tracked_task(
     task_id: uuid::Uuid,
 ) {
     let mut tracked = tracked_tasks.write().await;
-    let _ = tracked.remove(&task_id);
+    tracked.remove(&task_id);
 }
 
 /// Check health of tracked tasks and restart any that have crashed
@@ -779,5 +819,42 @@ mod tests {
         let tracked = Arc::new(RwLock::new(HashMap::new()));
         cancel_tracked_task(&tracked, uuid::Uuid::new_v4()).await;
         assert!(tracked.read().await.is_empty());
+    }
+
+    #[test]
+    fn skip_reason_shutting_down_takes_precedence() {
+        // Regression: during graceful shutdown / restart the engine emits
+        // terminator events (ResponseAborted{EngineShutdown}, CodingAgentIdled,
+        // SessionEnded) that match the notify-on-idle-and-new-changes trigger.
+        // Firing it would spawn a script whose `lucidos threads count` callback
+        // hits the API mid-restart and dies with a "<trigger> failed" push.
+        // Shutdown must short-circuit dispatch regardless of depth.
+        assert_eq!(
+            event_trigger_skip_reason(true, 0),
+            Some(EventTriggerSkip::ShuttingDown)
+        );
+        assert_eq!(
+            event_trigger_skip_reason(true, MAX_EVENT_TRIGGER_DEPTH + 5),
+            Some(EventTriggerSkip::ShuttingDown),
+            "shutdown wins over the depth cap so the log names the real reason"
+        );
+    }
+
+    #[test]
+    fn skip_reason_depth_cap_when_not_shutting_down() {
+        assert_eq!(
+            event_trigger_skip_reason(false, MAX_EVENT_TRIGGER_DEPTH),
+            Some(EventTriggerSkip::MaxDepth)
+        );
+        assert_eq!(
+            event_trigger_skip_reason(false, MAX_EVENT_TRIGGER_DEPTH - 1),
+            None,
+            "below the cap and not shutting down → dispatch proceeds"
+        );
+        assert_eq!(
+            event_trigger_skip_reason(false, 0),
+            None,
+            "normal operation → dispatch proceeds"
+        );
     }
 }

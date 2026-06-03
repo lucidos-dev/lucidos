@@ -544,7 +544,7 @@ mod tests {
 
     /// Encode a real JPEG of given size — needed to exercise the decode
     /// + downscale path in `get_or_create_preview`. Solid color, smallest
-    /// possible payload that still round-trips through the `image` crate.
+    ///   possible payload that still round-trips through the `image` crate.
     fn encoded_jpeg(width: u32, height: u32) -> Vec<u8> {
         use image::codecs::jpeg::JpegEncoder;
         use image::{ColorType, ImageEncoder};

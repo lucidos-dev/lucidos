@@ -7,10 +7,11 @@ import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, appPseudoFul
 import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
 import { getAppFrameSrc, getVisibleAppFrame, exitPseudoFullscreen, refreshAppUI } from '../../store/actions/apps';
 import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon } from '../shared/icons';
-import { RENDERABLE_EXTS } from '../files/FilePreviewInline';
+import { RENDERABLE_EXTS } from '../files/previewExts';
 import { isTauri, isIOSPwa } from '../../utils/platform';
 import { webviewReload } from '../../utils/tauri';
-import { openFileSearch } from '../files/FileSearchModal';
+import { openFileSearch } from '../files/fileSearchActions';
+import { pushOverlay, removeOverlay } from '../../store/overlayStack';
 
 /** Shared action buttons for the content side of the header (used by both mobile and desktop). */
 export function ContentHeaderActions() {
@@ -36,11 +37,13 @@ export function ContentHeaderActions() {
     if (overlay?.type !== 'app-ui' && isPseudo) exitPseudoFullscreen();
   }, [overlay?.type, isPseudo]);
 
+  // Pseudo-fullscreen is dismissable via the central Escape dispatcher: register
+  // it on the overlay stack while active instead of hand-rolling a `document`
+  // Escape listener (which would race the dispatcher).
   useEffect(() => {
     if (!isPseudo) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') exitPseudoFullscreen(); };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
+    pushOverlay({ id: 'pseudo-fullscreen', dismiss: exitPseudoFullscreen });
+    return () => removeOverlay('pseudo-fullscreen');
   }, [isPseudo]);
 
   const isFullscreen = isNativeFullscreen || isPseudo;
@@ -112,7 +115,11 @@ export function ContentHeaderActions() {
 
   // Context-specific actions — mutually exclusive via if/else
   if (overlay?.type === 'app-ui') {
-    addAction('refresh', reloadButton(() => refreshAppUI()));
+    // preserveWip: the header refresh re-fetches whatever the iframe is
+    // currently pointed at, including WIP. Apply landing on disk and direct
+    // file-source edits still drop WIP — those paths call refreshAppUI()
+    // with the default options.
+    addAction('refresh', reloadButton(() => void refreshAppUI(undefined, { preserveWip: true })));
     addAction('time-travel', <TimeTravelDropdown />);
     // iOS standalone PWA cannot open same-origin links in an external browser
     // (all WebKit-based browsers on iOS share this limitation).

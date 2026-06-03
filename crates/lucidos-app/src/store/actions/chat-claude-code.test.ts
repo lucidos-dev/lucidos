@@ -13,7 +13,7 @@ function makeThread(): { map: Map<string, ThreadState>; id: string } {
   const id = 'thread-1';
   const map = new Map<string, ThreadState>();
   map.set(id, {
-    meta: { id, title: 'Test', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', ccHasChanges: false, ccRequiresRestart: false, ccIsExternalRepo: false, ccApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, state: 'active' },
+    meta: { id, title: 'Test', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, state: 'active', latestTodoList: null },
     events: new Map(),
     streamingBuffer: '',
     eventsLoaded: false,

@@ -1,4 +1,27 @@
-import type { EngineReason } from '../store/thread-events';
+import type { AbortCause, EngineReason } from '../store/thread-events';
+
+/** Why a system-driven `ResponseAborted` fired, for the route popover. The
+ *  heading ("Why the response stopped") is owned by the renderer. Each branch
+ *  must return a non-empty string — the renderer suppresses the explainer row
+ *  on null/undefined, so silently dropping a cause would regress the panel
+ *  back to the "Unknown" wart this helper exists to fix. */
+export function describeAbortCause(cause: AbortCause | undefined): string {
+  switch (cause) {
+    case 'safety_net':
+      return 'The Claude Code event loop ended without a clean response — usually a Claude Code session crash or driver task death. (The 10-minute hung-session watchdog used to land here too, but now auto-resumes the session via ContinuationRequested instead.)';
+    case 'engine_shutdown':
+      return 'The engine shut down (or restarted) while this turn was in flight.';
+    case 'recovery_after_restart':
+      return 'The engine recovered the thread after a restart; the in-flight turn could not be resumed.';
+    case 'process_killed':
+      return 'The Claude Code session was killed (crash, signal, or out-of-memory).';
+    case 'stale_settle':
+      return 'The engine cleaned up a stuck response state — no live work was running.';
+    case 'unknown':
+    case undefined:
+      return 'The response was interrupted by the system (cause not recorded).';
+  }
+}
 
 /** Why the engine acted, for the route popover. Returns null for `scheduler`
  *  because that variant has its own richer renderer (links to the trigger).
@@ -7,13 +30,13 @@ export function describeEngineReason(reason: EngineReason): string | null {
   switch (reason.kind) {
     case 'continuation_started':
     case 'session_recovered':
-      return 'CC sessions running when the engine stops are auto-resumed when it restarts. This event marks the resume.';
+      return 'Claude Code sessions running when the engine stops are auto-resumed when it restarts. This event marks the resume.';
     case 'orphan_recovery':
       return 'After a restart, the engine resumes orphaned threads where work was in flight.';
     case 'harden_retrigger':
       return 'The engine re-triggers `/harden` when the hardening marker is missing or stale, so changes aren’t applied unhardened.';
     case 'stale_session':
-      return 'The engine cleans up CC sessions that became stale (process gone, marker missing). This event marks the cleanup.';
+      return 'The engine cleans up Claude Code sessions that became stale (process gone, marker missing). This event marks the cleanup.';
     case 'merge_conflict':
       return 'The engine detected a conflict when merging changes from main into your branch. We need to resolve it before applying.';
     case 'missing_hardening':

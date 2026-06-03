@@ -111,13 +111,21 @@ describe('originMode', () => {
   });
 });
 
-describe('actorInitiator (mode-driven)', () => {
-  it('device → You', () => {
+describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / System / API caller)', () => {
+  it('device → You (the only origin that is unambiguously the user)', () => {
     expect(actorInitiator({ kind: 'device', device_id: 'd', label: 'L' }))
       .toEqual({ icon: '\u{1F464}', label: 'You' });
   });
-  it('api with default mode → You', () => {
-    expect(actorInitiator({ kind: 'api' })).toEqual({ icon: '\u{1F464}', label: 'You' });
+  it('api with default mode → API caller (anonymous HTTP, never impersonates the user)', () => {
+    // Regression: a Lucidos agent that POSTed via raw urllib without forwarding
+    // x-lucidos-agent-origin-token used to land as Api{Human} and the chip
+    // rendered "You". The chip now refuses to call any non-device origin
+    // "You"; the popover still discloses the User-Agent.
+    expect(actorInitiator({ kind: 'api' })).toEqual({ icon: '🔌', label: 'API caller' });
+  });
+  it('api with explicit mode=human → API caller', () => {
+    expect(actorInitiator({ kind: 'api', mode: 'human', user_agent: 'curl/8' }))
+      .toEqual({ icon: '🔌', label: 'API caller' });
   });
   it('api with mode=agent → Lucidos Agent', () => {
     expect(actorInitiator({ kind: 'api', mode: 'agent' }))
@@ -127,9 +135,9 @@ describe('actorInitiator (mode-driven)', () => {
     expect(actorInitiator({ kind: 'api', mode: 'engine' }))
       .toEqual({ icon: '⚙', label: 'Lucidos Engine' });
   });
-  it('workspace with mode=human → You', () => {
+  it('workspace with mode=human → API caller (a human in another workspace is not "You" here)', () => {
     expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'human' }))
-      .toEqual({ icon: '\u{1F464}', label: 'You' });
+      .toEqual({ icon: '🔌', label: 'API caller' });
   });
   it('workspace with mode=agent → Lucidos Agent', () => {
     expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'agent' }))

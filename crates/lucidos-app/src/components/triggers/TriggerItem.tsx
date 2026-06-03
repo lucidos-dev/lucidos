@@ -9,37 +9,37 @@ import { formatShortDate, formatShortTime } from '../../utils/formatTime';
 import { describeCron } from '../../utils/describeCron';
 
 interface Props {
-  task: TriggerInfo;
+  trigger: TriggerInfo;
 }
 
-export function TriggerItem({ task }: Props) {
-  const lastRunDate = task.last_run ? new Date(task.last_run) : null;
+export function TriggerItem({ trigger }: Props) {
+  const lastRunDate = trigger.last_run ? new Date(trigger.last_run) : null;
   const lastRunStr = lastRunDate ? `${formatShortDate(lastRunDate)} ${formatShortTime(lastRunDate)}` : null;
-  const triggerType = deriveTriggerType(task);
-  const noMoreRuns = hasNoMoreRuns(task);
+  const triggerType = deriveTriggerType(trigger);
+  const noMoreRuns = hasNoMoreRuns(trigger);
 
   return (
-    <div class={`list-row trigger-row${task.paused ? ' trigger-disabled' : ''}`}>
+    <div class={`list-row trigger-row${trigger.paused ? ' trigger-disabled' : ''}`}>
       <div class="list-row-info">
-        <div class="title list-row-name">{task.name}</div>
+        <div class="title list-row-name">{trigger.name}</div>
         <div class="list-row-details">
           {noMoreRuns ? (
             <span class="trigger-no-more-runs">No more runs</span>
           ) : (
-            <span class={task.paused ? 'trigger-paused' : 'trigger-enabled'}>
-              {task.paused ? 'Paused' : 'Active'}
+            <span class={trigger.paused ? 'trigger-paused' : 'trigger-enabled'}>
+              {trigger.paused ? 'Paused' : 'Active'}
             </span>
           )}
           <span class={`label trigger-type-${triggerType}`}>
             {triggerType === 'hybrid' ? 'Hybrid' : triggerType === 'event' ? 'Event' : 'Schedule'}
           </span>
           <span class="label">
-            {task.run.type === 'script' ? 'script' : 'LLM'}
+            {trigger.run.type === 'script' ? 'script' : 'LLM'}
           </span>
         </div>
-        {task.cron_expressions.length > 0 && (
+        {trigger.cron_expressions.length > 0 && (
           <ul class="trigger-cron-list">
-            {task.cron_expressions.map((expr, i) => (
+            {trigger.cron_expressions.map((expr, i) => (
               <li key={i} class="trigger-cron-item">
                 <span class="trigger-cron-desc">{describeCron(expr)}</span>
                 <code class="trigger-cron">{expr}</code>
@@ -47,13 +47,17 @@ export function TriggerItem({ task }: Props) {
             ))}
           </ul>
         )}
-        {task.on && (
-          <div class="trigger-event-info">
-            <span class="trigger-event-type">on {task.on}</span>
-            {task.condition && (
-              <code class="trigger-condition">{JSON.stringify(task.condition)}</code>
-            )}
-          </div>
+        {trigger.on && trigger.on.length > 0 && (
+          <ul class="trigger-event-list">
+            {trigger.on.map((sub, i) => (
+              <li key={i} class="trigger-event-info">
+                <span class="trigger-event-type">on {sub.event_type}</span>
+                {sub.condition && (
+                  <code class="trigger-condition">{JSON.stringify(sub.condition)}</code>
+                )}
+              </li>
+            ))}
+          </ul>
         )}
         {lastRunStr && (
           <div class="list-row-date">Last run {lastRunStr}</div>
@@ -62,19 +66,19 @@ export function TriggerItem({ task }: Props) {
       <div class="list-row-actions">
         <button
           class="action-btn action-btn-danger"
-          onClick={() => deleteTrigger(task.id, task.name)}
+          onClick={() => void deleteTrigger(trigger.id, trigger.name)}
         >
           Delete
         </button>
         <button
           class="action-btn"
-          onClick={() => toggleTrigger(task.id, !task.paused)}
+          onClick={() => void toggleTrigger(trigger.id, !trigger.paused)}
         >
-          {task.paused ? 'Resume' : 'Pause'}
+          {trigger.paused ? 'Resume' : 'Pause'}
         </button>
         <button
           class="action-btn"
-          onClick={() => openEditTrigger(task.id)}
+          onClick={() => openEditTrigger(trigger.id)}
         >
           Edit
         </button>

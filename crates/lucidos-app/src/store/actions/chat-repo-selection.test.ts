@@ -63,7 +63,7 @@ vi.mock('../../utils/platform', () => ({
 import {
   focusedThreadId,
   threadMap,
-  selectedRepoId,
+  selectedScope,
   connectionStatus,
 } from '../store';
 import { sendMessage } from './chat';
@@ -71,13 +71,14 @@ import { sendCompose } from './compose';
 import { setDraft, _resetComposeDraftsForTesting } from '../composeDrafts';
 import { submitChat } from '../../api/client';
 import type { ChatRequestBody } from '../../api/types';
+import type { ThreadMeta } from '../thread-events';
 
 const mockedSubmitChat = vi.mocked(submitChat);
 
 beforeEach(() => {
   threadMap.value = new Map();
   focusedThreadId.value = null;
-  selectedRepoId.value = '';
+  selectedScope.value = { kind: 'lucidos' };
   connectionStatus.value = 'connected';
   mockedSubmitChat.mockClear();
   _resetComposeDraftsForTesting();
@@ -88,7 +89,7 @@ function lastBody(): ChatRequestBody {
   return mockedSubmitChat.mock.calls[0][0];
 }
 
-function makeMeta(id: string, overrides: Record<string, unknown>): any {
+function makeMeta(id: string, overrides: Partial<ThreadMeta>): ThreadMeta {
   return {
     id,
     title: 't',
@@ -102,17 +103,20 @@ function makeMeta(id: string, overrides: Record<string, unknown>): any {
     section: 'archived',
     activeChildrenCount: 0,
     totalChildrenCount: 0,
-    ccHasChanges: false,
-    ccRequiresRestart: false,
-    ccIsExternalRepo: false,
-    ccApplying: false,
+    blockingDescendantCount: 0, attentionDescendantCount: 0,
+    codingAgentProposed: false,
+    codingAgentRequiresRestart: false,
+    codingAgentIsExternalRepo: false,
+    codingAgentApplying: false,
+    codingAgentHasDiff: false,
     lastRevivedAt: '',
     state: 'active',
+    latestTodoList: null,
     ...overrides,
   };
 }
 
-function putThread(id: string, metaOverrides: Record<string, unknown>): void {
+function putThread(id: string, metaOverrides: Partial<ThreadMeta>): void {
   threadMap.value = new Map([[id, {
     meta: makeMeta(id, metaOverrides),
     events: new Map(),
@@ -124,80 +128,120 @@ function putThread(id: string, metaOverrides: Record<string, unknown>): void {
   } as any]]);
 }
 
-describe('sendMessage repo selection (regression: dropdown ignored)', () => {
-  it('new CC thread (no draft, no focus) sends repo_id from dropdown', async () => {
-    selectedRepoId.value = 'external-repo-uuid';
+describe('sendMessage scope selection (regression: dropdown ignored)', () => {
+  it('new CC thread (no draft, no focus) sends folder from external scope', async () => {
+    selectedScope.value = { kind: 'external', repoId: 'external-repo-uuid' };
 
     await sendMessage('fix the merge conflict', undefined, { useClaudeCode: true });
 
     const body = lastBody();
     expect(body.use_claude_code).toBe(true);
-    expect(body.repo_id).toBe('external-repo-uuid');
+    expect(body.folder).toBe('external-repo-uuid');
+    expect(body.repo_id).toBeUndefined();
   });
 
-  it('compose-view DRAFT (focusedThreadId set, state=composing) sends repo_id from dropdown', async () => {
-    const draftId = 'draft-thread';
-    focusedThreadId.value = draftId;
-    putThread(draftId, { state: 'composing', channel: 'claude_code' });
-    selectedRepoId.value = 'external-repo-uuid';
-
-    await sendMessage('fix the merge conflict', undefined, { useClaudeCode: true });
-
-    const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
-    expect(body.repo_id).toBe('external-repo-uuid');
-  });
-
-  it('new CC thread with empty selectedRepoId omits repo_id (default Lucidos)', async () => {
-    selectedRepoId.value = '';
+  it('new CC thread with Lucidos scope omits folder (default Lucidos)', async () => {
+    selectedScope.value = { kind: 'lucidos' };
 
     await sendMessage('hello', undefined, { useClaudeCode: true });
 
     const body = lastBody();
     expect(body.use_claude_code).toBe(true);
+    expect(body.folder).toBeUndefined();
     expect(body.repo_id).toBeUndefined();
   });
 
-  it('follow-up on active CC thread uses meta.repoId, ignores selectedRepoId', async () => {
+  it('new CC thread with app scope sends folder=data/apps/<id>', async () => {
+    selectedScope.value = { kind: 'app', appId: 'momentum' };
+
+    await sendMessage('fix the chart bug', undefined, { useClaudeCode: true });
+
+    const body = lastBody();
+    expect(body.use_claude_code).toBe(true);
+    expect(body.folder).toBe('data/apps/momentum');
+    expect(body.repo_id).toBeUndefined();
+  });
+
+  it('follow-up on active CC thread uses meta.repoId, ignores selectedScope', async () => {
     const tid = 'existing-thread';
     focusedThreadId.value = tid;
     putThread(tid, { state: 'active', channel: 'claude_code', messageCount: 1, repoId: 'repo-A-uuid' });
-    selectedRepoId.value = 'repo-B-uuid';
+    selectedScope.value = { kind: 'external', repoId: 'repo-B-uuid' };
 
     await sendMessage('follow up', undefined, { useClaudeCode: true });
 
     const body = lastBody();
     expect(body.use_claude_code).toBe(true);
     expect(body.repo_id).toBe('repo-A-uuid');
+    expect(body.folder).toBeUndefined();
   });
 
   it('follow-up on active CC thread bound to default Lucidos (no meta.repoId) ignores dropdown', async () => {
     const tid = 'lucidos-thread';
     focusedThreadId.value = tid;
     putThread(tid, { state: 'active', channel: 'claude_code', messageCount: 1 });
-    selectedRepoId.value = 'repo-B-uuid';
+    selectedScope.value = { kind: 'external', repoId: 'repo-B-uuid' };
 
     await sendMessage('follow up', undefined, { useClaudeCode: true });
 
     const body = lastBody();
     expect(body.use_claude_code).toBe(true);
     expect(body.repo_id).toBeUndefined();
+    expect(body.folder).toBeUndefined();
+  });
+
+  it('follow-up on active app CC thread re-sends folder from meta.codingAgentFolder', async () => {
+    const tid = 'app-thread';
+    focusedThreadId.value = tid;
+    putThread(tid, {
+      state: 'active',
+      channel: 'claude_code',
+      messageCount: 1,
+      codingAgentKind: 'app',
+      codingAgentFolder: '/some/workspace/data/apps/momentum',
+    });
+    selectedScope.value = { kind: 'lucidos' };
+
+    await sendMessage('keep going', undefined, { useClaudeCode: true });
+
+    const body = lastBody();
+    expect(body.use_claude_code).toBe(true);
+    expect(body.folder).toBe('data/apps/momentum');
+    expect(body.repo_id).toBeUndefined();
   });
 });
 
-describe('sendCompose carries dropdown repo through to chat body (real flow)', () => {
-  it('promoting a CC draft to active sends repo_id from selectedRepoId', async () => {
+describe('sendCompose carries dropdown scope through to chat body (real flow)', () => {
+  it('promoting a CC draft to active sends folder from external scope', async () => {
     const draftId = 'draft-thread';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
-    selectedRepoId.value = 'external-repo-uuid';
+    selectedScope.value = { kind: 'external', repoId: 'external-repo-uuid' };
 
     await sendCompose(draftId, { useClaudeCode: true });
 
     const body = lastBody();
     expect(body.use_claude_code).toBe(true);
+    // sendCompose flips composing→active BEFORE delegating, so the chat path
+    // now treats this as a follow-up and reads meta.repoId — which compose
+    // bound from the external scope.
     expect(body.repo_id).toBe('external-repo-uuid');
+  });
+
+  it('promoting an app-scope CC draft sends folder=data/apps/<id>', async () => {
+    const draftId = 'app-draft';
+    focusedThreadId.value = draftId;
+    putThread(draftId, { state: 'composing', channel: 'claude_code' });
+    setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
+    selectedScope.value = { kind: 'app', appId: 'momentum' };
+
+    await sendCompose(draftId, { useClaudeCode: true });
+
+    const body = lastBody();
+    expect(body.use_claude_code).toBe(true);
+    expect(body.folder).toBe('data/apps/momentum');
+    expect(body.repo_id).toBeUndefined();
   });
 
   it('promoting a non-CC draft does not bind a repo even if dropdown has one', async () => {
@@ -205,30 +249,32 @@ describe('sendCompose carries dropdown repo through to chat body (real flow)', (
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'chat' });
     setDraft(draftId, { text: 'hi', image_hashes: [], mode: null });
-    selectedRepoId.value = 'external-repo-uuid';
+    selectedScope.value = { kind: 'external', repoId: 'external-repo-uuid' };
 
     await sendCompose(draftId, { useClaudeCode: false });
 
     const body = lastBody();
     expect(body.use_claude_code).toBeUndefined();
     expect(body.repo_id).toBeUndefined();
+    expect(body.folder).toBeUndefined();
   });
 
-  it('retrying a draft after rollback with empty dropdown clears prior repoId binding', async () => {
+  it('retrying a draft after rollback with Lucidos scope clears prior repoId binding', async () => {
     // Simulate rollback state: a CC draft already has meta.repoId from a
     // previous sendCompose attempt (or some other source). User now picks
-    // the default repo (empty selection) and resends. The stale binding
-    // must NOT leak into the chat body.
+    // the default scope (Lucidos) and resends. The stale binding must NOT
+    // leak into the chat body.
     const draftId = 'rollback-draft';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code', repoId: 'stale-repo-uuid' });
     setDraft(draftId, { text: 'retry', image_hashes: [], mode: 'claude_code' });
-    selectedRepoId.value = '';
+    selectedScope.value = { kind: 'lucidos' };
 
     await sendCompose(draftId, { useClaudeCode: true });
 
     const body = lastBody();
     expect(body.use_claude_code).toBe(true);
     expect(body.repo_id).toBeUndefined();
+    expect(body.folder).toBeUndefined();
   });
 });

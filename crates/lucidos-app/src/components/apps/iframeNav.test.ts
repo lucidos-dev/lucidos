@@ -19,11 +19,21 @@ describe('navigateAppIframe', () => {
       },
     } as unknown as HTMLIFrameElement;
 
-    navigateAppIframe(iframe, '/app/notes-app/');
+    const ok = navigateAppIframe(iframe, '/app/notes-app/');
 
+    expect(ok).toBe(true);
     expect(replaceSpy).toHaveBeenCalledTimes(1);
     expect(replaceSpy).toHaveBeenCalledWith('/app/notes-app/');
     expect(srcMutated).toBe(false);
   });
 
+  it('returns false without throwing when contentWindow is null', () => {
+    // A detached iframe (mid-unmount, removed between layout and effect
+    // flushes) has contentWindow === null. The previous non-null assertion
+    // would throw a TypeError on `.location` that AppUiInline never caught.
+    const iframe = { contentWindow: null } as unknown as HTMLIFrameElement;
+
+    expect(() => navigateAppIframe(iframe, '/x')).not.toThrow();
+    expect(navigateAppIframe(iframe, '/x')).toBe(false);
+  });
 });

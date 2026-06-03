@@ -4,6 +4,7 @@ import { toasts, applyingChangeIds, threadMap } from '../store';
 // Mock the API module before importing the action
 vi.mock('../../api/client', () => ({
   applyChange: vi.fn(),
+  applyAllChanges: vi.fn(),
 }));
 
 // focusThread imports React/Preact-coupled modules (scrollState, navigation) that
@@ -12,12 +13,11 @@ vi.mock('../actions/threads', () => ({
   focusThread: vi.fn(),
 }));
 
-import { applySingleChange } from '../actions/chat-changes';
-import { applyChange as apiApply } from '../../api/client';
-import { focusThread } from '../actions/threads';
+import { applySingleChange, applyAllChanges } from '../actions/chat-changes';
+import { applyChange as apiApply, applyAllChanges as apiApplyAll } from '../../api/client';
 
 const mockedApply = vi.mocked(apiApply);
-const mockedFocusThread = vi.mocked(focusThread);
+const mockedApplyAll = vi.mocked(apiApplyAll);
 
 beforeEach(() => {
   toasts.value = [];
@@ -73,7 +73,11 @@ describe('applySingleChange feedback', () => {
     expect(applyingChangeIds.value.has('change-2')).toBe(false);
   });
 
-  it('shows merge conflict toast when status is conflict', async () => {
+  it('does NOT show an HTTP-response toast on conflict — SSE handler covers it', async () => {
+    // Apply Now conflicts are surfaced by the MergeConflictDetected SSE
+    // handler (see merge-conflict-toast.test.ts), not by this HTTP path.
+    // Toasting here too would double-fire whenever the user isn't on the
+    // conflict thread.
     mockedApply.mockResolvedValue({
       status: 'conflict',
       change_id: 'change-4',
@@ -87,38 +91,8 @@ describe('applySingleChange feedback', () => {
 
     await applySingleChange('change-4');
 
-    const toast = toasts.value.find(t => t.message.toLowerCase().includes('merge conflict'));
-    expect(toast).toBeTruthy();
-    expect(toast!.type).toBe('warning');
-
-    // Conflict does not add to applyingChangeIds — that's handled by MergeConflictDetected SSE
+    expect(toasts.value.find(t => t.message.toLowerCase().includes('merge conflict'))).toBeUndefined();
     expect(applyingChangeIds.value.has('change-4')).toBe(false);
-  });
-
-  it('embeds thread title and links to the thread on click', async () => {
-    threadMap.value = new Map([
-      ['thread-456', { meta: { id: 'thread-456', title: 'Refactor settings' } } as any],
-    ]);
-    mockedApply.mockResolvedValue({
-      status: 'conflict',
-      change_id: 'change-5',
-      thread_id: 'thread-456',
-      message: 'Merge conflicts in 2 file(s)',
-      restart_required: false,
-      commits_applied: 0,
-      files_changed: 2,
-      conflict_thread_id: 'thread-456',
-    });
-
-    await applySingleChange('change-5');
-
-    const toast = toasts.value.find(t => t.message.toLowerCase().includes('merge conflict'));
-    expect(toast).toBeTruthy();
-    expect(toast!.message).toContain('Refactor settings');
-    expect(toast!.onClick).toBeTruthy();
-
-    toast!.onClick!();
-    expect(mockedFocusThread).toHaveBeenCalledWith('thread-456');
   });
 
   it('shows error toast on failure', async () => {
@@ -131,8 +105,11 @@ describe('applySingleChange feedback', () => {
     expect(toast!.message).toContain('Merge conflict');
   });
 
-  it('does not show bare "timeout" toast when client AbortController fires', async () => {
-    mockedApply.mockRejectedValue(new DOMException('aborted', 'AbortError'));
+  it('does not show bare "timeout" toast when client timeout fires', async () => {
+    // applyChange's 10-min timeout fires the controller with a TimeoutError
+    // reason; errorDetail must render that as "request timed out", not bare
+    // "timeout" (the unhelpful pre-refactor label).
+    mockedApply.mockRejectedValue(new DOMException('timeout', 'TimeoutError'));
 
     await applySingleChange('change-timeout');
 
@@ -140,5 +117,23 @@ describe('applySingleChange feedback', () => {
     expect(toast).toBeTruthy();
     expect(toast!.message).not.toBe('timeout');
     expect(toast!.message).toContain('timed out');
+  });
+
+  it('applyAllChanges shows a toast when the batch stops at a conflict', async () => {
+    threadMap.value = new Map([
+      ['thread-X', { meta: { id: 'thread-X', title: 'Big refactor' } } as any],
+    ]);
+    mockedApplyAll.mockResolvedValue({
+      message: 'Applied 3 change(s), then hit a conflict.',
+      restart_required: false,
+      conflict_thread_id: 'thread-X',
+      applied: 3,
+      failed: 0,
+    });
+    await applyAllChanges();
+    const t = toasts.value.find(t => t.message.toLowerCase().includes('merge conflict'));
+    expect(t).toBeTruthy();
+    expect(t!.message).toContain('Big refactor');
+    expect(t!.message).toContain('3');
   });
 });

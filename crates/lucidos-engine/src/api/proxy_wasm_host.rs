@@ -409,6 +409,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::proxy_hex::hex_lower;
 
     // Test vectors below come from RFC 4231 (HMAC-SHA-2) and RFC 3174 (SHA-1)
     // / FIPS 180-2 (SHA-256/512).
@@ -417,7 +418,7 @@ mod tests {
     fn sha1_known_vector() {
         // "abc" → A9993E364706816ABA3E25717850C26C9CD0D89D (FIPS 180-2)
         let h = sha1_digest(b"abc");
-        let hex = hex_to_string(&h);
+        let hex = hex_lower(&h);
         assert_eq!(hex, "a9993e364706816aba3e25717850c26c9cd0d89d");
     }
 
@@ -425,7 +426,7 @@ mod tests {
     fn sha256_known_vector() {
         // "abc" → ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
         let h = sha256_digest(b"abc");
-        let hex = hex_to_string(&h);
+        let hex = hex_lower(&h);
         assert_eq!(
             hex,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -436,7 +437,7 @@ mod tests {
     fn sha512_known_vector() {
         // "abc" → ddaf35a193617aba... (full hex below)
         let h = sha512_digest(b"abc");
-        let hex = hex_to_string(&h);
+        let hex = hex_lower(&h);
         assert_eq!(
             hex,
             "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
@@ -449,7 +450,7 @@ mod tests {
         // RFC 4231, test case 1: key=20×0x0b, data="Hi There"
         let key = [0x0b; 20];
         let mac = hmac_sha256_digest(&key, b"Hi There");
-        let hex = hex_to_string(&mac);
+        let hex = hex_lower(&mac);
         assert_eq!(
             hex,
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
@@ -460,7 +461,7 @@ mod tests {
     fn hmac_sha512_rfc4231_test_case_1() {
         let key = [0x0b; 20];
         let mac = hmac_sha512_digest(&key, b"Hi There");
-        let hex = hex_to_string(&mac);
+        let hex = hex_lower(&mac);
         assert_eq!(
             hex,
             "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cde\
@@ -473,7 +474,7 @@ mod tests {
         // RFC 2202, test case 1: same key+data shape
         let key = [0x0b; 20];
         let mac = hmac_sha1_digest(&key, b"Hi There");
-        let hex = hex_to_string(&mac);
+        let hex = hex_lower(&mac);
         assert_eq!(hex, "b617318655057264e28bc0b6fb378c8ef146be00");
     }
 
@@ -502,13 +503,5 @@ mod tests {
     fn base64_encode_returns_none_when_capacity_insufficient() {
         let mut out = [0u8; 4];
         assert!(base64_encode_into(b"hello", &mut out).is_none());
-    }
-
-    fn hex_to_string(bytes: &[u8]) -> String {
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            s.push_str(&format!("{:02x}", b));
-        }
-        s
     }
 }

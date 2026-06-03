@@ -1,6 +1,6 @@
 ---
 name: ThreadEvent Reference
-description: The full enumerated list of `ThreadEvent` variants the Lucidos engine emits — chat-side (MessageReceived, ResponseGenerated, …), coding-agent (CodingAgent*), thread lifecycle (ThreadStarted, ThreadArchived, …), changes (ChangeProposed, ChangeApplied, …), background bash, plugin / repo / merge-conflict, transient SSE-only commands (RefreshAppUI, CaptureAppUI, …). Documents each variant's payload, volume class, whether it's persisted, and whether a workspace `on_event:` trigger can subscribe to it today (the scheduler's ThreadEvent allowlist is gated to one entry). Load when the user asks "what events fire on a thread", "can I trigger on ResponseGenerated / ChangeApplied / TriggerCompleted / BackgroundBashCompleted", "list every ThreadEvent", "is X event persisted", "what payload does Y carry", or talks about the EventBus, event sourcing, SSE event stream, on_event triggers, projections — and especially before wiring `on_event:` to anything other than `UserQuestionAsked`. For the CC-only deep-dive (UserQuestion vs permission distinction, CodingAgentIdled semantics, the no-`CodingAgentErrored` gap), see `system-knowhow/coding-agent-events.md`.
+description: The full enumerated list of `ThreadEvent` variants the Lucidos engine emits — chat-side (MessageReceived, ResponseGenerated, …), coding-agent (CodingAgent*), thread lifecycle (ThreadStarted, ThreadArchived, …), changes (ChangeProposed, ChangeApplied, …), background bash, plugin / repo / merge-conflict, transient SSE-only request events (AppUiRefreshRequested, AppUiCaptureRequested, …). Documents each variant's payload, volume class, whether it's persisted, and whether a workspace trigger can subscribe to it via an `on:` entry (the scheduler uses a blocklist — every persisted variant is triggerable except a small set of high-volume streaming / per-action ones). Load when the user asks "what events fire on a thread", "can I trigger on ResponseGenerated / ChangeApplied / TriggerCompleted / BackgroundBashCompleted", "list every ThreadEvent", "is X event persisted", "what payload does Y carry", or talks about the EventBus, event sourcing, SSE event stream, event-based triggers, projections — and especially before wiring an `on:` subscription to a high-volume variant. For the CC-only deep-dive (UserQuestion vs permission distinction, CodingAgentIdled semantics, the no-`CodingAgentErrored` gap), see `system-knowhow/coding-agent-events.md`.
 ---
 
 # ThreadEvent Reference
@@ -9,35 +9,50 @@ The complete enumerated list of `ThreadEvent` — the per-thread event family th
 
 For the CC slice (`CodingAgent*` + the `UserQuestion*` / permission machinery) the deep-dive lives in `system-knowhow/coding-agent-events.md`. This file is the master enumeration; the CC entries below summarize and link.
 
-For event-store column shape, the chat-mode terminator set, and the `events` table schema, see `.claude/rules/db.md`. For trigger config syntax (cron, `on_event`, `condition` operators), see `system-knowhow/building-a-trigger.md`.
+For event-store column shape, the chat-mode terminator set, and the `events` table schema, see `.claude/rules/db.md`. For trigger config syntax (cron, the `on` subscription list, per-entry `condition` operators), see `system-knowhow/building-a-trigger.md`.
 
-## CRITICAL: today only `UserQuestionAsked` actually fires triggers
+## Today the scheduler uses a blocklist
 
-The scheduler subscribes to the EventBus and forwards events to the trigger matcher, but the `BusEvent::Thread` branch is gated by an explicit allowlist (`crates/lucidos-engine/src/scheduler/mod.rs`, look for `// Allow a curated subset of ThreadEvents`). Today that allowlist contains exactly one entry: `UserQuestionAsked`.
+The scheduler subscribes to the EventBus and forwards events to the trigger matcher. The `BusEvent::Thread` branch is gated by a small **blocklist** (`ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events.rs`; the gate itself lives in `crates/lucidos-engine/src/scheduler/mod.rs`). Every other persisted `ThreadEvent` is forwarded to the matcher and can be subscribed to via an `on:` entry on a trigger.
 
-That means right now:
+The blocklist contains exactly the per-token streaming variants — many fires per turn (one event per text chunk), never appropriate to subscribe a trigger to:
 
-- `on_event: UserQuestionAsked` — works.
-- `on_event: <any other ThreadEvent>` — **does not fire today**. The trigger config will validate and the trigger row will be persisted, but the matcher will never see the event because the scheduler skips it. This includes `ResponseGenerated`, `ResponseFailed`, `CodingAgentIdled`, `ChangeApplied`, `TriggerCompleted`, `BackgroundBashCompleted`, every `Change*`, every `Thread*` lifecycle event, etc.
-- `on_event: <a workspace-emitted DomainEvent>` — works. `SystemEvent::DomainEvent` (emitted via `lucidos events emit` / `emit_event` LLM tool) DOES go through the matcher. This is the supported path for "trigger on something my workspace observes."
+- `TextStreamed`
+- `ThoughtStreamed`
+- `CodingAgentTextStreamed`
 
-If a workspace asks for "notify me when X" and X is a `ThreadEvent`, **first** add it to the scheduler allowlist (engine code change, not a workspace config), or arrange for the relevant code path to also emit a domain event the trigger can listen to. Don't ship a trigger that silently never fires. The `In allowlist` column on every table below is the binary "would a trigger fire on this today?" answer.
+Per-action variants with high cardinality (`ToolCalled`, `ToolResult`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `ContextCaptured`, `MemorySearched`, `ImageDescribed`, `UserPromptInjected`, `CodingAgentPromptSent`) are **triggerable** — fire once per discrete action, scope with per-entry `condition:` filters (e.g. `name: "Bash"`, `args.command: { $regex: "git push" }`, `estimated_total_tokens: { $gt: 150000 }`).
+
+That means right now (each example below is one entry inside a trigger's `on` list — see `system-knowhow/building-a-trigger.md` for the full subscription shape):
+
+- `event_type: UserQuestionAsked` — works. The typical use is "push me when an interactive question is raised so I can answer from my phone." Pair `send_notification` with `tap: { kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<source_event_id>' } }` so the tap deep-links straight to the question — see `building-a-trigger.md` for the worked example.
+- `event_type: CodingAgentPermissionRequest` / `CredentialRequested` / `McpConsentRequested` — **work**. These are the other blocking-request events that should wake the user.
+- `event_type: ResponseGenerated` / `ResponseFailed` / `CodingAgentIdled` / `ChangeApplied` / `ChangeHardened` / `TriggerCompleted` / `BackgroundBashCompleted` / every `Change*` / every `Thread*` lifecycle event — **work**.
+- `event_type: ToolCalled` / `CodingAgentToolCalled` / `ContextCaptured` / `ImageDescribed` etc. — **work**. Use a per-entry `condition:` filter to scope; without one a chatty per-action variant will fire the trigger many times per turn.
+- `event_type: TextStreamed` / `ThoughtStreamed` / `CodingAgentTextStreamed` — does not fire. The trigger config will validate and the trigger row will be persisted, but the matcher never sees the event. Don't subscribe to per-token streaming variants — they'd saturate whatever they're wired to.
+- `event_type: <a workspace-emitted DomainEvent>` — works. `SystemEvent::DomainEvent` (emitted via `lucidos events emit` / the `emit_event` LLM tool) flows through the matcher unconditionally. This is the supported path for "trigger on something my workspace observes."
+
+If you add a new per-token streaming variant to `ThreadEvent`, add it to `ThreadEvent::is_per_token_streaming` in the same change. Lifecycle / one-per-turn / per-action variants need no scheduler change — they flow through by default.
+
+The `Triggerable` column on every table below is the binary "would a trigger fire on this today?" answer. **Triggerable does not mean "good idea to subscribe without a condition"** — for any per-action variant, lean on `condition:` filters to scope the matches.
 
 ## Persisted vs transient
 
 The enum splits into two halves, mirrored by `ThreadEvent::is_persisted()`:
 
-- **Past tense → persisted.** `MessageReceived`, `ResponseGenerated`, `CodingAgentIdled`, `ChangeApplied`, etc. Written to the `events` table; replayable; visible to projections, history queries, and (in principle) the trigger matcher.
-- **Present participle / imperative → transient.** `TextStreaming`, `Retrying`, `RefreshAppUI`, `PluginInstallRequest`, etc. Broadcast over SSE only. Never persisted; never reach the projection or trigger paths. Used for live UI updates (token streaming, modal-trigger commands) and child thread broadcasts.
+All variants are past tense — events-only model, no command concept (imperative actions are reframed as request events like `AppUiRefreshRequested`). Persistence is orthogonal to tense:
 
-A trigger on a transient event can never fire — it isn't even allowlistable, because the scheduler's matcher only looks at persisted events.
+- **Persisted.** `MessageReceived`, `ResponseGenerated`, `CodingAgentIdled`, `ChangeApplied`, etc. Written to the `events` table; replayable; visible to projections, history queries, and (in principle) the trigger matcher.
+- **Transient.** `CumulativeTextUpdated`, `LlmCallRetried`, `AppUiRefreshRequested`, `PluginInstallRequested`, etc. Broadcast over SSE only. Never persisted; never reach the projection or trigger paths. Used for live UI updates (token streaming preview, modal-trigger request events) and child thread broadcasts.
+
+A trigger on a transient event can never fire — the scheduler's matcher only looks at persisted events.
 
 ## Wire format and metadata
 
 Persisted events are stored with `event_type` set to the variant name and `payload` as the variant's JSON object. Cross-cutting fields merged into the payload at persist time by `EventMeta` (see `engine/thread_events.rs` `EventMeta::apply`):
 
 - `request_event_id` — links response/terminal events back to the originating request.
-- `channel` — `"chat"` / `"claude_code"` / `"trigger"` (`EventChannel`). The `"claude_code"` wire string is the legacy name for the CC channel; rename pending coordinated migration.
+- `channel` — `"chat"` / `"claude_code"` / `"trigger"` (`EventChannel`). The `"claude_code"` wire string is the deliberate Claude-Code instance identifier (not a legacy alias) — a future Codex coding agent would slot in as `EventChannel::Codex` with wire string `"codex"`.
 - `actor` — `MessageOrigin` of who initiated. Stamped by mutating HTTP handlers via `api/actor::user_actor_resolved`.
 
 Some variants (`ChangeApplied`, `ChangeDiscarded`, `ChangeReverted`, `ChangeApplyFailed`, `ChangeHardened`, `ThreadStarted`, `ThreadDiscarded`, `ImageUploaded`) carry `actor` as a per-variant field (predates `EventMeta`); `MessageReceived` and several others use `origin: Option<MessageOrigin>`. Treat both as the canonical "who did this" field for that event.
@@ -46,140 +61,144 @@ Some variants (`ChangeApplied`, `ChangeDiscarded`, `ChangeReverted`, `ChangeAppl
 
 Used in every table below. Pick the right class before subscribing a trigger.
 
-- **lifecycle** — fires once at a moment in a thread's life (creation, archive, terminal). Safe to trigger on if the trigger is allowlisted.
-- **one-per-turn** — fires at most once per chat / CC turn. Safe to trigger on (allowlisted), with a `condition` if needed.
-- **per-action** — fires once per discrete user/agent action (one tool call, one message, one captured context). Use a `condition` filter to scope.
-- **high-volume-streaming** — many fires per turn (per token chunk, per LLM round-trip). **Do not trigger on these** even if allowlisted in future — they will saturate whatever they're wired to.
+- **lifecycle** — fires once at a moment in a thread's life (creation, archive, terminal). Safe to trigger on directly.
+- **one-per-turn** — fires at most once per chat / CC turn. Safe to trigger on, with a `condition` if needed.
+- **per-action** — fires once per discrete user/agent action (one tool call, one message, one captured context). Triggerable, but always pair with a `condition` filter — without one, a chatty per-action variant will fire the trigger many times per turn.
+- **high-volume-streaming** — many fires per turn (per token chunk). **Blocked by the scheduler** (`TextStreamed`, `ThoughtStreamed`, `CodingAgentTextStreamed`); the matcher never sees them. Subscribing is a no-op.
 - **transient-SSE-only** — never persisted; cannot trigger.
 
 ## Chat / agentic loop
 
 These fire on chat threads (`channel = chat`) and on trigger-driven runs (`channel = trigger`). The CC equivalents under "Coding agent" use the parallel `CodingAgent*` names.
 
-| Event | When it fires | Volume | Persisted | In allowlist |
+| Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
-| `MessageReceived` | A user (or upstream workspace, or parent thread, or engine) submitted text into the thread. Stamped at the HTTP boundary in `api/chat.rs::chat_submit`. | one-per-turn | yes | no |
-| `TextStreamed` | A complete chunk of assistant text was committed to the thread (post-stream finalize for chat; one event per appended chunk). | per-action | yes | no |
-| `Thinking` | The model emitted a `thinking` block (extended-thinking models). | per-action | yes | no |
-| `ContextCaptured` | One snapshot of the LLM context the engine assembled for a single LLM call (prompt sections, tools, estimated tokens, real `usage` when the provider reports it). One per LLM call; the modal reads these to show context drift. | per-action | yes | no |
-| `MemorySearched` | The chat-side memory consumer ran a vector search to assemble context. Carries `results: usize`, `queries: Vec<String>`. | per-action | yes | no |
-| `ToolCalled` | The chat agentic loop invoked a tool (`name`, `args`, optional `description`). Distinct from `CodingAgentToolCalled` — those are CC's tool calls. | per-action | yes | no |
-| `ToolResult` | The result returned to the chat agentic loop for a prior `ToolCalled`. Carries `result: String`, `images`, `success: bool` (default true). | per-action | yes | no |
-| `BackgroundBashStarted` | A long-running shell command was spawned via the `run_bash_background` chat tool. Paired with a later `BackgroundBashCompleted`. | per-action | yes | no |
-| `BackgroundBashCompleted` | The bash task finished — natural exit, watchdog timeout, or `bash_kill`. Carries `exit_code: Option<i32>` (None on signal-only kills), `stdout`, `stderr`, `timed_out: bool`, `killed: bool`. The audit-trail counterpart of `Started`; `bash_output` falls back to this row after the in-memory registry evicts the task. | per-action | yes | no |
-| `ResponseGenerated` | The chat agentic loop terminated with an assistant response. The chat-mode terminator. | one-per-turn | yes | no |
-| `ResponseCanceled` | User clicked Stop, or clicked Apply / Discard / Archive on a still-running session. Carries `cause: CancelCause` (`UserStop` / `UserAction` / `Unknown`). Always emit via `thread_events::emit_response_canceled` — it's idempotent against pre-emitted terminators (the `/api/restart` race). | one-per-turn | yes | no |
-| `ResponseAborted` | System-driven termination — engine shutdown, safety net, recovery sweep, OS signal, stale-projection settle. Carries `cause: AbortCause` (`EngineShutdown` / `SafetyNet` / `RecoveryAfterRestart` / `ProcessKilled` / `StaleSettle` / `Unknown`). Always emit via `thread_events::emit_response_aborted`. | one-per-turn | yes | no |
-| `ResponseFailed` | Hard failure mid-turn: upstream API error, panic, OOM-killed bash, empty assistant text on a non-cancel turn (`agent_session::lifecycle::classify_result` triggers this for CC too). Carries `error: String`. | one-per-turn | yes | no |
-| `UserPromptInjected` | A user correction OR an engine-injected mid-flight message (resume note, child-thread callback in legacy paths) was relayed into the live agentic loop. Carries `text`, `mode: ActorMode`, optional `origin`, optional `injected_message_id`. | per-action | yes | no |
+| `MessageReceived` | A user (or upstream workspace, or parent thread, or engine) submitted text into the thread. Stamped at the HTTP boundary in `api/chat.rs::chat_submit`. | one-per-turn | yes | yes |
+| `TextStreamed` | A complete chunk of assistant text was committed to the thread (post-stream finalize for chat; one event per appended chunk). | high-volume-streaming | yes | **no (blocked)** |
+| `ThoughtStreamed` | The model emitted a `thinking` / reasoning block (extended-thinking models). One event per chunk. Legacy alias: `Thinking`. | high-volume-streaming | yes | **no (blocked)** |
+| `ContextCaptured` | One snapshot of the LLM context the engine assembled for a single LLM call (prompt sections, tools, estimated tokens, real `usage` when the provider reports it). One per LLM call; the modal reads these to show context drift. | per-action | yes | yes (use condition) |
+| `MemorySearched` | The chat-side memory consumer ran a vector search to assemble context. Carries `results: usize`, `queries: Vec<String>`. | per-action | yes | yes (use condition) |
+| `ToolCalled` | The chat agentic loop invoked a tool (`name`, `args`, optional `description`). Distinct from `CodingAgentToolCalled` — those are CC's tool calls. | per-action | yes | yes (use condition) |
+| `ToolResult` | The result returned to the chat agentic loop for a prior `ToolCalled`. Carries `result: String`, `images`, `success: bool` (default true), and optional `tool_called_event_id: Uuid` set only by the post-restart recovery sweep (`recover_orphan_tool_calls`) for synthetic backfills — the frontend's `groupIntoExchanges` uses it to land the synthetic result in the same exchange as its orphan `ToolCalled` so the "Executing …" spinner resolves. Live emits omit it; chronological name pairing handles those. | per-action | yes | yes (use condition) |
+| `BackgroundBashStarted` | A long-running task was spawned via `run_bash_background` (shell command) OR `run_python_background` (venv-rooted Python script — the engine wraps it as `/bin/sh -c "<venv-python> <script>"` and routes it through the same registry). The `command` field captures the exact shell invocation. Paired with a later `BackgroundBashCompleted`. | per-action | yes | yes |
+| `BackgroundBashCompleted` | The task finished — natural exit, watchdog timeout, or `bash_kill`. Carries `exit_code: Option<i32>` (None on signal-only kills), `stdout`, `stderr`, `timed_out: bool`, `killed: bool`. The audit-trail counterpart of `Started`; `bash_output` falls back to this row after the in-memory registry evicts the task. Same shape whether the spawning tool was `run_bash_background` or `run_python_background`. | per-action | yes | yes |
+| `ResponseGenerated` | The chat agentic loop terminated with an assistant response. The chat-mode terminator. | one-per-turn | yes | yes |
+| `ResponseCanceled` | User clicked Stop, or clicked Apply / Discard / Archive on a still-running session. Carries `cause: CancelCause` (`UserStop` / `UserAction` / `Unknown`). Always emit via `thread_events::emit_response_canceled` — it's idempotent against pre-emitted terminators (the `/api/v1/restart` race). | one-per-turn | yes | yes |
+| `ResponseAborted` | System-driven termination — engine shutdown, safety net (non-watchdog), recovery sweep, OS signal, stale-projection settle. Carries `cause: AbortCause` (`EngineShutdown` / `SafetyNet` / `RecoveryAfterRestart` / `ProcessKilled` / `StaleSettle` / `Unknown`). Always emit via `thread_events::emit_response_aborted`. Note: when a hung-subprocess watchdog kills CC (vs a CC crash or driver death), the engine emits `ContinuationRequested{auto_recovery_after_hang}` instead of `ResponseAborted{SafetyNet}` so the thread auto-resumes without user intervention. Two watchdogs can fire that path — see the `ContinuationRequested` row below. | one-per-turn | yes | yes |
+| `ResponseFailed` | Hard failure mid-turn: upstream API error, panic, OOM-killed bash, empty assistant text on a non-cancel turn (`agent_session::lifecycle::classify_result` triggers this for CC too). Carries `error: String`. | one-per-turn | yes | yes |
+| `UserPromptInjected` | A user correction OR an engine-injected mid-flight message (resume note, child-thread callback in legacy paths) was relayed into the live agentic loop. Carries `text`, `mode: ActorMode`, optional `origin`, optional `injected_message_id`. | per-action | yes | yes (use condition) |
+| `ImageDescribed` | A background Flash call produced a text description for one of the images attached to a `MessageReceived`. Emitted from the agentic loop after iteration 1 of a chat turn — one event per attached `user_image_hashes` entry, all carrying the same description text. Replaced an in-place `jsonb_set` mutation that used to write `image_description` back into the source row. Carries `source_event_id: Uuid` (the originating `MessageReceived`), `hash: String` (the described blob's sha256), `description: String` (post `is_bad_image_description` filter), `model: String` (literal `"backfill"` on rows produced by the startup backfill, otherwise the actual Flash model). The `description` is indexed into memory (it carries real shared content — screenshots, tickets, photos), so an image-only turn isn't a memory black hole. | per-action | yes | yes (use condition) |
+| `TodoListWritten` | The *Lucidos Agent* called the `todo_write` LLM tool, OR the engine's `todo_consumer` flipped abandoned items at response termination. Replace-whole-list semantics — `items: Vec<TodoItem>` is the new complete *todo list*, fully superseding any prior `TodoListWritten` in the thread. Each `TodoItem` has `content: String` (imperative form, "Run tests"), `active_form: String` (present continuous, "Running tests"), `status: TodoStatus` (`pending` / `in_progress` / `completed` / `abandoned`, snake_case on the wire). LLM tool handler enforces ≤ 50 items, at most one `in_progress`, and rejects `abandoned` (engine-only); empty list is valid and means "cleared". The engine-side `todo_consumer` subscribes to `ResponseGenerated` / `ResponseCanceled` / `ResponseAborted` and re-emits the latest list with any `pending` / `in_progress` items flipped to `abandoned`, so the panel always shows an honest final state once a response ends. Chat-agent tool only — *coding-agent threads* use *Claude Code*'s own `TodoWrite` rendering instead. UI: frontend walks the thread's events backwards, finds the most recent `TodoListWritten`, and renders the items in the prompt-bar collapsible panel; abandoned rows render with a dashed strike-through and an `abandoned` tag. | per-action | yes | yes (use condition) |
 
 Terminator set for chat-mode (`TERMINATOR_EVENT_TYPES` constant): `ResponseGenerated`, `ResponseCanceled`, `ResponseAborted`, `ResponseFailed`. Used by `has_terminator_for` for idempotent terminator emission.
 
 ## Resume / continuation
 
-| Event | When it fires | Volume | Persisted | In allowlist |
+| Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
-| `ContinuationStarted` | Resume-after-abort boundary. Opens a new exchange in the timeline whose body is the rerun (chat: re-LLM call after abort; CC: `--resume` into the same `cc_session_id`). Carries optional `branch` and engine-stamped `origin`. Aliases for old DB rows: `SessionRecovered`, `SessionResumed`. | lifecycle | yes | no |
-| `SessionStarted` | A coding-agent process spawned. Carries `session_id` (CC's CLI session id), optional `branch`, optional `repo_id`. | lifecycle | yes | no |
-| `SessionEnded` | A coding-agent thread is truly done (Phase 4 of the CC resume architecture: terminal-only). Carries `reason: SessionEndReason` (`Shutdown` / `Panic` / `Closed` / `StaleResume` / `LegacyNonTerminal`). `StaleResume` is the one transient case — the chat handler retries internally; frontend skips the AbortPanel. | lifecycle | yes | no |
+| `ContinuationStarted` | Resume-after-abort boundary. Opens a new exchange in the timeline whose body is the rerun (chat: re-LLM call after abort; CC: `--resume` into the same `cc_session_id`). Carries optional `branch` and engine-stamped `origin`. Aliases for old DB rows: `SessionRecovered`, `SessionResumed`. | lifecycle | yes | yes |
+| `SessionStarted` | A coding-agent process spawned. Carries `session_id` (CC's CLI session id), optional `branch`, optional `repo_id`, plus *coding-agent-thread* discriminators: `coding_agent_kind` (`"lucidos" \| "app" \| "external"`, default `"lucidos"`), `coding_agent_folder` (canonical folder the spawn targets — `<ws>/data/apps/<id>/` for App, repo root otherwise), and `app_id` (set only for App). Legacy rows without these decode as Lucidos via the serde defaults. | lifecycle | yes | yes |
+| `SessionEnded` | A coding-agent thread is truly done (Phase 4 of the CC resume architecture: terminal-only). Carries `reason: SessionEndReason` (`Shutdown` / `Panic` / `Closed` / `StaleResume` / `LegacyNonTerminal`). `StaleResume` is the one transient case — the chat handler retries internally; frontend skips the AbortPanel. | lifecycle | yes | yes |
 
 ## Coding agent (CC / Codex)
 
-The umbrella `CodingAgent*` family covers Claude Code and Codex (the variants carry `agent: AgentKind`, default `ClaudeCode`). Each variant has a `#[serde(alias = "ClaudeCode<X>")]` for the legacy pre-rename name — write new code against the `CodingAgent*` form.
+The umbrella `CodingAgent*` family covers Claude Code and Codex (the variants carry `coding_agent: CodingAgent`, default `ClaudeCode`; the wire field has `#[serde(alias = "agent")]` so legacy DB rows persisted before the rename still decode). Each variant has a `#[serde(alias = "ClaudeCode<X>")]` for the legacy pre-rename variant name — write new code against the `CodingAgent*` form.
 
 **See `system-knowhow/coding-agent-events.md` for full payload shapes, the `CodingAgentIdled` field-by-field reference, the `UserQuestion` vs `CodingAgentPermission` distinction, and the no-`CodingAgentErrored` gap.** This table is the index.
 
-| Event | When it fires | Volume | Persisted | In allowlist |
+| Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
-| `CodingAgentUserMessageSent` | A user message was relayed into the agent's input stream. | one-per-turn | yes | no |
-| `CodingAgentPromptSent` | An engine-synthesized prompt was injected (orphan-recovery, hardening retrigger, merge-conflict explainer, post-question continuation). Carries `origin: Option<MessageOrigin>`. Audit-only, not rendered in chat. | per-action | yes | no |
-| `CodingAgentTextStreamed` | One chunk of CC's assistant text. | high-volume-streaming | yes | no |
-| `CodingAgentToolCalled` | One CC tool invocation. Carries `name`, `args`, optional `description`, `tool_use_id`. | high-volume-streaming | yes | no |
-| `CodingAgentToolResult` | The result returned to CC for a prior `CodingAgentToolCalled`. Same `tool_use_id`. | high-volume-streaming | yes | no |
-| `CodingAgentIdled` | **The CC turn-boundary marker.** Emitted at the end of every CC turn whose Result wasn't an engine-shutdown abort. Carries `has_changes`, `is_external_repo`, `requires_restart`, `cc_session_id`, `agent`, optional `reason`, optional `worktree_path`, optional `worktree_head_sha`. | one-per-turn | yes | no |
-| `CodingAgentSettingsChanged` | User changed model, reasoning effort, or permission mode mid-session. | lifecycle (rare) | yes | no |
-| `CodingAgentPermissionRequest` | CC's MCP permission-prompt subprocess asked to confirm a tool call (path outside cwd, `.claude/`, `.git/`). | per-action | yes | no |
-| `CodingAgentPermissionResolved` | The above request was answered (or auto-resolved by recovery). Carries `allowed`, optional `reason`, optional `persist_scope` (`narrow` / `broad` / `session`). | per-action | yes | no |
-| `MissingHardeningDetected` | Engine detected a CC session ended without running `/harden` and auto-spawned a recovery hardening session. Not a session terminator — the thread stays active until hardening finishes. | lifecycle (rare) | yes | no |
-| `ContinueSignal` | Continuation marker — emitted when an interrupted CC turn (engine-restart-mid-turn, user-clicked-Continue) needs to be resumed without a new user message. Picked up by the spawn dispatcher; the event id is the spawn idempotency key. Carries `reason: String`. | lifecycle | yes | no |
+| `CodingAgentUserMessageSent` | A user message was relayed into the agent's input stream. | one-per-turn | yes | yes |
+| `CodingAgentPromptSent` | An engine-synthesized prompt was injected (orphan-recovery, hardening retrigger, merge-conflict explainer, post-question continuation). Carries `origin: Option<MessageOrigin>`. Audit-only, not rendered in chat. | per-action | yes | yes (use condition) |
+| `CodingAgentTextStreamed` | One chunk of CC's assistant text. | high-volume-streaming | yes | **no (blocked)** |
+| `CodingAgentToolCalled` | One CC tool invocation. Carries `name`, `args`, optional `description`, `tool_use_id`. | per-action | yes | yes (use condition) |
+| `CodingAgentToolResult` | The result returned to CC for a prior `CodingAgentToolCalled`. Same `tool_use_id`. | per-action | yes | yes (use condition) |
+| `CodingAgentIdled` | **The CC turn-boundary marker.** Emitted at the end of every CC turn whose Result wasn't an engine-shutdown abort. Carries `has_changes`, `is_external_repo`, `requires_restart`, `cc_session_id`, `coding_agent`, optional `reason`, optional `worktree_path`, optional `worktree_head_sha`, `bg_bash_pending` (recorded-history flag: true when the turn idled with a chat-agent `run_bash_background` task still running; **no longer gates proposal or drives any UI** — the change proposes at idle regardless of background bash, and correctness is covered by harden-at-apply). | one-per-turn | yes | yes |
+| `CodingAgentSettingsChanged` | User changed model, reasoning effort, or permission mode mid-session — and also emitted once at CC `Init` carrying `cc_session_id` so the session id is durable before the first `CodingAgentIdled` (lets a mid-turn engine restart still `--resume`). | lifecycle (rare) | yes | yes |
+| `CodingAgentPermissionRequest` | CC's MCP permission-prompt subprocess asked to confirm a tool call (path outside cwd, `.claude/`, `.git/`). | per-action | yes | yes |
+| `CodingAgentPermissionResolved` | The above request was answered (or auto-resolved by recovery, or by supersession when the user types a new message instead of clicking — `allowed: false`, `reason: "Superseded by a new message"`). Carries `allowed`, optional `reason`, optional `persist_scope` (`narrow` / `broad` / `session`). | per-action | yes | yes |
+| `MissingHardeningDetected` | Engine detected a CC session ended without running `/harden` and auto-spawned a recovery hardening session. Not a session terminator — the thread stays active until hardening finishes. | lifecycle (rare) | yes | yes |
+| `ContinuationRequested` | Continuation marker — emitted when an interrupted CC turn needs to resume without a new user message. Picked up by the spawn dispatcher; the event id is the spawn idempotency key. `reason: String` is one of: `"user_clicked_continue"` (user clicked Continue after an engine restart), `"answered_after_idle"` (user answered an `AskUserQuestion` after CC's subprocess was torn down at idle), `"auto_recovery_after_hang"` (a hung-subprocess watchdog detected CC silent past its inactivity limit and auto-resumes without user intervention). Two watchdogs can produce `auto_recovery_after_hang`: the in-loop one inside `run_session`'s `select!` (10 min, fast first line) and an external scanner task (12 min, ticks every 30 s from outside any per-thread loop — catches the case where the `select!` itself is wedged in an event-handler await). The two share a gate, the 2-min grace ensures the in-loop fires first when it can. Past name `ContinueSignal` is kept as a serde alias for old DB rows. | lifecycle | yes | yes |
 
 ## Question / permission machinery
 
-Not prefixed `CodingAgent*` because the same machinery serves any agent that needs to ask the user a structured question. **`UserQuestionAsked` is the only `ThreadEvent` in the scheduler allowlist today** — it's how the seeded "session waiting on me" push trigger fires.
+Not prefixed `CodingAgent*` because the same machinery serves any agent that needs to ask the user a structured question. All four blocking-request events below are triggerable — wire a trigger to any of them to push the user when the agent needs an answer. See `building-a-trigger.md` for the deep-link pattern (`tap: { kind: 'navigate', to: { target: 'thread', id, event_id } }`).
 
-| Event | When it fires | Volume | Persisted | In allowlist |
+| Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
-| `UserQuestionAsked` | An interactive question raised — typically CC's `AskUserQuestion` tool, or a permission-prompt path routed through the same registry. The CC subprocess is killed at intercept; resume happens via `POST /api/cc/answer-question`. Carries `tool_use_id`, `cc_session_id`, `question`, `options: Vec<QuestionOption>`, optional `worktree_path`, `multi_select: bool`. | one-per-turn (of the `Asked` kind) | yes | **YES** |
-| `UserQuestionAnswered` | The user (or, on the orphan-recovery path, the engine) supplied an answer. Pairs 1:1 with the matching `UserQuestionAsked` via `tool_use_id`. Carries `answer: AnswerKind` (`Selected` / `FreeText` / `MultiSelected` / `Canceled`). | one-per-turn | yes | no |
-| `CredentialRequested` | Persisted record that a credential prompt was opened for `provider`. Pairs with the transient `CredentialRequest` SSE command that drives the modal. | lifecycle | yes | no |
-| `McpConsentRequested` | Persisted record that an MCP consent prompt was opened for tool with `args`. Pairs with the transient `McpConsentRequest` SSE command. | lifecycle | yes | no |
+| `UserQuestionAsked` | An interactive question raised — by CC's `AskUserQuestion` tool, the chat agent's `ask_user_question` tool, or an MCP permission-prompt path routed through the same registry. `meta.channel` (`claude_code` / `chat`) records which agent raised it. Resume happens via `POST /api/v1/threads/{thread_id}/answer-question`; the engine branches on the channel to fire the right resume side-effects (CC: respawn with `--resume`; chat: wake the in-process tool). Carries `tool_use_id`, `cc_session_id` (empty for chat-channel rows), `question`, `options: Vec<QuestionOption>`, optional `worktree_path`, `multi_select: bool`. | one-per-turn (of the `Asked` kind) | yes | yes |
+| `UserQuestionAnswered` | The user (or, on the orphan-recovery path, the engine) supplied an answer. Pairs 1:1 with the matching `UserQuestionAsked` via `tool_use_id`. Carries `answer: AnswerKind` (`Selected` / `FreeText` / `MultiSelected` / `Canceled`) and propagates `meta.channel` from the originating `Asked`. | one-per-turn | yes | yes |
+| `CredentialRequested` | Persisted audit-log entry: a credential prompt was opened for `provider`. Pairs with the transient `CredentialPromptRequested` SSE request that carries the JSON payload for the modal. | lifecycle | yes | yes |
+| `McpConsentRequested` | Persisted audit-log entry: an MCP consent prompt was opened for tool with `args`. Pairs with the transient `McpConsentPromptRequested` SSE request that carries the JSON payload for the modal. | lifecycle | yes | yes |
 
-`QUESTION_ORPHANING_EVENT_TYPES` constant (`ResponseAborted`, `ResponseCanceled`, `ResponseFailed`, `CodingAgentIdled`) — once any of these lands after a `UserQuestionAsked`, the surrounding turn is gone and the next user text starts a fresh follow-up rather than a `FreeText` answer.
+`QUESTION_OVERTAKEN_EVENT_TYPES` constant — the unified set of event names that mean a `UserQuestionAsked` is no longer the latest interactive point on the thread. Once any of these lands after a question, the next typed user text starts a fresh follow-up rather than a `FreeText` answer. Two categories: **terminal** (`ResponseAborted`, `ResponseCanceled`, `ResponseFailed`, `CodingAgentIdled`); **agent progression** — CC (`CodingAgentTextStreamed`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `CodingAgentPromptSent`) and chat (`TextStreamed`, `ThoughtStreamed`, `ToolCalled`, `ToolResult`). The CC progression category defends against the parallel-tool-call race: CC can emit `AskUserQuestion` alongside sibling tool_uses in one assistant message, the hook blocks only AskUserQuestion, the siblings dispatch and emit events while the question stays unanswered. Without filtering on those events, the user's next typed comment is silently absorbed as a `FreeText` answer to the dead question.
 
 ## Thread lifecycle
 
-| Event | When it fires | Volume | Persisted | In allowlist |
+| Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
-| `ThreadStarted` | A thread was created in `composing` state (debounced first user input on a fresh compose). Carries `mode: String` (initial compose mode), optional `actor`. | lifecycle | yes | no |
-| `ThreadDiscarded` | A composing thread was explicitly discarded (DELETE /threads/:id). Terminal — the state-machine guard rejects all subsequent compose mutations with 410 Gone. | lifecycle | yes | no |
-| `ThreadTitleGenerated` | The title-generation pass produced a title for the thread (background, after enough body to summarize). | lifecycle | yes | no |
-| `ThreadTitleRenamed` | The user manually renamed the thread. | lifecycle | yes | no |
-| `ThreadSaved` | User pinned / saved the thread. Empty payload. | lifecycle | yes | no |
-| `ThreadUnsaved` | User unsaved. Empty payload. | lifecycle | yes | no |
-| `ThreadArchived` | User archived. Empty payload. | lifecycle | yes | no |
-| `ImageUploaded` | A user attached an image to a compose draft (POST /api/v1/threads/:id/blobs). Carries `hash` (sha256, sole identity), `mime`, `byte_size`, optional `actor`. Bytes live exactly once at `data/blobs/<hh>/<hash>.<ext>`. | per-action | yes | no |
-| `TriggerStarted` | A scheduled or event-driven trigger run started. Carries `trigger_id`, optional `trigger_name`, optional `prompt`, optional `invocation: TriggerInvocation` (`Schedule` or `Event { event_type, event_id }`), optional `origin`, `go_to_review: bool`. Aliases on the wire: `task_id`, `task_name` (legacy from when triggers were called "scheduled tasks"). | lifecycle | yes | no |
-| `TriggerCompleted` | A trigger run finished. Carries `trigger_id`, optional `trigger_name`, optional `result_summary`. Same aliases. | lifecycle | yes | no |
+| `ThreadStarted` | A thread was created in `composing` state (debounced first user input on a fresh compose). Carries `mode: String` (initial compose mode), optional `actor`. | lifecycle | yes | yes |
+| `ThreadDiscarded` | A composing thread was explicitly discarded (DELETE /threads/:id). Terminal — the state-machine guard rejects all subsequent compose mutations with 410 Gone. | lifecycle | yes | yes |
+| `ThreadTitleGenerated` | The title-generation pass produced a title for the thread (background, after enough body to summarize). | lifecycle | yes | yes |
+| `ThreadTitleRenamed` | The user manually renamed the thread. | lifecycle | yes | yes |
+| `ThreadSaved` | User pinned / saved the thread. Empty payload. | lifecycle | yes | yes |
+| `ThreadUnsaved` | User unsaved. Empty payload. | lifecycle | yes | yes |
+| `ThreadArchived` | User archived. Empty payload. | lifecycle | yes | yes |
+| `ImageUploaded` | A user attached an image to a compose draft (POST /api/v1/threads/:id/blobs). Carries `hash` (sha256, sole identity), `mime`, `byte_size`, optional `actor`. Bytes live exactly once at `data/blobs/<hh>/<hash>.<ext>`. | per-action | yes | yes |
+| `TriggerStarted` | A scheduled or event-driven trigger run started. Carries `trigger_id`, optional `trigger_name`, optional `prompt`, optional `invocation: TriggerInvocation` (`Schedule` or `Event { event_type, event_id?, thread_id? }` — `thread_id` set only for thread-scoped source events; exposed to script triggers as `TRIGGER_EVENT_THREAD_ID`), optional `origin`, `go_to_review: bool`. Aliases on the wire: `task_id`, `task_name` (legacy from when triggers were called "scheduled tasks"). | lifecycle | yes | yes |
+| `TriggerCompleted` | A trigger run finished. Carries `trigger_id`, optional `trigger_name`, optional `result_summary`. Same aliases. | lifecycle | yes | yes |
 
 ## Changes (per-thread CC change proposals)
 
-The change family is per-thread — `change_id` is the primary identifier. `ChangeProposed` is emitted per-commit by a post-commit hook in the CC worktree (Phase 4.2), so multiple events with the same `change_id` can land for one branch (each carrying a unique `commit_sha`). The DB-level `changes` table is a projection over these events.
+The change family is per-thread — `change_id` is the primary identifier. `ChangeProposed` is emitted **once per CC turn**, at end-of-turn, gated by `should_propose_change_at_idle` (only fires on `TerminalKind::Generated` with worktree changes; aborts/cancels/failures don't propose). That's the "CC is done with real finished work" contract — the chip never flips on partial mid-turn state.
 
-| Event | When it fires | Volume | Persisted | In allowlist |
+Legacy: historical events with empty `change_id` + `commit_sha` set are from the old per-commit git hook (deleted along with `commit_hook.rs` + `/api/v1/internal/commit-made` to enforce the "never auto-propose for unfinished work" rule). The projection still handles them on replay, but they're inert — no `thread_summaries` updates, no row inserts into `changes`. The DB-level `changes` table is a projection over the aggregate events only.
+
+| Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
-| `ChangeProposed` | A CC commit landed in the worktree (per-commit hook). Carries `change_id`, optional `description`, `files`, `requires_restart`, optional `origin`, optional `commit_sha`, `branch_name`, `repo_root`, `hardened`, `incomplete`, plus legacy `path` / `diff` for old rows. `incomplete: true` when the proposing CC turn ended in `ResponseFailed`. | per-action | yes | no |
-| `ChangeApplied` | A change was merged to main. Carries `change_id`, `requires_restart`, `client_update`, `commits: Vec<String>` (subjects, oldest first), optional `thread_title`, optional `actor`, optional `pre_merge_sha` / `post_merge_sha` (used by Revert), legacy `path`. | lifecycle | yes | no |
-| `ChangeDiscarded` | A pending change was discarded. Carries `change_id`, optional `actor`, legacy `path`. | lifecycle | yes | no |
-| `ChangeReverted` | An applied change was reverted. Carries `change_id`, optional `actor`, legacy `path`. | lifecycle | yes | no |
-| `ChangeApplyFailed` | Apply attempt failed mid-merge. Carries `change_id`, `error`, optional `actor`. | lifecycle | yes | no |
-| `ChangeHardened` | The change's working tree was hardened (`/harden` marker stamped on HEAD). Idempotent — projection treats only the latest event per `change_id`. Implicitly downgraded when a fresh `ChangeProposed` arrives with `hardened: false`. | lifecycle | yes | no |
-| `MergeConflictDetected` | Engine detected a merge conflict pulling main into a CC branch. Carries `change_id`, `files`, optional engine-stamped `origin`. | lifecycle (rare) | yes | no |
-| `MergeResolutionStarted` | A merge-resolution worktree was set up. Carries `change_id`, `worktree_path`, `temp_branch`. Survives restart so startup cleanup can find dangling worktrees. | lifecycle (rare) | yes | no |
-| `MergeResolutionCleared` | The merge-resolution worktree was torn down (cleanup finished). Carries `change_id`. | lifecycle (rare) | yes | no |
+| `ChangeProposed` | End-of-turn aggregate emit from `propose_change` (CC finished a turn `Generated` with worktree changes). Carries `change_id` (non-empty UUID), optional `description`, `files`, `requires_restart`, optional `origin`, `commit_sha: None`, `branch_name`, `repo_root`, `hardened`, `incomplete`, plus legacy `path` / `diff` for old rows. `incomplete: true` only on engine-internal recovery paths (orphan recovery, stale-session cleanup) that surface commits whose originating turn was killed before closure; a subsequent clean-Generated turn re-emits with `incomplete: false` and clears the flag. Legacy per-commit shape (empty `change_id`, `commit_sha` set) exists only in historical events and is inert in the projection. | per-action | yes | yes |
+| `ChangeApplied` | A change was merged to main. Carries `change_id`, `requires_restart`, `client_update`, `commits: Vec<String>` (subjects, oldest first), optional `thread_title`, optional `actor`, optional `pre_merge_sha` / `post_merge_sha` (used by Revert), legacy `path`. | lifecycle | yes | yes |
+| `ChangeDiscarded` | A pending change was discarded. Carries `change_id`, optional `actor`, legacy `path`. | lifecycle | yes | yes |
+| `ChangeReverted` | An applied change was reverted. Carries `change_id`, optional `actor`, legacy `path`. | lifecycle | yes | yes |
+| `ChangeApplyFailed` | Apply attempt failed mid-merge. Carries `change_id`, `error`, optional `actor`. | lifecycle | yes | yes |
+| `ChangeHardened` | The change's working tree was hardened (`/harden` marker stamped on HEAD). Idempotent — projection treats only the latest event per `change_id`. Implicitly downgraded when a fresh `ChangeProposed` arrives with `hardened: false`. | lifecycle | yes | yes |
+| `MergeConflictDetected` | Engine detected a merge conflict pulling main into a CC branch. Carries `change_id`, `files`, optional engine-stamped `origin`. | lifecycle (rare) | yes | yes |
+| `MergeResolutionStarted` | A merge-resolution worktree was set up. Carries `change_id`, `worktree_path`, `temp_branch`. Survives restart so startup cleanup can find dangling worktrees. | lifecycle (rare) | yes | yes |
+| `MergeResolutionCleared` | The merge-resolution worktree was torn down (cleanup finished). Carries `change_id`. | lifecycle (rare) | yes | yes |
 
 ## Cross-thread / context
 
-| Event | When it fires | Volume | Persisted | In allowlist |
+| Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
-| `ChildThreadCompleted` | A child thread spawned by `run_thread` / `run_claude` reached a terminal event (CC: `CodingAgentIdled` or `SessionEnded`; chat: `ResponseGenerated` / `ResponseFailed`). Emitted on the **parent** thread by EventBus fan-in. Carries `child_thread_id`, optional `child_thread_title`, `status: ChildCompletionStatus` (`Success` / `Failure` / `NoChanges` / `Canceled`), `summary` (truncated to 2000 chars; indexed by `indexable_text`), `pending_change_ids`. | per-action | yes | no |
-| `ContextDismissed` | The agent (LLM) explicitly asked to drop a prior `ToolCalled` / `ToolResult` / `ChildThreadCompleted` from future resume context, via the `dismiss_from_context` tool. Carries `dismissed_event_id`. The resume helper honours it on every subsequent assembly. | per-action | yes | no |
-| `WorktreeCleaned` | Background worktree cleanup ran on this thread (Phase 10.2/10.3). Carries `tier: u8` (1 = build artifacts stripped, worktree still on disk; 2 = entire worktree removed), `freed_bytes: u64` (best-effort), `branch_deleted: bool` (Tier 2 also dropped a fully-merged branch). | lifecycle (rare per thread) | yes | no |
+| `ChildThreadCompleted` | A child thread spawned by `run_thread` / `run_claude` reached a terminal event (CC: `CodingAgentIdled` or `SessionEnded`; chat: `ResponseGenerated` / `ResponseFailed`). Emitted on the **parent** thread by EventBus fan-in. Carries `child_thread_id`, optional `child_thread_title`, `status: ChildCompletionStatus` (`Success` / `Failure` / `NoChanges` / `Canceled`), `summary` (truncated to 2000 chars; indexed by `indexable_text`), `pending_change_ids`. | per-action | yes | yes |
+| `ContextDismissed` | The agent (LLM) explicitly asked to drop a prior `ToolCalled` / `ToolResult` / `ChildThreadCompleted` from future resume context, via the `dismiss_from_context` tool. Carries `dismissed_event_id`. The resume helper honours it on every subsequent assembly. | per-action | yes | yes |
+| `WorktreeCleaned` | Background worktree cleanup ran on this thread (Phase 10.2/10.3). Carries `tier: u8` (0 = applied/clean worktree removed after the short grace; 1 = build artifacts stripped, worktree still on disk; 2 = entire worktree removed — the full-removal tier, also used for *stranded* worktrees whose git admin dir is gone), `freed_bytes: u64` (best-effort), `branch_deleted: bool` (a full removal that also dropped a fully-merged branch; always false for stranded removal). | lifecycle (rare per thread) | yes | yes |
 
 ## Transient — never persisted, broadcast over SSE only
 
-These cannot trigger (the matcher only sees persisted events). They drive live UI state (streaming, modal opens, in-app refreshes) and parent-thread fan-out signals.
+All transient names are past tense (events-only model). They cannot trigger (the matcher only sees persisted events). They drive live UI state (streaming preview, modal opens, in-app refreshes) and parent-thread fan-out signals. The "request events" carry the JSON payload that drives a frontend modal; the persisted siblings (`CredentialRequested`, `McpConsentRequested`) are the audit-log entry that the same request opened a prompt.
 
 | Event | When it fires | Volume |
 |---|---|---|
-| `TextStreaming` | One streamed-text chunk from the chat agentic loop. The pre-finalize counterpart of `TextStreamed`. | high-volume-streaming |
-| `Retrying` | The chat agentic loop is retrying (rate-limit, transient API error, "retry with different approach" path). Carries `reason: String`. | per-action |
-| `PreambleCompleting` | Reserved variant — defined on the enum and skipped by the projection's transient match arm, but **not emitted** by any production code path today. Treat as a stub for future use. | n/a |
-| `CredentialRequest` | Side-effect command — opens the credential prompt modal. Pairs with persisted `CredentialRequested`. Carries `payload: String`. | per-action |
-| `PluginInstallRequest` | Side-effect command — opens the plugin install panel. Carries the JSON preview emitted by `install_plugin` (manifest, file list, overwrites, optional setup). Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm\|cancel}`. | per-action |
-| `PluginUninstallRequest` | Side-effect command — opens the plugin uninstall panel. Carries the JSON preview from `uninstall_plugin` (plugin name + version, file list partitioned into still-on-disk vs already-missing). Resolved by `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm\|cancel}`. | per-action |
-| `EmailConfirmRequest` | Side-effect command — opens the email confirmation modal. Carries `payload: String`. | per-action |
-| `PushNotificationRequest` | Side-effect command — prompts the device to register for web push. Empty payload. | lifecycle |
-| `McpConsentRequest` | Side-effect command — opens the MCP consent prompt modal. Carries `data: String`. Pairs with persisted `McpConsentRequested`. | per-action |
-| `RefreshFile` | Tells the frontend / open editors to re-read a file at `path`. Emitted by `agentic_loop_special_tool`. | per-action |
-| `RefreshAppUI` | Tells any open app iframe with `app_id` to reload itself. | per-action |
-| `CaptureAppUI` | Asks an open app iframe to capture state for `request_id`. The reply lands via the SDK capture path. | per-action |
+| `CumulativeTextUpdated` | One snapshot of the assistant's streaming buffer (cumulative text so far). Emitted at every flush boundary alongside the persisted delta in `TextStreamed`; the frontend just overwrites with the latest snapshot. Legacy alias: `TextStreaming`. | high-volume-streaming |
+| `LlmCallRetried` | The chat agentic loop is retrying an LLM call (rate-limit, transient API error, "retry with different approach" path). Carries `reason: String`. Legacy alias: `Retrying`. | per-action |
+| `PreambleCompleted` | Reserved variant — defined on the enum and skipped by the projection's transient match arm, but **not emitted** by any production code path today. Treat as a stub for future use. Legacy alias: `PreambleCompleting`. | n/a |
+| `CredentialPromptRequested` | Request event — opens the credential prompt modal. Pairs with persisted `CredentialRequested`. Carries `payload: String` (the JSON the modal needs). Legacy alias: `CredentialRequest`. | per-action |
+| `PluginInstallRequested` | Request event — opens the plugin install panel. Carries the JSON preview emitted by `install_plugin` (manifest, file list, overwrites, optional setup). Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm\|cancel}`. Legacy alias: `PluginInstallRequest`. | per-action |
+| `PluginUninstallRequested` | Request event — opens the plugin uninstall panel. Carries the JSON preview from `uninstall_plugin` (plugin name + version, file list partitioned into still-on-disk vs already-missing). Resolved by `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm\|cancel}`. Legacy alias: `PluginUninstallRequest`. | per-action |
+| `EmailConfirmRequested` | Request event — opens the email confirmation modal. Carries `payload: String`. Legacy alias: `EmailConfirmRequest`. | per-action |
+| `PushNotificationRequested` | Request event — prompts the device to register for web push. Empty payload. Legacy alias: `PushNotificationRequest`. | lifecycle |
+| `McpConsentPromptRequested` | Request event — opens the MCP consent prompt modal. Carries `data: String`. Pairs with persisted `McpConsentRequested`. Legacy alias: `McpConsentRequest`. | per-action |
+| `FileRefreshRequested` | Tells the frontend / open editors to re-read a file at `path`. Emitted by `agentic_loop_special_tool`. Legacy alias: `RefreshFile`. | per-action |
+| `AppUiRefreshRequested` | Tells any open app iframe with `app_id` to reload itself. Legacy alias: `RefreshAppUI`. | per-action |
+| `AppUiCaptureRequested` | Asks an open app iframe to capture state for `request_id`. The reply lands via the SDK capture path. Legacy alias: `CaptureAppUI`. | per-action |
 | `NavigationRequested` | Tells the frontend to navigate (URL, intra-app route, etc.). Carries `payload: String`. | per-action |
 | `CodingAgentThreadSpawned` | A child CC thread (spawned via `run_claude` / `run_thread`) has started. Carries `cc_thread_id`, `title`, `agent`. SSE-only — the persisted record of the child is its own thread row. Alias: `CcThreadSpawned`. | per-action |
-| `ChildrenCountChanged` | A parent thread's `(active_children_count, total_children_count)` flipped. Carries `active: i64`, `total: i64`. Drives the "Active children" badge. | per-action |
+| `ChildrenCountChanged` | A parent or ancestor thread's aggregate metadata changed. Carries the full updated aggregate (`active_children_count`, `total_children_count`, `blocking_descendant_count`, `attention_descendant_count`, …). Fires when (a) a direct child terminates and the parent's active/total counts shift, or (b) any descendant's "blocking" or "attention-needing" predicate flips (Running, WaitingForUserAnswer, or `has_pending_changes` && CodingAgent — see `is_blocking` / `is_attention_needing`), in which case every ancestor on the chain receives the broadcast with its updated counts. Drives the "Active children" badge, the cascading-archive button-hide (via `blocking_descendant_count`), and the REVIEW-bubble routing in `display_section` (via `attention_descendant_count`). | per-action |
 
 ## Indexable text
 
-`ThreadEvent::indexable_text()` returns `Some(&str)` for variants whose body should be indexed into the memory store: `MessageReceived`, `UserPromptInjected`, `ResponseGenerated`, `ResponseCanceled`, `ResponseAborted`, `ChildThreadCompleted`. All others are `None`.
+`ThreadEvent::indexable_text()` returns `Some(&str)` for variants whose body should be indexed into the memory store: `MessageReceived`, `UserPromptInjected`, `ResponseGenerated`, `ResponseCanceled`, `ResponseAborted`, `ChildThreadCompleted`, and `ImageDescribed` (its `description` — the only textual record of an image-only turn). All others are `None`.
 
 ## Concrete payload shapes (selected)
 
@@ -195,7 +214,6 @@ For `CodingAgentIdled`, `UserQuestionAsked`, `UserQuestionAnswered`, and the `Co
     "user_image_hashes": [],
     "device_id": "device-abc123",
     "device": "Kenneth's MacBook",
-    "image_description": null,
     "parent_thread_id": null,
     "spawning_event_id": null,
     "mode": "human",
@@ -211,6 +229,39 @@ For `CodingAgentIdled`, `UserQuestionAsked`, `UserQuestionAnswered`, and the `Co
 ```
 
 `mode` is `ActorMode` (`human` / `agent` / `engine`). `origin` is the structured `MessageOrigin` (`Device` / `Api` / `Workspace` / `ThreadLink` / `Engine` / `System`). Old DB rows may be missing `origin` — the frontend's `legacyOrigin()` synthesizes from `device_id` / `parent_thread_id`.
+
+The `Api` variant carries an optional `source_thread_id`:
+
+```json
+"origin": {
+  "kind": "api",
+  "user_agent": "curl/8.7.1",
+  "mode": "agent",
+  "source_thread_id": "9c1f-..."
+}
+```
+
+Set when the engine recognised the request as coming from a Lucidos-spawned subprocess (CC, `run_bash`, `run_python`, scheduled script, `lucidos` CLI). Detection is via the per-engine-startup token: every spawned subprocess gets `LUCIDOS_AGENT_ORIGIN_TOKEN` (and `LUCIDOS_THREAD_ID`) injected into its env; the `lucidos` CLI auto-forwards them as `x-lucidos-agent-origin-token` + `x-lucidos-source-thread-id` headers on every engine call. When the token check passes, mutating HTTP handlers (`apply_change`, `revert_change`, `discard_change`, `chat_submit`, settings writes, …) stamp `Api { mode: "agent", source_thread_id: <spawning thread> }` regardless of what the request body claims — agent actions never appear as "You" cards. External API clients without the token fall through to the regular `Api { mode: "human" }` resolution (no behaviour change for non-subprocess callers). Cross-thread chat injection from a subprocess (target thread ≠ source thread) is refused with 403 at `chat_submit`; see `api::chat::subprocess_chat_legitimate` for the full allow/deny matrix.
+
+`image_description` on this payload is **deprecated** — it survives only on legacy rows persisted before the `ImageDescribed` past-tense event existed. New `MessageReceived` emissions always serialize it as `null` (the field is `Option<String>` with `skip_serializing_if = Option::is_none`). Read the description from `ImageDescribed` instead, joined by `source_event_id`. The startup backfill emits one `ImageDescribed` per legacy `(source, hash)` pair so the new event-based read path covers historical rows too.
+
+### `ImageDescribed`
+
+```json
+{
+  "type": "ImageDescribed",
+  "data": {
+    "source_event_id": "550e8400-e29b-41d4-a716-446655440000",
+    "hash": "abcd1234...",
+    "description": "A screenshot of a calendar invitation showing 'Standup' on March 17, 2026 at 09:00.",
+    "model": "claude-haiku-4-5"
+  }
+}
+```
+
+`source_event_id` is the `MessageReceived` this description applies to. `hash` is the sha256 of one attached blob (matches one entry in `MessageReceived.user_image_hashes`). Multi-image messages emit one event per hash — collapse on `source_event_id` to recover the per-message description (every event for the same source carries identical `description` text). `model` is the actual Flash model that produced the text (`claude-haiku-4-5`, `gemini-2.5-flash`, …) — except on rows generated by the one-shot startup backfill, where it's the literal `"backfill"` because the original model identity wasn't recorded.
+
+The `description` is surfaced by `ThreadEvent::indexable_text()` and therefore **indexed into memory** like a message or response — a "what's this?" + screenshot turn would otherwise leave no trace in memory, since the typed `MessageReceived.text` carries none of the image's content. Note CC (coding-agent) threads never emit `ImageDescribed` (the description runs only in the chat agentic loop), so their image turns still index text-only.
 
 ### `ResponseGenerated`
 
@@ -272,6 +323,8 @@ For `CodingAgentIdled`, `UserQuestionAsked`, `UserQuestionAnswered`, and the `Co
 
 `exit_code: null` means the watchdog killed the child on timeout (signal-only exit gives no usable code on macOS).
 
+Both events also fire for `run_python_background`. The `command` field then carries the venv-rooted python invocation, e.g. `'/<ws>/.lucidos/runtime/python/venv/bin/python' '/<ws>/.lucidos/exhaust/<run_id>/script.py'`, so the audit trail records which script ran (the file is preserved under `.lucidos/exhaust/`). One registry, one event pair, one watcher — chat-agent consumers don't branch on the spawning tool.
+
 ### `ContextCaptured`
 
 ```json
@@ -294,6 +347,26 @@ For `CodingAgentIdled`, `UserQuestionAsked`, `UserQuestionAnswered`, and the `Co
 ```
 
 `producer` is `ContextProducer` (e.g. `MainLlm`, `ClaudeCode`). `usage` is `None` pre-call and on providers that don't report it (OpenAI, Gemini); when present it carries the real provider-reported counts.
+
+**Snapshot endpoint strips the heavy fields.** `GET /api/v1/threads/:thread_id/events` removes `sections` and `tools` from `ContextCaptured` payloads and stamps `sections_stripped: true` so the events list stays small on heavy threads (one capture can be ~50 kB; a long chat session carries hundreds, totaling many MB the events list never renders). Live SSE emissions still carry the full arrays. To get the stripped pieces back on demand (the step-detail modal does this when the user opens it), call `GET /api/v1/events/:event_id/context` — returns `{ sections, tools }` for that single `ContextCaptured` event. The endpoint is keyed on `event_id` only (UUIDs are unguessable, scope is the same as the snapshot endpoint) so callers don't have to plumb the thread id through their lookup path. For bulk consumers that genuinely need the full payload (e.g. `exportThread.ts` for bug-report dumps), pass `?include_context=true` on the snapshot endpoint instead of N+1 fetches. Triggers and event subscribers don't need to read `sections` / `tools`; if you do, use one of the on-demand paths, not the default snapshot.
+
+### `ToolResult`
+
+```json
+{
+  "type": "ToolResult",
+  "data": {
+    "name": "run_bash",
+    "result": "file1.txt\nfile2.txt\n",
+    "images": [],
+    "tool_called_event_id": "8b1d3e0a-7c0b-4e2f-9c4a-1a2b3c4d5e6f"
+  }
+}
+```
+
+The result returned to the chat agentic loop for a prior `ToolCalled`. `result` is the textual output (e.g. bash stdout, file contents); `images` carries generated-image hashes that render inline in the chat exchange; `tool_called_event_id` is stamped on every live emit (and on synthetic backfills written by `recover_orphan_tool_calls`) so the frontend's `groupIntoExchanges` pairs the result with its `ToolCalled` exchange via `chatToolCallOwners`. Without explicit pairing, an `ask_user_question` result followed the post-`UserQuestionAsked` request-id redirect into the question divider and left the original exchange's "Executing …" spinner pending forever. Server-side resume-block synthesis (LLM-message pairing) still uses chronological name matching (`collect_tool_pairs_chronological`). The field is optional only for legacy DB rows predating the live-emit stamp.
+
+**Snapshot endpoint strips the heavy field.** Mirrors the `ContextCaptured` contract above: `GET /api/v1/threads/:thread_id/events` removes `result` from `ToolResult` payloads and stamps `result_stripped: true` so the events list stays small on busy CC-style threads (one bash result can be 150 kB+; a long session carries hundreds, totaling ~2 MB the chat exchange never renders — only `StepDetailModal.tsx`'s `<pre class="step-detail-result">` does). Live SSE emissions still carry the full text. The strip keeps `name` + `images` inline — the step row label and generated-image rendering paths in `thread-events.ts` need them. To fetch the dropped text on demand, call `GET /api/v1/events/:event_id/tool-result` — returns `{ result: string | null }` for that single `ToolResult` event (`null` for image-only results, which never had a textual result written). Same event-id-only routing as the context endpoint. The same `?include_context=true` flag on the snapshot endpoint that opts back into `ContextCaptured.sections` now ALSO opts back into `ToolResult.result` — covers `exportThread.ts` and any future bulk consumer. `CodingAgentToolResult` is NOT stripped today; if its bash-output bloat becomes the bottleneck, the same pattern (`strip_*_content` helper + `GET /api/v1/events/:event_id/...` endpoint + a marker field) applies.
 
 ### `ChangeProposed`
 
@@ -361,11 +434,11 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
 {
   "type": "TriggerStarted",
   "data": {
-    "trigger_id": "trg-cc-question-push",
-    "trigger_name": "Notify on Claude question",
+    "trigger_id": "trg-question-push",
+    "trigger_name": "Push when Claude needs me",
     "prompt": null,
-    "invocation": { "kind": "Event", "event_type": "UserQuestionAsked", "event_id": "…" },
-    "origin": { "kind": "engine", "reason": { "kind": "scheduler", "trigger_id": "trg-cc-question-push", "trigger_name": "Notify on Claude question" } },
+    "invocation": { "kind": "Event", "event_type": "UserQuestionAsked", "event_id": "…", "thread_id": "…" },
+    "origin": { "kind": "engine", "reason": { "kind": "scheduler", "trigger_id": "trg-question-push", "trigger_name": "Push when Claude needs me" } },
     "go_to_review": false
   }
 }
@@ -375,8 +448,8 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
 {
   "type": "TriggerCompleted",
   "data": {
-    "trigger_id": "trg-cc-question-push",
-    "trigger_name": "Notify on Claude question",
+    "trigger_id": "trg-question-push",
+    "trigger_name": "Push when Claude needs me",
     "result_summary": "sent push notification"
   }
 }
@@ -397,7 +470,7 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
 }
 ```
 
-`tier: 1` = build artifacts (`target/`, `node_modules/`, `.lucidos/cache/`) stripped from a long-idle worktree (still on disk). `tier: 2` = entire worktree directory removed. `branch_deleted: true` only on Tier 2 sweeps that also dropped a fully-merged branch.
+`tier: 0` = an applied/clean worktree (branch at main HEAD, no pending change) removed after the short grace window. `tier: 1` = build artifacts (`target/`, `node_modules/`, `.lucidos/cache/`) stripped from a long-idle worktree (still on disk). `tier: 2` = entire worktree directory removed — both the 30-day idle sweep and *stranded* worktrees (their git admin dir under `.git/worktrees/<name>` is gone, so git can't act on them and they're deleted directly). `branch_deleted: true` only on a full removal that also dropped a fully-merged branch; stranded removal never deletes a branch (it touches no refs), so `branch_deleted` is always false there.
 
 ### `ContinuationStarted`
 
@@ -415,17 +488,28 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
 
 ## How a workspace would actually trigger on these
 
-Today: only `UserQuestionAsked`. Anything else needs one of:
+For any persisted `ThreadEvent` that isn't in the per-token streaming blocklist (i.e. anything other than `TextStreamed` / `ThoughtStreamed` / `CodingAgentTextStreamed`), an `on` subscription works directly:
 
-1. **Add the event to the scheduler allowlist** in `crates/lucidos-engine/src/scheduler/mod.rs` (engine code change). Trade-off: every emission of that event runs through the trigger matcher — fine for `lifecycle` and `one-per-turn` events, never appropriate for `high-volume-streaming` ones.
-2. **Have the relevant code path also `emit_event(...)` a domain event** the trigger can listen to. `SystemEvent::DomainEvent` flows through the matcher unconditionally. This is the right move for "I want a workspace-visible signal that doesn't need to be a first-class engine event." See the `emit_event` LLM tool and `lucidos events emit` CLI in `system-knowhow/lucidos-cli.md`.
-3. **For trigger failures specifically** — the scheduler already auto-creates an error notification when a trigger run blows up. No extra wiring needed.
+```yaml
+on:
+  - event_type: ChangeApplied
+    condition:
+      hardened: true
+run:
+  intent: "Tell me which change just landed and what files it touched."
+```
 
-Tell the user the cost up front when they ask for "trigger on X" where X isn't `UserQuestionAsked` — the answer is never one line of trigger config.
+Three knobs:
+
+1. **Pick the right event.** Lifecycle / one-per-turn variants are usually what you want. Per-action variants (e.g. `ToolCalled`, `CodingAgentToolCalled`, `ContextCaptured`, `ImageDescribed`) fire many times per turn — always pair them with the entry's `condition:` filter so the trigger only matches the case you care about (e.g. `name: "Bash"`, `args.command: { $regex: "git push" }`, `estimated_total_tokens: { $gt: 150000 }`).
+2. **Per-token streaming is off-limits.** `TextStreamed` / `ThoughtStreamed` / `CodingAgentTextStreamed` are blocked at the scheduler. Subscribing to one validates and persists, but the matcher never sees the event. If a workspace genuinely needs token-level reactivity, it has to consume the SSE stream directly — not from a trigger.
+3. **For workspace-defined signals**, `lucidos events emit` (or the `emit_event` LLM tool) writes a `SystemEvent::DomainEvent` that flows through the matcher unconditionally. Use this when you want a name that isn't part of the engine's own ThreadEvent enum (e.g. `OuraDataImported`, `BuildBroken`) — see `system-knowhow/lucidos-cli.md`.
+
+Trigger-run failures still auto-create an error notification — no separate wiring needed for "tell me when one of my own triggers blew up."
 
 ## Recipe-shaped guidance
 
-For trigger config syntax (cron format, `on_event`, the `condition` operator vocabulary `$eq` / `$ne` / `$lt` / `$lte` / `$gt` / `$gte` / `$in`), see `system-knowhow/building-a-trigger.md`. Conditions are pure payload filters — they read top-level fields of the event payload (the `data: { … }` object above), nothing else.
+For trigger config syntax (cron format, the `on` subscription list, the per-entry `condition` operator vocabulary `$eq` / `$ne` / `$lt` / `$lte` / `$gt` / `$gte` / `$in`), see `system-knowhow/building-a-trigger.md`. Conditions are pure payload filters — they read top-level fields of the event payload (the `data: { … }` object above), nothing else.
 
 For the CC slice — the `UserQuestion` vs permission distinction, the exact `CodingAgentIdled` field semantics, and the no-`CodingAgentErrored` gap — see `system-knowhow/coding-agent-events.md`.
 

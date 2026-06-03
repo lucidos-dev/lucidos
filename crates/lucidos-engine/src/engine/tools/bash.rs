@@ -3,16 +3,12 @@ use super::ToolOutcome;
 use crate::core::{redact_postgres_secrets, sanitize_for_jsonb};
 use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
+use crate::engine::types::AgentUserInput;
+use crate::llm::tools::{
+    BG_DEFAULT_TIMEOUT_SECS, BG_MAX_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS,
+};
 
 const MAX_OUTPUT_BYTES: usize = 100 * 1024; // 100 KB
-pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 60;
-pub(crate) const MAX_TIMEOUT_SECS: u64 = 300;
-
-/// Background bash defaults. Higher than the synchronous tool because the
-/// caller can poll across many turns; the LLM is still bounded by
-/// `BG_MAX_TIMEOUT_SECS` to prevent runaway processes.
-pub(crate) const BG_DEFAULT_TIMEOUT_SECS: u64 = 600;
-pub(crate) const BG_MAX_TIMEOUT_SECS: u64 = 3600;
 
 /// Sanitize raw subprocess bytes for storage in a jsonb event payload and
 /// truncate to the LLM-facing cap. Centralized so the sync `run_bash` and
@@ -26,6 +22,7 @@ impl LucidosEngine {
     pub(crate) async fn execute_bash_tool(
         &self,
         args: &serde_json::Value,
+        thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let command = match args.get("command").and_then(|v| v.as_str()) {
             Some(c) if !c.is_empty() => c,
@@ -38,7 +35,7 @@ impl LucidosEngine {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS);
 
-        let env_vars = self.build_script_env_vars().await;
+        let env_vars = self.build_script_env_vars(Some(thread_id)).await;
 
         let mut cmd = tokio::process::Command::new("/bin/sh");
         cmd.args(["-c", command])
@@ -135,7 +132,7 @@ impl LucidosEngine {
             .unwrap_or(BG_DEFAULT_TIMEOUT_SECS)
             .min(BG_MAX_TIMEOUT_SECS);
 
-        let env_vars = self.build_script_env_vars().await;
+        let env_vars = self.build_script_env_vars(Some(thread_id)).await;
         let safe_command = redact_postgres_secrets(command);
         log!(
             "[BashBg] Spawning: {}",
@@ -144,7 +141,13 @@ impl LucidosEngine {
 
         let (task_id, finish_rx) = match self
             .bash_background
-            .spawn(command, timeout_secs, self.workspace_path(), &env_vars)
+            .spawn(
+                command,
+                timeout_secs,
+                self.workspace_path(),
+                &env_vars,
+                Some(thread_id),
+            )
             .await
         {
             Ok(pair) => pair,
@@ -181,8 +184,23 @@ impl LucidosEngine {
     }
 
     /// Awaits the registry watchdog's notify, evicts the finished task,
-    /// and emits `BackgroundBashCompleted` with the final state.
-    fn spawn_bash_completion_watcher(
+    /// emits `BackgroundBashCompleted` with the final state, and — if the
+    /// owning CC session is still parked on this thread — pushes a synthetic
+    /// `AgentUserInput { kind: User }` onto its `msg_tx` so CC resumes the
+    /// turn and reads the bash result via `bash_output`. The synthetic input
+    /// flows through the standard `User`-kind path so `run_session` emits a
+    /// `CodingAgentPromptSent` (an exchange-starter in the frontend's
+    /// `EXCHANGE_START_TYPES` set) — without this, CC's resumed tool calls
+    /// would be orphaned into the prior exchange, because
+    /// `BackgroundBashCompleted` itself is classified as `metadata`.
+    ///
+    /// The wake is the counterpart to the idle-handler gate in
+    /// `run_session.rs` that suppresses propose+terminate while
+    /// `BackgroundBashRegistry::has_running_for_thread` is true. Without
+    /// the wake, a CC that idled mid-/harden waiting on background tests
+    /// stays alive forever — the engine never tells it the bash is done,
+    /// and the user has to type a manual follow-up to break the deadlock.
+    pub(super) fn spawn_bash_completion_watcher(
         &self,
         thread_id: uuid::Uuid,
         task_id: String,
@@ -191,6 +209,7 @@ impl LucidosEngine {
     ) {
         let bus = self.event_bus.clone();
         let registry = self.bash_background.clone();
+        let agent_sessions = self.agent_sessions.clone();
         tokio::spawn(async move {
             // finish_rx only errors when the runtime is shutting down.
             if finish_rx.await.is_err() {
@@ -204,16 +223,19 @@ impl LucidosEngine {
                 let s = safe_command.as_str();
                 s[..s.floor_char_boundary(200)].to_string()
             };
+            let exit_code = task.exit_code;
+            let timed_out = task.timed_out;
+            let killed = task.killed;
             let event = ThreadEvent::BackgroundBashCompleted {
                 task_id: task_id.clone(),
-                command: cmd_prefix,
-                exit_code: task.exit_code,
+                command: cmd_prefix.clone(),
+                exit_code,
                 stdout: finalize_stream(&task.stdout),
                 stderr: finalize_stream(&task.stderr),
                 started_at: task.started_at,
                 finished_at: task.finished_at.unwrap_or_else(chrono::Utc::now),
-                timed_out: task.timed_out,
-                killed: task.killed,
+                timed_out,
+                killed,
             };
             if let Err(e) = bus
                 .emit(BusEvent::Thread {
@@ -225,12 +247,61 @@ impl LucidosEngine {
             {
                 log!("[BashBg] failed to emit BackgroundBashCompleted: {}", e);
             }
+
+            // Auto-wake the parked CC session. The wake message is informative
+            // enough that CC can act without re-querying — but CC will still
+            // call `bash_output` to read the actual stdout/stderr. Skip the
+            // wake when the session is gone (CC truly exited, or this is a
+            // chat-mode background bash with no CC session at all).
+            let msg_tx = {
+                let guard = agent_sessions.lock().await;
+                guard.get(&thread_id).map(|s| s.msg_tx.clone())
+            };
+            if let Some(tx) = msg_tx {
+                let wake_text =
+                    format_bash_wake_text(&task_id, &cmd_prefix, exit_code, killed, timed_out);
+                // `AgentInputKind::User` so `run_session` emits the standard
+                // `CodingAgentPromptSent` audit row — that's the frontend's
+                // exchange-starter for CC's resumed work. `BackgroundBashCompleted`
+                // itself is classified as `metadata` (not `start`) in
+                // `EXCHANGE_START_TYPES`, so suppressing the emit would orphan
+                // CC's tool calls into the prior exchange. The text is obviously
+                // engine-driven ("Background task X finished...") so the
+                // `User`-attributed chip won't confuse readers — we mirror the
+                // `AUTO_HARDEN_MESSAGE` pattern in `change_ops::request_hardening_in_session`.
+                if tx
+                    .send(AgentUserInput {
+                        text: wake_text,
+                        images: None,
+                        origin_event_id: None,
+                        kind: crate::engine::types::AgentInputKind::User,
+                    })
+                    .is_err()
+                {
+                    // Channel closed = the run_session loop has already
+                    // torn down. Nothing to wake; the next user follow-up
+                    // (or apply click) will re-spawn CC fresh.
+                    log!(
+                        "[BashBg] auto-wake skipped: msg_tx closed for thread {} (session torn down)",
+                        thread_id
+                    );
+                }
+            }
         });
     }
 
-    /// `bash_output(task_id)` — drain in-memory output if the task is
-    /// still running, else fall back to the persisted
+    /// `bash_output(task_id, wait_secs?)` — drain in-memory output if
+    /// the task is still running, else fall back to the persisted
     /// `BackgroundBashCompleted` event. Returns a JSON string.
+    ///
+    /// When `wait_secs` is provided (1..=`BASH_OUTPUT_MAX_WAIT_SECS`),
+    /// blocks server-side until new output arrives, the task finishes,
+    /// or the wait elapses. Replaces the sleep-poll antipattern where
+    /// a chat agent spawned `run_python_background` then issued a
+    /// fresh `run_python` containing `time.sleep(N)` — that burned two
+    /// tool calls per wait, doubled context, and stalled the turn.
+    /// Values above the max are clamped silently so a misprompted
+    /// agent can't pin a model turn forever.
     pub(crate) async fn execute_bash_output_tool(
         &self,
         args: &serde_json::Value,
@@ -241,7 +312,35 @@ impl LucidosEngine {
             _ => return Err("Error: task_id is required".to_string()),
         };
 
-        if let Some(snap) = self.bash_background.read_output_in_memory(task_id).await {
+        // Reject non-integer wait_secs explicitly. Silently coercing
+        // a stringified or float value to 0 would let a misprompted
+        // LLM think it waited, immediately re-poll, and trip the
+        // 3-strike guard on a verbatim retry — exactly the antipattern
+        // wait_secs exists to prevent. Missing arg is fine (defaults
+        // to 0 = non-blocking drain).
+        let wait_secs = match args.get("wait_secs") {
+            None => 0u64,
+            Some(serde_json::Value::Null) => 0u64,
+            Some(v) => match v.as_u64() {
+                Some(n) => {
+                    n.min(crate::engine::tools::bash_background::BASH_OUTPUT_MAX_WAIT_SECS as u64)
+                }
+                None => {
+                    return Err(format!(
+                        "Error: wait_secs must be a non-negative integer (0..={}), got {}",
+                        crate::engine::tools::bash_background::BASH_OUTPUT_MAX_WAIT_SECS,
+                        v
+                    ));
+                }
+            },
+        };
+        let wait = std::time::Duration::from_secs(wait_secs);
+
+        if let Some(snap) = self
+            .bash_background
+            .read_output_in_memory_wait(task_id, wait)
+            .await
+        {
             return Ok(serde_json::json!({
                 "stdout": finalize_stream(snap.stdout.as_bytes()),
                 "stderr": finalize_stream(snap.stderr.as_bytes()),
@@ -311,6 +410,42 @@ fn truncate_output(s: &str, max: usize) -> String {
     }
 }
 
+/// Text the engine pushes to CC via `msg_tx` when a background task
+/// (spawned via `run_bash_background` OR `run_python_background`) completes
+/// and CC is parked waiting on it. Extracted as a free function so the
+/// formatting can be regression-pinned without spinning up the full watcher
+/// (which depends on `agent_sessions`, the event bus, and a real
+/// `BackgroundBashRegistry`).
+///
+/// The text gives CC enough context to act without re-querying — the
+/// task_id, the command prefix it spawned, and an outcome word — but
+/// CC still calls `bash_output(task_id)` to read the actual stdout/
+/// stderr. Killed and timed-out cases get their own outcome word so
+/// CC knows the result isn't "exit code 0 — clean success".
+///
+/// "Background task" instead of "Background bash task" — the same watcher
+/// fires for python-spawned tasks (via `run_python_background`), and the
+/// command-prefix line tells the LLM which it was. `bash_output` /
+/// `bash_kill` are correct because they ARE the consumer tools for both.
+fn format_bash_wake_text(
+    task_id: &str,
+    cmd_prefix: &str,
+    exit_code: Option<i32>,
+    killed: bool,
+    timed_out: bool,
+) -> String {
+    let status = match (exit_code, killed, timed_out) {
+        (_, true, _) => "killed".to_string(),
+        (_, _, true) => "timed out".to_string(),
+        (Some(c), _, _) => format!("exit code {}", c),
+        (None, _, _) => "no exit code".to_string(),
+    };
+    format!(
+        "Background task {} finished ({}): {}\n\nUse `bash_output(\"{}\")` to read the result and continue your work.",
+        task_id, status, cmd_prefix, task_id
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +470,60 @@ mod tests {
         let s = "ééééé"; // 10 bytes in UTF-8
         let result = truncate_output(s, 5);
         assert!(result.contains("[truncated"));
+    }
+
+    /// Regression for the May-2026 premature-Apply incident: when CC
+    /// idled mid-/harden waiting on its own `run_bash_background` Rust
+    /// tests, the engine had no way to tell CC the bash had finished —
+    /// the user had to type a manual follow-up to break the deadlock.
+    /// The watcher now pushes `format_bash_wake_text` onto `msg_tx`
+    /// with `AgentInputKind::User` (so `CodingAgentPromptSent` fires
+    /// as the exchange-starter). Pin the text so a CC-side regression
+    /// that stops calling `bash_output` after the wake shows up in
+    /// this test, not in the next user incident.
+    #[test]
+    fn format_bash_wake_text_clean_exit_zero() {
+        let text = format_bash_wake_text("task-123", "cargo test --lib", Some(0), false, false);
+        assert!(text.contains("task-123"), "task_id must appear so CC can refer to it");
+        assert!(text.contains("exit code 0"), "clean exit must say 'exit code 0'");
+        assert!(text.contains("cargo test --lib"), "command prefix gives CC context");
+        assert!(
+            text.contains("bash_output(\"task-123\")"),
+            "must instruct CC to read the result via bash_output"
+        );
+    }
+
+    #[test]
+    fn format_bash_wake_text_non_zero_exit() {
+        let text = format_bash_wake_text("t1", "npm test", Some(1), false, false);
+        assert!(text.contains("exit code 1"));
+    }
+
+    /// `killed` outranks an exit_code value: a child reaped by SIGKILL/
+    /// SIGTERM may still report an exit code, but the CC-facing semantic
+    /// is "the engine killed this" — not "the command finished with X".
+    #[test]
+    fn format_bash_wake_text_killed_outranks_exit_code() {
+        let text = format_bash_wake_text("t2", "sleep 30", Some(143), true, false);
+        assert!(text.contains("killed"), "killed must be the outcome word");
+        assert!(
+            !text.contains("exit code"),
+            "killed must NOT also report the exit code (would confuse CC)"
+        );
+    }
+
+    /// Timeout is the second special outcome. Same precedence reason as
+    /// killed — CC needs to know the result wasn't a real completion.
+    #[test]
+    fn format_bash_wake_text_timed_out() {
+        let text = format_bash_wake_text("t3", "sleep 99999", None, false, true);
+        assert!(text.contains("timed out"));
+        assert!(!text.contains("exit code"));
+    }
+
+    #[test]
+    fn format_bash_wake_text_no_exit_code() {
+        let text = format_bash_wake_text("t4", "true", None, false, false);
+        assert!(text.contains("no exit code"));
     }
 }

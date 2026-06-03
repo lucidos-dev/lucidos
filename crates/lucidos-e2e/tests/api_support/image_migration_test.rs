@@ -245,7 +245,7 @@ async fn migration_preserves_already_migrated_compose_images() {
     let hashes = json!(["abcd1234567890", "ef0987654321"]);
     sqlx::query(
         "INSERT INTO thread_summaries \
-            (thread_id, source, is_cc, created_at, last_activity, message_count, status, \
+            (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status, \
              state, compose_text, compose_images) \
          VALUES ($1, 'chat', FALSE, NOW(), NOW(), 0, 'idle', \
                  'composing', '', $2) \

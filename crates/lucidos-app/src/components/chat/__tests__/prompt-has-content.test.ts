@@ -7,8 +7,8 @@
  * background: the image lives in `pendingUploads` until the server returns
  * the hash, only then moving to `attachedImages`. The original predicate
  * `text || attachedImages` was false during that window, so the prompt
- * looked empty and `getPromptSectionButtons('review', ...)` won, rendering
- * Save in the slot that should have been Send.
+ * looked empty and the section-button slot won, rendering Save where Send
+ * should have been.
  */
 import { describe, it, expect } from 'vitest';
 import { composeHasContent } from '../PromptInput';

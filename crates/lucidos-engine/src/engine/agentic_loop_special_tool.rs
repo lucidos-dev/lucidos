@@ -9,6 +9,7 @@ use uuid::Uuid;
 use super::{build_intent_tools, derive_call_key};
 use crate::engine::context::trim_context_if_needed;
 use crate::engine::event_bus::BusEvent;
+use crate::engine::http::workspace_client::cross_workspace_http_client;
 use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
 use crate::engine::LucidosEngine;
 use crate::llm::tool_names as tn;
@@ -18,10 +19,12 @@ use crate::llm::{ContentBlock, Message, MessageContent};
 /// thread that issued the spawn. Drives both the spawn linkage (parent /
 /// spawning event ids) and the result-text branch.
 ///
-/// `Sub` (default) preserves today's callback semantics: the spawning
+/// `Child` (default) preserves today's callback semantics: the spawning
 /// thread's `notify_parent_if_child` fires when the spawned thread reaches
 /// a terminal event, and `active_children_count` is incremented while the
-/// spawned thread is in flight.
+/// spawned thread is in flight. The wire string is `"child"`; `"sub"` is
+/// accepted as a back-compat alias from before the glossary settled on
+/// *child thread* (direct descendant) vs *sub-thread* (transitive).
 ///
 /// `Top` drops the linkage entirely — no callback, no count bump. The
 /// spawned thread appears as an independent top-level thread in the list.
@@ -29,27 +32,29 @@ use crate::llm::{ContentBlock, Message, MessageContent};
 /// thread to resume on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Relation {
-    Sub,
+    Child,
     Top,
 }
 
 /// Parse the optional `relation` argument from a tool call. Defaults to
-/// [`Relation::Sub`] when absent so existing prompts keep working unchanged.
-/// Returns `Err` for unknown values or non-string types so the LLM sees the
-/// contract violation instead of silently getting `Sub`.
+/// [`Relation::Child`] when absent so existing prompts keep working unchanged.
+/// Accepts `"child"` (canonical) and `"sub"` (back-compat alias from the
+/// pre-glossary wire name). Returns `Err` for unknown values or non-string
+/// types so the LLM sees the contract violation instead of silently getting
+/// `Child`.
 pub(crate) fn parse_relation(args: &serde_json::Value) -> Result<Relation, String> {
     match args.get("relation") {
-        None | Some(serde_json::Value::Null) => Ok(Relation::Sub),
+        None | Some(serde_json::Value::Null) => Ok(Relation::Child),
         Some(serde_json::Value::String(s)) => match s.as_str() {
-            "sub" => Ok(Relation::Sub),
+            "child" | "sub" => Ok(Relation::Child),
             "top" => Ok(Relation::Top),
             other => Err(format!(
-                "relation must be \"sub\" or \"top\", got {:?}",
+                "relation must be \"child\" or \"top\", got {:?}",
                 other
             )),
         },
         Some(other) => Err(format!(
-            "relation must be \"sub\" or \"top\", got {}",
+            "relation must be \"child\" or \"top\", got {}",
             other
         )),
     }
@@ -57,7 +62,7 @@ pub(crate) fn parse_relation(args: &serde_json::Value) -> Result<Relation, Strin
 
 impl Relation {
     /// Resolve the `(parent_thread_id, spawning_event_id)` pair to pass
-    /// into the spawn helpers. `Sub` carries the spawning thread + tool
+    /// into the spawn helpers. `Child` carries the spawning thread + tool
     /// call event through; `Top` drops both so the spawned thread has no
     /// parent linkage and `notify_parent_if_child` early-returns.
     pub(crate) fn spawn_linkage(
@@ -66,49 +71,60 @@ impl Relation {
         tool_called_event_id: Option<Uuid>,
     ) -> (Option<Uuid>, Option<Uuid>) {
         match self {
-            Self::Sub => (Some(spawning_thread_id), tool_called_event_id),
+            Self::Child => (Some(spawning_thread_id), tool_called_event_id),
             Self::Top => (None, None),
         }
     }
 
     /// Tool-result text returned for `run_thread`. The LLM reads this to
     /// decide whether to expect a callback, so each branch must state the
-    /// callback contract explicitly.
-    pub(crate) fn run_thread_success_text(self, child_thread_id: Uuid) -> String {
+    /// callback contract explicitly. `workspace` is stamped into the body and
+    /// the link prefix so the LLM cannot hallucinate which workspace the
+    /// thread landed in (the link is workspace-qualified per the `thread:`
+    /// renderer in `renderMarkdown.ts`).
+    pub(crate) fn run_thread_success_text(self, child_thread_id: Uuid, workspace: &str) -> String {
         match self {
-            Self::Sub => format!(
-                "Thread started (thread_id: {0}). When the child thread finishes, \
-                 this conversation will automatically resume with its results — \
-                 you don't need to check on it. Continue with other work or tell \
-                 the user you've delegated this subtask: [Open thread](thread:{0})",
-                child_thread_id
+            Self::Child => format!(
+                "Thread started in workspace '{ws}' (thread_id: {tid}). When the child \
+                 thread finishes, this conversation will automatically resume with its \
+                 results — you don't need to check on it. Continue with other work or \
+                 tell the user you've delegated this subtask in the {ws} workspace: \
+                 [Open thread](thread:{ws}/{tid})",
+                ws = workspace,
+                tid = child_thread_id
             ),
             Self::Top => format!(
-                "Top-level thread started (thread_id: {0}). It runs independently \
-                 and will NOT report back to this conversation. Tell the user you've \
-                 started a separate thread for them to follow: [Open thread](thread:{0})",
-                child_thread_id
+                "Top-level thread started in workspace '{ws}' (thread_id: {tid}). It \
+                 runs independently and will NOT report back to this conversation. Tell \
+                 the user you've started a separate thread in the {ws} workspace for \
+                 them to follow: [Open thread](thread:{ws}/{tid})",
+                ws = workspace,
+                tid = child_thread_id
             ),
         }
     }
 
     /// Tool-result text returned for `run_claude`. Mirrors the
     /// callback-contract guarantee of `run_thread_success_text` so the LLM
-    /// sees both spawn tools as a uniform pair.
-    pub(crate) fn run_claude_success_text(self, cc_thread_id: Uuid) -> String {
+    /// sees both spawn tools as a uniform pair. Stamps `workspace` into the
+    /// body and link prefix so the LLM's narration cannot drift from where
+    /// the session actually landed.
+    pub(crate) fn run_claude_success_text(self, cc_thread_id: Uuid, workspace: &str) -> String {
         match self {
-            Self::Sub => format!(
-                "Claude Code session started in a new thread (thread_id: {0}). \
-                 Tell the user you've started a new thread to work on this and include \
-                 a link: [Open thread](thread:{0})",
-                cc_thread_id
+            Self::Child => format!(
+                "Claude Code session started in workspace '{ws}' (thread_id: {tid}). \
+                 Tell the user you've started a new Claude Code thread in the {ws} \
+                 workspace and include this link: [Open thread](thread:{ws}/{tid})",
+                ws = workspace,
+                tid = cc_thread_id
             ),
             Self::Top => format!(
-                "Top-level Claude Code session started (thread_id: {0}). It runs \
-                 independently and will NOT report back to this conversation. \
-                 Include the link in your reply so the user can follow it: \
-                 [Open thread](thread:{0})",
-                cc_thread_id
+                "Top-level Claude Code session started in workspace '{ws}' (thread_id: \
+                 {tid}). It runs independently and will NOT report back to this \
+                 conversation. Include the link in your reply so the user can follow it: \
+                 [Open thread](thread:{ws}/{tid})",
+                ws = workspace,
+                tid = cc_thread_id
             ),
         }
     }
@@ -118,6 +134,9 @@ impl LucidosEngine {
     /// Handle tool calls that need special processing outside of `execute_tool`.
     /// Returns `Some(result)` if the tool was handled, `None` if it should fall through
     /// to `execute_tool()`.
+    // Per-parameter rationale lives in the inline comments below; a bundle
+    // struct would just rename the same set of fields.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_special_tool(
         &self,
         tool_name: &str,
@@ -130,19 +149,25 @@ impl LucidosEngine {
         // so the new thread can be traced back to the exact tool call that
         // started it.
         tool_called_event_id: Option<Uuid>,
+        // Outer batch id `ask_user_question` keys its per-question wait
+        // registry sub_ids on (see `synth_question_id`).
+        tool_use_id: &str,
     ) -> Option<String> {
+        if tool_name == tn::ASK_USER_QUESTION {
+            return Some(self.handle_chat_ask_user_question(thread_id, tool_use_id, tool_args).await);
+        }
         if tool_name == tn::REFRESH_FILE {
             let path = tool_args["path"].as_str().unwrap_or("");
             self.event_bus
                 .emit_or_log(
                     BusEvent::Thread {
                         thread_id,
-                        event: ThreadEvent::RefreshFile {
+                        event: ThreadEvent::FileRefreshRequested {
                             path: path.to_string(),
                         },
                         meta: EventMeta::NONE,
                     },
-                    "[AgenticLoop] RefreshFile",
+                    "[AgenticLoop] FileRefreshRequested",
                 )
                 .await;
             Some(format!("File preview refreshed for {}", path))
@@ -158,12 +183,12 @@ impl LucidosEngine {
                     .emit_or_log(
                         BusEvent::Thread {
                             thread_id,
-                            event: ThreadEvent::RefreshAppUI {
+                            event: ThreadEvent::AppUiRefreshRequested {
                                 app_id: app_id.clone(),
                             },
                             meta: EventMeta::NONE,
                         },
-                        "[AgenticLoop] RefreshAppUI (refresh_app tool)",
+                        "[AgenticLoop] AppUiRefreshRequested (refresh_app tool)",
                     )
                     .await;
             }
@@ -191,23 +216,20 @@ impl LucidosEngine {
                     .emit_or_log(
                         BusEvent::Thread {
                             thread_id,
-                            event: ThreadEvent::CaptureAppUI {
+                            event: ThreadEvent::AppUiCaptureRequested {
                                 app_id: app_id.clone(),
                                 request_id: request_id.clone(),
                             },
                             meta: EventMeta::NONE,
                         },
-                        "[AgenticLoop] CaptureAppUI",
+                        "[AgenticLoop] AppUiCaptureRequested",
                     )
                     .await;
 
                 Some(
                     match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
                         Ok(Ok(capture)) => {
-                            format!(
-                                "[APP_CAPTURE:{}]\nDOM snapshot:\n{}",
-                                capture.screenshot, capture.dom
-                            )
+                            super::format_capture_result(&capture.screenshot, &capture.dom)
                         }
                         Ok(Err(_)) => {
                             "Error: Capture failed — the frontend channel was dropped.".to_string()
@@ -229,24 +251,151 @@ impl LucidosEngine {
                     Ok(r) => r,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
+                let workspace_arg = tool_args
+                    .get("workspace")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                // Defer workspace_name() until we know the same-workspace
+                // path needs it — most calls omit `workspace` and stay local,
+                // and workspace_name() allocates a fresh String each call.
+                let current_ws = if workspace_arg.is_some() {
+                    Some(self.workspace_name())
+                } else {
+                    None
+                };
+                if let Some(target_ws) =
+                    workspace_arg.filter(|w| Some(*w) != current_ws.as_deref())
+                {
+                    return Some(
+                        self.cross_workspace_run_claude(
+                            prompt,
+                            target_ws,
+                            relation,
+                            tool_args,
+                            thread_id,
+                            tool_called_event_id,
+                        )
+                        .await,
+                    );
+                }
                 let (parent_thread_id, spawning_event_id) =
                     relation.spawn_linkage(thread_id, tool_called_event_id);
-                let repo_id = match tool_args["repo"].as_str().filter(|s| !s.is_empty()) {
-                    Some(repo_param) => match crate::core::repositories::RepositoryStore::resolve(
-                        &self.pool, repo_param,
+
+                // `folder` is the new canonical parameter; `repo` is the
+                // deprecated alias kept for one release. Passing both is an
+                // error so callers don't silently get the resolution of one
+                // when they meant the other.
+                let folder_param = tool_args
+                    .get("folder")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let repo_param = tool_args
+                    .get("repo")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if folder_param.is_some() && repo_param.is_some() {
+                    return Some("Error: pass `folder` (preferred) or `repo` (deprecated alias), not both.".to_string());
+                }
+                let folder_input = folder_param.or(repo_param);
+                // Resolve the folder against the §3.2 classification table.
+                // App folder (`data/apps/<id>` or absolute path under the
+                // workspace's `data/apps/<id>`) → spawn an app coding-agent
+                // thread. Lucidos source → existing flow. Registered repo
+                // name → existing external-repo flow.
+                let mut spawn_repo_id: Option<String> = None;
+                let mut spawn_app_id: Option<String> = None;
+                if let Some(folder_in) = folder_input {
+                    use crate::engine::agent_session::{
+                        classify_resolved_folder, resolve_folder_input,
+                        FolderClassification,
+                    };
+                    let ws_root = self.workspace_path().to_path_buf();
+                    let pool = self.pool.clone();
+                    let folder_in_owned = folder_in.to_string();
+                    // Snapshot the repo registry up front. The classifier's
+                    // `external_repo_match` closure is sync; without this
+                    // snapshot it would have to await, and a no-op closure
+                    // would mean External never matches and every registered
+                    // external repo would fall through to UnrecognisedPath.
+                    let registered_repos = match crate::core::repositories::RepositoryStore::list(
+                        &pool,
                     )
                     .await
                     {
-                        Ok(Some(repo)) => Some(repo.id.to_string()),
-                        Ok(None) => {
-                            return Some(format!("Error: Repository '{}' not found. Use manage_repositories with action 'list' to see registered repositories.", repo_param));
+                        Ok(list) => list,
+                        Err(e) => {
+                            return Some(format!("Error: Failed to list repositories: {e}"));
+                        }
+                    };
+                    let resolved = resolve_folder_input(&folder_in_owned, &ws_root, |name| {
+                        Ok(registered_repos
+                            .iter()
+                            .find(|r| r.name == name || r.id.to_string() == name)
+                            .map(|r| std::path::PathBuf::from(&r.path)))
+                    });
+                    let canonical = match crate::core::repositories::RepositoryStore::resolve(
+                        &pool, &folder_in_owned,
+                    )
+                    .await
+                    {
+                        Ok(Some(repo)) => Some(std::path::PathBuf::from(repo.path)),
+                        _ => resolved.ok(),
+                    };
+                    let Some(folder_abs) = canonical else {
+                        return Some(format!(
+                            "Error: `folder` value '{folder_in_owned}' could not be resolved — \
+                             not a registered repo and not a path on disk in this workspace."
+                        ));
+                    };
+                    // Resolve the Lucidos source repo root for the classifier.
+                    let lucidos_root = registered_repos
+                        .iter()
+                        .find(|r| r.name == "Lucidos")
+                        .map(|r| std::path::PathBuf::from(&r.path))
+                        .unwrap_or_else(|| self.repo_root().to_path_buf());
+                    let class = classify_resolved_folder(
+                        &folder_abs,
+                        &ws_root,
+                        &lucidos_root,
+                        |p| {
+                            registered_repos
+                                .iter()
+                                .find(|r| std::path::Path::new(&r.path) == p)
+                                .map(|r| std::path::PathBuf::from(&r.path))
+                        },
+                    );
+                    match class {
+                        Ok(FolderClassification::Lucidos { .. }) => {
+                            // Existing flow — no repo_id, default folder.
+                        }
+                        Ok(FolderClassification::App { app_id, .. }) => {
+                            spawn_app_id = Some(app_id);
+                        }
+                        Ok(FolderClassification::External { repo_root }) => {
+                            // The classifier already confirmed this path is
+                            // a registered external repo; pull the UUID from
+                            // the snapshot rather than re-querying.
+                            if let Some(repo) = registered_repos
+                                .iter()
+                                .find(|r| std::path::Path::new(&r.path) == repo_root)
+                            {
+                                spawn_repo_id = Some(repo.id.to_string());
+                            } else {
+                                return Some(format!(
+                                    "Error: Repository at '{}' is not registered. Use manage_repositories action='add' first.",
+                                    repo_root.display()
+                                ));
+                            }
                         }
                         Err(e) => {
-                            return Some(format!("Error: Failed to look up repository: {}", e));
+                            return Some(format!("Error: {e}"));
                         }
-                    },
-                    None => None,
-                };
+                    }
+                }
+                let repo_id = spawn_repo_id;
 
                 // Absent `images` → forward the current message's images (default).
                 // Present (even empty) → caller has explicitly chosen the selection.
@@ -286,8 +435,8 @@ impl LucidosEngine {
                     .or(user_images)
                     .map(<[crate::api::ChatImage]>::to_vec);
                 Some(
-                    match self
-                        .spawn_agent_thread(crate::engine::claude_code::SpawnAgentThreadParams {
+                    match self.spawn_agent_thread(
+                        crate::engine::claude_code::SpawnAgentThreadParams {
                             prompt: prompt.to_string(),
                             user_images: images,
                             device_id: device_id.map(str::to_string),
@@ -295,10 +444,13 @@ impl LucidosEngine {
                             spawning_event_id,
                             repo_id,
                             caller_title: caller_title.map(str::to_string),
-                        })
-                        .await
-                    {
-                        Ok(cc_thread_id) => relation.run_claude_success_text(cc_thread_id),
+                            app_id: spawn_app_id,
+                        },
+                    ) {
+                        Ok(cc_thread_id) => {
+                            let ws = current_ws.unwrap_or_else(|| self.workspace_name());
+                            relation.run_claude_success_text(cc_thread_id, &ws)
+                        }
                         Err(e) => format!("Error: Failed to start Claude Code: {}", e),
                     },
                 )
@@ -323,12 +475,12 @@ impl LucidosEngine {
                             // instead of the user's chat-mode preference.
                             let (chat_model, chat_effort) =
                                 crate::core::PreferenceStore::user_chat_settings(&self.pool).await;
-                            // Eager emit BEFORE the background spawn: a Sub child's
-                            // active_children_count must increment before the parent
+                            // Eager emit BEFORE the background spawn: a Child relation
+                            // child's active_children_count must increment before the parent
                             // can complete this turn, otherwise ResponseGenerated wins
                             // the race and the parent flips to "review" before the
                             // child is on the projection. origin=None so
-                            // make_message_received synthesizes a ParentThread origin
+                            // make_message_received synthesizes a ThreadLink origin
                             // from mode + parent_thread_id — emits None for a Top
                             // spawn since parent_thread_id is None there.
                             let eager_result = self
@@ -370,7 +522,10 @@ impl LucidosEngine {
                                         chat_model,
                                         chat_effort,
                                     ) {
-                                        Ok(cid) => relation.run_thread_success_text(cid),
+                                        Ok(cid) => relation.run_thread_success_text(
+                                            cid,
+                                            &self.workspace_name(),
+                                        ),
                                         Err(e) => format!("Error starting thread: {}", e),
                                     }
                                 }
@@ -422,7 +577,7 @@ impl LucidosEngine {
                     .emit_or_log(
                         BusEvent::Thread {
                             thread_id,
-                            event: ThreadEvent::McpConsentRequest {
+                            event: ThreadEvent::McpConsentPromptRequested {
                                 data: serde_json::json!({
                                     "request_id": consent_request_id,
                                     "server_name": server_name,
@@ -433,7 +588,7 @@ impl LucidosEngine {
                             },
                             meta: EventMeta::NONE,
                         },
-                        "[AgenticLoop] McpConsentRequest",
+                        "[AgenticLoop] McpConsentPromptRequested",
                     )
                     .await;
 
@@ -466,6 +621,127 @@ impl LucidosEngine {
         } else {
             None
         }
+    }
+
+    /// Cross-workspace `run_claude`: POST a CC spawn request to another
+    /// workspace's engine. Returns the formatted tool-result string (success
+    /// text on 2xx, error string otherwise) so the caller can pass it through
+    /// to the LLM unchanged.
+    ///
+    /// Cross-workspace requires `relation=Top` — child-thread auto-resume
+    /// callbacks across workspaces are unsupported because the receiving
+    /// engine has no way to notify ours when the spawned thread terminates.
+    /// Refusing Child explicitly (instead of silently downgrading to Top)
+    /// keeps the LLM honest about the no-callback semantics.
+    ///
+    /// Image forwarding is not supported across workspaces yet — the images
+    /// live in this workspace's blob store and the receiver wouldn't be able
+    /// to resolve them. The `images` arg is ignored for cross-workspace.
+    async fn cross_workspace_run_claude(
+        &self,
+        prompt: &str,
+        target_ws: &str,
+        relation: Relation,
+        tool_args: &serde_json::Value,
+        thread_id: Uuid,
+        tool_called_event_id: Option<Uuid>,
+    ) -> String {
+        if matches!(relation, Relation::Child) {
+            return format!(
+                "Error: cross-workspace run_claude (workspace=\"{}\") requires \
+                 relation=\"top\" — child-thread auto-resume callbacks across \
+                 workspaces are unsupported. Set relation=\"top\" if the spawn \
+                 should run independently in {0}, or omit the workspace \
+                 parameter for a same-workspace child thread.",
+                target_ws
+            );
+        }
+        let target = match crate::engine::http::workspace_resolver::resolve_workspace(
+            target_ws, None,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                return format!("Error: cannot resolve workspace '{}': {}", target_ws, e)
+            }
+        };
+        let title = tool_args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let repo = tool_args
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let ctx = crate::engine::http::workspace_client::WorkspaceCallCtx {
+            self_workspace: self.workspace_name(),
+            source_thread_id: Some(thread_id),
+            source_event_id: tool_called_event_id,
+            mode: ActorMode::Agent,
+        };
+        match crate::engine::http::workspace_client::spawn_claude_in_workspace(
+            cross_workspace_http_client(),
+            &target,
+            prompt,
+            title,
+            repo,
+            &ctx,
+            &target.proto,
+        )
+        .await
+        {
+            Ok(cc_thread_id) => relation.run_claude_success_text(cc_thread_id, target_ws),
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    /// Chat-side `ask_user_question`: walks the question batch via
+    /// `walk_question_batch(channel=Chat)` and returns the joined
+    /// `{question_text: answer_label}` map as a JSON string. The `Chat`
+    /// channel is what makes `answer_pending_question` skip the CC-only
+    /// resume side-effects (no `CodingAgentPromptSent`, no `ContinuationRequested`).
+    async fn handle_chat_ask_user_question(
+        &self,
+        thread_id: Uuid,
+        tool_use_id: &str,
+        tool_args: &serde_json::Value,
+    ) -> String {
+        let questions = tool_args
+            .get("questions")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if !questions.is_array() {
+            return "Error: `questions` must be an array of question objects".to_string();
+        }
+
+        let outcome = self
+            .walk_question_batch(
+                thread_id,
+                tool_use_id,
+                &questions,
+                String::new(),
+                EventChannel::Chat,
+            )
+            .await;
+        let answer_kinds = match outcome {
+            Ok(o) => o.answer_kinds,
+            Err(e) => {
+                crate::log!(
+                    "[AskUserQuestion] chat walk failed for {thread_id}/{tool_use_id}: {e}"
+                );
+                return format!("Error: ask_user_question failed: {e}");
+            }
+        };
+
+        if answer_kinds.is_empty() {
+            // LLM sent zero questions in the batch. Surface a typed-error
+            // shape rather than the empty `{}` so the model gets a clear
+            // signal to retry with at least one question.
+            return "Error: `questions` array was empty — pass at least one question".to_string();
+        }
+
+        let answers =
+            crate::engine::agent_question::build_hook_answers(&answer_kinds, &questions);
+        serde_json::to_string(&answers).unwrap_or_else(|_| answers.to_string())
     }
 
     /// Run an isolated agentic loop for intent execution.
@@ -506,9 +782,11 @@ impl LucidosEngine {
                 return Ok("Intent execution reached iteration limit.".to_string());
             }
 
-            // Trim context if needed
+            // Trim context if needed. Intent sub-loops have no user message
+            // to pin — the seed messages were synthesized by the special-tool
+            // dispatcher, not typed by a user — so pass 2 trims freely.
             let message_budget = 400_000; // ~100k tokens budget for intent sub-loops
-            trim_context_if_needed(&mut messages, message_budget);
+            trim_context_if_needed(&mut messages, message_budget, None);
 
             // Call LLM with no streaming (sub-loop doesn't stream text to frontend)
             let response = self
@@ -538,6 +816,7 @@ impl LucidosEngine {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
                     input: tc.arguments.clone(),
+                    thought_signature: tc.thought_signature.clone(),
                 });
             }
             messages.push(Message {
@@ -607,6 +886,7 @@ impl LucidosEngine {
                         None,
                         device_id,
                         tool_called_event_id,
+                        &tc.id,
                     )
                     .await
                 {
@@ -640,6 +920,7 @@ impl LucidosEngine {
                                 result: crate::core::sanitize_for_jsonb(&result),
                                 images: vec![],
                                 success: !is_error,
+                                tool_called_event_id: None,
                             },
                             meta: EventMeta::NONE,
                         },

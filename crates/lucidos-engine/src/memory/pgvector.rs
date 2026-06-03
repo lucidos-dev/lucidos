@@ -214,6 +214,9 @@ impl PgVectorIndex {
         Ok(())
     }
 
+    // One arg per indexed column (id, source, topic, summary, importance, entities,
+    // embedding, embedding_model, src_created_at, extractor_version) — a struct
+    // wrapper would mirror the row shape with no readability gain.
     #[allow(clippy::too_many_arguments)]
     pub async fn index_entry(
         &self,
@@ -429,6 +432,17 @@ impl PgVectorIndex {
             .fetch_one(&self.pool)
             .await?;
         Ok(count.0 as usize)
+    }
+
+    /// Cheap emptiness check — `SELECT EXISTS` short-circuits on the first
+    /// row, so this stays O(1) on a populated table rather than scanning to
+    /// compute `COUNT(*)` like [`Self::len`].
+    pub async fn is_empty(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let exists: (bool,) =
+            sqlx::query_as("SELECT EXISTS (SELECT 1 FROM memory_entries)")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(!exists.0)
     }
 
     /// Delete an entry
@@ -760,8 +774,8 @@ mod extractor_version_tests {
     use crate::test_support::{setup_test_db, teardown_test_db};
 
     /// `index_entry` must persist whatever extractor_version it was given —
-    /// otherwise the stale-detection query in `count_stale_extractor` is
-    /// looking at a column that always reads 0.
+    /// otherwise `delete_below_extractor_version` is looking at a column that
+    /// always reads 0.
     #[tokio::test]
     async fn index_entry_persists_extractor_version() {
         let (pool, db_name) = setup_test_db().await;

@@ -51,7 +51,11 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
 
 ### 1. Triggers — intent vs knowhow split
 
-Per the engine prompt's taxonomy section and the worked example in `docs/taxonomy.md` (mirrored in best-practices). Trigger threads discover knowhow at fire time via `load_knowhow` (same as chat); there is no per-trigger allow-list on the trigger config. For each `TriggerCreated` (and any subsequent `TriggerUpdated` that mutated `run`), reduce to the *latest* `run` (most recent payload by sequence) before applying these checks:
+**Start from the live projection (`list_triggers` / the trigger registry the scheduler uses), not from `TriggerCreated` events.** Only audit triggers present in the live list — anything else has been deleted (`TriggerDeleted`) or is otherwise no longer firing. Use `TriggerCreated`/`TriggerUpdated` events purely to reconstruct historical `run` fields the projection doesn't expose (intent text, stale `run.knowhow:[...]`, slug) for triggers that are still live.
+
+Walking `TriggerCreated` alone produces phantom findings — "broken" triggers that don't actually exist anymore — and wastes the user's time chasing them. The scheduler's live state is the source of truth for *what is currently scheduled*; events are the source of truth for *what the run config historically looked like*.
+
+Per the engine prompt's taxonomy section and the worked example in `docs/taxonomy.md` (mirrored in best-practices). Trigger threads discover knowhow at fire time via `load_knowhow` (same as chat); there is no per-trigger allow-list on the trigger config. For each *live* trigger, reduce its `TriggerCreated` + subsequent `TriggerUpdated` events to the *latest* `run` (most recent payload by sequence) before applying these checks:
 
 - **Imperative verbs about *how* in `run.intent`** (hit, parse, scan, fall back, retry, GET, POST, scrape) → procedure leaked into intent.
 
@@ -60,6 +64,24 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 - **Missing explicit `slug` field** — per `system-knowhow/building-a-trigger.md` § "Setup checklist" item 5: when slug isn't persisted on the event, the engine derives one from the name on read; renaming the trigger then silently moves any per-trigger knowhow path. Recommend persisting an explicit `slug` via a `TriggerUpdated` event when the trigger has (or will have) per-trigger knowhow files. Severity: **nit** (preventive).
 
 - **Per-trigger knowhow dir orphaned from any live trigger** — for each directory under `data/triggers/<slug>/knowhow/`, confirm `<slug>` matches the slug of an active (non-deleted) trigger. Knowhow under an unreferenced slug is invisible (the system prompt scopes by exact slug match); flag and recommend renaming the directory to a live slug or deleting it. Reference: `system-knowhow/building-a-trigger.md`.
+
+- **Notification routing — `tap` opt-ins for CTA-shaped triggers.** For each trigger whose `run.intent` mentions `send_notification` (or each `NotificationCreated` event traceable to a trigger), look at the body the trigger produces. Per `system-knowhow/building-a-trigger.md` § "Notification routing":
+  - Body reads like a direct CTA inside an app ("check in", "open <X>", "tap to log") **and** the trigger sets `app_id` → suggest `tap: { kind: 'navigate', to: { target: 'app', app_id: '<id>' } }` so the tap skips the modal.
+  - Body reads like a question or prompt that needs the user back in the conversation ("Claude is asking", "needs your input", "respond to") → suggest `tap: { kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<event_id?>' } }`.
+  - Body reads like a multi-result panel-shaped destination ("N changes ready to apply", "3 triggers failed overnight") → suggest `tap: { kind: 'navigate', to: { target: 'changes' | 'triggers' | 'files' | 'notifications' } }` for the matching panel.
+  - Body reads like a purely informational push that needs no follow-up ("backup complete", "sync finished", "5 tasks today") → suggest `tap: { kind: 'none' }` so the row marks itself read on display and doesn't sit in the inbox.
+  - Body reads like a status report the user re-reads later ("daily summary", "weekly digest") → leave `tap` at the default `{ kind: 'modal' }`.
+  Severity: **drift** (current default works, opt-in tightens UX). Skip when the trigger already sets `tap` to a non-default value.
+
+- **Old-form `tap` strings — schema drift.** The `tap` field used to be a four-string union (`'modal' | 'open_app' | 'open_thread' | 'none'`); the new shape is a discriminated union object (`{ kind: 'modal' | 'none' | 'navigate', to?: NavigateUi }`). The engine now hard-rejects old-form strings with `400 Bad Request` at write time. Walk:
+  - `data/triggers/**/scripts/*.{py,sh,js,ts}` — grep for `"tap": "modal"`, `"tap": "open_app"`, `"tap": "open_thread"`, `"tap": "none"` and the single-quoted / JS-syntax variants.
+  - `data/apps/**/{ui,**}.{js,ts,html}` — grep for `tap: 'modal'` / `tap: 'open_app'` / etc. and the double-quoted variants.
+  - `data/scripts/**/*.{py,sh,js,ts}` — same patterns.
+  - `data/knowhow/**/*.md` — fenced code blocks (`python`, `bash`, `js`, `ts`) carrying the same patterns; stale recipes propagate the leak.
+
+  For each match, surface the file path + line + the matched form. Recommend running `system-knowhow/migrate-tap-shape.md` to rewrite all in place. Severity: **broken** (will 400 at next fire). Reference: `system-knowhow/js-sdk.md` § `lucidos.notifications`.
+
+  Do NOT rewrite during the audit — the audit stays read-only. The migration recipe is the surface that actually edits files.
 
 ### 2. Apps — SDK boilerplate and structure
 

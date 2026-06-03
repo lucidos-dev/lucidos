@@ -1,21 +1,21 @@
 import type { ComponentType } from 'preact';
-import { useState, useRef, useCallback } from 'preact/hooks';
 import { ConnectionStatus } from './ConnectionStatus';
 import { unfocusThread } from '../../store/actions/threads';
 import { composeHandlers } from '../chat/promptFocus';
-import { ComposeIcon, GridIcon, SearchIcon, FilterIcon, ThreadsIcon, DraftsIcon } from '../shared/icons';
+import { ComposeIcon, GridIcon, SearchIcon, FilterIcon, DraftsIcon } from '../shared/icons';
 import { CopyThreadRefButton } from '../shared/CopyThreadRefButton';
 import { ExportThreadButton } from '../shared/ExportThreadButton';
 import { ThreadNav } from '../shared/ThreadNav';
+import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
-import { ControlPanel, controlPanelOpen, controlPanelBadgeCount, controlPanelBadgeTooltip } from './ControlPanel';
+import { ControlPanel, controlPanelOpen, controlPanelAnchor, controlPanelBadgeCount, controlPanelBadgeTooltip } from './ControlPanel';
 import { ThreadFilterDropdown } from './ThreadFilterDropdown';
 import { getContentTitle, getDiffDescription } from './headerHelpers';
-import { attentionThreadCount, threadSearchQuery, mobileView, MOBILE_VIEWS, threadChannelFilter, ALL_CHANNELS, unreadCount, focusedThreadId, threadMap, effectiveThreadStatus, draftsViewActive, type MobileView } from '../../store/store';
-import { navigateToPane, toggleThreads } from '../../store/actions/pane';
-import { useThreadSearch } from '../../hooks/useThreadSearch';
+import { threadSearchQuery, mobileView, MOBILE_VIEWS, unreadCount, focusedThreadId, threadMap, effectiveThreadStatus, draftsViewActive, type MobileView } from '../../store/store';
+import { navigateToPane } from '../../store/actions/pane';
+import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
 import { ThreadTitleEditor } from '../chat/ThreadTitleEditor';
 import { ThreadStatusIcon, resolveVisualStatus } from '../shared/ThreadStatusIcon';
 import { threadDisplayTitle } from '../../utils/threadTitle';
@@ -41,20 +41,14 @@ export const MOBILE_PANE_CONFIGS: Record<MobileView, MobilePaneConfig> = {
 
 /** Mobile threads header — search and filter for the threads pane */
 function MobileThreadsHeader() {
-  const [filterOpen, setFilterOpen] = useState(false);
-  const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadSearch();
-  const toggleRef = useRef<HTMLButtonElement>(null);
-  const closeFilter = useCallback(() => setFilterOpen(false), []);
-  const filterActive = threadChannelFilter.value.size < ALL_CHANNELS.length;
+  const { filterOpen, setFilterOpen, toggleRef, closeFilter, filterActive,
+          searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
 
   return (
     <div class={`mobile-threads-header${searchOpen ? ' search-active' : ''}`}>
       <div class="mobile-header-row">
         <div class="mobile-thread-search-bar">
-          <svg class="thread-search-bar-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="7" cy="7" r="4.5" />
-            <path d="M10.5 10.5L14 14" />
-          </svg>
+          <SearchIcon className="thread-search-bar-icon" />
           <input
             ref={searchInputRef}
             class="thread-search-input"
@@ -120,16 +114,7 @@ function MobileThreadHeader() {
   return (
     <div class="mobile-thread-header">
       <div class="mobile-header-row">
-        <button
-          class="icon-btn header-icon thread-toggle"
-          onClick={() => toggleThreads()}
-          aria-label="Show threads"
-        >
-          <ThreadsIcon />
-          {attentionThreadCount.value > 0 && (
-            <span class="badge">{attentionThreadCount.value}</span>
-          )}
-        </button>
+        <ThreadToggleButton ariaLabel="Show threads" />
         <div class="mobile-nav-slot"><ThreadNav /></div>
         <span class="pane-header-brand mobile-header-title">
           <span
@@ -137,6 +122,7 @@ function MobileThreadHeader() {
             data-role="control-panel-toggle"
             onClick={(e) => {
               if (e.target === e.currentTarget) return;
+              controlPanelAnchor.value = e.currentTarget as HTMLElement;
               controlPanelOpen.value = !controlPanelOpen.value;
             }}
           >
@@ -144,7 +130,7 @@ function MobileThreadHeader() {
             {badgeCount > 0 && <span class="badge brand-badge" data-tooltip={controlPanelBadgeTooltip()}>{badgeCount}</span>}
             <ConnectionStatus />
           </span>
-          <ControlPanel />
+          <ControlPanel layout="mobile" />
         </span>
         <div class="pane-header-spacer" />
         <button
@@ -222,7 +208,7 @@ export function MobileThreadTitleBar() {
   const visualStatus = resolveVisualStatus(
     effectiveThreadStatus(eventThread),
     eventThread.meta.activeChildrenCount > 0,
-    eventThread.meta.ccHasChanges,
+    eventThread.meta.codingAgentProposed,
   );
 
   return (

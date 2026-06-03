@@ -2,29 +2,25 @@ import {
   threadsLoaded,
   currentModel,
   reasoningEffort,
-  currentApp,
-  previewFile,
-  selectedLines,
   panelUrl,
   panelTitle,
-  isConnected,
   showToast,
   focusedThreadId,
   threadMap,
-  repositories,
-  selectedRepoId,
+  selectedScope,
+  scopeToFolder,
   ccPendingModel,
   ccPendingReasoningEffort,
-  parseRepoPath,
   cancelingThreadIds,
   setFocusedThread,
 } from '../store';
-import { toFailed, setLoadingIfFresh } from '../types';
+import type { ChatContext } from './chatContext';
 import type { ChatRequestBody } from '../../api/types';
-import { API_BASE, submitChat, cancelChat, stopClaudeCode } from '../../api/client';
-import { getDisconnectedMsg } from './connection';
+import { submitChat, cancelChat, stopClaudeCode, isTransportError } from '../../api/client';
+import { getUnreachableEngineMsg } from './connection';
 import { getDeviceId } from './devices';
 import { handleEvent, makeOptimisticThreadState, type StoredEvent } from '../thread-events';
+import { bumpThreadEvents } from '../threadActivity';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
 import { scrollToBottom } from '../../components/chat/scrollState';
 import { refreshThreadEvents } from './thread-loading';
@@ -48,6 +44,12 @@ function removePendingMessage(threadId: string, eventId: string): void {
   if (idx !== -1) {
     t.pendingUserMessages.splice(idx, 1);
     threadMap.value = new Map(threadMap.value);
+    // Same contract as addPendingMessage / the unreachable-engine path:
+    // `activeExchanges` subscribes only to the per-thread bump and reads
+    // threadMap via .peek(), so without this the stale 'Requesting...'
+    // synthetic exchange (composed from pendingUserMessages) keeps painting
+    // in the focused ThreadView until the next SSE event for this thread.
+    bumpThreadEvents(threadId);
   }
 }
 
@@ -66,6 +68,10 @@ export function clearStalePendingMessages(threadId: string): void {
   );
   if (thread.pendingUserMessages.length < before) {
     threadMap.value = new Map(threadMap.value);
+    // Same per-thread bump pairing as removePendingMessage — see comment
+    // there. Without this the stale 'Requesting...' row that this safety
+    // timer exists to clear keeps painting in the focused ThreadView.
+    bumpThreadEvents(threadId);
   }
 }
 
@@ -118,63 +124,22 @@ function addPendingMessage(
     });
     scrollToBottom();
     threadMap.value = new Map(map);
+    // `computeExchanges` reads `thread.pendingUserMessages` to synthesize the
+    // optimistic user-message row, but `activeExchanges` no longer subscribes
+    // to `threadMap` — it subscribes to the per-thread events bump (see
+    // `store/threadActivity.ts`). Without this bump the focused-thread
+    // computeds (`activeExchanges` in CreateThreadView + ThreadPane,
+    // `activeStreamingBuffer` in ThreadView) keep their cached value and the
+    // synthetic exchange doesn't render until the next SSE event arrives.
+    bumpThreadEvents(threadId);
   }
 }
 
-/** Load registered repositories from the backend. */
-export async function loadRepositories(): Promise<void> {
-  setLoadingIfFresh(repositories);
-  try {
-    const res = await fetch(`${API_BASE}/api/repositories`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    repositories.value = { status: 'loaded', data };
-  } catch (e) {
-    repositories.value = toFailed(e);
-  }
-}
-
-/**
- * Returns context based on the current state.
- * - If an app UI is open, includes app_context so the LLM knows which app is active
- * - If viewing a file, includes file_context
- * - claude_code mode: null (handled separately)
- */
-function getActiveContext(): {
-  app_context?: { app_id: string };
-  file_context?: { path: string };
-  repo_file_context?: { repo_id: string; path: string; lines?: [number, number] };
-} | null {
-  // If an app UI is open, let the LLM know
-  const app = currentApp.value;
-  if (app) {
-    return {
-      app_context: {
-        app_id: app.id,
-      },
-    };
-  }
-
-  // Check file preview — repo files have "repo:" prefix
-  const file = previewFile.value;
-  const repo = file ? parseRepoPath(file) : null;
-  if (repo) {
-    const sel = selectedLines.value;
-    return {
-      repo_file_context: {
-        repo_id: repo.repoId,
-        path: repo.path,
-        lines: sel ? [sel.start, sel.end] : undefined,
-      },
-    };
-  }
-
-  if (file) {
-    return { file_context: { path: file } };
-  }
-
-  return null;
-}
+// `loadRepositories` lives in `./repositoriesLoader` so SSE-handler modules
+// can refresh the repositories cache without dragging in chat.ts's transitive
+// import tree. Re-exported here so existing call sites
+// (`import { loadRepositories } from '../store/actions/chat'`) keep working.
+export { loadRepositories } from './repositoriesLoader';
 
 /**
  * Send a chat message. Side effects (modals, refreshes) are handled by
@@ -183,42 +148,12 @@ function getActiveContext(): {
 export async function sendMessage(
   message: string,
   imageHashes?: string[],
-  options?: { useClaudeCode?: boolean },
+  options?: { useClaudeCode?: boolean; context?: ChatContext | null },
 ): Promise<void> {
   threadsLoaded.value = true;
   const eventId = crypto.randomUUID();
   const isNewThread = focusedThreadId.value === null;
   const threadId = focusedThreadId.value || eventId;
-
-  // Check connection — show error in thread context, not just a toast
-  if (!isConnected.value) {
-    const map = threadMap.value;
-    if (!map.has(threadId)) {
-      map.set(threadId, makeOptimisticThreadState({
-        id: threadId,
-        title: message.slice(0, 40),
-        channel: 'chat',
-        initiator: 'user',
-        eventsLoaded: true,
-      }));
-    }
-    // failedSeq must be > messageSeq so ResponseFailed groups under the user's exchange.
-    const messageSeq = -Date.now() - 1;
-    const failedSeq = messageSeq + 1;
-    const now = new Date().toISOString();
-    handleEvent(map, threadId, messageSeq, {
-      type: 'MessageReceived',
-      text: message,
-    } as StoredEvent, now);
-    handleEvent(map, threadId, failedSeq, {
-      type: 'ResponseFailed',
-      error: getDisconnectedMsg(),
-    } as StoredEvent, now);
-    setFocusedThread(threadId);
-    if (isNewThread) pushThreadNavState({ type: 'thread', id: threadId });
-    threadMap.value = new Map(map);
-    return;
-  }
 
   setFocusedThread(threadId);
   if (isNewThread) pushThreadNavState({ type: 'thread', id: threadId });
@@ -240,48 +175,70 @@ export async function sendMessage(
   }
   addPendingMessage(threadId, message, eventId, imageHashes);
 
-  const ctx = getActiveContext();
   const body: ChatRequestBody = {
     message,
     mode: 'human',
     model: currentModel.value,
     device_id: getDeviceId(),
-    reasoning_effort: reasoningEffort.value,
+    // reasoning_effort is set below: chat threads use the chat preference,
+    // CC threads only set it when the user has a pending pick. CC follow-ups
+    // without a pending pick must NOT carry the chat default — the backend
+    // resolves from the prior session / CodingAgentSettingsChanged events,
+    // and a stray default here overrides that with the unrelated chat value.
     event_id: eventId,
     thread_id: threadId,
+    ...(options?.context ?? {}),
   };
-  if (ctx?.app_context) body.app_context = ctx.app_context;
-  if (ctx?.file_context) body.file_context = ctx.file_context;
-  if (ctx?.repo_file_context) body.repo_file_context = ctx.repo_file_context;
   if (imageHashes?.length) body.image_hashes = imageHashes;
 
-  // Drafts (state='composing') ARE threads in threadMap with focusedThreadId
-  // set, so neither `threadMap.get` truthiness nor `focusedThreadId === null`
-  // discriminates draft from established follow-up. Use the lifecycle marker
-  // against the pre-insert snapshot.
-  const isUnsent = !threadBeforeSend || threadBeforeSend.meta.state === 'composing';
-  const isCcThread = isUnsent
-    ? !!options?.useClaudeCode
-    : threadBeforeSend!.meta.channel === 'claude_code';
+  // `sendCompose` (compose.ts) flips composing→active before delegating here,
+  // so by this point `threadBeforeSend.meta.state` is always 'active' when the
+  // thread exists. The only discriminator that matters is whether the thread
+  // is in `threadMap` at all — captured pre-insert because the optimistic
+  // insert below creates a state='active' row for raw new sends.
+  const isCcThread = threadBeforeSend
+    ? threadBeforeSend.meta.channel === 'claude_code'
+    : !!options?.useClaudeCode;
   if (isCcThread) {
     body.use_claude_code = true;
-    if (!isUnsent && threadBeforeSend?.meta.repoId) {
+    // First send from compose-view: derive `folder` from the scope picker so
+    // the engine routes via `coding_agent_kind` (Lucidos / app / external).
+    // Follow-up on an existing thread: prefer the bound `codingAgentFolder`
+    // when present (app threads), then fall back to `repoId` for back-compat
+    // on threads bound before this rename. The engine resolves the absent
+    // case via `thread_summaries.cc_repo_id` lookup.
+    if (!threadBeforeSend) {
+      const folder = scopeToFolder(selectedScope.value);
+      if (folder) body.folder = folder;
+    } else if (threadBeforeSend.meta.codingAgentFolder
+      && threadBeforeSend.meta.codingAgentKind === 'app') {
+      // Re-send the workspace-relative form the spawn was created with so
+      // the engine's classifier lands on `App` again on every follow-up.
+      body.folder = `data/apps/${threadBeforeSend.meta.codingAgentFolder.split('/').pop()}`;
+    } else if (threadBeforeSend.meta.repoId) {
       body.repo_id = threadBeforeSend.meta.repoId;
-    } else if (isUnsent && selectedRepoId.value) {
-      body.repo_id = selectedRepoId.value;
     }
     // Apply pending CC preferences (set from compose view before session start).
     // Don't clear pending here — they stay visible in the UI until
-    // loadCommands() confirms the session adopted them (has_active_session: true).
-    // Clearing early causes a race: loadCommands() fires before the session
-    // exists, gets stale cache values, and with pending gone the UI shows
-    // the previous session's effort/model instead of the user's selection.
+    // loadCommands() confirms the session adopted them (matched value via
+    // current_reasoning_effort / current_model). Clearing early causes a
+    // race: loadCommands() fires before the session exists, gets stale cache
+    // values, and with pending gone the UI shows the previous session's
+    // effort/model instead of the user's selection.
     if (ccPendingModel.value !== null) {
       body.cc_model = ccPendingModel.value;
     }
     if (ccPendingReasoningEffort.value !== null) {
       body.reasoning_effort = ccPendingReasoningEffort.value;
     }
+    // No CC pending and a CC thread → omit reasoning_effort entirely so the
+    // backend falls through cc_reasoning_effort → prev_effort (live session)
+    // → event_effort (CodingAgentSettingsChanged) → cc_default. The chat
+    // default ('high') is a chat preference, not a CC preference, and would
+    // wrongly override the prior session's effort on a follow-up after the
+    // user already picked something else mid-session.
+  } else {
+    body.reasoning_effort = reasoningEffort.value;
   }
 
   // CC ignores url_context; only send for non-CC threads. Content extraction is
@@ -306,14 +263,37 @@ export async function sendMessage(
     await submitChat(body);
     schedulePendingCleanup(threadId, eventId);
   } catch (error: unknown) {
-    // Raw new sends create the thread optimistically (`threadBeforeSend`
-    // snapshot is undefined). When submitChat fails the engine has no record
-    // of it — leaving the row in `threadMap` would render a phantom in the
-    // Active drawer that vanishes on refresh. Drop the row, drop nav entries
-    // pointing at it (so Back/Forward can't restore a phantom), and unfocus.
-    // Established threads (active follow-up, draft promotion) keep their row;
-    // their content predates this send and only the pending entry is rolled
-    // back.
+    if (isTransportError(error)) {
+      // Engine unreachable. Render the user's message as a failed in-thread
+      // exchange (toast alone hides the text they spent time writing).
+      // Passing eventId to handleEvent piggybacks on its pending-message
+      // cleanup so the optimistic row inserted by addPendingMessage clears
+      // without a second signal write via removePendingMessage.
+      const messageSeq = -Date.now() - 1;
+      const failedSeq = messageSeq + 1;
+      const now = new Date().toISOString();
+      handleEvent(threadMap.value, threadId, messageSeq, {
+        type: 'MessageReceived',
+        text: message,
+      } as StoredEvent, now, eventId);
+      handleEvent(threadMap.value, threadId, failedSeq, {
+        type: 'ResponseFailed',
+        error: getUnreachableEngineMsg(),
+      } as StoredEvent, now);
+      threadMap.value = new Map(threadMap.value);
+      // Per `addPendingMessage`: focused-thread computeds subscribe to the
+      // per-thread bump, not `threadMap`. Without this, the synthetic
+      // MessageReceived + ResponseFailed events land in `thread.events` but
+      // `activeExchanges` keeps its cached value until the next SSE event.
+      bumpThreadEvents(threadId);
+      return;
+    }
+    // HTTP error (4xx/5xx with body) or unknown bug. Raw new sends create
+    // the thread optimistically (`threadBeforeSend === undefined`); the
+    // engine has no record of it, so leaving the row would render a phantom
+    // in the Active drawer that vanishes on refresh. Drop row + nav entries
+    // and unfocus. Established threads keep their row; their content
+    // predates this send and only the pending entry rolls back.
     if (threadBeforeSend === undefined) {
       const next = new Map(threadMap.value);
       next.delete(threadId);

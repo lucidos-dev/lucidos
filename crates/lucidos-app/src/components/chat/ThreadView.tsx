@@ -1,7 +1,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, promptAnimating, effectiveThreadStatus, revealOnFocus } from '../../store/store';
+import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
 import { loadThreadEvents, forceRetryThreadEvents } from '../../store/actions/thread-loading';
+import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useAutoScroll, renderExchanges, ScrollControls } from './CreateThreadView';
 import { ThreadStatusIcon, resolveVisualStatus } from '../shared/ThreadStatusIcon';
 import { ThreadTitleEditor } from './ThreadTitleEditor';
@@ -157,10 +159,16 @@ export function ThreadView() {
     // useMemo avoids recomputing on unrelated re-renders (scroll, streaming).
     // threadId MUST be in deps — without it, switching between threads with the
     // same eventCount returns stale exchanges from the previous thread.
+    // The per-thread events bump is also in deps: SSE-time streaming arrivals
+    // no longer fire `threadMap`, so `eventCount` (read from `threadMap`) can't
+    // be the only stream-aware dep. Reading the bump here both subscribes
+    // ThreadView to this thread's stream activity AND invalidates the memo on
+    // every event arrival. See `~/.claude/plans/generic-sparking-garden.md`.
+    const eventsBump = threadId ? getThreadEventsBump(threadId) : 0;
     const exchanges = useMemo(
         () => hasContent && !animating && eventThread
             ? computeExchanges(eventThread) : [],
-        [threadId, eventCount, pendingCount, hasContent, animating],
+        [threadId, eventCount, pendingCount, hasContent, animating, eventsBump],
     );
     const streamingBuffer = animating ? '' : activeStreamingBuffer.value;
 
@@ -204,7 +212,7 @@ export function ThreadView() {
     const threadInMap = !!eventThread;
     useEffect(() => {
         if (threadId && threadInMap && !eventsLoaded) {
-            loadThreadEvents(threadId);
+            void loadThreadEvents(threadId);
         }
     }, [threadId, threadInMap, eventsLoaded]);
 
@@ -226,7 +234,7 @@ export function ThreadView() {
             const t = threadMap.value.get(threadId);
             if (t && t.events.size === 0 && t.pendingUserMessages.length === 0) {
                 t.eventsLoaded = false;
-                loadThreadEvents(threadId);
+                void loadThreadEvents(threadId);
             }
         }, delay);
         return () => clearTimeout(timer);
@@ -340,14 +348,7 @@ export function ThreadView() {
         if (hasExhaustedRetries(watchdogRef, threadId, 2)) return;
         const timer = setTimeout(() => {
             incrementRetry(watchdogRef, threadId);
-            const thread = threadMap.value.get(threadId);
-            if (thread) {
-                // Rebuild Map internals (corrupted has()/get()), then full re-fetch.
-                thread.events = new Map(thread.events);
-                thread.eventsLoaded = false;
-                thread.lastDbSeq = 0;
-                loadThreadEvents(threadId);
-            }
+            rebuildCorruptedThreadEvents(threadId);
         }, 300);
         return () => clearTimeout(timer);
     }, [threadId, eventsLoaded, exchanges.length, eventCount]);
@@ -403,7 +404,7 @@ export function ThreadView() {
     const visualStatus = resolveVisualStatus(
       effectiveThreadStatus(eventThread),
       eventThread.meta.activeChildrenCount > 0,
-      eventThread.meta.ccHasChanges,
+      eventThread.meta.codingAgentProposed,
     );
     return (
         <div class="thread-view">

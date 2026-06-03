@@ -4,6 +4,9 @@ use crate::support::{
 use serde_json::json;
 use uuid::Uuid;
 
+// Test helper mirrors the full `seed-change-for-test` endpoint payload one-to-one;
+// a struct wrapper would just duplicate the JSON shape with no readability gain.
+#[allow(clippy::too_many_arguments)]
 async fn seed_change_for_test(
     client: &reqwest::Client,
     change_id: Uuid,
@@ -15,7 +18,7 @@ async fn seed_change_for_test(
     requires_restart: bool,
     hardened: bool,
 ) {
-    let url = format!("{}/api/internal/seed-change-for-test", base_url());
+    let url = format!("{}/api/v1/internal/seed-change-for-test", base_url());
     let resp = client
         .post(&url)
         .json(&json!({
@@ -73,7 +76,7 @@ async fn apply_unhardened_change_emits_missing_hardening_detected() {
     )
     .await;
 
-    let url = format!("{}/api/changes/{}/apply", base_url(), change_id);
+    let url = format!("{}/api/v1/changes/{}/apply", base_url(), change_id);
     let resp = client
         .post(&url)
         .send()
@@ -186,23 +189,33 @@ async fn sequential_apply_two_changes_succeeds() {
 
     let change1_id = Uuid::new_v4();
     let change2_id = Uuid::new_v4();
-    // Aggregate row keys off change_id, so one synthetic thread serves both.
-    let thread_id = Uuid::new_v4();
-    seed_cc_thread_summary(&pool, thread_id, "idle").await;
+    // One pending change per thread is the production invariant: a CC thread
+    // owns exactly one branch, and `propose_change` reuses the existing
+    // pending change for that branch rather than stacking a second. The
+    // single-change apply endpoint is gated by `available_thread_actions_for`,
+    // which derives Apply from the thread's per-thread `coding_agent_proposed`
+    // flag — applying change 1 clears that flag on its thread. So each change
+    // must live on its own synthetic thread, exactly as two real CC threads
+    // would. (This test still exercises the regression it was written for:
+    // two sequential applies must leave the working tree clean.)
+    let thread1_id = Uuid::new_v4();
+    let thread2_id = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, thread1_id, "idle").await;
+    seed_cc_thread_summary(&pool, thread2_id, "idle").await;
 
     seed_change_for_test(
-        &client, change1_id, thread_id, &branch1, repo_root,
+        &client, change1_id, thread1_id, &branch1, repo_root,
         "E2E test change 1", &[&file1], false, true,
     )
     .await;
     seed_change_for_test(
-        &client, change2_id, thread_id, &branch2, repo_root,
+        &client, change2_id, thread2_id, &branch2, repo_root,
         "E2E test change 2", &[&file2], false, true,
     )
     .await;
 
     // Apply change 1
-    let url1 = format!("{}/api/changes/{}/apply", base_url(), change1_id);
+    let url1 = format!("{}/api/v1/changes/{}/apply", base_url(), change1_id);
     let resp1 = client
         .post(&url1)
         .send()
@@ -259,7 +272,7 @@ async fn sequential_apply_two_changes_succeeds() {
     );
 
     // Apply change 2 — this was the failing case before the fix
-    let url2 = format!("{}/api/changes/{}/apply", base_url(), change2_id);
+    let url2 = format!("{}/api/v1/changes/{}/apply", base_url(), change2_id);
     let resp2 = client
         .post(&url2)
         .send()
@@ -362,20 +375,29 @@ async fn sequential_apply_two_changes_succeeds() {
     {
         eprintln!("Failed to clean up changes: {}", e);
     }
+    if let Err(e) = sqlx::query("DELETE FROM thread_summaries WHERE thread_id = ANY($1)")
+        .bind(&[thread1_id, thread2_id][..])
+        .execute(&pool)
+        .await
+    {
+        eprintln!("Failed to clean up thread_summaries: {}", e);
+    }
 
     pool.close().await;
 }
 
-/// Regression: previously, archiving a CC thread silently auto-discarded any
-/// remaining pending changes via `discard_pending_for_thread`, leaving a
-/// confusing engine-attributed `Change discarded` chip in the chat history
-/// while the change row's status flipped to `discarded`. Per the new contract,
-/// Archive only emits `ThreadArchived` — pending changes survive and the
-/// thread routes to Review (not Archive) via `displaySection`'s
-/// `hasPendingChanges` priority. The user resolves each pending change
-/// explicitly from the Review row.
+/// An in-workspace CC thread with a pending change is NOT archivable — the
+/// archive endpoint returns 409 `parent_has_pending_changes` and emits
+/// nothing. The user must Apply or Discard the change first. Without this
+/// gate, `ThreadArchived` projects through `CLEAR_CODING_AGENT_FLAGS` and
+/// silently clears `coding_agent_proposed`, leaving the change row dangling
+/// in the `changes` table while the thread sits in Archive — the original
+/// cca058432 "pending changes survive into Review" contract never held
+/// because the projection always cleared the column the routing depended on.
+/// Aligns with `resolve_actions`, which already returns [Discard, Apply]
+/// (never Archive) in this state.
 #[tokio::test]
-async fn archive_with_pending_change_does_not_emit_change_discarded() {
+async fn archive_with_pending_change_is_rejected_409() {
     let client = http_client();
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap();
@@ -404,7 +426,7 @@ async fn archive_with_pending_change_does_not_emit_change_discarded() {
     )
     .await;
 
-    let url = format!("{}/api/threads/archive", base_url());
+    let url = format!("{}/api/v1/threads/archive", base_url());
     let body = json!({ "thread_id": thread_id.to_string() });
     let resp = client
         .post(&url)
@@ -412,7 +434,16 @@ async fn archive_with_pending_change_does_not_emit_change_discarded() {
         .send()
         .await
         .expect("archive request failed");
-    assert_eq!(resp.status().as_u16(), 200, "archive should succeed");
+    assert_eq!(
+        resp.status().as_u16(),
+        409,
+        "archive must reject when there is a pending change"
+    );
+    let body: serde_json::Value = resp.json().await.expect("response body");
+    assert_eq!(
+        body["reason"], "parent_has_pending_changes",
+        "rejection reason must be parent_has_pending_changes: {body:?}"
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -422,19 +453,10 @@ async fn archive_with_pending_change_does_not_emit_change_discarded() {
     .bind(thread_id)
     .fetch_one(&pool)
     .await
-    .unwrap_or(0);
-    assert_eq!(archived, 1, "ThreadArchived must fire on archive click");
-
-    let discarded: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = 'ChangeDiscarded'",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
     .unwrap_or(99);
     assert_eq!(
-        discarded, 0,
-        "Archive must NOT auto-discard pending changes — the user resolves them from Review explicitly"
+        archived, 0,
+        "ThreadArchived must NOT fire when archive is rejected"
     );
 
     let status: Option<String> = sqlx::query_scalar("SELECT status FROM changes WHERE id = $1")
@@ -445,7 +467,7 @@ async fn archive_with_pending_change_does_not_emit_change_discarded() {
     assert_eq!(
         status.as_deref(),
         Some("pending"),
-        "pending change row must remain pending after archive"
+        "pending change row must remain pending after the rejected archive"
     );
 
     let _ = sqlx::query("DELETE FROM changes WHERE id = $1")

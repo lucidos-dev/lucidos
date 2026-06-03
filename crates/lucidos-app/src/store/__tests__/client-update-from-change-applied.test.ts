@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { updateAvailable, toasts, threadMap } from '../store';
+import { updateAvailable, toasts, threadMap, TOAST_AUTO_DISMISS_MS } from '../store';
 import { hasClientUpdateSincePageLoad, appliedToastRefreshAction } from '../actions/chat-changes';
 import { handleThreadEvent } from '../actions/thread-sync';
 import type { Change } from '../../api/client';
@@ -152,7 +152,7 @@ describe('Applied toast auto-dismiss timer', () => {
     vi.useRealTimers();
   });
 
-  it('auto-dismisses the Applied toast after 4s even with a Refresh action', () => {
+  it('auto-dismisses the Applied toast after TOAST_AUTO_DISMISS_MS even with a Refresh action', () => {
     const threadId = 't-refresh-timer';
     const applyKey = `applying-${threadId}`;
 
@@ -164,13 +164,15 @@ describe('Applied toast auto-dismiss timer', () => {
     });
     expect(toasts.value.find(t => t.key === applyKey)?.action?.label).toBe('Refresh');
 
-    vi.advanceTimersByTime(4000);
+    vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS);
     expect(toasts.value.find(t => t.key === applyKey)).toBeUndefined();
   });
 
-  it('restarts the 4s window when a second ChangeApplied upgrades the toast', () => {
+  it('restarts the dismiss window when a second ChangeApplied upgrades the toast', () => {
     const threadId = 't-restart-timer';
     const applyKey = `applying-${threadId}`;
+    const beforeUpgrade = TOAST_AUTO_DISMISS_MS - 2000;
+    const afterUpgrade = TOAST_AUTO_DISMISS_MS - 2000;
 
     handleThreadEvent({
       thread_id: threadId,
@@ -180,7 +182,7 @@ describe('Applied toast auto-dismiss timer', () => {
     });
     expect(toasts.value.find(t => t.key === applyKey)?.action).toBeUndefined();
 
-    vi.advanceTimersByTime(3000);
+    vi.advanceTimersByTime(beforeUpgrade);
     handleThreadEvent({
       thread_id: threadId,
       seq: 2,
@@ -189,12 +191,12 @@ describe('Applied toast auto-dismiss timer', () => {
     });
     expect(toasts.value.find(t => t.key === applyKey)?.action?.label).toBe('Refresh');
 
-    // Prior 4s timer would have fired at 4000ms; the upgrade should have
-    // restarted the window so the toast survives until 3000+4000=7000ms.
-    vi.advanceTimersByTime(2000);
+    // Upgrade should have restarted the dismiss window — toast must survive
+    // a full TOAST_AUTO_DISMISS_MS past the upgrade.
+    vi.advanceTimersByTime(afterUpgrade);
     expect(toasts.value.find(t => t.key === applyKey)?.action?.label).toBe('Refresh');
 
-    vi.advanceTimersByTime(2000);
+    vi.advanceTimersByTime(2001);
     expect(toasts.value.find(t => t.key === applyKey)).toBeUndefined();
   });
 });

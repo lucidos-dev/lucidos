@@ -10,26 +10,45 @@
 //! `mode` defaults to "agent" since this CLI is invoked from CC subprocesses;
 //! override with --mode for engine-mode helpers.
 //!
-//! `--relation sub` emits `parent_thread_id` + `spawning_event_id` instead of
-//! `caller_*` fields, for same-workspace parent-with-callback spawns. The
+//! `--relation child` emits `parent_thread_id` + `spawning_event_id` instead
+//! of `caller_*` fields, for same-workspace parent-with-callback spawns. The
 //! target workspace basename must match `$LUCIDOS_WORKSPACE` basename in
-//! `sub` mode (else error). `--relation top` (the default) emits caller_*
+//! `child` mode (else error). `--relation top` (the default) emits caller_*
 //! and never gets a callback. `--parent` is a deprecated alias for
-//! `--relation sub` and prints a stderr warning.
+//! `--relation child` and prints a stderr warning. `sub` is also accepted
+//! as a back-compat alias for `child`.
 //!
 //! The CLI generates the new thread's UUID up front and includes it in the
 //! request body so it can print a `[title](thread:workspace/uuid)` markdown
 //! link on stdout — the engine renders this as a clickable thread link when a
 //! CC subprocess includes it in its response.
+//!
+//! `--folder <path>` targets a folder instead of a repo: with `--cc`, a
+//! `data/apps/<id>` value spawns an *app coding-agent thread* — the engine
+//! resolves the `folder` body field through the same `coding_agent_kind`
+//! pipeline `run_claude(folder=…)` uses (sparse-checkout worktree of the app
+//! folder, Apply ff-merges to the workspace's main, no `/harden`, no engine
+//! restart). `--folder` is mutually exclusive with `--repo` (enforced by clap)
+//! and suppresses the `$LUCIDOS_REPO` default, because the engine rejects a
+//! request carrying both `repo_id` and `folder`.
 
 use std::path::PathBuf;
 
-use crate::workspace::{read_api_port, BoxError};
+use crate::workspace::{read_ports, BoxError};
 use crate::{CliRelation, SpawnThreadArgs};
 
 pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
+    // `--folder` only makes sense for coding-agent threads (it targets an app
+    // folder for a CC worktree). Reject early with a clear message — clap
+    // already rejects `--folder` together with `--repo`.
+    if args.folder.is_some() && !args.cc {
+        return Err(
+            "--folder requires --cc (folder targeting only applies to coding-agent threads)".into(),
+        );
+    }
+
     let target_root = resolve_target(&args.to)?;
-    let api_port = read_api_port(&target_root.join(".lucidos/ports"))?;
+    let (api_port, ports_proto) = read_ports(&target_root.join(".lucidos/ports"))?;
 
     let caller_workspace = std::env::var("LUCIDOS_WORKSPACE")
         .ok()
@@ -43,23 +62,23 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
         .unwrap_or_default();
 
     // Resolve relation: explicit `--relation` wins; `--parent` is a
-    // deprecated alias for `--relation sub` (warn once on stderr); otherwise
+    // deprecated alias for `--relation child` (warn once on stderr); otherwise
     // default to `top` so existing cross-workspace recipes keep their
     // fire-and-forget behavior.
     let relation = match (args.relation, args.parent) {
         (Some(r), _) => r,
         (None, true) => {
-            eprintln!("warning: --parent is deprecated; use --relation sub");
-            CliRelation::Sub
+            eprintln!("warning: --parent is deprecated; use --relation child");
+            CliRelation::Child
         }
         (None, false) => CliRelation::Top,
     };
 
-    if matches!(relation, CliRelation::Sub) {
+    if matches!(relation, CliRelation::Child) {
         let caller_basename = caller_workspace.as_deref().unwrap_or("");
         if target_basename != caller_basename {
             return Err(format!(
-                "--relation sub requires --to to match $LUCIDOS_WORKSPACE basename ({}), got {} \
+                "--relation child requires --to to match $LUCIDOS_WORKSPACE basename ({}), got {} \
                  — same-workspace only (callbacks across workspaces are unsupported)",
                 caller_basename, target_basename
             ).into());
@@ -70,11 +89,20 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     // fall back to $LUCIDOS_REPO (the engine sets this on every CC subprocess
     // to the calling thread's repo name). Passing `--repo ""` explicitly
     // requests the workspace default even when the env var is set.
-    let repo = match args.repo {
-        Some(s) => Some(s),
-        None => std::env::var("LUCIDOS_REPO").ok(),
-    }
-    .filter(|s| !s.is_empty());
+    //
+    // `--folder` suppresses the env-var default entirely: the engine 400s on a
+    // request carrying both `repo_id` and `folder`, and since it sets
+    // $LUCIDOS_REPO on every subprocess, a folder spawn would otherwise always
+    // collide. (`--folder` + explicit `--repo` is already rejected by clap.)
+    let repo = if args.folder.is_some() {
+        None
+    } else {
+        match args.repo {
+            Some(s) => Some(s),
+            None => std::env::var("LUCIDOS_REPO").ok(),
+        }
+        .filter(|s| !s.is_empty())
+    };
 
     // Generate the new thread's UUID up front so we can print the link without
     // a second request. The engine accepts a client-supplied thread_id and
@@ -92,9 +120,12 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     if let Some(m) = args.cc_model { obj.insert("cc_model".into(), m.into()); }
     if let Some(m) = args.model { obj.insert("model".into(), m.into()); }
     if let Some(r) = repo { obj.insert("repo_id".into(), r.into()); }
+    // App coding-agent thread targeting: the engine resolves `folder` through
+    // the shared `coding_agent_kind` pipeline (same as `run_claude(folder=…)`).
+    if let Some(ref f) = args.folder { obj.insert("folder".into(), f.clone().into()); }
 
     match relation {
-        CliRelation::Sub => {
+        CliRelation::Child => {
             if let Some(t) = caller_thread_id { obj.insert("parent_thread_id".into(), t.into()); }
             if let Some(e) = caller_event_id { obj.insert("spawning_event_id".into(), e.into()); }
         }
@@ -105,10 +136,15 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
         }
     }
 
-    let scheme = if args.insecure_http { "http" } else { "https" };
-    let url = format!("{}://localhost:{}/api/chat/stream", scheme, api_port);
+    let scheme = if args.insecure_http { "http" } else { &ports_proto };
+    let url = format!("{}://localhost:{}/api/v1/chat/stream", scheme, api_port);
     let client = crate::http::client()?;
-    let resp = client.post(&url).json(&body).send()?;
+    let start = std::time::Instant::now();
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .map_err(|e| crate::http::format_request_error("POST", &url, &e, start.elapsed()))?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {

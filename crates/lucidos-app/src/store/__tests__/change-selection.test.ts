@@ -19,7 +19,7 @@ vi.mock('../../api/client', async () => {
   };
 });
 
-import { getChangeById, getChangeDiff, getRepoChanges } from '../../api/client';
+import { getChangeById, getChangeDiff, getRepoChanges, ApiError } from '../../api/client';
 import {
   selectRepoChange, loadRepoChanges, viewChangeDiff,
   restoreRepoSelectionFromStorage,
@@ -239,14 +239,25 @@ describe('restoreRepoSelectionFromStorage', () => {
     expect(getChangeById).not.toHaveBeenCalled();
   });
 
-  it('clears stale ID when change no longer exists', async () => {
+  it('clears stale ID when change no longer exists (404 from engine)', async () => {
     localStorage.setItem(SELECTED_CHANGE_KEY, 'change-gone');
-    (getChangeById as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Not found'));
+    (getChangeById as ReturnType<typeof vi.fn>).mockRejectedValue(new ApiError(404, 'Not found'));
 
     await restoreRepoSelectionFromStorage();
 
     expect(localStorage.getItem(SELECTED_CHANGE_KEY)).toBeNull();
     expect(repoSelectedChangeId.value).toBeNull();
+  });
+
+  it('keeps saved ID on transient failures (network down, 5xx)', async () => {
+    // Without this guard, a momentary engine outage would silently lose the
+    // user's diff-view selection across the next reload.
+    localStorage.setItem(SELECTED_CHANGE_KEY, 'change-still-there');
+    (getChangeById as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Network down'));
+
+    await restoreRepoSelectionFromStorage();
+
+    expect(localStorage.getItem(SELECTED_CHANGE_KEY)).toBe('change-still-there');
   });
 
   it('skips when a file-preview overlay already encodes the same change', async () => {

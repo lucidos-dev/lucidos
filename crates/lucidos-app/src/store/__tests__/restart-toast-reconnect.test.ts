@@ -7,6 +7,7 @@ const mockCheckHealth = vi.fn();
 vi.mock('../../api/client', () => ({
   checkHealth: (...args: any[]) => mockCheckHealth(...args),
   API_BASE: 'http://localhost:3000',
+  API: 'http://localhost:3000/api/v1',
 }));
 vi.mock('../actions/thread-sync', () => ({
   connectThreadEvents: vi.fn(),
@@ -51,13 +52,17 @@ beforeEach(() => {
 });
 
 describe('restart toast survives network reconnect', () => {
-  function health(overrides: Record<string, unknown> = {}) {
-    return { workspace: 'test', workspace_path: '/tmp', started_at: STARTED_AT, ...overrides };
+  function loadedHealth(overrides: Record<string, unknown> = {}) {
+    return {
+      status: 'loaded',
+      data: { workspace: 'test', workspace_path: '/tmp', started_at: STARTED_AT, ...overrides },
+    };
   }
+  const unreachable = { status: 'failed', error: 'Failed to fetch' };
 
   /** Helper: simulate initial connection to set hasEverConnected=true */
   async function establishConnection() {
-    mockCheckHealth.mockResolvedValueOnce(health());
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth());
     await checkConnection();
     // Now hasEverConnected=true, engineStartedAt=STARTED_AT
   }
@@ -72,12 +77,12 @@ describe('restart toast survives network reconnect', () => {
     expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeTruthy();
 
     // Engine becomes briefly unreachable (health check timeout during apply)
-    mockCheckHealth.mockResolvedValueOnce(null);
+    mockCheckHealth.mockResolvedValueOnce(unreachable);
     await checkConnection();
     expect(connectionStatus.value).toBe('disconnected');
 
     // Engine comes back — same started_at (NOT a restart, just network hiccup)
-    mockCheckHealth.mockResolvedValueOnce(health());
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth());
     await checkConnection();
 
     // Toast must survive — the engine didn't restart
@@ -95,7 +100,7 @@ describe('restart toast survives network reconnect', () => {
     expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeTruthy();
 
     // Engine restarts — started_at changes
-    mockCheckHealth.mockResolvedValueOnce(health({ started_at: RESTARTED_AT }));
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({ started_at: RESTARTED_AT }));
     await checkConnection();
 
     // Toast must be dismissed — engine restarted
@@ -112,11 +117,11 @@ describe('restart toast survives network reconnect', () => {
     localStorage.setItem(RESTART_LS_KEY, 'true');
 
     // Engine goes down
-    mockCheckHealth.mockResolvedValueOnce(null);
+    mockCheckHealth.mockResolvedValueOnce(unreachable);
     await checkConnection();
 
     // Engine comes back with NEW started_at (restarted while we were disconnected)
-    mockCheckHealth.mockResolvedValueOnce(health({ started_at: RESTARTED_AT }));
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({ started_at: RESTARTED_AT }));
     await checkConnection();
 
     // Toast must be dismissed
@@ -130,7 +135,7 @@ describe('restart toast survives network reconnect', () => {
     updateAvailable.value = false;
 
     // Engine restarts with new started_at
-    mockCheckHealth.mockResolvedValueOnce(health({ started_at: RESTARTED_AT }));
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({ started_at: RESTARTED_AT }));
     await checkConnection();
 
     expect(updateAvailable.value).toBe(true);
@@ -141,7 +146,7 @@ describe('restart toast survives network reconnect', () => {
     updateAvailable.value = false;
 
     // Regular health check with same started_at — not a restart
-    mockCheckHealth.mockResolvedValueOnce(health());
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth());
     await checkConnection();
 
     expect(updateAvailable.value).toBe(false);
@@ -152,7 +157,7 @@ describe('restart toast survives network reconnect', () => {
     updateAvailable.value = false;
     (window as any).__LUCIDOS_APP_VERSION__ = '2026.03.01.0';
 
-    mockCheckHealth.mockResolvedValueOnce(health({ latest_tauri_app_version: '2026.04.01.0' }));
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({ latest_tauri_app_version: '2026.04.01.0' }));
     await checkConnection();
 
     expect(updateAvailable.value).toBe(true);
@@ -163,7 +168,7 @@ describe('restart toast survives network reconnect', () => {
     updateAvailable.value = false;
     (window as any).__LUCIDOS_APP_VERSION__ = '2026.04.01.0';
 
-    mockCheckHealth.mockResolvedValueOnce(health({ latest_tauri_app_version: '2026.04.01.0' }));
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({ latest_tauri_app_version: '2026.04.01.0' }));
     await checkConnection();
 
     expect(updateAvailable.value).toBe(false);
@@ -174,7 +179,7 @@ describe('restart toast survives network reconnect', () => {
     updateAvailable.value = false;
     // window.__LUCIDOS_APP_VERSION__ is undefined (browser mode)
 
-    mockCheckHealth.mockResolvedValueOnce(health({ latest_tauri_app_version: '2026.04.01.0' }));
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({ latest_tauri_app_version: '2026.04.01.0' }));
     await checkConnection();
 
     expect(updateAvailable.value).toBe(false);
@@ -184,7 +189,7 @@ describe('restart toast survives network reconnect', () => {
     await establishConnection();
     restartRequired.value = false;
 
-    mockCheckHealth.mockResolvedValueOnce(health({
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({
       engine_version: '2026.04.01.1',
       latest_engine_version: '2026.04.13.1',
     }));
@@ -199,7 +204,7 @@ describe('restart toast survives network reconnect', () => {
     await establishConnection();
     restartRequired.value = false;
 
-    mockCheckHealth.mockResolvedValueOnce(health({
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({
       engine_version: '2026.04.13.1',
       latest_engine_version: '2026.04.13.1',
     }));
@@ -212,7 +217,7 @@ describe('restart toast survives network reconnect', () => {
     await establishConnection();
     restartRequired.value = false;
 
-    mockCheckHealth.mockResolvedValueOnce(health({
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({
       engine_version: '2026.04.01.1',
     }));
     await checkConnection();

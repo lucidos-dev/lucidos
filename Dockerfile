@@ -16,8 +16,8 @@ FROM debian:bookworm-slim
 # Install PostgreSQL, pgvector, and other dependencies
 RUN apt-get update && apt-get install -y \
     # PostgreSQL
-    postgresql-16 \
-    postgresql-16-pgvector \
+    postgresql-17 \
+    postgresql-17-pgvector \
     # Python
     python3 \
     python3-pip \
@@ -26,20 +26,9 @@ RUN apt-get update && apt-get install -y \
     libpq5 \
     libssl3 \
     ca-certificates \
-    # PDF text extraction
-    poppler-utils \
-    # OCR for scanned PDFs
-    tesseract-ocr \
-    tesseract-ocr-eng \
-    tesseract-ocr-nor \
-    # Image processing for OCR
-    imagemagick \
-    ghostscript \
     # Utilities
     sudo \
-    && rm -rf /var/lib/apt/lists/* \
-    # Allow ImageMagick to process PDFs
-    && sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml 2>/dev/null || true
+    && rm -rf /var/lib/apt/lists/*
 
 # Create workspace directory
 RUN mkdir -p /workspace/artifacts /workspace/.lucidos /workspace/data/postgres

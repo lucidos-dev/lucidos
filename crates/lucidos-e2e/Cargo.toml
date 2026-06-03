@@ -9,7 +9,10 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
-lucidos-engine = { path = "../lucidos-engine" }
+# The `e2e-test-hooks` feature pulls in the in-process push-log writer and
+# the GET /api/_test/push-log endpoint that browser/API e2e tests assert
+# against — see system-knowhow/notifications.md §5.4.
+lucidos-engine = { path = "../lucidos-engine", features = ["e2e-test-hooks"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 serde_json = "1"

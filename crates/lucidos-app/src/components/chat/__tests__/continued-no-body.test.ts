@@ -7,7 +7,10 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
+// ChatExchangeImpl + its <ResponsePanel> usage live in ChatExchange.tsx;
+// the ResponsePanel component itself moved to chat-exchange-parts.tsx.
 const source = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
+const partsSource = readFileSync(resolve(here, '../chat-exchange-parts.tsx'), 'utf-8');
 
 /**
  * A non-last CC exchange that produced nothing (no response, no events) is
@@ -22,7 +25,7 @@ const source = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
  * render an empty header.
  *
  * The latest exchange is always shown — the !isLast guard means an active
- * CC session (working/streaming/pending) keeps its panel even before any
+ * Claude Code session (working/streaming/pending) keeps its panel even before any
  * events arrive.
  *
  * ResponsePanel still gates its body div on hasBody for the rare cases
@@ -31,8 +34,10 @@ const source = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
  */
 describe('Empty Continued-below panel is hidden entirely', () => {
   it('ChatExchange skips the response panel for empty non-last done/interrupted exchanges', () => {
-    const fnMatch = source.match(/export function ChatExchange[\s\S]*?^\}/m);
-    expect(fnMatch, 'ChatExchange function not found').not.toBeNull();
+    // ChatExchange is `memo(ChatExchangeImpl, …)`; the body to scan is the
+    // `function ChatExchangeImpl(...)` declaration.
+    const fnMatch = source.match(/function ChatExchangeImpl[\s\S]*?^\}/m);
+    expect(fnMatch, 'ChatExchangeImpl function not found').not.toBeNull();
     const fn = fnMatch![0];
     // showResponsePanel must rule out the empty non-last terminal-ish cases —
     // delegated to isEmptyContinuedExchange (in thread-events.ts) so the
@@ -42,8 +47,8 @@ describe('Empty Continued-below panel is hidden entirely', () => {
   });
 
   it('ResponsePanel still accepts hasBody and gates .response-body on it', () => {
-    expect(source).toMatch(/interface ResponsePanelProps[\s\S]*?hasBody:\s*boolean/);
-    const fnMatch = source.match(/function ResponsePanel\(\{[\s\S]*?\n\}\n/);
+    expect(partsSource).toMatch(/interface ResponsePanelProps[\s\S]*?hasBody:\s*boolean/);
+    const fnMatch = partsSource.match(/function ResponsePanel\(\{[\s\S]*?\n\}\n/);
     expect(fnMatch, 'ResponsePanel function not found').not.toBeNull();
     expect(fnMatch![0]).toMatch(/hasBody\s*&&\s*!collapsed[\s\S]*?class="response-body"/);
   });

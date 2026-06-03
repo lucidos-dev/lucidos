@@ -44,7 +44,17 @@ pub(super) async fn upload_file(
         }
     };
 
-    let filename = field.file_name().unwrap_or("unnamed").to_string();
+    let raw_filename = field.file_name().unwrap_or("unnamed").to_string();
+    let filename = match super::sanitize_leaf_filename(&raw_filename) {
+        Some(name) => name,
+        None => {
+            return Json(UploadResponse {
+                success: false,
+                filename: Some(raw_filename),
+                error: Some("Invalid filename".to_string()),
+            });
+        }
+    };
     let data = match field.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -76,7 +86,9 @@ pub(super) async fn upload_file(
             log!(@upload, "Import succeeded: {}", result);
             let _ = std::fs::remove_file(&temp_path);
 
-            // Spawn background processing (summarization, PDF extraction, memory indexing)
+            // Spawn the post-import hook. Today it's a near no-op (memory
+            // indexing for text artifacts runs via `memory_consumer`); kept
+            // as the upload-side extension point.
             let engine = Arc::clone(&state.engine);
             let dest_bg = dest.clone();
             tokio::spawn(async move {
@@ -121,7 +133,7 @@ pub(super) async fn get_commit_at_timestamp(
     Ok(Json(serde_json::json!({ "commit": commit })))
 }
 
-/// GET /api/commits?path=...&limit=...&offset=... - List commits touching a path prefix
+/// GET /api/v1/commits?path=...&limit=...&offset=... - List commits touching a path prefix
 pub(super) async fn list_commits(
     State(state): State<AppState>,
     Query(query): Query<CommitsQuery>,

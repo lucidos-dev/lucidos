@@ -1,0 +1,918 @@
+/* --- Response panel — bordered card wrapping the executor's reply. Header
+   carries executor + status + timestamp + (optional) stop button + collapse
+   toggle. Body collapses when the user clicks the header. */
+.response-panel {
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    margin: 0.5rem 0 0.25rem 0;
+    background: var(--bg-primary);
+    overflow: hidden;
+}
+
+.response-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+}
+
+.response-executor-icon {
+    flex-shrink: 0;
+    font-size: 0.875rem;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+}
+
+.response-executor-icon svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    color: var(--initiator-cc);
+}
+
+.response-executor-label {
+    font-weight: 500;
+    color: var(--text-primary);
+    flex-shrink: 0;
+}
+
+/* Status + timestamp pair: visually grouped on the right since they describe
+   the same thing — the current state of the response and when it last updated. */
+.response-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+.response-timestamp {
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+}
+
+.response-panel-collapsed .response-header,
+.response-panel-bodyless .response-header {
+    border-bottom: none;
+}
+
+.response-body {
+    padding: 0.75rem 1rem;
+}
+
+/* ContinuationStarted engine note — collapsed by default, expands inline when
+   the user clicks the subline. Sits inside an initiator-panel body so it
+   inherits the panel's padding; we only style the disclosure summary and
+   the expanded preformatted block. */
+.resume-note {
+    margin-top: 0.25rem;
+    font-size: 0.8125rem;
+    color: var(--text-secondary);
+}
+
+.resume-note > summary {
+    cursor: pointer;
+    user-select: none;
+    color: var(--text-secondary);
+}
+
+.resume-note > summary:hover {
+    color: var(--text-primary);
+}
+
+.resume-note-body {
+    margin: 0.375rem 0 0 0;
+    padding: 0.5rem 0.625rem;
+    border-left: 0.125rem solid var(--border-subtle, var(--border-color));
+    background: var(--bg-secondary);
+    white-space: pre-wrap;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: var(--text-secondary);
+}
+
+/* Engine reason badges — every engine panel inherits the teal border + tinted
+   header from .initiator-panel-system; only the summary line color differs to
+   convey *why* the engine spoke (trigger fired, change applied/failed/...). */
+.initiator-panel-trigger          .initiator-summary { color: var(--reason-trigger); }
+.initiator-panel-change-applied   .initiator-summary { color: var(--reason-applied); }
+.initiator-panel-change-failed    .initiator-summary { color: var(--reason-failed); }
+.initiator-panel-change-discarded .initiator-summary,
+.initiator-panel-change-reverted  .initiator-summary { color: var(--reason-muted); }
+
+/* Action buttons (Diff/Revert) render in a footer at the bottom-right of the
+   panel — keeps the timestamp alone in the header's top-right slot. */
+.initiator-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    padding: 0.5rem 0.875rem;
+    border-top: 1px solid var(--border-color);
+}
+
+/* --- Change body — surfaces description, file count, and error message
+   inside a change-lifecycle initiator panel. */
+.change-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+}
+
+.change-body-desc {
+    color: var(--text-muted);
+    word-break: break-word;
+}
+
+.change-body-meta {
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+}
+
+.change-body-error {
+    color: var(--text-primary);
+    word-break: break-word;
+    padding: 0.375rem 0.5rem;
+    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+    border-radius: 0.25rem;
+}
+
+/* User message sent to Claude Code (shown inline in streaming area) */
+.claude-code-user-msg {
+    background: var(--bg-tertiary);
+    border-left: 0.1875rem solid var(--accent);
+    padding: 0.5rem 0.75rem;
+    margin: 0.5rem 0;
+    font-size: 0.75rem;
+    white-space: pre-wrap;
+    color: var(--text-primary);
+}
+
+.message-channel-tag {
+    float: right;
+    clear: right;
+    margin-left: 0.75rem;
+    margin-bottom: 0.25rem;
+}
+
+.channel-error {
+    background: color-mix(in srgb, var(--accent-red) 20%, transparent);
+    color: var(--accent-red);
+    border-color: var(--accent-red);
+}
+
+/* Clear floats after channel tag so content starts below */
+.float-clear {
+    clear: both;
+}
+
+/* Chat exchange wrapper (initiator + response panels) */
+.chat-exchange {
+    margin-bottom: 0.75rem;
+    padding: 0;
+}
+
+.chat-exchange:last-child {
+    margin-bottom: 0;
+}
+
+/* scrollToEventAndPulse uses scrollIntoView, which would otherwise land
+   exchanges under the sticky .mobile-thread-title-row inside the same
+   scroll container. --mobile-thread-title-height tracks the bar's live
+   height so a wrapped title still clears. */
+@media (max-width: 768px) {
+    .chat-exchange {
+        scroll-margin-top: calc(var(--mobile-thread-title-height, 2.75rem) + 0.5rem);
+    }
+}
+
+/* Brief highlight applied by scrollToEventAndPulse when a notification deep-link
+   lands on a specific event (e.g. a UserQuestionAsked tapped from a push).
+   Class is removed after ~1.8s by the same scroll helper. Tracks --accent so
+   theme changes carry through; matches the settings-search-highlight-pulse
+   pattern (settings.css) with a slightly longer dwell. */
+.chat-exchange.event-pulse {
+    animation: chat-exchange-pulse 1.8s ease-out 1;
+    border-radius: 0.375rem;
+}
+
+@keyframes chat-exchange-pulse {
+    0% {
+        background-color: transparent;
+        box-shadow: 0 0 0 0 transparent;
+    }
+    15% {
+        background-color: color-mix(in srgb, var(--accent) 25%, transparent);
+        box-shadow: 0 0 0 0.5rem color-mix(in srgb, var(--accent) 15%, transparent);
+    }
+    100% {
+        background-color: transparent;
+        box-shadow: 0 0 0 0 transparent;
+    }
+}
+
+/* Response content — markdown rules inherited from .markdown-content in global.css */
+.response-content {
+    line-height: 1.6;
+    font-size: 0.75rem;
+    padding-left: 0.4rem;
+    white-space: normal;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    max-width: 100%;
+}
+
+.response-content li p {
+    margin: 0;
+}
+
+.response-content a.artifact-link,
+.response-content a.app-link {
+    text-decoration: underline dashed;
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .response-content a.artifact-link:hover,
+    .response-content a.app-link:hover {
+        text-decoration: underline solid;
+    }
+}
+
+
+/* Welcome message */
+.welcome-message {
+    white-space: normal;
+}
+
+.welcome-message h2 {
+    margin: 0 0 0.25rem 0;
+}
+
+.welcome-message .tagline {
+    margin: 0 0 1rem 0;
+    color: var(--text-secondary);
+    font-style: italic;
+    font-size: 1.125rem;
+}
+
+.welcome-message p {
+    margin: 0.75rem 0;
+}
+
+.welcome-message .workspace-info,
+.welcome-message .getting-started {
+    background: var(--bg-tertiary);
+    border-left: 0.1875rem solid var(--accent);
+    padding: 0.75rem 1rem;
+    margin: 1rem 0;
+    border-radius: 0 0.375rem 0.375rem 0;
+}
+
+.welcome-message .getting-started {
+    border-left-color: var(--accent-green);
+}
+
+.welcome-message ul {
+    margin: 0.5rem 0;
+    padding-left: 1.25rem;
+}
+
+.welcome-message li {
+    margin: 0.375rem 0;
+}
+
+.welcome-message .disclaimer {
+    margin: 1.5rem 0 0 0;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    line-height: 1.5;
+}
+
+/* Error state */
+.error {
+    color: var(--accent-red);
+    padding: 0.75rem;
+    background: rgba(248, 81, 73, 0.1);
+    border: 1px solid rgba(248, 81, 73, 0.4);
+    border-radius: 0.375rem;
+    font-size: 0.8125rem;
+}
+
+
+/* Thread empty state — always-visible fallback when no exchanges render.
+   Every path uses real text content so iOS Safari can never show blank. */
+.thread-empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    padding: 3rem 1rem;
+    color: var(--text-muted);
+    font-size: 0.875rem;
+}
+
+.thread-empty-state p {
+    margin: 0;
+}
+
+.thread-empty-error p {
+    color: var(--accent-red);
+}
+
+.thread-empty-reload {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    cursor: pointer;
+    padding: 0.25rem 0.5rem;
+    text-decoration: underline;
+    text-underline-offset: 0.125rem;
+}
+
+/* Thread timeline events */
+.thread-event-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 1rem;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+}
+
+.thread-event-icon {
+    flex-shrink: 0;
+    width: 1rem;
+    text-align: center;
+}
+
+.event-applied .thread-event-icon { color: var(--accent-green); }
+.event-discarded .thread-event-icon { color: var(--accent-red); }
+.event-reverted .thread-event-icon { color: var(--text-secondary); }
+.event-start .thread-event-icon { color: var(--accent); }
+.event-end .thread-event-icon { color: var(--text-secondary); }
+
+.thread-event-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.thread-event-time {
+    flex-shrink: 0;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
+
+/* CC question divider — body of an UserQuestionAsked initiator panel. The
+   surrounding .initiator-body provides padding/border/background, so the
+   body itself is just a vertical stack of the question text, options, and
+   (in answered state) the resolution block. */
+.cc-question-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.cc-question-text {
+    color: var(--text-primary);
+    font-weight: 600;
+    line-height: 1.5;
+}
+
+/* Mode pill — sits above the question text. Single-select cards commit on
+   click; multi-select cards need explicit Submit. Without this label the user
+   can't tell the two apart before acting. */
+.cc-question-mode-badge {
+    display: inline-flex;
+    align-self: flex-start;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.125rem 0.5rem 0.125rem 0.375rem;
+    border: 1px solid var(--border-color);
+    border-radius: 1rem;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.cc-question-mode-badge .cc-question-option-indicator {
+    width: 0.625rem;
+    height: 0.625rem;
+}
+
+/* Option indicator — radio circle (single-select) or checkbox box (multi-
+   select). Distinct shape from the start so the user can tell the mode apart
+   before any click. Selected state echoes the accent tint already used on
+   .cc-question-option[aria-pressed="true"] and .cc-question-option-selected. */
+.cc-question-option-indicator {
+    display: inline-block;
+    flex-shrink: 0;
+    width: 0.875rem;
+    height: 0.875rem;
+    border: 1px solid var(--text-muted);
+    background: transparent;
+    transition:
+        background-color var(--duration-normal),
+        border-color var(--duration-normal);
+}
+
+.cc-question-option-indicator-radio {
+    border-radius: 50%;
+}
+
+.cc-question-option-indicator-checkbox {
+    border-radius: 0.1875rem;
+}
+
+.cc-question-option-indicator-selected {
+    border-color: var(--accent);
+    background:
+        radial-gradient(circle, var(--accent) 35%, transparent 38%);
+}
+
+/* The row already shows the accent tint via [aria-pressed="true"], so the
+   indicator only needs the check glyph itself — no fill on top of the tint. */
+.cc-question-option-indicator-checkbox.cc-question-option-indicator-selected {
+    position: relative;
+    background: transparent;
+}
+
+.cc-question-option-indicator-checkbox.cc-question-option-indicator-selected::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 0.25rem;
+    height: 0.5rem;
+    border: solid var(--accent);
+    border-width: 0 0.125rem 0.125rem 0;
+    transform: translate(-55%, -65%) rotate(45deg);
+}
+
+.cc-question-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+/* Two-column grid shared by the live button and the resolved-state row.
+   Indicator + label sit on row 1; .cc-question-option-desc spans both columns
+   on row 2 so the description can use the full card width on mobile instead
+   of squeezing into the narrow column to the right of the checkbox. The
+   surfaces share the layout block so OptionContent's flat fragment can't
+   silently break in one and not the other. */
+.cc-question-option,
+.cc-question-option-static {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    column-gap: 0.625rem;
+    row-gap: 0.25rem;
+    align-items: start;
+    width: 100%;
+    padding: 0.75rem 0.875rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    color: var(--text-primary);
+    text-align: left;
+    white-space: normal;
+}
+
+.cc-question-option {
+    cursor: pointer;
+    font-family: inherit;
+    transition:
+        background-color var(--duration-normal),
+        border-color var(--duration-normal),
+        transform var(--duration-fast);
+}
+
+.cc-question-option .cc-question-option-indicator,
+.cc-question-option-static .cc-question-option-indicator {
+    /* Match the cap height of the option label so the dot aligns with the
+       first line of text rather than floating above it. */
+    margin-top: 0.1875rem;
+}
+
+.cc-question-option:focus-visible {
+    outline: 0.125rem solid var(--accent);
+    outline-offset: 0.125rem;
+}
+
+@media (hover: hover) {
+    .cc-question-option:hover {
+        background: color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary));
+        border-color: color-mix(in srgb, var(--accent) 50%, var(--border-color));
+    }
+}
+
+.cc-question-option:active {
+    transform: scale(0.99);
+}
+
+.cc-question-option-label {
+    font-weight: 500;
+    font-size: 0.875rem;
+    line-height: 1.4;
+    word-break: break-word;
+}
+
+.cc-question-option-desc {
+    grid-column: 1 / -1;
+    color: var(--text-secondary);
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    word-break: break-word;
+}
+
+.cc-question-hint {
+    color: var(--text-muted);
+    font-size: 0.8125rem;
+    font-style: italic;
+}
+
+/* Highlighted: the picked option in Selected answers — accent border + tint.
+   Same treatment for live multi-select toggles via aria-pressed, so changing
+   the accent recipe touches one block. */
+.cc-question-option-selected,
+.cc-question-option[aria-pressed="true"] {
+    border-color: color-mix(in srgb, var(--accent) 50%, var(--border-color));
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary));
+}
+
+/* Dimmed: non-chosen options after resolution. Muted color, subdued surface. */
+.cc-question-option-dimmed {
+    opacity: 0.55;
+    color: var(--text-muted);
+}
+
+.cc-question-option-dimmed .cc-question-option-label {
+    text-decoration: line-through;
+    text-decoration-color: var(--text-muted);
+}
+
+/* Terminated: the surrounding response was canceled / aborted / failed /
+   overtaken before any answer landed. TerminatedQuestionBody sets `disabled`
+   on every option so taps can't land — these rules make that state visible.
+   Same recipe as `cc-question-option-dimmed`, applied to every option in the
+   card, plus `not-allowed` cursor and a hover override so the accent tint
+   from the live hover rule doesn't bleed in. */
+.cc-question-body-terminated .cc-question-option:disabled {
+    opacity: 0.55;
+    color: var(--text-muted);
+    cursor: not-allowed;
+}
+
+.cc-question-body-terminated .cc-question-option:disabled .cc-question-option-label {
+    text-decoration: line-through;
+    text-decoration-color: var(--text-muted);
+}
+
+@media (hover: hover) {
+    .cc-question-body-terminated .cc-question-option:disabled:hover {
+        background: var(--bg-tertiary);
+        border-color: var(--border-color);
+    }
+}
+
+/* FreeText resolution block — highlighted box echoing the selected-option
+   tint so the user's typed answer reads as the equivalent "picked" surface. */
+.cc-question-freetext {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--border-color));
+    border-radius: 0.375rem;
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-tertiary));
+}
+
+.cc-question-freetext-label {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.cc-question-freetext-text {
+    color: var(--text-primary);
+    line-height: 1.5;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+/* Right-align inside the .cc-question-body flex column. The full-opacity
+   "this is the picked affordance" rule comes from .cc-permission-btn-picked,
+   stacked alongside on the same button. */
+.cc-question-cancel-picked.action-btn:disabled {
+    align-self: flex-end;
+}
+
+/* CC permission divider — body of a CodingAgentPermissionRequest initiator
+   panel. Like .cc-question-body, the .initiator-body wrapper provides chrome;
+   the body is just a vertical stack of the prompt text and action rows. After
+   the user resolves the request the same buttons stay rendered (disabled, with
+   the picked one marked and the rest struck through) so layout doesn't jump
+   and history reads at a glance. */
+.cc-permission-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.875rem;
+}
+
+.cc-permission-text {
+    color: var(--text-primary);
+    font-weight: 500;
+    line-height: 1.5;
+    word-break: break-word;
+}
+
+.cc-permission-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.cc-permission-actions-secondary {
+    margin-top: -0.375rem;
+}
+
+.cc-permission-actions-secondary code {
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-size: 0.875em;
+}
+
+/* Disabled "this is what got picked" affordance — keeps full opacity (the
+   default .action-btn:disabled fades to 40%, which would visually demote the
+   choice). Used by permission picked scope AND question card cancel; the name
+   lives in the permission-card namespace for historical reasons. */
+.cc-permission-btn-picked.action-btn:disabled {
+    opacity: 1;
+}
+
+/* Rejected (not-picked) buttons on an answered permission card — strike them
+   through and drop them to a muted slate. The default .action-btn:disabled
+   opacity (0.4) already greys the colour; the line-through tells the user
+   these buttons WERE on offer but were not chosen. */
+.cc-permission-btn-rejected.action-btn:disabled {
+    background-color: var(--bg-tertiary);
+    color: var(--text-muted);
+    text-decoration: line-through;
+    text-decoration-color: var(--text-muted);
+    opacity: 0.7;
+}
+
+.cc-permission-btn-rejected.action-btn:disabled code {
+    text-decoration: line-through;
+}
+
+/* Shared across the "this is the affordance you picked" treatment on every
+   answered timeline card — permission picked, question canceled. The class
+   name lives in the permission-card namespace for historical reasons but the
+   visual is generic. */
+.cc-permission-btn-check {
+    margin-right: 0.125rem;
+}
+
+/* Tool-permissions settings section: full-width monospace textarea + action row */
+.cc-allowed-tools-editor {
+    width: 100%;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    padding: 0.625rem 0.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+.cc-allowed-tools-actions {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 0.625rem;
+}
+
+/* Copyable blocks — <copy>...</copy> rendered by renderMarkdown */
+.copyable-block {
+    position: relative;
+    display: inline;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    padding: 0.125rem 0.375rem;
+    color: var(--text-primary);
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+}
+
+.copyable-block-multi {
+    display: block;
+    padding: 0.5rem 2.25rem 0.5rem 0.75rem;
+    margin: 0.5rem 0;
+    white-space: pre-wrap;
+}
+
+/* Inline-flow: absolute positioning inside a wrapping inline .copyable-block
+   would land the button mid-height of the wrapped lines. */
+.copy-btn {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+    margin-left: 0.25rem;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 0.125rem;
+    line-height: 0;
+    border-radius: 0.1875rem;
+    transition: color var(--duration-fast) ease;
+}
+
+.copy-btn svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+.copy-btn:hover {
+    color: var(--text-primary);
+}
+
+.copy-btn-copied {
+    color: var(--accent-green);
+}
+
+.copy-btn-copied:hover {
+    color: var(--accent-green);
+}
+
+.copyable-block-multi .copy-btn {
+    position: absolute;
+    top: 0.375rem;
+    right: 0.25rem;
+    margin-left: 0;
+}
+
+@media (max-width: 768px) {
+    .copyable-block-multi .copy-btn,
+    .code-block-copy-btn {
+        padding: 0.25rem;
+    }
+
+    .copyable-block-multi .copy-btn svg,
+    .code-block-copy-btn svg {
+        width: var(--icon-size-md);
+        height: var(--icon-size-md);
+    }
+
+    /* Tap-area extender via ::before — same pattern as .action-btn::before
+       in mobile.css. Sibling .copyable-block-multi .copy-btn already has
+       position: absolute, so only .code-block-copy-btn needs the anchor. */
+    .code-block-copy-btn {
+        position: relative;
+    }
+
+    .copyable-block-multi .copy-btn::before,
+    .code-block-copy-btn::before {
+        content: '';
+        position: absolute;
+        inset: -0.375rem -0.25rem;
+    }
+
+    .code-block-wrapper pre {
+        padding-top: 2.25rem;
+    }
+}
+
+/* Fenced code block. Lang label + copy button live in one .code-block-header
+   overlay row — single absolute element rather than two absolute siblings of
+   <pre>, so positioning has one source of truth. */
+.code-block-wrapper {
+    position: relative;
+}
+
+.code-block-wrapper pre {
+    margin-top: 0;
+    padding-top: 1.75rem;
+}
+
+/* Click-through overlay — header itself doesn't intercept taps so the user
+   can still select code under it. The button child re-enables its own. */
+.code-block-header {
+    position: absolute;
+    top: 0.375rem;
+    left: 0.625rem;
+    right: 0.375rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    pointer-events: none;
+    z-index: 2;
+}
+
+.code-block-header > * {
+    pointer-events: auto;
+}
+
+.code-block-lang {
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+    -webkit-user-select: none;
+    user-select: none;
+    pointer-events: none;
+}
+
+/* Load-bearing for code blocks without a language fence: with no lang
+   sibling, the lone button would otherwise sit at flex-start (left). */
+.code-block-copy-btn {
+    margin-left: auto;
+}
+
+/* JS-detected, not CSS @media: (hover)/(pointer) media queries are unreliable
+   across iOS Safari standalone, iPadOS with trackpad, and hybrid touch laptops,
+   and width-based queries can't tell a narrow desktop window from a touch
+   device. See main.tsx — body.is-touch is set on touch devices. */
+body:not(.is-touch) .code-block-copy-btn {
+    opacity: 0;
+    transition: opacity var(--duration-fast) ease;
+}
+
+body:not(.is-touch) .code-block-wrapper:hover .code-block-copy-btn,
+body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
+    opacity: 1;
+}
+
+/* Flat — no border/background; the surrounding InitiatorPanel owns the chrome. */
+.child-completion-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+.child-completion-header-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+}
+.child-completion-prefix {
+    color: var(--text-secondary);
+}
+.child-completion-status {
+    display: inline-flex;
+    align-items: center;
+    font-size: 0.75rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 0.25rem;
+    font-weight: 600;
+}
+.child-completion-status-success {
+    background: color-mix(in srgb, var(--accent-green) 18%, transparent);
+    color: var(--accent-green);
+}
+.child-completion-status-failure {
+    background: color-mix(in srgb, var(--accent-red) 18%, transparent);
+    color: var(--accent-red);
+}
+.child-completion-status-no-changes {
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+}
+.child-completion-status-canceled {
+    background: color-mix(in srgb, var(--accent-yellow) 18%, transparent);
+    color: var(--accent-yellow);
+}
+.child-completion-disclosure {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+.child-completion-disclosure > summary {
+    cursor: pointer;
+    user-select: none;
+}
+.child-completion-disclosure > summary:hover {
+    color: var(--text-secondary);
+}
+.child-completion-summary {
+    margin-top: 0.375rem;
+    color: var(--text-secondary);
+}
+

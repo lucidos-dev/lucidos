@@ -1,11 +1,16 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
 import { stepDetailModal } from '../../store/store';
 import { ModalOverlay } from '../shared/ModalOverlay';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { stepStatus } from '../../store/thread-events';
-import type { ContextSection, ContextCapture } from '../../store/types';
+import type { ContextSection, ContextCapture, Loadable } from '../../store/types';
+import { toFailed } from '../../store/types';
 import { formatTokens, estimateTokens, contextPercent } from '../../utils/formatTokens';
 import { highlightEllipsis } from './highlightEllipsis';
+import { groupSections, type RoleGroup, type InnerGroup } from './contextGrouping';
+import { fetchContextCapture, fetchToolResult, type ContextCapturePayload } from '../../api/threads';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { mergeContextCaptureSections, needsLazyFetch } from './loadStrippedSections';
 
 function close() {
   stepDetailModal.value = null;
@@ -39,6 +44,203 @@ function ContextSectionRow({ section }: { section: ContextSection }) {
   );
 }
 
+function ContextInnerGroup({ group }: { group: InnerGroup }) {
+  const [open, setOpen] = useState(true);
+  const totalChars = group.sections.reduce((a, s) => a + s.char_count, 0);
+  return (
+    <div class="context-inner-group">
+      <button class="context-inner-header" onClick={() => setOpen(!open)}>
+        <span>{open ? '▾' : '▸'}</span>
+        <span class="context-inner-label">{group.name}</span>
+        <span class="context-inner-chars">
+          {formatChars(totalChars)} · ≈{formatTokens(estimateTokens(totalChars))}
+        </span>
+      </button>
+      {open && group.sections.map(s => <ContextSectionRow key={s.name} section={s} />)}
+    </div>
+  );
+}
+
+function ContextRoleGroup({ role }: { role: RoleGroup }) {
+  const [open, setOpen] = useState(true);
+  const totalChars = role.innerGroups
+    .flatMap(ig => ig.sections)
+    .reduce((a, s) => a + s.char_count, 0);
+  return (
+    <div class="context-role">
+      <button class="context-role-header" onClick={() => setOpen(!open)}>
+        <span>{open ? '▼' : '▶'}</span>
+        <span class="context-role-label">{role.label}</span>
+        <span class="context-role-chars">
+          {formatChars(totalChars)} chars · ≈{formatTokens(estimateTokens(totalChars))} tokens
+        </span>
+      </button>
+      {open && role.innerGroups.map(ig => (
+        ig.name
+          ? <ContextInnerGroup key={ig.name} group={ig} />
+          : ig.sections.map(s => <ContextSectionRow key={s.name} section={s} />)
+      ))}
+    </div>
+  );
+}
+
+/** Sections + tools area. Lazy-fetches when the server stripped them on the
+ *  snapshot endpoint (see `api/threads.rs :: strip_context_capture_sections`).
+ *  Renders loading/error/loaded states from a `Loadable<ContextCapturePayload>`
+ *  per `.claude/rules/frontend.md`'s "Async Data Loading" rule. The
+ *  surrounding inline-chip fields (tokens, model, usage) render synchronously
+ *  from `snap` either way; only the sections + tools detail block needs the
+ *  async hydration. */
+function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
+  // Synchronous inline-rendered captures (live SSE, legacy synth, or any
+  // path where the server didn't strip) resolve to a `loaded` Loadable with
+  // the existing fields, so the render path below is uniform.
+  const inlineLoadable: Loadable<ContextCapturePayload> = useMemo(() => ({
+    status: 'loaded',
+    data: { sections: snap.sections, tools: snap.tools },
+  }), [snap]);
+  const [loadable, setLoadable] = useState<Loadable<ContextCapturePayload>>(
+    needsLazyFetch(snap) ? { status: 'loading' } : inlineLoadable,
+  );
+
+  useEffect(() => {
+    if (!needsLazyFetch(snap)) {
+      setLoadable(inlineLoadable);
+      return;
+    }
+    const eventId = snap.event_id;
+    if (!eventId) {
+      // Stripped marker without an event id is an upstream contract break.
+      // Toast is wrong here — the inline `failed` Loadable below already
+      // surfaces the issue in the open modal where the user is looking,
+      // and the next open of the same step would re-trigger the same fetch
+      // attempt (self-recovering once the upstream fix lands).
+      console.warn('[StepDetailModal] ContextCapture is sections_stripped but has no event_id; cannot lazy-fetch.');
+      setLoadable(toFailed<ContextCapturePayload>(new Error('missing event id')));
+      return;
+    }
+    let cancelled = false;
+    setLoadable({ status: 'loading' });
+    fetchContextCapture(eventId)
+      .then(payload => {
+        if (cancelled) return;
+        setLoadable({ status: 'loaded', data: payload });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setLoadable(toFailed<ContextCapturePayload>(err));
+      });
+    return () => { cancelled = true; };
+  }, [snap, inlineLoadable]);
+
+  const showLoading = useDelayedLoading(loadable);
+  if (loadable.status === 'failed') {
+    return <div class="context-sections-error" data-role="context-sections-error">Failed to load sections: {loadable.error}</div>;
+  }
+  if (loadable.status !== 'loaded') {
+    if (!showLoading) return null;
+    return <div class="context-sections-loading" data-role="context-sections-loading">Loading sections…</div>;
+  }
+  const hydrated = mergeContextCaptureSections(snap, loadable.data);
+  return (
+    <>
+      <div class="step-detail-context-meta">
+        <code>{hydrated.model || '(unknown model)'}</code>
+        <span> · {hydrated.producer === 'claude_code' ? 'Claude Code' : 'Main LLM'}</span>
+        <span> · {hydrated.tools.length} tools</span>
+        {hydrated.legacy && <span class="context-legacy-badge" data-tooltip="Synthesized from legacy events">legacy capture</span>}
+      </div>
+      <div class="context-sections">
+        {groupSections(hydrated.sections).map(role => (
+          <ContextRoleGroup key={role.role} role={role} />
+        ))}
+      </div>
+    </>
+  );
+}
+
+/** ToolResult.result area. Renders inline if the snapshot already carried it
+ *  (live SSE, `?include_context=true`, or any path where the server didn't
+ *  strip). Otherwise lazy-fetches via `GET /events/:event_id/tool-result` —
+ *  mirrors `ContextSectionsArea` above, including the
+ *  `Loadable<T>` shape per `.claude/rules/frontend.md`'s "Async Data Loading"
+ *  rule. `null` result is the image-only ToolResult contract: the
+ *  surrounding `<pre>` block is elided. */
+function ResultArea({
+  inlineResult,
+  resultStripped,
+  resultEventId,
+}: {
+  inlineResult: string | undefined;
+  resultStripped: boolean | undefined;
+  resultEventId: string | undefined;
+}) {
+  const inlineLoadable: Loadable<{ result: string | null }> = useMemo(() => ({
+    status: 'loaded',
+    data: { result: inlineResult ?? null },
+  }), [inlineResult]);
+  const [loadable, setLoadable] = useState<Loadable<{ result: string | null }>>(
+    resultStripped ? { status: 'loading' } : inlineLoadable,
+  );
+
+  useEffect(() => {
+    if (!resultStripped) {
+      setLoadable(inlineLoadable);
+      return;
+    }
+    if (!resultEventId) {
+      // Stripped marker without an event id is an upstream contract break —
+      // mirror ContextSectionsArea above. Toast is wrong (the modal already
+      // surfaces the failure where the user is looking); console.warn flags
+      // it for developer console + failed Loadable shows "Failed to load
+      // result" inline. Next re-open of the same step re-runs the fetch
+      // attempt (self-recovering once the upstream fix lands).
+      console.warn('[StepDetailModal] ToolResult is result_stripped but has no event_id; cannot lazy-fetch.');
+      setLoadable(toFailed<{ result: string | null }>(new Error('missing event id')));
+      return;
+    }
+    let cancelled = false;
+    setLoadable({ status: 'loading' });
+    fetchToolResult(resultEventId)
+      .then(payload => {
+        if (cancelled) return;
+        setLoadable({ status: 'loaded', data: payload });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setLoadable(toFailed<{ result: string | null }>(err));
+      });
+    return () => { cancelled = true; };
+  }, [resultStripped, resultEventId, inlineLoadable]);
+
+  const showLoading = useDelayedLoading(loadable);
+  if (loadable.status === 'failed') {
+    return (
+      <>
+        <div class="step-detail-section-label">Result</div>
+        <div class="step-detail-result-error" data-role="result-error">Failed to load result: {loadable.error}</div>
+      </>
+    );
+  }
+  if (loadable.status !== 'loaded') {
+    if (!showLoading) return null;
+    return (
+      <>
+        <div class="step-detail-section-label">Result</div>
+        <div class="step-detail-result-loading" data-role="result-loading">Loading result…</div>
+      </>
+    );
+  }
+  const text = loadable.data.result;
+  if (!text) return null; // image-only or genuinely empty — match prior `{step.result && …}` semantics
+  return (
+    <>
+      <div class="step-detail-section-label">Result</div>
+      <pre class="step-detail-result">{text}</pre>
+    </>
+  );
+}
+
 /** Budget bar + section list + (when usage is present) cache breakdown. */
 function ContextCapturePanel({ snap }: { snap: ContextCapture }) {
   const used = snap.usage?.input_tokens ?? snap.estimated_total_tokens;
@@ -63,15 +265,7 @@ function ContextCapturePanel({ snap }: { snap: ContextCapture }) {
           <div class="progress-bar-fill" style={`width: ${pct}%`} />
         </div>
       </div>
-      <div class="step-detail-context-meta">
-        <code>{snap.model || '(unknown model)'}</code>
-        <span> · {snap.producer === 'claude_code' ? 'Claude Code' : 'Main LLM'}</span>
-        <span> · {snap.tools.length} tools</span>
-        {snap.legacy && <span class="context-legacy-badge" data-tooltip="Synthesized from legacy events">legacy capture</span>}
-      </div>
-      <div class="context-sections">
-        {snap.sections.map(s => <ContextSectionRow key={s.name} section={s} />)}
-      </div>
+      <ContextSectionsArea snap={snap} />
       {snap.usage && (
         <div class="context-usage" data-role="usage-row">
           <span>input <strong>{formatTokens(snap.usage.input_tokens)}</strong></span>
@@ -103,12 +297,11 @@ export function StepDetailModal() {
         <div class="step-detail-description">{highlightEllipsis(step.description)}</div>
         {step.detail && <div class="step-detail-detail">{highlightEllipsis(step.detail)}</div>}
         {showFull && <pre class="step-detail-full">{step.full}</pre>}
-        {step.result && (
-          <>
-            <div class="step-detail-section-label">Result</div>
-            <pre class="step-detail-result">{step.result}</pre>
-          </>
-        )}
+        <ResultArea
+          inlineResult={step.result}
+          resultStripped={step.result_stripped}
+          resultEventId={step.result_event_id}
+        />
         {snap
           ? <ContextCapturePanel snap={snap} />
           : <div class="step-detail-empty">No context snapshot captured for this step.</div>}

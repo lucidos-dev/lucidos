@@ -9,12 +9,13 @@ import { escapeHtml } from '../../utils/escapeHtml';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { LoadableError } from '../shared/LoadableError';
 
 interface Props {
   file: DiffFile;
-  /** Lucidos change ID — fetch via /api/changes/:id/file. Null for external-repo
-   *  CC sessions, which have no Change row; in that case `gitRef` carries the
-   *  worktree branch and we fetch via /api/repositories/:id/file?ref=. */
+  /** Lucidos change ID — fetch via /api/v1/changes/:id/file. Null for external-repo
+   *  Claude Code sessions, which have no Change row; in that case `gitRef` carries the
+   *  worktree branch and we fetch via /api/v1/repositories/:id/file?ref=. */
   changeId: string | null;
   repoId: string;
   gitRef: string | null;
@@ -246,7 +247,7 @@ export function RenderedDiff({ file, changeId, repoId, gitRef }: Props) {
   }, [html]);
 
   if (content.status === 'failed') {
-    return <div class="empty-state error-text">Failed to load: {content.error}</div>;
+    return <LoadableError noun="diff" error={content.error} />;
   }
   if (content.status !== 'loaded') {
     if (!showLoading) return null;

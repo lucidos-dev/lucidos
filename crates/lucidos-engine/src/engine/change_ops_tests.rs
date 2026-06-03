@@ -1,6 +1,6 @@
 // # macOS test-suite SIGABRT note (read this before blaming a `change_ops` test)
 //
-// Three earlier CC sessions reported `apply_round_trip_branch_can_advance_again`
+// Three earlier Claude Code sessions reported `apply_round_trip_branch_can_advance_again`
 // and `discard_resets_even_when_worktree_is_dirty` as the trigger
 // for a SIGABRT under parallel `cargo test -p lucidos-engine --lib`.
 // They were wrong. Bisection in a fourth session pinned the actual

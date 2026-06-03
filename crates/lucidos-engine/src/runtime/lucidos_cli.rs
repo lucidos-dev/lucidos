@@ -138,7 +138,20 @@ pub(crate) fn workspace_script_env_vars(
 
 /// Skill content embedded at compile time — written into each CC worktree's
 /// `.claude/skills/lucidos-cli/SKILL.md` so CC discovers the CLI workflow.
-pub(crate) const LUCIDOS_CLI_SKILL: &str = include_str!("../../../lucidos-cli/skill.md");
+/// The embedded source is the very file we write to: in the Lucidos repo
+/// itself, `.claude/skills/lucidos-cli/SKILL.md` is tracked, and pointing
+/// `include_str!` at it makes the engine's compiled-in copy byte-identical to
+/// what's committed — so `install_lucidos_cli_skill` is a no-op there and a
+/// fresh CC worktree never starts with a phantom `M` on this path.
+pub(crate) const LUCIDOS_CLI_SKILL: &str =
+    include_str!("../../../../.claude/skills/lucidos-cli/SKILL.md");
+
+/// Worktree-relative path the skill is written to. `install_lucidos_cli_skill`
+/// writes here relative to its `worktree` arg (CC's cwd: the app folder for app
+/// coding-agent threads, the worktree root otherwise), and the spawn path feeds
+/// the same constant to `hide_phantom_tracked_skill` so the install site and the
+/// phantom-change guard can never drift apart.
+pub(crate) const LUCIDOS_CLI_SKILL_REL_PATH: &str = ".claude/skills/lucidos-cli/SKILL.md";
 
 /// Install the lucidos-cli skill into a CC worktree. Skipped when the binary
 /// isn't reachable — teaching CC about a tool it can't run wastes context.
@@ -151,8 +164,11 @@ pub(crate) fn install_lucidos_cli_skill(
     if cli_dir.is_none() {
         return Ok(());
     }
-    let skill_dir = worktree.join(".claude/skills/lucidos-cli");
-    let skill_file = skill_dir.join("SKILL.md");
+    let skill_file = worktree.join(LUCIDOS_CLI_SKILL_REL_PATH);
+    let skill_dir = skill_file
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| worktree.to_path_buf());
     if let Ok(existing) = std::fs::read_to_string(&skill_file) {
         if existing == LUCIDOS_CLI_SKILL {
             return Ok(());

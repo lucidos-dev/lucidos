@@ -380,3 +380,36 @@ fn test_tokenize_or() {
         vec!["OR", "SUBJECT", "\"test\"", "FROM", "\"user@example.com\""]
     );
 }
+
+#[test]
+fn debug_redacts_email_account_password() {
+    let account = EmailAccount {
+        id: uuid::Uuid::nil(),
+        name: "work".to_string(),
+        email_address: "me@work.com".to_string(),
+        imap_host: "imap.work.com".to_string(),
+        imap_port: 993,
+        smtp_host: "smtp.work.com".to_string(),
+        smtp_port: 465,
+        username: "me@work.com".to_string(),
+        password: "hunter2-super-secret".to_string(),
+        use_tls: true,
+        require_send_confirmation: false,
+        oauth_account_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let dbg = format!("{:?}", account);
+    // The password must never appear in a `{:?}` rendering.
+    assert!(
+        !dbg.contains("hunter2-super-secret"),
+        "password leaked: {dbg}"
+    );
+    assert!(
+        dbg.contains("password: \"<redacted>\""),
+        "expected redacted password: {dbg}"
+    );
+    // Non-secret connection fields stay visible for debugging.
+    assert!(dbg.contains("imap.work.com"));
+    assert!(dbg.contains("me@work.com"));
+}

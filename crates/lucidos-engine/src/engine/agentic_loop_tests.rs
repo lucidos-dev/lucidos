@@ -218,6 +218,7 @@ async fn ensure_terminator_emitted_recovers_silent_exit() {
             result: "ok".into(),
             images: vec![],
             success: true,
+            tool_called_event_id: None,
         },
         meta: meta.clone(),
     })
@@ -330,6 +331,7 @@ async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
             result: "ok".into(),
             images: vec![],
             success: true,
+            tool_called_event_id: None,
         },
         meta: current_meta.clone(),
     })
@@ -355,7 +357,7 @@ async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: `/api/restart` pre-emits `ResponseAborted{actor: device}` for
+/// Regression: `/api/v1/restart` pre-emits `ResponseAborted{actor: device}` for
 /// the in-flight chat thread, then `force_evict_chat_thread` cancels its
 /// token. The agentic loop's cancel branches fire moments later. Without
 /// the dedup gate inside `emit_response_canceled`, the loop's emit lands
@@ -374,7 +376,7 @@ async fn emit_response_canceled_is_idempotent_when_terminator_exists_for_request
     let origin_id = Uuid::new_v4();
     let meta = anchor_request(&bus, thread_id, origin_id, "fix the bug").await;
 
-    // Pre-emit the boundary abort (mirroring `/api/restart`).
+    // Pre-emit the boundary abort (mirroring `/api/v1/restart`).
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseAborted {

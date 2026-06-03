@@ -38,10 +38,10 @@ pub async fn proxy(vite_base: String, req: axum::extract::Request) -> Response {
     };
 
     let url = format!("{}{}", vite_base, uri);
-    let mut builder = CLIENT.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
-        &url,
-    );
+    // `reqwest::Method` is a re-export of `http::Method` (the same type
+    // axum's `req.method()` returned), so no parse / clone roundtrip is
+    // needed — pass the already-parsed method straight through.
+    let mut builder = CLIENT.request(method, &url);
     for (name, value) in &headers {
         if name != header::HOST {
             if let Ok(v) = value.to_str() {

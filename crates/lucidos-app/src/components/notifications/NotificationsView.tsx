@@ -1,4 +1,4 @@
-import { useRef, useCallback } from 'preact/hooks';
+import { useRef, useEffect } from 'preact/hooks';
 import {
   notifications,
   notificationsFilter,
@@ -16,17 +16,10 @@ import { formatTimeAgo, formatNotificationDate } from '../../utils/formatTime';
 import { loadedOr } from '../../store/types';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { LoadableError } from '../shared/LoadableError';
 
 export function NotificationsView() {
-  const listRef = useRef<HTMLDivElement>(null);
-
-  const handleScroll = useCallback(() => {
-    const el = listRef.current;
-    if (!el) return;
-    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 50) {
-      loadMoreNotifications();
-    }
-  }, []);
+  const sentinelRef = useRef<HTMLDivElement>(null);
 
   const loadable = notifications.value;
   const items = loadedOr(loadable, []);
@@ -35,11 +28,32 @@ export function NotificationsView() {
   const hasMore = notificationsHasMore.value;
   const loadingMore = notificationsLoadingMore.value;
 
+  // Infinite scroll: observe a sentinel at the bottom of the list. The real
+  // scroll container is the ancestor `.content-pane-body` (overflow-y: auto in
+  // panels/shell.css), NOT this view's `.panel-content` — a scroll listener on
+  // `.panel-content` never fired because that element doesn't scroll (scroll
+  // events don't bubble). Rooting the observer at `.content-pane-body` (mirrors
+  // ThreadDrawer's pattern) loads the next page as the sentinel comes into
+  // view. `loadMoreNotifications` self-guards against concurrent calls and the
+  // no-more-pages case, so a stray intersection is harmless.
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel || !hasMore) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) void loadMoreNotifications();
+      },
+      { root: sentinel.closest('.content-pane-body'), threshold: 0 },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasMore]);
+
   const emptyMessage =
     filter === 'unread' ? 'No unread notifications' : 'No notifications';
 
   return (
-    <div class="panel-content" ref={listRef} onScroll={handleScroll}>
+    <div class="panel-content">
       <div class="dropdown-panel-toolbar">
         <div class="notifications-filter segmented-control">
           <button
@@ -57,14 +71,14 @@ export function NotificationsView() {
         </div>
         <button
           class="mark-all-read"
-          onClick={markAllRead}
+          onClick={() => void markAllRead()}
           disabled={items.length === 0 || items.every((n) => n.read)}
         >
           Mark all read
         </button>
       </div>
       {loadable.status === 'failed' ? (
-        <div class="empty-state error-text">Failed to load notifications: {loadable.error}</div>
+        <LoadableError noun="notifications" error={loadable.error} />
       ) : loadable.status !== 'loaded' ? (
         showLoading ? <div class="loading-spinner" /> : null
       ) : items.length === 0 ? (
@@ -79,7 +93,7 @@ export function NotificationsView() {
               <button
                 key={n.id}
                 class={`notification-item ${n.read ? '' : 'unread'}`}
-                onClick={() => viewNotification(n.id)}
+                onClick={() => void viewNotification(n.id)}
               >
                 <div class="title notification-title">
                   <span class="trigger-icon">📋</span>
@@ -94,12 +108,13 @@ export function NotificationsView() {
               </button>
             );
           })}
-          {loadingMore && (
-            <div class="dropdown-panel-loading-more">Loading more...</div>
-          )}
-          {!loadingMore && hasMore && (
-            <div class="dropdown-panel-loading-more" style="opacity: 0.4">
-              Scroll for more
+          {hasMore && (
+            <div
+              ref={sentinelRef}
+              class="dropdown-panel-loading-more"
+              style={loadingMore ? undefined : 'opacity: 0.4'}
+            >
+              {loadingMore ? 'Loading more...' : 'Scroll for more'}
             </div>
           )}
         </>

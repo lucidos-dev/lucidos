@@ -90,7 +90,11 @@ impl BackupProvider for DropboxBackupProvider {
         "dropbox"
     }
 
-    async fn verify_access(&self) -> Result<(), BoxError> {
+    async fn preflight(&self, _estimated_upload_bytes: u64) -> Result<(), BoxError> {
+        // Dropbox preflight is intentionally minimal — confirm the token and
+        // that the backup folder is reachable. The over-quota / scope checks are
+        // Drive-specific (that was the reported bug); Dropbox surfaces upload
+        // failures directly, so the `_estimated_upload_bytes` hint is unused.
         let token = super::get_oauth_token(&self.pool, "dropbox").await?;
         self.ensure_folder(&token).await?;
         Ok(())

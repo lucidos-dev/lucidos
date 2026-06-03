@@ -1,5 +1,7 @@
 import type { SettingsSubview } from '../../store/store';
 import type { SearchResultItem } from '../../api/client';
+import { SHORTCUT_DEFS, bindingSearchText } from '../../utils/shortcuts';
+import { displayBinding, bindingFor } from '../../store/actions/keybindings';
 
 type Subview = Exclude<SettingsSubview, 'main'>;
 
@@ -14,6 +16,9 @@ interface SettingsSearchEntry {
   path: string;
   /** Optional `data-search-anchor` value to scroll/highlight after navigation. */
   anchor?: string;
+  /** Extra free-text matched in addition to the label (e.g. key-combo aliases
+   *  like "ctrl k" for a shortcut). Not shown in the UI. */
+  keywords?: string;
 }
 
 /**
@@ -31,6 +36,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'repositories', label: 'Repositories', subview: 'repositories', path: 'Settings' },
   { id: 'backup', label: 'Backup', subview: 'backup', path: 'Settings' },
   { id: 'memory', label: 'Memory', subview: 'memory', path: 'Settings' },
+  { id: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', subview: 'keyboard-shortcuts', path: 'Settings', keywords: 'keybindings hotkeys shortcut' },
 
   // Models subview
   { id: 'models:chat', label: 'Chat', subview: 'models', path: 'Settings → Models', anchor: 'models:chat' },
@@ -52,6 +58,8 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'appearance:font', label: 'Font', subview: 'appearance', path: 'Settings → Appearance → Typography', anchor: 'appearance:font' },
   { id: 'appearance:ui-scale', label: 'UI scale', subview: 'appearance', path: 'Settings → Appearance → Typography', anchor: 'appearance:ui-scale' },
   { id: 'appearance:animation-speed', label: 'Animation speed', subview: 'appearance', path: 'Settings → Appearance → Typography', anchor: 'appearance:animation-speed' },
+  { id: 'appearance:mobile', label: 'Mobile', subview: 'appearance', path: 'Settings → Appearance', anchor: 'appearance:mobile' },
+  { id: 'appearance:mobile-header-sticky', label: 'Keep header visible', subview: 'appearance', path: 'Settings → Appearance → Mobile', anchor: 'appearance:mobile-header-sticky' },
 
   // Backup subview
   { id: 'backup:restore', label: 'Restore from backup', subview: 'backup', path: 'Settings → Backup', anchor: 'backup:restore' },
@@ -62,11 +70,31 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'accounts:oauth', label: 'OAuth', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:oauth' },
 ];
 
-/** Filter the index by query (case-insensitive substring on label) and return as SearchResultItems. */
+/** Per-shortcut search entries, synthesized from the registry so they reflect
+ *  the user's CURRENT (possibly-customized) binding. Each carries key-combo
+ *  aliases ("ctrl k", "ctrl+k", "cmd k", …) as keywords so typing a combo finds
+ *  it; selecting one opens the Keyboard Shortcuts cheat sheet. */
+function shortcutSearchEntries(): SettingsSearchEntry[] {
+  return SHORTCUT_DEFS.map((def) => ({
+    id: `shortcut:${def.id}`,
+    label: `${def.label} (${displayBinding(def.id)})`,
+    subview: 'keyboard-shortcuts' as Subview,
+    path: 'Settings → Keyboard Shortcuts',
+    keywords: `${def.label} ${bindingSearchText(bindingFor(def.id))} keyboard shortcut`,
+  }));
+}
+
+function allSettingsEntries(): SettingsSearchEntry[] {
+  return [...SETTINGS_SEARCH_INDEX, ...shortcutSearchEntries()];
+}
+
+/** Filter the index by query (case-insensitive substring over label + keywords)
+ *  and return as SearchResultItems. An empty query lists the static settings
+ *  index only (not every shortcut). */
 export function getSettingsSearchResults(query: string, limit: number): SearchResultItem[] {
   const q = query.trim().toLowerCase();
   const matches = q
-    ? SETTINGS_SEARCH_INDEX.filter(e => e.label.toLowerCase().includes(q))
+    ? allSettingsEntries().filter(e => `${e.label} ${e.keywords ?? ''}`.toLowerCase().includes(q))
     : SETTINGS_SEARCH_INDEX;
   return matches.slice(0, limit).map(e => ({
     id: e.id,
@@ -78,5 +106,5 @@ export function getSettingsSearchResults(query: string, limit: number): SearchRe
 }
 
 export function findSettingsEntry(id: string): SettingsSearchEntry | undefined {
-  return SETTINGS_SEARCH_INDEX.find(e => e.id === id);
+  return allSettingsEntries().find(e => e.id === id);
 }

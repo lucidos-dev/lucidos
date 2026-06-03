@@ -1,8 +1,8 @@
 //! Per-`change_id` stash for the user actor of an in-flight Apply.
 //!
-//! When the user clicks Apply on a pending change whose CC session has exited
+//! When the user clicks Apply on a pending change whose Claude Code session has exited
 //! (Tier 3 slow path with conflict resolution), `apply_change` has the user's
-//! actor in scope but spawns a *new* CC subprocess for the merge. By the time
+//! actor in scope but spawns a *new* Claude Code subprocess for the merge. By the time
 //! that subprocess finishes and `agent_session::run_session` cleanup emits
 //! `ChangeApplied` / `ChangeApplyFailed`, the original HTTP call has long
 //! returned and the actor is gone — the cleanup used to stamp `actor: None`,
@@ -11,7 +11,7 @@
 //! This stash lets the apply call site park the actor by `change_id` before
 //! spawning the merge session; the cleanup code then takes it back out and
 //! stamps it on the resulting event. Take is one-shot (the `HashMap::remove`
-//! contract): if no cleanup ever runs (e.g. CC subprocess fails to start) the
+//! contract): if no cleanup ever runs (e.g. Claude Code subprocess fails to start) the
 //! entry leaks until the engine restarts — a single `MessageOrigin` per failed
 //! apply, not worth refcounting around.
 

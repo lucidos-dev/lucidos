@@ -7,7 +7,7 @@
 //! has zero memory of the prior conversation ("amnesia mode").
 //!
 //! This module replaces that with a TEXT projection of the thread's events so
-//! the next fresh CC session can be primed with a synthetic recap of what came
+//! the next fresh Claude Code session can be primed with a synthetic recap of what came
 //! before. The recap is prepended to the user's actual message so CC sees
 //! `<reconstruction>\n\n<actual user input>`.
 //!
@@ -233,7 +233,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Build the user-message text the engine sends to a fresh CC subprocess
+/// Build the user-message text the engine sends to a fresh Claude Code subprocess
 /// when prior context is unavailable (CC's local JSONL is gone, or we're
 /// deliberately starting fresh): `<reconstruction>\n\n<message>`. Returns
 /// the raw message when the thread has no events to reconstruct.
@@ -262,7 +262,7 @@ mod tests {
 
     fn cc_meta() -> EventMeta {
         EventMeta {
-            channel: Some(EventChannel::CodingAgent),
+            channel: Some(EventChannel::ClaudeCode),
             ..EventMeta::NONE
         }
     }
@@ -296,7 +296,7 @@ mod tests {
     fn cc_text(text: &str) -> ThreadEvent {
         ThreadEvent::CodingAgentTextStreamed {
             text: text.into(),
-            agent: crate::runtime::AgentKind::ClaudeCode,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         }
     }
 
@@ -305,7 +305,7 @@ mod tests {
             name: name.into(),
             args: json!({}),
             description: description.into(),
-            agent: crate::runtime::AgentKind::ClaudeCode,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             tool_use_id: String::new(),
         }
     }
@@ -314,7 +314,7 @@ mod tests {
         ThreadEvent::CodingAgentToolResult {
             name: String::new(),
             result: result.into(),
-            agent: crate::runtime::AgentKind::ClaudeCode,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             tool_use_id: String::new(),
         }
     }
@@ -391,6 +391,9 @@ mod tests {
                 session_id: "sess-1".into(),
                 branch: "claude-code/foo".into(),
                 repo_id: None,
+                coding_agent_kind: Default::default(),
+                coding_agent_folder: String::new(),
+                app_id: None,
             },
         )
         .await;
@@ -403,10 +406,11 @@ mod tests {
                 is_external_repo: false,
                 requires_restart: false,
                 cc_session_id: Some("sess-1".into()),
-                agent: crate::runtime::AgentKind::ClaudeCode,
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 reason: None,
                 worktree_path: None,
                 worktree_head_sha: None,
+                bg_bash_pending: false,
             },
         )
         .await;
@@ -444,6 +448,9 @@ mod tests {
                 session_id: "sess-1".into(),
                 branch: "claude-code/trunc".into(),
                 repo_id: None,
+                coding_agent_kind: Default::default(),
+                coding_agent_folder: String::new(),
+                app_id: None,
             },
         )
         .await;

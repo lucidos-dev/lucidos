@@ -16,7 +16,7 @@ test.describe('Claude Code changes - apply and discard via UI', () => {
     const { threadId, changeId, branch, file } = createCCThreadWithChange('E2E Change Test', suffix);
 
     try {
-      const resp = await page.request.get('/api/changes');
+      const resp = await page.request.get('/api/v1/changes');
       const body = await resp.json();
       const pending = body.pending as Array<{ id: string; description: string }>;
       const found = pending.find(c => c.id === changeId);
@@ -45,7 +45,7 @@ test.describe('Claude Code changes - apply and discard via UI', () => {
 
       // Wait for the change to leave the pending list
       await page.waitForFunction(async (cid) => {
-        const resp = await fetch('/api/changes');
+        const resp = await fetch('/api/v1/changes');
         const body = await resp.json();
         return !(body.pending as Array<{ id: string }>).find(c => c.id === cid);
       }, changeId, { timeout: 15_000 });
@@ -78,7 +78,7 @@ test.describe('Claude Code changes - apply and discard via UI', () => {
 
       // Wait for the change to leave the pending list
       await page.waitForFunction(async (cid) => {
-        const resp = await fetch('/api/changes');
+        const resp = await fetch('/api/v1/changes');
         const body = await resp.json();
         return !(body.pending as Array<{ id: string }>).find(c => c.id === cid);
       }, changeId, { timeout: 15_000 });

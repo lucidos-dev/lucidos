@@ -1,8 +1,38 @@
 import { useEffect } from 'preact/hooks';
-import { mobileView, panelOverlay } from '../store/store';
+import { mobileView, panelOverlay, preferences, type MobileView, type PanelOverlay } from '../store/store';
 import { opensSoftwareKeyboard, getRemPx } from '../utils/dom';
-import { getResizeMode, scrollToBottom, scrolledUp } from '../components/chat/scrollState';
+import { getResizeMode, pinToBottomNow, scrolledUp } from '../components/chat/scrollState';
 import { isMobile } from '../utils/viewport';
+import { currentMobileHeaderSticky } from '../store/actions/preferences';
+
+/** Pure rule for when hide-on-scroll should be inert and the header pinned visible.
+ *  Sticky preference wins everywhere; otherwise only the content pane with an
+ *  open app-UI iframe pins (its scroll events leak to the parent — other panes
+ *  don't have that problem and should hide normally). */
+export function shouldKeepHeaderVisible(opts: {
+  view: MobileView;
+  overlayType: NonNullable<PanelOverlay>['type'] | null | undefined;
+  stickyPref: boolean;
+}): boolean {
+  if (opts.stickyPref) return true;
+  return opts.view === 'content' && opts.overlayType === 'app-ui';
+}
+
+/** Pixel height for the `--mobile-header-height` spacer that sits below the
+ *  fixed header. Collapses to the safe-area inset only while the header is
+ *  actually sliding off to make room for the keyboard. When the header is
+ *  pinned visible (`disabled` — sticky pref or app-ui), it never slides off,
+ *  so the spacer MUST stay at full header height — otherwise content slides up
+ *  behind the still-visible header (editing a device name on an iOS PWA with
+ *  "Keep header visible" on rendered the input under the header). */
+export function spacerHeightPx(opts: {
+  cachedHeight: number;
+  safeAreaTop: number;
+  keyboardOpen: boolean;
+  disabled: boolean;
+}): number {
+  return opts.keyboardOpen && !opts.disabled ? opts.safeAreaTop : opts.cachedHeight;
+}
 
 // Selectors scoped to .mobile-swipe-pane to avoid finding the desktop elements
 // (both desktop SplitLayout and mobile MobileSwipeContainer render ThreadPane/ContentPane)
@@ -26,6 +56,8 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let prevScrollTop = 0;
     let headerOffset = 0; // 0 = fully visible, -cachedHeight = fully hidden
     let cachedHeight = 0;
+    // Header's padding-top (env(safe-area-inset-top)) in px. See updateHeaderVar.
+    let cachedSafeAreaTop = 0;
     let titleBarHeight = 0; // px, thread title bar height (0 when not on thread view)
     let titleBarEl: HTMLElement | null = null;
     let titleBarResizeObserver: ResizeObserver | null = null;
@@ -34,7 +66,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let currentViewKey: string | null = null;
     let mutationRafId: number | null = null;
     let keyboardOpen = false; // true while a prompt input is focused
-    let disabled = false; // true when app UI iframe is active — header stays visible
+    let disabled = false;
     // Per-pane scroll state so each pane has independent header position
     const paneState: Record<string, { headerOffset: number; prevScrollTop: number }> = {};
     let cachedRemSize = getRemPx();
@@ -48,11 +80,21 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       return Math.min(0, Math.max(-(cachedHeight + titleBarHeight), offset)) || 0;
     }
 
-    /** Set --mobile-header-height based on keyboard state.
-     *  Keyboard open → 0rem (collapses spacer so content fills header space).
-     *  Keyboard closed → actual header height. */
+    /** Set --mobile-header-height based on keyboard + pinned state.
+     *  Keyboard open (header sliding off) → safe-area-inset-top: keeps a spacer
+     *    at the notch / dynamic-island clearance so focused inputs near the top
+     *    of the page don't end up behind iOS chrome. Resolves to 0 on platforms
+     *    without a safe-area inset (Android, pre-notch iPhones, desktop).
+     *  Header pinned visible (sticky pref / app-ui) or keyboard closed → actual
+     *    header height, so content stays clear of the still-visible header. */
     function updateHeaderVar() {
-      const heightRem = keyboardOpen ? 0 : cachedHeight / cachedRemSize;
+      const heightPx = spacerHeightPx({
+        cachedHeight,
+        safeAreaTop: cachedSafeAreaTop,
+        keyboardOpen,
+        disabled,
+      });
+      const heightRem = heightPx / cachedRemSize;
       document.documentElement.style.setProperty('--mobile-header-height', `${heightRem}rem`);
     }
 
@@ -125,8 +167,9 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       cachedRemSize = getRemPx();
       const el = headerRef.current;
       if (!el) {
-        if (cachedHeight !== 0) {
+        if (cachedHeight !== 0 || cachedSafeAreaTop !== 0) {
           cachedHeight = 0;
+          cachedSafeAreaTop = 0;
           updateHeaderVar();
         }
         return;
@@ -135,10 +178,14 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // to integer, leaving a fractional-pixel gap between the fixed header and
       // sticky/spacer elements below it. Do NOT revert to offsetHeight.
       const h = el.getBoundingClientRect().height;
-      if (Math.abs(h - cachedHeight) > 0.1) {
-        cachedHeight = h;
-        updateHeaderVar();
-      }
+      if (Math.abs(h - cachedHeight) <= 0.1) return;
+      cachedHeight = h;
+      // padding-top is env(safe-area-inset-top, 0px) (mobile.css). Any change
+      // to it also changes the bounding height, so we only re-read when the
+      // height delta above already proved something moved — skipping a forced
+      // style flush on every no-op refreshHeight tick.
+      cachedSafeAreaTop = parseFloat(getComputedStyle(el).paddingTop) || 0;
+      updateHeaderVar();
     }
 
     function onScroll() {
@@ -174,15 +221,17 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       prevScrollTop = scrollTop;
     }
 
-    /** Recover from stale keyboard state. iOS Safari doesn't always fire
-     *  focusout when swiping between scroll-snap panes, leaving keyboardOpen
-     *  stuck true — which permanently hides the header and collapses the spacer. */
+    /** iOS Safari sometimes misses focusout — when swiping scroll-snap panes,
+     *  or when the focused input is removed mid-edit. syncToScroll re-applies
+     *  the transform; updateHeaderVar alone leaves the header stuck at
+     *  translateY(-cachedHeight) above the viewport. */
     function recoverKeyboardState() {
       if (!keyboardOpen) return;
       const active = document.activeElement;
       if (active && opensSoftwareKeyboard(active)) return;
       keyboardOpen = false;
       updateHeaderVar();
+      syncToScroll(currentContainer);
     }
 
     function attachListener() {
@@ -255,18 +304,25 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // Title bar is inside the scroll pane (not the header) but should
       // behave like a header input — don't hide when editing the title.
       if (target.closest('.mobile-thread-title-row')) return;
+      // Header pinned visible (sticky pref / app-ui): it never slides off for
+      // the keyboard, so the spacer must stay full-height. Collapsing it here
+      // would slide content up behind the still-visible header (editing a
+      // device name on an iOS PWA rendered the input under the header).
+      if (disabled) return;
       if (keyboardOpen) return; // Already hidden — skip duplicate scroll compensation
       const wasAtBottom = !scrolledUp.value;
       keyboardOpen = true;
       updateHeaderVar();
-      // Compensate scroll: spacer collapsed, content shifted up
+      // Compensate scroll: spacer shrinks from cachedHeight to cachedSafeAreaTop,
+      // so move content up by the same delta to stay visually anchored.
       if (currentContainer) {
-        currentContainer.scrollTop = Math.max(0, currentContainer.scrollTop - cachedHeight);
+        const delta = cachedHeight - cachedSafeAreaTop;
+        currentContainer.scrollTop = Math.max(0, currentContainer.scrollTop - delta);
       }
       applyTransform();
       // Scroll compensation corrupts scrolledUp via the scroll event it fires.
       // Restore bottom-pinned state through the keyboard open animation.
-      if (wasAtBottom) scrollToBottom();
+      if (wasAtBottom) pinToBottomNow();
     }
     document.addEventListener('focusin', onFocusIn);
 
@@ -286,14 +342,14 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       const wasAtBottom = !scrolledUp.value;
       keyboardOpen = false;
       updateHeaderVar();
-      // Compensate scroll: spacer restored, content shifted down
+      // Mirror onFocusIn: spacer grows back, so add the same delta to scrollTop.
       if (currentContainer) {
-        currentContainer.scrollTop += cachedHeight;
+        currentContainer.scrollTop += cachedHeight - cachedSafeAreaTop;
       }
       syncToScroll(currentContainer);
       // Same as onFocusIn: scroll compensation corrupts scrolledUp.
       // Restore bottom-pinned state through the keyboard close animation.
-      if (wasAtBottom) scrollToBottom();
+      if (wasAtBottom) pinToBottomNow();
     }
     document.addEventListener('focusout', onFocusOut);
 
@@ -316,7 +372,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         // Correct header if scroll position warrants more visibility
         // than the current offset provides. attachListener() only runs
         // this check when the container element changes, but content can
-        // shrink (e.g. steps collapsed, CC session finished) without the
+        // shrink (e.g. steps collapsed, Claude Code session finished) without the
         // container changing — leaving the header stuck hidden.
         if (currentContainer && cachedHeight > 0 && !keyboardOpen && !disabled) {
           const actualScroll = Math.max(0, currentContainer.scrollTop);
@@ -336,12 +392,42 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       observer.observe(swipeWrapper, { childList: true, subtree: true });
     }
 
-    // Track header height changes (e.g. thread title row appearing/disappearing)
-    // so --mobile-header-height stays accurate for scroll spacers.
+    // Track header height changes (e.g. thread title row appearing/disappearing,
+    // safe-area-inset-top resolving from 0 to its on-device value during iOS
+    // PWA layout settle / orientation changes) so --mobile-header-height stays
+    // accurate for scroll spacers. observe() defaults to content-box, which
+    // does NOT change when only the header's padding-top env() inset changes —
+    // the spacer would then keep its pre-inset size and the first row of the
+    // threads list peeks behind the header. Watch the border-box explicitly.
     const headerResizeObserver = new ResizeObserver(() => {
       refreshHeight();
     });
-    if (headerRef.current) headerResizeObserver.observe(headerRef.current);
+    if (headerRef.current) headerResizeObserver.observe(headerRef.current, { box: 'border-box' });
+
+    // Belt-and-braces for iOS PWA: ResizeObserver alone is not reliable on
+    // WebKit when env(safe-area-inset-top) resolves from 0 to its real value
+    // a tick after first paint (cold start, return-from-background, orientation
+    // change). The visible symptom is the entire section title row sitting
+    // behind the header — the spacer is sized for env=0 and never grows.
+    // Catch the same transitions through three independent triggers:
+    //  - window.resize: orientation change, viewport size change.
+    //  - visualViewport.resize: viewport-relative changes including the
+    //    on-screen keyboard appearing/disappearing AND env() resolution on
+    //    iOS PWA (the visualViewport's height adapts to the resolved insets).
+    //  - rAF poll for the first ~500ms after mount: covers the cold-start
+    //    case where env() lands AFTER useEffect runs but BEFORE any of the
+    //    above events fire. A handful of frames is enough — anything beyond
+    //    that lives on the ResizeObserver / event listeners.
+    window.addEventListener('resize', refreshHeight);
+    window.visualViewport?.addEventListener('resize', refreshHeight);
+    let coldStartPollFrames = 30; // ~500ms at 60fps
+    let coldStartPollId: number | null = null;
+    function coldStartPoll() {
+      refreshHeight();
+      if (--coldStartPollFrames > 0) coldStartPollId = requestAnimationFrame(coldStartPoll);
+      else coldStartPollId = null;
+    }
+    coldStartPollId = requestAnimationFrame(coldStartPoll);
 
     // Reveal header when a change is applied/discarded/reverted — the user
     // is typically scrolled far down and the header is hidden, but the state
@@ -353,29 +439,33 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     }
     document.addEventListener('reveal-mobile-header', onRevealHeader);
 
+    function recomputeDisabled() {
+      const next = shouldKeepHeaderVisible({
+        view: mobileView.value,
+        overlayType: panelOverlay.value?.type,
+        stickyPref: currentMobileHeaderSticky(),
+      });
+      if (next === disabled) return;
+      disabled = next;
+      // Reset stale keyboard state when pinning the header. iOS Safari may
+      // miss focusout when opening app UI, leaving keyboardOpen true →
+      // spacer would collapse while header is forced visible.
+      if (disabled && keyboardOpen) {
+        keyboardOpen = false;
+        updateHeaderVar();
+      }
+      applyTransform();
+    }
+    recomputeDisabled();
+
     const unsub = mobileView.subscribe(() => {
       attachListener();
       refreshHeight();
+      recomputeDisabled();
     });
 
-    // Disable hide-on-scroll when an app UI iframe is active.
-    // Iframe scroll events can propagate unpredictably to the parent,
-    // causing the header to flicker or get stuck. Keeping the header
-    // fixed visible eliminates the race condition entirely.
-    const unsubOverlay = panelOverlay.subscribe((overlay) => {
-      const newDisabled = overlay?.type === 'app-ui';
-      if (newDisabled !== disabled) {
-        disabled = newDisabled;
-        // Reset stale keyboard state when entering disabled mode.
-        // iOS Safari may miss focusout when opening app UI, leaving
-        // keyboardOpen true → spacer collapses while header is forced visible.
-        if (disabled && keyboardOpen) {
-          keyboardOpen = false;
-          updateHeaderVar();
-        }
-        applyTransform();
-      }
-    });
+    const unsubOverlay = panelOverlay.subscribe(recomputeDisabled);
+    const unsubPrefs = preferences.subscribe(recomputeDisabled);
 
     return () => {
       if (currentContainer) {
@@ -384,12 +474,16 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
       document.removeEventListener('reveal-mobile-header', onRevealHeader);
+      window.removeEventListener('resize', refreshHeight);
+      window.visualViewport?.removeEventListener('resize', refreshHeight);
+      if (coldStartPollId !== null) cancelAnimationFrame(coldStartPollId);
       if (mutationRafId !== null) cancelAnimationFrame(mutationRafId);
       observer.disconnect();
       headerResizeObserver.disconnect();
       if (titleBarResizeObserver) titleBarResizeObserver.disconnect();
       unsub();
       unsubOverlay();
+      unsubPrefs();
       if (headerRef.current) {
         headerRef.current.style.transform = '';
       }

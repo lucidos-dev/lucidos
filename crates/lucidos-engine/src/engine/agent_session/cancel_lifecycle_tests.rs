@@ -31,7 +31,7 @@ use crate::engine::LucidosEngine;
 
 fn cc_meta() -> EventMeta {
     EventMeta {
-        channel: Some(EventChannel::CodingAgent),
+        channel: Some(EventChannel::ClaudeCode),
         ..EventMeta::NONE
     }
 }
@@ -152,6 +152,9 @@ async fn cancel_does_not_terminate_session() {
             session_id: "sid-cancel-1".into(),
             branch: "claude-code/cancel-test".into(),
             repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
         },
         meta: cc_meta(),
     })
@@ -177,10 +180,11 @@ async fn cancel_does_not_terminate_session() {
             is_external_repo: false,
             requires_restart: false,
             cc_session_id: Some("sid-cancel-1".into()),
-            agent: crate::runtime::AgentKind::ClaudeCode,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             reason: None,
             worktree_path: None,
             worktree_head_sha: None,
+            bg_bash_pending: false,
         },
         meta: cc_meta(),
     })
@@ -251,7 +255,7 @@ async fn cancel_does_not_terminate_session() {
     teardown_test_db(&db_name).await;
 }
 
-/// A stop signal landing on an idle CC session must NOT emit a terminal
+/// A stop signal landing on an idle Claude Code session must NOT emit a terminal
 /// event — the previous turn's `ResponseGenerated` + `CodingAgentIdled`
 /// already terminated the exchange, and a late "Canceled the response"
 /// would lie about a turn the user never canceled. Holds regardless of

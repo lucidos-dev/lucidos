@@ -23,6 +23,21 @@ export function isActive(status: ExchangeStatus): boolean {
   return ACTIVE_STATUSES.has(status);
 }
 
+/** Statuses where the response is no longer running AND the agent will not act
+ *  on a fresh AskUserQuestion / permission answer landing after this point.
+ *  Used by ChatExchange to disable inline question / permission buttons whose
+ *  surrounding response was canceled / aborted / failed / superseded. */
+export const TERMINATED_STATUSES: Set<ExchangeStatus> = new Set([
+  'canceled',
+  'aborted',
+  'error',
+  'interrupted',
+]);
+
+export function isTerminated(status: ExchangeStatus): boolean {
+  return TERMINATED_STATUSES.has(status);
+}
+
 /** Map status to a UI label and CSS class. */
 export function statusLabel(
   status: ExchangeStatus,

@@ -1,10 +1,12 @@
-import { useState, useRef, useEffect } from 'preact/hooks';
+import { useState, useRef } from 'preact/hooks';
 import {
   repoChanges, repoSelectedChangeId, repoChangesLoadingMore, selectedChange,
 } from '../../store/store';
 import { selectRepoChange, loadMoreRepoChanges } from '../../store/actions/repositories';
 import { formatTimeAgo } from '../../utils/formatTime';
 import type { Change } from '../../api/client';
+import { LoadableError } from '../shared/LoadableError';
+import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
 
 function changeLabel(change: Change): string {
   return (change.description || 'Claude Code changes').split('\n')[0];
@@ -15,18 +17,10 @@ export function ChangeSelector() {
   const ref = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener('click', handleClick);
-    return () => document.removeEventListener('click', handleClick);
-  }, [open]);
+  useDismissOnOutside(open, ref, null, () => setOpen(false));
 
   const loadable = repoChanges.value;
+  if (loadable.status === 'failed') return <LoadableError error={loadable.error} noun="changes" />;
   if (loadable.status !== 'loaded') return null;
 
   const { pending, applied, has_more } = loadable.data;
@@ -40,12 +34,12 @@ export function ChangeSelector() {
     const el = listRef.current;
     if (!el || !has_more || loadingMore) return;
     if (el.scrollTop + el.clientHeight >= el.scrollHeight - 30) {
-      loadMoreRepoChanges();
+      void loadMoreRepoChanges();
     }
   }
 
   function handleSelect(change: Change | null) {
-    selectRepoChange(change);
+    void selectRepoChange(change);
     setOpen(false);
   }
 

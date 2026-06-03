@@ -1,4 +1,4 @@
-mod actor;
+pub mod actor;
 mod app_ui;
 mod apps;
 mod artifacts;
@@ -18,8 +18,10 @@ mod memory;
 mod notifications;
 mod plugins;
 mod presence;
+pub mod presence_pong;
 pub(crate) mod proxy;
 pub(crate) mod proxy_auth_layer;
+pub(crate) mod proxy_hex;
 pub(crate) mod proxy_hmac_layer;
 pub mod proxy_migration;
 pub(crate) mod proxy_pipeline;
@@ -36,8 +38,10 @@ mod sdk;
 mod sdk_prefs;
 mod search;
 mod settings;
+pub mod sse_connections;
 mod threads;
 mod threads_compose;
+mod trigger_groups;
 mod triggers;
 
 use axum::{
@@ -48,7 +52,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{any, delete, get, post, put},
+    routing::{any, get, post, put},
     Json, Router,
 };
 use futures::stream::Stream;
@@ -81,9 +85,28 @@ pub type SharedEngine = Arc<LucidosEngine>;
 type PendingOAuthFlows =
     Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Receiver<OAuthFlowResult>>>>;
 
-/// Check for path traversal attempts (`..`, leading `/` or `\`)
-pub(crate) fn is_path_traversal(path: &str) -> bool {
-    path.contains("..") || path.starts_with('/') || path.starts_with('\\')
+/// Canonical traversal guard, re-exported from `core` so every existing
+/// `crate::api::is_path_traversal` call site keeps working while the engine has
+/// a single implementation. See `crate::core::is_path_traversal`.
+pub(crate) use crate::core::is_path_traversal;
+
+/// Reject upload filenames that would escape their destination directory.
+/// Multipart `Content-Disposition` filenames are attacker-controlled — without
+/// this guard, a name like `../../etc/passwd` slipped into `dir.join(name)` or
+/// `format!("imported/{name}")` would write outside the intended subtree.
+/// Trims surrounding whitespace; the leaf invariant is what matters.
+pub(super) fn sanitize_leaf_filename(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('\0')
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Parse an optional UUID query/body string, mapping malformed input to `BAD_REQUEST`.
@@ -94,6 +117,18 @@ pub(super) fn parse_optional_uuid(opt: Option<&str>) -> Result<Option<Uuid>, Sta
     opt.map(Uuid::parse_str)
         .transpose()
         .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+/// Trim-then-parse for an optional UUID coming from a JSON body or LLM tool
+/// argument. Treats `None` / empty / whitespace-only as `Ok(None)`; otherwise
+/// returns the parsed UUID or `Err(raw)` carrying the offending input so the
+/// caller can build a context-appropriate error message (the HTTP handler
+/// returns 400 with the value; the LLM tool returns it in a tool-error).
+pub(crate) fn parse_optional_uuid_trimmed(opt: Option<&str>) -> Result<Option<Uuid>, String> {
+    match opt.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => Uuid::parse_str(s).map(Some).map_err(|_| s.to_string()),
+    }
 }
 
 /// Reject refs/commits that git would parse as a flag, traverse with `..`, or contain
@@ -142,13 +177,6 @@ pub struct AppState {
     pub app_manager: Arc<AppManager>,
     pub scheduler: Arc<tokio::sync::Mutex<SchedulerManager>>,
     pub started_at: chrono::DateTime<chrono::Utc>,
-    /// Pending notification from SW notificationclick — simple in-memory slot
-    /// that bypasses client-side storage issues on iOS Safari.
-    pub pending_notification_click: Arc<std::sync::Mutex<Option<String>>>,
-    /// Pending notification from SW push event — fallback for iOS where
-    /// notificationclick may not fire or fires too late on warm resume.
-    /// Stored with timestamp so we can expire stale pushes.
-    pub pending_notification_push: Arc<std::sync::Mutex<Option<(String, std::time::Instant)>>>,
     /// Pending OAuth flows keyed by provider — the receiver resolves when the
     /// background listener receives the callback and completes token exchange.
     pub pending_oauth_flows: PendingOAuthFlows,
@@ -290,7 +318,7 @@ pub fn compress_images(images: Vec<ChatImage>) -> Vec<ChatImage> {
 #[derive(Debug, Deserialize)]
 pub struct AppCaptureRequest {
     pub request_id: String,
-    pub screenshot: String, // base64 PNG
+    pub screenshot: String, // base64-encoded image (JPEG from html2canvas; format sniffed downstream)
     pub dom: String,
 }
 
@@ -335,7 +363,7 @@ pub struct ChatRequest {
     #[serde(default)]
     pub thread_id: Option<String>,
     /// Required when `mode` is `"agent"` or `"engine"`: the thread that is
-    /// spawning this new thread (e.g. the CC session whose `spawn-thread` skill
+    /// spawning this new thread (e.g. the Claude Code session whose `spawn-thread` skill
     /// is making this call). Must be `null` when `mode` is `"human"`. The
     /// `spawn-thread` skill reads `$LUCIDOS_THREAD_ID` and forwards it here.
     #[serde(default)]
@@ -364,7 +392,7 @@ pub struct ChatRequest {
     /// Cross-workspace origin: UUID of the event in the calling workspace
     /// that triggered this POST (e.g. the `ToolCalled` event for a
     /// `lucidos spawn-thread` invocation). Allowed only when `caller_workspace`
-    /// is set. Often `None` from CC subprocesses, which lack access to their
+    /// is set. Often `None` from Claude Code subprocesses, which lack access to their
     /// own tool-call event id.
     #[serde(default)]
     pub caller_event_id: Option<String>,
@@ -372,6 +400,16 @@ pub struct ChatRequest {
     pub conflict_change_id: Option<String>,
     #[serde(default)]
     pub repo_id: Option<String>,
+    /// Scope-picker payload: an absolute path, a workspace-relative path
+    /// (`data/apps/<id>`), or a registered repo name/UUID. Resolved via the
+    /// shared `coding_agent_kind` pipeline to one of `lucidos | app | external`
+    /// and translated to (repo_id, app stash) by the chat handler. Mutually
+    /// exclusive with `repo_id`; supplying both is a 400. Frontend sends this
+    /// going forward; `repo_id` stays accepted for back-compat (CLI, older
+    /// frontends). An empty / missing folder falls through to today's default
+    /// (Lucidos when `repo_id` is also empty / missing).
+    #[serde(default)]
+    pub folder: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
 }
@@ -419,7 +457,33 @@ pub struct CreateCredentialRequest {
 
 #[derive(Deserialize)]
 pub struct UpdateCredentialRequest {
-    pub auth_value: String,
+    pub base_url: String,
+    pub auth_type: String,
+    #[serde(default)]
+    pub auth_header: Option<String>,
+    /// New secret. `None` / empty string keeps the currently-stored secret —
+    /// lets the user edit non-secret fields without re-entering it.
+    #[serde(default)]
+    pub auth_value: Option<String>,
+    /// Editable email server settings, present only when editing an
+    /// `email_password` credential. The credential's `email_accounts` row is
+    /// the source of truth for IMAP/SMTP, so it must be kept in sync here.
+    #[serde(default)]
+    pub email: Option<EmailAccountSettings>,
+}
+
+/// Email server settings carried by an `UpdateCredentialRequest` for
+/// `email_password` credentials. Mirrors the columns `configure_email` writes.
+#[derive(Deserialize)]
+pub struct EmailAccountSettings {
+    pub email_address: String,
+    pub imap_host: String,
+    pub imap_port: i32,
+    pub smtp_host: String,
+    pub smtp_port: i32,
+    pub username: String,
+    pub use_tls: bool,
+    pub require_send_confirmation: bool,
 }
 
 /// Generic success/error response used by credential, preference, and trigger endpoints.
@@ -468,12 +532,10 @@ impl ApiResult {
                 "OAuth client credentials required for {}",
                 provider
             )),
-            credential_request: Some(serde_json::json!({
-                "service": format!("oauth:{}", provider),
-                "prompt": format!("Enter your OAuth client credentials for {}.", provider),
-                "base_url": format!("https://{}.com", provider),
-                "auth_type": "oauth_client"
-            })),
+            credential_request: Some(crate::core::oauth::oauth_client_request(
+                provider,
+                &crate::core::oauth::OAuthClientOverrides::default(),
+            )),
             auth_url: None,
         })
     }
@@ -570,6 +632,11 @@ struct KeyQuery {
 }
 
 #[derive(Deserialize)]
+struct NameQuery {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct ProviderQuery {
     provider: String,
 }
@@ -629,11 +696,6 @@ struct SessionMessagesQuery {
 }
 
 #[derive(Deserialize)]
-struct AppCommitQuery {
-    commit: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct AppVersionsQuery {
     id: String,
     limit: Option<usize>,
@@ -662,8 +724,8 @@ struct GitVersion {
 async fn request_logger(req: axum::extract::Request, next: Next) -> Response {
     let uri_path = req.uri().path();
     let should_log = match uri_path {
-        "/api/health" | "/api/events" => false,
-        p => p.starts_with("/api/") || p.starts_with("/app/"),
+        "/api/v1/health" | "/api/v1/events" => false,
+        p => p.starts_with("/api/v1/") || p.starts_with("/app/"),
     };
     if !should_log {
         return next.run(req).await;
@@ -681,6 +743,8 @@ async fn request_logger(req: axum::extract::Request, next: Next) -> Response {
     response
 }
 
+// Top-level wiring helper that takes every engine subsystem the router needs;
+// reducing it would force the call site to thread the same set into a holder.
 #[allow(clippy::too_many_arguments)]
 pub fn create_router(
     engine: SharedEngine,
@@ -706,21 +770,22 @@ pub fn create_router(
         app_manager,
         scheduler,
         started_at,
-        pending_notification_click: Arc::new(std::sync::Mutex::new(None)),
-        pending_notification_push: Arc::new(std::sync::Mutex::new(None)),
         pending_oauth_flows: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     // Serve static files from data/ tree — single mount covers all subdirectories
     let serve_data = ServeDir::new(workspace_path.join(crate::core::DATA_DIR));
 
-    // Clone state for SDK v1 routes and app UI routes (api_routes consumes state below)
+    // Clone state for the SDK-shaped slice (added below to the same router) and
+    // the app-UI router. The main `legacy_routes` block consumes `state` directly.
     let v1_state = state.clone();
     let app_ui_state = state.clone();
 
-    // API routes under /api/*
-    // Convention: query params for identifiers, path segments only for file paths
-    let api_routes = Router::new()
+    // ALL routes live under `/api/v1/` — see CLAUDE.md "API URL Conventions".
+    // Convention: query params for identifiers, path segments only for file paths.
+    // This block defines the engine-side ("legacy") slice; the SDK-shaped slice
+    // is defined below as `sdk_v1_routes` and merged in before mounting.
+    let legacy_routes = Router::new()
         .route("/health", get(history::health))
         .route("/restart", post(history::restart_engine))
         .route("/workspaces", get(history::list_workspaces))
@@ -728,7 +793,6 @@ pub fn create_router(
         .route("/chat", post(chat::chat))
         .route("/chat/stream", post(chat::chat_submit))
         .route("/chat/cancel", post(chat::cancel_chat))
-        .route("/chat/inject", post(chat::inject_prompt))
         .route("/claude-code/stop", post(claude_code::claude_code_stop))
         .route(
             "/claude-code/interrupt",
@@ -751,8 +815,8 @@ pub fn create_router(
             post(claude_code::claude_code_discard),
         )
         .route(
-            "/claude-code/answer-question",
-            post(claude_code::claude_code_answer_question),
+            "/threads/:thread_id/answer-question",
+            post(threads::answer_thread_question),
         )
         .route("/changes", get(changes::list_changes))
         .route("/changes/applied", get(changes::list_applied_changes))
@@ -793,6 +857,7 @@ pub fn create_router(
         .route("/commits/before", get(artifacts::get_commit_at_timestamp))
         // Events
         .route("/events/query", get(history::query_events))
+        .route("/events/count", get(history::count_events))
         .route("/events/types", get(history::event_types))
         .route("/events/emit", post(history::emit_event))
         // Credentials endpoints
@@ -804,6 +869,7 @@ pub fn create_router(
                 .delete(settings::delete_credential),
         )
         .route("/credential-value", get(settings::get_credential_value))
+        .route("/email-account", get(settings::get_email_account))
         // OAuth account endpoints
         .route(
             "/oauth/accounts",
@@ -823,6 +889,20 @@ pub fn create_router(
             "/triggers/historical",
             get(triggers::list_historical_triggers),
         )
+        // Trigger groups — user-visible folders that organize triggers in the
+        // panel. Pure label, no firing. The reorder endpoint is a batch op so
+        // the panel can persist a drag-to-reorder with one round-trip.
+        .route(
+            "/trigger-groups",
+            get(trigger_groups::list_trigger_groups)
+                .post(trigger_groups::create_trigger_group)
+                .put(trigger_groups::update_trigger_group)
+                .delete(trigger_groups::delete_trigger_group),
+        )
+        .route(
+            "/trigger-groups/reorder",
+            post(trigger_groups::reorder_trigger_groups),
+        )
         .route("/knowhow", get(knowhow::list_knowhow))
         // Preferences endpoints
         .route(
@@ -839,21 +919,20 @@ pub fn create_router(
         // Push notification endpoints
         .route("/push/vapid-key", get(notifications::get_vapid_key))
         .route("/push/subscribe", post(notifications::push_subscribe))
-        .route("/push/unsubscribe", post(notifications::push_unsubscribe))
-        .route(
-            "/notification-clicked",
-            post(notifications::notification_clicked).get(notifications::get_notification_clicked),
-        )
-        .route(
-            "/notification-pushed",
-            post(notifications::notification_pushed).get(notifications::get_notification_pushed),
-        )
-        .route(
-            "/notification-dismissed",
-            post(notifications::notification_dismissed),
-        )
-        // Thread presence (focus tracking → notification suppression)
-        .route("/thread-presence", post(presence::update_presence))
+        .route("/push/unsubscribe", post(notifications::push_unsubscribe));
+
+    // Test-only push assertion endpoint. Compiled in only with the
+    // `e2e-test-hooks` cargo feature so production binaries don't expose
+    // the push_log to the network at all.
+    #[cfg(feature = "e2e-test-hooks")]
+    let legacy_routes =
+        legacy_routes.route("/_test/push-log", get(notifications::get_push_log));
+
+    let legacy_routes = legacy_routes
+        // Device presence (any visible tab → PresenceCheck candidate)
+        .route("/device-presence", post(presence::update_device_presence))
+        // PresenceCheck pong inbox (system-knowhow/notifications.md §3)
+        .route("/presence-pong", post(presence_pong::presence_pong))
         // Device endpoints
         .route("/devices/register", post(settings::register_device))
         .route("/devices", get(settings::list_devices))
@@ -911,7 +990,6 @@ pub fn create_router(
             "/internal/cc-edit-preread",
             get(internal::cc_edit_preread_check),
         )
-        .route("/internal/commit-made", post(internal::commit_made))
         .route("/internal/client-log", post(internal::client_log))
         .route(
             "/internal/seed-change-for-test",
@@ -923,7 +1001,12 @@ pub fn create_router(
         // Backup endpoints
         .route("/backup", post(backup::create_backup))
         .route("/backup/list", get(backup::list_backups))
+        .route("/backup/status", get(backup::get_backup_status))
         .route("/backup/restore", post(backup::restore_backup))
+        .route(
+            "/backup/restore-status",
+            get(backup::get_restore_status).delete(backup::clear_restore_status),
+        )
         .route("/backup/key", get(backup::get_backup_key))
         .route("/backup/providers", get(backup::list_providers))
         .route(
@@ -941,6 +1024,8 @@ pub fn create_router(
         .route("/backup/start-workspace", post(backup::start_workspace))
         // Thread endpoints
         .route("/threads", get(threads::list_threads))
+        .route("/threads/list", get(threads::list_thread_summaries))
+        .route("/threads/count", get(threads::count_thread_summaries))
         .route("/threads/search", get(threads::search_threads))
         .route("/threads/save", post(threads::save_thread))
         .route("/threads/unsave", post(threads::unsave_thread))
@@ -954,6 +1039,14 @@ pub fn create_router(
         .route(
             "/threads/:thread_id/events",
             get(threads::get_thread_events_snapshot),
+        )
+        .route(
+            "/events/:event_id/context",
+            get(threads::get_context_capture),
+        )
+        .route(
+            "/events/:event_id/tool-result",
+            get(threads::get_tool_result),
         )
         .route(
             "/threads/:thread_id/continue",
@@ -974,6 +1067,7 @@ pub fn create_router(
             get(images::get_thread_image),
         )
         .route("/threads/older", get(threads::get_older_threads))
+        .route("/threads/filter-facets", get(threads::get_filter_facets))
         .route("/search", get(search::search))
         .route(
             "/repositories",
@@ -996,26 +1090,42 @@ pub fn create_router(
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .with_state(state);
 
-    // SDK v1 API routes
-    let api_v1_routes = Router::new()
+    // SDK-shaped slice of the /api/v1/ surface (proxy, blobs, data, plugins,
+    // SDK static assets). Defined separately for clarity; merged with
+    // `legacy_routes` below so a single router mounts at `/api/v1/`.
+    let sdk_v1_routes = Router::new()
         .route("/sdk.js", get(sdk::serve_sdk_js))
         .route("/sdk-iframe.css", get(sdk::serve_sdk_iframe_css))
         .route("/sdk-iframe-audio.js", get(sdk::serve_sdk_iframe_audio_js))
         .route("/sdk-prefs.js", get(sdk_prefs::serve_sdk_prefs_js))
+        // Short-lived OAuth access-token for in-browser SDKs (e.g. Spotify
+        // Web Playback SDK). Refresh token never leaves the engine.
+        .route(
+            "/oauth/:provider/access-token",
+            get(settings::get_oauth_access_token),
+        )
         .route("/ui/navigate", post(sdk::ui_navigate))
+        .route("/notifications", post(notifications::create_notification))
         .route("/data", get(data_api::list_data))
         .route("/data/edit", post(data_api::edit_data))
         .route("/data/upload", post(data_api::upload_data))
         .route("/threads", post(threads_compose::post_thread))
-        .route("/threads/:id", delete(threads_compose::delete_thread))
+        // By-id summary GET shares the `/threads/:id` leaf with delete_thread.
+        // It MUST use the `:id` param name and live here (not in legacy_routes,
+        // which uses `:thread_id`): a second bare `/threads/<param>` leaf with a
+        // different param name would make matchit panic when the two routers
+        // merge. Same path + non-overlapping methods → axum merges GET+DELETE.
+        .route(
+            "/threads/:id",
+            get(threads::get_thread_summary).delete(threads_compose::delete_thread),
+        )
         .route("/threads/:id/compose", put(threads_compose::put_compose))
         .route("/threads/:id/blobs", post(blobs::post_blob))
         .route("/blobs/:hash", get(blobs::get_blob))
         .route("/blobs/:hash/preview", get(blobs::get_blob_preview))
         .route(
             "/plugins/upload-archive",
-            post(plugins::upload_archive)
-                .layer(DefaultBodyLimit::max(plugins::MAX_ARCHIVE_BYTES)),
+            post(plugins::upload_archive).layer(DefaultBodyLimit::max(plugins::MAX_ARCHIVE_BYTES)),
         )
         .route(
             "/plugins/install/:install_id/confirm",
@@ -1039,10 +1149,7 @@ pub fn create_router(
         .route("/proxy/:name", any(proxy::proxy_handler_root))
         .route("/proxy/:name/", any(proxy::proxy_handler_root))
         .route("/proxy/:name/*path", any(proxy::proxy_handler))
-        .route(
-            "/proxy-modules/reload",
-            post(proxy::proxy_modules_reload),
-        )
+        .route("/proxy-modules/reload", post(proxy::proxy_modules_reload))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .route(
             "/data/*path",
@@ -1054,16 +1161,21 @@ pub fn create_router(
 
     // App UI routes under /app/* — file serving must be path-shaped (relative
     // URLs in app HTML resolve against the document path), so this lives at
-    // the top level rather than under /api/.
+    // the top level rather than under /api/v1/.
     let app_ui_routes = Router::new()
         .route("/:app_id/", get(apps::serve_app_ui))
         .route("/:app_id/artifacts/*path", get(apps::serve_app_artifact))
         .route("/:app_id/*path", get(apps::serve_app_file))
         .with_state(app_ui_state);
 
+    // All HTTP API lives under `/api/v1/`. The two router slices (engine-side
+    // "legacy" + SDK-shaped) are merged so axum sees them as one mount point,
+    // and so paths shared between them (e.g. `GET /threads` + `POST /threads`)
+    // collapse into a single method router instead of conflicting at startup.
+    let api_routes = sdk_v1_routes.merge(legacy_routes);
+
     let router = Router::new()
-        .nest("/api/v1", api_v1_routes)
-        .nest("/api", api_routes)
+        .nest("/api/v1", api_routes)
         .nest("/app", app_ui_routes)
         .nest_service("/data", serve_data);
 
@@ -1149,6 +1261,46 @@ mod tests {
             h,
             MAX_IMAGE_DIMENSION
         );
+    }
+
+    /// Pins the security contract of the canonical traversal guard used by every
+    /// path-accepting endpoint (data_api, proxy script runner, script triggers,
+    /// import/image/email tools, …). A regression here is a path-escape bug.
+    #[test]
+    fn is_path_traversal_pins_security_contract() {
+        // Plain relative paths within the tree are allowed.
+        assert!(!is_path_traversal("scripts/auth/handshake.py"));
+        assert!(!is_path_traversal("foo.py"));
+        assert!(!is_path_traversal("a/b/c/d.txt"));
+
+        // Parent-dir escapes are blocked.
+        assert!(is_path_traversal("../escape"));
+        assert!(is_path_traversal("../../etc/passwd"));
+
+        // Absolute paths are blocked (Unix `/` and Windows-style `\`): joining
+        // an absolute path onto the workspace root discards the prefix, so
+        // `workspace.join("/etc/passwd")` would resolve to `/etc/passwd`.
+        assert!(is_path_traversal("/etc/passwd"));
+        assert!(is_path_traversal("\\windows\\system32"));
+
+        // An embedded `..` segment is blocked even though it might normalize
+        // back inside the tree — the guard fails closed on any `..` rather than
+        // resolving the path first.
+        assert!(is_path_traversal("foo/../bar"));
+
+        // Conservative by design: `..` anywhere in the string blocks, including
+        // a legitimate-looking filename like `a..b` (a false positive, but it
+        // fails closed, which is safe). Pinned so the over-broad behavior stays
+        // a deliberate contract rather than something a future refactor
+        // "tightens" into a vulnerability.
+        assert!(is_path_traversal("weird..name.txt"));
+
+        // The guard operates on the raw string and does NOT percent-decode, so
+        // a URL-encoded `%2e%2e` is a literal directory name, not `..`. That is
+        // correct here: callers (e.g. the proxy script path from `apis.json`)
+        // never percent-decode before this check, so `%2e%2e` resolves to a real
+        // (non-existent) directory rather than an escape.
+        assert!(!is_path_traversal("%2e%2e/escape"));
     }
 
     #[test]
@@ -1317,6 +1469,41 @@ mod tests {
         assert!(
             !req.transient,
             "omitted transient must default to false so existing callers persist"
+        );
+    }
+
+    #[test]
+    fn sanitize_leaf_filename_rejects_traversal_and_separators() {
+        assert!(super::sanitize_leaf_filename("../escape.txt").is_none());
+        assert!(super::sanitize_leaf_filename("foo/../bar.txt").is_none());
+        assert!(super::sanitize_leaf_filename("..").is_none());
+        assert!(super::sanitize_leaf_filename(".").is_none());
+        assert!(super::sanitize_leaf_filename("/etc/passwd").is_none());
+        assert!(super::sanitize_leaf_filename("\\windows\\system32").is_none());
+        assert!(super::sanitize_leaf_filename("foo/bar").is_none());
+        assert!(super::sanitize_leaf_filename("foo\\bar").is_none());
+        assert!(super::sanitize_leaf_filename("nul\0byte").is_none());
+        assert!(super::sanitize_leaf_filename("").is_none());
+        assert!(super::sanitize_leaf_filename("   ").is_none());
+    }
+
+    #[test]
+    fn sanitize_leaf_filename_accepts_normal_names() {
+        assert_eq!(
+            super::sanitize_leaf_filename("report.pdf"),
+            Some("report.pdf".to_string())
+        );
+        assert_eq!(
+            super::sanitize_leaf_filename("My Document v1.docx"),
+            Some("My Document v1.docx".to_string())
+        );
+        assert_eq!(
+            super::sanitize_leaf_filename("  padded.txt  "),
+            Some("padded.txt".to_string())
+        );
+        assert_eq!(
+            super::sanitize_leaf_filename("plugin-1.0.lucidos-plugin"),
+            Some("plugin-1.0.lucidos-plugin".to_string())
         );
     }
 }

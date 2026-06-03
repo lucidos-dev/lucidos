@@ -10,7 +10,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // ---------------------------------------------------------------------------
 
 /// Full OAuth account row including tokens (internal use only)
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 pub struct OAuthAccount {
     pub id: Uuid,
     pub provider: String,
@@ -22,6 +22,30 @@ pub struct OAuthAccount {
     pub scopes: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+// Manual `Debug` so an account never leaks its tokens through `{:?}` in a log
+// line or error message. The token *presence* (Some/None for the refresh
+// token) stays visible because it's useful for debugging without exposing the
+// secret value itself.
+impl std::fmt::Debug for OAuthAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthAccount")
+            .field("id", &self.id)
+            .field("provider", &self.provider)
+            .field("email", &self.email)
+            .field("display_name", &self.display_name)
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("token_expiry", &self.token_expiry)
+            .field("scopes", &self.scopes)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 /// OAuth account info without tokens (safe for API responses)
@@ -37,40 +61,65 @@ pub struct OAuthAccountInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Well-known provider configuration
+// OAuth client credential requests
 // ---------------------------------------------------------------------------
+//
+// The engine ships NO hardcoded endpoint table. The registry of known OAuth
+// providers — auth/token/userinfo URLs, typical scopes, and alias rules like
+// "ghealth" -> Google's endpoints — lives in `system-knowhow/oauth-providers.md`,
+// which the agent reads and maintains. When the agent requests an `oauth_client`
+// credential it passes the endpoints it looked up via `OAuthClientOverrides`;
+// they pre-fill the modal and are persisted into the per-credential JSON, which
+// is the single source of truth for endpoints. Both `prepare_oauth_flow` and
+// `refresh_oauth_if_needed` read the URLs back from that JSON; legacy rows for
+// the formerly-hardcoded providers are backfilled by migration
+// `20260531..._backfill_oauth_endpoint_urls.sql`.
 
-pub struct OAuthProviderConfig {
-    pub auth_url: &'static str,
-    pub token_url: &'static str,
-    pub userinfo_url: Option<&'static str>,
+/// Caller-supplied OAuth endpoint + base/scopes values used to pre-fill the
+/// credential modal. Every field is optional; whatever is present lands in the
+/// request's `defaults` block, which is what tells the modal to pre-fill (and
+/// stop requiring) the endpoint fields. All-`None` => no `defaults` block, so
+/// the modal expands its endpoint section for manual entry.
+#[derive(Debug, Default, Clone)]
+pub struct OAuthClientOverrides {
+    pub base_url: Option<String>,
+    pub auth_url: Option<String>,
+    pub token_url: Option<String>,
+    pub userinfo_url: Option<String>,
+    pub scopes: Option<String>,
 }
 
-/// Return well-known OAuth endpoints for a provider name.
-pub fn well_known_provider(provider: &str) -> Option<OAuthProviderConfig> {
-    match provider {
-        "google" => Some(OAuthProviderConfig {
-            auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
-            token_url: "https://oauth2.googleapis.com/token",
-            userinfo_url: Some("https://www.googleapis.com/oauth2/v2/userinfo"),
-        }),
-        "microsoft" => Some(OAuthProviderConfig {
-            auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-            token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-            userinfo_url: Some("https://graph.microsoft.com/v1.0/me"),
-        }),
-        "github" => Some(OAuthProviderConfig {
-            auth_url: "https://github.com/login/oauth/authorize",
-            token_url: "https://github.com/login/oauth/access_token",
-            userinfo_url: Some("https://api.github.com/user"),
-        }),
-        "dropbox" => Some(OAuthProviderConfig {
-            auth_url: "https://www.dropbox.com/oauth2/authorize",
-            token_url: "https://api.dropboxapi.com/oauth2/token",
-            userinfo_url: None,
-        }),
-        _ => None,
+/// Build the credential-request JSON the frontend modal opens for an
+/// `oauth_client` flow. Single source of truth for service/prompt/base_url
+/// shape — both the LLM tool path and the OAuth re-auth API path call here.
+pub fn oauth_client_request(provider: &str, overrides: &OAuthClientOverrides) -> serde_json::Value {
+    let base_url = overrides
+        .base_url
+        .clone()
+        .unwrap_or_else(|| format!("https://{provider}.com"));
+    let mut request = serde_json::json!({
+        "service": format!("oauth:{provider}"),
+        "prompt": format!("Enter your OAuth client credentials for {provider}."),
+        "base_url": base_url,
+        "auth_type": "oauth_client",
+    });
+    // Only the keys the caller actually supplied go into `defaults` — never as
+    // present-but-null — so the modal can treat "key absent" as "not pre-filled".
+    let mut defaults = serde_json::Map::new();
+    for (key, value) in [
+        ("auth_url", &overrides.auth_url),
+        ("token_url", &overrides.token_url),
+        ("userinfo_url", &overrides.userinfo_url),
+        ("scopes", &overrides.scopes),
+    ] {
+        if let Some(v) = value {
+            defaults.insert(key.to_string(), serde_json::Value::String(v.clone()));
+        }
     }
+    if !defaults.is_empty() {
+        request["defaults"] = serde_json::Value::Object(defaults);
+    }
+    request
 }
 
 /// Determine the provider name from an API URL.
@@ -83,6 +132,8 @@ pub fn provider_for_url(url: &str) -> Option<&'static str> {
         Some("github")
     } else if url.contains("dropboxapi.com") || url.contains("dropbox.com") {
         Some("dropbox")
+    } else if url.contains("api.spotify.com") || url.contains("accounts.spotify.com") {
+        Some("spotify")
     } else {
         None
     }
@@ -279,6 +330,34 @@ pub fn provider_not_connected_msg(provider: &str) -> String {
     )
 }
 
+/// Why `get_account_with_fresh_token` couldn't return a usable account.
+/// Each caller maps these to its preferred HTTP status / error message
+/// (the proxy script-handshake layer maps `NotConnected` to BAD_GATEWAY,
+/// the access-token endpoint maps it to NOT_FOUND).
+pub enum AccountLookupError {
+    NotConnected,
+    DbError(BoxError),
+    RefreshFailed(BoxError),
+}
+
+/// One-shot "give me a valid access token for this provider": loads the
+/// account row and refreshes the token if it's expired or expiring soon.
+/// Used by `proxy_script_layer::DbOAuthLookup` and the
+/// `/api/v1/oauth/{provider}/access-token` endpoint.
+pub async fn get_account_with_fresh_token(
+    pool: &PgPool,
+    provider: &str,
+) -> Result<OAuthAccount, AccountLookupError> {
+    let mut account = OAuthStore::get_by_provider(pool, provider)
+        .await
+        .map_err(|e| AccountLookupError::DbError(Box::new(e)))?
+        .ok_or(AccountLookupError::NotConnected)?;
+    refresh_oauth_if_needed(pool, &mut account)
+        .await
+        .map_err(AccountLookupError::RefreshFailed)?;
+    Ok(account)
+}
+
 /// Build `OAUTH_*` environment variables from connected OAuth accounts.
 /// For each account: `OAUTH_{PROVIDER}_ACCESS_TOKEN` (always),
 /// `OAUTH_{PROVIDER}_EMAIL` (if known). Provider name is uppercased and
@@ -309,13 +388,30 @@ pub fn account_env_vars(accounts: Vec<OAuthAccount>) -> Vec<(String, String)> {
 // Token exchange & refresh (HTTP)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_in: Option<u64>,
     pub token_type: Option<String>,
     pub scope: Option<String>,
+}
+
+// Manual `Debug` so a token-exchange/refresh response never leaks its tokens
+// through `{:?}`. Non-secret fields (expiry, type, scope) stay visible.
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 /// Exchange an authorization code for tokens.
@@ -422,14 +518,10 @@ pub async fn refresh_oauth_if_needed(
     let csec = config["client_secret"]
         .as_str()
         .ok_or_else(|| format!("Missing client_secret in {} credentials", cred_service))?;
-    let turl = if let Some(wk) = well_known_provider(&account.provider) {
-        wk.token_url.to_string()
-    } else {
-        config["token_url"]
-            .as_str()
-            .ok_or_else(|| format!("Missing token_url in {} credentials", cred_service))?
-            .to_string()
-    };
+    let turl = config["token_url"]
+        .as_str()
+        .ok_or_else(|| format!("Missing token_url in {} credentials", cred_service))?
+        .to_string();
 
     crate::log!(
         "[OAuth] Refreshing {} token for {}",
@@ -507,10 +599,13 @@ async fn wait_for_oauth_callback(
         })
         .ok_or("No authorization code in callback")?;
 
-    // Send a success response to the browser
+    // Best-effort browser response — token already exchanged downstream, so a
+    // disconnected browser must not fail the caller. Log so regressions surface.
     let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to Lucidos.</p></body></html>";
     stream.writable().await?;
-    let _ = stream.try_write(response.as_bytes());
+    if let Err(e) = stream.try_write(response.as_bytes()) {
+        crate::log!("[OAuth] Failed to write success response to browser: {}", e);
+    }
 
     // URL-decode the code
     let code = urlencoding::decode(&code)?.into_owned();
@@ -566,29 +661,24 @@ pub async fn prepare_oauth_flow(
         .ok_or("Missing client_secret in OAuth credentials")?
         .to_string();
 
-    // Determine endpoints
-    let (auth_url, token_url, userinfo_url) = if let Some(config) = well_known_provider(provider) {
-        (
-            config.auth_url.to_string(),
-            config.token_url.to_string(),
-            config.userinfo_url.map(|s| s.to_string()),
-        )
-    } else {
-        let auth = client_config["auth_url"]
-            .as_str()
-            .ok_or("Missing auth_url for custom provider")?;
-        let token = client_config["token_url"]
-            .as_str()
-            .ok_or("Missing token_url for custom provider")?;
-        let userinfo = client_config["userinfo_url"]
-            .as_str()
-            .map(|s| s.to_string());
-        (auth.to_string(), token.to_string(), userinfo)
-    };
+    // Endpoints come from the per-credential JSON — the single source of truth.
+    // The agent pre-fills them from `system-knowhow/oauth-providers.md` at
+    // request time; legacy rows are backfilled by migration.
+    let auth_url = client_config["auth_url"]
+        .as_str()
+        .ok_or("Missing auth_url in OAuth credentials")?
+        .to_string();
+    let token_url = client_config["token_url"]
+        .as_str()
+        .ok_or("Missing token_url in OAuth credentials")?
+        .to_string();
+    let userinfo_url = client_config["userinfo_url"]
+        .as_str()
+        .map(|s| s.to_string());
 
     // Start temporary localhost listener for callback BEFORE returning the URL
     let listener = tokio::net::TcpListener::bind("127.0.0.1:14981").await?;
-    let redirect_uri = "http://localhost:14981/oauth/callback".to_string();
+    let redirect_uri = "http://127.0.0.1:14981/oauth/callback".to_string();
 
     // Build authorization URL with merged scopes
     let auth_request_url = format!(
@@ -744,188 +834,5 @@ async fn fetch_userinfo(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn merge_scopes_adds_new_without_duplicates() {
-        let existing = "openid email https://www.googleapis.com/auth/gmail.readonly";
-        let requested = "https://www.googleapis.com/auth/calendar.readonly";
-        let merged = merge_scopes(existing, requested);
-        assert_eq!(
-            merged,
-            "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar.readonly"
-        );
-    }
-
-    #[test]
-    fn merge_scopes_deduplicates() {
-        let existing = "openid email";
-        let requested = "email https://www.googleapis.com/auth/calendar.readonly";
-        let merged = merge_scopes(existing, requested);
-        assert_eq!(
-            merged,
-            "openid email https://www.googleapis.com/auth/calendar.readonly"
-        );
-    }
-
-    #[test]
-    fn merge_scopes_empty_existing() {
-        let merged = merge_scopes("", "openid email");
-        assert_eq!(merged, "openid email");
-    }
-
-    #[test]
-    fn merge_scopes_empty_requested() {
-        let merged = merge_scopes("openid email", "");
-        assert_eq!(merged, "openid email");
-    }
-
-    #[test]
-    fn merge_scopes_all_duplicates() {
-        let merged = merge_scopes("openid email", "openid email");
-        assert_eq!(merged, "openid email");
-    }
-
-    fn make_account(
-        provider: &str,
-        access_token: &str,
-        refresh_token: Option<&str>,
-        token_expiry: Option<DateTime<Utc>>,
-    ) -> OAuthAccount {
-        OAuthAccount {
-            id: Uuid::new_v4(),
-            provider: provider.to_string(),
-            email: Some("test@example.com".to_string()),
-            display_name: None,
-            access_token: access_token.to_string(),
-            refresh_token: refresh_token.map(|s| s.to_string()),
-            token_expiry,
-            scopes: "openid email".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
-    #[test]
-    fn token_needs_refresh_when_expired() {
-        let expired = Utc::now() - chrono::Duration::seconds(300);
-        let account = make_account("google", "old-token", Some("refresh-tok"), Some(expired));
-        assert!(
-            token_needs_refresh(&account),
-            "expired token should need refresh"
-        );
-    }
-
-    #[test]
-    fn token_needs_refresh_when_expiring_within_60s() {
-        let soon = Utc::now() + chrono::Duration::seconds(30);
-        let account = make_account("google", "token", Some("refresh-tok"), Some(soon));
-        assert!(
-            token_needs_refresh(&account),
-            "token expiring in 30s should need refresh"
-        );
-    }
-
-    #[test]
-    fn token_does_not_need_refresh_when_valid() {
-        let future = Utc::now() + chrono::Duration::seconds(3600);
-        let account = make_account("google", "token", Some("refresh-tok"), Some(future));
-        assert!(
-            !token_needs_refresh(&account),
-            "token valid for 1h should not need refresh"
-        );
-    }
-
-    #[test]
-    fn token_needs_refresh_when_expiry_null_with_refresh_token() {
-        let account = make_account("google", "token", Some("refresh-tok"), None);
-        assert!(
-            token_needs_refresh(&account),
-            "null expiry with refresh token should need refresh"
-        );
-    }
-
-    #[test]
-    fn token_does_not_need_refresh_when_expiry_null_without_refresh_token() {
-        // GitHub-style: no expiry, no refresh token — token is long-lived
-        let account = make_account("github", "ghp_token", None, None);
-        assert!(
-            !token_needs_refresh(&account),
-            "null expiry without refresh token should not refresh"
-        );
-    }
-
-    #[test]
-    fn token_does_not_need_refresh_well_beyond_boundary() {
-        // Token expiring in 61s — comfortably beyond the 60s buffer, no refresh needed
-        let expiry = Utc::now() + chrono::Duration::seconds(61);
-        let account = make_account("google", "token", Some("refresh-tok"), Some(expiry));
-        assert!(
-            !token_needs_refresh(&account),
-            "token expiring in 61s should not need refresh"
-        );
-    }
-
-    #[test]
-    fn token_needs_refresh_at_59s() {
-        let expiry = Utc::now() + chrono::Duration::seconds(59);
-        let account = make_account("google", "token", Some("refresh-tok"), Some(expiry));
-        assert!(
-            token_needs_refresh(&account),
-            "token expiring in 59s should need refresh"
-        );
-    }
-
-    fn make_env_account(provider: &str, email: Option<&str>, token: &str) -> OAuthAccount {
-        OAuthAccount {
-            id: Uuid::new_v4(),
-            provider: provider.to_string(),
-            email: email.map(String::from),
-            display_name: None,
-            access_token: token.to_string(),
-            refresh_token: None,
-            token_expiry: None,
-            scopes: String::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
-    #[test]
-    fn account_env_vars_injects_access_token_and_email() {
-        let accounts = vec![make_env_account(
-            "google",
-            Some("user@gmail.com"),
-            "ya29.test-token",
-        )];
-        let map: std::collections::HashMap<_, _> = account_env_vars(accounts).into_iter().collect();
-        assert_eq!(
-            map.get("OAUTH_GOOGLE_ACCESS_TOKEN").unwrap(),
-            "ya29.test-token"
-        );
-        assert_eq!(map.get("OAUTH_GOOGLE_EMAIL").unwrap(), "user@gmail.com");
-    }
-
-    #[test]
-    fn account_env_vars_skips_email_when_none() {
-        let accounts = vec![make_env_account("github", None, "ghp_test123")];
-        let map: std::collections::HashMap<_, _> = account_env_vars(accounts).into_iter().collect();
-        assert_eq!(map.get("OAUTH_GITHUB_ACCESS_TOKEN").unwrap(), "ghp_test123");
-        assert!(!map.contains_key("OAUTH_GITHUB_EMAIL"));
-    }
-
-    #[test]
-    fn account_env_vars_normalizes_provider_name() {
-        let accounts = vec![make_env_account("my-provider", None, "tok")];
-        let map: std::collections::HashMap<_, _> = account_env_vars(accounts).into_iter().collect();
-        assert_eq!(map.get("OAUTH_MY_PROVIDER_ACCESS_TOKEN").unwrap(), "tok");
-    }
-
-    #[test]
-    fn provider_not_connected_msg_names_provider_and_recovery() {
-        let msg = provider_not_connected_msg("google");
-        assert!(msg.contains("google"));
-        assert!(msg.contains("connect_oauth_account"));
-    }
-}
+#[path = "oauth_tests.rs"]
+mod tests;

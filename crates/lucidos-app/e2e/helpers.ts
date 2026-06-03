@@ -31,7 +31,7 @@ export function isMobileViewport(page: Page): boolean {
  *  re-render (e.g., dismiss-thread fan-out updating the drawer) gets retried.
  *  polling: 250 caps re-clicks at 4/sec instead of the rAF default (~60/sec)
  *  to avoid event-storming Preact handlers while the pane settles. */
-async function ensureMobileView(page: Page, viewName: 'thread' | 'threads'): Promise<void> {
+export async function ensureMobileView(page: Page, viewName: 'thread' | 'threads' | 'content'): Promise<void> {
   if (!isMobileViewport(page)) return;
   await page.waitForFunction((target) => {
     const header = document.querySelector('.app-header');
@@ -224,7 +224,7 @@ export async function getHeaderTop(page: Page): Promise<number> {
 }
 
 export async function assertHealthy(page: Page): Promise<void> {
-  const response = await page.request.get('/api/health');
+  const response = await page.request.get('/api/v1/health');
   expect(response.ok()).toBeTruthy();
   const body = await response.json();
   expect(body.status).toBe('ok');
@@ -339,7 +339,7 @@ export async function waitForCCToStart(page: Page, timeout = 60_000): Promise<vo
 export async function waitForActiveSession(page: Page, threadId: string, timeout = 30_000): Promise<Record<string, unknown>> {
   let cmdData: Record<string, unknown> = {};
   await expect(async () => {
-    const cmdResp = await page.request.get(`/api/claude-code/commands?thread_id=${threadId}`);
+    const cmdResp = await page.request.get(`/api/v1/claude-code/commands?thread_id=${threadId}`);
     expect(cmdResp.ok()).toBeTruthy();
     cmdData = await cmdResp.json();
     expect(cmdData.has_active_session).toBe(true);
@@ -371,6 +371,26 @@ export async function countVisibleResponses(page: Page): Promise<number> {
       return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim().length > 0;
     }).length;
   });
+}
+
+/** Wait until at least `count` visible response-content elements have non-empty
+ *  text. Polls the end-state directly. Prefer this over waitForResponse() before
+ *  a "got N responses" assertion in a multi-turn test: waitForResponse() only
+ *  checks that no status label reads Working/Requesting, so right after a prior
+ *  turn settles (its label already says Done/Canceled) it can resolve before the
+ *  next turn starts streaming — the count then runs one response short. */
+export async function waitForVisibleResponseCount(
+  page: Page,
+  count: number,
+  timeout = 90_000,
+): Promise<void> {
+  await page.waitForFunction((n) => {
+    const els = document.querySelectorAll('.response-content');
+    return Array.from(els).filter(el => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim().length > 0;
+    }).length >= n;
+  }, count, { timeout });
 }
 
 /** Trimmed text of the last visible response-content element, or '' if none. */
@@ -451,5 +471,157 @@ export async function dismissCCSession(page: Page): Promise<void> {
     await clickVisibleElement(page, '.thread-action-buttons button.action-btn', 'Archive');
   } catch {
     // CC session may have already ended — not an error
+  }
+}
+
+/** Wait for a visible `.thread-title-display` (read-only <textarea>) with a
+ *  non-empty value (dual-layout safe). */
+export async function waitForThreadTitle(page: Page, timeout = 30_000): Promise<void> {
+  await page.waitForFunction(() => {
+    const els = document.querySelectorAll('.thread-title-display');
+    return Array.from(els).some(el => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && ((el as HTMLTextAreaElement).value ?? '').trim().length > 0;
+    });
+  }, undefined, { timeout });
+}
+
+/** Wait for the thread title editor to enter edit mode (wrapper gains
+ *  `.is-editing`), returning a locator for the visible input. */
+export async function waitForTitleInput(page: Page, timeout = 5_000) {
+  await page.waitForFunction(() => {
+    const wrappers = document.querySelectorAll('.thread-title-edit.is-editing');
+    return Array.from(wrappers).some(w => {
+      const rect = w.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+  }, undefined, { timeout });
+  return page.locator('.thread-title-edit.is-editing .thread-title-edit-input').first();
+}
+
+/** Height (px) of the desktop `.thread-view-header` title display textarea.
+ *  Returns 0 if not rendered. */
+export async function getDesktopTitleHeight(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const el = document.querySelector('.thread-view-header .thread-title-display') as HTMLTextAreaElement | null;
+    return el ? el.getBoundingClientRect().height : 0;
+  });
+}
+
+/** Height (px) of the visible mobile thread-title-display textarea, ignoring
+ *  the desktop copy. Returns 0 if neither layout's display is rendered. */
+export async function getMobileTitleHeight(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const els = document.querySelectorAll('.mobile-thread-title-row .thread-title-display');
+    for (const el of els) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0) return rect.height;
+    }
+    return 0;
+  });
+}
+
+/** Visible thread title text from whichever layout's display textarea is
+ *  currently rendered (dual-layout safe). */
+export async function getVisibleTitleText(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const els = document.querySelectorAll('.thread-title-display');
+    for (const el of els) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        return ((el as HTMLTextAreaElement).value ?? '').trim();
+      }
+    }
+    return '';
+  });
+}
+
+// =====================================================================
+// Test-only push-log assertions.
+// Backed by GET /api/v1/_test/push-log, which is only mounted when the engine
+// is built with the `e2e-test-hooks` cargo feature (see
+// system-knowhow/notifications.md §5.4). Used by the §5.3 scenarios in
+// notifications.spec.ts to assert "OS push WAS / WAS NOT sent" without
+// waiting for actual APNs/FCM delivery.
+// =====================================================================
+
+export interface PushLogEntry {
+  device_id: string;
+  notification_id: string;
+  sent_at: string;
+  /** The JSON string the real transport would have encrypted and sent —
+   *  populated by every current write. Lets §5.3 scenarios assert the
+   *  Declarative Web Push envelope shape (`{web_push: 8030, notification: {…}}`)
+   *  in addition to delivery. Absent on rows recorded before the
+   *  20260523114252_add_payload_to_push_log migration. */
+  payload?: string | null;
+}
+
+/** Page-scoped fetch (uses Playwright's APIRequestContext) — required so the
+ *  self-signed localhost cert that the engine serves is trusted via the
+ *  browser context that already accepts it, rather than Node's stricter
+ *  fetch which would reject with "unable to verify the first certificate". */
+async function fetchPushLog(
+  page: Page,
+  params: {
+    notificationId?: string;
+    deviceId?: string;
+  },
+): Promise<PushLogEntry[]> {
+  const qs: Record<string, string> = {};
+  if (params.notificationId) qs.notification_id = params.notificationId;
+  if (params.deviceId) qs.device_id = params.deviceId;
+  const res = await page.request.get('/api/v1/_test/push-log', { params: qs });
+  if (!res.ok()) {
+    throw new Error(
+      `GET /api/v1/_test/push-log -> ${res.status()}. Is the engine built with --features e2e-test-hooks?`,
+    );
+  }
+  return (await res.json()) as PushLogEntry[];
+}
+
+/** Poll the push-log until a row appears for `notificationId` (optionally
+ *  scoped to `deviceId`). Returns the row so callers can inspect the
+ *  recorded payload (Declarative Web Push envelope shape). Throws if no
+ *  row arrives within `timeoutMs`. */
+export async function expectPushSent(
+  page: Page,
+  notificationId: string,
+  options: { deviceId?: string; timeoutMs?: number } = {},
+): Promise<PushLogEntry> {
+  const timeoutMs = options.timeoutMs ?? 2000;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const log = await fetchPushLog(page, {
+      notificationId,
+      deviceId: options.deviceId,
+    });
+    if (log.length > 0) return log[0];
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error(
+    `expected push_log entry for notification=${notificationId}` +
+      (options.deviceId ? ` device=${options.deviceId}` : '') +
+      `, none arrived in ${timeoutMs}ms`,
+  );
+}
+
+/** Wait `waitMs` (give the engine time to NOT push), then assert the
+ *  push-log has no row for `notificationId`. Use this when the §2 matrix
+ *  says push is suppressed; absence-of-evidence is fine because the
+ *  engine's decision is synchronous (PresenceCheck deadline + write or
+ *  return). */
+export async function expectNoPushSent(
+  page: Page,
+  notificationId: string,
+  waitMs = 500,
+): Promise<void> {
+  await new Promise((r) => setTimeout(r, waitMs));
+  const log = await fetchPushLog(page, { notificationId });
+  if (log.length > 0) {
+    throw new Error(
+      `expected NO push for notification=${notificationId}, but ${log.length} log entries: ` +
+        JSON.stringify(log),
+    );
   }
 }

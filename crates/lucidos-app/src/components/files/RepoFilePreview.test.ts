@@ -8,9 +8,9 @@ describe('shouldRenderMarkdownDiff', () => {
     })).toBe(true);
   });
 
-  it('renders for an external-repo CC session that has only a branch ref', () => {
+  it('renders for an external-repo Claude Code session that has only a branch ref', () => {
     // viewThreadCcDiff() leaves repoSelectedChangeId null because external-repo
-    // CC sessions never produce a Lucidos `Change` row — they only have the
+    // Claude Code sessions never produce a Lucidos `Change` row — they only have the
     // worktree branch in repoPending. Before the fix, this returned false and
     // the .md diff fell back to the unified DiffView instead of RenderedDiff.
     expect(shouldRenderMarkdownDiff({

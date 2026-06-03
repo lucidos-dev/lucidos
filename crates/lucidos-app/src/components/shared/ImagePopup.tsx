@@ -489,7 +489,13 @@ export function ImagePopup() {
       // toggle twice on the way to dblclick-zoom.
       if (e.detail > 1) return;
       if (zoomRef.current.scale > 1) return;
-      setChromeHidden(v => !v);
+      // Backdrop clicks close — the modal-overlay handles the outer
+      // padding, the strip handles the dark area inside content.
+      if (e.target instanceof HTMLImageElement) {
+        setChromeHidden(v => !v);
+      } else {
+        popupImage.value = null;
+      }
     }
 
     strip.addEventListener('wheel', handleWheel, { passive: false });

@@ -7,6 +7,7 @@ pub type BoxError = Box<dyn Error + Send + Sync>;
 pub(crate) struct Workspace {
     pub(crate) root: PathBuf,
     pub(crate) api_port: u16,
+    pub(crate) proto: String,
 }
 
 impl Workspace {
@@ -15,7 +16,7 @@ impl Workspace {
     }
 
     pub(crate) fn base_url(&self) -> String {
-        format!("https://localhost:{}", self.api_port)
+        format!("{}://localhost:{}", self.proto, self.api_port)
     }
 }
 
@@ -39,7 +40,8 @@ pub(crate) fn resolve_from_env() -> Result<Workspace, BoxError> {
 /// then saw Missing at apply time and triggered an unnecessary auto-/harden.
 pub(crate) fn resolve(start_dir: &Path, env_workspace: Option<&Path>) -> Result<Workspace, BoxError> {
     if let Some(root) = env_workspace {
-        let api_port = read_api_port(&root.join(".lucidos/ports")).map_err(|e| {
+        let ports_path = root.join(".lucidos/ports");
+        let (api_port, proto) = read_ports(&ports_path).map_err(|e| {
             format!(
                 "LUCIDOS_WORKSPACE={}: {}",
                 root.display(),
@@ -49,12 +51,13 @@ pub(crate) fn resolve(start_dir: &Path, env_workspace: Option<&Path>) -> Result<
         return Ok(Workspace {
             root: root.to_path_buf(),
             api_port,
+            proto,
         });
     }
 
     if let Some(root) = walk_up_for_ports(start_dir) {
-        let api_port = read_api_port(&root.join(".lucidos/ports"))?;
-        return Ok(Workspace { root, api_port });
+        let (api_port, proto) = read_ports(&root.join(".lucidos/ports"))?;
+        return Ok(Workspace { root, api_port, proto });
     }
 
     Err(format!(
@@ -76,20 +79,27 @@ fn walk_up_for_ports(start_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn read_api_port(path: &Path) -> Result<u16, BoxError> {
+/// Read API_PORT and PROTO from the ports file. PROTO defaults to "https"
+/// for backward compatibility with ports files written before it was added.
+pub(crate) fn read_ports(path: &Path) -> Result<(u16, String), BoxError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let mut port: Option<u16> = None;
+    let mut proto: Option<String> = None;
     for line in content.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("API_PORT=") {
-            let port: u16 = rest
-                .trim()
-                .parse()
-                .map_err(|e| format!("Invalid API_PORT in {}: {}", path.display(), e))?;
-            return Ok(port);
+            port = Some(
+                rest.trim()
+                    .parse()
+                    .map_err(|e| format!("Invalid API_PORT in {}: {}", path.display(), e))?,
+            );
+        } else if let Some(rest) = line.strip_prefix("PROTO=") {
+            proto = Some(rest.trim().to_string());
         }
     }
-    Err(format!("API_PORT line not found in {}", path.display()).into())
+    let port = port.ok_or_else(|| format!("API_PORT line not found in {}", path.display()))?;
+    Ok((port, proto.unwrap_or_else(|| "https".to_string())))
 }
 
 #[cfg(test)]
@@ -115,6 +125,7 @@ mod tests {
         let ws = resolve(tmp.path(), None).unwrap();
         assert_eq!(ws.root, tmp.path());
         assert_eq!(ws.api_port, 1234);
+        assert_eq!(ws.proto, "https");
     }
 
     #[test]
@@ -197,5 +208,29 @@ mod tests {
         fs::write(lucidos.join("ports"), "VITE_PORT=9000\n").unwrap();
         let err = resolve(tmp.path(), None).unwrap_err();
         assert!(err.to_string().contains("API_PORT"));
+    }
+
+    #[test]
+    fn reads_proto_from_ports_file() {
+        let tmp = tempdir().unwrap();
+        let lucidos = tmp.path().join(".lucidos");
+        fs::create_dir_all(&lucidos).unwrap();
+        fs::write(
+            lucidos.join("ports"),
+            "API_PORT=5177\nVITE_PORT=5177\nPROTO=http\n",
+        )
+        .unwrap();
+        let ws = resolve(tmp.path(), None).unwrap();
+        assert_eq!(ws.proto, "http");
+        assert_eq!(ws.base_url(), "http://localhost:5177");
+    }
+
+    #[test]
+    fn defaults_to_https_when_proto_missing() {
+        let tmp = tempdir().unwrap();
+        write_ports(tmp.path(), 5177);
+        let ws = resolve(tmp.path(), None).unwrap();
+        assert_eq!(ws.proto, "https");
+        assert_eq!(ws.base_url(), "https://localhost:5177");
     }
 }

@@ -1,0 +1,22 @@
+{
+  "_note": "Source of truth for Claude Code's /model and /effort pickers. Hand-maintained because CC does not expose available models programmatically (https://github.com/anthropics/claude-code/issues/12612). Updates: use the `update-lucidos-cc-models` skill — it diffs this file against `claude /model` and bumps entries to match. include_str!() baked at compile time, parsed once via LazyLock — no runtime IO cost.",
+  "models": [
+    { "value": "default",          "label": "Default",         "description": "Use the default model for your plan" },
+    { "value": "sonnet",           "label": "Sonnet 4.6",      "description": "Best for everyday tasks" },
+    { "value": "sonnet[1m]",       "label": "Sonnet 4.6 (1M)", "description": "Sonnet 4.6 for long sessions" },
+    { "value": "claude-opus-4-8@default", "label": "Opus 4.8",  "description": "Latest and most capable" },
+    { "value": "claude-opus-4-8[1m]", "label": "Opus 4.8 (1M)", "description": "Opus 4.8 for long sessions" },
+    { "value": "claude-opus-4-7",  "label": "Opus 4.7",        "description": "Previous generation" },
+    { "value": "claude-opus-4-1",  "label": "Opus 4.1",        "description": "Legacy" },
+    { "value": "opus",             "label": "Opus 4.6",        "description": "Most capable for complex work" },
+    { "value": "opus[1m]",         "label": "Opus 4.6 (1M)",   "description": "Opus 4.6 for long sessions" },
+    { "value": "haiku",            "label": "Haiku 4.5",       "description": "Fastest for quick answers" }
+  ],
+  "reasoning_efforts": [
+    { "value": "low",    "label": "Low",        "description": "Minimal thinking · Fastest responses" },
+    { "value": "medium", "label": "Medium",     "description": "Balanced thinking · Default" },
+    { "value": "high",   "label": "High",       "description": "Deep thinking · Most thorough" },
+    { "value": "xhigh",  "label": "Extra High", "description": "Extra deep thinking · Higher than High" },
+    { "value": "max",    "label": "Max",        "description": "Maximum thinking · Extended reasoning" }
+  ]
+}

@@ -1,0 +1,46 @@
+/* Backup health card — surfaces running / last-run / staleness at the top of
+   the Backup section so the page answers "is my data backed up?" at a glance. */
+.backup-health-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 0.75rem;
+    padding: 0.5rem 0.625rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    background: var(--bg-primary);
+    font-size: 0.75rem;
+}
+
+.backup-health-line {
+    color: var(--text-primary);
+}
+
+.backup-health-ok {
+    color: var(--text-muted);
+}
+
+.backup-health-success {
+    color: var(--accent-green);
+}
+
+.backup-health-error {
+    color: var(--accent-red);
+}
+
+.backup-health-muted {
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+}
+
+/* Stale / no-backup warning — escalates the whole card so it can't be missed. */
+.backup-health-card[data-state="stale"] {
+    border-color: color-mix(in srgb, var(--accent-yellow) 50%, var(--border-color));
+    background: color-mix(in srgb, var(--accent-yellow) 10%, transparent);
+}
+
+.backup-health-warn {
+    color: var(--accent-yellow);
+    font-weight: 600;
+}
+

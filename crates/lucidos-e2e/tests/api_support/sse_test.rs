@@ -4,7 +4,7 @@ use std::time::Duration;
 #[tokio::test]
 async fn sse_stream_connects_and_receives_events() {
     let client = http_client();
-    let sse_url = format!("{}/api/events", base_url());
+    let sse_url = format!("{}/api/v1/events", base_url());
 
     // Connect to SSE stream
     let resp = client
@@ -30,14 +30,14 @@ async fn sse_stream_connects_and_receives_events() {
 /// Mobile-on-Tailscale users connect via browsers that send `Accept-Encoding:
 /// gzip` automatically. The SSE handler must compress the response body so
 /// repetitive markdown / JSON event payloads (`MessageReceived` ≈17 KB,
-/// `ToolResult` ≈4 KB, the embedded `ThreadInfo` aggregate snapshots) shrink
+/// `ToolResult` ≈4 KB, the embedded `ThreadAggregate` snapshots) shrink
 /// 10–20× on the wire. Verify both the negotiation header and the absence
 /// when the client doesn't ask for it.
 #[tokio::test]
 async fn sse_sets_content_encoding_gzip_when_client_offers_it() {
     let client = http_client();
     let resp = client
-        .get(format!("{}/api/events", base_url()))
+        .get(format!("{}/api/v1/events", base_url()))
         .header("Accept", "text/event-stream")
         .header("Accept-Encoding", "gzip")
         .send()
@@ -75,7 +75,7 @@ async fn sse_omits_content_encoding_when_client_does_not_offer_gzip() {
     // Accept-Encoding for us — omitting the header here really does omit
     // it on the wire.
     let resp = http_client()
-        .get(format!("{}/api/events", base_url()))
+        .get(format!("{}/api/v1/events", base_url()))
         .header("Accept", "text/event-stream")
         .send()
         .await
@@ -102,7 +102,7 @@ async fn sse_compressed_events_decompress_to_sse_wire_format() {
     let sse_marker = marker.clone();
     let sse_handle: tokio::task::JoinHandle<Vec<String>> = tokio::spawn(async move {
         let resp = http_client()
-            .get(format!("{}/api/events", base_url()))
+            .get(format!("{}/api/v1/events", base_url()))
             .header("Accept", "text/event-stream")
             .header("Accept-Encoding", "gzip")
             .timeout(Duration::from_secs(60))
@@ -150,7 +150,7 @@ async fn sse_compressed_events_decompress_to_sse_wire_format() {
     // Give the SSE subscriber a moment to register before sending the chat.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let chat_url = format!("{}/api/chat/stream", base_url());
+    let chat_url = format!("{}/api/v1/chat/stream", base_url());
     let chat_body = serde_json::json!({
         "message": format!("Say exactly: \"sse gzip {marker}\""),
         "mode": "human",
@@ -185,7 +185,7 @@ async fn sse_receives_events_after_chat() {
     let marker = unique_marker("api-sse");
 
     // Start SSE stream in background
-    let sse_url = format!("{}/api/events", base_url());
+    let sse_url = format!("{}/api/v1/events", base_url());
     let sse_client = http_client();
 
     let sse_handle = tokio::spawn(async move {
@@ -206,7 +206,7 @@ async fn sse_receives_events_after_chat() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Send a chat message to generate events
-    let chat_url = format!("{}/api/chat/stream", base_url());
+    let chat_url = format!("{}/api/v1/chat/stream", base_url());
     let chat_body = serde_json::json!({
         "message": format!("Say exactly: \"sse {marker}\""),
         "mode": "human",

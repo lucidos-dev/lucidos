@@ -1,8 +1,8 @@
 import { searchEverywhereOpen } from '../../store/store';
 import { SearchIcon } from './icons';
-import { tooltipWithShortcut } from '../../utils/shortcuts';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { composeHandlers } from '../chat/promptFocus';
-import { focusSearchInput } from '../search/SearchEverywhere';
+import { focusSearchInput } from '../search/searchEverywhereActions';
 
 export function SearchEverywhereButton({ showTooltip }: { showTooltip?: boolean }) {
   return (

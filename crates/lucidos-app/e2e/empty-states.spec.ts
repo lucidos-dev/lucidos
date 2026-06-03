@@ -33,7 +33,7 @@ test.describe('Empty and error states', () => {
   });
 
   test('health endpoint returns ok', async ({ page }) => {
-    const response = await page.request.get('/api/health');
+    const response = await page.request.get('/api/v1/health');
     expect(response.ok()).toBeTruthy();
     const body = await response.json();
     expect(body.status).toBe('ok');
@@ -43,7 +43,7 @@ test.describe('Empty and error states', () => {
   });
 
   test('malformed chat request returns error', async ({ page }) => {
-    const response = await page.request.post('/api/chat/stream', {
+    const response = await page.request.post('/api/v1/chat/stream', {
       headers: { 'content-type': 'application/json' },
       data: '{invalid json}',
       failOnStatusCode: false,

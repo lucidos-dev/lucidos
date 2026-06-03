@@ -8,29 +8,188 @@
 //! fields on `ChatRequest`), not in headers. Handlers parse and validate those
 //! fields up front, then bundle them into a `CallerOrigin` and pass it here.
 //!
-//! Resolution (mode = `Human`):
-//! 1. `caller` set → `Workspace` (other Lucidos workspace; carries optional
+//! Resolution order (mode = `Human`):
+//! 1. **Subprocess origin** (`X-Lucidos-Agent-Origin-Token` header matches the
+//!    per-engine-startup token) → `Api { mode: Agent, source_thread_id }`. A
+//!    Lucidos-spawned subprocess (CC, run_bash, run_python, scheduled script,
+//!    `lucidos` CLI) calling back into the engine is an agent action, never the
+//!    user — stamp honestly so the timeline shows "Lucidos Agent" instead of
+//!    "You" and the source thread id flows into the route popover.
+//! 2. `caller` set → `Workspace` (other Lucidos workspace; carries optional
 //!    thread/event id from the request body)
-//! 2. `device_id` present     → `Device` (label looked up by caller from the
+//! 3. `device_id` present     → `Device` (label looked up by caller from the
 //!    `devices` table)
-//! 3. else                    → `Api` (carries `User-Agent`)
+//! 4. else                    → `Api { mode: Human }` (external API client;
+//!    carries `User-Agent`)
 //!
 //! Mode = `Agent` or `Engine`:
 //! - With `caller` set → `Workspace` (cross-workspace agent/engine call)
-//! - Otherwise → `ParentThread` when `parent_thread_id` is set, else `None`
+//! - Otherwise → `ThreadLink` when `parent_thread_id` is set, else `None`
 //!   (callers must construct `MessageOrigin::Engine { reason }` directly).
 //!
 //! Caller fields are user-controllable — treat as a display hint only,
-//! never for authorization.
+//! never for authorization. The subprocess token is process-local secret state
+//! (env-injected) and IS authoritative for "did this request come from a
+//! Lucidos-spawned process". `source_thread_id` from `X-Lucidos-Source-Thread-Id`
+//! is display attribution only: any subprocess can claim any source thread id.
 
 use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
 use sqlx::PgPool;
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 /// Header carrying the originating browser/device id on mutating endpoints
 /// that don't accept a request body (apply/discard/revert, pin/unpin, etc.).
 /// Frontend's `json()` helper sets this from `getDeviceId()`.
 pub const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
+
+/// Header forwarded by the `lucidos` CLI carrying the per-engine-startup
+/// token; matched against [`AGENT_ORIGIN_TOKEN`] by [`subprocess_origin`].
+pub const HEADER_AGENT_ORIGIN_TOKEN: &str = "x-lucidos-agent-origin-token";
+
+/// Header carrying the spawning thread id when a subprocess calls back into
+/// the engine. Only trusted when paired with a valid
+/// `HEADER_AGENT_ORIGIN_TOKEN`; surfaced as `MessageOrigin::Api.source_thread_id`.
+pub const HEADER_SOURCE_THREAD_ID: &str = "x-lucidos-source-thread-id";
+
+/// Env-var name for the subprocess-origin token. Engine sets it; CLI forwards
+/// it as [`HEADER_AGENT_ORIGIN_TOKEN`]. The CLI mirrors this literal because
+/// it can't depend on the engine crate (no `lucidos-common`); rename the
+/// engine side and the CLI's `crates/lucidos-cli/src/http.rs` constant must
+/// follow in lockstep.
+pub const ENV_AGENT_ORIGIN_TOKEN: &str = "LUCIDOS_AGENT_ORIGIN_TOKEN";
+
+/// Env-var name for the spawning thread id. Same engine/CLI mirror rule as
+/// [`ENV_AGENT_ORIGIN_TOKEN`].
+pub const ENV_SOURCE_THREAD_ID: &str = "LUCIDOS_THREAD_ID";
+
+/// Per-startup secret. `OnceLock::set` is first-writer-wins, which matches
+/// the production invariant (engine startup writes once); test harnesses
+/// that reboot the engine in the same process keep the first token.
+static AGENT_ORIGIN_TOKEN: OnceLock<String> = OnceLock::new();
+
+/// Install the per-engine-startup token. Idempotent.
+pub fn init_agent_origin_token(token: String) {
+    let _ = AGENT_ORIGIN_TOKEN.set(token);
+}
+
+/// Read the installed token; `None` before [`init_agent_origin_token`] is
+/// called (no-token path leaves device/api resolution unchanged).
+pub fn agent_origin_token() -> Option<&'static str> {
+    AGENT_ORIGIN_TOKEN.get().map(String::as_str)
+}
+
+/// Outcome of subprocess-origin detection. The two-variant shape forces
+/// callers to spell out "is this a subprocess" rather than overload an
+/// `Option<Option<Uuid>>` whose inner `None` is "subprocess without source
+/// thread" — readers don't have to translate nested `Option`s back to prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubprocessOrigin {
+    /// Request did not present a valid origin token. Fall through to the
+    /// regular device/api resolution.
+    NotSubprocess,
+    /// Request came from a Lucidos-spawned subprocess. `source_thread_id`
+    /// is the spawning thread when known (CC always; Lucidos LLM tools when
+    /// the tool invocation has thread context).
+    Subprocess { source_thread_id: Option<Uuid> },
+}
+
+impl SubprocessOrigin {
+    /// Source thread when this is a subprocess, else `None`. Lets callers
+    /// shovel the value into `MessageOrigin::Api.source_thread_id` directly.
+    pub fn source_thread_id(self) -> Option<Uuid> {
+        match self {
+            Self::Subprocess { source_thread_id } => source_thread_id,
+            Self::NotSubprocess => None,
+        }
+    }
+}
+
+/// Detect a request from a Lucidos-spawned subprocess by comparing the
+/// `HEADER_AGENT_ORIGIN_TOKEN` header to the engine-wide token. O(1)
+/// lock-free on the no-token fast path (one `OnceLock::get` + one
+/// `HeaderMap::get`).
+pub fn subprocess_origin(headers: &axum::http::HeaderMap) -> SubprocessOrigin {
+    let Some(expected) = AGENT_ORIGIN_TOKEN.get().map(String::as_str) else {
+        return SubprocessOrigin::NotSubprocess;
+    };
+    let Some(presented) = headers
+        .get(HEADER_AGENT_ORIGIN_TOKEN)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return SubprocessOrigin::NotSubprocess;
+    };
+    if presented != expected {
+        return SubprocessOrigin::NotSubprocess;
+    }
+    let source_thread_id = headers
+        .get(HEADER_SOURCE_THREAD_ID)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok());
+    SubprocessOrigin::Subprocess { source_thread_id }
+}
+
+/// Build the env vars every Lucidos-spawned subprocess receives so the
+/// engine recognises its HTTP callbacks. Single source of truth — both
+/// `engine::engine_impl::build_script_env_vars` and
+/// `runtime::claude_code::build_command` call this so a future subprocess
+/// surface (MCP child process, future signer host, …) cannot silently ship
+/// without origin attribution — which is exactly how the original incident
+/// would re-grow.
+///
+/// `thread_id = None` produces just the token (scheduled scripts with no
+/// thread context); `Some(tid)` adds the source-thread-id env so callbacks
+/// can deep-link back to the spawning thread.
+pub fn subprocess_origin_env_vars(thread_id: Option<Uuid>) -> Vec<(&'static str, String)> {
+    let mut vars = Vec::with_capacity(2);
+    if let Some(token) = agent_origin_token() {
+        vars.push((ENV_AGENT_ORIGIN_TOKEN, token.to_string()));
+    }
+    if let Some(tid) = thread_id {
+        vars.push((ENV_SOURCE_THREAD_ID, tid.to_string()));
+    }
+    vars
+}
+
+/// Build the env vars every Lucidos-spawned subprocess receives so that
+/// kill-stale-by-port code reachable from inside the subprocess
+/// (`scripts/lib/ports.sh`, ad-hoc shell scripts, the pre-kill Bash hook)
+/// can refuse to signal the host engine or its sibling frontend.
+///
+/// Single source of truth for the same reason `subprocess_origin_env_vars`
+/// is: both `runtime::claude_code::build_command` and
+/// `engine::engine_impl::build_script_env_vars` call this so a future
+/// subprocess surface (MCP child, signer host, scheduled script, …)
+/// cannot ship without the guard — which is exactly how the original
+/// incident grew (a test invoked from a Claude Code subprocess freed up "stale"
+/// ports and took down its own host).
+///
+///   * `LUCIDOS_HOST_PID`     — always set; the engine's own pid.
+///   * `LUCIDOS_FRONTEND_PID` — set only when `<workspace>/.lucidos/frontend.pid`
+///     exists and is non-blank (web-dev mode; Tauri / production-bundled
+///     installs have no separate Vite process).
+///   * `LUCIDOS_API_PORT`     — re-exported when the engine itself was given
+///     one, so the pre-kill hook can block `lsof -ti :<port> | xargs kill`
+///     patterns targeting the engine port.
+pub fn host_protection_env_vars(workspace_path: &std::path::Path) -> Vec<(&'static str, String)> {
+    let mut vars: Vec<(&'static str, String)> = Vec::with_capacity(3);
+    vars.push(("LUCIDOS_HOST_PID", std::process::id().to_string()));
+    let frontend_pid_path = workspace_path.join(".lucidos/frontend.pid");
+    if let Ok(contents) = std::fs::read_to_string(&frontend_pid_path) {
+        // Validate as u32: a multi-line pidfile (or other junk) would
+        // otherwise inject an embedded newline into the env var and break the
+        // hook's regex match — silently disabling the guard for that pid.
+        if let Ok(pid) = contents.trim().parse::<u32>() {
+            vars.push(("LUCIDOS_FRONTEND_PID", pid.to_string()));
+        }
+    }
+    if let Ok(api_port) = std::env::var("LUCIDOS_API_PORT") {
+        if !api_port.is_empty() {
+            vars.push(("LUCIDOS_API_PORT", api_port));
+        }
+    }
+    vars
+}
 
 /// Cross-workspace origin info, extracted from request body `caller_*` fields.
 /// `Some(_)` means this is a cross-workspace POST; `None` means same-workspace.
@@ -45,6 +204,9 @@ pub struct CallerOrigin {
     pub mode: ActorMode,
 }
 
+// Aggregates eight unrelated inputs (headers + mode + device + parent-thread + caller);
+// a struct wrapper would just shift the parameters one level deeper at every call site.
+#[allow(clippy::too_many_arguments)]
 pub fn build_message_origin(
     headers: &axum::http::HeaderMap,
     mode: ActorMode,
@@ -56,6 +218,18 @@ pub fn build_message_origin(
     caller: Option<CallerOrigin>,
 ) -> Option<MessageOrigin> {
     let user_agent = header_str(headers, "user-agent");
+    // Subprocess origin overrides device/api resolution so an agent action
+    // never stamps as Human. Cross-workspace `caller` still wins (different
+    // channel, different actor model).
+    if caller.is_none() {
+        if let SubprocessOrigin::Subprocess { source_thread_id } = subprocess_origin(headers) {
+            return Some(MessageOrigin::Api {
+                user_agent,
+                mode: ActorMode::Agent,
+                source_thread_id,
+            });
+        }
+    }
     if let Some(c) = caller {
         return Some(MessageOrigin::Workspace {
             workspace: c.workspace,
@@ -77,6 +251,7 @@ pub fn build_message_origin(
                 Some(MessageOrigin::Api {
                     user_agent,
                     mode: ActorMode::Human,
+                    source_thread_id: None,
                 })
             }
         }
@@ -154,424 +329,5 @@ fn header_str(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn headers_with(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
-        let mut h = axum::http::HeaderMap::new();
-        for (k, v) in pairs {
-            h.insert(
-                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                axum::http::HeaderValue::from_str(v).unwrap(),
-            );
-        }
-        h
-    }
-
-    fn caller(
-        name: &str,
-        thread_id: Option<Uuid>,
-        event_id: Option<Uuid>,
-        mode: ActorMode,
-    ) -> Option<CallerOrigin> {
-        Some(CallerOrigin {
-            workspace: name.into(),
-            thread_id,
-            event_id,
-            mode,
-        })
-    }
-
-    #[test]
-    fn build_origin_user_with_caller_yields_workspace() {
-        let src_thread = Uuid::new_v4();
-        let src_event = Uuid::new_v4();
-        let h = headers_with(&[("user-agent", "lucidos-engine/0.1")]);
-        let origin = build_message_origin(
-            &h,
-            ActorMode::Human,
-            Some("dev-1"),
-            Some("dev label".into()),
-            None,
-            None,
-            None,
-            caller(
-                "personal",
-                Some(src_thread),
-                Some(src_event),
-                ActorMode::Human,
-            ),
-        );
-        match origin {
-            Some(MessageOrigin::Workspace {
-                workspace,
-                thread_id,
-                event_id,
-                user_agent,
-                mode: _,
-            }) => {
-                assert_eq!(workspace, "personal");
-                assert_eq!(thread_id, Some(src_thread));
-                assert_eq!(event_id, Some(src_event));
-                assert_eq!(user_agent.as_deref(), Some("lucidos-engine/0.1"));
-            }
-            other => panic!("expected Workspace, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn build_origin_user_caller_takes_precedence_over_device() {
-        let h = headers_with(&[]);
-        let origin = build_message_origin(
-            &h,
-            ActorMode::Human,
-            Some("dev-1"),
-            Some("Chrome".into()),
-            None,
-            None,
-            None,
-            caller("work", None, None, ActorMode::Human),
-        );
-        assert!(matches!(origin, Some(MessageOrigin::Workspace { .. })));
-    }
-
-    #[test]
-    fn build_origin_user_with_device_id_yields_device_with_label() {
-        let h = headers_with(&[]);
-        let origin = build_message_origin(
-            &h,
-            ActorMode::Human,
-            Some("dev-1"),
-            Some("Chrome on Mac".into()),
-            None,
-            None,
-            None,
-            None,
-        );
-        match origin {
-            Some(MessageOrigin::Device { device_id, label }) => {
-                assert_eq!(device_id, "dev-1");
-                assert_eq!(label, "Chrome on Mac");
-            }
-            other => panic!("expected Device, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn build_origin_user_with_device_id_no_label_falls_back_to_short_id() {
-        let h = headers_with(&[]);
-        let origin = build_message_origin(
-            &h,
-            ActorMode::Human,
-            Some("abcdef0123456789"),
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        match origin {
-            Some(MessageOrigin::Device { label, .. }) => assert_eq!(label, "device-abcdef01"),
-            other => panic!("expected Device, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn build_origin_user_short_label_handles_short_id() {
-        // Defensive: device_id shorter than 8 chars must not panic.
-        let h = headers_with(&[]);
-        let origin = build_message_origin(
-            &h,
-            ActorMode::Human,
-            Some("ab"),
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        match origin {
-            Some(MessageOrigin::Device { label, .. }) => assert_eq!(label, "device-ab"),
-            other => panic!("expected Device, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn build_origin_user_no_device_no_caller_yields_api() {
-        let h = headers_with(&[("user-agent", "curl/8")]);
-        let origin = build_message_origin(
-            &h,
-            ActorMode::Human,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        match origin {
-            Some(MessageOrigin::Api { user_agent, mode }) => {
-                assert_eq!(user_agent.as_deref(), Some("curl/8"));
-                assert_eq!(mode, ActorMode::Human);
-            }
-            other => panic!("expected Api, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn build_origin_human_mode_with_caller_yields_workspace_human_mode() {
-        let h = headers_with(&[]);
-        let origin = build_message_origin(
-            &h,
-            ActorMode::Human,
-            None,
-            None,
-            None,
-            None,
-            None,
-            caller("personal", None, None, ActorMode::Human),
-        );
-        match origin {
-            Some(MessageOrigin::Workspace {
-                workspace, mode, ..
-            }) => {
-                assert_eq!(workspace, "personal");
-                assert_eq!(mode, ActorMode::Human);
-            }
-            other => panic!("expected Workspace, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn build_origin_agent_mode_with_caller_yields_workspace_agent_mode() {
-        // CallerOrigin carries the upstream mode — the calling workspace's
-        // actor (Agent here) flows straight into the Workspace branch.
-        let h = headers_with(&[]);
-        let origin = build_message_origin(
-            &h,
-            ActorMode::Agent,
-            None,
-            None,
-            None,
-            None,
-            None,
-            caller("personal", None, None, ActorMode::Agent),
-        );
-        match origin {
-            Some(MessageOrigin::Workspace { mode, .. }) => assert_eq!(mode, ActorMode::Agent),
-            other => panic!("expected Workspace agent mode, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn build_origin_engine_mode_with_caller_yields_workspace_engine_mode() {
-        let h = headers_with(&[]);
-        let origin = build_message_origin(
-            &h,
-            ActorMode::Engine,
-            None,
-            None,
-            None,
-            None,
-            None,
-            caller("personal", None, None, ActorMode::Engine),
-        );
-        match origin {
-            Some(MessageOrigin::Workspace { mode, .. }) => assert_eq!(mode, ActorMode::Engine),
-            other => panic!("expected Workspace engine mode, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn build_origin_agent_mode_with_parent_thread_yields_thread_link_parent_agent_mode() {
-        let parent_id = Uuid::new_v4();
-        let origin = build_message_origin(
-            &headers_with(&[]),
-            ActorMode::Agent,
-            None,
-            None,
-            Some(parent_id),
-            Some("parent".into()),
-            None,
-            None,
-        );
-        match origin {
-            Some(MessageOrigin::ThreadLink {
-                thread_id,
-                mode,
-                direction,
-                ..
-            }) => {
-                assert_eq!(thread_id, parent_id);
-                assert_eq!(mode, ActorMode::Agent);
-                assert_eq!(direction, ThreadDirection::Parent);
-            }
-            other => panic!("expected ThreadLink, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn build_origin_engine_mode_with_no_parent_yields_none() {
-        // Engine-initiated work without a parent thread context returns None;
-        // callers must construct MessageOrigin::Engine { reason } directly.
-        let origin = build_message_origin(
-            &headers_with(&[]),
-            ActorMode::Engine,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        assert!(origin.is_none());
-    }
-
-    #[test]
-    fn build_origin_engine_mode_with_parent_thread_yields_thread_link_engine_mode() {
-        let parent_id = Uuid::new_v4();
-        let origin = build_message_origin(
-            &headers_with(&[]),
-            ActorMode::Engine,
-            None,
-            None,
-            Some(parent_id),
-            None,
-            None,
-            None,
-        );
-        match origin {
-            Some(MessageOrigin::ThreadLink {
-                mode, direction, ..
-            }) => {
-                assert_eq!(mode, ActorMode::Engine);
-                assert_eq!(direction, ThreadDirection::Parent);
-            }
-            other => panic!("expected ThreadLink, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn user_actor_convenience_passes_through_to_build_message_origin() {
-        let h = headers_with(&[("user-agent", "curl/8")]);
-        let actor = user_actor(&h, Some("dev-1"), Some("Chrome".into()));
-        match actor {
-            Some(MessageOrigin::Device { device_id, label }) => {
-                assert_eq!(device_id, "dev-1");
-                assert_eq!(label, "Chrome");
-            }
-            other => panic!("expected Device, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn user_actor_falls_back_to_header_device_id_when_no_explicit_id() {
-        let h = headers_with(&[("x-lucidos-device-id", "abcdef0123456789")]);
-        let actor = user_actor(&h, None, None);
-        match actor {
-            Some(MessageOrigin::Device { device_id, label }) => {
-                assert_eq!(device_id, "abcdef0123456789");
-                assert_eq!(label, "device-abcdef01");
-            }
-            other => panic!("expected Device from header, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn user_actor_explicit_id_takes_precedence_over_header() {
-        let h = headers_with(&[("x-lucidos-device-id", "dev-from-header")]);
-        let actor = user_actor(&h, Some("dev-from-arg"), Some("Chrome".into()));
-        match actor {
-            Some(MessageOrigin::Device { device_id, label }) => {
-                assert_eq!(device_id, "dev-from-arg");
-                assert_eq!(label, "Chrome");
-            }
-            other => panic!("expected explicit Device, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn user_actor_resolved_enriches_device_label_from_db() {
-        // Regression: every mutating handler used to call `user_actor(.., None, None)`
-        // and never looked up the label, so events stamped Device { label: <fallback> }
-        // — visible as the bare `device-<short>` placeholder in the actor popover.
-        let (pool, db_name) = crate::test_support::setup_test_db().await;
-        crate::core::DeviceStore::register(&pool, "test-device-1", Some("Mozilla/5.0"))
-            .await
-            .unwrap();
-        crate::core::DeviceStore::rename(&pool, "test-device-1", Some("My MacBook"))
-            .await
-            .unwrap();
-
-        let h = headers_with(&[("x-lucidos-device-id", "test-device-1")]);
-        let actor = user_actor_resolved(&h, &pool, None).await;
-        match actor {
-            Some(MessageOrigin::Device { device_id, label }) => {
-                assert_eq!(device_id, "test-device-1");
-                assert_eq!(
-                    label, "My MacBook",
-                    "label must come from devices table, not the device-<short> fallback"
-                );
-            }
-            other => panic!("expected Device with db-looked-up label, got {:?}", other),
-        }
-
-        crate::test_support::teardown_test_db(&db_name).await;
-    }
-
-    #[tokio::test]
-    async fn user_actor_resolved_uses_explicit_device_id_override() {
-        // The settings endpoint takes device_id from the request body, not the header.
-        let (pool, db_name) = crate::test_support::setup_test_db().await;
-        crate::core::DeviceStore::register(&pool, "from-body", None)
-            .await
-            .unwrap();
-        crate::core::DeviceStore::rename(&pool, "from-body", Some("Body Device"))
-            .await
-            .unwrap();
-
-        let h = headers_with(&[("x-lucidos-device-id", "from-header")]);
-        let actor = user_actor_resolved(&h, &pool, Some("from-body")).await;
-        match actor {
-            Some(MessageOrigin::Device { device_id, label }) => {
-                assert_eq!(device_id, "from-body", "explicit override beats header");
-                assert_eq!(label, "Body Device");
-            }
-            other => panic!("expected Device using override, got {:?}", other),
-        }
-
-        crate::test_support::teardown_test_db(&db_name).await;
-    }
-
-    #[tokio::test]
-    async fn user_actor_resolved_no_caller_no_device_yields_api() {
-        let (pool, db_name) = crate::test_support::setup_test_db().await;
-        let h = headers_with(&[("user-agent", "curl/8")]);
-        let actor = user_actor_resolved(&h, &pool, None).await;
-        match actor {
-            Some(MessageOrigin::Api { user_agent, mode }) => {
-                assert_eq!(user_agent.as_deref(), Some("curl/8"));
-                assert_eq!(mode, ActorMode::Human);
-            }
-            other => panic!("expected Api, got {:?}", other),
-        }
-        crate::test_support::teardown_test_db(&db_name).await;
-    }
-
-    #[tokio::test]
-    async fn user_actor_resolved_unknown_device_id_falls_back_to_short_label() {
-        // Device id in header but row missing in DB — falls back via
-        // build_message_origin's `device-<short>` derivation, never panics.
-        let (pool, db_name) = crate::test_support::setup_test_db().await;
-        let h = headers_with(&[("x-lucidos-device-id", "no-such-device")]);
-        let actor = user_actor_resolved(&h, &pool, None).await;
-        match actor {
-            Some(MessageOrigin::Device { device_id, label }) => {
-                assert_eq!(device_id, "no-such-device");
-                assert_eq!(label, "device-no-such-");
-            }
-            other => panic!("expected Device with fallback label, got {:?}", other),
-        }
-        crate::test_support::teardown_test_db(&db_name).await;
-    }
-}
+#[path = "actor_tests.rs"]
+mod tests;

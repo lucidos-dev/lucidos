@@ -3,26 +3,61 @@ use crate::core::oauth;
 use crate::core::CredentialStore;
 
 /// Sentinel prefix on a tool result that the agentic loop strips off and
-/// re-emits as a `CredentialRequest` SSE event for the frontend modal.
+/// re-emits as a `CredentialPromptRequested` SSE event for the frontend modal.
 pub(crate) const CREDENTIAL_REQUEST_PREFIX: &str = "[CREDENTIAL_REQUEST]";
 
-/// Build a `[CREDENTIAL_REQUEST]<json>` tool result for the frontend to intercept.
-/// The JSON is built via `serde_json` so any characters (newlines, quotes,
-/// backslashes) in the inputs are escaped correctly — `format!`-based
-/// interpolation produces invalid JSON the moment a prompt has a newline.
+/// Wrap a pre-built credential-request JSON value in the sentinel prefix.
+/// The JSON must be built via `serde_json` (not `format!`-interpolated) so
+/// newlines, quotes, and backslashes in the inputs are escaped correctly —
+/// the agentic loop strips the prefix and parses the rest as JSON.
+pub(crate) fn credential_request_envelope(payload: serde_json::Value) -> String {
+    format!("{CREDENTIAL_REQUEST_PREFIX}{payload}")
+}
+
+/// Convenience wrapper for the common 4-field credential-request shape.
 pub(crate) fn credential_request_payload(
     service: &str,
     prompt: &str,
     base_url: &str,
     auth_type: &str,
 ) -> String {
-    let payload = serde_json::json!({
+    credential_request_with_defaults(service, prompt, base_url, auth_type, serde_json::Map::new())
+}
+
+/// Build the enveloped credential-request payload, optionally attaching an
+/// oauth `defaults` block (endpoint URLs + scopes the modal pre-fills). An empty
+/// `defaults` map omits the block entirely, so the modal treats it as a custom
+/// provider and expands the endpoint section for manual entry.
+pub(crate) fn credential_request_with_defaults(
+    service: &str,
+    prompt: &str,
+    base_url: &str,
+    auth_type: &str,
+    defaults: serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let mut payload = serde_json::json!({
         "service": service,
         "prompt": prompt,
         "base_url": base_url,
         "auth_type": auth_type,
     });
-    format!("{CREDENTIAL_REQUEST_PREFIX}{payload}")
+    if !defaults.is_empty() {
+        payload["defaults"] = serde_json::Value::Object(defaults);
+    }
+    credential_request_envelope(payload)
+}
+
+/// Collect the optional oauth endpoint + scopes args an agent passes (looked up
+/// from `system-knowhow/oauth-providers.md`) into a `defaults` map. Blank/absent
+/// args are dropped so they never pre-fill an empty field.
+fn oauth_defaults_from_args(args: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let mut defaults = serde_json::Map::new();
+    for key in ["auth_url", "token_url", "userinfo_url", "scopes"] {
+        if let Some(v) = args[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            defaults.insert(key.to_string(), serde_json::Value::String(v.to_string()));
+        }
+    }
+    defaults
 }
 
 impl LucidosEngine {
@@ -50,11 +85,21 @@ impl LucidosEngine {
                     ));
                 }
 
-                Ok(credential_request_payload(
+                // For oauth_client, the agent may pass endpoint URLs (looked up in
+                // the oauth-providers knowhow) so the modal pre-fills them instead
+                // of demanding the user type Google's own endpoints by hand.
+                let defaults = if auth_type == "oauth_client" {
+                    oauth_defaults_from_args(args)
+                } else {
+                    serde_json::Map::new()
+                };
+
+                Ok(credential_request_with_defaults(
                     service_name,
                     prompt,
                     base_url,
                     auth_type,
+                    defaults,
                 ))
             }
             "connect_oauth_account" => {
@@ -71,12 +116,27 @@ impl LucidosEngine {
                     .await?
                     .is_none()
                 {
-                    return Ok(credential_request_payload(
-                        &cred_service,
-                        &format!("Enter your OAuth client credentials for {provider}."),
-                        &format!("https://{provider}.com"),
-                        "oauth_client",
-                    ));
+                    // No client credentials yet — open the modal. Forward any
+                    // endpoints the agent looked up in the oauth-providers knowhow
+                    // (so a derived name like "ghealth" pre-fills Google's URLs),
+                    // and seed the default scopes from the requested scopes.
+                    let str_arg = |key: &str| {
+                        args[key]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    };
+                    let overrides = oauth::OAuthClientOverrides {
+                        base_url: str_arg("base_url"),
+                        auth_url: str_arg("auth_url"),
+                        token_url: str_arg("token_url"),
+                        userinfo_url: str_arg("userinfo_url"),
+                        scopes: Some(scopes.to_string()),
+                    };
+                    return Ok(credential_request_envelope(oauth::oauth_client_request(
+                        &provider, &overrides,
+                    )));
                 }
 
                 let (email, _display_name, _merged_scopes) =
@@ -140,5 +200,63 @@ mod tests {
         let parsed = parse_payload(&result);
         assert_eq!(parsed["service"], r#"weird"service"#);
         assert_eq!(parsed["base_url"], r#"https://example.com/path with "quotes""#);
+    }
+
+    #[test]
+    fn basic_payload_has_no_defaults_block() {
+        let result =
+            credential_request_payload("svc", "prompt", "https://api.example.com", "api_key");
+        let parsed = parse_payload(&result);
+        assert!(
+            parsed.get("defaults").is_none(),
+            "non-oauth payloads must not carry a defaults block: {parsed}"
+        );
+    }
+
+    #[test]
+    fn oauth_payload_attaches_supplied_endpoint_defaults() {
+        // request_credential with oauth_client + endpoints the agent looked up in
+        // the oauth-providers knowhow → the modal pre-fills (and stops requiring)
+        // the endpoint fields for a derived provider name like "oauth:ghealth".
+        let mut defaults = serde_json::Map::new();
+        defaults.insert(
+            "auth_url".to_string(),
+            serde_json::json!("https://accounts.google.com/o/oauth2/v2/auth"),
+        );
+        defaults.insert(
+            "token_url".to_string(),
+            serde_json::json!("https://oauth2.googleapis.com/token"),
+        );
+        let result = credential_request_with_defaults(
+            "oauth:ghealth",
+            "Enter your OAuth client credentials.",
+            "https://healthcare.googleapis.com",
+            "oauth_client",
+            defaults,
+        );
+        let parsed = parse_payload(&result);
+        assert_eq!(parsed["service"], "oauth:ghealth");
+        assert_eq!(parsed["auth_type"], "oauth_client");
+        assert_eq!(
+            parsed["defaults"]["auth_url"],
+            "https://accounts.google.com/o/oauth2/v2/auth"
+        );
+        assert_eq!(parsed["defaults"]["token_url"], "https://oauth2.googleapis.com/token");
+    }
+
+    #[test]
+    fn empty_defaults_map_omits_the_block() {
+        let result = credential_request_with_defaults(
+            "svc",
+            "prompt",
+            "https://api.example.com",
+            "oauth_client",
+            serde_json::Map::new(),
+        );
+        let parsed = parse_payload(&result);
+        assert!(
+            parsed.get("defaults").is_none(),
+            "an empty defaults map must omit the block entirely: {parsed}"
+        );
     }
 }

@@ -4,6 +4,7 @@ import {
   settingsSubview,
   panelOverlay,
   webviewInitialUrl,
+  wipPreviewThreadId,
 } from '../store';
 import type { SettingsSubview, InlineForm, PanelOverlay } from '../store';
 import type { MenuItem } from '../types';
@@ -17,6 +18,10 @@ export interface NavEntry {
   menuItem: MenuItem;
   settingsSubview: SettingsSubview;
   overlay: PanelOverlay;
+  /** Which app coding-agent thread's worktree the app-ui iframe is serving from.
+   *  Null when the iframe is showing the live workspace. Treated as nav-tracked
+   *  panel state so back/forward walks each toggle and a reload restores it. */
+  wipPreviewThreadId: string | null;
 }
 
 function inlineFormsEqual(a: InlineForm | null, b: InlineForm | null): boolean {
@@ -33,7 +38,7 @@ function inlineFormsEqual(a: InlineForm | null, b: InlineForm | null): boolean {
     }
     case 'app-edit': return a.appId === (b as typeof a).appId;
     case 'new-app': return true;
-    case 'trigger': return a.taskId === (b as typeof a).taskId;
+    case 'trigger': return a.triggerId === (b as typeof a).triggerId;
     case 'email-confirm': {
       const ar = a.request;
       const br = (b as typeof a).request;
@@ -70,7 +75,8 @@ export function statesEqual(a: NavEntry, b: NavEntry): boolean {
   return (
     a.menuItem === b.menuItem &&
     a.settingsSubview === b.settingsSubview &&
-    overlaysEqual(a.overlay, b.overlay)
+    overlaysEqual(a.overlay, b.overlay) &&
+    a.wipPreviewThreadId === b.wipPreviewThreadId
   );
 }
 
@@ -86,8 +92,16 @@ export function pushEntry(
   entry: NavEntry,
 ): { stack: NavEntry[]; cursor: number } | null {
   if (cursor < stack.length) {
-    // Same overlay = same content — skip even if menuItem differs
-    if (entry.overlay && overlaysEqual(entry.overlay, stack[cursor].overlay)) return null;
+    // Same overlay = same content — skip even if menuItem differs. WIP toggle
+    // is a separate axis on top of the overlay: same app-ui overlay with
+    // different wipPreviewThreadId is a distinct destination (the iframe is
+    // pointed at a different URL), so the overlay-only dedupe must not collapse
+    // it. statesEqual catches the all-fields-match case below.
+    if (
+      entry.overlay
+      && overlaysEqual(entry.overlay, stack[cursor].overlay)
+      && entry.wipPreviewThreadId === stack[cursor].wipPreviewThreadId
+    ) return null;
     if (statesEqual(entry, stack[cursor])) return null;
   }
   let newStack = [...stack.slice(0, cursor + 1), entry];
@@ -105,6 +119,7 @@ function captureState(): NavEntry {
     menuItem: activeMenuItem.value,
     settingsSubview: settingsSubview.value,
     overlay: panelOverlay.value,
+    wipPreviewThreadId: wipPreviewThreadId.value,
   };
 }
 
@@ -128,6 +143,7 @@ function migrateEntry(raw: Record<string, unknown>): NavEntry {
     menuItem: (raw.menuItem as MenuItem) ?? 'files',
     settingsSubview: (raw.settingsSubview as SettingsSubview) ?? 'main',
     overlay,
+    wipPreviewThreadId: (raw.wipPreviewThreadId as string | null | undefined) ?? null,
   };
 }
 
@@ -157,6 +173,11 @@ function restoreState(entry: NavEntry): void {
     if (overlay?.type === 'url-preview') {
       webviewInitialUrl.value = normalizeUrl(overlay.url);
     }
+    // Restore WIP last so the wipPreview effect re-runs with the overlay
+    // (and therefore currentApp) already in place — otherwise the effect
+    // would briefly see WIP set while the iframe is still showing the prior
+    // app and prematurely clear WIP via the openApp.id !== wipAppId branch.
+    wipPreviewThreadId.value = migrated.wipPreviewThreadId;
   } finally {
     _restoring = false;
   }

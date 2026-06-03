@@ -4,6 +4,7 @@ import {
   assertHealthy, switchToClaudeMode, sendFollowUp,
   waitForActionPanel, newThread, waitForCCToFinish,
   assertUserMessagesVisible, userMessageBody, USER_MSG_SELECTOR,
+  isMobileViewport, clickVisibleElement, waitForVisibleInput,
 } from './helpers';
 
 test.describe('Claude Code interaction', () => {
@@ -80,6 +81,44 @@ test.describe('Claude Code interaction', () => {
         return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').includes(marker);
       });
     }, { marker: msg, sel: USER_MSG_SELECTOR }, { timeout: 10_000 });
+  });
+
+  // Regression: the prompt toggle must decide routing at SEND time, not at
+  // draft-creation time. Typing first stamps thread.meta.channel from the
+  // current toggle ('chat'), so toggling to Claude afterwards has to update
+  // the channel binding before sendMessage reads it — otherwise the message
+  // routes through Lucidos despite the UI showing Claude. Mirrors the user
+  // report: "I selected Claude Code in the toggle but it started Lucidos".
+  test('typing first then toggling to Claude still routes to Claude Code', async ({ page }) => {
+    await navigateToApp(page);
+    await newThread(page);
+
+    const msg = uniqueMessage('cc-toggle-after-type');
+    const fullText = `Say exactly: "toggled ${msg}" and nothing else. Do not create any files.`;
+
+    // Type FIRST — this is what creates the optimistic compose thread with
+    // channel='chat' (because the toggle is still Lucidos at this moment).
+    const input = await waitForVisibleInput(page, 15_000);
+    await input.fill(fullText);
+
+    // Now toggle to Claude. Pre-fix this only updated draft.mode + inputMode
+    // but left thread.meta.channel stale → the send routed through Lucidos.
+    await switchToClaudeMode(page);
+    await expect(page.locator('button.segmented-btn.active:visible').first()).toHaveText('Claude');
+
+    // Send via the same viewport gate sendMessage uses: Enter on desktop,
+    // click Send on mobile (mobile disables Enter-to-submit so the soft
+    // keyboard can insert newlines).
+    if (isMobileViewport(page)) {
+      await clickVisibleElement(page, 'button[aria-label="Send message"]');
+    } else {
+      await input.press('Enter');
+    }
+
+    // The CC-specific "Archive" action panel only appears for Claude Code
+    // threads — Lucidos chats stream a response and stop, no action panel.
+    // If the bug were back, this would time out waiting for an Archive button.
+    await waitForActionPanel(page, 'Archive', 120_000);
   });
 
   test('CC thread shows reply placeholder when idle', async ({ page }) => {

@@ -99,7 +99,9 @@
 .thread-row {
     cursor: pointer;
     position: relative;
-    padding-left: 1.25rem;
+    /* `--thread-depth` inherits from the row wrapper for nested children (set
+     * via depthStyle() in ThreadDrawer.tsx); 0 keeps top-level rows aligned. */
+    padding-left: calc(1.25rem + var(--thread-depth, 0) * 1rem);
     /* Right padding matches `.threads-header`'s `padding: 0 0.5rem` so action
      * icons sit in the same horizontal slot as the filter/search above. */
     padding-right: 0.5rem;
@@ -108,10 +110,231 @@
     user-select: none;
 }
 
+/* Override `.list-row:hover` (global.css) — its `--bg-hover` (#eaeef2) is
+ * almost the same gray as `--border-color` (#d0d7de), so the hovered row's
+ * top edge of bg-hover visually merges with the 1px divider above it and the
+ * pair reads as one thick band (~5x the apparent thickness of an unhovered
+ * divider). `--bg-secondary` is light enough vs the border color to keep the
+ * divider visually separate while still signalling hover.
+ *
+ * `:not()` exclusions keep this from outranking the focused / highlighted
+ * rules below — without them, this selector's (0,4,0) specificity beats
+ * `.thread-row-focused:hover` (0,3,0) and the selected row would lose its
+ * `bg-selected` background whenever the user hovers it. */
+@media (hover: hover) {
+    .thread-drawer .list-row.thread-row:not(.thread-row-focused):not(.thread-row-highlighted):hover {
+        background: var(--bg-secondary);
+    }
+}
+
+/* Drawer rows: the horizontal divider between rows lives on the *next*
+ * wrapper's ::before (rule below), not on the row itself — kill the
+ * inherited `.list-row` border-bottom so the wrapper's leading divider is
+ * the only horizontal line between rows. Scoped to wrapped rows so
+ * `SearchResultRow` (which renders a bare `.list-row.thread-row` without
+ * a wrapper) keeps its standard `.list-row` divider. */
+.thread-row-wrap .thread-row {
+    border-bottom: 0;
+}
+
+/* Each row wrapper owns one horizontal divider ABOVE itself, spanning the
+ * full drawer width. Drawing it on the *next* wrapper (rather than below the
+ * previous row) keeps the line attached to the row whose content sits right
+ * below it. Each wrapper draws exactly one divider, so dividers never stack. */
+.thread-row-wrap {
+    position: relative;
+}
+
+.thread-row-wrap::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: var(--border-color);
+    pointer-events: none;
+    /* Paint above the row's background — the focused row's bg-selected and
+     * the family-toggle band's bg-secondary both reach the wrapper's top edge
+     * and would otherwise hide this 1px line. */
+    z-index: 1;
+}
+
+/* x-position of the family rail: one indent step to the left of this row's
+ * own status-icon column, so the rail sits centered below the parent's
+ * status dot. Shared by the rail (`.thread-row::before`) and the row's
+ * clip-path; also reused as the family-toggle-wrap's margin-left so the
+ * header band lines up with the children's visible left edge below.
+ * `--thread-depth` is set inline by depthStyle() in ThreadDrawer.tsx and
+ * inherits down to the row + its pseudo-elements. */
+.thread-row-wrap.is-nested {
+    --thread-indent: calc(0.8125rem + (var(--thread-depth, 0) - 1) * 1rem);
+    --rail-x: var(--thread-indent);
+}
+
+/* Inset the top divider to the rail position so it respects the row's
+ * indent instead of bleeding across the parent's rail/indent area. */
+.thread-row-wrap.is-nested::before {
+    left: var(--rail-x);
+}
+
+/* First row of a section: the section title already has its own
+ * border-bottom — suppress the row's top divider so the two don't stack
+ * into a doubled line at the top of the first row. */
+.list-section-title + .thread-row-wrap::before {
+    display: none;
+}
+
+/* Family-toggle's top divider extends leftward past the wrap's own
+ * `margin-left: var(--thread-indent)` so it lines up with the parent row's
+ * divider above. min(var(--thread-indent), 1rem) is the parent's indent step
+ * from the wrap's perspective — depth 1 child pulls back the full base
+ * (parent is at drawer edge), depth ≥2 pulls back one indent step. */
+.thread-row-wrap.is-nested.family-toggle-wrap::before {
+    left: calc(-1 * min(var(--thread-indent), 1rem));
+}
+
+/* Family rail: a 1px vertical guide line at each nested row's parent indent,
+ * drawn per-row so segments butt into a continuous line under the parent.
+ * Visually links a child back to its parent — the indent alone reads too
+ * weakly. Only on nested rows (depth > 0); the wrapper carries the marker
+ * class so the depth gate doesn't depend on style-attribute matching.
+ *
+ * The family-toggle header itself does NOT carry the rail — the spine starts
+ * at the first child row below. */
+.thread-row-wrap.is-nested .thread-row::before {
+    content: '';
+    position: absolute;
+    left: var(--rail-x);
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: var(--border-color);
+    pointer-events: none;
+    /* Match `.thread-row-wrap::before`'s z-index so the rail and divider
+     * paint in tree order at the 1px corner — without it, the divider would
+     * clip the top of the focused/lifted-child accent rail. */
+    z-index: 1;
+}
+
+.thread-row-wrap.is-nested .thread-row::before {
+    transition: background var(--duration-fast) ease, width var(--duration-fast) ease;
+}
+
+/* Hover anywhere on the row brightens that row's rail segment. Adjacent
+ * segments stay gray until hovered themselves — keeps the cue local without
+ * needing JS to know the family extent. */
+@media (hover: hover) {
+    .thread-row-wrap.is-nested .thread-row:hover::before {
+        background: var(--accent);
+    }
+}
+
+/* Lifted-family cue: a descendant whose own natural section matches the
+ * routed section (i.e. it earned the lift). Promotes the rail to the section
+ * accent at 2px so the eye lands on it while scanning the section, then
+ * traces up to the lifted family. */
+.thread-row-wrap.is-nested .thread-row.thread-row-lifted-child::before {
+    width: 0.125rem;
+    background: var(--accent);
+}
+
+/* Lifted-family root: render the parent muted so it reads as "I'm here
+ * because of one of my children". The native-section style is not modeled per
+ * section in the drawer today — opacity is a strong-enough demotion cue
+ * without needing per-section row treatments. */
+.thread-row.thread-row-lifted-parent .thread-row-title,
+.thread-row.thread-row-lifted-parent .thread-row-meta,
+.thread-row.thread-row-lifted-parent .thread-row-time,
+.thread-row.thread-row-lifted-parent .message-channel-tag {
+    opacity: 0.6;
+}
+
+/* Family toggle row: a sub-section header that renders under a parent
+ * thread row when the family has any sub-threads. Tinted background frames
+ * the children as one unit and signals the hidden family when collapsed.
+ *
+ * `margin-left` matches the CHILDREN's nesting offset (`--thread-indent`),
+ * so the header starts at the same x as the children's visible (clip-path)
+ * left edge below — the tinted band reads as the children's header, not
+ * the parent's. The first child wrap's inherited `::before { left: var(
+ * --rail-x); }` (rail-x === thread-indent for is-nested rows) puts the
+ * divider directly underneath the header at the same x.
+ *
+ * Padding and font-size deliberately mirror `.list-section-title` in
+ * global.css — this is the sub-section sibling of the top-level section
+ * header. Lighter tint (bg-secondary vs bg-tertiary) and weight 500 (not
+ * 600) keep the visual hierarchy: section header > family header > row. */
+.thread-row-wrap.is-nested.family-toggle-wrap {
+    background: var(--bg-secondary);
+    margin-left: var(--thread-indent);
+    /* Override the depth-relative inherited --rail-x to a constant so the
+     * glyph-padding-inside-wrap (which uses --rail-x below) stays at the
+     * base 0.8125rem regardless of depth. The header itself draws no rail. */
+    --rail-x: 0.8125rem;
+}
+
+.family-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    /* Left padding == --rail-x (overridden to 0.8125rem on the wrap above)
+     * keeps the ▾ glyph at the same internal inset at every depth. */
+    padding: 0.375rem 1rem 0.375rem var(--rail-x);
+    font-size: 0.6875rem;
+    font-weight: 500;
+    /* Stay on the pixel grid: fractional row heights put 1px dividers
+     * off-grid, where retina + zoom anti-alias them visibly fuzzy. */
+    line-height: 0.8125rem;
+    text-align: left;
+    transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+
+.family-toggle-glyph {
+    width: 0.625rem;
+    text-align: center;
+    color: var(--text-secondary);
+    transition: color var(--duration-fast) ease;
+}
+
+.family-toggle-progress {
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+@media (hover: hover) {
+    .family-toggle:hover {
+        color: var(--text-primary);
+        background: var(--bg-tertiary);
+    }
+    .family-toggle:hover .family-toggle-glyph {
+        color: var(--accent);
+    }
+}
+
 .thread-row.thread-row-focused,
 .thread-row.thread-row-focused:hover {
     background: var(--bg-selected);
     border-left: 0.125rem solid var(--accent);
+}
+
+/* Nested focus marker: drop the border instead of making it transparent —
+ * the rail ::before below is positioned from the padding edge, so a 2px
+ * transparent border would shift it past var(--rail-x) (the clip-path edge)
+ * and leak a bg-selected gap before the accent starts. */
+.thread-row-wrap.is-nested .thread-row.thread-row-focused,
+.thread-row-wrap.is-nested .thread-row.thread-row-focused:hover {
+    border-left: 0;
+}
+
+.thread-row-wrap.is-nested .thread-row.thread-row-focused::before {
+    background: var(--accent);
+    width: 0.125rem;
 }
 
 .thread-row.thread-row-highlighted {
@@ -122,6 +345,18 @@
 
 .thread-row.thread-row-highlighted.thread-row-focused {
     background: var(--bg-selected);
+}
+
+/* Nested rows: the whole row's painted output (background, focused
+ * selection tint, highlighted outline) is clipped to start at the rail
+ * position. The row's box still spans the full width — layout and
+ * positions stay identical to top-level rows — but visually the row looks
+ * indented as a single unit instead of having content pushed right inside
+ * a full-width strip. The horizontal divider lives on the wrapper's
+ * ::before (above) which sits outside the row's clip, so the inset divider
+ * lands at rail-x regardless. */
+.thread-row-wrap.is-nested .thread-row {
+    clip-path: inset(0 0 0 var(--rail-x));
 }
 
 .thread-row-left {
@@ -164,11 +399,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     padding-left: 0.25rem;
-}
-
-.thread-row-children-progress {
-    color: var(--text-secondary);
-    font-variant-numeric: tabular-nums;
 }
 
 .thread-row-right {
@@ -231,7 +461,10 @@
 
 .thread-row > .thread-status {
     position: absolute;
-    left: 0.375rem;
+    /* Stays a fixed 0.875rem inset from the padded edge — at depth 0 this is
+     * 0.375rem, at depth 1 it's 1.375rem, etc. — so the dot tracks the title
+     * indent instead of sitting in dead space at the row's left edge. */
+    left: calc(0.375rem + var(--thread-depth, 0) * 1rem);
     top: 1.0625rem;
     transform: translateY(-50%);
 }
@@ -381,7 +614,7 @@
     gap: 0.25rem;
 }
 
-.section-review-badge {
+.section-attention-badge {
     margin-left: auto;
     font-size: 0.6875rem;
     font-weight: 600;
@@ -389,8 +622,10 @@
     background: var(--accent);
     padding: 0 0.375rem;
     border-radius: 0.625rem;
-    line-height: 1.1rem;
-    min-width: 1.1rem;
+    /* Integer pixels — the badge sizes the section title's flex row, so a
+     * fractional line-height here knocks every drawer row off-grid. */
+    line-height: 1rem;
+    min-width: 1rem;
     text-align: center;
 }
 

@@ -1,10 +1,14 @@
 pub mod condition;
 pub mod config;
+pub mod groups;
 pub mod replay;
 
 pub use config::{
-    is_valid_trigger_slug, slugify_trigger_name, slugify_trigger_name_with_fallback,
-    validate_script_extension, TriggerConfig, TriggerRun,
+    is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
+    EventSubscription, TriggerConfig, TriggerRun,
+};
+pub use groups::{
+    find_group_by_name_ci, replay_trigger_group_events, TriggerGroup, TriggerGroupEventRow,
 };
 pub use replay::{replay_trigger_events, TriggerEventRow};
 
@@ -14,8 +18,12 @@ use std::collections::HashMap;
 ///
 /// Returns configs for triggers where:
 /// 1. The trigger is not paused
-/// 2. `trigger.on` matches `event_type`
-/// 3. The condition (if any) evaluates to true against `payload`
+/// 2. At least one of `trigger.on[*].event_type` matches `event_type`, AND
+///    that entry's condition (if any) evaluates true against `payload`.
+///
+/// Conditions are scoped to each subscription, so a single trigger can listen
+/// for multiple events with different payload shapes without one filter
+/// constraining the other.
 pub fn find_matching_event_triggers(
     configs: &HashMap<String, TriggerConfig>,
     event_type: &str,
@@ -25,8 +33,10 @@ pub fn find_matching_event_triggers(
         .values()
         .filter(|t| {
             !t.paused
-                && t.on.as_deref() == Some(event_type)
-                && condition::evaluate(t.condition.as_ref(), payload)
+                && t.on.iter().any(|sub| {
+                    sub.event_type == event_type
+                        && condition::evaluate(sub.condition.as_ref(), payload)
+                })
         })
         .cloned()
         .collect()
@@ -37,11 +47,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn make_event_trigger(
-        id: &str,
-        on: &str,
-        condition: Option<serde_json::Value>,
-    ) -> TriggerConfig {
+    fn make_event_trigger(id: &str, subs: Vec<EventSubscription>) -> TriggerConfig {
         TriggerConfig {
             id: id.to_string(),
             name: format!("Trigger {}", id),
@@ -51,12 +57,19 @@ mod tests {
             run: TriggerRun::Script {
                 path: "scripts/run.py".to_string(),
             },
-            on: Some(on.to_string()),
-            condition,
+            on: subs,
             paused: false,
             last_run: None,
             app_id: None,
             go_to_review: false,
+            group_id: None,
+        }
+    }
+
+    fn sub(event_type: &str, condition: Option<serde_json::Value>) -> EventSubscription {
+        EventSubscription {
+            event_type: event_type.to_string(),
+            condition,
         }
     }
 
@@ -65,7 +78,7 @@ mod tests {
         let mut configs = HashMap::new();
         configs.insert(
             "t1".into(),
-            make_event_trigger("t1", "SlideTextEdited", None),
+            make_event_trigger("t1", vec![sub("SlideTextEdited", None)]),
         );
 
         let matches = find_matching_event_triggers(&configs, "SlideTextEdited", &json!({}));
@@ -78,7 +91,7 @@ mod tests {
         let mut configs = HashMap::new();
         configs.insert(
             "t1".into(),
-            make_event_trigger("t1", "SlideTextEdited", None),
+            make_event_trigger("t1", vec![sub("SlideTextEdited", None)]),
         );
 
         let matches = find_matching_event_triggers(&configs, "OtherEvent", &json!({}));
@@ -88,7 +101,7 @@ mod tests {
     #[test]
     fn skips_paused_triggers() {
         let mut configs = HashMap::new();
-        let mut trigger = make_event_trigger("t1", "SlideTextEdited", None);
+        let mut trigger = make_event_trigger("t1", vec![sub("SlideTextEdited", None)]);
         trigger.paused = true;
         configs.insert("t1".into(), trigger);
 
@@ -103,17 +116,17 @@ mod tests {
             "t1".into(),
             make_event_trigger(
                 "t1",
-                "SleepImported",
-                Some(json!({"sleep_score": {"$lt": 70}})),
+                vec![sub(
+                    "SleepImported",
+                    Some(json!({"sleep_score": {"$lt": 70}})),
+                )],
             ),
         );
 
-        // Matching payload
         let matches =
             find_matching_event_triggers(&configs, "SleepImported", &json!({"sleep_score": 55}));
         assert_eq!(matches.len(), 1);
 
-        // Non-matching payload
         let matches =
             find_matching_event_triggers(&configs, "SleepImported", &json!({"sleep_score": 85}));
         assert!(matches.is_empty());
@@ -122,9 +135,18 @@ mod tests {
     #[test]
     fn multiple_triggers_for_same_event() {
         let mut configs = HashMap::new();
-        configs.insert("t1".into(), make_event_trigger("t1", "DataImported", None));
-        configs.insert("t2".into(), make_event_trigger("t2", "DataImported", None));
-        configs.insert("t3".into(), make_event_trigger("t3", "OtherEvent", None));
+        configs.insert(
+            "t1".into(),
+            make_event_trigger("t1", vec![sub("DataImported", None)]),
+        );
+        configs.insert(
+            "t2".into(),
+            make_event_trigger("t2", vec![sub("DataImported", None)]),
+        );
+        configs.insert(
+            "t3".into(),
+            make_event_trigger("t3", vec![sub("OtherEvent", None)]),
+        );
 
         let matches = find_matching_event_triggers(&configs, "DataImported", &json!({}));
         assert_eq!(matches.len(), 2);
@@ -142,16 +164,80 @@ mod tests {
             run: TriggerRun::Intent {
                 intent: "do something".to_string(),
             },
-            on: None,
-            condition: None,
+            on: vec![],
             paused: false,
             last_run: None,
             app_id: None,
             go_to_review: false,
+            group_id: None,
         };
         configs.insert("cron-only".into(), cron_trigger);
 
         let matches = find_matching_event_triggers(&configs, "SlideTextEdited", &json!({}));
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn matches_when_any_subscription_event_type_matches() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "multi".into(),
+            make_event_trigger(
+                "multi",
+                vec![sub("OuraSleepImported", None), sub("EmailReceived", None)],
+            ),
+        );
+
+        assert_eq!(
+            find_matching_event_triggers(&configs, "OuraSleepImported", &json!({})).len(),
+            1
+        );
+        assert_eq!(
+            find_matching_event_triggers(&configs, "EmailReceived", &json!({})).len(),
+            1
+        );
+        assert!(find_matching_event_triggers(&configs, "OtherEvent", &json!({})).is_empty());
+    }
+
+    #[test]
+    fn per_subscription_condition_scopes_to_that_event() {
+        // Each entry's condition only filters its own event_type, so an unrelated
+        // sibling event can fire even when the other entry's condition references
+        // fields it doesn't carry.
+        let mut configs = HashMap::new();
+        configs.insert(
+            "per-event".into(),
+            make_event_trigger(
+                "per-event",
+                vec![
+                    sub(
+                        "OuraSleepImported",
+                        Some(json!({"sleep_score": {"$lt": 70}})),
+                    ),
+                    sub("EmailReceived", None),
+                ],
+            ),
+        );
+
+        assert_eq!(
+            find_matching_event_triggers(
+                &configs,
+                "OuraSleepImported",
+                &json!({"sleep_score": 55}),
+            )
+            .len(),
+            1
+        );
+        assert!(find_matching_event_triggers(
+            &configs,
+            "OuraSleepImported",
+            &json!({"sleep_score": 90}),
+        )
+        .is_empty());
+        assert_eq!(
+            find_matching_event_triggers(&configs, "EmailReceived", &json!({"from": "a@b"}))
+                .len(),
+            1
+        );
     }
 }

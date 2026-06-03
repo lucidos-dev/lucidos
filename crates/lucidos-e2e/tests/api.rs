@@ -17,6 +17,12 @@ mod chat_test;
 #[path = "api_support/threads_test.rs"]
 mod threads_test;
 
+#[path = "api_support/threads_list_test.rs"]
+mod threads_list_test;
+
+#[path = "api_support/filter_facets_test.rs"]
+mod filter_facets_test;
+
 #[path = "api_support/sse_test.rs"]
 mod sse_test;
 
@@ -25,6 +31,9 @@ mod errors_test;
 
 #[path = "api_support/changes_test.rs"]
 mod changes_test;
+
+#[path = "api_support/app_coding_agent_test.rs"]
+mod app_coding_agent_test;
 
 #[path = "api_support/cc_diff_test.rs"]
 mod cc_diff_test;
@@ -61,3 +70,24 @@ mod blobs_test;
 
 #[path = "api_support/image_migration_test.rs"]
 mod image_migration_test;
+
+#[path = "api_support/load_knowhow_dedup_test.rs"]
+mod load_knowhow_dedup_test;
+
+#[path = "api_support/context_capture_lazy_test.rs"]
+mod context_capture_lazy_test;
+
+#[path = "api_support/tool_result_lazy_test.rs"]
+mod tool_result_lazy_test;
+
+#[path = "api_support/trigger_groups_test.rs"]
+mod trigger_groups_test;
+
+#[path = "api_support/cascade_archive_test.rs"]
+mod cascade_archive_test;
+
+#[path = "api_support/notifications_presence_test.rs"]
+mod notifications_presence_test;
+
+#[path = "api_support/credentials_test.rs"]
+mod credentials_test;

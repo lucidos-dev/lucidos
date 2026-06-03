@@ -3,11 +3,12 @@ import { showToast } from '../../store/store';
 import { getCcAllowedTools, putCcAllowedTools } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import type { Loadable } from '../../store/types';
+import { toFailed, type Loadable } from '../../store/types';
+import { LoadableError } from '../shared/LoadableError';
 
 /** Direct view/edit of `~/.lucidos/cc-allowed-tools` — the file Lucidos passes
- *  to CC subprocesses as `--allowedTools`. Edits take effect on the next CC
- *  spawn (running subprocesses keep their frozen flag). */
+ *  to each coding-agent session (today: Claude Code) as `--allowedTools`. Edits
+ *  take effect on the next session spawn (running sessions keep their frozen flag). */
 export function CcAllowedToolsSection() {
   const [loadable, setLoadable] = useState<Loadable<string>>({ status: 'not-loaded' });
   const [draft, setDraft] = useState<string>('');
@@ -22,7 +23,7 @@ export function CcAllowedToolsSection() {
         setDraft(contents);
       })
       .catch((e) => {
-        setLoadable({ status: 'failed', error: errorDetail(e) });
+        setLoadable(toFailed(e));
       });
   }, []);
 
@@ -43,7 +44,7 @@ export function CcAllowedToolsSection() {
     return (
       <div class="settings-section">
         <div class="settings-section-title">Tool permissions</div>
-        <div class="empty-state error-text">Failed to load: {loadable.error}</div>
+        <LoadableError noun="tool permissions" error={loadable.error} />
       </div>
     );
   }
@@ -64,7 +65,7 @@ export function CcAllowedToolsSection() {
       <div class="settings-section-title">Tool permissions</div>
       <p class="settings-section-desc">
         Patterns passed to Claude Code as <code>--allowedTools</code>. One per line; lines starting with <code>#</code> are ignored.
-        Use the <strong>Always allow</strong> buttons on permission prompts to add entries quickly. Changes apply to new CC sessions.
+        Use the <strong>Always allow</strong> buttons on permission prompts to add entries quickly. Changes apply to new Claude Code sessions.
       </p>
       <textarea
         class="cc-allowed-tools-editor"

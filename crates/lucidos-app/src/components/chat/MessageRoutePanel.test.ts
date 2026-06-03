@@ -311,7 +311,7 @@ describe('executorExtras', () => {
     expect(extras.ccSessionId).toBe('s1');
   });
 
-  it('falls back to earlier SessionStarted for follow-up exchanges in the same CC session', () => {
+  it('falls back to earlier SessionStarted for follow-up exchanges in the same Claude Code session', () => {
     // Turn 1: MessageReceived + SessionStarted (branch A)
     // Turn 2: MessageReceived only — no fresh SessionStarted because CC reused the session
     const t1User = stamp(0, { type: 'MessageReceived', text: 'first' });
@@ -327,7 +327,7 @@ describe('executorExtras', () => {
   });
 
   it('uses the most recent SessionStarted when a thread has multiple sessions over time', () => {
-    // Two CC sessions back-to-back: branch A then branch B. Follow-up exchange after B
+    // Two Claude Code sessions back-to-back: branch A then branch B. Follow-up exchange after B
     // must report branch B, not branch A.
     const t1User = stamp(0, { type: 'MessageReceived', text: 'first' });
     const sessA = stamp(1, { type: 'SessionStarted', session_id: 's1', branch: 'branch-A' });
@@ -343,7 +343,7 @@ describe('executorExtras', () => {
   });
 
   it('does not leak a future session into an earlier exchange', () => {
-    // The first exchange ran on branch A; later the user started a new CC session on
+    // The first exchange ran on branch A; later the user started a new Claude Code session on
     // branch B. Looking at the first exchange's panel must still show branch A.
     const t1User = stamp(0, { type: 'MessageReceived', text: 'first' });
     const sessA = stamp(1, { type: 'SessionStarted', session_id: 's1', branch: 'branch-A' });
@@ -357,7 +357,7 @@ describe('executorExtras', () => {
     expect(extras.ccSessionId).toBe('s1');
   });
 
-  it('reads branch from ContinuationStarted (engine restart resumes a CC session)', () => {
+  it('reads branch from ContinuationStarted (engine restart resumes a Claude Code session)', () => {
     const recovered = stamp(0, { type: 'ContinuationStarted', branch: 'recovered-branch' });
     const followUp = stamp(60, { type: 'MessageReceived', text: 'continue' });
     const exchange: Exchange = { userEvent: followUp, userSeq: 5, steps: [] };
@@ -416,7 +416,7 @@ describe('executorExtras', () => {
   it('still extracts permissionMode and context from the current exchange steps only', () => {
     const userEvent = stamp(0, { type: 'MessageReceived', text: 'go' });
     const settings = stamp(1, { type: 'CodingAgentSettingsChanged', permission_mode: 'plan' });
-    const thinking = stamp(2, { type: 'Thinking', text: '...', context_tokens: 12345, trimmed: true });
+    const thinking = stamp(2, { type: 'ThoughtStreamed', text: '...', context_tokens: 12345, trimmed: true });
     const exchange: Exchange = {
       userEvent,
       userSeq: 1,
@@ -439,11 +439,62 @@ describe('renderChannelSection', () => {
     const node = renderChannelSection({ kind: 'api', user_agent: 'MyApp/1.0', mode: 'agent' });
     expect(JSON.stringify(node)).toContain('MyApp/1.0');
   });
+  it('api origin with source_thread_id renders deep-link to spawning thread', () => {
+    // The subprocess-origin path: `source_thread_id` set after the engine
+    // recognised the request as coming from a Lucidos subprocess. The
+    // popover must surface that link so a user can answer "which agent
+    // did this".
+    const node = renderChannelSection(
+      { kind: 'api', user_agent: 'curl/8.7.1', mode: 'agent', source_thread_id: 'src-thread' },
+      undefined,
+      (tid) => tid === 'src-thread' ? 'Spawning thread title' : undefined,
+    );
+    const s = JSON.stringify(node);
+    expect(s).toContain('curl/8.7.1');
+    expect(s).toContain('Spawning thread title');
+  });
+  it('api origin with source_thread_id falls back to short id when no title resolver', () => {
+    // When `getLiveTitle` returns undefined we still want a visible link —
+    // a `thread <short>` placeholder so the popover is never blank.
+    const node = renderChannelSection({
+      kind: 'api',
+      user_agent: 'curl/8.7.1',
+      mode: 'agent',
+      source_thread_id: '12345678-abcd-...',
+    });
+    const s = JSON.stringify(node);
+    expect(s).toContain('curl/8.7.1');
+    expect(s).toContain('thread 12345678');
+  });
   it('workspace origin renders workspace name', () => {
     const node = renderChannelSection({
       kind: 'workspace', workspace: 'personal', mode: 'agent',
     });
     expect(JSON.stringify(node)).toContain('personal');
+  });
+  it('workspace origin with thread_id renders a thread link (short id when title unresolved)', () => {
+    // No getLiveTitle and an empty current-workspace name (the test default) →
+    // treated as local with no resolvable title → `thread <short>` placeholder
+    // so the link is never blank.
+    const node = renderChannelSection({
+      kind: 'workspace',
+      workspace: 'personal',
+      thread_id: '12345678-aaaa-bbbb-cccc-dddddddddddd',
+      mode: 'agent',
+    });
+    const s = JSON.stringify(node);
+    expect(s).toContain('personal');
+    expect(s).toContain('thread 12345678');
+  });
+  it('workspace origin renders the live thread name when the source thread is local', () => {
+    // workspaceName defaults to '' in tests → the origin is treated as local →
+    // the live `getLiveTitle` lookup wins over the short-id fallback.
+    const node = renderChannelSection(
+      { kind: 'workspace', workspace: 'dev', thread_id: 'tid', mode: 'agent' },
+      undefined,
+      (id) => (id === 'tid' ? 'Local thread name' : undefined),
+    );
+    expect(JSON.stringify(node)).toContain('Local thread name');
   });
   it('parent_thread origin renders thread title', () => {
     const node = renderChannelSection(
@@ -460,19 +511,25 @@ describe('renderChannelSection', () => {
 });
 
 describe('renderAuditSection', () => {
-  it('workspace origin with thread/event ids renders them', () => {
+  it('workspace origin renders the event id but not the thread id (thread id is a channel link)', () => {
     const node = renderAuditSection({
       kind: 'workspace', workspace: 'p', thread_id: 'tid', event_id: 'eid', mode: 'agent',
     });
     const s = JSON.stringify(node);
-    expect(s).toContain('tid');
     expect(s).toContain('eid');
+    expect(s).not.toContain('tid');
+  });
+  it('workspace origin with only a thread id renders nothing (thread id moved to the channel)', () => {
+    const node = renderAuditSection({
+      kind: 'workspace', workspace: 'p', thread_id: 'tid', mode: 'agent',
+    });
+    expect(node).toBeNull();
   });
   it('parent_thread origin without spawning_event_id renders nothing', () => {
     const node = renderAuditSection({ kind: 'thread_link', thread_id: 't', mode: 'agent' });
     expect(node).toBeNull();
   });
-  it('device/api/engine origin renders nothing', () => {
+  it('device/api/v1/engine origin renders nothing', () => {
     expect(renderAuditSection({ kind: 'device', device_id: 'd', label: 'L' })).toBeNull();
     expect(renderAuditSection({ kind: 'api' })).toBeNull();
     expect(renderAuditSection({ kind: 'engine', reason: { kind: 'session_recovered' } })).toBeNull();

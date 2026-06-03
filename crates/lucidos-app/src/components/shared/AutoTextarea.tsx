@@ -11,8 +11,8 @@ interface Props {
 /**
  * Auto-expanding textarea for modal form fields.
  * - Grows/shrinks to fit content (min 1 row)
- * - Enter submits the parent form
- * - Shift+Enter inserts a newline
+ * - Inside a <form>: Enter submits, Shift+Enter inserts a newline
+ * - Outside a <form>: Enter inserts a newline (default browser behavior)
  */
 export function AutoTextarea({ value, onInput, placeholder, required }: Props) {
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -25,8 +25,11 @@ export function AutoTextarea({ value, onInput, placeholder, required }: Props) {
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      ref.current?.form?.requestSubmit();
+      const form = ref.current?.form;
+      if (form) {
+        e.preventDefault();
+        form.requestSubmit();
+      }
     }
   }
 

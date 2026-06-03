@@ -5,7 +5,7 @@ async fn unknown_route_returns_non_json() {
     let client = http_client();
     // Unknown /api routes fall through to the Vite SPA proxy, returning HTML.
     // Verify the response is NOT valid JSON (it's the SPA fallback, not an API response).
-    let url = format!("{}/api/nonexistent-endpoint", base_url());
+    let url = format!("{}/api/v1/nonexistent-endpoint", base_url());
 
     let resp = client.get(&url).send().await.expect("Request failed");
     let body = resp.text().await.expect("Failed to read body");
@@ -19,7 +19,7 @@ async fn unknown_route_returns_non_json() {
 #[tokio::test]
 async fn malformed_chat_body_returns_error() {
     let client = http_client();
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
 
     // Send invalid JSON
     let resp = client
@@ -41,7 +41,7 @@ async fn malformed_chat_body_returns_error() {
 #[tokio::test]
 async fn missing_content_type_for_chat_returns_error() {
     let client = http_client();
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
 
     // Send without content-type header
     let resp = client
@@ -61,7 +61,7 @@ async fn missing_content_type_for_chat_returns_error() {
 #[tokio::test]
 async fn get_on_post_only_endpoint_returns_405() {
     let client = http_client();
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
 
     let resp = client.get(&url).send().await.expect("Request failed");
     let status = resp.status().as_u16();
@@ -76,7 +76,7 @@ async fn get_on_post_only_endpoint_returns_405() {
 async fn thread_messages_for_nonexistent_thread() {
     let client = http_client();
     let url = format!(
-        "{}/api/threads/00000000-0000-0000-0000-000000000000/messages",
+        "{}/api/v1/threads/00000000-0000-0000-0000-000000000000/messages",
         base_url()
     );
 

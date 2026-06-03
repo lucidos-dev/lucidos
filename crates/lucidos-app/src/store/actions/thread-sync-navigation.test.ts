@@ -31,6 +31,15 @@ vi.mock('./triggers', () => ({ navigateToTrigger, loadTriggers: vi.fn() }));
 const pushNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState }));
 
+// Mock pane helper so we can assert handleNavigationRequest reveals the
+// content pane on EVERY content-landing target — directly (for branches
+// that use setActiveMenu) or transitively (for branches that delegate to a
+// helper that already calls it). See `.claude/rules/frontend.md` —
+// "Navigation that lands content must call revealContentPane()".
+const revealContentPane = vi.fn();
+const navigateToPane = vi.fn();
+vi.mock('./pane', () => ({ revealContentPane, navigateToPane }));
+
 const unfocusThread = vi.fn();
 vi.mock('./threads', () => ({ focusThread: vi.fn(), unfocusThread }));
 
@@ -44,6 +53,7 @@ vi.mock('../../components/chat/promptFocus', () => ({ focusPromptNow }));
 // Minimal mocks for other imports that thread-sync.ts pulls in
 vi.mock('../../api/client', () => ({
   API_BASE: '',
+  API: '/api/v1',
   postMcpConsent: vi.fn(),
 }));
 vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn() }));
@@ -109,6 +119,11 @@ describe('handleNavigationRequest', () => {
     // switchMenuItem would push an extra (triggers, no overlay) entry first.
     expect(switchMenuItem).not.toHaveBeenCalled();
     expect(pushNavState).toHaveBeenCalledTimes(1);
+    // The new-trigger branch uses setActiveMenu directly (NOT switchMenuItem),
+    // so it must call revealContentPane itself — without this the mobile user
+    // tapping a new-trigger deep-link silently stayed on whatever pane they
+    // were on.
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 
   it('opens new-app form atomically (single nav push)', () => {
@@ -119,6 +134,7 @@ describe('handleNavigationRequest', () => {
     );
     expect(switchMenuItem).not.toHaveBeenCalled();
     expect(pushNavState).toHaveBeenCalledTimes(1);
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 
   it('opens fresh compose for new-chat target (no prefill)', async () => {

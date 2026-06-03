@@ -55,7 +55,7 @@ pub(super) async fn upload_archive(
         .file_name()
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing filename"))?
         .to_string();
-    let safe_name = sanitize_filename(&raw_name)
+    let safe_name = super::sanitize_leaf_filename(&raw_name)
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid filename"))?;
     if !safe_name.to_ascii_lowercase().ends_with(PLUGIN_ARCHIVE_EXT) {
         return Err(err(
@@ -200,49 +200,3 @@ pub(super) async fn cancel_uninstall(
     }
 }
 
-/// Reject filenames that would escape the upload directory or break the
-/// `<uuid>/<name>` shape. Mirrors `is_path_traversal` (rejects any `..`
-/// substring, not just the whole-name case) plus null-byte and empty-name
-/// guards; the upload dir is per-request UUID-named so collisions are
-/// impossible and we only need to keep the name a leaf.
-fn sanitize_filename(name: &str) -> Option<String> {
-    if name.is_empty()
-        || name == "."
-        || name.contains("..")
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains('\0')
-    {
-        return None;
-    }
-    Some(name.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_rejects_path_separators_and_traversal() {
-        assert!(sanitize_filename("foo/bar.lucidos-plugin").is_none());
-        assert!(sanitize_filename("foo\\bar.lucidos-plugin").is_none());
-        assert!(sanitize_filename("../escape.lucidos-plugin").is_none());
-        assert!(sanitize_filename("foo..bar.lucidos-plugin").is_none());
-        assert!(sanitize_filename(".").is_none());
-        assert!(sanitize_filename("..").is_none());
-        assert!(sanitize_filename("").is_none());
-        assert!(sanitize_filename("nul\0byte.lucidos-plugin").is_none());
-    }
-
-    #[test]
-    fn sanitize_accepts_normal_names() {
-        assert_eq!(
-            sanitize_filename("no-role-playing-0.1.1.lucidos-plugin"),
-            Some("no-role-playing-0.1.1.lucidos-plugin".to_string()),
-        );
-        assert_eq!(
-            sanitize_filename("Plugin With Space 1.0.lucidos-plugin"),
-            Some("Plugin With Space 1.0.lucidos-plugin".to_string()),
-        );
-    }
-}

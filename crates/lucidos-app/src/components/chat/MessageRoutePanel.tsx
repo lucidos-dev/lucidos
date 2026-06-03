@@ -1,6 +1,12 @@
 import { useRef } from 'preact/hooks';
-import { messageRoutePanel, closeMessageRoutePanel, triggers, threadMap, repositories } from '../../store/store';
-import { focusThread } from '../../store/actions/threads';
+import { messageRoutePanel, closeMessageRoutePanel, triggers, threadMap, repositories, appsList, workspaceName } from '../../store/store';
+import { loadApps } from '../../store/actions/apps';
+import { focusThreadOrBootstrap } from '../../store/actions/threads';
+import {
+  openThreadAcrossWorkspaces,
+  crossWorkspaceThreadTitle,
+  ensureCrossWorkspaceThreadTitle,
+} from '../../store/actions/cross-workspace';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { loadRepositories } from '../../store/actions/chat';
 import { useDismissOnOutside, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
@@ -20,8 +26,9 @@ import {
   type EngineReason,
   type MessageOrigin,
   type StoredEvent,
+  type ThreadMeta,
 } from '../../store/thread-events';
-import { describeEngineReason } from '../../utils/engineEventExplainers';
+import { describeAbortCause, describeEngineReason } from '../../utils/engineEventExplainers';
 
 /** Takes the full Exchange so the divider-starter cases (UserQuestionAsked,
  *  CodingAgentPermissionRequest) can walk the exchange's steps for the matching
@@ -78,7 +85,7 @@ export function resolveThreadLinkTitle(
 
 /** Branch + ccSessionId come from `SessionStarted` (or `ContinuationStarted`), which fire
  *  once per CC process spawn — not per user message. A follow-up exchange within an
- *  existing CC session has no SessionStarted in its own steps, so we walk the full thread
+ *  existing Claude Code session has no SessionStarted in its own steps, so we walk the full thread
  *  up to this exchange's user event and track the most recent branch-defining event.
  *
  *  Permission/context info is per-exchange and stays scoped to `exchange.steps`. */
@@ -123,12 +130,13 @@ export function executorExtras(
   for (const { event } of exchange.steps) {
     if (event.type === 'CodingAgentSettingsChanged') {
       if (event.permission_mode) permissionMode = event.permission_mode;
-    } else if (event.type === 'Thinking') {
+    } else if (event.type === 'ThoughtStreamed') {
       // Legacy DB rows — ContextCaptured below overrides when present.
       if (typeof event.context_tokens === 'number') contextTokens = event.context_tokens;
       if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;
     } else if (event.type === 'ContextCaptured') {
-      // Prefer real input_tokens; fall back to the chars/4 estimate.
+      // Prefer real input_tokens; fall back to the conservative chars*2/3
+      // estimate (see `estimate_tokens_from_chars` in the engine).
       const tokens = event.usage?.input_tokens ?? event.estimated_total_tokens;
       if (typeof tokens === 'number') contextTokens = tokens;
       if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;
@@ -161,7 +169,7 @@ export function MessageRoutePanel() {
     >
       {section === 'origin'
         ? renderOriginSection(exchange, thread.meta.parentThreadTitle, getLiveThreadTitle)
-        : renderExecutorSection(exchange, thread.events, priorModel, priorEffort)}
+        : renderExecutorSection(exchange, thread.events, thread.meta, priorModel, priorEffort)}
     </div>
   );
 }
@@ -193,6 +201,31 @@ function renderOriginSection(
   const explainer = origin?.kind === 'engine'
     ? renderEngineExplainerSection(origin.reason)
     : null;
+
+  // System-driven `ResponseAborted` (safety_net, engine_shutdown, …): the
+  // device/api/v1/workspace/engine renderers above all return null for
+  // `kind: 'system'`, so without this branch the panel falls through to the
+  // bare "Unknown" fallback below — even though the event carries a typed
+  // `cause`. Skip when there's a device actor (e.g. /api/v1/restart) so the
+  // existing "You — Restarted" path keeps rendering.
+  if (
+    userEvent.type === 'ResponseAborted'
+    && (origin === undefined || origin.kind === 'system')
+  ) {
+    return (
+      <section class="route-section">
+        <h4>Origin</h4>
+        <div class="route-row">
+          <strong>Issued by</strong>
+          <span>System</span>
+        </div>
+        <div class="route-explainer">
+          <strong>Why the response stopped</strong>
+          <p>{describeAbortCause(userEvent.cause)}</p>
+        </div>
+      </section>
+    );
+  }
 
   if (!initiatorRow && !channel && !audit && !explainer) {
     return (
@@ -256,20 +289,46 @@ export function renderChannelSection(
           <span>{origin.label}</span>
         </div>
       );
-    case 'api':
+    case 'api': {
+      // `source_thread_id` is set when the engine recognised this request
+      // as coming from a Lucidos-spawned subprocess (CC, run_bash,
+      // run_python, scheduled script, `lucidos` CLI). Surface it as a
+      // deep-link so the popover answers "which agent did this".
+      const sourceThreadId = origin.source_thread_id;
+      const sourceTitle = sourceThreadId
+        ? getLiveTitle?.(sourceThreadId) ?? `thread ${sourceThreadId.slice(0, 8)}`
+        : null;
       return (
         <div class="route-row">
           <strong>API client</strong>
           <span>{origin.user_agent ?? '(no user-agent)'}</span>
+          {sourceThreadId && (
+            <button
+              type="button"
+              class="accent-link"
+              onClick={() => {
+                focusThreadOrBootstrap(sourceThreadId);
+                closeMessageRoutePanel();
+              }}
+            >
+              {sourceTitle ?? 'spawning thread'}
+            </button>
+          )}
         </div>
       );
-    case 'workspace':
+    }
+    case 'workspace': {
+      const tid = origin.thread_id;
       return (
-        <div class="route-row">
-          <strong>Workspace</strong>
-          <span>{origin.workspace}</span>
-        </div>
+        <>
+          <div class="route-row">
+            <strong>Workspace</strong>
+            <span>{origin.workspace}</span>
+          </div>
+          {tid && renderWorkspaceThreadLink(origin.workspace, tid, getLiveTitle)}
+        </>
       );
+    }
     case 'thread_link': {
       const title = resolveThreadLinkTitle(
         origin,
@@ -285,7 +344,7 @@ export function renderChannelSection(
             type="button"
             class="accent-link"
             onClick={() => {
-              focusThread(linkedId);
+              focusThreadOrBootstrap(linkedId);
               closeMessageRoutePanel();
             }}
           >
@@ -300,15 +359,55 @@ export function renderChannelSection(
   }
 }
 
-/** Audit: cross-workspace thread/event IDs, parent spawning_event_id. Returns
- *  null when there's nothing extra to show beyond the channel. */
+/** Named, clickable link to a Workspace-origin's source thread. Resolves the
+ *  title: same-workspace → live `threadMap` lookup; cross-workspace → the
+ *  best-effort live-fetch cache (firing the fetch when absent, which re-renders
+ *  the popover once it arrives). Falls back to a short id so the link is never
+ *  blank. The click routes cross-workspace-aware — focus in place when local,
+ *  hop to the source workspace's UI when remote. */
+function renderWorkspaceThreadLink(
+  workspace: string,
+  threadId: string,
+  getLiveTitle?: (threadId: string) => string | undefined,
+): preact.JSX.Element {
+  const isLocal = !workspaceName.value || workspace === workspaceName.value;
+  let title: string | undefined;
+  if (isLocal) {
+    title = getLiveTitle?.(threadId);
+  } else {
+    title = crossWorkspaceThreadTitle(workspace, threadId);
+    if (title === undefined) void ensureCrossWorkspaceThreadTitle(workspace, threadId);
+  }
+  const label =
+    title && title !== PENDING_TITLE_PLACEHOLDER ? title : `thread ${threadId.slice(0, 8)}`;
+  return (
+    <div class="route-row">
+      <strong>Thread</strong>
+      <button
+        type="button"
+        class="accent-link"
+        onClick={() => {
+          openThreadAcrossWorkspaces(workspace, threadId);
+          closeMessageRoutePanel();
+        }}
+      >
+        {label}
+      </button>
+    </div>
+  );
+}
+
+/** Audit: cross-workspace event id, parent spawning_event_id, raw user-agent.
+ *  Returns null when there's nothing extra to show beyond the channel. */
 export function renderAuditSection(origin: MessageOrigin): preact.JSX.Element | null {
   switch (origin.kind) {
     case 'workspace':
-      if (!origin.thread_id && !origin.event_id && !origin.user_agent) return null;
+      // The thread id is rendered as a named link in the channel section
+      // (`renderWorkspaceThreadLink`); the audit section keeps only the
+      // spawning event id and the raw user-agent.
+      if (!origin.event_id && !origin.user_agent) return null;
       return (
         <>
-          {origin.thread_id && <div class="muted mono">thread: {origin.thread_id}</div>}
           {origin.event_id && <div class="muted mono">event: {origin.event_id}</div>}
           {origin.user_agent && <div class="muted">{origin.user_agent}</div>}
         </>
@@ -340,6 +439,7 @@ export function renderEngineExplainerSection(reason: EngineReason): preact.JSX.E
 function renderExecutorSection(
   exchange: Exchange,
   threadEvents: Map<number, StoredEvent>,
+  meta: ThreadMeta,
   priorModel?: string,
   priorEffort?: string,
 ) {
@@ -350,6 +450,11 @@ function renderExecutorSection(
     || extras.ccSessionId || typeof extras.contextTokens === 'number';
   const ccActive = extras.branch !== undefined || extras.ccSessionId !== undefined;
   const repo = ccActive ? resolveRepoLabel(extras.repoId) : undefined;
+  // App coding-agent threads carry their kind on the projection; resolve the
+  // app's icon + display name so the Branch row reads "{icon} {name} ·
+  // claude-code/app/<id>/..." at a glance. The folder's last segment is the
+  // canonical app id.
+  const appInfo = meta.codingAgentKind === 'app' ? resolveAppInfo(meta.codingAgentFolder) : undefined;
 
   return (
     <section class="route-section">
@@ -391,7 +496,16 @@ function renderExecutorSection(
       {extras.branch && (
         <div class="route-row">
           <strong>Branch</strong>
-          <span class="mono">{extras.branch}</span>
+          <span class="route-branch">
+            {appInfo && (
+              <>
+                <span class="route-branch-app-icon" aria-hidden="true">{appInfo.icon}</span>
+                <span class={appInfo.failed ? 'route-branch-app-name error-text' : 'route-branch-app-name'}>{appInfo.name}</span>
+                <span class="route-branch-sep" aria-hidden="true">·</span>
+              </>
+            )}
+            <span class="mono">{extras.branch}</span>
+          </span>
         </div>
       )}
       {extras.ccSessionId && (
@@ -404,12 +518,37 @@ function renderExecutorSection(
   );
 }
 
+/** App icon + name for the Branch row prefix on app coding-agent threads.
+ *  Distinguishes the four `Loadable` states so a failed appsList fetch
+ *  doesn't render identically to a loading one (per frontend.md). */
+function resolveAppInfo(
+  folder: string | undefined,
+): { icon: string; name: string; failed?: boolean } | undefined {
+  if (!folder) return undefined;
+  const appId = folder.split('/').filter(Boolean).pop();
+  if (!appId) return undefined;
+  const apps = appsList.value;
+  if (apps.status === 'not-loaded') void loadApps();
+  const FALLBACK_ICON = '\u{1F4E6}'; // 📦 — neutral "app" pictogram
+  if (apps.status === 'failed') {
+    return { icon: FALLBACK_ICON, name: `${appId} (apps failed to load)`, failed: true };
+  }
+  if (apps.status !== 'loaded') {
+    return { icon: FALLBACK_ICON, name: appId };
+  }
+  const match = apps.data.find(a => a.id === appId);
+  return {
+    icon: match?.icon || FALLBACK_ICON,
+    name: match?.name || appId,
+  };
+}
+
 /** CC repo label. Returns undefined for legacy events from before the engine
  *  always stamped `repo_id` — those sessions render no Repository row. */
 function resolveRepoLabel(repoId: string | undefined): { text: string; failed?: boolean } | undefined {
   if (!repoId) return undefined;
   const repos = repositories.value;
-  if (repos.status === 'not-loaded') loadRepositories();
+  if (repos.status === 'not-loaded') void loadRepositories();
   if (repos.status === 'failed') return { text: `${repoId} (load failed)`, failed: true };
   if (repos.status !== 'loaded') return { text: repoId };
   const match = repos.data.find(r => r.id === repoId);
@@ -440,7 +579,7 @@ function renderTriggerOrigin(userEvent: Extract<StoredEvent, { type: 'TriggerSta
             type="button"
             class="accent-link"
             onClick={() => {
-              navigateToTrigger(trigger?.id ?? userEvent.trigger_id);
+              void navigateToTrigger(trigger?.id ?? userEvent.trigger_id);
               closeMessageRoutePanel();
             }}
           >

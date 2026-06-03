@@ -1,14 +1,15 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../api/threads', () => ({
-  fetchOlderThreads: vi.fn().mockResolvedValue({ threads: [], has_more: false }),
+  fetchOlderThreads: vi.fn().mockResolvedValue({ threads: [], family_threads: [], has_more: false }),
 }));
 
 import { fetchOlderThreads } from '../../api/threads';
-import { loadOlderThreads } from '../actions/thread-loading';
-import { threadMap, threadHasMore, threadLoadingMore, threadChannelFilter, selectedTriggerIds, selectedRepoIds, ALL_CHANNELS } from '../store';
+import { loadOlderThreads, reloadAfterFilterChange, _clearFamilyExtensionIdsForTest } from '../actions/thread-loading';
+import { threadMap, threadHasMore, threadLoadingMore, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, ALL_CHANNELS } from '../store';
 import { makeOptimisticThreadState } from '../thread-events';
 import type { ThreadState } from '../thread-events';
+import type { ThreadSummary } from '../../api/threads';
 
 const fetchMock = vi.mocked(fetchOlderThreads);
 
@@ -20,13 +21,15 @@ function loaded(thread: ThreadState, updatedAt: string): ThreadState {
 describe('loadOlderThreads', () => {
   beforeEach(() => {
     fetchMock.mockClear();
-    fetchMock.mockResolvedValue({ threads: [], has_more: false });
+    fetchMock.mockResolvedValue({ threads: [], family_threads: [], has_more: false });
     threadMap.value = new Map();
     threadHasMore.value = true;
     threadLoadingMore.value = false;
     threadChannelFilter.value = new Set(ALL_CHANNELS);
     selectedTriggerIds.value = new Set();
     selectedRepoIds.value = new Set();
+    selectedAppIds.value = new Set();
+    _clearFamilyExtensionIdsForTest();
   });
 
   it('passes selected trigger ids to fetchOlderThreads when set', async () => {
@@ -46,6 +49,7 @@ describe('loadOlderThreads', () => {
       15,
       ['trigger'],
       ['trig-a'],
+      undefined,
       undefined,
     );
   });
@@ -68,6 +72,7 @@ describe('loadOlderThreads', () => {
       ['claude_code'],
       undefined,
       ['repo-a'],
+      undefined,
     );
   });
 
@@ -88,10 +93,148 @@ describe('loadOlderThreads', () => {
       ['chat'],
       undefined,
       undefined,
+      undefined,
     );
   });
 
-  it('falls back to current time when filter matches no loaded thread, so history is reachable', async () => {
+  it('a family-extension thread does not advance the cursor on the next page', async () => {
+    // A trigger parent with a much-older child: the first pagination call
+    // returns the parent's sibling (`base-1`) as a base thread plus the
+    // older child as a family extension. The next call's cursor must come
+    // from the base thread, not the family extension — otherwise infinite
+    // scroll skips ~24 h of intermediate threads.
+    const parent = loaded(makeOptimisticThreadState({
+      id: 'parent', title: 'Run nightly', channel: 'trigger', initiator: 'system',
+      eventsLoaded: false,
+    }), '2026-05-17T01:23:00Z');
+    threadMap.value = new Map([['parent', parent]]);
+
+    const oldChildInfo: ThreadSummary = {
+      thread_id: 'old-child',
+      title: 'Build & test',
+      channel: 'claude_code',
+      initiator: 'user',
+      created_at: '2026-05-16T22:46:00Z',
+      last_activity: '2026-05-16T22:46:00Z',
+      message_count: 1,
+      section: 'archived',
+      active_children_count: 0,
+      total_children_count: 0,
+      blocking_descendant_count: 0, attention_descendant_count: 0,
+      status: 'idle',
+      coding_agent_has_diff: false,
+      coding_agent_proposed: false,
+      coding_agent_requires_restart: false,
+      coding_agent_is_external_repo: false,
+      coding_agent_applying: false,
+      last_revived_at: null,
+      parent_thread_id: 'parent',
+      state: 'active',
+      compose_text: '',
+      compose_images: [],
+    };
+    const sibling: ThreadSummary = {
+      ...oldChildInfo,
+      thread_id: 'base-1',
+      parent_thread_id: null,
+      last_activity: '2026-05-17T00:30:00Z',
+      title: 'Some older sibling',
+    };
+    fetchMock.mockResolvedValueOnce({
+      threads: [sibling],
+      family_threads: [oldChildInfo],
+      has_more: true,
+    });
+    await loadOlderThreads();
+    expect(fetchMock).toHaveBeenLastCalledWith('2026-05-17T01:23:00Z', 15, undefined, undefined, undefined, undefined);
+
+    // Second call: the family-extension `old-child` is in threadMap but must
+    // be skipped by the cursor — otherwise `before` would be 2026-05-16, not
+    // the new oldest base thread `base-1`'s 2026-05-17T00:30 timestamp.
+    fetchMock.mockResolvedValueOnce({ threads: [], family_threads: [], has_more: false });
+    await loadOlderThreads();
+    expect(fetchMock).toHaveBeenLastCalledWith('2026-05-17T00:30:00Z', 15, undefined, undefined, undefined, undefined);
+  });
+
+  it('promotes a family-extension thread to base when natural pagination later returns it', async () => {
+    // First call: server returns nothing base + the old child as family.
+    // Second call: natural pagination has reached far enough back to return
+    // the old child as base — it must now drive the cursor.
+    const parent = loaded(makeOptimisticThreadState({
+      id: 'parent', title: 'P', channel: 'chat', initiator: 'user',
+      eventsLoaded: false,
+    }), '2026-05-17T01:23:00Z');
+    threadMap.value = new Map([['parent', parent]]);
+
+    const oldInfo: ThreadSummary = {
+      thread_id: 'old',
+      title: 'Old',
+      channel: 'chat',
+      initiator: 'user',
+      created_at: '2026-05-16T22:46:00Z',
+      last_activity: '2026-05-16T22:46:00Z',
+      message_count: 1,
+      section: 'archived',
+      active_children_count: 0,
+      total_children_count: 0,
+      blocking_descendant_count: 0, attention_descendant_count: 0,
+      status: 'idle',
+      coding_agent_has_diff: false,
+      coding_agent_proposed: false,
+      coding_agent_requires_restart: false,
+      coding_agent_is_external_repo: false,
+      coding_agent_applying: false,
+      last_revived_at: null,
+      parent_thread_id: 'parent',
+      state: 'active',
+      compose_text: '',
+      compose_images: [],
+    };
+    fetchMock.mockResolvedValueOnce({ threads: [{ ...oldInfo, thread_id: 'mid', last_activity: '2026-05-17T00:30:00Z', parent_thread_id: null }], family_threads: [oldInfo], has_more: true });
+    await loadOlderThreads();
+
+    // Server returns the old child as BASE — promote it. Use a different
+    // base id so `added > 0` and the call doesn't terminate.
+    fetchMock.mockResolvedValueOnce({
+      threads: [oldInfo, { ...oldInfo, thread_id: 'mid-2', last_activity: '2026-05-16T23:30:00Z', parent_thread_id: null }],
+      family_threads: [],
+      has_more: false,
+    });
+    await loadOlderThreads();
+
+    // Third call would cursor off the promoted base thread (oldInfo).
+    fetchMock.mockResolvedValueOnce({ threads: [], family_threads: [], has_more: false });
+    threadHasMore.value = true; // override the previous has_more=false so we can probe
+    await loadOlderThreads();
+    expect(fetchMock).toHaveBeenLastCalledWith('2026-05-16T22:46:00Z', 15, undefined, undefined, undefined, undefined);
+  });
+
+  it('reloadAfterFilterChange eagerly fetches matching threads when none are loaded (archived-only repo facet)', async () => {
+    // Reproduces the reported bug: a repo whose threads are all archived is
+    // selected as a filter. None of its threads are in the loaded window, so
+    // the drawer renders empty. Selecting the facet MUST deterministically
+    // fetch its matches — not wait for the IntersectionObserver sentinel,
+    // which is suppressed while Archive is collapsed.
+    threadChannelFilter.value = new Set(['claude_code']);
+    selectedRepoIds.value = new Set(['45d9a172-a23e-484b-bf3b-d6a0f9a7983f']);
+    threadMap.value = new Map(); // nothing loaded matches the facet
+    threadHasMore.value = false; // e.g. a prior unfiltered scroll exhausted the list
+
+    await reloadAfterFilterChange();
+
+    // Re-armed pagination so the fetch isn't short-circuited by a stale
+    // "no more" from the previous (unfiltered) cursor space.
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [before, limit, sources, triggerIds, repoIds, appIds] = fetchMock.mock.calls[0];
+    expect(sources).toEqual(['claude_code']);
+    expect(repoIds).toEqual(['45d9a172-a23e-484b-bf3b-d6a0f9a7983f']);
+    expect(triggerIds).toBeUndefined();
+    expect(appIds).toBeUndefined();
+    expect(limit).toBe(15);
+    expect(typeof before).toBe('string'); // now()-fallback cursor
+  });
+
+  it('falls back to current time when filter matches no loaded thread, so archive is reachable', async () => {
     selectedTriggerIds.value = new Set(['gone-1']);
     threadChannelFilter.value = new Set(['trigger']);
     // Loaded threads include a trigger thread for a different trigger

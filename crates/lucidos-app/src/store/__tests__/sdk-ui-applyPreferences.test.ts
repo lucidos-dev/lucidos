@@ -3,7 +3,7 @@ import { lucidos } from '@lucidos/sdk';
 
 // Theme is stored device-scoped (see crates/lucidos-app/src/store/actions/preferences.ts:141).
 // `lucidos.ui.applyPreferences()` runs in app iframes and must read the SAME device id
-// the parent uses (`lucidos-device-id` in localStorage), otherwise `/api/preferences`
+// the parent uses (`lucidos-device-id` in localStorage), otherwise `/api/v1/preferences`
 // returns only globally-scoped prefs (no `theme` key) and the iframe defaults to dark.
 describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
   let fetchSpy: ReturnType<typeof vi.fn>;
@@ -28,13 +28,13 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     globalThis.fetch = originalFetch;
   });
 
-  it('passes the lucidos-device-id from localStorage to GET /api/preferences', async () => {
+  it('passes the lucidos-device-id from localStorage to GET /api/v1/preferences', async () => {
     localStorage.setItem('lucidos-device-id', 'device-abc');
 
     await lucidos.ui.applyPreferences();
 
     const url = fetchedUrl();
-    expect(url.pathname).toBe('/api/preferences');
+    expect(url.pathname).toBe('/api/v1/preferences');
     expect(url.searchParams.get('device_id')).toBe('device-abc');
   });
 
@@ -42,7 +42,7 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     await lucidos.ui.applyPreferences();
 
     const url = fetchedUrl();
-    expect(url.pathname).toBe('/api/preferences');
+    expect(url.pathname).toBe('/api/v1/preferences');
     expect(url.searchParams.get('device_id')).toBeNull();
   });
 

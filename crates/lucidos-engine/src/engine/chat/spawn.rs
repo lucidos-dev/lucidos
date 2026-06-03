@@ -35,16 +35,11 @@ impl LucidosEngine {
             .map(str::to_string);
 
         let bus = self.event_bus.clone();
-        let title_provider = match &explicit_title {
-            Some(_) => None,
-            None => self
-                .extractor
-                .as_ref()
-                .map(|ext| ext.provider_for_model("")),
-        };
+        let has_explicit_title = explicit_title.is_some();
         let msg = prompt.to_string();
         let initial_title =
             explicit_title.unwrap_or_else(|| prompt.chars().take(60).collect::<String>());
+        let title_engine = self.clone_arc();
         tokio::spawn(async move {
             if let Err(e) = bus
                 .emit(crate::engine::event_bus::BusEvent::Thread {
@@ -59,9 +54,39 @@ impl LucidosEngine {
                 log!("[FanOut] Failed to emit title: {}", e);
             }
 
-            if let Some(provider) = title_provider {
-                // Spawned child threads carry no images on their first prompt.
-                emit_generated_title(&bus, &provider, child_thread_id, &msg, None, None, 0).await;
+            // Build the title provider here (in the async task) so it can
+            // honor the `model_title` preference, matching the chat and CC
+            // paths; an unset/empty preference falls back to the extractor's
+            // default model.
+            if !has_explicit_title {
+                if let Some(ref extractor) = title_engine.extractor {
+                    let title_model = crate::core::PreferenceStore::get(
+                        &title_engine.pool,
+                        crate::core::PREF_MODEL_TITLE,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                    match extractor.provider_for_model(&title_model) {
+                        Ok(provider) => {
+                            // Spawned child threads carry no images on their first prompt.
+                            emit_generated_title(
+                                &bus,
+                                &provider,
+                                child_thread_id,
+                                &msg,
+                                None,
+                                None,
+                                0,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            log!("[FanOut] Failed to build title provider: {}", e)
+                        }
+                    }
+                }
             }
         });
 

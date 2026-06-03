@@ -59,13 +59,13 @@ waitForLucidos();
     await page.goto('/');
     const deviceId = 'e2e-device-' + Date.now();
     await page.evaluate((id) => localStorage.setItem('lucidos-device-id', id), deviceId);
-    await request.put(`/api/preferences?key=theme`, {
+    await request.put(`/api/v1/preferences?key=theme`, {
       data: { value: 'dark', device_id: deviceId },
     });
 
     // Embed the test app inside an iframe sandbox identical to AppUiInline.tsx.
     // The parent page also opens its own SSE listener (matches the real app
-    // where Lucidos UI subscribes to the same /api/events).
+    // where Lucidos UI subscribes to the same /api/v1/events).
     await page.setContent(`<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"></head>
@@ -78,7 +78,7 @@ waitForLucidos();
 <script>
   // Mirror the parent Lucidos app — open an EventSource so connection-limit
   // contention with the iframe is realistic.
-  window.__parentSse = new EventSource('/api/events');
+  window.__parentSse = new EventSource('/api/v1/events');
 </script>
 </body>
 </html>`);
@@ -88,7 +88,7 @@ waitForLucidos();
     await expect(appFrame.locator('html')).toHaveAttribute('data-theme', 'dark');
 
     // Toggle to light — SSE event broadcast to all subscribers including the iframe.
-    await request.put(`/api/preferences?key=theme`, {
+    await request.put(`/api/v1/preferences?key=theme`, {
       data: { value: 'light', device_id: deviceId },
     });
 
@@ -197,7 +197,7 @@ waitForLucidos();
     // SSE round-trip agrees with the localStorage cache. (Without this, the
     // backend would return its default and the iframe's SDK applyPreferences
     // call would later flip the theme back, masking a real FOUC.)
-    await request.put(`/api/preferences?key=theme`, {
+    await request.put(`/api/v1/preferences?key=theme`, {
       data: { value: 'light', device_id: deviceId },
     });
 

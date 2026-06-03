@@ -1,4 +1,5 @@
 import { signal, computed } from '@preact/signals';
+import { hydratePinnedAppsFromStorage } from './actions/pinnedApps';
 import type {
   MenuItem,
   ConnectionStatus,
@@ -8,6 +9,7 @@ import type {
   OAuthAccountInfo,
   PinnedAppEntry,
   TriggerInfo,
+  TriggerGroup,
   HistoricalTriggerInfo,
   App,
   ConfirmState,
@@ -21,12 +23,13 @@ import type {
 } from './types';
 import { MENU_ITEMS } from './types';
 import type { ThreadState, ThreadStatus, Exchange } from './thread-events';
-import { computeExchanges } from './thread-events';
+import { computeExchanges, isExcludedFromSections } from './thread-events';
+import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import { resetContentScroll } from '../hooks/useScrollMemory';
-import type { Change, CCModelValue, CCReasoningEffort } from '../api/client';
+import type { Change, CCModelValue, CCReasoningEffort, RestoreState } from '../api/client';
 import { markSwUpdateDismissed } from '../hooks/sw-update';
 
 /** localStorage key holding the focused thread id across reloads. Focus is
@@ -38,7 +41,7 @@ export type InlineForm =
   | { type: 'credential'; editing?: string; request?: CredentialRequest }
   | { type: 'app-edit'; appId: string }
   | { type: 'new-app' }
-  | { type: 'trigger'; taskId?: string }
+  | { type: 'trigger'; triggerId?: string }
   | { type: 'email-confirm'; request: EmailConfirmRequest }
   | { type: 'plugin-install'; request: PluginInstallRequest }
   | { type: 'plugin-uninstall'; request: PluginUninstallRequest };
@@ -96,7 +99,7 @@ export function closeInlineForm(): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'disk-usage' | 'tool-permissions';
+export type SettingsSubview = 'main' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'disk-usage' | 'tool-permissions' | 'keyboard-shortcuts';
 export const settingsSubview = signal<SettingsSubview>('main');
 /** Anchor to scroll/highlight after navigating from Search Everywhere. SettingsView clears it after applying. */
 export const settingsScrollTarget = signal<string | null>(null);
@@ -110,6 +113,7 @@ export const SETTINGS_NAV_ITEMS: Array<{ key: Exclude<SettingsSubview, 'main'>; 
   { key: 'backup', label: 'Backup' },
   { key: 'memory', label: 'Memory' },
   { key: 'tool-permissions', label: 'Tool permissions' },
+  { key: 'keyboard-shortcuts', label: 'Keyboard Shortcuts' },
   { key: 'disk-usage', label: 'Disk Usage' },
 ];
 
@@ -259,6 +263,35 @@ export function setSelectedRepoIds(next: Set<string>): void {
   localStorage.setItem(SELECTED_REPO_IDS_KEY, JSON.stringify([...next]));
 }
 
+// Mirrors selectedRepoIds for app coding-agent threads. Apps live alongside
+// repos under the Claude Code parent in the filter dropdown; their selection
+// set is independent so a user can pick "this repo OR this app".
+const SELECTED_APP_IDS_KEY = 'lucidos-selected-app-ids';
+
+function restoreSelectedAppIds(): Set<string> {
+  try {
+    const saved = localStorage.getItem(SELECTED_APP_IDS_KEY);
+    if (!saved) return new Set();
+    const parsed = JSON.parse(saved);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((x): x is string => typeof x === 'string'));
+  } catch { return new Set(); }
+}
+
+export const selectedAppIds = signal<Set<string>>(restoreSelectedAppIds());
+
+export function setSelectedAppIds(next: Set<string>): void {
+  selectedAppIds.value = next;
+  localStorage.setItem(SELECTED_APP_IDS_KEY, JSON.stringify([...next]));
+}
+
+// Complete set of selectable filter facets (every trigger/repo/app that has a
+// thread), fetched from /api/v1/threads/filter-facets. Seeds the drawer "Show"
+// dropdown so it lists ALL session-having triggers/repos/apps, not just those
+// in the currently-loaded window. Refreshed on startup and after each full
+// thread reload.
+export const filterFacets = signal<Loadable<import('../api/threads').FilterFacets>>({ status: 'not-loaded' });
+
 // --- Thread search ---
 export const threadSearchQuery = signal('');
 export const threadSearchResults = signal<Loadable<import('../api/threads').ThreadSearchResult[]>>({ status: 'not-loaded' });
@@ -313,16 +346,18 @@ export function getThreadDisplaySection(thread: ThreadState): DisplaySection {
     effectiveThreadStatus(thread),
     thread.meta.saved,
     thread.meta.activeChildrenCount > 0,
-    thread.meta.ccHasChanges,
+    thread.meta.codingAgentProposed,
+    thread.meta.attentionDescendantCount > 0,
   );
 }
 
-/** All threads whose display section is 'review'. Section membership is a pure
- *  function of thread state — thread-attached drafts route to their natural
- *  section per the lifecycle contract, so no draft carve-out is needed. */
+/** Threads visible in the REVIEW drawer section. `displaySection` ignores
+ *  `meta.state`, so the drawer-hidden carve-out is applied here too — the
+ *  picker and attention badge must agree with what the user can see. */
 export function getReviewThreads(): ThreadState[] {
   const result: ThreadState[] = [];
   for (const thread of threadMap.value.values()) {
+    if (isExcludedFromSections(thread)) continue;
     if (getThreadDisplaySection(thread) === 'review') result.push(thread);
   }
   return result;
@@ -334,7 +369,13 @@ export const attentionThreadCount = computed(() => getReviewThreads().length);
 export const activeExchanges = computed<Exchange[]>(() => {
   const id = focusedThreadId.value;
   if (!id) return [];
-  const thread = threadMap.value.get(id);
+  // Subscribe to ONLY this thread's events bump — other threads' streaming
+  // doesn't fan out here. Then `threadMap.peek()` reads the current map
+  // without a wide subscription. The bump fires on every event arrival for
+  // this thread (including the SSE skeleton-create path), so the computed
+  // catches a freshly-inserted thread as soon as its first event lands.
+  getThreadEventsBump(id);
+  const thread = threadMap.peek().get(id);
   if (!thread) return [];
   return computeExchanges(thread);
 });
@@ -350,7 +391,11 @@ export const activeThreadStatus = computed(() => {
 export const activeStreamingBuffer = computed(() => {
   const id = focusedThreadId.value;
   if (!id) return '';
-  const thread = threadMap.value.get(id);
+  // Per-thread bump subscription — see `activeExchanges` above for the
+  // pattern. `streamingBuffer` mutates per token, which is exactly what
+  // bumpThreadEvents fires on, so the live token stream lands here.
+  getThreadEventsBump(id);
+  const thread = threadMap.peek().get(id);
   if (!thread) return '';
   return thread.streamingBuffer;
 });
@@ -400,22 +445,25 @@ export type InputMode =
   | { type: 'do' }
   | { type: 'claude_code' };
 
+/** Remembers the last pick across page reloads via localStorage. The matching
+ *  persist effect lives in `effects.ts`. `sendCompose` / `discardCompose` no
+ *  longer reset this — the user explicitly asked for the choice to stick so
+ *  picking Claude once means the next fresh compose stays on Claude too. */
 function restoreInputMode(): InputMode {
   try {
-    const saved = localStorage.getItem('lucidos-input-mode');
-    if (saved) {
-      const parsed = JSON.parse(saved) as InputMode;
-      if (parsed.type === 'do' || parsed.type === 'claude_code') {
-        return parsed;
-      }
-    }
-  } catch { /* ignore */ }
-  // Migrate from old format
-  const old = localStorage.getItem('lucidos-input-target');
-  if (old === 'claude_code') return { type: 'claude_code' };
-  return { type: 'do' };
+    const raw = localStorage.getItem('lucidos-input-mode');
+    if (!raw) return { type: 'do' };
+    const parsed = JSON.parse(raw) as { type?: unknown };
+    if (parsed?.type === 'claude_code') return { type: 'claude_code' };
+    return { type: 'do' };
+  } catch (err) {
+    // Startup probe the user did not initiate — no toast/Loadable surface
+    // exists at module-load time. Self-recovery: the next toggle click fires
+    // the persist effect in effects.ts and overwrites the bad payload.
+    console.warn('[store] dropping malformed lucidos-input-mode payload', err);
+    return { type: 'do' };
+  }
 }
-
 export const inputMode = signal<InputMode>(restoreInputMode());
 
 // --- Repositories ---
@@ -427,7 +475,75 @@ export interface Repository {
 }
 
 export const repositories = signal<Loadable<Repository[]>>({ status: 'not-loaded' });
-export const selectedRepoId = signal<string>(localStorage.getItem('lucidos-cc-last-repo') ?? '');  // '' = Lucidos (default)
+
+// --- Compose-view scope picker ---
+// Discriminated union of where a CC coding-agent thread should run. The
+// compose-view dropdown writes here; chat.ts resolves it to the engine's
+// `folder` request field; compose.ts binds the resolved values onto the
+// promoted thread's `meta` (codingAgentKind / codingAgentFolder / repoId).
+export type Scope =
+  | { kind: 'lucidos' }
+  | { kind: 'external'; repoId: string }
+  | { kind: 'app'; appId: string };
+
+const SCOPE_STORAGE_KEY = 'lucidos-cc-last-scope';
+const LEGACY_REPO_STORAGE_KEY = 'lucidos-cc-last-repo';
+
+function restoreScope(): Scope {
+  const raw = localStorage.getItem(SCOPE_STORAGE_KEY);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.kind === 'lucidos') return { kind: 'lucidos' };
+        if (parsed.kind === 'external' && typeof parsed.repoId === 'string' && parsed.repoId) {
+          return { kind: 'external', repoId: parsed.repoId };
+        }
+        if (parsed.kind === 'app' && typeof parsed.appId === 'string' && parsed.appId) {
+          return { kind: 'app', appId: parsed.appId };
+        }
+      }
+    } catch {
+      // Corrupt value — drop and fall through to legacy migration / default.
+    }
+  }
+  // One-time migration from the legacy `lucidos-cc-last-repo` string ('' meant
+  // Lucidos, any other value was an external repo UUID). Migrate once at
+  // startup and delete the legacy key so the next reload reads the new shape.
+  const legacy = localStorage.getItem(LEGACY_REPO_STORAGE_KEY);
+  if (legacy !== null) {
+    localStorage.removeItem(LEGACY_REPO_STORAGE_KEY);
+    if (legacy && legacy.length > 0) {
+      const migrated: Scope = { kind: 'external', repoId: legacy };
+      localStorage.setItem(SCOPE_STORAGE_KEY, JSON.stringify(migrated));
+      return migrated;
+    }
+  }
+  return { kind: 'lucidos' };
+}
+
+export const selectedScope = signal<Scope>(restoreScope());
+
+/** Translate a Scope into the engine's `folder` request field. Lucidos →
+ *  empty string (engine defaults to Lucidos when both folder and repo_id are
+ *  empty). External → the repo UUID (engine's `resolve_folder_input` looks
+ *  it up in the registry). App → workspace-relative path which
+ *  `classify_resolved_folder` matches to the app branch. */
+export function scopeToFolder(scope: Scope): string {
+  switch (scope.kind) {
+    case 'lucidos': return '';
+    case 'external': return scope.repoId;
+    case 'app': return `data/apps/${scope.appId}`;
+  }
+}
+
+/** Read the repo UUID out of a Scope when one applies — used by code paths
+ *  that still need to surface the bound repo (e.g. CCControlMenu's
+ *  per-repo command listing). App + Lucidos return undefined; the menu
+ *  falls back to its default Lucidos resolution. */
+export function scopeToRepoId(scope: Scope): string | undefined {
+  return scope.kind === 'external' ? scope.repoId : undefined;
+}
 
 // --- Repo File Explorer ---
 export const repoSource = signal<string | null>(null); // null = workspace, string = repo ID
@@ -527,10 +643,12 @@ export const discardingCCThreadIds = signal<Set<string>>(new Set());
  *  the Cancel button (shows "Cancel...") and drives the spinner status label.
  *  Cleared when the thread leaves active status (via PromptInput effect). */
 export const cancelingThreadIds = signal<Set<string>>(new Set());
-/** All changes from Claude Code sessions. Updated via SSE push or API fetch. */
-export const changes = signal<Change[]>([]);
-/** Recently applied/reverted changes. Updated via SSE push. */
-export const appliedChanges = signal<Change[]>([]);
+/** Pending changes from Claude Code sessions. `Loadable<Change[]>` so a backend
+ *  failure surfaces as `failed` instead of looking like "no changes" —
+ *  consumers branch on all four states per `.claude/rules/frontend.md`. */
+export const changes = signal<Loadable<Change[]>>({ status: 'not-loaded' });
+/** Recently applied/reverted changes. Same Loadable shape as `changes`. */
+export const appliedChanges = signal<Loadable<Change[]>>({ status: 'not-loaded' });
 /** Per-id cache for changes fetched on-demand by `ChangeBody` when the id
  *  isn't in `changes` or `appliedChanges`. `loading` doubles as the dedup
  *  token; `failed` prevents refetching a 404. */
@@ -539,10 +657,14 @@ export const lazyChanges = signal<Map<string, Loadable<Change>>>(new Map());
  *  resolved `Change` only — callers that need to distinguish loading/failed
  *  should read `lazyChanges.value.get(id)` directly. */
 export function findChangeById(id: string): Change | undefined {
-  const pending = changes.value.find(c => c.id === id);
-  if (pending) return pending;
-  const applied = appliedChanges.value.find(c => c.id === id);
-  if (applied) return applied;
+  if (changes.value.status === 'loaded') {
+    const pending = changes.value.data.find(c => c.id === id);
+    if (pending) return pending;
+  }
+  if (appliedChanges.value.status === 'loaded') {
+    const applied = appliedChanges.value.data.find(c => c.id === id);
+    if (applied) return applied;
+  }
   const lazy = lazyChanges.value.get(id);
   return lazy?.status === 'loaded' ? lazy.data : undefined;
 }
@@ -551,8 +673,8 @@ export function findChangeById(id: string): Change | undefined {
 export const busyChangeIds = computed(() => {
   const ids = new Set(applyingChangeIds.value);
   const threadIds = applyingNowThreadIds.value;
-  if (threadIds.size > 0) {
-    for (const c of changes.value) {
+  if (threadIds.size > 0 && changes.value.status === 'loaded') {
+    for (const c of changes.value.data) {
       if (c.thread_id && threadIds.has(c.thread_id)) ids.add(c.id);
     }
   }
@@ -658,10 +780,41 @@ export const triggers = signal<Loadable<TriggerInfo[]>>({ status: 'not-loaded' }
 
 export const historicalTriggers = signal<Loadable<HistoricalTriggerInfo[]>>({ status: 'not-loaded' });
 
+/** User-visible folders that organize triggers in the panel. Pure label —
+ *  groups don't fire or schedule anything. Loaded from /trigger-groups on
+ *  startup and kept live via SSE handlers in `thread-events.ts`. */
+export const triggerGroups = signal<Loadable<TriggerGroup[]>>({ status: 'not-loaded' });
+
+/** Per-device collapsed state for trigger-group sections in the panel,
+ *  keyed by group_id. localStorage-backed so a collapsed Morning Routine
+ *  section stays collapsed across reloads and engine restarts on this
+ *  device, but doesn't sync across devices (phone and laptop independent). */
+const COLLAPSED_TRIGGER_GROUPS_KEY = 'lucidos-collapsed-trigger-groups';
+
+function restoreCollapsedTriggerGroups(): Set<string> {
+  try {
+    const saved = localStorage.getItem(COLLAPSED_TRIGGER_GROUPS_KEY);
+    if (!saved) return new Set();
+    const parsed = JSON.parse(saved);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((x): x is string => typeof x === 'string'));
+  } catch { return new Set(); }
+}
+
+export const collapsedTriggerGroupIds = signal<Set<string>>(restoreCollapsedTriggerGroups());
+
+export function toggleTriggerGroupCollapsed(groupId: string): void {
+  const next = new Set(collapsedTriggerGroupIds.value);
+  if (next.has(groupId)) next.delete(groupId);
+  else next.add(groupId);
+  collapsedTriggerGroupIds.value = next;
+  localStorage.setItem(COLLAPSED_TRIGGER_GROUPS_KEY, JSON.stringify([...next]));
+}
+
 // --- Pending message (used to send a message from outside the chat module) ---
 export const pendingChatMessage = signal<string | null>(null);
 
-// --- CC session version — bumped when a CC session starts/resumes so components can re-fetch commands ---
+// --- Claude Code session version — bumped when a Claude Code session starts/resumes so components can re-fetch commands ---
 export const ccSessionVersion = signal(0);
 
 // --- CC pending preferences — set from compose view before a session starts, consumed on first CC message ---
@@ -682,15 +835,19 @@ export const appCommit = signal<string | null>(null);
  *  iframe src so Preact naturally propagates the reload to ALL iframe instances
  *  (desktop + mobile). 0 = initial load (no cache-buster needed). */
 export const appRefreshKey = signal(0);
-export const pinnedApps = signal<PinnedAppEntry[]>(
-  (() => {
-    try {
-      const saved = localStorage.getItem('pinned_apps');
-      return saved ? JSON.parse(saved) as PinnedAppEntry[] : [];
-    } catch {
-      return [];
-    }
-  })()
+/** When set, the app UI iframe renders from the named app coding-agent
+ *  thread's worktree (`?thread_id=<id>` route) instead of the live workspace
+ *  data — the WIP app preview. Cleared on: button re-click, navigating away
+ *  from the thread or opening a different app (focusedThreadId / currentApp
+ *  effect in `actions/wipPreview.ts`), and on terminal change events
+ *  (ChangeApplied / ChangeDiscarded / ChangeReverted / ThreadArchived in
+ *  thread-sync.ts, plus the AppUiRefreshRequested path in refreshAppUI).
+ *  Apply removes the worktree as part of ff-merge, so cleanup must fire
+ *  before the iframe re-renders — iframes do not raise `onError` for HTTP
+ *  4xx responses, so SSE-driven cleanup is the only reliable signal. */
+export const wipPreviewThreadId = signal<string | null>(null);
+export const pinnedApps = signal<Loadable<PinnedAppEntry[]>>(
+  hydratePinnedAppsFromStorage(),
 );
 
 
@@ -707,6 +864,10 @@ export const confirmState = signal<ConfirmState>({
 // --- Toasts ---
 let toastIdCounter = 0;
 export const toasts = signal<ToastItem[]>([]);
+/** Standard "passive status banner" duration. Keyed toasts default to
+ *  sticky (see `scheduleAutoDismiss`); callers without an action button to
+ *  wait on opt back in with this so every such banner shares one tunable. */
+export const TOAST_AUTO_DISMISS_MS = 5_000;
 /** Pending auto-dismiss timers for keyed toasts. Cleared when the same key is
  *  re-shown (window restarts) or when the toast is dismissed by other means
  *  (close button, explicit dismissToast call) — without this cleanup, the
@@ -731,7 +892,7 @@ export function showToast(message: string, type: ToastType = 'info', opts?: { ke
     return;
   }
   // Unkeyed: errors, warnings, and toasts with actions/onClick require manual dismissal; other types auto-close
-  const ms = autoDismissMs ?? (action || onClick || type === 'error' || type === 'warning' ? undefined : 5000);
+  const ms = autoDismissMs ?? (action || onClick || type === 'error' || type === 'warning' ? undefined : TOAST_AUTO_DISMISS_MS);
   if (ms !== undefined) {
     setTimeout(() => {
       toasts.value = toasts.value.filter((t) => t.id !== id);
@@ -802,73 +963,10 @@ export function showConfirm(
 export type StepDetailModalState = Extract<ResponseEvent, { type: 'step' }> | null;
 export const stepDetailModal = signal<StepDetailModalState>(null);
 
-// --- Image popup ---
-export interface ImagePopupState {
-  images: string[];
-  index: number;
-}
-
-export const popupImage = signal<ImagePopupState | null>(null);
-
-export function openImagePopup(src: string): void {
-  popupImage.value = { images: [src], index: 0 };
-}
-
-/** Open the popup with prev/next nav across every sibling thumbnail in the
- *  nearest image group around `clicked` — either a sent-message thread
- *  (`.thread-content`) or the unsent prompt strip (`.image-preview-strip`).
- *  Degrades to single-image when no siblings can be collected. */
-export function openImagePopupFromGroup(src: string, clicked: Element | EventTarget | null): void {
-  const container = (clicked instanceof Element) ? clicked.closest('.thread-content, .image-preview-strip') : null;
-  if (!container) { openImagePopup(src); return; }
-  const els = container.querySelectorAll<HTMLImageElement>('.image-thumbnail, .user-image-thumb, .image-preview-thumb');
-  const seen = new Set<string>();
-  const images: string[] = [];
-  els.forEach(el => {
-    const url = el.dataset.fullSrc || el.src;
-    if (url && !seen.has(url)) { seen.add(url); images.push(url); }
-  });
-  const index = images.indexOf(src);
-  if (index === -1) { openImagePopup(src); return; }
-  popupImage.value = { images, index };
-}
-
-// --- Message route panel (anchored popover for the route badge) ---
-type MessageRoutePanelSection = 'origin' | 'executor';
-export interface MessageRoutePanelState {
-  anchor: HTMLElement;
-  exchange: Exchange;
-  threadId: string;
-  section: MessageRoutePanelSection;
-  /** Carried forward from prior exchanges so the panel can show model/effort
-   *  before the current exchange's ResponseGenerated event arrives. */
-  priorModel?: string;
-  priorEffort?: string;
-}
-export const messageRoutePanel = signal<MessageRoutePanelState | null>(null);
-/** Click semantics for the route badge: opens the panel for the given exchange +
- *  section, or closes it when re-clicking the same combination. Switching to a
- *  different exchange/section opens the panel with the new contents.
- *
- *  Identity is `(threadId, userSeq, section)` rather than the anchor DOM ref
- *  because the badge button can be re-rendered between clicks (streaming
- *  updates), which would replace the DOM node and silently defeat ref equality. */
-export function toggleMessageRoutePanel(state: MessageRoutePanelState): void {
-  const current = messageRoutePanel.value;
-  if (
-    current &&
-    current.threadId === state.threadId &&
-    current.exchange.userSeq === state.exchange.userSeq &&
-    current.section === state.section
-  ) {
-    messageRoutePanel.value = null;
-    return;
-  }
-  messageRoutePanel.value = state;
-}
-export function closeMessageRoutePanel(): void {
-  messageRoutePanel.value = null;
-}
+// --- Image popup + message route panel state live in their own modules; re-exported
+// so importers keep using `from '../store/store'`. ---
+export * from './imagePopup';
+export * from './messageRoutePanel';
 
 // --- Memory rebuild progress ---
 /** Updated from SSE memory_rebuilding events. null = not rebuilding. */
@@ -877,10 +975,21 @@ export const memoryRebuildProgress = signal<{ processed: number; total: number; 
 /** Updated from SSE BackupProgress events. null = not backing up/restoring. */
 export const backupProgress = signal<{ phase: string; progress: number; total: number } | null>(null);
 
+/** Authoritative restore state, kept in lockstep by the `Restore*` SSE events
+ *  AND seeded from `getRestoreStatus()` on load, so a mid-restore page reload
+ *  re-attaches to the identical phase/percent/result. null = not yet fetched. */
+export const restoreState = signal<RestoreState | null>(null);
+
 /** Bumped on every BackupCompleted SSE event. BackupSection re-fetches the
  *  list when this changes, so any mounted instance (in either layout copy)
  *  sees the new entry without each running its own completion handler. */
 export const backupListVersion = signal(0);
+
+/** Bumped on every terminal backup SSE event (BackupCompleted AND
+ *  BackupFailed). BackupSection re-fetches `/backup/status` when this changes
+ *  so the health card reflects the new last-run outcome — failures don't
+ *  change the backup list, so they can't piggyback on backupListVersion. */
+export const backupStatusVersion = signal(0);
 
 /** Updated from SSE RecoveryProgress events. null = not recovering. */
 export const recoveryProgress = signal<{ completed: number; total: number } | null>(null);

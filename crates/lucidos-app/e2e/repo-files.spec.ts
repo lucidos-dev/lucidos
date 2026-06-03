@@ -7,7 +7,7 @@ import { resolve } from 'path';
 
 /** Register the e2e workspace as a repository via API. */
 async function registerRepo(page: Page, name: string): Promise<string> {
-  const resp = await page.request.post('/api/repositories', {
+  const resp = await page.request.post('/api/v1/repositories', {
     data: { name, path: WORKSPACE, description: 'e2e test repo' },
   });
   expect(resp.ok()).toBeTruthy();
@@ -17,7 +17,7 @@ async function registerRepo(page: Page, name: string): Promise<string> {
 
 /** Remove a repository via API. */
 async function removeRepo(page: Page, id: string): Promise<void> {
-  await page.request.delete(`/api/repositories/${id}`);
+  await page.request.delete(`/api/v1/repositories/${id}`);
 }
 
 test.describe('Repo File Explorer', () => {

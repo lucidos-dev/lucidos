@@ -53,9 +53,11 @@ fn internal_err<E: std::fmt::Display>(e: E) -> (StatusCode, Json<JsonValue>) {
 /// POST /api/v1/threads/:id/blobs — content-addressed image upload.
 ///
 /// State-machine guard mirrors `PUT /threads/:id/compose`: rejects with
-/// 410 on `discarded`, 404 on missing, accepts `composing|active|archived`.
-/// Same blob attached to two threads = two `ImageUploaded` events but a
-/// single on-disk file (write_blob is idempotent on identical bytes).
+/// 410 on `discarded`, 404 on missing, accepts `composing|active`. Archived
+/// threads carry `state='active'` plus `archive_state='archived'`, and
+/// uploads into them are accepted so a gmail-like revival reply can attach
+/// images. Same blob attached to two threads = two `ImageUploaded` events but
+/// a single on-disk file (write_blob is idempotent on identical bytes).
 pub(super) async fn post_blob(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
@@ -79,7 +81,7 @@ pub(super) async fn post_blob(
         Some(ThreadState::Discarded) => {
             return Err(err(StatusCode::GONE, "thread discarded"))
         }
-        Some(ThreadState::Composing | ThreadState::Active | ThreadState::Archived) => {}
+        Some(ThreadState::Composing | ThreadState::Active) => {}
     }
 
     // Read the single `file` part. The frontend uploads exactly one image

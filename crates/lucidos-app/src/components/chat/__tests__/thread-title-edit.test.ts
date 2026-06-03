@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
+import { normalizeRename } from '../ThreadTitleEditor';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(here, '../ThreadTitleEditor.tsx'), 'utf-8');
@@ -62,6 +63,34 @@ describe('ThreadTitleEditor — dual-element split', () => {
     // or reload. A ResizeObserver re-runs the resize on width-only changes.
     expect(source).toMatch(/new ResizeObserver\(/);
     expect(source).toMatch(/observer\.observe\(el\)/);
+  });
+});
+
+describe('normalizeRename', () => {
+  // Production case: thread b046ae3e on 2026-05-15. The user clicked the title
+  // editor while the title was still the pre-LLM previewText fallback. SSE
+  // delivered ThreadTitleGenerated mid-edit; the [title, editing] useEffect
+  // skipped the editValue sync to protect typing in progress, leaving
+  // editValueRef.current holding the pre-SSE title. A subsequent blur fired
+  // save(editValueRef.current) and POSTed the stale value back to /rename,
+  // overwriting the LLM title. Tracking "did the user actually type" makes
+  // that path a no-op without relying on a stale-snapshot comparison.
+  it('returns null when the user did not type (isDirty=false)', () => {
+    expect(normalizeRename('anything', 'old', false)).toBe(null);
+  });
+
+  it('returns null on empty / whitespace-only input', () => {
+    expect(normalizeRename('', 'foo', true)).toBe(null);
+    expect(normalizeRename('   ', 'foo', true)).toBe(null);
+  });
+
+  it('returns null when trimmed value matches the current title', () => {
+    expect(normalizeRename('foo', 'foo', true)).toBe(null);
+    expect(normalizeRename('  foo  ', 'foo', true)).toBe(null);
+  });
+
+  it('returns the trimmed value when the user typed a genuinely new title', () => {
+    expect(normalizeRename('  user typed  ', 'old title', true)).toBe('user typed');
   });
 });
 

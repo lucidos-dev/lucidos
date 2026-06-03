@@ -5,6 +5,10 @@ use std::fmt;
 use uuid::Uuid;
 
 /// Authentication type for a stored credential.
+///
+/// `Unknown` catches DB rows written by a newer engine version with an
+/// auth_type variant this binary doesn't recognize — falls through the
+/// header-injection sites as a raw value instead of pretending to be ApiKey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthType {
@@ -14,10 +18,15 @@ pub enum AuthType {
     Password,
     OauthClient,
     EmailPassword,
+    Unknown,
 }
 
 impl AuthType {
-    /// Parse from a database string, defaulting to `ApiKey` for unknown values.
+    /// Parse from a database string, returning `Unknown` for unrecognized
+    /// values so callers can detect-and-skip rather than getting silently
+    /// coerced to `ApiKey`. The auth-header injection sites already gate on
+    /// the specific variants (`Bearer`, `Basic`, `Password`) and treat
+    /// everything else as raw value, so `Unknown` lands in the safe branch.
     pub fn parse(s: &str) -> Self {
         match s {
             "api_key" => Self::ApiKey,
@@ -26,7 +35,7 @@ impl AuthType {
             "password" => Self::Password,
             "oauth_client" => Self::OauthClient,
             "email_password" => Self::EmailPassword,
-            _ => Self::ApiKey,
+            _ => Self::Unknown,
         }
     }
 }
@@ -40,6 +49,7 @@ impl fmt::Display for AuthType {
             Self::Password => "password",
             Self::OauthClient => "oauth_client",
             Self::EmailPassword => "email_password",
+            Self::Unknown => "unknown",
         };
         f.write_str(s)
     }
@@ -58,7 +68,7 @@ pub struct CredentialInfo {
 }
 
 /// Full credential including the secret value
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Credential {
     pub id: Uuid,
     pub service_name: String,
@@ -68,6 +78,24 @@ pub struct Credential {
     pub auth_header: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+// Manual `Debug` so the secret `auth_value` (API key, bearer token, password,
+// or the oauth client_secret JSON blob) never leaks through `{:?}`. Everything
+// else stays visible so the struct is still useful for debugging.
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credential")
+            .field("id", &self.id)
+            .field("service_name", &self.service_name)
+            .field("base_url", &self.base_url)
+            .field("auth_type", &self.auth_type)
+            .field("auth_value", &"<redacted>")
+            .field("auth_header", &self.auth_header)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 /// Parse a credential row tuple from the database (with secret).
@@ -125,7 +153,9 @@ fn parse_credential_info(
 pub struct CredentialStore;
 
 impl CredentialStore {
-    /// Initialize the credentials table schema
+    /// Defensive double-write — the migration owns this CREATE TABLE
+    /// (see `20260517160627_consolidate_init_schema_tables.sql`). Slated
+    /// for removal in `harden-init-schema-tables-vs-migrations-pattern-finish`.
     pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -249,23 +279,55 @@ impl CredentialStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Update just the auth_value for an existing credential
-    pub async fn update_value(
+    /// Update an existing credential's editable fields (everything except the
+    /// immutable `service_name`). `auth_value: None` keeps the stored secret
+    /// untouched — used when the user edits non-secret fields without
+    /// re-entering the secret. Returns whether a row existed.
+    pub async fn update(
         pool: &PgPool,
         service_name: &str,
-        auth_value: &str,
+        base_url: &str,
+        auth_type: AuthType,
+        auth_header: Option<&str>,
+        auth_value: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            UPDATE credentials
-            SET auth_value = $2, updated_at = NOW()
-            WHERE service_name = $1
-            "#,
-        )
-        .bind(service_name)
-        .bind(auth_value)
-        .execute(pool)
-        .await?;
+        let auth_header = auth_header.unwrap_or("Authorization");
+
+        // Two static queries instead of a dynamic one: the only difference is
+        // whether `auth_value` is touched, and sqlx wants compile-time SQL.
+        let result = match auth_value {
+            Some(value) => {
+                sqlx::query(
+                    r#"
+                    UPDATE credentials
+                    SET base_url = $2, auth_type = $3, auth_header = $4, auth_value = $5, updated_at = NOW()
+                    WHERE service_name = $1
+                    "#,
+                )
+                .bind(service_name)
+                .bind(base_url)
+                .bind(auth_type.to_string())
+                .bind(auth_header)
+                .bind(value)
+                .execute(pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    UPDATE credentials
+                    SET base_url = $2, auth_type = $3, auth_header = $4, updated_at = NOW()
+                    WHERE service_name = $1
+                    "#,
+                )
+                .bind(service_name)
+                .bind(base_url)
+                .bind(auth_type.to_string())
+                .bind(auth_header)
+                .execute(pool)
+                .await?
+            }
+        };
 
         Ok(result.rows_affected() > 0)
     }
@@ -310,11 +372,24 @@ pub fn credential_env_vars(credentials: Vec<Credential>) -> Vec<(String, String)
         let prefix = format!("CRED_{}", env_name);
 
         if cred.auth_type == AuthType::Password {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cred.auth_value) {
-                let username = parsed["username"].as_str().unwrap_or("");
-                let password = parsed["password"].as_str().unwrap_or("");
-                env_vars.push((format!("{}_USERNAME", prefix), username.to_string()));
-                env_vars.push((format!("{}_PASSWORD", prefix), password.to_string()));
+            match serde_json::from_str::<serde_json::Value>(&cred.auth_value) {
+                Ok(parsed) => {
+                    let username = parsed["username"].as_str().unwrap_or("");
+                    let password = parsed["password"].as_str().unwrap_or("");
+                    env_vars.push((format!("{}_USERNAME", prefix), username.to_string()));
+                    env_vars.push((format!("{}_PASSWORD", prefix), password.to_string()));
+                }
+                Err(e) => {
+                    // Malformed JSON in a Password credential means a script
+                    // expecting CRED_<NAME>_USERNAME / _PASSWORD will see them
+                    // missing with no signal — log so the user has something to
+                    // diagnose against instead of silently failing in the script.
+                    log!(
+                        "[Credentials] {} has invalid password JSON, skipping env injection: {}",
+                        cred.service_name,
+                        e
+                    );
+                }
             }
         } else {
             env_vars.push((prefix, cred.auth_value));
@@ -349,9 +424,15 @@ mod tests {
         );
         let env: std::collections::HashMap<_, _> =
             credential_env_vars(vec![cred]).into_iter().collect();
-        assert_eq!(env.get("CRED_COMFORT_CLOUD_USERNAME").map(String::as_str), Some("alice"));
-        assert_eq!(env.get("CRED_COMFORT_CLOUD_PASSWORD").map(String::as_str), Some("s3cret"));
-        assert!(env.get("CRED_COMFORT_CLOUD").is_none());
+        assert_eq!(
+            env.get("CRED_COMFORT_CLOUD_USERNAME").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            env.get("CRED_COMFORT_CLOUD_PASSWORD").map(String::as_str),
+            Some("s3cret")
+        );
+        assert!(!env.contains_key("CRED_COMFORT_CLOUD"));
     }
 
     #[test]
@@ -367,8 +448,8 @@ mod tests {
             env.get("CRED_FIREBASE_WEB_API_KEY").map(String::as_str),
             Some("AIzaSy-fake-key-value")
         );
-        assert!(env.get("CRED_FIREBASE_WEB_API_KEY_USERNAME").is_none());
-        assert!(env.get("CRED_FIREBASE_WEB_API_KEY_PASSWORD").is_none());
+        assert!(!env.contains_key("CRED_FIREBASE_WEB_API_KEY_USERNAME"));
+        assert!(!env.contains_key("CRED_FIREBASE_WEB_API_KEY_PASSWORD"));
     }
 
     #[test]
@@ -376,8 +457,11 @@ mod tests {
         let cred = make_cred("openai-key", AuthType::Bearer, "sk-test-123");
         let env: std::collections::HashMap<_, _> =
             credential_env_vars(vec![cred]).into_iter().collect();
-        assert_eq!(env.get("CRED_OPENAI_KEY").map(String::as_str), Some("sk-test-123"));
-        assert!(env.get("CRED_OPENAI_KEY_USERNAME").is_none());
+        assert_eq!(
+            env.get("CRED_OPENAI_KEY").map(String::as_str),
+            Some("sk-test-123")
+        );
+        assert!(!env.contains_key("CRED_OPENAI_KEY_USERNAME"));
     }
 
     #[test]
@@ -388,9 +472,45 @@ mod tests {
         let cred = make_cred("svc-basic", AuthType::Basic, "alice:s3cret");
         let env: std::collections::HashMap<_, _> =
             credential_env_vars(vec![cred]).into_iter().collect();
-        assert_eq!(env.get("CRED_SVC_BASIC").map(String::as_str), Some("alice:s3cret"));
-        assert!(env.get("CRED_SVC_BASIC_USERNAME").is_none());
-        assert!(env.get("CRED_SVC_BASIC_PASSWORD").is_none());
+        assert_eq!(
+            env.get("CRED_SVC_BASIC").map(String::as_str),
+            Some("alice:s3cret")
+        );
+        assert!(!env.contains_key("CRED_SVC_BASIC_USERNAME"));
+        assert!(!env.contains_key("CRED_SVC_BASIC_PASSWORD"));
+    }
+
+    #[test]
+    fn parse_unknown_db_string_yields_unknown_variant_not_apikey() {
+        // Regression: a row with an auth_type the binary doesn't recognize
+        // (e.g. written by a newer version) used to be coerced to ApiKey and
+        // injected with the wrong shape. parse() must return Unknown so the
+        // env-var path / header-injection sites fall through safely.
+        assert_eq!(AuthType::parse("api_key"), AuthType::ApiKey);
+        assert_eq!(AuthType::parse("totally-new-thing"), AuthType::Unknown);
+        assert_eq!(AuthType::parse(""), AuthType::Unknown);
+    }
+
+    #[test]
+    fn unknown_round_trips_through_to_string_and_parse() {
+        assert_eq!(AuthType::Unknown.to_string(), "unknown");
+        assert_eq!(AuthType::parse("unknown"), AuthType::Unknown);
+    }
+
+    #[test]
+    fn unknown_emits_single_cred_var_not_password_pair() {
+        // The Password pair check (`==` AuthType::Password) must not match
+        // Unknown — Unknown lands in the else branch with a single CRED_*
+        // variable carrying the raw value, same as ApiKey/Bearer/Basic.
+        let cred = make_cred("legacy-svc", AuthType::Unknown, "raw-value");
+        let env: std::collections::HashMap<_, _> =
+            credential_env_vars(vec![cred]).into_iter().collect();
+        assert_eq!(
+            env.get("CRED_LEGACY_SVC").map(String::as_str),
+            Some("raw-value")
+        );
+        assert!(!env.contains_key("CRED_LEGACY_SVC_USERNAME"));
+        assert!(!env.contains_key("CRED_LEGACY_SVC_PASSWORD"));
     }
 
     #[test]
@@ -399,8 +519,31 @@ mod tests {
         let env: std::collections::HashMap<_, _> =
             credential_env_vars(vec![cred]).into_iter().collect();
         assert_eq!(
-            env.get("CRED_SNAKE_STORAGE_FAMILIEN_PROD").map(String::as_str),
+            env.get("CRED_SNAKE_STORAGE_FAMILIEN_PROD")
+                .map(String::as_str),
             Some("v")
         );
+    }
+
+    #[test]
+    fn debug_redacts_credential_secret() {
+        let cred = make_cred(
+            "oauth:google",
+            AuthType::OauthClient,
+            r#"{"client_id":"abc","client_secret":"super-secret-value"}"#,
+        );
+        let dbg = format!("{:?}", cred);
+        // The secret `auth_value` must never appear in a `{:?}` rendering.
+        assert!(
+            !dbg.contains("super-secret-value"),
+            "secret leaked: {dbg}"
+        );
+        assert!(
+            dbg.contains("auth_value: \"<redacted>\""),
+            "expected redacted auth_value: {dbg}"
+        );
+        // Non-secret fields stay visible for debugging.
+        assert!(dbg.contains("oauth:google"));
+        assert!(dbg.contains("OauthClient"));
     }
 }

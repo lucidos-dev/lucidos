@@ -1,5 +1,5 @@
 import { effect } from '@preact/signals';
-import { pageTitle, unreadCount, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, inputMode, threadDrawerOpen, selectedRepoId, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, repoSelectedChangeId, SELECTED_CHANGE_KEY, MOBILE_VIEW_KEY } from './store';
+import { pageTitle, unreadCount, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, repoSelectedChangeId, inputMode, SELECTED_CHANGE_KEY, MOBILE_VIEW_KEY } from './store';
 
 // Sync page title with unread count
 effect(() => {
@@ -17,6 +17,15 @@ localStorage.removeItem('lucidos-reasoning-effort');
 // mobile-view moved from localStorage to sessionStorage so a cold PWA launch
 // doesn't strand the user on a pane they last viewed days ago.
 localStorage.removeItem(MOBILE_VIEW_KEY);
+// Legacy key from when the toggle used a different shape — drop so it can't
+// shadow the current 'lucidos-input-mode' payload.
+localStorage.removeItem('lucidos-input-target');
+
+// Persist the compose actor toggle (Lucidos / Claude). Restored on init in
+// store.ts so a Claude pick survives reload.
+effect(() => {
+  localStorage.setItem('lucidos-input-mode', JSON.stringify(inputMode.value));
+});
 
 // Persist animation speed
 effect(() => {
@@ -38,19 +47,16 @@ effect(() => {
   localStorage.setItem('lucidos-expanded-folders', JSON.stringify([...expandedFolders.value]));
 });
 
-// Persist input mode
-effect(() => {
-  localStorage.setItem('lucidos-input-mode', JSON.stringify(inputMode.value));
-});
-
 // Persist thread drawer open state
 effect(() => {
   localStorage.setItem('lucidos-thread-drawer-open', String(threadDrawerOpen.value));
 });
 
-// Persist selected CC repo
+// Persist selected CC scope (Lucidos / external repo / app). Legacy
+// `lucidos-cc-last-repo` is migrated once at signal-restore time inside
+// store.ts; this effect only ever writes the new key.
 effect(() => {
-  localStorage.setItem('lucidos-cc-last-repo', selectedRepoId.value);
+  localStorage.setItem('lucidos-cc-last-scope', JSON.stringify(selectedScope.value));
 });
 
 // Persist notifications filter

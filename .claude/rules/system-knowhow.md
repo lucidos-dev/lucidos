@@ -2,6 +2,7 @@
 globs:
   - "system-knowhow/**"
   - "docs/taxonomy.md"
+  - "docs/glossary.md"
   - "crates/lucidos-engine/src/engine/thread_events.rs"
   - "crates/lucidos-engine/src/engine/event_bus.rs"
   - "crates/lucidos-engine/src/scheduler/mod.rs"
@@ -19,6 +20,18 @@ globs:
   - "crates/lucidos-engine/src/engine/tools/plugins.rs"
   - "packages/lucidos-sdk/**"
   - "crates/lucidos-cli/**"
+  - "crates/lucidos-engine/src/scheduler/push.rs"
+  - "crates/lucidos-engine/src/core/device_presence.rs"
+  - "crates/lucidos-engine/src/api/presence.rs"
+  - "crates/lucidos-engine/src/api/presence_pong.rs"
+  - "crates/lucidos-app/public/sw.js"
+  - "crates/lucidos-app/src/utils/pageActive.ts"
+  - "crates/lucidos-app/src/store/actions/device-presence.ts"
+  - "crates/lucidos-app/src/store/actions/presence-pong.ts"
+  - "crates/lucidos-app/src/store/actions/in-app-notification-toast.ts"
+  - "crates/lucidos-app/src/store/actions/push.ts"
+  - "crates/lucidos-engine/src/runtime/python.rs"
+  - "crates/lucidos-engine/src/engine/agentic_loop.rs"
 ---
 
 # System-Knowhow Maintenance
@@ -38,14 +51,17 @@ When you touch any of the surfaces in the left column, you MUST update the file 
 |---|---|
 | `crates/lucidos-engine/src/engine/thread_events.rs` (`ThreadEvent` enum — variant added/removed/renamed, payload field changed, persistence flipped, alias added/removed) | `system-knowhow/thread-events.md` (master enumeration + payload shapes), AND if the change touches a `CodingAgent*` / `UserQuestion*` / `CodingAgentPermission*` variant, also `system-knowhow/coding-agent-events.md` |
 | `crates/lucidos-engine/src/engine/event_bus.rs` (`SystemEvent` enum — variant added/removed/renamed, aggregate name changed, persistence/projection routing changed) | `.claude/rules/db.md` § Key event types, AND any `system-knowhow/*.md` that references that event by name (grep first — workspace-learning + thread-events + coding-agent-events all index events by name) |
-| `crates/lucidos-engine/src/scheduler/mod.rs` (`// Allow a curated subset of ThreadEvents` block — adding/removing an entry, changing the trigger matcher routing) | `system-knowhow/thread-events.md` "In allowlist" column, AND `system-knowhow/coding-agent-events.md` "CRITICAL" section, AND `system-knowhow/building-a-trigger.md` if the change opens a new "you can now `on_event:` X" path |
+| `ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events.rs`, or the scheduler trigger gate in `crates/lucidos-engine/src/scheduler/mod.rs` that consumes it (adding/removing a blocklisted variant, changing the trigger matcher routing) | `system-knowhow/thread-events.md` "Triggerable" column + "Today the scheduler uses a blocklist" section, AND `system-knowhow/coding-agent-events.md` "Triggerability: blocklist semantics" section, AND `system-knowhow/building-a-trigger.md` if the change opens a new "you can now `on_event:` X" path |
 | `packages/lucidos-sdk/**` (the `window.lucidos.*` JS surface — new/changed method, signature change, namespace addition) | `system-knowhow/js-sdk.md` § matching `lucidos.<namespace>` heading (also see `.claude/rules/sdk.md` for the same rule from the SDK side) |
 | `crates/lucidos-cli/**` (the `lucidos` CLI — new subcommand, flag change, output shape change) | `system-knowhow/lucidos-cli.md` |
 | `crates/lucidos-engine/src/{api,core}/plugins.rs` + `crates/lucidos-engine/src/engine/tools/plugins.rs` (plugin manifest schema, install / uninstall / list flow, plugin LLM tools) | `system-knowhow/building-a-plugin.md`, AND `docs/taxonomy.md` § plugins if the layout / install semantics changed |
 | `crates/lucidos-engine/src/llm/tools.rs` + `crates/lucidos-engine/src/engine/tools/**` (LLM tool added/removed/renamed, args schema changed) | `crates/lucidos-engine/src/engine/agent_session/prompts.rs` (system prompts advertise tools), AND `system-knowhow/best-practices.md` / `system-knowhow/intent-registry.md` if the tool's intent maps there |
+| `crates/lucidos-engine/src/engine/tools/bash_background.rs` (`BackgroundBashRegistry` — `read_output_in_memory_wait`, `BASH_OUTPUT_MAX_WAIT_SECS`, the `Notify`-on-chunk semantics), `crates/lucidos-engine/src/engine/tools/bash.rs` (`execute_bash_output_tool` — `wait_secs` arg handling, clamping), `crates/lucidos-engine/src/runtime/python.rs` (`truncate_python_error` — frame-trim shape, line/byte budgets), or `crates/lucidos-engine/src/engine/agentic_loop.rs` (`derive_call_key` / `python_call_key` for `RUN_PYTHON*`, the `excluded` list in the generic 3-strike guard) | `system-knowhow/running-python.md` (drain pattern, `wait_secs` semantics, error-truncation behavior, anti-pattern list — the LLM acts on what this file says about `bash_output(wait_secs)`, the auto-truncation, and the repeated-call guard) |
 | `crates/lucidos-engine/src/api/history.rs` + `crates/lucidos-engine/src/api/app_ui.rs` (HTTP shapes for events / app UI bridge) | `system-knowhow/js-sdk.md` (the SDK calls these), AND `system-knowhow/building-an-app.md` if the app-side contract shifts |
 | `crates/lucidos-engine/src/api/proxy_pipeline_config.rs` + `proxy*.rs` siblings (the on-disk `data/config/apis.json` schema — auth pipeline, signer kinds, header/body shapes) | `system-knowhow/building-an-auth-handshake.md`, AND `system-knowhow/best-practices.md` § `config/` |
 | `crates/lucidos-engine/src/engine/agent_session/prompts.rs` (engine system prompts — the taxonomy/trigger sections, the intent registry advertise-list, the knowhow listing) | `system-knowhow/intent-registry.md` if intents added/removed, AND `system-knowhow/workspace-audit.md` (audit's reference table names sections of this file by heading) |
+| `crates/lucidos-engine/src/scheduler/push.rs`, `crates/lucidos-engine/src/core/device_presence.rs`, `crates/lucidos-engine/src/api/presence.rs`, `crates/lucidos-engine/src/api/presence_pong.rs`, `crates/lucidos-app/public/sw.js`, `crates/lucidos-app/src/utils/pageActive.ts`, `crates/lucidos-app/src/store/actions/device-presence.ts`, `crates/lucidos-app/src/store/actions/presence-pong.ts`, `crates/lucidos-app/src/store/actions/in-app-notification-toast.ts`, `crates/lucidos-app/src/store/actions/push.ts` (notification fan-out, presence tracking, PresenceCheck protocol, in-app surface §4 matrix, service worker push handling, push subscription lifecycle) | `system-knowhow/notifications.md` § matching `§N` section (§2 for the fan-out matrix, §3 for the PresenceCheck protocol, §4 for the in-app surface), AND `system-knowhow/glossary.md` if the change shifts what "active device" / "in-app surface" / "OS surface" / "source event" mean |
+| Any code, UI string, or prose change that renames / retires / semantically shifts a term in `system-knowhow/glossary.md` (user-facing) or `docs/glossary.md` (dev-only) — e.g. renaming the `Trigger` Rust type, the `app` URL prefix, the `artifact` CLI subcommand, a `lucidos.*` SDK namespace; or replacing the canonical word in a user-facing message | The matching glossary entry — in the same commit. New term introduced → add a new entry to the appropriate layer (user-facing → `system-knowhow/glossary.md`; dev-only → `docs/glossary.md`). Drift between code/UI and the glossary is a `/harden` failure on the same footing as a stale `system-knowhow` file. |
 
 The rule is simple: **the doc and the code ship together, in the same commit, on the same branch**. If the doc update would be large and you want to defer it, that's a sign the change itself needs to wait. Do not land a code change with a TODO to "update knowhow later" — the engine LLM doesn't read TODOs, it reads the published `system-knowhow/*.md`.
 
@@ -58,7 +74,8 @@ A new surface in any of these categories cannot land without a matching `system-
 - A new `lucidos.*` SDK method or namespace — must land with a `## lucidos.<namespace>` section in `system-knowhow/js-sdk.md` (signature, example, when-to-use).
 - A new `lucidos` CLI subcommand or flag — must land with a section in `system-knowhow/lucidos-cli.md`.
 - A new auth-pipeline shape in the `apis.json` schema (signer kind, layer, header/body mode — defined in `crates/lucidos-engine/src/api/proxy_pipeline_config.rs` and the `proxy*.rs` siblings) — must land with the worked example in `system-knowhow/building-an-auth-handshake.md`.
-- A new entry in the scheduler `ThreadEvent` allowlist — must land with the "In allowlist" column flipped in `system-knowhow/thread-events.md` AND a follow-up note in `system-knowhow/coding-agent-events.md` if the new entry is CC-related.
+- A new project term that's reused in user-facing prose, code identifiers, or design docs — must land with a glossary entry. User-facing concept (anything the user or the workspace LLM would encounter) → `system-knowhow/glossary.md`. Internal-only (engine plumbing, DB columns, build/test tooling, CC mechanics) → `docs/glossary.md`. No term gets defined in both files. See `.claude/rules/glossary.md` for the canonical-term rule itself.
+- A change to the scheduler `ThreadEvent` blocklist (a new variant added to `ThreadEvent::is_per_token_streaming`, or an existing entry removed) — must land with the "Triggerable" column flipped in `system-knowhow/thread-events.md` AND a follow-up note in `system-knowhow/coding-agent-events.md` if the entry is CC-related.
 - A change to the plugin manifest schema (required keys, validation rules, install / uninstall flow) — must land with the matching schema section in `system-knowhow/building-a-plugin.md`.
 
 ## `/harden` enforcement

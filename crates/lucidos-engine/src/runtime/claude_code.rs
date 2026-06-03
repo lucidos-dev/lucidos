@@ -1,41 +1,56 @@
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{
-    AgentEvent, AgentInput, AgentKind, AgentRuntime, ControlRequest, RunningAgent, SpawnArgs,
+    AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent, SpawnArgs,
 };
 use super::lucidos_cli::{
-    lucidos_cli_dir, ensure_workspace_bin_symlink, install_lucidos_cli_skill, path_with_prefix,
+    ensure_workspace_bin_symlink, install_lucidos_cli_skill, lucidos_cli_dir, path_with_prefix,
+    LUCIDOS_CLI_SKILL_REL_PATH,
 };
 
-/// Hardcoded list of models available in Claude Code's `/model` picker.
-/// Maintained manually — use the `update-lucidos-cc-models` skill to keep in sync.
-/// Source: https://code.claude.com/docs/en/model-config
-pub const CC_MODEL_OPTIONS: &[(&str, &str, &str)] = &[
-    // (value, label, description)
-    ("default", "Default", "Use the default model for your plan"),
-    ("sonnet", "Sonnet 4.6", "Best for everyday tasks"),
-    (
-        "sonnet[1m]",
-        "Sonnet 4.6 (1M)",
-        "Sonnet 4.6 for long sessions",
-    ),
-    ("claude-opus-4-7", "Opus 4.7", "Latest and most capable"),
-    ("claude-opus-4-1", "Opus 4.1", "Legacy"),
-    ("opus", "Opus 4.6", "Most capable for complex work"),
-    ("opus[1m]", "Opus 4.6 (1M)", "Opus 4.6 for long sessions"),
-    ("haiku", "Haiku 4.5", "Fastest for quick answers"),
-];
+/// Single source of truth for CC's `/model` and `/effort` picker entries.
+/// The data lives in `cc_menu_options.json` next to this file — see that
+/// file's `_note` for why it's hand-maintained and how to update it. The
+/// JSON is `include_str!()`-baked at compile time and parsed once via
+/// `LazyLock` so there's no runtime IO cost.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CcMenuOption {
+    pub value: String,
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CcMenuOptionsFile {
+    models: Vec<CcMenuOption>,
+    reasoning_efforts: Vec<CcMenuOption>,
+}
+
+const CC_MENU_OPTIONS_JSON: &str = include_str!("cc_menu_options.json");
+
+static CC_MENU_OPTIONS: std::sync::LazyLock<CcMenuOptionsFile> = std::sync::LazyLock::new(|| {
+    serde_json::from_str(CC_MENU_OPTIONS_JSON)
+        .expect("cc_menu_options.json is malformed — see runtime/cc_menu_options.json")
+});
+
+pub fn cc_model_options() -> &'static [CcMenuOption] {
+    &CC_MENU_OPTIONS.models
+}
+
+pub fn cc_reasoning_effort_options() -> &'static [CcMenuOption] {
+    &CC_MENU_OPTIONS.reasoning_efforts
+}
 
 /// Map a full CC CLI model ID (e.g. `claude-sonnet-4-6`) back to the short
 /// alias we originally sent (e.g. `sonnet`).  Returns the input unchanged if
-/// it already is a known CC_MODEL_OPTIONS value or doesn't match any alias.
+/// it already is a known `cc_model_options()` value or doesn't match any alias.
 pub fn normalize_cc_model_id(full_id: &str) -> &str {
-    if CC_MODEL_OPTIONS.iter().any(|(v, _, _)| *v == full_id) {
+    if cc_model_options().iter().any(|m| m.value == full_id) {
         return full_id;
     }
     if full_id.starts_with("claude-sonnet-4") {
@@ -65,295 +80,26 @@ pub fn reconcile_cc_model(original: Option<&str>, cc_reported: &str) -> String {
     normalized.to_string()
 }
 
-/// Reasoning effort levels for Claude Code's thinking budget.
-pub const CC_REASONING_EFFORT_OPTIONS: &[(&str, &str, &str)] = &[
-    // (value, label, description)
-    ("low", "Low", "Minimal thinking \u{00b7} Fastest responses"),
-    ("medium", "Medium", "Balanced thinking \u{00b7} Default"),
-    ("high", "High", "Deep thinking \u{00b7} Most thorough"),
-    (
-        "xhigh",
-        "Extra High",
-        "Extra deep thinking \u{00b7} Higher than High",
-    ),
-    ("max", "Max", "Maximum thinking \u{00b7} Extended reasoning"),
-];
-
-/// Parse a single JSON line from Claude Code's stream output.
-/// Returns all recognized events from the line. An assistant message with
-/// multiple content blocks (text + tool_use) produces multiple events.
-/// Never produces `AgentEvent::Exited` — that variant is emitted by the
-/// driver task on process exit.
-pub fn parse_line(line: &str) -> Vec<AgentEvent> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Vec::new();
-    }
-
-    let val: serde_json::Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let event_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-    match event_type {
-        // Only parse subtype "init" — hook events (hook_started, hook_response,
-        // hook_progress) also have type "system" + session_id but lack slash_commands.
-        // Without this guard, hook events after init overwrite commands with empty arrays.
-        "system" => {
-            let subtype = val.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
-            if subtype == "init" {
-                if let Some(sid) = val.get("session_id").and_then(|v| v.as_str()) {
-                    let slash_commands = val
-                        .get("slash_commands")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let skills = val
-                        .get("skills")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let model = val.get("model").and_then(|v| v.as_str()).map(String::from);
-                    vec![AgentEvent::Init {
-                        session_id: sid.to_string(),
-                        model,
-                        slash_commands,
-                        skills,
-                    }]
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            }
-        }
-        "assistant" => {
-            let mut events = Vec::new();
-            let message = val.get("message");
-            if let Some(content) = message
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_array())
-            {
-                for block in content {
-                    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    match block_type {
-                        "text" => {
-                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                events.push(AgentEvent::Message {
-                                    role: "assistant".to_string(),
-                                    text: text.to_string(),
-                                });
-                            }
-                        }
-                        "tool_use" => {
-                            let name = block
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let input = block
-                                .get("input")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            let id = block
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            events.push(AgentEvent::ToolUse { name, input, id });
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            // CC mirrors Anthropic's `usage` block on each assistant
-            // message (one per LLM API call). Surfaced as a separate
-            // `Usage` event so the consumer can emit `ContextCaptured`.
-            if let Some(usage) = message.and_then(|m| m.get("usage")) {
-                let model = message
-                    .and_then(|m| m.get("model"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let input_tokens = usage
-                    .get("input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                let output_tokens = usage
-                    .get("output_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                let cache_read_tokens = usage
-                    .get("cache_read_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                let cache_creation_tokens = usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                // Skip empty-usage frames (CC sometimes emits a continuation
-                // assistant message with zeroed usage — no real API call
-                // happened, so a snapshot would be misleading).
-                if input_tokens > 0
-                    || output_tokens > 0
-                    || cache_read_tokens > 0
-                    || cache_creation_tokens > 0
-                {
-                    events.push(AgentEvent::Usage {
-                        model,
-                        input_tokens,
-                        output_tokens,
-                        cache_read_tokens,
-                        cache_creation_tokens,
-                    });
-                }
-            }
-            events
-        }
-        "tool_result" => {
-            let content = val
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            let is_error = val
-                .get("is_error")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let id = val
-                .get("tool_use_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let status = if is_error { "error" } else { "success" };
-            vec![AgentEvent::ToolResult {
-                output: content,
-                status: status.to_string(),
-                id,
-            }]
-        }
-        // CC 2.1.76+ sends tool results as "type": "user" with tool_result content blocks
-        "user" => {
-            let mut events = Vec::new();
-            if let Some(content) = val
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_array())
-            {
-                for block in content {
-                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                        let output = block
-                            .get("content")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let is_error = block
-                            .get("is_error")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let id = block
-                            .get("tool_use_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let status = if is_error { "error" } else { "success" };
-                        events.push(AgentEvent::ToolResult {
-                            output,
-                            status: status.to_string(),
-                            id,
-                        });
-                    }
-                }
-            }
-            events
-        }
-        "result" => {
-            let text = val
-                .get("result")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let duration = val.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-            let is_error = val
-                .get("is_error")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let error = if is_error {
-                let joined = val
-                    .get("errors")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    })
-                    .filter(|s| !s.is_empty());
-                // Fall back to the subtype label (e.g. "error_max_turns") when
-                // CC omits `errors` so ResponseFailed still has a non-empty
-                // user-facing reason string. Skip "success" — CC sometimes
-                // emits `is_error: true` with `subtype: "success"` (observed
-                // on upstream API drops after the conversation has streamed
-                // an `API Error: …` text). Using it would render as
-                // `[ERROR] **Error:** success` in the timeline.
-                Some(joined.unwrap_or_else(|| {
-                    let subtype = val.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
-                    if subtype.is_empty() || subtype == "success" {
-                        "Unknown error".to_string()
-                    } else {
-                        subtype.to_string()
-                    }
-                }))
-            } else {
-                None
-            };
-            vec![AgentEvent::Result {
-                text,
-                duration_ms: duration,
-                error,
-            }]
-        }
-        // CC 2.1.76+ sends streaming deltas as "type": "stream_event" wrappers.
-        // Silently ignore these — tool calls are captured from complete "assistant"
-        // messages, and text from AgentEvent::Message. Stream events are just
-        // intermediate deltas that don't need separate handling.
-        "stream_event" => Vec::new(),
-        // control_response is CC's reply to a control_request (e.g. interrupt).
-        // We don't need to act on it — the interrupt itself triggers a Result event.
-        "control_response" => Vec::new(),
-        other => {
-            if !other.is_empty() {
-                log!("[ClaudeCode] Unrecognized event type: {}", other);
-            }
-            Vec::new()
-        }
-    }
-}
+#[path = "claude_code_parse.rs"]
+mod parse;
+pub use parse::parse_line;
 
 /// Render the menu of supported control commands for the frontend's `/model`
 /// picker. CC-specific — Codex and other agents have their own menus.
 pub fn cc_command_definitions() -> serde_json::Value {
-    fn options_to_json(opts: &[(&str, &str, &str)]) -> Vec<serde_json::Value> {
+    fn options_to_json(opts: &[CcMenuOption]) -> Vec<serde_json::Value> {
         opts.iter()
-            .map(|(value, label, desc)| {
+            .map(|m| {
                 serde_json::json!({
-                    "value": value,
-                    "label": label,
-                    "description": desc,
+                    "value": m.value,
+                    "label": m.label,
+                    "description": m.description,
                 })
             })
             .collect()
     }
-    let model_options = options_to_json(CC_MODEL_OPTIONS);
-    let effort_options = options_to_json(CC_REASONING_EFFORT_OPTIONS);
+    let model_options = options_to_json(cc_model_options());
+    let effort_options = options_to_json(cc_reasoning_effort_options());
     serde_json::json!([
         {
             "subtype": "set_model",
@@ -399,9 +145,9 @@ pub fn cc_control_request_to_json(request: &ControlRequest, request_id: &str) ->
 static CC_DEFAULT_EFFORT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 fn is_valid_effort(value: &str) -> bool {
-    CC_REASONING_EFFORT_OPTIONS
+    cc_reasoning_effort_options()
         .iter()
-        .any(|(v, _, _)| *v == value)
+        .any(|m| m.value == value)
 }
 
 fn effort_from_json(path: &std::path::Path) -> Option<String> {
@@ -456,8 +202,8 @@ pub struct ClaudeCodeRuntime;
 
 #[async_trait]
 impl AgentRuntime for ClaudeCodeRuntime {
-    fn kind(&self) -> AgentKind {
-        AgentKind::ClaudeCode
+    fn kind(&self) -> CodingAgent {
+        CodingAgent::ClaudeCode
     }
 
     async fn spawn(
@@ -469,7 +215,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
         if cli_dir.is_none() {
             crate::log!(
                 "[ClaudeCode] lucidos CLI binary not found near current_exe — \
-                 spawned CC sessions won't have the `lucidos` command on PATH \
+                 spawned Claude Code sessions won't have the `lucidos` command on PATH \
                  (build with `cargo build -p lucidos-cli`)"
             );
         }
@@ -480,6 +226,17 @@ impl AgentRuntime for ClaudeCodeRuntime {
                 e
             );
         }
+        // If the injected skill is *tracked* in this repo (an earlier session
+        // auto-committed it before the deep-path exclude existed), overwriting
+        // it on disk just now produces a phantom `M` that `.git/info/exclude`
+        // can't hide. Skip-worktree it so this session never sees a change it
+        // didn't author. No-op for the Lucidos repo, where the tracked copy is
+        // identical and must stay editable.
+        crate::engine::git_ops::hide_phantom_tracked_skill(
+            args.worktree_path,
+            LUCIDOS_CLI_SKILL_REL_PATH,
+        )
+        .await;
         ensure_workspace_bin_symlink(args.worktree_path, cli_dir);
 
         // Materialize the PreToolUse hook config CC reads via --settings.
@@ -519,7 +276,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
         ));
 
         Ok(RunningAgent {
-            kind: AgentKind::ClaudeCode,
+            kind: CodingAgent::ClaudeCode,
             events_rx,
             input_tx,
             control_tx,
@@ -527,11 +284,35 @@ impl AgentRuntime for ClaudeCodeRuntime {
     }
 }
 
+/// Resolve the `claude` executable for spawn. The CC native installer (the
+/// canonical install since 2026-01) symlinks `$HOME/.local/bin/claude` at the
+/// active version, but a launchd-, IDE-, or any non-interactive-shell-launched
+/// engine inherits a PATH that omits `~/.local/bin`. A bare
+/// `Command::new("claude")` then ENOENTs even though the binary is installed —
+/// surfacing as "Failed to start Claude Code: No such file or directory".
+///
+/// Prefer the native-installer path when it exists; otherwise return bare
+/// `"claude"` so `Command::spawn` does its own PATH lookup (handles users who
+/// installed via Homebrew, npm, a custom symlink, etc.). `home` is injected to
+/// keep the function pure and testable; production callers pass
+/// `std::env::var_os("HOME")`.
+fn resolve_claude_binary(home: Option<&Path>) -> std::ffi::OsString {
+    if let Some(home) = home {
+        let native = home.join(".local/bin/claude");
+        if native.exists() {
+            return native.into_os_string();
+        }
+    }
+    std::ffi::OsString::from("claude")
+}
+
 /// Build the `claude` Command with all flags and env vars. Extracted so unit
 /// tests can inspect args/env without spawning. `cli_dir` is the directory
 /// containing the `lucidos` binary, prepended to PATH; pass `None` to skip.
 fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("claude");
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let claude_bin = resolve_claude_binary(home.as_deref());
+    let mut cmd = tokio::process::Command::new(claude_bin);
     if let Some(sid) = args.resume_session_id {
         cmd.arg("--print").arg("--resume").arg(sid);
     }
@@ -576,17 +357,31 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     if let Some(prompt) = args.system_prompt {
         cmd.arg("--append-system-prompt").arg(prompt);
     }
-    // Read by spawn-thread skill; see ChatRequest::parent_thread_id.
-    cmd.env("LUCIDOS_THREAD_ID", args.thread_id.to_string());
     cmd.env("LUCIDOS_WORKSPACE", args.workspace_path);
+    // Host-process protection env (LUCIDOS_HOST_PID + optional FRONTEND_PID +
+    // optional API_PORT). Shares a builder with
+    // `engine_impl::build_script_env_vars` so a future subprocess surface
+    // (MCP child, signer host, …) cannot ship without it. See the helper's
+    // doc for why this exists.
+    for (key, value) in crate::api::actor::host_protection_env_vars(args.workspace_path) {
+        cmd.env(key, value);
+    }
     // PG* env so CC can run `psql -c '…'` bare without putting the
     // password in argv (which gets persisted into CodingAgentToolCalled
     // and rendered in the steps UI). See `core::pg_env_vars` doc.
     for (key, value) in crate::core::pg_env_vars_cached() {
         cmd.env(key, value);
     }
+    // Subprocess-origin env (LUCIDOS_AGENT_ORIGIN_TOKEN + LUCIDOS_THREAD_ID).
+    // Shares a builder with `engine_impl::build_script_env_vars` so the two
+    // subprocess surfaces (CC + Lucidos LLM tool shells) cannot drift.
+    // `args.thread_id` is the Claude Code session's owning thread; the engine
+    // recognises callbacks bearing this pair and attributes them honestly.
+    for (key, value) in crate::api::actor::subprocess_origin_env_vars(Some(args.thread_id)) {
+        cmd.env(key, value);
+    }
     // Read by `lucidos spawn-thread` CLI to default `--caller-event-id` so
-    // cross-workspace POSTs from a CC subprocess carry the originating event.
+    // cross-workspace POSTs from a Claude Code subprocess carry the originating event.
     if let Some(event_id) = args.spawning_event_id {
         cmd.env("LUCIDOS_EVENT_ID", event_id.to_string());
     }
@@ -630,6 +425,20 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
             }
         }
     }
+    // NOTE: we deliberately do NOT attempt a post-fork macOS TCC "responsibility
+    // disclaim" here (a prior version called
+    // `responsibility_set_caller_responsible_for_self()` from a `pre_exec` hook).
+    // It was a verified no-op: macOS captures TCC responsibility from the
+    // `posix_spawnattr_t` at the `posix_spawn`/exec syscall, but Rust's
+    // `pre_exec` forces the `fork()`+`execvp()` path (no `posix_spawn`), so the
+    // only effective knob — `responsibility_spawnattrs_setdisclaim` — never gets
+    // set. Empirically, `responsibility_set_caller_responsible_for_self()` and
+    // `responsibility_set_pid_responsible_for_pid(self, self)` both leave the
+    // child attributed to the engine in every context tested (forked child,
+    // running process, parent-side reassignment). TCC grant stability for the
+    // dev engine is handled instead by signing the engine binary with a stable
+    // self-signed identity at build time (`scripts/lib/codesign.sh`), giving it
+    // a rebuild-stable Designated Requirement so a single Allow click sticks.
     cmd
 }
 
@@ -649,7 +458,7 @@ fn permission_mcp_config_json() -> String {
 }
 
 /// Format a user input as the JSON line CC expects on stdin. `session_id` is
-/// the CC session id (from the latest Init event, or the resumed id).
+/// the Claude Code session id (from the latest Init event, or the resumed id).
 fn format_user_input(input: &AgentInput, session_id: Option<&str>) -> String {
     let content = if input.images.is_empty() {
         serde_json::Value::String(input.text.clone())
@@ -687,23 +496,105 @@ fn format_user_input(input: &AgentInput, session_id: Option<&str>) -> String {
     line
 }
 
-/// Drain remaining stderr from the CC child (up to 4 KB, 2 s timeout).
-async fn drain_stderr(stderr_reader: &mut BufReader<ChildStderr>) -> String {
-    let mut output = String::with_capacity(4096);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let mut line = String::new();
-        while let Ok(n) = stderr_reader.read_line(&mut line).await {
-            if n == 0 {
-                break;
+/// Decode a `child.wait()` result into a debuggable string. `{:?}` on
+/// `ExitStatus` prints `unix_wait_status(36608)` — useless without
+/// manual decoding when a session-ending CC death lands in production
+/// logs. Three cases worth distinguishing:
+///
+/// * `exit=N` — clean exit with code `N` below the signal-convention
+///   range. Most CC sessions end here (exit 0 / 1 / SDK-specific codes).
+/// * `exit=N (probable SIGNAME)` — Node.js convention. A child that
+///   installs a signal handler typically re-exits with `128 + signum`
+///   after running cleanup. The hint converts the cryptic 143/137 codes
+///   the Lucidos engine sees from Claude Code into "SIGTERM" / "SIGKILL"
+///   at log-read time so future "who killed CC?" investigations don't
+///   require manual arithmetic.
+/// * `signal=NAME (N)` / `signal=N` — kernel delivered the signal as
+///   cause-of-death directly (no handler ran). Distinct from the
+///   exit=128+N path because the child never got to clean up.
+///
+/// `signal_name` is the bridge: keeps the named-signal table tiny
+/// (Node.js and the macOS Jetsam stack between them cover the common
+/// values we care about) and falls through to bare numbers for anything
+/// we haven't mapped, so the log never silently drops information.
+fn signal_name(sig: i32) -> Option<&'static str> {
+    match sig {
+        1 => Some("SIGHUP"),
+        2 => Some("SIGINT"),
+        3 => Some("SIGQUIT"),
+        6 => Some("SIGABRT"),
+        9 => Some("SIGKILL"),
+        13 => Some("SIGPIPE"),
+        15 => Some("SIGTERM"),
+        _ => None,
+    }
+}
+
+pub(crate) fn format_exit_status(
+    wait_result: &std::io::Result<std::process::ExitStatus>,
+) -> String {
+    match wait_result {
+        Err(e) => format!("wait_err: {e}"),
+        Ok(status) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = status.signal() {
+                    return match signal_name(sig) {
+                        Some(name) => format!("signal={name} ({sig})"),
+                        None => format!("signal={sig}"),
+                    };
+                }
+                if let Some(code) = status.code() {
+                    if (129..=159).contains(&code) {
+                        if let Some(name) = signal_name(code - 128) {
+                            return format!("exit={code} (probable {name})");
+                        }
+                    }
+                    return format!("exit={code}");
+                }
+                "no_status".to_string()
             }
-            output.push_str(&line);
-            line.clear();
-            if output.len() > 4096 {
-                break;
+            #[cfg(not(unix))]
+            {
+                match status.code() {
+                    Some(code) => format!("exit={code}"),
+                    None => "no_status".to_string(),
+                }
             }
         }
-    })
-    .await;
+    }
+}
+
+/// Drain remaining stderr from the CC child (up to 4 KB).
+///
+/// Per-line timeout — 100 ms of stderr silence means we're done. The
+/// previous wall-clock 2 s timeout blocked the post-loop cleanup for
+/// the full 2 s whenever a grandchild (e.g., rustc) inherited stderr
+/// and kept the fd open after CC's death: read_line on an inherited-
+/// but-silent fd is Pending forever, and the wall-clock timeout was
+/// our only escape. Per-line bounding returns the moment CC's own
+/// stderr is drained, even if grandchildren hold the fd.
+async fn drain_stderr(stderr_reader: &mut BufReader<ChildStderr>) -> String {
+    let mut output = String::with_capacity(4096);
+    let mut line = String::new();
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stderr_reader.read_line(&mut line),
+        )
+        .await
+        {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(_)) => {
+                output.push_str(&line);
+                line.clear();
+                if output.len() > 4096 {
+                    break;
+                }
+            }
+        }
+    }
     output
 }
 
@@ -722,16 +613,19 @@ async fn driver_task(
     cancel: CancellationToken,
     mut session_id: Option<String>,
 ) {
+    // Capture the child pid before the wait arm consumes the Child —
+    // `tokio::process::Child::id()` returns `None` after `wait()` resolves,
+    // and the post-loop diagnostic log line is the one place we genuinely
+    // need it (for correlating the engine's "CC process exited" line with
+    // macOS unified-log entries / ps output during incident analysis).
+    let child_pid = child.id();
     let mut line_buf = String::new();
     loop {
         tokio::select! {
             read_result = stdout_reader.read_line(&mut line_buf) => {
                 match read_result {
                     Ok(0) => {
-                        log!(
-                            "[ClaudeCode] driver stdout EOF (try_wait={:?})",
-                            child.try_wait()
-                        );
+                        log!("[ClaudeCode] driver stdout EOF — closing session");
                         break;
                     }
                     Ok(_) => {
@@ -783,14 +677,65 @@ async fn driver_task(
                 log!("[ClaudeCode] cancellation signalled — terminating CC process");
                 break;
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                // Detect dead process whose stdout pipe didn't EOF (e.g. after
-                // macOS sleep kills/hangs the process). Without this, the
-                // session would stay running forever from the engine's view.
-                if let Ok(Some(status)) = child.try_wait() {
-                    log!("[ClaudeCode] CC process exited (status: {}) but stdout didn't EOF — closing session", status);
-                    break;
+            wait_result = child.wait() => {
+                // Always-on subprocess exit handler. Fires the instant the
+                // OS reports the child is gone, regardless of stdout state.
+                //
+                // Catches the case where a grandchild (rustc forked by
+                // cargo, a backgrounded Bash tool, anything that inherited
+                // stdout) keeps the pipe open after CC's main process dies.
+                // Without this arm, the previous 500ms `try_wait` poll was
+                // starved by continuous grandchild noise: tokio::select!
+                // re-creates futures each iteration, so a noise line every
+                // ~100ms resets the 500ms timer before it can resolve. The
+                // engine then wedged at status='running' forever — no
+                // CodingAgentIdled, no ResponseAborted — until the
+                // grandchild eventually died on its own.
+                //
+                // After the exit, drain remaining stdout with a bounded
+                // timeout so a final `Result` line CC flushed before exiting
+                // is still forwarded (clean-exit path) without blocking on
+                // a noisy grandchild (silent-death path).
+                log!(
+                    "[ClaudeCode] CC process exited (pid={} status={}) — draining remaining stdout",
+                    child_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
+                    format_exit_status(&wait_result),
+                );
+                // tokio's `read_line` is not cancel-safe: when the stdout
+                // arm's read_line resolves Ready in the same poll cycle as
+                // wait_result, select! drops the read_line value but
+                // `*output = string` has already mutated line_buf. The
+                // captured line would be silently lost — and the next
+                // read_line would append fresh bytes to it, corrupting
+                // parse_line. Forward any pre-captured line before draining.
+                if !line_buf.is_empty() {
+                    for ev in parse_line(&line_buf) {
+                        let _ = events_tx.send(ev);
+                    }
+                    line_buf.clear();
                 }
+                let drain_deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(500);
+                loop {
+                    match tokio::time::timeout_at(
+                        drain_deadline,
+                        stdout_reader.read_line(&mut line_buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(_)) => {
+                            for ev in parse_line(&line_buf) {
+                                if events_tx.send(ev).is_err() {
+                                    line_buf.clear();
+                                    break;
+                                }
+                            }
+                            line_buf.clear();
+                        }
+                    }
+                }
+                break;
             }
         }
     }
@@ -806,7 +751,12 @@ async fn driver_task(
     }
 
     let stderr_tail = drain_stderr(&mut stderr_reader).await;
-    if !stderr_tail.is_empty() {
+    if stderr_tail.is_empty() {
+        // Absence-of-evidence is itself evidence. Without this log we
+        // can't distinguish "stderr was empty" (e.g. SIGKILL or clean
+        // SIGTERM-handled exit) from "we forgot to log stderr".
+        log!("[ClaudeCode] Claude Code stderr: <empty>");
+    } else {
         log!("[ClaudeCode] Claude Code stderr: {}", stderr_tail.trim());
     }
     let _ = events_tx.send(AgentEvent::Exited);
@@ -814,5 +764,17 @@ async fn driver_task(
 }
 
 #[cfg(test)]
-#[path = "claude_code_tests.rs"]
-mod tests;
+#[path = "claude_code_tests/parsing.rs"]
+mod parsing_tests;
+
+#[cfg(test)]
+#[path = "claude_code_tests/commands.rs"]
+mod commands_tests;
+
+#[cfg(test)]
+#[path = "claude_code_tests/build_command.rs"]
+mod build_command_tests;
+
+#[cfg(test)]
+#[path = "claude_code_tests/driver.rs"]
+mod driver_tests;

@@ -98,7 +98,7 @@ describe('button visual state', () => {
 });
 
 // ---------------------------------------------------------------------------
-// CC session version bump logic
+// Claude Code session version bump logic
 // ---------------------------------------------------------------------------
 
 /**
@@ -126,7 +126,7 @@ describe('ccSessionVersion bump triggers re-fetch of CC commands', () => {
     expect(shouldBumpCcSessionVersion('SessionEnded')).toBe(true);
   });
 
-  it('bumps on CodingAgentUserMessageSent — follow-ups to idle CC sessions need re-fetch', () => {
+  it('bumps on CodingAgentUserMessageSent — follow-ups to idle Claude Code sessions need re-fetch', () => {
     expect(shouldBumpCcSessionVersion('CodingAgentUserMessageSent')).toBe(true);
   });
 

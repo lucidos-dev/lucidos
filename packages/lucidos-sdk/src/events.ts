@@ -30,7 +30,7 @@ export const events = {
     if (params.until) qs.set('until', params.until);
     if (params.limit != null) qs.set('limit', String(params.limit));
     const q = qs.toString();
-    return request(`/api/events/query${q ? `?${q}` : ''}`);
+    return request(`/events/query${q ? `?${q}` : ''}`);
   },
 
   /**
@@ -44,7 +44,7 @@ export const events = {
     assertPlainObject('payload', payload);
     const body: Record<string, unknown> = { event_type: type, payload };
     if (options.transient) body.transient = true;
-    return requestVoid('/api/events/emit', {
+    return requestVoid('/events/emit', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),

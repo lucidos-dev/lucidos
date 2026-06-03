@@ -32,7 +32,7 @@ impl LucidosEngine {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed {
                                 text: delta.to_string(),
-                                agent: crate::runtime::AgentKind::ClaudeCode,
+                                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                             },
                             meta: meta.clone(),
                         },
@@ -60,7 +60,7 @@ impl LucidosEngine {
     /// `ResponseAborted` for this session — `run_session`'s terminal arms
     /// (Result classify, cancel, chat_cancel, safety net) skip their own emit
     /// when set, so the user sees one panel instead of two. Set by
-    /// `abort_in_flight_for_restart` (`/api/restart`) and
+    /// `abort_in_flight_for_restart` (`/api/v1/restart`) and
     /// `emit_stuck_thread_eviction_abort` (`register_thread_queued` 60s
     /// timeout).
     pub(super) fn external_terminal_already_emitted(
@@ -123,7 +123,7 @@ impl LucidosEngine {
     }
 
     /// Run the stop-arm body shared by both `stop.notified()` and
-    /// `chat_cancel.cancelled()` in `run_session`. Kills the CC subprocess,
+    /// `chat_cancel.cancelled()` in `run_session`. Kills the Claude Code subprocess,
     /// flushes any unpersisted text, then emits the terminal event chosen by
     /// `stop_terminal_kind` (deduping against the restart pre-emit when
     /// emitting Aborted, stamping `actor: System` when appropriate). `arm`
@@ -200,9 +200,9 @@ impl LucidosEngine {
             .await;
     }
 
-    /// Emit a `CodingAgentPromptSent` event for automated CC sessions (hardening,
+    /// Emit a `CodingAgentPromptSent` event for automated Claude Code sessions (hardening,
     /// merge conflict, recovery) and return the event ID for use as `origin_id`.
-    /// This ensures all events emitted by the CC session have a valid
+    /// This ensures all events emitted by the Claude Code session have a valid
     /// `request_event_id` pointing to a real persisted event.
     ///
     /// `origin` flows onto the event so engine-internal callers (orphan recovery,
@@ -222,11 +222,11 @@ impl LucidosEngine {
                 thread_id,
                 event: crate::engine::thread_events::ThreadEvent::CodingAgentPromptSent {
                     text: prompt.to_string(),
-                    agent: crate::runtime::AgentKind::ClaudeCode,
+                    coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                     origin,
                 },
                 meta: crate::engine::thread_events::EventMeta {
-                    channel: Some(EventChannel::CodingAgent),
+                    channel: Some(EventChannel::ClaudeCode),
                     ..crate::engine::thread_events::EventMeta::NONE
                 },
             })
@@ -329,7 +329,7 @@ mod tests {
         assert!(meta.actor.is_none());
     }
 
-    /// If a more specific actor is already set (e.g. device for /api/restart
+    /// If a more specific actor is already set (e.g. device for /api/v1/restart
     /// pre-emit), don't overwrite it. The pre-emit's device attribution must
     /// survive so the AbortPanel reads "You — Restarted" not "System".
     #[test]

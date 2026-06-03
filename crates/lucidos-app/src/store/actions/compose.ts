@@ -17,12 +17,13 @@
  * focused-textarea guards.
  */
 
-import { threadMap, focusedThreadId, inputMode, showToast, setFocusedThread, selectedRepoId } from '../store';
+import { threadMap, focusedThreadId, inputMode, showToast, setFocusedThread, selectedScope } from '../store';
 import { makeOptimisticThreadState, type ThreadMeta } from '../thread-events';
 import { clearDraft, composeDrafts, draftIsEmpty, getDraft, patchDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { ApiError, ensureThreadStarted, putComposeOnThread, deleteThread } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 import { sendMessage } from './chat';
+import type { ChatContext } from './chatContext';
 import { markHashesAsSent } from '../../components/chat/pastedImages';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
 
@@ -83,7 +84,11 @@ export function updateCompose(threadId: string, patch: ComposePatch): void {
   // failure) lands on the user's actual cleared state instead of stale text.
   patchDraft(threadId, patch);
   const thread = threadMap.value.get(threadId);
-  if (thread?.meta.state === 'composing' && draftIsEmpty(getDraft(threadId))) {
+  // Auto-discard fires only when the patch CLEARED content — text or images.
+  // A mode-only patch (the toggle click on an empty draft) is a "I'm preparing
+  // to type, in this channel" signal, not a discard signal.
+  const clearedContent = patch.text !== undefined || patch.image_hashes !== undefined;
+  if (clearedContent && thread?.meta.state === 'composing' && draftIsEmpty(getDraft(threadId))) {
     void discardCompose(threadId);
     return;
   }
@@ -320,7 +325,10 @@ function isAlreadyGone(err: unknown): boolean {
  *  pass them. Optimistic local clear + state→active before the chat POST so
  *  the input is immediately usable for follow-up text. On failure we restore
  *  the typed text — losing it would be the worst possible UX. */
-export async function sendCompose(threadId: string, opts: { useClaudeCode?: boolean }): Promise<void> {
+export async function sendCompose(
+  threadId: string,
+  opts: { useClaudeCode?: boolean; context?: ChatContext | null },
+): Promise<void> {
   const thread = threadMap.value.get(threadId);
   if (!thread) return;
   const draft = getDraft(threadId);
@@ -331,9 +339,27 @@ export async function sendCompose(threadId: string, opts: { useClaudeCode?: bool
 
   cancelPendingPush(threadId);
   // Bind here so sendMessage doesn't have to detect first-send vs follow-up
-  // (see frontend.md "Drafts Are Threads"). selectedRepoId may drift afterward.
-  const boundRepoId = opts.useClaudeCode && selectedRepoId.value ? selectedRepoId.value : undefined;
-  mutateThreadMeta(threadId, { state: 'active', repoId: boundRepoId });
+  // (see frontend.md "Drafts Are Threads"). selectedScope may drift afterward.
+  // Channel is locked from `opts.useClaudeCode` (which the caller resolved
+  // via effectiveSendMode) rather than the existing meta.channel: the latter
+  // was stamped at first-keystroke time from `currentComposeMode()` and goes
+  // stale the moment the user toggles. Without this lock, sendMessage reads
+  // the stale channel, ignores the explicit useClaudeCode option, and routes
+  // a "Claude" send through Lucidos (or vice versa).
+  const scope = selectedScope.value;
+  const boundRepoId = opts.useClaudeCode && scope.kind === 'external' ? scope.repoId : undefined;
+  const boundCodingAgentKind = opts.useClaudeCode ? scope.kind : undefined;
+  const boundCodingAgentFolder = opts.useClaudeCode && scope.kind === 'app'
+    ? `data/apps/${scope.appId}`
+    : undefined;
+  const boundChannel: ThreadMeta['channel'] = opts.useClaudeCode ? 'claude_code' : 'chat';
+  mutateThreadMeta(threadId, {
+    state: 'active',
+    channel: boundChannel,
+    repoId: boundRepoId,
+    codingAgentKind: boundCodingAgentKind,
+    codingAgentFolder: boundCodingAgentFolder,
+  });
   // Must run before the draft clear — see `markHashesAsSent`.
   if (wireHashes.length > 0) markHashesAsSent(wireHashes);
   clearDraft(threadId);
@@ -342,6 +368,7 @@ export async function sendCompose(threadId: string, opts: { useClaudeCode?: bool
   try {
     await sendMessage(text, wireHashes.length > 0 ? wireHashes : undefined, {
       useClaudeCode: opts.useClaudeCode,
+      context: opts.context,
     });
   } catch (err) {
     // Roll back state. Restore text/images only if the user hasn't started
@@ -368,7 +395,7 @@ export async function sendFollowup(
   threadId: string,
   text: string,
   imageHashes?: string[],
-  opts?: { useClaudeCode?: boolean },
+  opts?: { useClaudeCode?: boolean; context?: ChatContext | null },
 ): Promise<void> {
   // Must run before the draft clear — see `markHashesAsSent`.
   if (imageHashes?.length) markHashesAsSent(imageHashes);
@@ -400,6 +427,11 @@ function flushAllPending(): void {
       mode: thread.meta.state === 'composing' ? draft.mode : null,
     });
     if (body.length > 64 * 1024) {
+      // Telemetry carve-out (.claude/rules/frontend.md): the tab is unloading,
+      // so any toast would never render. The next foreground page load will
+      // re-PUT this draft via the normal debounce path — no data loss, the
+      // draft is still in `composeDrafts` and gets retried as soon as the
+      // user types again or focuses the thread.
       console.warn(`[compose] keepalive body exceeds 64KB (${body.length}B) for ${threadId}; will retry on next foreground push`);
       continue;
     }

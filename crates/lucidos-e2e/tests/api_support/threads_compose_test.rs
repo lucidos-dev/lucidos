@@ -7,7 +7,7 @@
 //! point of the redesign.
 //!
 //! Read-back verification reads `thread_summaries` directly via sqlx — the
-//! frontend hydrates composing rows from `/api/threads`'s `composing[]`
+//! frontend hydrates composing rows from `/api/v1/threads`'s `composing[]`
 //! field, but for these contract tests the row's columns are what we care
 //! about, and the projection is what the field reads anyway.
 //!
@@ -378,11 +378,21 @@ async fn put_compose_on_archived_thread_returns_no_content() {
     // Skip the live message + archive endpoints — directly seed the terminal
     // state we need to gate. The archive endpoint also tears down CC sessions
     // and would couple this contract test to unrelated machinery.
-    sqlx::query("UPDATE thread_summaries SET state = 'archived' WHERE thread_id = $1")
-        .bind(id)
-        .execute(&pool)
-        .await
-        .expect("seed archived state");
+    //
+    // Post the state↔archive_state collapse, `archive_state` is the sole
+    // archive flag; a post-send archived row carries `state='active'` plus
+    // `archive_state='archived'`. The handler-side `ThreadState::from_db_str`
+    // rejects `'archived'` loudly, so we never write that to `state`. POST
+    // /threads above creates `state='composing'`; flip it to `'active'` here
+    // to mirror what MessageReceived (the real path to post-send) would have
+    // produced, then flip archive_state to match ThreadArchived.
+    sqlx::query(
+        "UPDATE thread_summaries SET state = 'active', archive_state = 'archived' WHERE thread_id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .expect("seed archived state");
 
     let resp = client
         .put(compose_url(&id))
@@ -397,15 +407,19 @@ async fn put_compose_on_archived_thread_returns_no_content() {
         resp.status()
     );
 
-    let row: (String, String) = sqlx::query_as(
-        "SELECT state, compose_text FROM thread_summaries WHERE thread_id = $1",
+    let row: (String, String, String) = sqlx::query_as(
+        "SELECT state, archive_state, compose_text FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(id)
     .fetch_one(&pool)
     .await
     .expect("read back row");
-    assert_eq!(row.0, "archived", "compose write must not flip state");
-    assert_eq!(row.1, "follow up", "compose text must persist");
+    assert_eq!(row.0, "active", "compose write must not flip compose state");
+    assert_eq!(
+        row.1, "archived",
+        "compose write must not un-archive the row"
+    );
+    assert_eq!(row.2, "follow up", "compose text must persist");
 }
 
 /// Mode toggle is locked once the thread leaves composing — that lock must
@@ -423,11 +437,17 @@ async fn put_compose_on_archived_rejects_mode_change() {
         .await
         .expect("POST failed");
 
-    sqlx::query("UPDATE thread_summaries SET state = 'archived' WHERE thread_id = $1")
-        .bind(id)
-        .execute(&pool)
-        .await
-        .expect("seed archived state");
+    // Mirror the post-send archived row: state='active' (what MessageReceived
+    // would have flipped to) plus archive_state='archived' (what ThreadArchived
+    // would have set). POST above leaves state='composing', so flip it here.
+    // Seeding state='archived' would 500 via `from_db_str("archived")`.
+    sqlx::query(
+        "UPDATE thread_summaries SET state = 'active', archive_state = 'archived' WHERE thread_id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .expect("seed archived state");
 
     let resp = client
         .put(compose_url(&id))

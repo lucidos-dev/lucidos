@@ -42,7 +42,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     })
 }
 
-fn read_api_port() -> u16 {
+fn read_ports() -> (u16, String) {
     let workspace = workspace_path();
     let ports_file = workspace.join(".lucidos/ports");
     let content = fs::read_to_string(&ports_file).unwrap_or_else(|e| {
@@ -52,12 +52,17 @@ fn read_api_port() -> u16 {
             e
         )
     });
+    let mut port: Option<u16> = None;
+    let mut proto: Option<String> = None;
     for line in content.lines() {
         if let Some(val) = line.strip_prefix("API_PORT=") {
-            return val.trim().parse().expect("Invalid API_PORT");
+            port = Some(val.trim().parse().expect("Invalid API_PORT"));
+        } else if let Some(val) = line.strip_prefix("PROTO=") {
+            proto = Some(val.trim().to_string());
         }
     }
-    panic!("API_PORT not found in {}", ports_file.display());
+    let port = port.unwrap_or_else(|| panic!("API_PORT not found in {}", ports_file.display()));
+    (port, proto.unwrap_or_else(|| "https".to_string()))
 }
 
 pub fn workspace_path() -> PathBuf {
@@ -101,9 +106,9 @@ pub fn db_url() -> String {
     format!("postgres://lucidos:lucidos@localhost:{}/lucidos", port)
 }
 
-/// HTTPS with self-signed cert
 pub fn base_url() -> String {
-    format!("https://localhost:{}", read_api_port())
+    let (port, proto) = read_ports();
+    format!("{}://localhost:{}", proto, port)
 }
 
 pub fn http_client() -> reqwest::Client {
@@ -119,20 +124,38 @@ pub fn git(args: &[&str]) -> std::process::Output {
 }
 
 /// Run a git command in an arbitrary directory, asserting success.
+///
+/// Retries on `.git/index.lock` collisions — `#[tokio::test]`s run
+/// concurrently in one process, and two tests touching the same workspace
+/// (e.g. both `app_coding_agent_*` tests against `e2e-test`) race on the
+/// workspace's git index. The lock is short-lived; a few short backoffs
+/// drain it without changing what's actually under test.
 pub fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap_or_else(|e| panic!("git {} failed: {}", args.join(" "), e));
-    assert!(
-        output.status.success(),
-        "git {} in {} failed: {}",
-        args.join(" "),
-        dir.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
+    let mut attempt = 0u32;
+    loop {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {} failed: {}", args.join(" "), e));
+        if output.status.success() {
+            return output;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let is_lock_collision = stderr.contains("index.lock")
+            && (stderr.contains("File exists") || stderr.contains("Unable to create"));
+        if is_lock_collision && attempt < 20 {
+            attempt += 1;
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            continue;
+        }
+        panic!(
+            "git {} in {} failed: {}",
+            args.join(" "),
+            dir.display(),
+            stderr
+        );
+    }
 }
 
 pub fn unique_marker(prefix: &str) -> String {
@@ -145,7 +168,7 @@ pub fn unique_marker(prefix: &str) -> String {
 }
 
 /// Seed (or upsert) a CC-classified `thread_summaries` row. Required before
-/// emitting CC-only `ThreadEvent`s (`ChangeProposed`, `UserQuestionAsked`,
+/// emitting CC-only `ThreadEvent`s (`ChangeProposed`,
 /// `CodingAgentPermissionRequest`, …) — the lifecycle classifier rejects them
 /// when the thread isn't classified as CC.
 pub async fn seed_cc_thread_summary(
@@ -154,9 +177,9 @@ pub async fn seed_cc_thread_summary(
     status: &str,
 ) {
     sqlx::query(
-        "INSERT INTO thread_summaries (thread_id, source, is_cc, created_at, last_activity, message_count, status) \
+        "INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status) \
          VALUES ($1, 'claude_code', TRUE, NOW(), NOW(), 0, $2) \
-         ON CONFLICT (thread_id) DO UPDATE SET source = 'claude_code', is_cc = TRUE, status = EXCLUDED.status"
+         ON CONFLICT (thread_id) DO UPDATE SET source = 'claude_code', is_coding_agent = TRUE, status = EXCLUDED.status"
     )
     .bind(thread_id)
     .bind(status)
@@ -165,13 +188,69 @@ pub async fn seed_cc_thread_summary(
     .expect("failed to seed thread_summaries");
 }
 
-/// Poll `/api/threads` until `history` is non-empty, returning the parsed response.
+/// Seed an app coding-agent thread row. Sets `coding_agent_kind='app'` and
+/// `coding_agent_folder=<workspace>/data/apps/<app_id>/` so
+/// `load_apply_kind_context` dispatches through the App branch.
+pub async fn seed_app_cc_thread_summary(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+    app_id: &str,
+    status: &str,
+) {
+    let folder = workspace_path()
+        .join("data/apps")
+        .join(app_id)
+        .to_string_lossy()
+        .into_owned();
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+         (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status, \
+          coding_agent_kind, coding_agent_folder) \
+         VALUES ($1, 'claude_code', TRUE, NOW(), NOW(), 0, $2, 'app', $3) \
+         ON CONFLICT (thread_id) DO UPDATE SET \
+             source = 'claude_code', \
+             is_coding_agent = TRUE, \
+             status = EXCLUDED.status, \
+             coding_agent_kind = 'app', \
+             coding_agent_folder = EXCLUDED.coding_agent_folder",
+    )
+    .bind(thread_id)
+    .bind(status)
+    .bind(&folder)
+    .execute(pool)
+    .await
+    .expect("failed to seed app thread_summaries");
+}
+
+/// Seed (or upsert) a chat-classified `thread_summaries` row. Required
+/// before emitting `UserQuestionAsked` on a chat thread — the lifecycle
+/// validator accepts the variant on chat threads now that the chat agent's
+/// `ask_user_question` tool also raises it, but the row must exist with
+/// `source = 'chat'` so the classifier resolves to `ThreadType::Chat`.
+pub async fn seed_chat_thread_summary(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+    status: &str,
+) {
+    sqlx::query(
+        "INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status) \
+         VALUES ($1, 'chat', FALSE, NOW(), NOW(), 0, $2) \
+         ON CONFLICT (thread_id) DO UPDATE SET source = 'chat', is_coding_agent = FALSE, status = EXCLUDED.status"
+    )
+    .bind(thread_id)
+    .bind(status)
+    .execute(pool)
+    .await
+    .expect("failed to seed chat thread_summaries");
+}
+
+/// Poll `/api/v1/threads` until `archive` is non-empty, returning the parsed response.
 /// Times out after `max_secs` with a panic.
-pub async fn poll_threads_until_history(
+pub async fn poll_threads_until_archive(
     client: &reqwest::Client,
     max_secs: u64,
 ) -> serde_json::Value {
-    let url = format!("{}/api/threads", base_url());
+    let url = format!("{}/api/v1/threads", base_url());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     loop {
         let body: serde_json::Value = client
@@ -182,20 +261,20 @@ pub async fn poll_threads_until_history(
             .json()
             .await
             .expect("Invalid JSON");
-        let history = body["history"].as_array().unwrap();
-        if !history.is_empty() {
+        let archive = body["archive"].as_array().unwrap();
+        if !archive.is_empty() {
             return body;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "Timed out waiting for thread to appear in history after {}s",
+            "Timed out waiting for thread to appear in archive after {}s",
             max_secs
         );
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
 
-/// `POST /api/repositories` for the given path with a `unique_marker(label)`
+/// `POST /api/v1/repositories` for the given path with a `unique_marker(label)`
 /// name, asserting `201 Created` and returning the new repo id.
 pub async fn register_repo(client: &reqwest::Client, path: &Path, label: &str) -> String {
     let body = serde_json::json!({
@@ -204,7 +283,7 @@ pub async fn register_repo(client: &reqwest::Client, path: &Path, label: &str) -
         "description": format!("{} test repo", label),
     });
     let resp = client
-        .post(format!("{}/api/repositories", base_url()))
+        .post(format!("{}/api/v1/repositories", base_url()))
         .json(&body)
         .send()
         .await
@@ -223,7 +302,7 @@ pub struct ThreadSummaryRow {
 
 /// Poll thread_summaries for the row whose first_message contains `marker`.
 /// Tests sending chat messages with a unique marker use this to find their
-/// own thread without racing parallel tests on `history[0]` order.
+/// own thread without racing parallel tests on `archive[0]` order.
 pub async fn poll_thread_summary_by_marker(
     pool: &sqlx::PgPool,
     marker: &str,

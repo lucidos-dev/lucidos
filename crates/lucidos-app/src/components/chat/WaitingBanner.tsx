@@ -1,24 +1,23 @@
 import type { ComponentChildren } from 'preact';
-import { threadMap, focusedThreadId, applyingNowThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, changes, showConfirm, effectiveThreadStatus, isMidTurn } from '../../store/store';
-import { getCCWaitingInfo } from '../../store/thread-events';
-import { resolveActions, type Action } from '../../generated/thread-lifecycle';
-import { endClaudeCodeAndApply, handleDiscardCCChanges } from '../../store/actions/chat-claude-code';
-import { handleArchiveThread } from '../../store/actions/threads';
-import { viewChangeDiff, viewThreadCcDiff } from '../../store/actions/repositories';
-import type { Change } from '../../api/client';
-
-// Action buttons: Archive, Apply, Discard — never "Requesting"
-const ARCHIVE_ACTIONS: Action[] = ['archive'];
+import { threadMap, focusedThreadId, applyingNowThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn } from '../../store/store';
+import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
+import { viewThreadCcDiff } from '../../store/actions/repositories';
 
 export const DIFF_DISABLED_TOOLTIP = 'No changes on this branch';
 
 type CcDiff = 'hidden' | 'disabled' | 'enabled';
 
+/** The close-set kinds the banner renders. Discard-draft (rendered by
+ *  PromptInput's "Discard draft" button) and the Save/Unsave toggle (rendered
+ *  by PromptInput's section buttons) are excluded — they come from the same
+ *  selector but live in a different slot. */
+const BANNER_CLOSE_KINDS: ReadonlySet<string> = new Set(['discard', 'apply', 'archive']);
+
 type WaitingState =
   | { type: 'applying' }
   | { type: 'discarding' }
   | { type: 'canceling'; threadId: string; isCanceling: boolean }
-  | { type: 'actions'; actions: Action[]; threadId: string; isArchiving: boolean; requiresRestart: boolean; incomplete: boolean; pendingChange: Change | null; ccDiff: CcDiff };
+  | { type: 'actions'; actions: TaggedAction[]; threadId: string; isArchiving: boolean; ccDiff: CcDiff };
 
 /** Banner state passed to `getBannerSlots`. The 'canceling' variant is owned
  *  by PromptInput's morphable Send→Cancel button (so the swap can animate the
@@ -43,25 +42,26 @@ export function getWaitingState(): WaitingState | null {
   if (discardingCCThreadIds.value.has(focused)) return { type: 'discarding' };
 
   // Archive in progress — keep showing "Archive..." regardless of SSE state
-  // changes so the banner doesn't flash away mid-archive.
-  const isArchiving = archivingThreadIds.value.has(focused);
-  if (isArchiving) {
-    return { type: 'actions', actions: ARCHIVE_ACTIONS, threadId: focused, isArchiving: true, requiresRestart: false, incomplete: false, pendingChange: null, ccDiff: 'hidden' };
+  // changes so the banner doesn't flash away mid-archive. (The selector returns
+  // no Archive action once the optimistic section flips to 'archived', so this
+  // dedicated flag is what keeps the spinner on screen.)
+  if (archivingThreadIds.value.has(focused)) {
+    return { type: 'actions', actions: [], threadId: focused, isArchiving: true, ccDiff: 'hidden' };
   }
 
   const status = effectiveThreadStatus(thread);
 
-  // Mid-turn states get Cancel. Must come before resolveActions, which returns
-  // [] for both and would otherwise drop us into the "no banner" branch.
-  // Excludes 'waiting' (CC has changes — needs Apply/Discard, not Cancel).
+  // Mid-turn states get Cancel. Must come before the selector, which returns no
+  // close actions for both and would otherwise drop us into the "no banner"
+  // branch. Excludes 'waiting' (CC has changes — needs Apply/Discard, not Cancel).
   if (isMidTurn(status)) {
-    // ccApplying = MergeConflictDetected fired and the apply task is driving
-    // the CC session through a merge. The 'running' status reflects that
-    // engine-pushed merge prompt, not a user turn. Cancel here would only
+    // codingAgentApplying = MergeConflictDetected fired and the apply task is
+    // driving the Claude Code session through a merge. The 'running' status reflects
+    // that engine-pushed merge prompt, not a user turn. Cancel here would only
     // interrupt CC mid-merge — the apply task in the engine continues, sees
     // CC went idle, and emits ChangeApplied if the merge had already landed.
     // Show "Apply..." instead so the user can't trigger a no-op cancel.
-    if (thread.meta.ccApplying) return { type: 'applying' };
+    if (thread.meta.codingAgentApplying) return { type: 'applying' };
     return {
       type: 'canceling',
       threadId: focused,
@@ -69,52 +69,28 @@ export function getWaitingState(): WaitingState | null {
     };
   }
 
-  const threadType = thread.meta.channel === 'claude_code' ? 'claude_code' as const : 'chat' as const;
-  const ccInfo = threadType === 'claude_code' ? getCCWaitingInfo(thread.meta) : null;
-  // Use ccInfo.hasChanges as an early signal — CodingAgentIdled arrives before
-  // ChangeProposed (which requires async git ops + DB insert). Without this,
-  // there's a window where the banner flashes "Archive" before switching to Apply/Discard.
-  // file_count=0 rows are phantom changes (commit + revert with zero net diff)
-  // and must not surface Apply/Discard — there's nothing to apply or discard.
-  const pendingChange = changes.value.find(
-    c => c.thread_id === focused && c.status === 'pending' && c.file_count > 0,
-  ) ?? null;
-  const hasPendingChanges = !!pendingChange || (ccInfo?.hasChanges ?? false);
-  let actions = resolveActions(threadType, status, thread.meta.section, hasPendingChanges, thread.meta.saved);
+  // Close-set buttons come straight from the action-availability selector, so
+  // their labels, confirms, handlers, the external-repo carve-out, and the
+  // Apply restart/partial-work hints are all single-sourced (no enablement
+  // drift vs the close cascade, which drives the same TaggedActions).
+  const actions = resolveThreadActions(focused).filter((a) => BANNER_CLOSE_KINDS.has(a.kind));
   if (actions.length === 0) return null;
 
-  let requiresRestart = false;
-  if (threadType === 'claude_code' && actions.includes('apply')) {
-    if (ccInfo?.isExternalRepo) {
-      // External repo: can't Apply (changes are in a different repo).
-      // Show Archive instead so the user can dismiss the thread.
-      actions = ARCHIVE_ACTIONS;
-    } else if (pendingChange?.requires_restart || ccInfo?.requiresRestart) {
-      // Prefer the pending change's flag — it's the authoritative file-derived
-      // value at proposal time. meta.ccRequiresRestart can lag (only set by
-      // CodingAgentIdled) or be wrong (recovery fallback hardcodes false).
-      requiresRestart = true;
-    }
-  }
-
-  // Show Diff disabled (rather than hiding) when no signal indicates branch
-  // work, so CC threads always advertise the affordance without dropping
-  // the user into an empty diff.
+  // Diff is enabled iff the CC branch actually has a diff against main on
+  // disk (`codingAgentHasDiff` — single git-truth signal maintained by the
+  // backend projection + recovery sweep). The button stays visible (disabled)
+  // on CC threads with no diff so the affordance is always advertised, but
+  // it can never drop the user into an empty diff.
   let ccDiff: CcDiff;
-  if (threadType !== 'claude_code') {
+  if (thread.meta.channel !== 'claude_code') {
     ccDiff = 'hidden';
-  } else if (!!pendingChange || (ccInfo?.hasChanges ?? false) || thread.meta.ccIsExternalRepo) {
+  } else if (thread.meta.codingAgentHasDiff) {
     ccDiff = 'enabled';
   } else {
     ccDiff = 'disabled';
   }
 
-  // Surface partial-work warnings for changes proposed from a CC turn that
-  // ended in `ResponseFailed` (mid-stream API drop, etc.). The Apply button
-  // confirms before landing so the user can't accidentally merge half a turn.
-  const incomplete = pendingChange?.incomplete ?? false;
-
-  return { type: 'actions', actions, threadId: focused, isArchiving: false, requiresRestart, incomplete, pendingChange, ccDiff };
+  return { type: 'actions', actions, threadId: focused, isArchiving: false, ccDiff };
 }
 
 interface BannerSlots {
@@ -152,79 +128,84 @@ export function getBannerSlots(state: BannerState): BannerSlots {
     };
   }
 
-  const change = state.pendingChange;
-  const diffOnClick = change
-    ? () => viewChangeDiff(change)
-    : () => viewThreadCcDiff(state.threadId);
-  const actionButtons = state.actions.map(action =>
-    renderActionButton(action, state.threadId, state.isArchiving, state.requiresRestart, state.incomplete),
-  );
+  // Archive in flight: a dedicated disabled spinner (the selector no longer
+  // returns an Archive action once the optimistic section flips).
+  if (state.isArchiving) {
+    return {
+      liftable: null,
+      primary: <button key="archive" class="action-btn" data-row-item disabled aria-label="Archive thread">Archive...</button>,
+    };
+  }
 
-  const enabled = state.ccDiff === 'enabled';
+  // Diff always opens the thread-level branch diff. The historical
+  // change-row Diff buttons (ChatExchange, ChangesView) call viewChangeDiff
+  // for a specific Change; the WaitingBanner's affordance is "show me what
+  // this thread's branch looks like right now" — backed by codingAgentHasDiff,
+  // not by any one Change row.
+  const actionButtons = state.actions.map((action) => renderActionButton(action));
+
   return {
     liftable: state.ccDiff === 'hidden'
       ? null
-      : (
-        <button
-          key="diff"
-          class="action-btn"
-          data-row-item
-          disabled={!enabled}
-          data-tooltip={enabled ? undefined : DIFF_DISABLED_TOOLTIP}
-          onClick={diffOnClick}
-        >
-          Diff
-        </button>
-      ),
+      : renderDiffButton(state.threadId, state.ccDiff === 'enabled'),
     primary: <>{actionButtons}</>,
   };
 }
 
-function renderActionButton(action: Action, threadId: string, isArchiving: boolean, requiresRestart = false, incomplete = false) {
-  switch (action) {
-    case 'archive':
-      return (
-        <button key="archive" class="action-btn" data-row-item disabled={isArchiving}
-          onClick={() => handleArchiveThread(threadId)}>
-          {isArchiving ? 'Archive...' : 'Archive'}
-        </button>
-      );
-    case 'apply': {
-      // Tooltip prefers the partial-work warning (more critical) over the
-      // restart hint when both apply.
-      const tooltip = incomplete
-        ? 'This change was proposed by a turn that ended in failure. The worktree contents may be partial work. You will be asked to confirm.'
-        : requiresRestart
-          ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart'
-          : undefined;
-      const onClick = async () => {
-        if (incomplete) {
-          const ok = await showConfirm(
-            'This change was proposed by a turn that ended in failure (e.g. mid-stream API drop). The worktree contents may be incomplete. Apply anyway?',
-            'Apply',
-          );
-          if (!ok) return;
-        }
-        endClaudeCodeAndApply(threadId);
-      };
-      return (
-        <button key="apply" class="action-btn action-btn-confirm" data-row-item
-          data-tooltip={tooltip}
-          onClick={onClick}>
-          {requiresRestart ? 'Apply & Restart' : 'Apply'}
-        </button>
-      );
-    }
-    case 'discard':
-      return (
-        <button key="discard" class="action-btn action-btn-danger" data-row-item
-          onClick={async () => {
-            if (await showConfirm('Discard all changes from this session? This cannot be undone.', 'Discard')) {
-              handleDiscardCCChanges(threadId);
-            }
-          }}>
-          Discard
-        </button>
-      );
-  }
+/** Shared Diff-button JSX. Rendered in two places: inside the banner via
+ *  `getBannerSlots` (where it can be disabled with a tooltip), and as a
+ *  standalone slot via `getStandaloneCcDiffButton` (only the enabled form).
+ *  Same key in both call sites so Preact treats it as one node across
+ *  banner ↔ standalone transitions. */
+function renderDiffButton(threadId: string, enabled: boolean): ComponentChildren {
+  return (
+    <button
+      key="diff"
+      class="action-btn"
+      data-row-item
+      disabled={!enabled}
+      data-tooltip={enabled ? undefined : DIFF_DISABLED_TOOLTIP}
+      onClick={() => void viewThreadCcDiff(threadId)}
+    >
+      Diff
+    </button>
+  );
+}
+
+/** Diff button decoupled from waitingState: appears whenever the focused
+ *  CC thread's branch has commits, even mid-turn (when getWaitingState
+ *  returns 'canceling' and the banner is suppressed). PromptInput uses this
+ *  in the slots-fallback path so the user-facing rule "branch has commits →
+ *  Diff visible" holds regardless of CC's run-state. */
+export function getStandaloneCcDiffButton(): ComponentChildren | null {
+  const focused = focusedThreadId.value;
+  if (!focused) return null;
+  const thread = threadMap.value.get(focused);
+  if (!thread) return null;
+  if (thread.meta.channel !== 'claude_code') return null;
+  if (!thread.meta.codingAgentHasDiff) return null;
+  return renderDiffButton(focused, true);
+}
+
+/** Render one close-set TaggedAction. Class + aria derive from the action kind;
+ *  label, tooltip, and the (confirm-wrapped) handler come from the selector. */
+function renderActionButton(action: TaggedAction) {
+  const cls =
+    action.kind === 'discard'
+      ? 'action-btn action-btn-danger'
+      : action.kind === 'apply'
+        ? 'action-btn action-btn-confirm'
+        : 'action-btn';
+  return (
+    <button
+      key={action.kind}
+      class={cls}
+      data-row-item
+      aria-label={action.kind === 'archive' ? 'Archive thread' : undefined}
+      data-tooltip={action.tooltip}
+      onClick={() => void action.invoke()}
+    >
+      {action.label}
+    </button>
+  );
 }

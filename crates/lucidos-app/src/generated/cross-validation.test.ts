@@ -8,51 +8,53 @@
 // from the Rust implementation.
 
 import { describe, it, expect } from 'vitest';
-import { resolveActions, displaySection } from './thread-lifecycle';
+import { availableThreadActions, displaySection } from './thread-lifecycle';
 import type { ThreadType, ThreadStatus, ArchiveState, Action, DisplaySection } from './thread-lifecycle';
 import fixture from './cross-validation-fixture.json';
 
-interface ResolveActionsCase {
-  fn: 'resolveActions';
-  args: [string, string, string, boolean, boolean];
+interface AvailableThreadActionsCase {
+  fn: 'availableThreadActions';
+  args: [string, string, string, boolean, boolean, boolean, boolean];
   expected: string[];
 }
 
 interface DisplaySectionCase {
   fn: 'displaySection';
-  args: [string, string, boolean, boolean, boolean];
+  args: [string, string, boolean, boolean, boolean, boolean];
   expected: string;
 }
 
-type TestCase = ResolveActionsCase | DisplaySectionCase;
+type TestCase = AvailableThreadActionsCase | DisplaySectionCase;
 
 // Meta-test: every generated function with logic (not just data lookups) must have
 // cross-validation cases in the fixture. If you add a new function to generate_typescript()
 // that has branching logic, add it to this set AND to generate_cross_validation_fixture().
-const FUNCTIONS_REQUIRING_CROSS_VALIDATION = new Set(['resolveActions', 'displaySection']);
+const FUNCTIONS_REQUIRING_CROSS_VALIDATION = new Set(['availableThreadActions', 'displaySection']);
 
 describe('Cross-validation: generated TS matches Rust', () => {
   const cases = fixture.cases as TestCase[];
 
-  describe('resolveActions', () => {
-    const resolveActionsCases = cases.filter((c): c is ResolveActionsCase => c.fn === 'resolveActions');
+  describe('availableThreadActions', () => {
+    const availableThreadActionsCases = cases.filter((c): c is AvailableThreadActionsCase => c.fn === 'availableThreadActions');
 
-    it(`has exhaustive coverage (${resolveActionsCases.length} cases)`, () => {
-      // 2 thread types × 5 statuses × 2 sections × 2 pending × 2 saved = 80
-      expect(resolveActionsCases.length).toBe(80);
+    it(`has exhaustive coverage (${availableThreadActionsCases.length} cases)`, () => {
+      // 2 thread types × 5 statuses × 2 sections × 2 pending × 2 descendantsBlockArchive × 2 hasUnsentDraft × 2 isSaved = 320
+      expect(availableThreadActionsCases.length).toBe(320);
     });
 
-    for (const tc of resolveActionsCases) {
-      const [threadType, status, section, pending, saved] = tc.args;
-      const label = `(${threadType}, ${status}, ${section}, pending=${pending}, saved=${saved})`;
+    for (const tc of availableThreadActionsCases) {
+      const [threadType, status, section, pending, descendantsBlockArchive, hasUnsentDraft, isSaved] = tc.args;
+      const label = `(${threadType}, ${status}, ${section}, pending=${pending}, dba=${descendantsBlockArchive}, draft=${hasUnsentDraft}, saved=${isSaved})`;
 
       it(`${label} → [${tc.expected.join(', ')}]`, () => {
-        const result = resolveActions(
+        const result = availableThreadActions(
           threadType as ThreadType,
           status as ThreadStatus,
           section as ArchiveState,
           pending,
-          saved,
+          descendantsBlockArchive,
+          hasUnsentDraft,
+          isSaved,
         );
         expect(result).toEqual(tc.expected as Action[]);
       });
@@ -63,13 +65,13 @@ describe('Cross-validation: generated TS matches Rust', () => {
     const displaySectionCases = cases.filter((c): c is DisplaySectionCase => c.fn === 'displaySection');
 
     it(`has exhaustive coverage (${displaySectionCases.length} cases)`, () => {
-      // 2 sections × 5 statuses × 2 saved × 2 activeChildren × 2 pending = 80
-      expect(displaySectionCases.length).toBe(80);
+      // 2 sections × 5 statuses × 2 saved × 2 activeChildren × 2 pending × 2 attentionDescendants = 160
+      expect(displaySectionCases.length).toBe(160);
     });
 
     for (const tc of displaySectionCases) {
-      const [section, status, saved, activeChildren, pending] = tc.args;
-      const label = `(${section}, ${status}, saved=${saved}, active=${activeChildren}, pending=${pending})`;
+      const [section, status, saved, activeChildren, pending, attention] = tc.args;
+      const label = `(${section}, ${status}, saved=${saved}, active=${activeChildren}, pending=${pending}, attention=${attention})`;
 
       it(`${label} → ${tc.expected}`, () => {
         const result = displaySection(
@@ -78,6 +80,7 @@ describe('Cross-validation: generated TS matches Rust', () => {
           saved,
           activeChildren,
           pending,
+          attention,
         );
         expect(result).toBe(tc.expected as DisplaySection);
       });

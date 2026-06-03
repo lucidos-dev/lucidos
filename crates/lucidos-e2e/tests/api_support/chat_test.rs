@@ -6,7 +6,7 @@ use uuid::Uuid;
 #[tokio::test]
 async fn chat_stream_returns_event_id() {
     let client = http_client();
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
     let marker = unique_marker("api-chat");
 
     let body = serde_json::json!({
@@ -38,7 +38,7 @@ async fn chat_stream_with_thread_id() {
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
     let marker = unique_marker("api-thread");
 
     // First message creates a thread
@@ -60,7 +60,7 @@ async fn chat_stream_with_thread_id() {
         "First message should return event_id"
     );
 
-    // Resolve the thread by marker — `history[0]` would race with parallel
+    // Resolve the thread by marker — `archive[0]` would race with parallel
     // tests whose threads can sort ahead and yield a 409 when their (mode,
     // repo) doesn't match this follow-up.
     let row = poll_thread_summary_by_marker(&pool, &marker, 15).await;
@@ -87,7 +87,7 @@ async fn chat_stream_with_thread_id() {
 #[tokio::test]
 async fn chat_empty_message_is_rejected() {
     let client = http_client();
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
 
     let body = serde_json::json!({
         "message": "",
@@ -109,7 +109,7 @@ async fn chat_empty_message_is_rejected() {
     );
 }
 
-/// Refactor regression: POST /api/chat/stream used to hardcode parent_thread_id=NULL
+/// Refactor regression: POST /api/v1/chat/stream used to hardcode parent_thread_id=NULL
 /// and initiator='user', causing CC-spawned child threads to be mislabeled as
 /// user-initiated roots. Verify the wire fields actually reach thread_summaries
 /// when the caller explicitly identifies as system.
@@ -119,7 +119,7 @@ async fn parent_thread_id_propagates_to_projection() {
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
     let parent_uuid = Uuid::new_v4();
     let spawning_event = Uuid::new_v4();
     let marker = unique_marker("api-parent-prop");
@@ -157,7 +157,7 @@ async fn human_mode_means_user_initiated() {
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
     let marker = unique_marker("api-no-parent");
 
     let body = serde_json::json!({
@@ -182,7 +182,7 @@ async fn human_mode_means_user_initiated() {
 #[tokio::test]
 async fn invalid_parent_thread_id_returns_400() {
     let client = http_client();
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
     let body = serde_json::json!({
         "message": "test",
         "mode": "agent",
@@ -209,7 +209,7 @@ async fn invalid_parent_thread_id_returns_400() {
 #[tokio::test]
 async fn chat_stream_rejects_unknown_repo() {
     let client = http_client();
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
     let body = serde_json::json!({
         "message": "test",
         "mode": "human",
@@ -235,7 +235,7 @@ async fn chat_stream_rejects_unknown_repo() {
 #[tokio::test]
 async fn missing_mode_returns_400() {
     let client = http_client();
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
     let body = serde_json::json!({
         "message": "test",
     });
@@ -279,7 +279,7 @@ async fn chat_stream_rejects_mode_switch_on_existing_thread() {
     .expect("seed chat thread");
 
     let resp = client
-        .post(format!("{}/api/chat/stream", base_url()))
+        .post(format!("{}/api/v1/chat/stream", base_url()))
         .json(&serde_json::json!({
             "message": "switch me to CC",
             "mode": "human",
@@ -334,7 +334,7 @@ async fn chat_stream_allows_mode_switch_on_composing_thread() {
     .expect("seed composing thread with stale CC source");
 
     let resp = client
-        .post(format!("{}/api/chat/stream", base_url()))
+        .post(format!("{}/api/v1/chat/stream", base_url()))
         .json(&serde_json::json!({
             "message": "I changed my mind, send via Lucidos",
             "mode": "human",
@@ -384,7 +384,7 @@ async fn chat_stream_rejects_repo_switch_on_existing_cc_thread() {
     .expect("seed CC thread on repo A");
 
     let resp = client
-        .post(format!("{}/api/chat/stream", base_url()))
+        .post(format!("{}/api/v1/chat/stream", base_url()))
         .json(&serde_json::json!({
             "message": "switch repo on me",
             "mode": "human",
@@ -412,11 +412,11 @@ async fn chat_stream_rejects_repo_switch_on_existing_cc_thread() {
 
 /// Regression: mobile screenshots in base64 routinely exceed axum's 2 MiB
 /// default body limit, surfacing as "Failed to send message: Failed to buffer
-/// the request body" toast. /api/chat/stream must accept large image payloads.
+/// the request body" toast. /api/v1/chat/stream must accept large image payloads.
 #[tokio::test]
 async fn chat_stream_accepts_large_image_payload() {
     let client = http_client();
-    let url = format!("{}/api/chat/stream", base_url());
+    let url = format!("{}/api/v1/chat/stream", base_url());
 
     // 5 MiB of base64 — well above axum's 2 MiB default, well below our 100 MiB cap.
     let large_base64 = "A".repeat(5 * 1024 * 1024);

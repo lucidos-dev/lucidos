@@ -1,7 +1,7 @@
 // API response types that match the Rust backend
 
 import type { ActorMode } from '../store/thread-events';
-import type { AuthType } from '../store/types';
+import type { AuthType, CredentialInfo } from '../store/types';
 
 export interface ChatRequestBody {
   message: string;
@@ -51,7 +51,17 @@ export interface ChatRequestBody {
   /** Required when `mode !== 'human'`: the parent event that triggered the spawn. */
   spawning_event_id?: string;
   conflict_change_id?: string;
+  /** Legacy CC scope binding — a registered repo UUID or name. Kept for
+   *  back-compat with older callers (CLI, agent_thread spawns); the
+   *  compose-view picker now sends `folder` instead, and the engine accepts
+   *  either (mutually exclusive: 400 if both are set). */
   repo_id?: string;
+  /** New CC scope payload — an absolute path, a workspace-relative path
+   *  (`data/apps/<id>`), or a registered repo name/UUID. The engine resolves
+   *  via the `coding_agent_kind` pipeline to one of `lucidos | app |
+   *  external` and routes the spawn accordingly. Mutually exclusive with
+   *  `repo_id`. */
+  folder?: string;
   title?: string;
 }
 
@@ -75,12 +85,7 @@ export interface NotificationsResponse {
 }
 
 export interface CredentialsListResponse {
-  credentials: Array<{
-    service_name: string;
-    base_url: string;
-    auth_type: AuthType;
-    created_at: string;
-  }>;
+  credentials: CredentialInfo[];
 }
 
 /** Generic success/error response used by credential, preference, and trigger endpoints. */

@@ -1,15 +1,19 @@
 import { panelOverlay, showToast, closeInlineForm } from '../store';
-import { confirmPluginUninstall, cancelPluginUninstall } from '../../api/client';
+import { ApiError, confirmPluginUninstall, cancelPluginUninstall } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 import { pushNavState } from './navigation';
+import { revealContentPane } from './pane';
 import type { PluginUninstallRequest } from '../types';
 
 /** Open the plugin uninstall panel for the staged uninstall in `request`.
  *  Mirrors `openPluginInstallRequest` — panel takes over the content pane,
- *  resolves via Confirm/Cancel POSTs to the engine. */
+ *  resolves via Confirm/Cancel POSTs to the engine. Reveals the content pane
+ *  so a mobile user (or a desktop user with a collapsed split) actually sees
+ *  the SSE-triggered panel. */
 export function openPluginUninstallRequest(request: PluginUninstallRequest): void {
   panelOverlay.value = { type: 'form', form: { type: 'plugin-uninstall', request } };
   pushNavState();
+  revealContentPane();
 }
 
 /** User clicked Confirm — engine deletes the recorded files from `data/`,
@@ -35,13 +39,17 @@ export async function confirmPluginUninstallAction(uninstallId: string, pluginNa
 }
 
 /** User clicked Cancel — engine drops the pending entry + emits
- *  `PluginUninstallCanceled`. Closes the panel; failure is non-blocking
- *  (404 = entry already gone, which is harmless). */
+ *  `PluginUninstallCanceled`. Closes the panel; 404/410 (entry already
+ *  gone — engine cleanup race or peer device acted first) is harmless and
+ *  swallowed. Anything else means the pending entry likely persists and the
+ *  user — who explicitly clicked Cancel — should know it didn't take. */
 export async function cancelPluginUninstallAction(uninstallId: string): Promise<void> {
   try {
     await cancelPluginUninstall(uninstallId);
   } catch (e) {
-    console.error('cancel plugin uninstall failed:', e);
+    if (!(e instanceof ApiError) || (e.httpCode !== 404 && e.httpCode !== 410)) {
+      showToast(`Cancel plugin uninstall failed: ${errorDetail(e)}`, 'error');
+    }
   }
   closeInlineForm();
 }

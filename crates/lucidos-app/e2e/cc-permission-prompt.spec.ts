@@ -9,13 +9,13 @@ import { randomUUID } from 'crypto';
  * The "MCP server inside lucidos-cli" half is exercised by Rust unit tests
  * (lucidos-cli) and the API e2e test (permission_prompt_test.rs). This spec
  * covers the browser side end-to-end:
- *   - Seed a CC thread, then POST /api/internal/permission-prompt from the
+ *   - Seed a CC thread, then POST /api/v1/internal/permission-prompt from the
  *     test (simulating lucidos-cli's MCP subprocess).
  *   - Wait for the engine to emit CodingAgentPermissionRequest. The engine
  *     promotes that event into its own divider exchange (initiator panel,
  *     "You" chip), with the PermissionBody as the body — not inline in the
  *     prior CC response panel.
- *   - Click Allow → engine resolves the oneshot via /api/mcp/consent (driven
+ *   - Click Allow → engine resolves the oneshot via /api/v1/mcp/consent (driven
  *     by the click), responds to the still-blocked permission-prompt POST
  *     with `{ allowed: true }`, and emits CodingAgentPermissionResolved.
  *   - The SAME initiator panel flips in place to its answered state.
@@ -31,7 +31,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
     const msgEventId = randomUUID();
     const sessionStartedId = randomUUID();
     psql([
-      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count) VALUES ('${threadId}', 'CC Permission E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'running', 'inbox', true, 0)`,
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Permission E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'running', 'inbox', true, 0)`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${msgEventId}', 'MessageReceived', '{"text":"edit my skill","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${sessionStartedId}', 'SessionStarted', '{"session_id":"sess-perm-e2e-${suffix}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     ].join(';\n'));
@@ -53,7 +53,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       // Fire the (blocking) permission-prompt request from the test, mimicking
       // what lucidos-cli's MCP subprocess would do. Don't await yet — the
       // handler blocks on the user's decision.
-      promptResponse = apiContext.post('/api/internal/permission-prompt', {
+      promptResponse = apiContext.post('/api/v1/internal/permission-prompt', {
         data: {
           thread_id: threadId,
           tool_use_id: `tu-perm-e2e-${suffix}`,
@@ -123,7 +123,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
     const msgEventId = randomUUID();
     const sessionStartedId = randomUUID();
     psql([
-      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count) VALUES ('${threadId}', 'CC Permission Deny E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'running', 'inbox', true, 0)`,
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Permission Deny E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'running', 'inbox', true, 0)`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${msgEventId}', 'MessageReceived', '{"text":"do something risky","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${sessionStartedId}', 'SessionStarted', '{"session_id":"sess-deny-e2e-${suffix}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     ].join(';\n'));
@@ -142,7 +142,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       await row.click();
       await ensureOnThreadPane(page);
 
-      promptResponse = apiContext.post('/api/internal/permission-prompt', {
+      promptResponse = apiContext.post('/api/v1/internal/permission-prompt', {
         data: {
           thread_id: threadId,
           tool_use_id: `tu-deny-e2e-${suffix}`,
@@ -195,7 +195,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
     const pattern = `Skill(${plugin}:*)`;
 
     psql([
-      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count) VALUES ('${threadId}', 'CC Always Allow E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'running', 'inbox', true, 0)`,
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Always Allow E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'running', 'inbox', true, 0)`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"run a skill","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'SessionStarted', '{"session_id":"sess-aa-e2e-${suffix}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     ].join(';\n'));
@@ -207,7 +207,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
     let promptResponse: Promise<Awaited<ReturnType<typeof apiContext.post>>> | undefined;
 
     // Snapshot the file so we can restore it (don't pollute the real ~/.lucidos).
-    const snapshotResp = await apiContext.get('/api/cc-allowed-tools');
+    const snapshotResp = await apiContext.get('/api/v1/cc-allowed-tools');
     expect(snapshotResp.status()).toBe(200);
     const snapshot = (await snapshotResp.json()).contents as string;
 
@@ -220,7 +220,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       await row.click();
       await ensureOnThreadPane(page);
 
-      promptResponse = apiContext.post('/api/internal/permission-prompt', {
+      promptResponse = apiContext.post('/api/v1/internal/permission-prompt', {
         data: {
           thread_id: threadId,
           tool_use_id: `tu-aa-e2e-${suffix}`,
@@ -243,7 +243,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       expect((await resolved.json()).allowed).toBe(true);
 
       // File now contains the pattern.
-      const after = await apiContext.get('/api/cc-allowed-tools');
+      const after = await apiContext.get('/api/v1/cc-allowed-tools');
       expect(after.status()).toBe(200);
       const contents = (await after.json()).contents as string;
       expect(contents).toContain(pattern);
@@ -252,7 +252,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
         await promptResponse.catch(() => undefined);
       }
       // Restore the file unconditionally so the user's real allowlist is untouched.
-      await apiContext.put('/api/cc-allowed-tools', { data: { contents: snapshot } }).catch(() => undefined);
+      await apiContext.put('/api/v1/cc-allowed-tools', { data: { contents: snapshot } }).catch(() => undefined);
       await apiContext.dispose();
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
@@ -269,7 +269,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       ignoreHTTPSErrors: true,
     });
 
-    const snapshotResp = await apiContext.get('/api/cc-allowed-tools');
+    const snapshotResp = await apiContext.get('/api/v1/cc-allowed-tools');
     expect(snapshotResp.status()).toBe(200);
     const snapshot = (await snapshotResp.json()).contents as string;
 
@@ -278,13 +278,13 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
     try {
       // Write via PUT, read back via GET — the section component uses the same
       // endpoints, so this proves the wire contract used by the UI.
-      const put = await apiContext.put('/api/cc-allowed-tools', { data: { contents: sentinel } });
+      const put = await apiContext.put('/api/v1/cc-allowed-tools', { data: { contents: sentinel } });
       expect(put.status()).toBe(204);
-      const reread = await apiContext.get('/api/cc-allowed-tools');
+      const reread = await apiContext.get('/api/v1/cc-allowed-tools');
       expect(reread.status()).toBe(200);
       expect((await reread.json()).contents).toBe(sentinel);
     } finally {
-      await apiContext.put('/api/cc-allowed-tools', { data: { contents: snapshot } }).catch(() => undefined);
+      await apiContext.put('/api/v1/cc-allowed-tools', { data: { contents: snapshot } }).catch(() => undefined);
       await apiContext.dispose();
     }
   });

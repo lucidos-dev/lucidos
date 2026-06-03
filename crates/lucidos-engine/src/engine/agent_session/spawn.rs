@@ -1,6 +1,6 @@
 use crate::engine::git_ops::git_cmd;
 use crate::engine::LucidosEngine;
-use crate::runtime::{AgentKind, RunningAgent, SpawnArgs};
+use crate::runtime::{CodingAgent, RunningAgent, SpawnArgs};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 /// `args.resume_session_id` controls whether resume is attempted at all.
 pub(super) async fn spawn_or_resume(
     engine: &LucidosEngine,
-    agent: AgentKind,
+    agent: CodingAgent,
     args: SpawnArgs<'_>,
     cancel: CancellationToken,
 ) -> Result<RunningAgent, Box<dyn std::error::Error + Send + Sync>> {

@@ -60,8 +60,15 @@ pub enum DisplaySection {
 pub enum ThreadStatus {
     Idle,
     Running,
-    /// CC has finished and proposed changes that need user review (apply/discard).
-    /// Chat threads never reach this status — only CC threads with cc_has_changes=true.
+    /// Vestigial — no projection arm writes this anymore. Historical CC rows
+    /// where the user hasn't yet acted on a proposed change may still carry
+    /// it; kept on the enum so `ThreadStatus::parse` deserializes them
+    /// without falling back to Idle (the parse path's catch-all). New rows
+    /// settle to Idle and surface the "review required" state via
+    /// `coding_agent_proposed` (and `is_blocking` clause 3) instead — a
+    /// proposed change is an artifact for the user to review, not a parked
+    /// loop. For "loop is parked waiting for human input" see
+    /// `WaitingForUserAnswer`.
     Waiting,
     /// CC paused on an `AskUserQuestion` tool call. The subprocess was killed
     /// after emitting `UserQuestionAsked`; resuming requires the user to
@@ -84,6 +91,20 @@ impl ThreadStatus {
             Self::Failed => "failed",
         }
     }
+
+    /// Parse the snake_case wire form persisted in `thread_summaries.status`.
+    /// Mirrors `as_str` exactly; unknown values fall back to Idle
+    /// (defensive — the column is only written by the projection itself, so a
+    /// surprise value would indicate manual DB tampering, not a bug to crash on).
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "running" => Self::Running,
+            "waiting" => Self::Waiting,
+            "waiting_for_user_answer" => Self::WaitingForUserAnswer,
+            "failed" => Self::Failed,
+            _ => Self::Idle,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -99,9 +120,16 @@ pub enum EventClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
-    Archive,
-    Apply,
+    /// Discard the focused thread's unsent compose draft (close layer 1).
+    /// Serializes as `"discard_draft"`.
+    DiscardDraft,
     Discard,
+    Apply,
+    Archive,
+    /// Retention toggle — present for any focused thread (mutually exclusive
+    /// with `Unsave`). Not part of the close cascade.
+    Save,
+    Unsave,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -140,9 +168,13 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         }
         "MergeConflictDetected" | "MissingHardeningDetected" => EventClass::Start,
         // Activity
-        "TextStreamed" | "Thinking" | "MemorySearched" => EventClass::Activity,
+        "TextStreamed" | "ThoughtStreamed" | "MemorySearched" => EventClass::Activity,
         "ContextCaptured" => EventClass::Metadata,
         "ToolCalled" | "ToolResult" => EventClass::Activity,
+        // Mid-turn snapshot of the Lucidos Agent's todo list — replace-whole-list
+        // semantics. Classified as Activity so the thread reads as actively
+        // working when the agent calls `todo_write`, matching ToolCalled.
+        "TodoListWritten" => EventClass::Activity,
         // Background-bash lifecycle. Started fires synchronously inside
         // the LLM tool turn; Completed fires asynchronously from the
         // tokio watcher when the child exits. Both classified as Metadata
@@ -169,12 +201,12 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         | "ChangeProposed"
         | "UserQuestionAsked"
         | "CodingAgentPermissionRequest" => EventClass::ActionRequired,
-        // ContinueSignal — a continuation request, classified as Start so
+        // ContinuationRequested — a continuation request, classified as Start so
         // the recipient thread surfaces the spawn as the beginning of a
         // new exchange. Emitted by Phase 5.3 recovery paths; the spawn
         // dispatcher (Task 5.2) actuates a CC re-spawn against the same
         // session id without a fresh user message.
-        "ContinueSignal" => EventClass::Start,
+        "ContinuationRequested" => EventClass::Start,
         // UserQuestionAnswered is a step inside the same exchange as the
         // question — Activity, not Start. The status transition still moves
         // to Running so the resumed CC turn shows as in-progress.
@@ -198,6 +230,12 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // Resume-helper input from the `dismiss_from_context` tool. Pure
         // bookkeeping — no UI surface, no activity bump.
         "ContextDismissed" => EventClass::Metadata,
+        // Engine-internal Flash enrichment of a prior MessageReceived's
+        // attached images. The originating MessageReceived already moved
+        // the thread into Running; this event arrives one or more
+        // iterations later as a derived past-tense fact and must NOT
+        // disturb the section/status machinery.
+        "ImageDescribed" => EventClass::Metadata,
         _ => return None,
     })
 }
@@ -206,11 +244,12 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
     vec![
         "MessageReceived",
         "TextStreamed",
-        "Thinking",
+        "ThoughtStreamed",
         "ContextCaptured",
         "MemorySearched",
         "ToolCalled",
         "ToolResult",
+        "TodoListWritten",
         "ResponseGenerated",
         "ResponseCanceled",
         "ResponseAborted",
@@ -224,7 +263,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "CodingAgentUserMessageSent",
         "CodingAgentPromptSent",
         "CodingAgentIdled",
-        "ContinueSignal",
+        "ContinuationRequested",
         "MissingHardeningDetected",
         "ThreadTitleGenerated",
         "ThreadTitleRenamed",
@@ -260,6 +299,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         // Background-bash lifecycle (run_bash_background trio).
         "BackgroundBashStarted",
         "BackgroundBashCompleted",
+        // Engine-internal Flash enrichment for MessageReceived images.
+        "ImageDescribed",
     ]
 }
 
@@ -275,9 +316,12 @@ pub fn is_section_legal(thread_type: ThreadType, section: ArchiveState) -> bool 
     }
 }
 
-/// Custom error type (exception to the Box<dyn Error> convention in CLAUDE.md)
-/// because lifecycle violations carry structured data needed for fail-fast
-/// notifications: which event, which thread type, which section.
+/// Custom error type — blessed exception to the `Box<dyn Error>` convention
+/// (see `.claude/rules/rust.md` → "Error handling"). Justified by the
+/// structured fields below: the EventBus rejection path fails fast on the
+/// typed payload (event_type, thread_type, current_section, reason) instead
+/// of parsing a string. Don't add new custom error types without the same
+/// kind of structural justification.
 #[derive(Debug, Clone)]
 pub struct LifecycleViolation {
     pub event_type: String,
@@ -350,35 +394,32 @@ pub fn resolve_transition(
         | "CodingAgentPromptSent"
         | "MissingHardeningDetected"
         | "CodingAgentSettingsChanged"
-        | "ContinueSignal" => match thread_type {
+        | "ContinuationRequested" => match thread_type {
             ThreadType::CodingAgent => no_change,
             ThreadType::Chat => violation("CC-specific event on Chat thread"),
         },
         // User-attended terminals surface the thread in REVIEW so the user can
         // save or archive it. Without this, a cancel/abort on an already-
-        // archived thread leaves it actionless: `resolve_actions` returns []
-        // when stored_section != Inbox.
+        // archived thread leaves it actionless: `available_thread_actions`
+        // returns no close actions when stored_section != Inbox.
         "ResponseAborted" | "ResponseFailed" | "ResponseCanceled" => to_inbox,
         // ChangeProposed surfaces CC threads to inbox — proposed changes require
         // user action (apply/discard) and must surface in REVIEW. Without this,
-        // CC sessions that finish without an intermediate CodingAgentIdled (or where
-        // the thread is already archived) would go straight to HISTORY.
+        // Claude Code sessions that finish without an intermediate CodingAgentIdled (or where
+        // the thread is already archived) would go straight to ARCHIVE.
         "ChangeProposed" => match thread_type {
             ThreadType::CodingAgent => to_inbox,
             ThreadType::Chat => violation("ChangeProposed is CC-only"),
         },
         // UserQuestionAsked surfaces the thread in REVIEW so the user sees the
-        // question card and the action buttons. CC-only.
-        "UserQuestionAsked" => match thread_type {
-            ThreadType::CodingAgent => to_inbox,
-            ThreadType::Chat => violation("UserQuestionAsked is CC-only"),
-        },
-        // UserQuestionAnswered does not change section — CC will resume and the
-        // thread stays in REVIEW until the next terminal event.
-        "UserQuestionAnswered" => match thread_type {
-            ThreadType::CodingAgent => no_change,
-            ThreadType::Chat => violation("UserQuestionAnswered is CC-only"),
-        },
+        // question card and the action buttons. Raised by CC's
+        // `AskUserQuestion` tool AND by the chat agent's `ask_user_question`
+        // tool — same event, same lifecycle handling for both.
+        "UserQuestionAsked" => to_inbox,
+        // UserQuestionAnswered does not change section — the agent (CC or
+        // chat) resumes and the thread stays in REVIEW until the next
+        // terminal event.
+        "UserQuestionAnswered" => no_change,
         // CC permission request — surfaces the thread in REVIEW so the user
         // sees the PermissionCard. CC-only.
         "CodingAgentPermissionRequest" => match thread_type {
@@ -394,13 +435,18 @@ pub fn resolve_transition(
         // Events legal for both, no section change
         "MessageReceived"
         | "TextStreamed"
-        | "Thinking"
+        | "ThoughtStreamed"
         | "ContextCaptured"
         | "MemorySearched"
         | "ToolCalled"
         | "ToolResult"
+        // Lucidos Agent todo list snapshot — legal on both Chat and CC
+        // threads for forward-compat, though today only the chat-agent tool
+        // surface emits it. No section transition (the paired ToolCalled
+        // already bumped activity for the wrapping turn).
+        | "TodoListWritten"
         // ContinuationStarted opens the resume exchange after engine restart for
-        // both chat (via /api/threads/<id>/continue → chat/rerun.rs) and CC
+        // both chat (via /api/v1/threads/<id>/continue → chat/rerun.rs) and CC
         // (via the spawn-dispatcher's --resume path). Pure boundary marker —
         // the section transition belongs to the events that follow it.
         | "ContinuationStarted"
@@ -428,7 +474,7 @@ pub fn resolve_transition(
         | "ImageUploaded"
         // WorktreeCleaned is a passive bookkeeping event emitted by the
         // background cleanup worker (Phase 10.2). It must NOT bump the thread
-        // out of HISTORY or change status — that's the whole point of cleanup
+        // out of ARCHIVE or change status — that's the whole point of cleanup
         // running on long-idle threads.
         | "WorktreeCleaned"
         // Phase 4 fan-in events — typed callback emitted onto the parent
@@ -447,18 +493,26 @@ pub fn resolve_transition(
         // outside the LLM turn, so a status flip would surface a quiet
         // thread for no user-visible reason.
         | "BackgroundBashStarted"
-        | "BackgroundBashCompleted" => no_change,
+        | "BackgroundBashCompleted"
+        // Engine-internal Flash enrichment of a prior MessageReceived's
+        // attached images. Emitted one or more iterations after the
+        // originating MessageReceived (which already moved the section);
+        // a transition here would re-open a thread the user just settled.
+        | "ImageDescribed" => no_change,
         _ => violation("Unknown event type"),
     }?;
 
-    // Chat sub-threads never go to Inbox — agentic loop children shouldn't
-    // surface in REVIEW. CC threads always go to Inbox regardless of depth,
-    // because every CC session needs user action (Apply/Discard/Archive).
+    // Chat sub-threads and unattended trigger runs hide on terminal events —
+    // agentic-loop children and background trigger executions shouldn't
+    // surface in REVIEW. CC always goes to Inbox regardless of depth
+    // because every Claude Code session needs user action (Apply / Discard / Archive).
     if !is_top_level
         && thread_type != ThreadType::CodingAgent
         && result.new_section == Some(ArchiveState::Inbox)
     {
-        return Ok(TransitionResult { new_section: None });
+        return Ok(TransitionResult {
+            new_section: Some(ArchiveState::Archived),
+        });
     }
 
     Ok(result)
@@ -468,26 +522,48 @@ pub fn resolve_transition(
 
 /// Resolution order:
 ///   1. is_saved                                        → Saved
-///   2. status == Running OR has_active_children        → Active
-///   3. has_pending_changes                             → Review
-///   4. archive_state == Archived                       → Archive
-///   5. otherwise                                       → Review
+///   2. has_attention_descendants                       → Review
+///   3. status == Running OR has_active_children        → Active
+///   4. has_pending_changes                             → Review
+///   5. archive_state == Archived                       → Archive
+///   6. otherwise                                       → Review
 ///
 /// Saved is the strongest claim — saving is the user's "I'll manage this
-/// manually" gesture and overrides every other route. Pending changes
-/// outrank Archive so the user can never lose unresolved work behind the
-/// archive curtain: a thread the user archived while changes are still
-/// pending stays surfaced in Review until they explicitly Apply or
-/// Discard each one.
+/// manually" gesture and overrides every other route.
+///
+/// `has_attention_descendants` (clause 2) bubbles transitively from any
+/// descendant in `is_attention_needing` state — WaitingForUserAnswer or
+/// an in-workspace CC thread with pending changes. It outranks the local
+/// "Active" clause: if any descendant is paused on a user question /
+/// permission or has pending CC changes, the parent surfaces in Review
+/// so the user can find the attention card by walking down — even if a
+/// sibling descendant is still actively running.
+///
+/// `has_pending_changes` on SELF (clause 4) stays AFTER Running, not
+/// merged with attention-descendants. Rationale: when the thread itself
+/// is mid-turn, a pending change is typically about to be resolved by
+/// the live work — surfacing it as Review would mask the live activity.
+/// (See test `running_overrides_pending`.) An attention-needing
+/// DESCENDANT, by contrast, resolves independently of the parent's
+/// run state, so it bubbles past Running.
+///
+/// Pending changes still outrank Archive (clause 4 before clause 5) so
+/// the user can never lose unresolved work behind the archive curtain:
+/// a thread the user archived while changes are still pending stays
+/// surfaced in Review until they explicitly Apply or Discard each one.
 pub fn display_section(
     stored: ArchiveState,
     status: ThreadStatus,
     is_saved: bool,
     has_active_children: bool,
     has_pending_changes: bool,
+    has_attention_descendants: bool,
 ) -> DisplaySection {
     if is_saved {
         return DisplaySection::Saved;
+    }
+    if has_attention_descendants {
+        return DisplaySection::Review;
     }
     if status == ThreadStatus::Running || has_active_children {
         return DisplaySection::Active;
@@ -501,38 +577,157 @@ pub fn display_section(
     DisplaySection::Review
 }
 
-/// Resolve which actions are available for a thread in its current state.
-/// This is the single source of truth — frontend imports the codegen'd version.
-pub fn resolve_actions(
+/// A thread is "blocking" iff archiving its ancestor would silently strand
+/// active work in it. Three clauses, in order:
+///
+/// 1. Running or WaitingForUserAnswer always blocks, regardless of
+///    `archive_state` — active work cannot be "already terminal", and the
+///    Archived short-circuit must not mask it.
+/// 2. Otherwise, `archive_state == Archived` does NOT block — the user
+///    dismissed the thread and the row isn't stranding anything.
+/// 3. An idle in-workspace CodingAgent thread with pending changes blocks
+///    until the user Applies or Discards. External-repo CC is the carve-out:
+///    `WaitingBanner.tsx` swaps `[Discard, Apply]` for `[Archive]` because
+///    Apply can't merge into a different repo, and the cascade handler emits
+///    `ChangeApplied` for each pending change before the `ThreadArchived`
+///    emit so the change row closes cleanly instead of dangling.
+///
+/// Source of truth for the descendants_block_archive computation in the
+/// thread_summaries projection.
+///
+/// **SQL mirrors** — keep in sync when the predicate changes:
+/// - `event_bus_projection_propagation.rs::rebuild_blocking_descendant_count`
+///   (recursive CTE recomputing the column from scratch).
+/// - The most recent backfill migration applying this WHERE clause is
+///   `20260518132821_blocking_count_running_overrides_archived.sql`. CTEs
+///   can't share a function across migrations, so any new backfill must
+///   inline the same WHERE clause.
+pub fn is_blocking(
+    thread_type: ThreadType,
+    status: ThreadStatus,
+    archive_state: ArchiveState,
+    has_pending_changes: bool,
+    is_external_repo: bool,
+) -> bool {
+    if status == ThreadStatus::Running || status == ThreadStatus::WaitingForUserAnswer {
+        return true;
+    }
+    if archive_state == ArchiveState::Archived {
+        return false;
+    }
+    if has_pending_changes && thread_type == ThreadType::CodingAgent && !is_external_repo {
+        return true;
+    }
+    false
+}
+
+/// A thread "needs attention" iff its state requires a user action to
+/// progress. Same shape as `is_blocking` but DROPS the `Running` clause:
+/// a running descendant is delegated work (belongs to Active), not pending
+/// attention (would belong to Review).
+///
+/// Concretely:
+/// - `WaitingForUserAnswer` — user must answer the question / permission
+///   card before the agent can resume.
+/// - In-workspace CC thread with pending changes — user must Apply or
+///   Discard before the thread can settle. External-repo CC is the same
+///   carve-out as `is_blocking` clause 3.
+///
+/// Drives `thread_summaries.attention_descendant_count`, which bubbles
+/// transitively up the ancestor chain so any thread with a
+/// "needs-attention" descendant routes to Review via `display_section`.
+/// Relationship: `is_blocking = is_attention_needing OR status == Running`.
+/// `Archive`-button gating still uses `is_blocking` so a Running descendant
+/// keeps the button hidden — only the section routing splits them.
+///
+/// **SQL mirrors** — keep in sync when the predicate changes:
+/// - `event_bus_projection_propagation.rs::rebuild_blocking_descendant_count`
+///   (the recursive CTE there recomputes BOTH columns in one pass — see the
+///   `attention_cnt` clause).
+/// - `event_bus_projection_propagation.rs::reconcile_blocking_descendant_count_for_ancestors`
+///   (the per-ancestor reconcile updates BOTH columns in lockstep).
+/// - The backfill in `20260522091904_add_attention_descendant_count.sql`
+///   inlines the same WHERE clause. CTEs can't share a function across
+///   migrations, so any new backfill must inline it again.
+pub fn is_attention_needing(
+    thread_type: ThreadType,
+    status: ThreadStatus,
+    archive_state: ArchiveState,
+    has_pending_changes: bool,
+    is_external_repo: bool,
+) -> bool {
+    if status == ThreadStatus::WaitingForUserAnswer {
+        return true;
+    }
+    if archive_state == ArchiveState::Archived {
+        return false;
+    }
+    if has_pending_changes && thread_type == ThreadType::CodingAgent && !is_external_repo {
+        return true;
+    }
+    false
+}
+
+/// Every action available for a thread in its current state, in cascade
+/// priority order. This is the single DB-derivable source of truth — the
+/// frontend imports the codegen'd version AND the mutating HTTP handlers guard
+/// on it server-side.
+///
+/// Returned order makes the front-most close LAYER positional:
+/// `[DiscardDraft?, Discard?, Apply?, Archive?, Unsave|Save]`. The close set is
+/// the prefix; the retention toggle (`Save`/`Unsave`) always appends exactly
+/// one entry for a focused thread, matching the always-present prompt section
+/// toggle.
+///
+/// Inputs and their seam:
+/// - `has_pending_changes` / `descendants_block_archive` — projection facts
+///   (`coding_agent_proposed`, `blocking_descendant_count > 0`).
+/// - `has_unsent_draft` — `thread_summaries.compose_text`/`compose_images`
+///   non-empty. DB-derivable, but the frontend feeds the live value from the
+///   `composeDrafts` signal so the cascade doesn't lag the 250 ms compose
+///   debounce.
+/// - `is_saved` — `thread_summaries.is_saved`.
+///
+/// `descendants_block_archive` is true when any descendant is currently in a
+/// state that prevents archive (Running, WaitingForUserAnswer, or
+/// has_pending_changes && CodingAgent — see `is_blocking`).
+pub fn available_thread_actions(
     thread_type: ThreadType,
     status: ThreadStatus,
     stored_section: ArchiveState,
     has_pending_changes: bool,
+    descendants_block_archive: bool,
+    has_unsent_draft: bool,
     is_saved: bool,
 ) -> Vec<Action> {
-    // Mid-turn: nothing to dismiss; QuestionCard owns the input. Apply/Discard
-    // would commit incomplete work, so this branch must run BEFORE the
-    // pending-changes check below — even when archived + pending puts the
-    // thread in Review, mid-turn safety wins and the action bar stays empty.
-    // WaitingForUserAnswer is also mid-turn — the WaitingBanner renders a
-    // Cancel button (not an Action) for that state instead.
-    if status == ThreadStatus::Running || status == ThreadStatus::WaitingForUserAnswer {
-        return vec![];
+    let mut actions = Vec::new();
+    let live =
+        status == ThreadStatus::Running || status == ThreadStatus::WaitingForUserAnswer;
+    let cc_pending = has_pending_changes && thread_type == ThreadType::CodingAgent;
+
+    // Layer 1 — draft discard. Orthogonal to run state: an unsent draft can be
+    // discarded whether or not the thread is live.
+    if has_unsent_draft {
+        actions.push(Action::DiscardDraft);
     }
-    // Pending changes always win — display_section surfaces archived+pending
-    // in Review, so the action set must follow or the user sees dots with no
-    // buttons.
-    if has_pending_changes && thread_type == ThreadType::CodingAgent {
-        return vec![Action::Discard, Action::Apply];
+    // Layers 2 & 3 — change resolution then archive. Both are suppressed while
+    // the thread is live (mid-turn). A pending change outranks archive: the
+    // user must Apply or Discard before the thread can be archived.
+    if !live {
+        if cc_pending {
+            actions.push(Action::Discard);
+            actions.push(Action::Apply);
+        } else if stored_section == ArchiveState::Inbox && !descendants_block_archive {
+            actions.push(Action::Archive);
+        }
     }
-    // Saved threads render Archive via PromptInput.getPromptSectionButtons.
+    // Retention toggle — available in any run state, exactly one of the pair.
     if is_saved {
-        return vec![];
+        actions.push(Action::Unsave);
+    } else {
+        actions.push(Action::Save);
     }
-    if stored_section != ArchiveState::Inbox {
-        return vec![];
-    }
-    vec![Action::Archive]
+    actions
 }
 
 // ── TypeScript Codegen ──────────────────────────────────────────────
@@ -557,15 +752,19 @@ pub const LAST_ACTIVITY_EVENTS: &[&str] = &[
     "UserQuestionAnswered",
     "CodingAgentPermissionRequest",
     "CodingAgentPermissionResolved",
-    // ContinueSignal — start event for a CC continuation. Bumps last_activity
+    // ContinuationRequested — start event for a CC continuation. Bumps last_activity
     // so the thread surfaces in the recents list as soon as the recovery
     // dispatcher emits one.
-    "ContinueSignal",
-    // Step events (keep timestamp current during long agentic responses)
+    "ContinuationRequested",
+    // Step events (keep timestamp current during long agentic responses).
+    // Canonical names only — this constant is consulted via the
+    // deserialized variant (alias collapses legacy "Thinking" rows to
+    // ThoughtStreamed before the lookup).
     "ToolCalled",
     "ToolResult",
     "TextStreamed",
-    "Thinking",
+    "ThoughtStreamed",
+    "MemorySearched",
     "CodingAgentTextStreamed",
     "CodingAgentToolCalled",
     "CodingAgentToolResult",
@@ -585,7 +784,7 @@ pub const MESSAGE_COUNT_EVENTS: &[&str] = &[
 pub enum StatusRule {
     /// Set status to a fixed value.
     Set(ThreadStatus),
-    /// Status depends on cc_has_changes: first = with changes, second = without.
+    /// Status depends on coding_agent_proposed: first = with changes, second = without.
     ConditionalCc(ThreadStatus, ThreadStatus),
     /// No status change.
     NoChange,
@@ -594,13 +793,13 @@ pub enum StatusRule {
 /// How an event changes CC flags in thread_summaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CcFlagRule {
-    /// Clear all CC flags (cc_has_changes, cc_requires_restart, cc_is_external_repo, cc_applying).
+    /// Clear all CC flags (coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo, coding_agent_applying).
     ClearAll,
-    /// Set cc_has_changes = true.
+    /// Set coding_agent_proposed = true.
     SetChanges,
-    /// Set cc_applying = true.
+    /// Set coding_agent_applying = true.
     SetApplying,
-    /// Clear cc_applying only.
+    /// Clear coding_agent_applying only.
     ClearApplying,
     /// Read CC flags from event payload (CodingAgentIdled).
     FromPayload,
@@ -654,12 +853,12 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
-        // ContinueSignal — emitted by the recovery path (Phase 5.3) when a
-        // mid-turn-interrupted CC session needs to resume. The dispatcher
+        // ContinuationRequested — emitted by the recovery path (Phase 5.3) when a
+        // mid-turn-interrupted Claude Code session needs to resume. The dispatcher
         // (Task 5.2) actuates the spawn, so the thread transitions back to
         // Running just like any other start event.
         (
-            "ContinueSignal",
+            "ContinuationRequested",
             StatusTransition {
                 status: StatusRule::Set(ThreadStatus::Running),
                 cc_flags: CcFlagRule::None,
@@ -691,7 +890,7 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
             },
         ),
         // System interruption — surfaces in REVIEW with the same red error
-        // indicator as ResponseFailed, unless a CC session left pending
+        // indicator as ResponseFailed, unless a Claude Code session left pending
         // changes (then 'waiting' → changes dot wins, since reviewing the
         // changes is more actionable than acknowledging the interrupt).
         (
@@ -763,9 +962,12 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::ClearApplying,
             },
         ),
-        // CC AskUserQuestion — pauses CC, surfaces a question card.
-        // UserQuestionAnswered transitions back to Running so the resume code path
-        // (POST /api/cc/answer-question → resume_cc_with_tool_result) can take over.
+        // Question card raised — pauses the agent (CC or chat), surfaces
+        // the card. UserQuestionAnswered transitions back to Running so
+        // the channel-specific resume path
+        // (POST /api/v1/threads/{thread_id}/answer-question → CC
+        // `resume_cc_with_tool_result` for CC, in-process tool wake for
+        // chat) can take over.
         (
             "UserQuestionAsked",
             StatusTransition {
@@ -781,7 +983,7 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
             },
         ),
         // CC permission prompt — pauses CC's tool call, surfaces a PermissionCard.
-        // Mirrors UserQuestionAsked/Answered, but the CC subprocess is NOT
+        // Mirrors UserQuestionAsked/Answered, but the Claude Code subprocess is NOT
         // killed; the MCP stdio server inside the subprocess blocks on the
         // engine's HTTP response, so the resolution event transitions back to
         // Running so the in-flight tool call can complete.
@@ -814,9 +1016,7 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // into one Result haven't actually finished) must re-bump status to
         // Running. This is a no-op on the common streaming path where status
         // is already Running. Must list exactly the same events as the
-        // activity-event arm in `event_bus.rs::update_thread_projection`
-        // (`MemorySearched` is classified Activity but stays a projection
-        // no-op there, so it's also absent here).
+        // activity-event arm in `event_bus.rs::update_thread_projection`.
         //
         // Caveat: the projection skips this Running-bump when the event
         // carries `meta.actor = MessageOrigin::System`. Live LLM-loop
@@ -837,7 +1037,14 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
             },
         ),
         (
-            "Thinking",
+            "ThoughtStreamed",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        (
+            "MemorySearched",
             StatusTransition {
                 status: StatusRule::Set(ThreadStatus::Running),
                 cc_flags: CcFlagRule::None,
@@ -884,8 +1091,24 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[path = "thread_lifecycle_tests/tests.rs"]
-mod tests;
+#[path = "thread_lifecycle_tests/contract.rs"]
+mod contract_tests;
+
+#[cfg(test)]
+#[path = "thread_lifecycle_tests/classification.rs"]
+mod classification_tests;
+
+#[cfg(test)]
+#[path = "thread_lifecycle_tests/display_and_actions.rs"]
+mod display_and_actions_tests;
+
+#[cfg(test)]
+#[path = "thread_lifecycle_tests/events.rs"]
+mod events_tests;
+
+#[cfg(test)]
+#[path = "thread_lifecycle_tests/invariants.rs"]
+mod invariants_tests;
 
 #[cfg(test)]
 #[path = "thread_lifecycle_tests/scenario_tests.rs"]

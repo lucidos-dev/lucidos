@@ -10,10 +10,10 @@ export interface App {
 
 export const apps = {
   list(): Promise<App[]> {
-    return request('/api/apps');
+    return request('/apps');
   },
 
   get(id: string): Promise<App> {
-    return request(`/api/app?id=${encodeURIComponent(id)}`);
+    return request(`/app?id=${encodeURIComponent(id)}`);
   },
 };

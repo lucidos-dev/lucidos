@@ -4,6 +4,7 @@ import { getMemoryStats, getMemoryEntries, getMemorySource, rebuildMemory, cance
 import { showToast, memoryRebuildProgress } from '../../store/store';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { Dropdown } from '../shared/Dropdown';
+import { LoadableError } from '../shared/LoadableError';
 import { toFailed } from '../../store/types';
 import { formatTimeAgo, formatDateTime } from '../../utils/formatTime';
 import { errorDetail } from '../../utils/errorDetail';
@@ -136,7 +137,7 @@ function MemoryEntryRow({ entry }: { entry: MemoryEntryInfo }) {
             </div>
             <button
               class="action-btn memory-view-source-btn"
-              onClick={(e) => { e.stopPropagation(); toggleSource(); }}
+              onClick={(e) => { e.stopPropagation(); void toggleSource(); }}
             >
               {sourceData.status === 'loading' ? 'Loading...' : sourceVisible ? 'Hide source' : 'View source'}
             </button>
@@ -198,7 +199,7 @@ export function MemoryInspector() {
 
   useEffect(() => {
     if (stats.status === 'not-loaded') {
-      loadStats();
+      void loadStats();
     }
   }, []);
 
@@ -206,8 +207,8 @@ export function MemoryInspector() {
   useEffect(() => {
     const isRebuilding = rebuild !== null;
     if (prevRebuilding.current && !isRebuilding) {
-      loadStats();
-      loadEntries(0);
+      void loadStats();
+      void loadEntries(0);
       setOffset(0);
     }
     prevRebuilding.current = isRebuilding;
@@ -224,24 +225,24 @@ export function MemoryInspector() {
 
   useEffect(() => {
     setOffset(0);
-    loadEntries(0);
+    void loadEntries(0);
   }, [sourceFilter, sortBy, importanceParam, loadEntries]);
 
   function handleNextPage() {
     const newOffset = offset + PAGE_SIZE;
     setOffset(newOffset);
-    loadEntries(newOffset);
+    void loadEntries(newOffset);
   }
 
   function handlePrevPage() {
     const newOffset = Math.max(0, offset - PAGE_SIZE);
     setOffset(newOffset);
-    loadEntries(newOffset);
+    void loadEntries(newOffset);
   }
 
   function renderStats() {
     if (stats.status === 'failed') {
-      return <div class="empty-state error-text">Failed to load stats: {stats.error}</div>;
+      return <LoadableError noun="stats" error={stats.error} />;
     }
     if (stats.status !== 'loaded') {
       if (!showStatsLoading) return null;
@@ -277,7 +278,7 @@ export function MemoryInspector() {
 
   function renderEntries() {
     if (entries.status === 'failed') {
-      return <div class="empty-state error-text">Failed to load entries: {entries.error}</div>;
+      return <LoadableError noun="entries" error={entries.error} />;
     }
     if (entries.status !== 'loaded') {
       if (!showEntriesLoading) return null;

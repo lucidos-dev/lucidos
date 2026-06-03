@@ -30,7 +30,17 @@ When you suggest a fix, point at the file — don't quote it.
 
 ## What to walk
 
-Pull events from the last **N days** (default 7; user may say "last 30 days" or "since last release"). From chat, use the built-in `query_events` tool; from a script, use `lucidos events query`. Newest first, page through if you hit the 1000 cap.
+Window: last **N days** (default 7; user may say "last 30 days" or "since last release"). From chat use `query_events` / `count_events`; from a script use `lucidos events query` / `lucidos events count`.
+
+**Count first, then drill** — this is mandatory, not advisory. A busy week can easily produce 2 MB+ of `ToolResult` payloads, and chaining many `query_events` calls in a single turn will blow the LLM's prompt budget on the next turn (the recipe and trigger that owns this file did exactly that on 2026-05-25 — 8 calls × 256 KB tool results → 1.54 M tokens to a 1 M-cap API → `prompt is too long` failure). The workflow is:
+
+1. **Size the window.** Call `count_events` once with `since` set to the window start and **no** `event_type` filter. You'll get a per-type breakdown (`{by_type: [{event_type, count, byte_total}, ...]}`) sorted by count desc. `byte_total` is the raw payload byte sum and is the right proxy for "how expensive will it be to pull this into context".
+2. **Decide what to drill into.** Skip any friction-signal type with `count < 3` (the threshold rule below). For types above threshold, sort by `byte_total` and plan accordingly — high-byte types (`ToolResult`, `CodingAgentToolCalled`, `TextStreamed`) need especially tight `limit` values.
+3. **Drill narrow.** For each type you keep, call `query_events` with the `event_type` filter and `limit: 50` (the engine default — sampling, not enumeration). The engine hard-caps `limit` at 200 and `byte_limit` at 512 KB; the LLM-tool description states these. Never call `query_events` without an `event_type` filter on a window above ~24 hours.
+4. **Watch for `truncated:true`.** `query_events` returns `{events, total_matching, returned, byte_size, truncated, hint?}` and honours a 128 KB default `byte_limit`. When `truncated:true`, follow the hint: narrow by `aggregate_id` or shorten the time window. Do not retry with a larger `byte_limit` unless you've already narrowed.
+5. **Soft cap of 3 `query_events` calls per assistant turn.** The engine bounds each call but does NOT track per-turn totals — 5+ calls in one turn (one assistant message with many tool_use blocks) can still accumulate enough tool-result bytes to blow the next turn's prompt budget. If you have more than 3 friction-signal types above threshold, split the drill across multiple turns; the trigger thread persists and can resume.
+
+**Pagination is an anti-pattern here.** The whole point of count-first-then-sample is that you never need to enumerate every event of every type — clustering is the goal, exhaustion is not.
 
 Friction signals to pull:
 
@@ -45,6 +55,7 @@ Friction signals to pull:
 | App errors | App emits its own error events, or `ToolResult` errors in app-spawned threads |
 | User corrections in chats | `MessageReceived` immediately following a `ResponseGenerated` / `ResponseAborted` / `ToolResult` whose text reads like a correction ("no", "don't", "stop", "actually", "that's wrong", "instead", "you misunderstood") |
 | CC sessions ending without a useful change | `CodingAgentIdled` followed by `ChangeDiscarded`, or no `ChangeProposed` at all when one was clearly expected |
+| Engine crashes / supervisor respawns | `EngineSupervisorRespawned` — bash supervisor logged the previous engine pid died with a non-graceful exit (SIGKILL, panic, OOM, process-group kill). Payload carries `exit_code` (137 = SIGKILL, 143 = SIGTERM via 128+N, etc.) and `died_at`. Always `[engine]` scope. A single occurrence in the window is reportable even below the ≥3 threshold (catastrophic-single rule); cluster + report whenever the engine had to be respawned at all. |
 
 Trigger intent text lives in `TriggerCreated` payloads (`run.intent`) — pull it when assessing trigger findings.
 

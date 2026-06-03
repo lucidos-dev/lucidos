@@ -1,24 +1,14 @@
 import { describe, it, expect } from 'vitest';
-import type { ComponentChildren, VNode } from 'preact';
 import {
   BROAD_ALLOW_INEFFECTIVE,
+  inputTouchesProtectedPath,
+  narrowPattern,
+  permissionButtonState,
   renderQuestion,
   resolvedChoice,
   sessionLabel,
 } from '../PermissionCard';
-
-/** Minimal vnode → plain text walker (no DOM, no preact-render-to-string).
- *  The tests just need to assert "the tool name appears as <strong>" and
- *  "the path appears as <code>" so we collect a flat tag-tagged string. */
-function vnodeToText(node: ComponentChildren): string {
-  if (node === null || node === undefined || typeof node === 'boolean') return '';
-  if (typeof node === 'string' || typeof node === 'number') return String(node);
-  if (Array.isArray(node)) return node.map(vnodeToText).join('');
-  const v = node as VNode<{ children?: ComponentChildren }>;
-  const tag = typeof v.type === 'string' ? v.type : '';
-  const inner = vnodeToText(v.props?.children);
-  return tag ? `<${tag}>${inner}</${tag}>` : inner;
-}
+import { vnodeToText } from './vnodeToText';
 
 describe('BROAD_ALLOW_INEFFECTIVE', () => {
   it('contains the tools whose bare allowlist entry is silently ignored by CC', () => {
@@ -90,6 +80,103 @@ describe('sessionLabel', () => {
     expect(sessionLabel('Edit', {})).toBeNull();
     expect(sessionLabel('Bash', {})).toBeNull();
     expect(sessionLabel('Read', { file_path: '/x' })).toBeNull();
+  });
+});
+
+describe('inputTouchesProtectedPath', () => {
+  // Mirror of the engine-side `input_touches_protected_path` helper.
+  // Restricted to Bash because that's the only tool empirically observed
+  // to surface a card on these paths under bare allowlist entries (see
+  // `CC_PROTECTED_PATH_MARKERS` doc in claude_code.rs for the probing
+  // summary). Read / Edit / cat on `~/.claude/skills/...` all
+  // auto-approved silently — so the filter would be dead code for them.
+  it('detects .claude/ inside Bash command', () => {
+    expect(
+      inputTouchesProtectedPath('Bash', { command: 'rm -rf /Users/me/.claude/skills/grill' }),
+    ).toBe(true);
+  });
+
+  it('detects .git/ inside Bash command', () => {
+    expect(inputTouchesProtectedPath('Bash', { command: 'cat .git/HEAD' })).toBe(true);
+  });
+
+  it('returns false for unrelated Bash commands', () => {
+    expect(inputTouchesProtectedPath('Bash', { command: 'git status --short' })).toBe(false);
+  });
+
+  it('does not match .gitignore or .claude_backup (trailing slash anchor)', () => {
+    expect(inputTouchesProtectedPath('Bash', { command: 'cat .gitignore' })).toBe(false);
+    expect(inputTouchesProtectedPath('Bash', { command: 'ls .claude_backup' })).toBe(false);
+  });
+
+  it('returns false for non-Bash tools regardless of input', () => {
+    // Read/Edit/Glob/Grep/NotebookEdit on `~/.claude/skills/...`
+    // auto-approved silently under bare allowlist entries — so the
+    // helper is Bash-only by design.
+    const path = '/Users/me/repo/.claude/commands/harden.md';
+    expect(inputTouchesProtectedPath('Edit', { file_path: path })).toBe(false);
+    expect(inputTouchesProtectedPath('Write', { file_path: path })).toBe(false);
+    expect(inputTouchesProtectedPath('Read', { file_path: path })).toBe(false);
+    expect(
+      inputTouchesProtectedPath('NotebookEdit', { notebook_path: '/repo/.git/x.ipynb' }),
+    ).toBe(false);
+    expect(inputTouchesProtectedPath('Glob', { pattern: '.claude/skills/**/*.md' })).toBe(false);
+    expect(inputTouchesProtectedPath('Grep', { path: '/repo/.git/', pattern: 'HEAD' })).toBe(false);
+    expect(inputTouchesProtectedPath('Skill', { skill: 'code-review:code-review' })).toBe(false);
+  });
+});
+
+describe('narrowPattern', () => {
+  it('returns null when Bash command targets a CC-protected path', () => {
+    expect(
+      narrowPattern('Bash', { command: 'rm -rf /Users/me/.claude/skills/grill' }),
+    ).toBeNull();
+  });
+
+  it('returns Bash(<token>:*) for ordinary commands', () => {
+    expect(narrowPattern('Bash', { command: 'git status' })).toBe('Bash(git:*)');
+  });
+
+  it('returns Skill(<plugin>:*) for Skill', () => {
+    expect(narrowPattern('Skill', { skill: 'superpowers:test' })).toBe('Skill(superpowers:*)');
+  });
+
+  it('returns null for tools without a narrow scope', () => {
+    expect(narrowPattern('Edit', { file_path: '/x' })).toBeNull();
+    expect(narrowPattern('Read', { file_path: '/x' })).toBeNull();
+  });
+});
+
+describe('permissionButtonState', () => {
+  it('returns enabled with no stateClass when not answered and not terminated', () => {
+    expect(permissionButtonState({ answered: false, terminated: false, isPicked: false }))
+      .toEqual({ disabled: false, stateClass: '' });
+  });
+
+  it('marks the picked button with cc-permission-btn-picked when answered', () => {
+    expect(permissionButtonState({ answered: true, terminated: false, isPicked: true }))
+      .toEqual({ disabled: true, stateClass: ' cc-permission-btn-picked' });
+  });
+
+  it('marks the non-picked buttons with cc-permission-btn-rejected when answered', () => {
+    expect(permissionButtonState({ answered: true, terminated: false, isPicked: false }))
+      .toEqual({ disabled: true, stateClass: ' cc-permission-btn-rejected' });
+  });
+
+  it('disables every button without picked/rejected styling when terminated but unanswered', () => {
+    expect(permissionButtonState({ answered: false, terminated: true, isPicked: false }))
+      .toEqual({ disabled: true, stateClass: '' });
+    expect(permissionButtonState({ answered: false, terminated: true, isPicked: true }))
+      .toEqual({ disabled: true, stateClass: '' });
+  });
+
+  // answered+terminated: keep the recorded decision visible even after a
+  // later abort lands.
+  it('keeps picked/rejected styling when answered even if terminated also true', () => {
+    expect(permissionButtonState({ answered: true, terminated: true, isPicked: true }))
+      .toEqual({ disabled: true, stateClass: ' cc-permission-btn-picked' });
+    expect(permissionButtonState({ answered: true, terminated: true, isPicked: false }))
+      .toEqual({ disabled: true, stateClass: ' cc-permission-btn-rejected' });
   });
 });
 

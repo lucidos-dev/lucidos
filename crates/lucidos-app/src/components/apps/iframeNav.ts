@@ -6,10 +6,18 @@
  *  cached snapshot of a previous app pane mid-swipe. `location.replace()`
  *  performs the navigation without extending history.
  *
- *  No contentWindow=null fallback: an in-document iframe is guaranteed a
- *  browsing context, and a silent fallback to `iframe.src = url` would
- *  reintroduce the exact bug being fixed (a history entry per app switch)
- *  with no test signal. */
-export function navigateAppIframe(iframe: HTMLIFrameElement, url: string): void {
-  iframe.contentWindow!.location.replace(url);
+ *  An in-document iframe is normally guaranteed a browsing context, but a
+ *  detached iframe (mid-unmount, or one removed from the DOM between layout
+ *  and effect flushes) has `contentWindow === null` and would throw a
+ *  TypeError on `.location`. We return `false` instead — caller surfaces a
+ *  toast and skips the `lastSrcRef` update so the next render retries the
+ *  navigation against whatever iframe is mounted then.
+ *
+ *  No silent fallback to `iframe.src = url`: that would reintroduce the exact
+ *  bug being fixed (a history entry per app switch) with no test signal. */
+export function navigateAppIframe(iframe: HTMLIFrameElement, url: string): boolean {
+  const win = iframe.contentWindow;
+  if (!win) return false;
+  win.location.replace(url);
+  return true;
 }

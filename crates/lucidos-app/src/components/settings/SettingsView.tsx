@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
 import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, animationSpeed, speedMultiplier, repositories } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, toggleDevicePush, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCaptureContext, setCaptureContext, type Theme, type FontFamily } from '../../store/actions/preferences';
-import { openScaleModal } from '../shared/ScaleModal';
+import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCaptureContext, setCaptureContext, currentMobileHeaderSticky, setMobileHeaderSticky, type Theme, type FontFamily } from '../../store/actions/preferences';
+import { openScaleModal } from '../shared/scaleModalState';
 import { formatDateTime } from '../../utils/formatTime';
 import { loadOAuthAccounts, disconnectOAuthAccount, grantOAuthScope } from '../../store/actions/oauth';
 import { initPushSubscription } from '../../store/actions/push';
@@ -12,13 +12,15 @@ import { Dropdown } from '../shared/Dropdown';
 import { MemoryInspector } from './MemoryInspector';
 import { BackupSection } from './BackupSection';
 import { CcAllowedToolsSection } from './CcAllowedToolsSection';
+import { KeyboardShortcutsSection } from './KeyboardShortcutsSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { ChevronRightIcon } from '../shared/icons';
 import { CredentialItem } from '../credentials/CredentialItem';
 import { openAddCredential, loadCredentials } from '../../store/actions/credentials';
 import { loadRepositories } from '../../store/actions/chat';
-import { API_BASE, mutatingFetch, throwIfNotOk } from '../../api/client';
+import { API, mutatingFetch, throwIfNotOk } from '../../api/client';
 import { DirectoryPicker } from './DirectoryPicker';
+import { LoadableError } from '../shared/LoadableError';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { formatTimeAgo } from '../../utils/formatTime';
 import type { DeviceInfo } from '../../api/types';
@@ -77,10 +79,12 @@ const IMAGE_MODELS = [
 ];
 
 const BACKGROUND_MODELS = [
+  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
   { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
   { value: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite' },
   { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' },
+  { value: 'claude-haiku-4-5', label: 'Haiku 4.5' },
   { value: 'claude-3-5-haiku@20241022', label: 'Haiku 3.5' },
 ];
 
@@ -123,7 +127,7 @@ function DeviceRow({ device, editingId, setEditingId }: {
     const trimmed = editValue.trim();
     const newName = (trimmed && trimmed !== device.id) ? trimmed : null;
     if (newName !== device.name) {
-      updateDeviceName(device.id, newName);
+      void updateDeviceName(device.id, newName);
     }
   }
 
@@ -189,7 +193,7 @@ function DeviceRow({ device, editingId, setEditingId }: {
         ) : (
           <button
             class="action-btn action-btn-danger"
-            onClick={() => removeDevice(device.id)}
+            onClick={() => void removeDevice(device.id)}
           >Remove</button>
         )}
       </div>
@@ -219,7 +223,7 @@ function AddRepositoryForm() {
     if (!trimmedName || !trimmedPath) return;
     setSaving(true);
     try {
-      const res = await mutatingFetch(`${API_BASE}/api/repositories`, {
+      const res = await mutatingFetch(`${API}/repositories`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: trimmedName, path: trimmedPath }),
@@ -228,7 +232,7 @@ function AddRepositoryForm() {
       setAdding(false);
       setName('');
       setPath('');
-      loadRepositories();
+      void loadRepositories();
     } catch (e) {
       showToast(`Failed to add repository: ${errorDetail(e)}`, 'error');
     } finally {
@@ -245,7 +249,7 @@ function AddRepositoryForm() {
           placeholder="Name"
           value={name}
           onInput={(e) => setName((e.target as HTMLInputElement).value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') save(); if (e.key === 'Escape') setAdding(false); }}
+          onKeyDown={(e) => { if (e.key === 'Enter') void save(); if (e.key === 'Escape') setAdding(false); }}
           autoFocus
         />
         <div class="repo-path-row">
@@ -255,7 +259,7 @@ function AddRepositoryForm() {
             placeholder="Path (e.g. /Users/me/projects/myrepo)"
             value={path}
             onInput={(e) => setPath((e.target as HTMLInputElement).value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') save(); if (e.key === 'Escape') setAdding(false); }}
+            onKeyDown={(e) => { if (e.key === 'Enter') void save(); if (e.key === 'Escape') setAdding(false); }}
           />
           <button class="action-btn" onClick={() => setShowPicker(true)}>Browse</button>
         </div>
@@ -331,21 +335,30 @@ export function SettingsView() {
 
   useEffect(() => {
     if (loadable.status === 'not-loaded') {
-      loadDevices();
+      void loadDevices();
     }
   }, []);
 
   useEffect(() => {
     if (oauthAccounts.value.status === 'not-loaded') {
-      loadOAuthAccounts();
+      void loadOAuthAccounts();
     }
   }, []);
 
   useEffect(() => {
     if (credentials.value.status === 'not-loaded') {
-      loadCredentials();
+      void loadCredentials();
     }
   }, []);
+
+  useEffect(() => {
+    // Mirrors the devices/credentials/oauth effects above. Previously this
+    // ran inside `repositoriesSection()`'s render body, which fires a
+    // setState during render and trips preact lint.
+    if (repositories.value.status === 'not-loaded') {
+      void loadRepositories();
+    }
+  }, [repositories.value.status]);
 
   // Subscribe to both signals so this fires after the requested subview has rendered.
   useEffect(() => {
@@ -364,7 +377,7 @@ export function SettingsView() {
   function credentialsSection() {
     const credLoadable = credentials.value;
     if (credLoadable.status === 'failed') {
-      return <div class="list-rows"><div class="empty-state error-text">Failed to load credentials: {credLoadable.error}</div></div>;
+      return <div class="list-rows"><LoadableError noun="credentials" error={credLoadable.error} /></div>;
     }
     if (credLoadable.status !== 'loaded') {
       return null;
@@ -397,7 +410,7 @@ export function SettingsView() {
   function oauthSection() {
     const oauthLoadable = oauthAccounts.value;
     if (oauthLoadable.status === 'failed') {
-      return <div class="list-rows"><div class="empty-state error-text">Failed to load accounts: {oauthLoadable.error}</div></div>;
+      return <div class="list-rows"><LoadableError noun="accounts" error={oauthLoadable.error} /></div>;
     }
     if (oauthLoadable.status !== 'loaded') {
       return null;
@@ -416,11 +429,11 @@ export function SettingsView() {
             <div class="list-row-actions">
               <button
                 class="action-btn"
-                onClick={() => grantOAuthScope(account.provider, account.scopes)}
+                onClick={() => void grantOAuthScope(account.provider, account.scopes)}
               >Reconnect</button>
               <button
                 class="action-btn action-btn-danger"
-                onClick={() => disconnectOAuthAccount(account.id, account.provider)}
+                onClick={() => void disconnectOAuthAccount(account.id, account.provider)}
               >Disconnect</button>
             </div>
           </div>
@@ -444,7 +457,7 @@ export function SettingsView() {
               value={oauthProvider}
               disabled={oauthConnecting}
               onInput={(e) => setOauthProvider((e.target as HTMLInputElement).value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleConnectProvider(); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') void handleConnectProvider(); }}
             />
             <button
               class="action-btn action-btn-confirm"
@@ -476,7 +489,7 @@ export function SettingsView() {
     if (loadable.status === 'failed') {
       return (
         <div class="list-rows">
-          <div class="empty-state error-text">Failed to load devices: {loadable.error}</div>
+          <LoadableError noun="devices" error={loadable.error} />
         </div>
       );
     }
@@ -488,25 +501,32 @@ export function SettingsView() {
         </div>
       );
     }
+    if (loadable.data.length === 0) {
+      return <div class="list-rows"><div class="empty-state">No devices registered</div></div>;
+    }
+    // Current device first; then push-enabled; within each group keep the
+    // backend's last_seen_at DESC ordering via Array.prototype.sort's ES2019
+    // stability guarantee.
+    const currentId = getDeviceId();
+    const sorted = [...loadable.data].sort((a, b) => {
+      if (a.id === currentId) return -1;
+      if (b.id === currentId) return 1;
+      return Number(b.push_enabled) - Number(a.push_enabled);
+    });
     return (
       <div class="list-rows">
-        {loadable.data.length === 0 ? (
-          <div class="empty-state">No devices registered</div>
-        ) : (
-          loadable.data.map((device) => (
-            <DeviceRow key={device.id} device={device} editingId={editingId} setEditingId={setEditingId} />
-          ))
-        )}
+        {sorted.map((device) => (
+          <DeviceRow key={device.id} device={device} editingId={editingId} setEditingId={setEditingId} />
+        ))}
       </div>
     );
   }
 
   function repositoriesSection() {
-    if (repositories.value.status === 'not-loaded') loadRepositories();
     const repoLoadable = repositories.value;
 
     if (repoLoadable.status === 'failed') {
-      return <div class="list-rows"><div class="empty-state error-text">Failed to load repositories: {repoLoadable.error}</div></div>;
+      return <div class="list-rows"><LoadableError noun="repositories" error={repoLoadable.error} /></div>;
     }
     if (repoLoadable.status !== 'loaded') {
       return null;
@@ -527,9 +547,9 @@ export function SettingsView() {
                 <button class="action-btn action-btn-danger" onClick={async () => {
                   if (await showConfirm(`Remove "${repo.name}"?`, 'Remove')) {
                     try {
-                      const res = await mutatingFetch(`${API_BASE}/api/repositories/${repo.id}`, { method: 'DELETE' });
+                      const res = await mutatingFetch(`${API}/repositories/${repo.id}`, { method: 'DELETE' });
                       await throwIfNotOk(res);
-                      loadRepositories();
+                      void loadRepositories();
                     } catch (e) {
                       showToast(`Failed to remove repository: ${errorDetail(e)}`, 'error');
                     }
@@ -554,7 +574,7 @@ export function SettingsView() {
             <Dropdown
               options={MODELS}
               value={currentModel.value}
-              onChange={(v) => setCurrentModel(v)}
+              onChange={(v) => void setCurrentModel(v)}
             />
           </div>
           <div class="settings-row" data-search-anchor="models:reasoning">
@@ -562,7 +582,7 @@ export function SettingsView() {
             <Dropdown
               options={availableReasoningLevels(currentModel.value)}
               value={reasoningEffort.value}
-              onChange={(v) => setReasoningEffort(v)}
+              onChange={(v) => void setReasoningEffort(v)}
             />
           </div>
         </div>
@@ -573,7 +593,7 @@ export function SettingsView() {
             <Dropdown
               options={IMAGE_MODELS}
               value={imageModel}
-              onChange={(v) => setImageModel(v as ImageModel)}
+              onChange={(v) => void setImageModel(v as ImageModel)}
             />
           </div>
         </div>
@@ -584,7 +604,7 @@ export function SettingsView() {
             <Dropdown
               options={BACKGROUND_MODELS}
               value={currentBackgroundModel('model_title')}
-              onChange={(v) => setBackgroundModel('model_title', v)}
+              onChange={(v) => void setBackgroundModel('model_title', v)}
             />
           </div>
           <div class="settings-row" data-search-anchor="models:image-description">
@@ -592,7 +612,7 @@ export function SettingsView() {
             <Dropdown
               options={BACKGROUND_MODELS}
               value={currentBackgroundModel('model_image_description')}
-              onChange={(v) => setBackgroundModel('model_image_description', v)}
+              onChange={(v) => void setBackgroundModel('model_image_description', v)}
             />
           </div>
           <div class="settings-row" data-search-anchor="models:memory-context">
@@ -600,7 +620,7 @@ export function SettingsView() {
             <Dropdown
               options={BACKGROUND_MODELS}
               value={currentBackgroundModel('model_memory')}
-              onChange={(v) => setBackgroundModel('model_memory', v)}
+              onChange={(v) => void setBackgroundModel('model_memory', v)}
             />
           </div>
         </div>
@@ -612,7 +632,7 @@ export function SettingsView() {
               <input
                 type="checkbox"
                 checked={currentCaptureContext()}
-                onChange={(e) => setCaptureContext((e.currentTarget as HTMLInputElement).checked)}
+                onChange={(e) => void setCaptureContext((e.currentTarget as HTMLInputElement).checked)}
               />
               <span class="toggle-slider" />
             </label>
@@ -638,7 +658,7 @@ export function SettingsView() {
                 <button
                   key={t.value}
                   class={`settings-option ${theme === t.value ? 'active' : ''}`}
-                  onClick={() => setTheme(t.value)}
+                  onClick={() => void setTheme(t.value)}
                 >
                   {t.label}
                 </button>
@@ -653,7 +673,7 @@ export function SettingsView() {
             <Dropdown
               options={FONT_OPTIONS}
               value={font}
-              onChange={(v) => setFontFamily(v as FontFamily)}
+              onChange={(v) => void setFontFamily(v as FontFamily)}
             />
           </div>
           <div class="settings-row" data-search-anchor="appearance:ui-scale">
@@ -680,6 +700,20 @@ export function SettingsView() {
             </div>
           </div>
         </div>
+        <div class="settings-section">
+          <div class="settings-section-title" data-search-anchor="appearance:mobile">Mobile</div>
+          <div class="settings-row" data-search-anchor="appearance:mobile-header-sticky">
+            <span class="settings-row-label">Keep header visible</span>
+            <label class="toggle-switch">
+              <input
+                type="checkbox"
+                checked={currentMobileHeaderSticky()}
+                onChange={(e) => void setMobileHeaderSticky((e.currentTarget as HTMLInputElement).checked)}
+              />
+              <span class="toggle-slider" />
+            </label>
+          </div>
+        </div>
       </>
     );
   }
@@ -694,6 +728,7 @@ export function SettingsView() {
       case 'backup': return <BackupSection />;
       case 'repositories': return repositoriesSection();
       case 'tool-permissions': return <CcAllowedToolsSection />;
+      case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
       case 'disk-usage': return <DiskUsagePage />;
       default: return null;
     }

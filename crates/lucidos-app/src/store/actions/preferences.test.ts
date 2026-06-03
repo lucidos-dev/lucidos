@@ -158,6 +158,12 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
     // UI_SCALE_MAX = 200
     expect(localStorage.getItem('lucidos-ui-scale')).toBe('200');
   });
+
+  it('applyUiScale snaps off-grid values (115 → 112.5)', () => {
+    applyUiScale(115);
+    expect(localStorage.getItem('lucidos-ui-scale')).toBe('112.5');
+    expect(inlineProps['--user-ui-scale']).toBe('112.5%');
+  });
 });
 
 describe('loadPreferences — no flash when refetching after PreferencesChanged', () => {

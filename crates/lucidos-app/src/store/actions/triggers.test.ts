@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { triggers, historicalTriggers, selectedTriggerIds, panelOverlay } from '../store';
-import { pruneStaleSelectedTriggerIds, submitTrigger } from './triggers';
 import { makeTrigger } from '../__tests__/fixtures';
 
 const STORAGE_KEY = 'lucidos-selected-trigger-ids';
@@ -16,6 +15,21 @@ vi.mock('../../api/client', () => ({
   listHistoricalTriggers: vi.fn().mockResolvedValue({ triggers: [] }),
   deleteTriggerApi: vi.fn(),
 }));
+
+// Pane helper: navigateToTrigger must call revealContentPane (the canonical
+// "reveal content pane" helper that swipes on mobile AND expands a collapsed
+// split on desktop), NOT an ad-hoc isMobile()+navigateToPane('content') that
+// only handles mobile. See `.claude/rules/frontend.md`.
+// Use vi.hoisted to declare the spy BEFORE vi.mock's hoisted call needs it.
+const { mockRevealContentPane } = vi.hoisted(() => ({
+  mockRevealContentPane: vi.fn(),
+}));
+vi.mock('./pane', () => ({ revealContentPane: mockRevealContentPane, navigateToPane: vi.fn() }));
+
+vi.mock('./menu', () => ({ setActiveMenu: vi.fn() }));
+vi.mock('./navigation', () => ({ pushNavState: vi.fn() }));
+
+const { pruneStaleSelectedTriggerIds, submitTrigger, navigateToTrigger } = await import('./triggers');
 
 describe('pruneStaleSelectedTriggerIds', () => {
   beforeEach(() => {
@@ -65,7 +79,7 @@ describe('pruneStaleSelectedTriggerIds', () => {
 describe('submitTrigger scroll reset', () => {
   beforeEach(() => {
     localStorage.clear();
-    panelOverlay.value = { type: 'form', form: { type: 'trigger', taskId: 't1' } };
+    panelOverlay.value = { type: 'form', form: { type: 'trigger', triggerId: 't1' } };
     triggers.value = { status: 'loaded', data: [] };
     historicalTriggers.value = { status: 'loaded', data: [] };
     mockCreateTrigger.mockReset();
@@ -84,7 +98,7 @@ describe('submitTrigger scroll reset', () => {
       name: 'Nightly Build',
       run: { type: 'intent', intent: 'build' },
       cronExpressions: ['0 0 0 * * *'],
-      taskId: 't1',
+      triggerId: 't1',
       goToReview: false,
     });
 
@@ -115,7 +129,7 @@ describe('submitTrigger scroll reset', () => {
       name: 'X',
       run: { type: 'intent', intent: 'x' },
       cronExpressions: ['0 0 0 * * *'],
-      taskId: 't1',
+      triggerId: 't1',
       goToReview: false,
     });
 
@@ -123,5 +137,26 @@ describe('submitTrigger scroll reset', () => {
     // Form is still open; the user hasn't navigated, so the saved position
     // must be preserved for the eventual successful save (or cancel).
     expect(localStorage.getItem(SCROLL_KEY)).toBe('500');
+  });
+});
+
+describe('navigateToTrigger pane reveal', () => {
+  beforeEach(() => {
+    mockRevealContentPane.mockClear();
+    triggers.value = { status: 'loaded', data: [makeTrigger({ id: 't1', name: 'X' })] };
+    historicalTriggers.value = { status: 'loaded', data: [] };
+    panelOverlay.value = null;
+  });
+
+  it('reveals the content pane via the canonical helper (mobile swipe + desktop expand)', async () => {
+    // The earlier implementation reached for navigateToPane('content') under
+    // an isMobile() gate to compensate for setActiveMenu's bug-prone pane
+    // conditional. After consolidating on revealContentPane(), the deep-link
+    // path hits one canonical helper that handles BOTH mobile swipe and
+    // desktop split-collapsed expansion. Without that, opening a trigger
+    // deep-link on a desktop with the split collapsed silently looked like
+    // nothing happened.
+    await navigateToTrigger('t1');
+    expect(mockRevealContentPane).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
+import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { signal } from '@preact/signals';
 import { connectionStatus, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, restartRequired, updateAvailable, restartGroups, showConfirm, showToast } from '../../store/store';
 import { isNewerVersion } from '../../utils/version';
@@ -11,9 +11,16 @@ import { invoke } from '../../utils/tauri';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { CloseIcon } from '../shared/icons';
+import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
+import { viewportIsMobile } from '../../utils/viewport';
 import { ENGINE_VERSION } from 'virtual:engine-version';
 
 export const controlPanelOpen = signal(false);
+/** Anchor element of the toggle that opened the panel, so dismiss-on-outside
+ *  treats re-clicking the same toggle as "inside" (toggle's own onClick
+ *  handles the close). Set by the brand-label `data-role="control-panel-toggle"`
+ *  in AppHeader / MobileAppHeader at open time. */
+export const controlPanelAnchor = signal<HTMLElement | null>(null);
 
 const apiUrl = typeof window !== 'undefined' && window.location ? window.location.origin : '';
 
@@ -30,10 +37,16 @@ export function controlPanelBadgeTooltip(): string | undefined {
   return undefined;
 }
 
-export function ControlPanel() {
+export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
   const ref = useRef<HTMLDivElement>(null);
   const [wsLoadable, setWsLoadable] = useState<Loadable<WorkspaceInfo[]>>({ status: 'not-loaded' });
   const open = controlPanelOpen.value;
+  // Both AppHeader and MobileAppHeader render simultaneously (dual-layout) and
+  // each mounts a ControlPanel. Without this gate, the hidden copy's dismiss
+  // hook treats clicks on the visible panel's buttons as "outside" and
+  // swallows them — Restart/Refresh/X would never fire.
+  const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
+  const effectiveOpen = open && isActiveLayout;
 
   const status = connectionStatus.value;
   const connected = status === 'connected';
@@ -50,35 +63,21 @@ export function ControlPanel() {
   const restart = restartRequired.value;
   const update = updateAvailable.value;
 
-  // Click outside + Escape to close — only register when open
-  useEffect(() => {
-    if (!open) return;
-    function handleClick(e: MouseEvent) {
-      const target = e.target as HTMLElement;
-      if (target.closest('[data-role="control-panel-toggle"]')) return;
-      if (ref.current && !ref.current.contains(target)) {
-        controlPanelOpen.value = false;
-      }
-    }
-    function handleKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') controlPanelOpen.value = false;
-    }
-    document.addEventListener('click', handleClick);
-    document.addEventListener('keydown', handleKey);
-    return () => {
-      document.removeEventListener('click', handleClick);
-      document.removeEventListener('keydown', handleKey);
-    };
-  }, [open]);
+  // Anchor is the brand-label that opened the panel — re-clicking it routes
+  // through its own onClick toggle. Escape comes free with the hook.
+  useDismissOnOutside(effectiveOpen, ref, controlPanelAnchor.value, () => {
+    controlPanelOpen.value = false;
+  });
 
-  // Fetch other workspaces on open
+  // Fetch other workspaces on open. Gated to the active layout so the dual-
+  // mount doesn't double-fetch on every open.
   useEffect(() => {
-    if (!open || !connected) return;
+    if (!effectiveOpen || !connected) return;
     setWsLoadable({ status: 'loading' });
     fetchWorkspaces()
       .then(res => setWsLoadable({ status: 'loaded', data: res.workspaces }))
       .catch(e => setWsLoadable(toFailed(e)));
-  }, [open, connected]);
+  }, [effectiveOpen, connected]);
 
   const handleRefresh = useCallback(() => {
     controlPanelOpen.value = false;
@@ -113,7 +112,7 @@ export function ControlPanel() {
     );
   }, []);
 
-  if (!open) return null;
+  if (!effectiveOpen) return null;
 
   const hasEngineUpdate = engineVer && latestEngineVer && isNewerVersion(latestEngineVer, engineVer);
   // Tauri shells compare against the on-disk Tauri app version. Web compares

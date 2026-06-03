@@ -5,14 +5,15 @@ pub mod types;
 
 use crate::core::EventRow;
 use chrono::{DateTime, Utc};
-pub(crate) use messages::{
-    build_resume_tool_blocks_with_skip_ids, build_session_messages, find_orphan_tool_called_ids,
-    ORPHAN_TOOL_RESULT_STUB, RESUME_VERBATIM_TOOL_TAIL,
-};
 pub use messages::format_child_thread_completed_block;
+pub(crate) use messages::{
+    build_resume_tool_blocks_with_skip_ids, build_session_messages,
+    collect_tool_pairs_chronological, find_orphan_tool_called_ids, RESUME_VERBATIM_TOOL_TAIL,
+};
 use sqlx::PgPool;
 pub use threads::{
-    fetch_thread_aggregate, LegacyInitiator, ThreadAggregate, ThreadInfo, ThreadSearchResult,
+    active_thread_statuses, fetch_thread_aggregate, FilterFacet, FilterFacets, LegacyInitiator,
+    ThreadAggregate, ThreadSearchResult, ThreadSummary, ThreadSummaryFilters,
 };
 pub use types::*;
 use uuid::Uuid;
@@ -26,6 +27,29 @@ pub fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// Delimiters that terminate a screenshot path embedded in a tool result.
+///
+/// Includes `)` so that markdown link output like `[label](screenshots/foo.png)`
+/// truncates at the closing paren. Screenshot filenames never contain any of
+/// these characters, so widening the set is safe across the two call sites
+/// (conversation time-travel, messages projection).
+const SCREENSHOT_PATH_DELIMS: &[char] = &['"', '\n', ' ', ')'];
+
+/// Extract the screenshot path from a `browser_screenshot` tool result.
+///
+/// Looks for the first `"screenshots/"` token in `result` and returns the
+/// substring up to (but not including) the first occurrence of any
+/// [`SCREENSHOT_PATH_DELIMS`] delimiter — or end-of-string if none is
+/// present. Returns `None` if `"screenshots/"` is absent.
+pub(crate) fn extract_screenshot_path(result: &str) -> Option<String> {
+    let start = result.find("screenshots/")?;
+    let path_part = &result[start..];
+    let end = path_part
+        .find(SCREENSHOT_PATH_DELIMS)
+        .unwrap_or(path_part.len());
+    Some(path_part[..end].to_string())
 }
 
 /// Generate a human-readable description for a tool call event.
@@ -99,6 +123,13 @@ impl EventStore {
         Self { pool }
     }
 
+    /// Defensive double-write: the same CREATE TABLE / CREATE INDEX
+    /// statements now live in
+    /// `migrations/20260517160627_consolidate_init_schema_tables.sql`,
+    /// which is the canonical home per `.claude/rules/rust.md`. This body
+    /// is kept for one release cycle so existing installs that boot a
+    /// pre-migration build still come up; slated for removal in
+    /// `harden-init-schema-tables-vs-migrations-pattern-finish`.
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -153,21 +184,6 @@ impl EventStore {
         Ok(())
     }
 
-    /// Set the image_description field in a MessageReceived event's payload.
-    /// Called after the background Flash description task completes.
-    pub async fn update_image_description(
-        &self,
-        event_id: Uuid,
-        description: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE events SET payload = jsonb_set(payload, '{image_description}', $2) WHERE id = $1")
-            .bind(event_id)
-            .bind(serde_json::json!(description))
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     /// Query events by type with optional time filter and limit.
     /// Used by App UIs and the LLM `query_events` tool to fetch domain events
     /// (e.g. GoogleDocEdited). Newest-first; rows sharing one timestamp tie-
@@ -218,10 +234,7 @@ impl EventStore {
     /// Project `get_event_by_id` to the `(created, id)` cursor tuple, with a
     /// three-way result so the paged caller can distinguish "no cursor asked
     /// for" from "cursor asked for but missing".
-    async fn resolve_cursor(
-        &self,
-        id: Option<Uuid>,
-    ) -> Result<CursorResolution, sqlx::Error> {
+    async fn resolve_cursor(&self, id: Option<Uuid>) -> Result<CursorResolution, sqlx::Error> {
         match id {
             None => Ok(CursorResolution::None),
             Some(id) => Ok(match self.get_event_by_id(id).await? {
@@ -259,6 +272,65 @@ impl EventStore {
         .bind(after_cursor.map(|(_, i)| i))
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Count events matching the same filters as [`Self::query_events`],
+    /// without materialising the payloads.
+    ///
+    /// Returns `(count, byte_total)` for the single-type filter; when
+    /// `event_type` is `None`, the caller should use
+    /// [`Self::count_events_by_type`] instead — this helper only collapses
+    /// to a scalar.
+    ///
+    /// `byte_total` is `SUM(octet_length(payload::text))` — the on-disk
+    /// JSON size of the payloads. It's a good proxy for token cost when
+    /// the LLM is deciding whether a sweep will fit in its context budget.
+    pub async fn count_events(
+        &self,
+        event_type: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<(i64, i64), sqlx::Error> {
+        let (count, bytes): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint, SUM(octet_length(payload::text))::bigint FROM events \
+             WHERE ($1::text IS NULL OR event_type = $1) \
+             AND ($2::timestamptz IS NULL OR created > $2) \
+             AND ($3::timestamptz IS NULL OR created < $3)",
+        )
+        .bind(event_type)
+        .bind(since)
+        .bind(until)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((count, bytes.unwrap_or(0)))
+    }
+
+    /// Per-`event_type` breakdown across the same time window as
+    /// [`Self::count_events`], ordered by count descending so the noisiest
+    /// types surface first. Used by the `count_events` LLM tool and the
+    /// `GET /api/v1/events/count` endpoint when no `event_type` filter is
+    /// passed.
+    pub async fn count_events_by_type(
+        &self,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<Vec<(String, i64, i64)>, sqlx::Error> {
+        let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT event_type, COUNT(*)::bigint, SUM(octet_length(payload::text))::bigint \
+             FROM events \
+             WHERE ($1::timestamptz IS NULL OR created > $1) \
+             AND ($2::timestamptz IS NULL OR created < $2) \
+             GROUP BY event_type \
+             ORDER BY COUNT(*) DESC, event_type ASC",
+        )
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(et, count, bytes)| (et, count, bytes.unwrap_or(0)))
+            .collect())
     }
 
     /// Return all distinct event_type values, ordered alphabetically.

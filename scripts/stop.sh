@@ -46,13 +46,15 @@ stop_workspace() {
     local engine_pid_file="$ws/.lucidos/engine.pid"
     local frontend_pid_file="$ws/.lucidos/frontend.pid"
 
-    # Stop engine
+    # Stop engine via SIGUSR1, not SIGTERM — the engine ignores SIGTERM to
+    # survive accidental `xargs kill` from CC subprocess test scripts (see
+    # main.rs shutdown_signal). SIGUSR1 is the legitimate stop signal.
     if [ -f "$engine_pid_file" ]; then
         local pid
         pid="$(cat "$engine_pid_file")"
         if kill -0 "$pid" 2>/dev/null; then
             echo "Stopping engine (PID $pid) for $ws"
-            kill "$pid" 2>/dev/null || true
+            kill -USR1 "$pid" 2>/dev/null || true
             stopped="1"
         fi
         rm -f "$engine_pid_file"

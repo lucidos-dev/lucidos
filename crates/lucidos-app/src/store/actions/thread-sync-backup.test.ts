@@ -3,6 +3,7 @@ import { signal } from '@preact/signals-core';
 
 const backupProgress = signal<{ phase: string; progress: number; total: number } | null>(null);
 const backupListVersion = signal(0);
+const backupStatusVersion = signal(0);
 const showToast = vi.fn();
 
 vi.mock('../store', () => ({
@@ -19,6 +20,7 @@ vi.mock('../store', () => ({
   memoryRebuildProgress: signal(null),
   backupProgress,
   backupListVersion,
+  backupStatusVersion,
   recoveryProgress: signal(null),
   panelOverlay: signal(null),
   showConfirm: vi.fn(),
@@ -27,7 +29,7 @@ vi.mock('../store', () => ({
   repoSource: signal(null),
 }));
 
-vi.mock('../../api/client', () => ({ API_BASE: '', postMcpConsent: vi.fn() }));
+vi.mock('../../api/client', () => ({ API_BASE: '', API: '/api/v1', postMcpConsent: vi.fn() }));
 vi.mock('../thread-events', () => ({
   handleEvent: vi.fn(),
   isChannelDefiningEvent: vi.fn(() => false),
@@ -46,6 +48,7 @@ vi.mock('./artifacts', () => ({
 }));
 vi.mock('./triggers', () => ({ navigateToTrigger: vi.fn() }));
 vi.mock('./apps', () => ({ refreshAppUI: vi.fn(), captureAppUI: vi.fn(), openAppById: vi.fn() }));
+vi.mock('./wipPreview', () => ({ clearWipIfMatches: vi.fn() }));
 vi.mock('./credentials', () => ({ openCredentialRequest: vi.fn() }));
 vi.mock('./menu', () => ({
   setActiveMenu: vi.fn(),
@@ -71,9 +74,10 @@ describe('handleGlobalEvent — Backup terminal events', () => {
     vi.clearAllMocks();
     backupProgress.value = { phase: 'encrypting', progress: 60, total: 100 };
     backupListVersion.value = 0;
+    backupStatusVersion.value = 0;
   });
 
-  it('BackupCompleted clears progress, toasts once, and bumps the list version', () => {
+  it('BackupCompleted clears progress, toasts once, and bumps list + status versions', () => {
     handleGlobalEvent('BackupCompleted', {
       filename: 'lucidos-backup-personal-20260504-090000.enc',
       size_bytes: 927_401_289,
@@ -81,19 +85,22 @@ describe('handleGlobalEvent — Backup terminal events', () => {
 
     expect(backupProgress.value).toBeNull();
     expect(backupListVersion.value).toBe(1);
+    expect(backupStatusVersion.value).toBe(1);
     expect(showToast).toHaveBeenCalledExactlyOnceWith(
       'Backup created: lucidos-backup-personal-20260504-090000.enc (884 MB)',
       'success',
     );
   });
 
-  it('BackupFailed clears progress and toasts the error (does not bump list)', () => {
+  it('BackupFailed clears progress, toasts the error, and bumps status (not list) version', () => {
     handleGlobalEvent('BackupFailed', {
       error: 'Token refresh failed (invalid_grant)',
     });
 
     expect(backupProgress.value).toBeNull();
+    // A failed backup doesn't change the list, but it IS a new last-run outcome.
     expect(backupListVersion.value).toBe(0);
+    expect(backupStatusVersion.value).toBe(1);
     expect(showToast).toHaveBeenCalledExactlyOnceWith(
       'Backup failed: Token refresh failed (invalid_grant)',
       'error',

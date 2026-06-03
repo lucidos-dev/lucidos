@@ -5,6 +5,8 @@ import { changes, appliedChanges, changesHasMore, changesLoadingMore, busyChange
 import { applySingleChange, discardSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges } from '../../store/actions/chat-changes';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { formatTimeAgo } from '../../utils/formatTime';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { LoadableError } from '../shared/LoadableError';
 
 /** Render a change description, preserving line breaks. */
 function ChangeDescription({ description }: { description: string }) {
@@ -36,14 +38,43 @@ export function ChangesView() {
     const el = listRef.current;
     if (!el) return;
     if (el.scrollTop + el.clientHeight >= el.scrollHeight - 50) {
-      loadMoreChanges();
+      void loadMoreChanges();
     }
   }, []);
 
-  const pending = changes.value;
-  const applied = appliedChanges.value;
+  const pendingLoadable = changes.value;
+  const appliedLoadable = appliedChanges.value;
   const hasMore = changesHasMore.value;
   const loadingMore = changesLoadingMore.value;
+  // Both signals load and update in lockstep (refreshChangesState and the
+  // ChangesUpdated SSE both set them together), so failure on one ≈ failure
+  // on both. Pending drives the spinner — its `loading` window is what the
+  // user is waiting on for the next render.
+  const showLoading = useDelayedLoading(pendingLoadable);
+
+  if (pendingLoadable.status === 'failed' || appliedLoadable.status === 'failed') {
+    const err = pendingLoadable.status === 'failed' ? pendingLoadable.error
+              : appliedLoadable.status === 'failed' ? appliedLoadable.error
+              : 'Unknown error';
+    return (
+      <div class="panel-content">
+        <LoadableError noun="changes" error={err} />
+      </div>
+    );
+  }
+  if (pendingLoadable.status !== 'loaded' || appliedLoadable.status !== 'loaded') {
+    if (!showLoading) {
+      return <div class="panel-content" />;
+    }
+    return (
+      <div class="panel-content">
+        <div class="empty-state">Loading...</div>
+      </div>
+    );
+  }
+
+  const pending = pendingLoadable.data;
+  const applied = appliedLoadable.data;
 
   return (
     <div class="panel-content" ref={listRef} onScroll={handleScroll}>
@@ -53,8 +84,8 @@ export function ChangesView() {
         <>
           {pending.length > 1 && (
             <div class="changes-bulk-actions">
-              <button class="action-btn action-btn-danger" onClick={() => discardAllChanges()}>Discard All</button>
-              <button class="action-btn action-btn-confirm" onClick={() => applyAllChanges()}>Apply All</button>
+              <button class="action-btn action-btn-danger" onClick={() => void discardAllChanges()}>Discard All</button>
+              <button class="action-btn action-btn-confirm" onClick={() => void applyAllChanges()}>Apply All</button>
             </div>
           )}
           {pending.map(change => {
@@ -71,7 +102,7 @@ export function ChangesView() {
                   </span>
                 </div>
                 <div class="list-row-actions">
-                  <button class="action-btn" onClick={(e) => { e.stopPropagation(); viewChangeDiff(change); }}>Diff</button>
+                  <button class="action-btn" onClick={(e) => { e.stopPropagation(); void viewChangeDiff(change); }}>Diff</button>
                   <button class="action-btn action-btn-danger" disabled={busy} onClick={() => guardedAction(change.id, discardSingleChange)}>Discard</button>
                   <button class="action-btn action-btn-confirm" disabled={busy} data-tooltip={change.requires_restart ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart' : undefined} onClick={() => guardedAction(change.id, applySingleChange)}>
                     {busy ? 'Applying...' : 'Apply'}
@@ -96,7 +127,7 @@ export function ChangesView() {
                   </div>
                   <div class="list-row-actions">
                     {change.pre_merge_sha && (
-                      <button class="action-btn" onClick={(e) => { e.stopPropagation(); viewChangeDiff(change); }}>Diff</button>
+                      <button class="action-btn" onClick={(e) => { e.stopPropagation(); void viewChangeDiff(change); }}>Diff</button>
                     )}
                     {change.status === 'applied' ? (
                       <button class="action-btn action-btn-danger" disabled={busyIds.value.has(change.id)} onClick={async () => {
@@ -105,7 +136,7 @@ export function ChangesView() {
                         }
                       }}>Revert</button>
                     ) : (
-                      <span class="secondary" style="font-size: 0.8rem">Reverted</span>
+                      <span class="list-row-details" style="font-size: 0.8rem">Reverted</span>
                     )}
                   </div>
                 </div>

@@ -107,7 +107,7 @@ test.describe('Chat - send and receive messages', () => {
     // the event store is the source of truth.
     await expect.poll(
       async () => {
-        const resp = await page.request.get(`/api/threads/${threadId}/events`);
+        const resp = await page.request.get(`/api/v1/threads/${threadId}/events`);
         if (!resp.ok()) return false;
         const body = await resp.json();
         const events: Array<{ event_type?: string }> = Array.isArray(body)

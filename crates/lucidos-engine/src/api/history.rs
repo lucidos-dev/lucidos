@@ -17,12 +17,24 @@ pub(super) async fn global_events(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
+    // Register this connection in the live SSE-connection count. The guard is
+    // moved into the stream's map closure below so it's dropped — and the count
+    // decremented — exactly when the stream is dropped (client disconnects).
+    // The push fan-out reads this count to decide whether to run the
+    // PresenceCheck (system-knowhow/notifications.md §3): a connected page can
+    // pong even when its device_presence heartbeat has gone stale.
+    let conn_guard = state.engine.sse_connections.connect();
     let rx = state.engine.event_bus.subscribe();
-    let json_stream = BroadcastStream::new(rx).map(|r| match r {
-        Ok(emitted) => emitted.to_sse_json(),
-        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-            log!("[SSE] Event stream lagged by {} events", n);
-            lagged_event_json(n)
+    let json_stream = BroadcastStream::new(rx).map(move |r| {
+        // `move` captures `conn_guard` by value; it lives as long as this
+        // closure (i.e. as long as the stream), then Drop decrements the count.
+        let _hold = &conn_guard;
+        match r {
+            Ok(emitted) => emitted.to_sse_json(),
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                log!("[SSE] Event stream lagged by {} events", n);
+                lagged_event_json(n)
+            }
         }
     });
 
@@ -176,7 +188,7 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
 /// 4096-event buffer. Without this, lagged events vanish silently and the UI
 /// keeps a "Thinking" spinner forever waiting for a `ResponseGenerated` that
 /// already happened. The frontend treats this as a signal to resync loaded
-/// thread state from `/api/threads/<id>/events`.
+/// thread state from `/api/v1/threads/<id>/events`.
 fn lagged_event_json(count: u64) -> String {
     serde_json::json!({
         "type": "Lagged",
@@ -464,6 +476,75 @@ fn validate_cursor_pair(
     Ok(())
 }
 
+#[derive(Deserialize)]
+pub(super) struct EventsCountParams {
+    #[serde(default, alias = "type")]
+    event_type: Option<String>,
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
+}
+
+/// REST endpoint that mirrors the `count_events` LLM tool: per-type counts +
+/// byte totals over the given time window. With `event_type`, returns
+/// `{count, byte_total}` for that type; without, returns
+/// `{by_type:[...], total_count, total_byte_total}` sorted by count desc.
+///
+/// Use this to size a sweep before drilling with `/events/query` — same
+/// design rationale as the LLM tool (see `crate::engine::tools::execute_count_events`).
+pub(super) async fn count_events(
+    State(state): State<AppState>,
+    Query(q): Query<EventsCountParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let since = parse_optional_rfc3339(q.since.as_deref());
+    let until = parse_optional_rfc3339(q.until.as_deref());
+    if let Some(et) = q.event_type.as_deref() {
+        let (count, byte_total) = state
+            .event_store
+            .count_events(Some(et), since, until)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to count events: {}", e),
+                )
+            })?;
+        Ok(Json(serde_json::json!({
+            "count": count,
+            "byte_total": byte_total,
+        })))
+    } else {
+        let rows = state
+            .event_store
+            .count_events_by_type(since, until)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to count events: {}", e),
+                )
+            })?;
+        let total_count: i64 = rows.iter().map(|(_, c, _)| *c).sum();
+        let total_byte_total: i64 = rows.iter().map(|(_, _, b)| *b).sum();
+        let by_type: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|(et, count, byte_total)| {
+                serde_json::json!({
+                    "event_type": et,
+                    "count": count,
+                    "byte_total": byte_total,
+                })
+            })
+            .collect();
+        Ok(Json(serde_json::json!({
+            "by_type": by_type,
+            "total_count": total_count,
+            "total_byte_total": total_byte_total,
+        })))
+    }
+}
+
 /// REST endpoint to query stored events by type/time (not SSE)
 pub(super) async fn query_events(
     State(state): State<AppState>,
@@ -548,7 +629,7 @@ pub(super) async fn event_types(
     Ok(Json(all))
 }
 
-/// Validate an event type submitted to `POST /api/events/emit`.
+/// Validate an event type submitted to `POST /api/v1/events/emit`.
 ///
 /// Domain events sent over HTTP come from app UIs (untrusted). After
 /// `to_sse_json()` unwraps `DomainEvent` to `{"type": <event_type>, ...}`,
@@ -570,6 +651,7 @@ fn validate_emittable_event_type(event_type: &str) -> Result<(), String> {
 
 pub(super) async fn emit_event(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<EmitEventRequest>,
 ) -> Response {
     if let Err(msg) = validate_emittable_event_type(&body.event_type) {
@@ -580,10 +662,17 @@ pub(super) async fn emit_event(
             .into_response();
     }
 
+    // App UI emits are user-driven on a real device — stamp the resolved actor
+    // so persisted rows and SSE frames carry the same `actor` key as every
+    // other actor-bearing event. The merge is done inside
+    // `SystemEvent::DomainEvent::to_payload` so non-object payloads are
+    // preserved unchanged (no panic, just a no-op merge).
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+
     if body.transient {
         match state
             .engine
-            .broadcast_transient_domain_event(&body.event_type, body.payload)
+            .broadcast_transient_domain_event(&body.event_type, body.payload, actor)
             .await
         {
             Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
@@ -596,7 +685,7 @@ pub(super) async fn emit_event(
     } else {
         match state
             .engine
-            .emit_domain_event(&body.event_type, body.payload)
+            .emit_domain_event(&body.event_type, body.payload, actor)
             .await
         {
             Ok(id) => Json(serde_json::json!({

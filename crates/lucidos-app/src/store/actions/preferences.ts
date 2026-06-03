@@ -12,7 +12,11 @@ export type ImageModel = 'auto' | 'imagen-4' | 'gpt-image-1' | 'gpt-image-1.5' |
 
 export const UI_SCALE_MIN = 75;
 export const UI_SCALE_MAX = 200;
-export const UI_SCALE_STEP = 5;
+// 12.5% keeps the root font-size on integer pixels (16 × 0.125 = 2px per
+// step), so every `rem` resolves to an integer and 1px borders don't
+// anti-alias at varying widths across the layout. Inline duplicates exist
+// in FOUC scripts — grep for `Math.round(n / 12.5) * 12.5`.
+export const UI_SCALE_STEP = 12.5;
 export const UI_SCALE_DEFAULT = 100;
 
 const FONT_FAMILY_VALUES: Record<FontFamily, string> = {
@@ -80,8 +84,13 @@ export async function savePreference(
 
 // --- UI scale ---
 
+export function clampUiScale(scale: number): number {
+  const snapped = Math.round(scale / UI_SCALE_STEP) * UI_SCALE_STEP;
+  return Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, snapped));
+}
+
 export function applyUiScale(scale: number): void {
-  const clamped = Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, scale));
+  const clamped = clampUiScale(scale);
   localStorage.setItem('lucidos-ui-scale', String(clamped));
   document.documentElement.style.setProperty('--user-ui-scale', `${clamped}%`);
 }
@@ -90,15 +99,16 @@ export function currentUiScale(): number {
   if (preferences.value.status !== 'loaded') return UI_SCALE_DEFAULT;
   const raw = preferences.value.data['ui-scale'] || preferences.value.data['text-size'] || preferences.value.data['font-size'];
   if (!raw) return UI_SCALE_DEFAULT;
-  // Migrate old enum values
-  const legacyMap: Record<string, number> = { small: 100, medium: 113, large: 125 };
+  // Migrate old enum values. `medium` was 113 (pre-12.5%-grid); snap to 112.5.
+  const legacyMap: Record<string, number> = { small: 100, medium: 112.5, large: 125 };
   if (raw in legacyMap) return legacyMap[raw];
-  const parsed = parseInt(raw, 10);
-  return isNaN(parsed) ? UI_SCALE_DEFAULT : Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, parsed));
+  // parseFloat so fractional snapped values like "112.5" round-trip.
+  const parsed = parseFloat(raw);
+  return isNaN(parsed) ? UI_SCALE_DEFAULT : clampUiScale(parsed);
 }
 
 export function setUiScale(scale: number): Promise<void> {
-  const clamped = Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, scale));
+  const clamped = clampUiScale(scale);
   return savePreference('ui-scale', String(clamped), () => applyUiScale(clamped), true);
 }
 
@@ -115,7 +125,7 @@ export function applyTheme(theme: Theme): void {
   const resolved = resolveTheme(theme);
   const bg = resolved === 'light' ? '#ffffff' : '#0d1117';
   // Theme-flash telemetry — index.html installs __themeLogEvt as a fetch shim
-  // that POSTs to /api/internal/client-log (engine.log breadcrumbs).
+  // that POSTs to /api/v1/internal/client-log (engine.log breadcrumbs).
   type ThemeLogEvt = (label: string, info: unknown) => void;
   const logEvt = (window as unknown as { __themeLogEvt?: ThemeLogEvt }).__themeLogEvt;
   if (logEvt) {
@@ -296,6 +306,19 @@ export function currentCaptureContext(): boolean {
 
 export function setCaptureContext(enabled: boolean): Promise<void> {
   return savePreference('capture_context', enabled ? 'true' : 'false');
+}
+
+// --- Mobile header sticky ---
+
+/** When true, the mobile header stays fully visible — disables hide-on-scroll,
+ *  hide-on-keyboard-open, and the app-UI-active pin. Defaults to false. */
+export function currentMobileHeaderSticky(): boolean {
+  if (preferences.value.status !== 'loaded') return false;
+  return preferences.value.data['mobile_header_sticky'] === 'true';
+}
+
+export function setMobileHeaderSticky(enabled: boolean): Promise<void> {
+  return savePreference('mobile_header_sticky', enabled ? 'true' : 'false');
 }
 
 // --- Background model ---

@@ -62,6 +62,19 @@ pub struct ArtifactChange {
     pub timestamp: DateTime<Utc>,
 }
 
+/// `Result`-returning wrapper around the canonical `super::is_path_traversal`
+/// guard so the commit helpers can use `?` directly; `delete_data_path_and_commit`'s
+/// `Box<dyn Error>` accepts the `git2::Error` via `From`.
+fn reject_path_traversal(p: &str) -> Result<(), git2::Error> {
+    if super::is_path_traversal(p) {
+        return Err(git2::Error::from_str(&format!(
+            "Path traversal not allowed: {}",
+            p
+        )));
+    }
+    Ok(())
+}
+
 pub struct ArtifactManager {
     workspace_path: PathBuf,
     repo: Arc<Mutex<Repository>>,
@@ -117,6 +130,13 @@ impl ArtifactManager {
         relative_path: &str,
         content: impl AsRef<[u8]>,
     ) -> Result<PathBuf, std::io::Error> {
+        // Defence-in-depth: API/data_api validates already, but artifact writes
+        // also reach here from LLM tool handlers (`engine/tools/import.rs`,
+        // `image.rs`, `http.rs`, `email.rs`, memory consumer) that pass paths
+        // assembled from LLM-provided arguments. A `..` segment would otherwise
+        // let the joined path escape `data/artifacts/`.
+        reject_path_traversal(relative_path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         let full_path = self.workspace_path.join(ARTIFACTS_DIR).join(relative_path);
 
         if let Some(parent) = full_path.parent() {
@@ -159,6 +179,7 @@ impl ArtifactManager {
     /// Stage a single artifact file and commit.
     /// `artifact_path` is relative to data/artifacts/ (e.g., "user_profile.md").
     pub async fn commit(&self, artifact_path: &str, message: &str) -> Result<String, git2::Error> {
+        reject_path_traversal(artifact_path)?;
         let repo_path = format!("{}/{}", ARTIFACTS_DIR, artifact_path);
         self.commit_repo_path(&repo_path, message).await
     }
@@ -170,6 +191,9 @@ impl ArtifactManager {
         artifact_paths: &[String],
         message: &str,
     ) -> Result<String, git2::Error> {
+        for p in artifact_paths {
+            reject_path_traversal(p)?;
+        }
         let repo = self.repo.clone();
         let paths: Vec<String> = artifact_paths.to_vec();
         let message = message.to_string();
@@ -197,6 +221,7 @@ impl ArtifactManager {
         data_relative_path: &str,
         message: &str,
     ) -> Result<String, git2::Error> {
+        reject_path_traversal(data_relative_path)?;
         let repo_path = format!("data/{}", data_relative_path);
         self.commit_repo_path(&repo_path, message).await
     }
@@ -209,12 +234,7 @@ impl ArtifactManager {
         message: &str,
     ) -> Result<String, git2::Error> {
         for p in data_relative_paths {
-            if p.contains("..") || p.starts_with('/') || p.starts_with('\\') {
-                return Err(git2::Error::from_str(&format!(
-                    "Path traversal not allowed: {}",
-                    p
-                )));
-            }
+            reject_path_traversal(p)?;
         }
         let repo = self.repo.clone();
         let paths: Vec<String> = data_relative_paths.to_vec();
@@ -242,6 +262,7 @@ impl ArtifactManager {
         data_relative_path: &str,
         message: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        reject_path_traversal(data_relative_path)?;
         let full_path = self.workspace_path.join("data").join(data_relative_path);
         fs::remove_file(&full_path)?;
 
@@ -317,11 +338,16 @@ impl ArtifactManager {
     }
 
     pub fn read_artifact(&self, relative_path: &str) -> Result<String, std::io::Error> {
+        reject_path_traversal(relative_path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         let full_path = self.workspace_path.join(ARTIFACTS_DIR).join(relative_path);
         fs::read_to_string(full_path)
     }
 
     pub fn artifact_exists(&self, relative_path: &str) -> bool {
+        if reject_path_traversal(relative_path).is_err() {
+            return false;
+        }
         let full_path = self.workspace_path.join(ARTIFACTS_DIR).join(relative_path);
         full_path.exists()
     }
@@ -351,6 +377,7 @@ impl ArtifactManager {
         relative_path: &str,
         commit_hash: &str,
     ) -> Result<Vec<u8>, git2::Error> {
+        reject_path_traversal(relative_path)?;
         let repo = self.repo.lock().unwrap();
 
         // Parse the commit hash

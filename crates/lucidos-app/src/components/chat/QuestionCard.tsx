@@ -1,8 +1,9 @@
 import { signal, useSignal } from '@preact/signals';
 import { useEffect, useMemo } from 'preact/hooks';
 import { showToast } from '../../store/store';
-import { answerCCQuestion } from '../../store/actions/chat-claude-code';
+import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
 import { createTapGate } from '../../utils/tapGesture';
+import { renderMarkdownInline } from '../../utils/renderMarkdown';
 import { preserveAtBottom } from './scrollState';
 
 export type ResolvedAnswer =
@@ -18,6 +19,9 @@ export interface QuestionBodyProps {
   options: Array<{ id: string; label: string; description?: string }>;
   multiSelect?: boolean;
   resolved?: ResolvedAnswer;
+  /** Surrounding response was canceled / aborted / failed / superseded
+   *  without an answer landing — render every option disabled. */
+  terminated?: boolean;
 }
 
 // Multi-select state lives at module level so PromptInput can read selections
@@ -39,7 +43,7 @@ export function setMultiSelectedIds(toolUseId: string, ids: string[]): void {
   multiSelectedByToolUse.value = next;
 }
 
-export function toggleMultiSelectedId(toolUseId: string, optionId: string): void {
+function toggleMultiSelectedId(toolUseId: string, optionId: string): void {
   const current = getMultiSelectedIds(toolUseId);
   setMultiSelectedIds(
     toolUseId,
@@ -47,7 +51,7 @@ export function toggleMultiSelectedId(toolUseId: string, optionId: string): void
   );
 }
 
-export function clearMultiSelected(toolUseId: string): void {
+function clearMultiSelected(toolUseId: string): void {
   setMultiSelectedIds(toolUseId, []);
 }
 
@@ -64,12 +68,92 @@ export function clearPendingAnswer(toolUseId: string): void {
   pendingAnswerByToolUse.value = next;
 }
 
+/** Up-front text label for the card — "Pick one" vs "Pick one or more", or
+ *  "Suggested" for the *wake question* shape (single-option ask used to step
+ *  aside and let the user tap-to-continue; see system-knowhow/glossary.md).
+ *  Without this, single-select cards (which commit on click) look identical
+ *  to multi-select cards (which require Submit), so users discover the mode
+ *  only after acting. */
+export function questionModeLabel(
+  multiSelect: boolean | undefined,
+  optionCount?: number,
+): string {
+  if (optionCount === 1) return 'Suggested';
+  return multiSelect ? 'Pick one or more' : 'Pick one';
+}
+
+/** Mode pill at the top of the question body. Pure render so the unit test
+ *  can walk the vnode tree without a DOM. For wake questions (optionCount=1)
+ *  the radio dot is omitted — the lone button is its own affordance and a
+ *  fake indicator implies a choice that isn't there. */
+export function ModeBadge({
+  multiSelect,
+  optionCount,
+}: {
+  multiSelect: boolean | undefined;
+  optionCount?: number;
+}) {
+  const variant = optionCount === 1
+    ? 'cc-question-mode-badge-suggested'
+    : multiSelect ? 'cc-question-mode-badge-multi' : 'cc-question-mode-badge-single';
+  return (
+    <div class={`cc-question-mode-badge ${variant}`}>
+      {optionCount !== 1 && <OptionIndicator multiSelect={!!multiSelect} selected={false} />}
+      <span>{questionModeLabel(multiSelect, optionCount)}</span>
+    </div>
+  );
+}
+
+/** Radio (single) vs checkbox (multi) shape on each option, distinct from the
+ *  start so the user can tell the mode apart before any click. The selected
+ *  state is also rendered visually so the same component works for the live
+ *  options and the answered-state recap. */
+export function OptionIndicator({
+  multiSelect,
+  selected,
+}: {
+  multiSelect: boolean;
+  selected: boolean;
+}) {
+  const shape = multiSelect ? 'cc-question-option-indicator-checkbox' : 'cc-question-option-indicator-radio';
+  const sel = selected ? ' cc-question-option-indicator-selected' : '';
+  return <span class={`cc-question-option-indicator ${shape}${sel}`} aria-hidden="true" />;
+}
+
+/** Shared indicator + label/desc layout used by both the live OptionButton
+ *  and the AnsweredBody static row. Keeps the two surfaces visually identical
+ *  so resolving a question doesn't reflow. The flat fragment relies on the
+ *  parent grid (`.cc-question-option` / `.cc-question-option-static`) to place
+ *  desc on its own row spanning both columns. */
+function OptionContent({
+  option,
+  multiSelect,
+  selected,
+}: {
+  option: { id: string; label: string; description?: string };
+  multiSelect: boolean;
+  selected: boolean;
+}) {
+  return (
+    <>
+      <OptionIndicator multiSelect={multiSelect} selected={selected} />
+      <span class="cc-question-option-label">{option.label}</span>
+      {option.description && (
+        <span
+          class="cc-question-option-desc"
+          dangerouslySetInnerHTML={{ __html: renderMarkdownInline(option.description) }}
+        />
+      )}
+    </>
+  );
+}
+
 /** Body of an `AskUserQuestion` divider exchange — rendered inside the
  *  initiator panel which provides the chrome (border, header, timestamp).
  *  Multi-select Submit lives in the prompt action row (PromptInput.tsx); the
  *  card just renders toggleable options and reads its optimistic / resolved
  *  state from module-level signals. */
-export function QuestionBody({ threadId, toolUseId, question, options, multiSelect, resolved }: QuestionBodyProps) {
+export function QuestionBody({ threadId, toolUseId, question, options, multiSelect, resolved, terminated }: QuestionBodyProps) {
   // Single-select keeps a local pending — nothing outside the card needs it.
   const localPending = useSignal<ResolvedAnswer | null>(null);
 
@@ -84,13 +168,17 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
   const liftedPending = pendingAnswerByToolUse.value.get(toolUseId);
   const effective = resolved ?? liftedPending ?? localPending.value ?? undefined;
   if (effective) {
-    return <AnsweredBody question={question} options={options} resolved={effective} />;
+    return <AnsweredBody question={question} options={options} multiSelect={multiSelect} resolved={effective} />;
+  }
+  if (terminated) {
+    return <TerminatedQuestionBody question={question} options={options} multiSelect={multiSelect} />;
   }
 
   if (multiSelect) {
     const selected = multiSelectedByToolUse.value.get(toolUseId) ?? [];
     return (
       <div class="cc-question-body" data-tool-use-id={toolUseId}>
+        {options.length > 0 && <ModeBadge multiSelect={true} optionCount={options.length} />}
         <div class="cc-question-text">{question}</div>
         {options.length > 0 && (
           <div class="cc-question-options">
@@ -110,7 +198,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
 
   const onPick = async (optionId: string) => {
     localPending.value = { kind: 'Selected', option_id: optionId };
-    const ok = await answerCCQuestion(threadId, toolUseId, { kind: 'Selected', option_id: optionId });
+    const ok = await answerThreadQuestion(threadId, toolUseId, { kind: 'Selected', option_id: optionId });
     if (!ok) {
       localPending.value = null;
       showToast('Could not send answer — please try again.', 'error');
@@ -119,6 +207,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
 
   return (
     <div class="cc-question-body" data-tool-use-id={toolUseId}>
+      {options.length > 0 && <ModeBadge multiSelect={false} optionCount={options.length} />}
       <div class="cc-question-text">{question}</div>
       {options.length > 0 && (
         <div class="cc-question-options">
@@ -168,22 +257,24 @@ function OptionButton({
       }}
       aria-label={`${isToggle ? 'Toggle' : 'Answer'}: ${option.label}`}
     >
-      <span class="cc-question-option-label">{option.label}</span>
-      {option.description && <span class="cc-question-option-desc">{option.description}</span>}
+      <OptionContent option={option} multiSelect={isToggle} selected={!!pressed} />
     </button>
   );
 }
 
 /** Resolved-state rendering: options dim, the picked one is highlighted; the
  *  Custom-answer block surfaces freetext (FreeText answers, or the freetext
- *  typed alongside a MultiSelected); Canceled shows dimmed options + a badge. */
-function AnsweredBody({
+ *  typed alongside a MultiSelected); Canceled renders a disabled Cancel button
+ *  styled like the picked permission affordance. Exported for unit tests. */
+export function AnsweredBody({
   question,
   options,
+  multiSelect,
   resolved,
 }: {
   question: string;
   options: QuestionBodyProps['options'];
+  multiSelect: boolean | undefined;
   resolved: ResolvedAnswer;
 }) {
   const isSelected = (id: string) =>
@@ -195,6 +286,7 @@ function AnsweredBody({
     : undefined;
   return (
     <div class="cc-question-body cc-question-body-answered">
+      {options.length > 0 && <ModeBadge multiSelect={multiSelect} optionCount={options.length} />}
       <div class="cc-question-text">{question}</div>
       {options.length > 0 && (
         <div class="cc-question-options">
@@ -203,8 +295,7 @@ function AnsweredBody({
               key={opt.id}
               class={`cc-question-option-static${isSelected(opt.id) ? ' cc-question-option-selected' : ' cc-question-option-dimmed'}`}
             >
-              <span class="cc-question-option-label">{opt.label}</span>
-              {opt.description && <span class="cc-question-option-desc">{opt.description}</span>}
+              <OptionContent option={opt} multiSelect={!!multiSelect} selected={isSelected(opt.id)} />
             </div>
           ))}
         </div>
@@ -216,7 +307,43 @@ function AnsweredBody({
         </div>
       )}
       {resolved.kind === 'Canceled' && (
-        <div class="cc-question-canceled-badge">Canceled</div>
+        <button
+          type="button"
+          class="action-btn action-btn-danger cc-permission-btn-picked cc-question-cancel-picked"
+          disabled
+        >
+          <span class="cc-permission-btn-check" aria-hidden="true">✓ </span>
+          Cancel
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Dead-question rendering: same layout as the live card so the user can
+ *  still read the question, but every option is disabled. Pure render so
+ *  tests can walk the vnode tree directly. */
+export function TerminatedQuestionBody({
+  question,
+  options,
+  multiSelect,
+}: {
+  question: string;
+  options: QuestionBodyProps['options'];
+  multiSelect: boolean | undefined;
+}) {
+  return (
+    <div class="cc-question-body cc-question-body-terminated">
+      {options.length > 0 && <ModeBadge multiSelect={multiSelect} optionCount={options.length} />}
+      <div class="cc-question-text">{question}</div>
+      {options.length > 0 && (
+        <div class="cc-question-options">
+          {options.map(opt => (
+            <button key={opt.id} type="button" class="cc-question-option" disabled>
+              <OptionContent option={opt} multiSelect={!!multiSelect} selected={false} />
+            </button>
+          ))}
+        </div>
       )}
     </div>
   );

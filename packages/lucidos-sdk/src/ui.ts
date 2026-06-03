@@ -78,13 +78,15 @@ export const ui = {
     const fontValue = FONT_FAMILIES[fontKey] || FONT_FAMILIES['monospace'];
     document.documentElement.style.setProperty('--font-ui', fontValue);
 
-    // Scale — handle legacy named sizes
+    // Mirrors clampUiScale in preferences.ts — keep (75, 200, 12.5) in sync.
     const rawScale = prefs['ui-scale'] || prefs['text-size'] || prefs['font-size'];
     if (rawScale) {
-      const legacyMap: Record<string, string> = { small: '100%', medium: '113%', large: '125%' };
-      const value = legacyMap[rawScale] || (/^\d+$/.test(rawScale) ? `${rawScale}%` : null);
-      if (value) {
-        document.documentElement.style.setProperty('--user-ui-scale', value);
+      const legacy: Record<string, number> = { small: 100, medium: 112.5, large: 125 };
+      let n = legacy[rawScale];
+      if (n === undefined) n = parseFloat(rawScale);
+      if (!isNaN(n)) {
+        const snapped = Math.min(200, Math.max(75, Math.round(n / 12.5) * 12.5));
+        document.documentElement.style.setProperty('--user-ui-scale', `${snapped}%`);
       }
     }
   },
@@ -105,7 +107,7 @@ export const ui = {
    */
   navigate(target: string, params: Record<string, string> = {}): Promise<void> {
     assertPlainObject('params', params);
-    return requestVoid('/api/v1/ui/navigate', {
+    return requestVoid('/ui/navigate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ target, params }),

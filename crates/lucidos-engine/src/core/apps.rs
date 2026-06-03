@@ -290,7 +290,7 @@ impl AppManager {
 
         let mut git_paths = Vec::new();
         for (name, content) in files {
-            if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {
+            if super::is_path_traversal(name) {
                 return Err(format!("Invalid filename: {}", name).into());
             }
             let file_path = app_dir.join(name);

@@ -1,35 +1,32 @@
-//! Thread presence/focus endpoints.
-//!
-//! The frontend POSTs `{ device_id, thread_id, focused }` whenever its focus
-//! state changes (focus, blur, visibility change, heartbeat, beforeunload).
-//! The handler converts it into the appropriate `SystemEvent` and emits
-//! through EventBus, which then projects to the `thread_presence` table.
+//! `/device-presence` (`update_device_presence`): the frontend POSTs
+//! `{ device_id, visible }` when ANY top-level Lucidos tab transitions
+//! visible/hidden. Projects to `device_presence` and feeds the
+//! candidate list the PresenceCheck protocol pings (see
+//! `system-knowhow/notifications.md` §3). Per-thread focus is now
+//! reported live in the pong rather than via a separate POST loop.
 
 use super::*;
 
 #[derive(Deserialize)]
-pub struct PresenceRequest {
+pub struct DevicePresenceRequest {
     pub device_id: String,
-    pub thread_id: Uuid,
-    pub focused: bool,
+    pub visible: bool,
 }
 
-pub(super) async fn update_presence(
+pub(super) async fn update_device_presence(
     State(state): State<AppState>,
-    Json(request): Json<PresenceRequest>,
+    Json(request): Json<DevicePresenceRequest>,
 ) -> Json<ApiResult> {
     if request.device_id.is_empty() {
         return ApiResult::err("device_id is required");
     }
 
-    let event = if request.focused {
-        crate::engine::event_bus::SystemEvent::ThreadFocused {
-            thread_id: request.thread_id,
+    let event = if request.visible {
+        crate::engine::event_bus::SystemEvent::DeviceVisible {
             device_id: request.device_id,
         }
     } else {
-        crate::engine::event_bus::SystemEvent::ThreadUnfocused {
-            thread_id: request.thread_id,
+        crate::engine::event_bus::SystemEvent::DeviceHidden {
             device_id: request.device_id,
         }
     };
@@ -41,6 +38,6 @@ pub(super) async fn update_presence(
         .await
     {
         Ok(_) => ApiResult::ok(),
-        Err(e) => ApiResult::err(format!("Failed to record presence: {}", e)),
+        Err(e) => ApiResult::err(format!("Failed to record device presence: {}", e)),
     }
 }

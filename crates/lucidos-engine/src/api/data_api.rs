@@ -195,6 +195,7 @@ pub(super) async fn read_data(State(state): State<AppState>, Path(path): Path<St
 pub(super) async fn write_data(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     if let Err((code, msg)) = validate_data_path_mutate(&path) {
@@ -208,21 +209,24 @@ pub(super) async fn write_data(
 
     let _repo_guard = state.engine.lock_workspace_repo().await;
 
-    if let Some(artifact_path) = path.strip_prefix("artifacts/") {
-        let content = String::from_utf8_lossy(&body).to_string();
+    let (commit_opt, response) = if let Some(artifact_path) = path.strip_prefix("artifacts/") {
+        // `write_and_commit` takes `impl AsRef<[u8]>` — pass the raw bytes so
+        // binary uploads (PNG, PDF, …) aren't silently mangled by a lossy
+        // UTF-8 round-trip that replaces every non-UTF-8 byte with U+FFFD.
         match am
             .write_and_commit(
                 artifact_path,
-                &content,
+                body.as_ref(),
                 &format!("Update {}", artifact_path),
             )
             .await
         {
-            Ok(commit) => {
+            Ok(commit) => (
+                Some(commit.clone()),
                 Json(serde_json::json!({ "success": true, "path": path, "commit": commit }))
-                    .into_response()
-            }
-            Err(e) => (
+                    .into_response(),
+            ),
+            Err(e) => return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),
             )
@@ -247,23 +251,50 @@ pub(super) async fn write_data(
             .commit_data_path(&path, &format!("Update {}", path))
             .await
         {
-            Ok(commit) => {
+            Ok(commit) => (
+                Some(commit.clone()),
                 Json(serde_json::json!({ "success": true, "path": path, "commit": commit }))
-                    .into_response()
-            }
+                    .into_response(),
+            ),
+            // The file is on disk but the git commit failed — that's a genuine
+            // failure, not a no-op: `commit_index` creates an (even empty)
+            // commit rather than erroring when there's nothing to commit, so an
+            // `Err` here always means git itself failed. Surface it instead of
+            // claiming `success: true` with a null commit, matching the
+            // artifacts/delete branches. Returning early also skips the
+            // `DataFileWritten` audit event, which would otherwise record a
+            // commit that never happened.
             Err(e) => {
-                log!(@data_api, "Warning: file written but commit failed: {}", e);
-                Json(serde_json::json!({ "success": true, "path": path, "commit": null }))
-                    .into_response()
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("File written to disk but git commit failed: {}", e)
+                    })),
+                )
+                    .into_response();
             }
         }
-    }
+    };
+
+    state
+        .engine
+        .event_bus
+        .emit_user_system(&headers, &state.pool, "[DataApi] DataFileWritten", |actor| {
+            crate::engine::event_bus::SystemEvent::DataFileWritten {
+                path: path.clone(),
+                commit: commit_opt,
+                actor,
+            }
+        })
+        .await;
+    response
 }
 
 /// DELETE /api/v1/data/*path — delete a data file
 pub(super) async fn delete_data(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err((code, msg)) = validate_data_path_mutate(&path) {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
@@ -276,16 +307,17 @@ pub(super) async fn delete_data(
 
     let _repo_guard = state.engine.lock_workspace_repo().await;
 
-    if let Some(artifact_path) = path.strip_prefix("artifacts/") {
+    let (commit_opt, response) = if let Some(artifact_path) = path.strip_prefix("artifacts/") {
         match am
             .delete_and_commit(artifact_path, &format!("Delete {}", artifact_path))
             .await
         {
-            Ok(commit) => {
+            Ok(commit) => (
+                Some(commit.clone()),
                 Json(serde_json::json!({ "success": true, "path": path, "commit": commit }))
-                    .into_response()
-            }
-            Err(e) => (
+                    .into_response(),
+            ),
+            Err(e) => return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),
             )
@@ -296,17 +328,31 @@ pub(super) async fn delete_data(
             .delete_data_path_and_commit(&path, &format!("Delete {}", path))
             .await
         {
-            Ok(commit) => {
+            Ok(commit) => (
+                Some(commit.clone()),
                 Json(serde_json::json!({ "success": true, "path": path, "commit": commit }))
-                    .into_response()
-            }
-            Err(e) => (
+                    .into_response(),
+            ),
+            Err(e) => return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),
             )
                 .into_response(),
         }
-    }
+    };
+
+    state
+        .engine
+        .event_bus
+        .emit_user_system(&headers, &state.pool, "[DataApi] DataFileDeleted", |actor| {
+            crate::engine::event_bus::SystemEvent::DataFileDeleted {
+                path: path.clone(),
+                commit: commit_opt,
+                actor,
+            }
+        })
+        .await;
+    response
 }
 
 /// POST /api/v1/data/edit — edit a data file (JSON path or text find-replace)
@@ -326,6 +372,7 @@ pub(super) struct DataEditOp {
 
 pub(super) async fn edit_data(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<DataEditRequest>,
 ) -> Response {
     if let Err((code, msg)) = validate_data_path_mutate(&body.path) {
@@ -359,6 +406,12 @@ pub(super) async fn edit_data(
         }
     }
 
+    // Emit `DataFileEdited` with the count of operations actually applied —
+    // even on partial failure, the file has been mutated by ops 0..completed
+    // and the audit log must reflect that. The error response still
+    // surfaces the failed op to the caller.
+    let mut completed: usize = 0;
+    let mut failure: Option<(StatusCode, String)> = None;
     for op in &body.operations {
         if let Err(e) = state
             .engine
@@ -378,10 +431,29 @@ pub(super) async fn edit_data(
             } else {
                 StatusCode::BAD_REQUEST
             };
-            return (status, Json(serde_json::json!({ "error": e }))).into_response();
+            failure = Some((status, e));
+            break;
         }
+        completed += 1;
     }
 
+    if completed > 0 {
+        state
+            .engine
+            .event_bus
+            .emit_user_system(&headers, &state.pool, "[DataApi] DataFileEdited", |actor| {
+                crate::engine::event_bus::SystemEvent::DataFileEdited {
+                    path: body.path.clone(),
+                    operations_count: completed,
+                    actor,
+                }
+            })
+            .await;
+    }
+
+    if let Some((status, e)) = failure {
+        return (status, Json(serde_json::json!({ "error": e }))).into_response();
+    }
     Json(serde_json::json!({ "success": true })).into_response()
 }
 

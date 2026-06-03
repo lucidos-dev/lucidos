@@ -1,9 +1,11 @@
 /** Default chat model when no preference is set.
  *  Mirrored on the backend in `crates/lucidos-engine/src/core/preferences.rs`. */
-export const DEFAULT_CHAT_MODEL = 'claude-opus-4-7';
+export const DEFAULT_CHAT_MODEL = 'claude-opus-4-8@default';
 
 /** Lucidos chat model options — used for display labels and model pickers. */
 export const MODELS = [
+  { value: 'claude-opus-4-8@default', label: 'Opus 4.8' },
+  { value: 'claude-opus-4-8@default[1m]', label: 'Opus 4.8 (1M)' },
   { value: 'claude-opus-4-7', label: 'Opus 4.7' },
   { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 (1M)' },
   { value: 'claude-opus-4-6', label: 'Opus 4.6' },
@@ -12,6 +14,7 @@ export const MODELS = [
   { value: 'claude-sonnet-4-6[1m]', label: 'Sonnet 4.6 (1M)' },
   { value: 'claude-opus-4-5@20251101', label: 'Opus 4.5' },
   { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
+  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
   { value: 'gpt-5.5-pro', label: 'GPT-5.5 Pro' },
   { value: 'gpt-5.5', label: 'GPT-5.5' },
@@ -36,13 +39,13 @@ const REASONING_ORDER = REASONING_LEVELS.map(l => l.value);
 
 /** Filter REASONING_LEVELS to those the given model actually supports.
  *  - OpenAI: drops `max` (its top tier is `xhigh`, so `max` would be a duplicate).
- *  - Opus 4.7: full set (only adaptive Anthropic model that natively supports `xhigh`).
+ *  - Opus 4.7+: full set (the adaptive Anthropic family that natively supports `xhigh`).
  *  - Other Claude / Gemini: drops `xhigh` (not a distinct tier on those backends). */
 export function availableReasoningLevels(model: string): typeof REASONING_LEVELS {
   if (model.startsWith('gpt-')) {
     return REASONING_LEVELS.filter(l => l.value !== 'max');
   }
-  if (model.startsWith('claude-opus-4-7')) {
+  if (model.startsWith('claude-opus-4-7') || model.startsWith('claude-opus-4-8')) {
     return REASONING_LEVELS;
   }
   return REASONING_LEVELS.filter(l => l.value !== 'xhigh');

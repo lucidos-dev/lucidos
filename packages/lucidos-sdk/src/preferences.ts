@@ -22,14 +22,14 @@ export const preferences = {
    */
   get(deviceId: string | null | undefined = parentDeviceId()): Promise<Preferences> {
     const qs = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : '';
-    return request<{ preferences: Preferences }>(`/api/preferences${qs}`)
+    return request<{ preferences: Preferences }>(`/preferences${qs}`)
       .then(r => r.preferences);
   },
 
   set(key: string, value: string, deviceId?: string): Promise<void> {
     assertString('key', key);
     assertString('value', value);
-    return requestVoid(`/api/preferences?key=${encodeURIComponent(key)}`, {
+    return requestVoid(`/preferences?key=${encodeURIComponent(key)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ value, device_id: deviceId }),

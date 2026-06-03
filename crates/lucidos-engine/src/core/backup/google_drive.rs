@@ -15,6 +15,15 @@ use tokio::sync::Mutex;
 const FOLDER_NAME: &str = "Lucidos Backups";
 const DRIVE_FILES_URL: &str = "https://www.googleapis.com/drive/v3/files";
 const DRIVE_UPLOAD_URL: &str = "https://www.googleapis.com/upload/drive/v3/files";
+/// `about` endpoint — `?fields=storageQuota` reports the account's limit/usage.
+const DRIVE_ABOUT_URL: &str = "https://www.googleapis.com/drive/v3/about";
+/// Token introspection — reports the scopes actually granted on the token.
+const GOOGLE_TOKENINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/tokeninfo";
+
+/// Bytes per GB for the user-facing free-space message. Google reports its
+/// quota in binary GB (a "100 GB" plan = 100 GiB) and labels it "GB", so divide
+/// by 1024³ to match the number the user sees in Google's own UI.
+const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// Chunk size for resumable uploads. Must be a multiple of 256 KiB per Drive's spec.
 /// 8 MiB balances request count against the cost of re-uploading a failed chunk.
@@ -34,6 +43,17 @@ const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const DRIVE_AUTH_401_MSG: &str = "Google Drive authentication failed (401). Go to Settings > Backup and click 'Grant access' to re-authorize.";
 const DRIVE_AUTH_403_MSG: &str = "Google Drive access denied (403). Go to Settings > Backup and click 'Grant access' to authorize Drive permissions.";
 
+/// Shown when a 403 carries a storage-quota reason — an over-quota failure, NOT
+/// an access problem. Must NOT mention "Grant access": the old code mapped EVERY
+/// 403 to `DRIVE_AUTH_403_MSG`, so an over-quota Drive sent the user re-granting
+/// access repeatedly while the real fix was to free space.
+const DRIVE_QUOTA_MSG: &str =
+    "Google Drive is full — delete old backups or free space; this is NOT an access problem.";
+
+/// Shown by preflight when the granted token is missing the required Drive
+/// scope — the ONLY preflight case that should tell the user to re-grant access.
+const DRIVE_SCOPE_MISSING_MSG: &str = "Google Drive backup is missing the required Drive permission. Go to Settings > Backup and click 'Grant access' to re-authorize.";
+
 /// Drive-specific resumable-upload headers (reqwest has no constants for these).
 const X_UPLOAD_CONTENT_TYPE: &str = "X-Upload-Content-Type";
 const X_UPLOAD_CONTENT_LENGTH: &str = "X-Upload-Content-Length";
@@ -42,6 +62,9 @@ pub struct GoogleDriveBackupProvider {
     pool: PgPool,
     client: reqwest::Client,
     folder_id_cache: Arc<Mutex<Option<String>>>,
+    /// Scope substring the token must carry, threaded from the provider
+    /// registry's `required_scope` so there's a single source of truth for it.
+    required_scope: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -89,14 +112,81 @@ impl std::fmt::Display for ChunkError {
 }
 
 /// Check a Google Drive API response, returning actionable errors for auth failures
-/// and the generic reqwest error for everything else.
-fn check_drive_status(resp: reqwest::Response) -> Result<reqwest::Response, BoxError> {
+/// and the generic reqwest error for everything else. A 403 is classified by its
+/// error body so an over-quota failure isn't mislabeled as an access problem
+/// (see `classify_403_body`) — async because that classification reads the body.
+async fn check_drive_status(resp: reqwest::Response) -> Result<reqwest::Response, BoxError> {
     match resp.status() {
         s if s.is_success() => Ok(resp),
-        StatusCode::FORBIDDEN => Err(DRIVE_AUTH_403_MSG.into()),
+        StatusCode::FORBIDDEN => {
+            let body = resp.text().await.unwrap_or_default();
+            Err(classify_403_body(&body).into())
+        }
         StatusCode::UNAUTHORIZED => Err(DRIVE_AUTH_401_MSG.into()),
         _ => Ok(resp.error_for_status()?),
     }
+}
+
+/// True when a Drive 403 body indicates an over-quota failure rather than an
+/// access denial. Parses Google's error JSON for a `storageQuotaExceeded`
+/// reason in either the v3 (`error.errors[].reason`) or legacy (`errors[].reason`)
+/// shape, and falls back to a substring check for "quota" so a shape change or a
+/// non-JSON body still classifies correctly.
+fn drive_403_is_quota(body: &str) -> bool {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        let reasons = v["error"]["errors"]
+            .as_array()
+            .or_else(|| v["errors"].as_array());
+        if let Some(arr) = reasons {
+            if arr.iter().any(|e| {
+                e["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.eq_ignore_ascii_case("storageQuotaExceeded"))
+            }) {
+                return true;
+            }
+        }
+    }
+    body.to_lowercase().contains("quota")
+}
+
+/// Pick the right user-facing message for a Drive 403 body: the over-quota
+/// message when it's a storage-quota failure (NOT an access problem), otherwise
+/// the genuine access-denied "Grant access" message.
+fn classify_403_body(body: &str) -> &'static str {
+    if drive_403_is_quota(body) {
+        DRIVE_QUOTA_MSG
+    } else {
+        DRIVE_AUTH_403_MSG
+    }
+}
+
+/// Decide whether the estimated upload fits in the free space (with 10%
+/// headroom), returning the over-quota message when it doesn't. `limit == None`
+/// means an unlimited quota (some Workspace accounts) and always fits. Pure so
+/// the arithmetic is unit-testable without a live `about` response.
+fn quota_check(limit: Option<u64>, usage: u64, estimated_upload_bytes: u64) -> Result<(), String> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let free = limit.saturating_sub(usage);
+    let needed = estimated_upload_bytes.saturating_add(estimated_upload_bytes / 10);
+    if free < needed {
+        Err(format!(
+            "Google Drive is full: {:.1} GB free, need ~{:.1} GB. Delete old backups or free space.",
+            free as f64 / BYTES_PER_GB,
+            needed as f64 / BYTES_PER_GB,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// True when the granted-scopes string includes the required scope substring.
+/// Mirrors the readiness check in `api::backup` (substring match against the
+/// space-separated granted scopes); an empty requirement always passes.
+fn scopes_include(granted: &str, required: &str) -> bool {
+    required.is_empty() || granted.contains(required)
 }
 
 /// Parse Drive's `Range:` response header (`bytes=0-262143`) and return the
@@ -128,16 +218,93 @@ fn chunk_end(start: u64, total: u64, chunk_size: u64) -> u64 {
 }
 
 impl GoogleDriveBackupProvider {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: PgPool, required_scope: &'static str) -> Self {
         Self {
             pool,
             client: reqwest::Client::new(),
             folder_id_cache: Arc::new(Mutex::new(None)),
+            required_scope,
         }
     }
 
     async fn get_token(&self) -> Result<String, BoxError> {
         super::get_oauth_token(&self.pool, "google").await
+    }
+
+    /// Verify the access token actually carries the required Drive scope, via
+    /// Google's tokeninfo endpoint. A confirmed-missing scope is the ONLY
+    /// preflight failure that tells the user to re-grant access; a tokeninfo
+    /// HTTP failure is surfaced as a generic error rather than misattributed to
+    /// a missing scope.
+    async fn verify_scope(&self, token: &str) -> Result<(), BoxError> {
+        #[derive(Deserialize)]
+        struct TokenInfo {
+            scope: Option<String>,
+        }
+        let resp = self
+            .client
+            .get(GOOGLE_TOKENINFO_URL)
+            .query(&[("access_token", token)])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "Could not verify Google Drive token scope (tokeninfo HTTP {})",
+                resp.status().as_u16()
+            )
+            .into());
+        }
+        let info: TokenInfo = resp.json().await?;
+        let granted = info.scope.unwrap_or_default();
+        if scopes_include(&granted, self.required_scope) {
+            Ok(())
+        } else {
+            Err(DRIVE_SCOPE_MISSING_MSG.into())
+        }
+    }
+
+    /// Verify the Drive has room for the estimated upload, via the `about`
+    /// endpoint's `storageQuota`. Fails BEFORE encrypting with an actionable
+    /// over-quota message (never a grant-access message). An absent limit means
+    /// an unlimited quota and passes.
+    async fn check_free_space(
+        &self,
+        token: &str,
+        estimated_upload_bytes: u64,
+    ) -> Result<(), BoxError> {
+        #[derive(Deserialize)]
+        struct StorageQuota {
+            limit: Option<String>,
+            usage: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct AboutResponse {
+            #[serde(rename = "storageQuota")]
+            storage_quota: Option<StorageQuota>,
+        }
+        let resp = self
+            .client
+            .get(DRIVE_ABOUT_URL)
+            .bearer_auth(token)
+            .query(&[("fields", "storageQuota")])
+            .send()
+            .await?;
+        let resp = check_drive_status(resp).await?;
+        let about: AboutResponse = resp.json().await?;
+        let Some(quota) = about.storage_quota else {
+            // No quota info reported — don't block the backup on its absence.
+            return Ok(());
+        };
+        // Drive reports limit/usage as stringified bytes; an absent limit means
+        // unlimited. Like the None cases above, only block on clear evidence of
+        // insufficient space — an unparseable usage defaults to 0 (don't block).
+        let limit = quota.limit.as_deref().and_then(|s| s.parse::<u64>().ok());
+        let usage = quota
+            .usage
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        quota_check(limit, usage, estimated_upload_bytes).map_err(BoxError::from)
     }
 
     async fn get_or_create_folder(&self, token: &str) -> Result<String, BoxError> {
@@ -161,7 +328,7 @@ impl GoogleDriveBackupProvider {
             .query(&[("q", &query), ("fields", &"files(id)".to_string())])
             .send()
             .await?;
-        let resp = check_drive_status(resp)?;
+        let resp = check_drive_status(resp).await?;
 
         let list: DriveFileList = resp.json().await?;
         let folder_id = if let Some(folder) = list.files.into_iter().next() {
@@ -179,7 +346,8 @@ impl GoogleDriveBackupProvider {
                     .json(&metadata)
                     .send()
                     .await?,
-            )?;
+            )
+            .await?;
 
             let created: DriveCreateResponse = resp.json().await?;
             created.id
@@ -216,7 +384,7 @@ impl GoogleDriveBackupProvider {
             .body(metadata.to_string())
             .send()
             .await?;
-        let resp = check_drive_status(resp)?;
+        let resp = check_drive_status(resp).await?;
         let location = resp
             .headers()
             .get(reqwest::header::LOCATION)
@@ -336,11 +504,7 @@ impl GoogleDriveBackupProvider {
                         // Don't let the server move us backwards.
                         start = next.max(end + 1);
                         progress(start, total_size);
-                        crate::log!(
-                            "[Backup] Uploaded chunk: {} / {} bytes",
-                            start,
-                            total_size
-                        );
+                        crate::log!("[Backup] Uploaded chunk: {} / {} bytes", start, total_size);
                         break;
                     }
                     Err(ChunkError::Fatal(e)) => return Err(e),
@@ -413,10 +577,9 @@ async fn classify_chunk_response(resp: reqwest::Response) -> Result<ChunkOutcome
     let status = resp.status();
 
     if status.is_success() {
-        let created: DriveCreateResponse = resp
-            .json()
-            .await
-            .map_err(|e| ChunkError::Fatal(format!("Drive success response parse: {}", e).into()))?;
+        let created: DriveCreateResponse = resp.json().await.map_err(|e| {
+            ChunkError::Fatal(format!("Drive success response parse: {}", e).into())
+        })?;
         return Ok(ChunkOutcome::Done(created.id));
     }
 
@@ -436,7 +599,10 @@ async fn classify_chunk_response(resp: reqwest::Response) -> Result<ChunkOutcome
         return Err(ChunkError::Fatal(DRIVE_AUTH_401_MSG.into()));
     }
     if status == StatusCode::FORBIDDEN {
-        return Err(ChunkError::Fatal(DRIVE_AUTH_403_MSG.into()));
+        // Classify by the error body so an over-quota 403 (the production
+        // failure) isn't mislabeled as an access problem during the upload.
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ChunkError::Fatal(classify_403_body(&body).into()));
     }
 
     // 5xx / 408 / 429 are transient per Drive's resumable-upload guidance.
@@ -471,8 +637,17 @@ impl BackupProvider for GoogleDriveBackupProvider {
         "google"
     }
 
-    async fn verify_access(&self) -> Result<(), BoxError> {
+    async fn preflight(&self, estimated_upload_bytes: u64) -> Result<(), BoxError> {
+        // Cheap, ordered checks — fail before any expensive work, and keep the
+        // grant-access guidance reserved for an actual permission problem.
+        // 1. Token: connect / refresh (get_token surfaces the connect/grant guidance).
         let token = self.get_token().await?;
+        // 2. Required scope: the ONLY case that tells the user to Grant access.
+        self.verify_scope(&token).await?;
+        // 3. Free space: fail before pg_dump/compress/encrypt if it won't fit.
+        self.check_free_space(&token, estimated_upload_bytes)
+            .await?;
+        // 4. Folder: verifies write access and warms the id cache for the upload.
         self.get_or_create_folder(&token).await?;
         Ok(())
     }
@@ -521,7 +696,8 @@ impl BackupProvider for GoogleDriveBackupProvider {
                 ])
                 .send()
                 .await?,
-        )?;
+        )
+        .await?;
 
         let list: DriveFileList = resp.json().await?;
 
@@ -560,7 +736,8 @@ impl BackupProvider for GoogleDriveBackupProvider {
         let token = self.get_token().await?;
 
         let url = format!("{}/{}?alt=media", DRIVE_FILES_URL, backup_id);
-        let resp = check_drive_status(self.client.get(&url).bearer_auth(&token).send().await?)?;
+        let resp =
+            check_drive_status(self.client.get(&url).bearer_auth(&token).send().await?).await?;
 
         let total = resp.content_length().unwrap_or(0);
         let mut file = tokio::fs::File::create(dest).await?;
@@ -585,7 +762,7 @@ impl BackupProvider for GoogleDriveBackupProvider {
         let token = self.get_token().await?;
 
         let url = format!("{}/{}", DRIVE_FILES_URL, backup_id);
-        check_drive_status(self.client.delete(&url).bearer_auth(&token).send().await?)?;
+        check_drive_status(self.client.delete(&url).bearer_auth(&token).send().await?).await?;
 
         Ok(())
     }
@@ -662,5 +839,101 @@ mod tests {
         let chunk: u64 = 8 * 1024 * 1024;
         let total: u64 = 1024 * 1024;
         assert_eq!(chunk_end(0, total, chunk), total - 1);
+    }
+
+    // --- 403 classification (the mislabeling bug) ------------------------
+
+    /// An over-quota 403 (Drive's v3 `error.errors[].reason == storageQuotaExceeded`)
+    /// must map to the quota message — NOT the access-denied "Grant access" one
+    /// that previously sent the user re-granting access while the Drive was full.
+    #[test]
+    fn classify_403_quota_body_returns_quota_message() {
+        let body = r#"{"error":{"errors":[{"domain":"usageLimits","reason":"storageQuotaExceeded","message":"The user's Drive storage quota has been exceeded."}],"code":403,"message":"The user's Drive storage quota has been exceeded."}}"#;
+        assert_eq!(classify_403_body(body), DRIVE_QUOTA_MSG);
+        assert!(
+            !classify_403_body(body).contains("Grant access"),
+            "an over-quota 403 must never tell the user to grant access"
+        );
+    }
+
+    /// A genuine auth-denied 403 (`insufficientPermissions`) keeps the existing
+    /// grant-access message.
+    #[test]
+    fn classify_403_insufficient_permissions_returns_grant_message() {
+        let body = r#"{"error":{"errors":[{"domain":"global","reason":"insufficientPermissions","message":"Insufficient Permission"}],"code":403,"message":"Insufficient Permission"}}"#;
+        assert_eq!(classify_403_body(body), DRIVE_AUTH_403_MSG);
+        assert!(classify_403_body(body).contains("Grant access"));
+    }
+
+    /// The legacy top-level `errors[]` shape and a plain-text "quota" body both
+    /// classify as quota; an empty / hint-less body is a genuine access denial.
+    #[test]
+    fn classify_403_legacy_shape_and_text_fallback() {
+        let legacy = r#"{"errors":[{"reason":"storageQuotaExceeded"}]}"#;
+        assert_eq!(classify_403_body(legacy), DRIVE_QUOTA_MSG);
+        assert_eq!(
+            classify_403_body("403: The user's storage quota has been exceeded"),
+            DRIVE_QUOTA_MSG
+        );
+        assert_eq!(classify_403_body(""), DRIVE_AUTH_403_MSG);
+        // A non-quota reason embedded in otherwise-noisy JSON stays a grant case.
+        assert_eq!(
+            classify_403_body(r#"{"error":{"errors":[{"reason":"forbidden"}]}}"#),
+            DRIVE_AUTH_403_MSG
+        );
+    }
+
+    // --- preflight quota / scope decision core --------------------------
+
+    /// Preflight passes when the Drive has room for the estimated upload.
+    #[test]
+    fn quota_check_passes_with_room() {
+        let gib = 1024 * 1024 * 1024;
+        assert!(quota_check(Some(100 * gib), 50 * gib, gib).is_ok());
+    }
+
+    /// The production case: 100 GiB limit, ~96.5 GiB used (~3.5 GiB free) and a
+    /// 5 GiB upload → preflight fails with the over-quota message and never the
+    /// grant-access one.
+    #[test]
+    fn quota_check_fails_when_free_below_estimate_with_quota_message() {
+        let gib = 1024 * 1024 * 1024;
+        let usage = (96.5 * gib as f64) as u64;
+        let err = quota_check(Some(100 * gib), usage, 5 * gib).unwrap_err();
+        assert!(err.contains("Google Drive is full"), "got: {err}");
+        assert!(err.contains("free"), "should report free GB: {err}");
+        assert!(
+            !err.contains("Grant access"),
+            "over-quota is not an access problem: {err}"
+        );
+    }
+
+    /// The 10% headroom rejects an upload that would *just barely* fit raw, so
+    /// estimate error can't push a real backup over the edge at upload time.
+    #[test]
+    fn quota_check_headroom_rejects_a_near_exact_fit() {
+        // free = 1_000_000, estimate = 950_000 → needed = 1_045_000 > free.
+        assert!(quota_check(Some(1_000_000), 0, 950_000).is_err());
+    }
+
+    /// An absent limit (some Workspace accounts report no quota) is unlimited.
+    #[test]
+    fn quota_check_unlimited_limit_always_passes() {
+        assert!(quota_check(None, u64::MAX, u64::MAX / 2).is_ok());
+    }
+
+    /// Scope verification is a substring match against the space-separated
+    /// granted scopes (mirrors `api::backup`'s readiness check). A token without
+    /// the Drive scope fails — the case preflight maps to the re-grant message.
+    #[test]
+    fn scopes_include_substring_and_empty() {
+        let granted = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email";
+        assert!(scopes_include(granted, "drive"));
+        assert!(!scopes_include(
+            "https://www.googleapis.com/auth/userinfo.email",
+            "drive"
+        ));
+        // An empty requirement always passes (the Dropbox no-scope case).
+        assert!(scopes_include("", ""));
     }
 }

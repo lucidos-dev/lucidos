@@ -205,6 +205,75 @@
     gap: 0.125rem;
 }
 
+/* Two-layer grouping: outer = API role (system / prior_message / user),
+ * inner = curated tier inside the user role. Indentation hierarchy:
+ * role (0) → inner group (1rem) → section (2rem). */
+.context-role {
+    margin-bottom: 0.75rem;
+}
+
+.context-role-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.375rem 0.5rem;
+    font-weight: 600;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+    width: 100%;
+    text-align: left;
+    border: 0;
+    cursor: pointer;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+}
+
+.context-role-label {
+    flex: 1;
+}
+
+.context-role-chars {
+    margin-left: auto;
+    font-weight: 400;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
+
+.context-inner-group {
+    margin: 0.25rem 0 0.25rem 1rem;
+}
+
+.context-inner-header {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.25rem 0.375rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    width: 100%;
+    text-align: left;
+    border: 0;
+    cursor: pointer;
+    background: transparent;
+    font-family: var(--font-ui);
+    font-size: 0.8125rem;
+}
+
+.context-inner-label {
+    flex: 1;
+}
+
+.context-inner-chars {
+    margin-left: auto;
+    font-weight: 400;
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+}
+
+.context-inner-group .context-section {
+    margin-left: 1rem;
+}
+
 .context-header {
     background: none;
     border: none;

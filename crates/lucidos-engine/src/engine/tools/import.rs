@@ -1,4 +1,3 @@
-use super::super::document::{extract_text_with_ocr, safe_extract_pdf_text};
 use super::super::LucidosEngine;
 use super::bulk_limits::{
     bulk_threshold_error, BulkContext, MAX_BULK_BYTES, MAX_BULK_FILE_COUNT,
@@ -95,68 +94,7 @@ impl LucidosEngine {
                     .to_lowercase();
                 let is_binary = crate::core::is_binary_extension(&extension);
 
-                let (summary, _file_size, commit_sha) = if extension == "pdf" {
-                    // PDF file: copy as bytes and extract text for indexing
-                    let bytes = match std::fs::read(source) {
-                        Ok(b) => b,
-                        Err(e) => return Ok(format!("Error: Failed to read file: {}", e)),
-                    };
-                    let size = bytes.len();
-                    let main_commit = self
-                        .artifact_manager
-                        .write_and_commit(
-                            &dest_relative,
-                            &bytes,
-                            &format!("Import {}", dest_relative),
-                        )
-                        .await?;
-
-                    // Extract text from PDF for summarization
-                    // Try pdf_extract first (for text-based PDFs), fall back to OCR (for scanned)
-                    let extracted_text = match safe_extract_pdf_text(source) {
-                        Ok(text) if !text.trim().is_empty() => {
-                            log!("[Import] PDF text extracted successfully for {:?}", source);
-                            Some(text)
-                        }
-                        Ok(_) | Err(_) => {
-                            log!("[Import] PDF text extraction failed, trying OCR for {:?}", source);
-                            match extract_text_with_ocr(source) {
-                                Ok(text) => {
-                                    log!("[Import] OCR successful for {:?}", source);
-                                    Some(text)
-                                }
-                                Err(e) => {
-                                    log!("[Import] OCR failed for {:?}: {}", source, e);
-                                    None
-                                }
-                            }
-                        }
-                    };
-
-                    let summary = if let Some(text) = &extracted_text {
-                        // Save extracted text as sidecar file for fast future access
-                        let text_path = format!("{}.txt", dest_relative);
-                        if let Err(e) = self
-                            .artifact_manager
-                            .write_and_commit(
-                                &text_path,
-                                text,
-                                &format!("Extract text from {}", dest_relative),
-                            )
-                            .await
-                        {
-                            log!("[Import] Failed to write/commit extracted text: {}", e);
-                        }
-
-                        // Generate summary from extracted text
-                        self.summarize_artifact(&dest_relative, text)
-                            .await
-                            .unwrap_or_else(|| format!("PDF document ({} bytes)", size))
-                    } else {
-                        format!("PDF document ({} bytes) - could not extract text", size)
-                    };
-                    (Some(summary), size, main_commit)
-                } else if is_binary {
+                let (summary, _file_size, commit_sha) = if is_binary {
                     // Other binary file: copy as bytes
                     let bytes = match std::fs::read(source) {
                         Ok(b) => b,
@@ -404,6 +342,9 @@ impl LucidosEngine {
                 let mut imported_files: Vec<String> = Vec::new();
                 let dest_base = format!("imported/{}", dest_subdir);
 
+                // Inner recursive helper: every parameter is per-recursion-frame state
+                // (filters + four mutable counters); flattening into a struct would just
+                // wrap the same set without simplifying the call sites below.
                 #[allow(clippy::too_many_arguments)]
                 fn walk_dir(
                     dir: &Path,
@@ -629,7 +570,7 @@ impl LucidosEngine {
         let is_binary = crate::core::is_binary_extension(&extension);
 
         // Phase 1: Write file to artifact store + git commit (synchronous)
-        let commit_sha = if is_binary || extension == "pdf" {
+        let commit_sha = if is_binary {
             let bytes = std::fs::read(source)?;
             self.artifact_manager
                 .write_and_commit(dest_relative, &bytes, &format!("Import {}", dest_relative))

@@ -3,6 +3,91 @@ use std::sync::Arc;
 use crate::core::EventRow;
 use crate::engine::LucidosEngine;
 
+/// SQL the orphan-recovery sweep runs to find chat / trigger / CC threads
+/// whose last exchange has activity events but no terminal event. Extracted
+/// from `recover_orphaned_threads` as a `const` so the test in the sibling
+/// module can run the exact same query against a hand-built fixture and
+/// assert the filter contract (archived threads are excluded) without
+/// duplicating the SQL.
+const ORPHAN_THREADS_SQL: &str = r#"
+WITH candidate_threads AS (
+    -- Skip archived threads outright. The user dismissed them;
+    -- emitting a fresh `ResponseAborted` here would route the
+    -- thread back to inbox via the contract layer's `to_inbox`
+    -- rule (`thread_lifecycle::resolve_transition`), silently
+    -- reviving a row the user deliberately closed. The
+    -- projection's `status` column for those rows stays at
+    -- whatever value it carried (typically `running`), but
+    -- nothing user-visible reads `status` for archived threads
+    -- — inbox / active queries already filter on
+    -- `archive_state`.
+    SELECT thread_id::text AS aggregate_id
+    FROM thread_summaries
+    WHERE thread_id != ALL($1::uuid[])
+      AND archive_state != 'archived'
+),
+per_thread AS (
+    SELECT
+        e.aggregate_id,
+        MAX(CASE WHEN e.event_type IN ('MessageReceived','TriggerStarted','ChildThreadCompleted')
+                 THEN e.created END) AS last_start,
+        MAX(CASE WHEN e.event_type IN ('TextStreamed','Thinking','ThoughtStreamed','ToolCalled','ToolResult',
+                                        'CodingAgentTextStreamed','CodingAgentToolCalled','CodingAgentToolResult')
+                 THEN e.created END) AS last_activity,
+        MAX(CASE WHEN e.event_type IN ('ResponseGenerated','ResponseCanceled','ResponseAborted','ResponseFailed',
+                                        'CodingAgentIdled','SessionEnded')
+                 THEN e.created END) AS last_terminal
+    FROM events e
+    WHERE e.aggregate = 'thread'
+      AND e.aggregate_id IN (SELECT aggregate_id FROM candidate_threads)
+      AND e.event_type IN (
+          'MessageReceived','TriggerStarted','ChildThreadCompleted',
+          'TextStreamed','Thinking','ThoughtStreamed','ToolCalled','ToolResult',
+          'CodingAgentTextStreamed','CodingAgentToolCalled','CodingAgentToolResult',
+          'ResponseGenerated','ResponseCanceled','ResponseAborted','ResponseFailed',
+          'CodingAgentIdled','SessionEnded'
+      )
+    GROUP BY e.aggregate_id
+),
+orphans AS (
+    SELECT pt.aggregate_id::uuid AS thread_id, pt.last_start
+    FROM per_thread pt
+    WHERE pt.last_start IS NOT NULL
+      AND pt.last_activity > pt.last_start
+      AND (pt.last_terminal IS NULL OR pt.last_terminal <= pt.last_start)
+)
+SELECT o.thread_id,
+       (SELECT LEFT(string_agg(e2.payload->>'text', '' ORDER BY e2.created), 2000)
+        FROM events e2
+        WHERE e2.aggregate_id = o.thread_id::text
+          AND e2.event_type IN ('TextStreamed', 'CodingAgentTextStreamed')
+          AND e2.created > o.last_start) AS partial_text,
+       start_evt.id AS originating_event_id,
+       start_evt.event_type AS originating_event_type,
+       start_evt.channel AS originating_channel
+FROM orphans o
+LEFT JOIN LATERAL (
+    SELECT e3.id, e3.event_type, e3.payload->>'channel' AS channel FROM events e3
+    WHERE e3.aggregate_id = o.thread_id::text
+      AND e3.event_type IN ('MessageReceived','TriggerStarted','ChildThreadCompleted')
+      AND e3.created = o.last_start
+    ORDER BY e3.sequence DESC LIMIT 1
+) start_evt ON true
+"#;
+
+/// SQL the orphan-recovery sweep runs to fetch the `(ToolCalled, ToolResult)`
+/// pairs it pairs into orphans. Extracted from `recover_orphan_tool_calls`
+/// for the same testability reason as `ORPHAN_THREADS_SQL`.
+const ORPHAN_TOOL_CALLS_SQL: &str = r#"
+SELECT e.id, e.event_type, e.payload, e.created, e.thread_id, e.sequence
+FROM events e
+JOIN thread_summaries ts ON ts.thread_id = e.thread_id
+WHERE e.event_type IN ('ToolCalled', 'ToolResult')
+  AND e.thread_id IS NOT NULL
+  AND ts.archive_state != 'archived'
+ORDER BY e.thread_id, e.created, e.sequence
+"#;
+
 impl LucidosEngine {
     /// Detect threads whose last exchange has activity events but no terminal event.
     /// These are in-flight threads (chat or CC) that died when the engine crashed.
@@ -31,66 +116,30 @@ impl LucidosEngine {
         // event. Returns the originating event id and the originating event's
         // type so the emitted ResponseAborted can carry `request_event_id`
         // linking back to it AND the right channel (chat vs trigger).
-        // Tuple shape: (thread_id, partial_text, originating_event_id, originating_event_type).
-        type OrphanRow = (uuid::Uuid, Option<String>, Option<uuid::Uuid>, Option<String>);
-        let rows: Vec<OrphanRow> = match sqlx::query_as(
-            r#"
-            WITH candidate_threads AS (
-                SELECT thread_id::text AS aggregate_id
-                FROM thread_summaries
-                WHERE thread_id != ALL($1::uuid[])
-            ),
-            per_thread AS (
-                SELECT
-                    e.aggregate_id,
-                    MAX(CASE WHEN e.event_type IN ('MessageReceived','TriggerStarted')
-                             THEN e.created END) AS last_start,
-                    MAX(CASE WHEN e.event_type IN ('TextStreamed','Thinking','ToolCalled','ToolResult',
-                                                    'CodingAgentTextStreamed','CodingAgentToolCalled','CodingAgentToolResult')
-                             THEN e.created END) AS last_activity,
-                    MAX(CASE WHEN e.event_type IN ('ResponseGenerated','ResponseCanceled','ResponseAborted','ResponseFailed',
-                                                    'CodingAgentIdled','SessionEnded')
-                             THEN e.created END) AS last_terminal
-                FROM events e
-                WHERE e.aggregate = 'thread'
-                  AND e.aggregate_id IN (SELECT aggregate_id FROM candidate_threads)
-                  AND e.event_type IN (
-                      'MessageReceived','TriggerStarted',
-                      'TextStreamed','Thinking','ToolCalled','ToolResult',
-                      'CodingAgentTextStreamed','CodingAgentToolCalled','CodingAgentToolResult',
-                      'ResponseGenerated','ResponseCanceled','ResponseAborted','ResponseFailed',
-                      'CodingAgentIdled','SessionEnded'
-                  )
-                GROUP BY e.aggregate_id
-            ),
-            orphans AS (
-                SELECT pt.aggregate_id::uuid AS thread_id, pt.last_start
-                FROM per_thread pt
-                WHERE pt.last_start IS NOT NULL
-                  AND pt.last_activity > pt.last_start
-                  AND (pt.last_terminal IS NULL OR pt.last_terminal <= pt.last_start)
-            )
-            SELECT o.thread_id,
-                   (SELECT LEFT(string_agg(e2.payload->>'text', '' ORDER BY e2.created), 2000)
-                    FROM events e2
-                    WHERE e2.aggregate_id = o.thread_id::text
-                      AND e2.event_type IN ('TextStreamed', 'CodingAgentTextStreamed')
-                      AND e2.created > o.last_start) AS partial_text,
-                   start_evt.id AS originating_event_id,
-                   start_evt.event_type AS originating_event_type
-            FROM orphans o
-            LEFT JOIN LATERAL (
-                SELECT e3.id, e3.event_type FROM events e3
-                WHERE e3.aggregate_id = o.thread_id::text
-                  AND e3.event_type IN ('MessageReceived','TriggerStarted')
-                  AND e3.created = o.last_start
-                ORDER BY e3.sequence DESC LIMIT 1
-            ) start_evt ON true
-            "#,
-        )
-        .bind(exclude_thread_ids)
-        .fetch_all(self.pool())
-        .await
+        // Tuple shape: (thread_id, partial_text, originating_event_id, originating_event_type, originating_channel).
+        type OrphanRow = (
+            uuid::Uuid,
+            Option<String>,
+            Option<uuid::Uuid>,
+            Option<String>,
+            Option<String>,
+        );
+        // `ChildThreadCompleted` is a turn-originator alongside
+        // `MessageReceived` / `TriggerStarted` — a thread waking from a
+        // finished child stamps the CTC's id as `request_event_id` on
+        // every event in the wake turn. Without CTC in `last_start` and
+        // the LATERAL JOIN, a chat (or CC) thread whose only in-flight
+        // turn was woken from a child is silently skipped: `last_start`
+        // resolves to a prior completed turn's MR, `last_terminal`
+        // (that turn's ResponseGenerated) is newer than `last_start`,
+        // and the `last_terminal <= last_start` orphan predicate fails.
+        // The thread sits in `requesting` forever with no Continue path.
+        // SQL is in the `ORPHAN_THREADS_SQL` const at module top so the
+        // sibling test in `recovery_tests` can run the exact same query.
+        let rows: Vec<OrphanRow> = match sqlx::query_as(ORPHAN_THREADS_SQL)
+            .bind(exclude_thread_ids)
+            .fetch_all(self.pool())
+            .await
         {
             Ok(rows) => rows,
             Err(e) => {
@@ -105,16 +154,33 @@ impl LucidosEngine {
 
         log!("[Recovery] Found {} orphaned thread(s)", rows.len());
 
-        for (thread_id, partial_text, originating_event_id, originating_event_type) in rows {
+        for (
+            thread_id,
+            partial_text,
+            originating_event_id,
+            originating_event_type,
+            originating_channel,
+        ) in rows
+        {
             let text = match partial_text {
                 Some(t) if !t.is_empty() => t,
                 _ => "This response was interrupted by an engine restart.".to_string(),
             };
-            let channel = match originating_event_type.as_deref() {
-                Some("TriggerStarted") => Some(EventChannel::Trigger),
-                Some("MessageReceived") => Some(EventChannel::Chat),
-                _ => None,
-            };
+            // ChildThreadCompleted-anchored turns inherit the parent thread's
+            // emit channel from the CTC row itself (stamped by
+            // `notify_parent_of_child_completion`). MR / TriggerStarted callers
+            // hardcoded chat/trigger via the originating_event_type below, but
+            // the wire channel on those rows is the same — fall back to the
+            // event-type mapping when the payload's channel field is missing
+            // (legacy rows that predated stamping it on starts).
+            let channel = originating_channel
+                .as_deref()
+                .and_then(EventChannel::from_wire)
+                .or(match originating_event_type.as_deref() {
+                    Some("TriggerStarted") => Some(EventChannel::Trigger),
+                    Some("MessageReceived") => Some(EventChannel::Chat),
+                    _ => None,
+                });
 
             // Direct .emit (not emit_response_aborted): wants the Err for the per-thread log below.
             if let Err(e) = self
@@ -171,17 +237,15 @@ impl LucidosEngine {
         use crate::engine::event_bus::BusEvent;
         use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 
-        let rows: Vec<EventRow> = match sqlx::query_as::<_, EventRow>(
-            r#"
-            SELECT id, event_type, payload, created, thread_id, sequence
-            FROM events
-            WHERE event_type IN ('ToolCalled', 'ToolResult')
-              AND thread_id IS NOT NULL
-            ORDER BY thread_id, created, sequence
-            "#,
-        )
-        .fetch_all(self.pool())
-        .await
+        // Skip archived threads — same reasoning as the
+        // `recover_orphaned_threads` sweep: don't emit follow-up events
+        // (here, synthetic ToolResults) on a row the user dismissed.
+        // SQL is in the `ORPHAN_TOOL_CALLS_SQL` const at module top so
+        // the sibling test in `recovery_tests` can run the exact same
+        // query.
+        let rows: Vec<EventRow> = match sqlx::query_as::<_, EventRow>(ORPHAN_TOOL_CALLS_SQL)
+            .fetch_all(self.pool())
+            .await
         {
             Ok(rows) => rows,
             Err(e) => {
@@ -229,6 +293,17 @@ impl LucidosEngine {
                                 ),
                                 images: vec![],
                                 success: false,
+                                // Frontend `groupIntoExchanges` routes this
+                                // synthetic ToolResult into the same exchange
+                                // as its originating `ToolCalled` by event
+                                // id. Without this, the synthetic ToolResult
+                                // would route via `request_event_id` to
+                                // whichever exchange the redirect points to
+                                // (e.g. the new ResponseAborted boundary
+                                // exchange) instead of pairing with its
+                                // ToolCalled — the "Executing …" spinner on
+                                // the original step would keep spinning.
+                                tool_called_event_id: Some(orphan_id),
                             },
                             meta: EventMeta {
                                 actor: Some(MessageOrigin::system()),
@@ -250,3 +325,7 @@ impl LucidosEngine {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "recovery_tests.rs"]
+mod recovery_tests;

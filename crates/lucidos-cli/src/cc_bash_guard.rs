@@ -65,7 +65,7 @@ pub(crate) fn decide(command: &str) -> GuardDecision {
 fn matches_ps_xargs_kill(cmd: &str) -> bool {
     let mut segments = cmd.split('|');
     let saw_producer = segments.any(|seg| {
-        let first = seg.trim().split_whitespace().next().unwrap_or("");
+        let first = seg.split_whitespace().next().unwrap_or("");
         first == "ps" || first == "pgrep"
     });
     saw_producer && segments.any(segment_runs_xargs_kill)

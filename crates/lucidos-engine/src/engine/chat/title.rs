@@ -62,31 +62,73 @@ const TITLE_SYSTEM_PROMPT: &str = "Generate a very short title (3-6 words) for t
      Return ONLY the title text, nothing else. No quotes.";
 
 /// True when the LLM echoed the system-prompt instruction back as the
-/// title instead of generating one. Production case: thread
-/// 8c3b5619 — user typed "Release", gemini-3-flash-preview returned
-/// "Generate conversation title". Routing the instruction through
-/// `system_instruction` instead of the user message reduces echo rate
-/// but does not eliminate it: with near-empty user content, the model
-/// still latches onto the most prominent thing in its context, which
-/// on Vertex includes the system instruction. Patterns are distinctive
-/// enough not to false-positive on real titles ("Movie title
-/// brainstorming", "Generated report for Q4").
+/// title instead of generating one. Substring matches on topic words
+/// (e.g. "conversation title") cannot distinguish an echoed instruction
+/// from a legitimate title whose subject IS conversation titles, so
+/// matches are anchored to instruction shape: imperative "Generate X"
+/// prefix, exact-match bare instruction fragments (LLM bailed to a
+/// 2-word stub), and a few distinctive instruction phrases that
+/// virtually never appear in real titles.
 fn is_prompt_echo(title: &str) -> bool {
     let lower = title.to_lowercase();
-    const ECHO_PATTERNS: &[&str] = &[
+    let trimmed = lower.trim();
+
+    const EXACT_BARE_FRAGMENTS: &[&str] = &[
         "conversation title",
         "very short title",
         "very short conversation",
-        "3-6 word",
+        "title",
+        "conversation",
+    ];
+    if EXACT_BARE_FRAGMENTS.contains(&trimmed) {
+        return true;
+    }
+
+    const ECHO_PATTERNS: &[&str] = &[
         "title for the conversation",
         "title for this conversation",
+        "3-6 word",
     ];
     if ECHO_PATTERNS.iter().any(|p| lower.contains(p)) {
         return true;
     }
-    // "Generate <noun>" almost never starts a real human title;
+
     // "generated" (adjective) is a different word and stays allowed.
-    lower.trim_start().starts_with("generate ")
+    trimmed.starts_with("generate ")
+}
+
+/// The title system prompt asks for a "very short title (3-6 words)". An
+/// output past double that maximum is no longer a title — it's the model
+/// answering the message (a clarifying question, refusal, or explanation)
+/// instead of summarizing it. Observed with a Gemini Flash title model: a
+/// screenshot-less "whats this app, and why does it have a filter entry but
+/// no threads" message produced the literal title "Please provide more
+/// context, a screenshot, or the name of the app you are referring to!".
+/// Reject by word count rather than brittle per-phrase matching so the check
+/// stays provider-agnostic.
+const MAX_TITLE_WORDS: usize = 12;
+
+fn is_oversized_for_title(title: &str) -> bool {
+    title.split_whitespace().count() > MAX_TITLE_WORDS
+}
+
+/// Validate an LLM-produced title. `Err` carries a human-readable reason and
+/// signals the caller to resample or fall back. A title can fail three ways:
+/// empty, an echo of the system instruction, or a full conversational
+/// response (too long to be a title).
+fn validate_title(
+    title: String,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if title.is_empty() {
+        return Err("LLM returned empty title".into());
+    }
+    if is_oversized_for_title(&title) {
+        return Err(format!("LLM returned a non-title response: {:?}", title).into());
+    }
+    if is_prompt_echo(&title) {
+        return Err(format!("LLM echoed title prompt: {:?}", title).into());
+    }
+    Ok(title)
 }
 
 /// Build the user message for thread title generation — the conversation
@@ -116,29 +158,40 @@ pub(crate) async fn generate_thread_title(
     use crate::llm::provider::{LlmProvider, Message, MessageContent};
 
     let user_content = build_title_user_content(message, image_description);
-    let messages = vec![Message {
-        role: "user".to_string(),
-        content: MessageContent::Text(user_content),
-    }];
-    let response = provider
-        .chat(
-            messages,
-            vec![],
-            None,
-            Some(TITLE_SYSTEM_PROMPT),
-            None,
-            Some("none"),
-        )
-        .await?;
-    let title = response.content.ok_or("No title returned")?;
-    let title = title.trim().to_string();
-    if title.is_empty() {
-        return Err("LLM returned empty title".into());
+
+    // Smaller/faster title models intermittently answer the message (a
+    // clarifying question, refusal, or explanation) instead of titling it;
+    // `validate_title` rejects those. Gemini's default sampling is
+    // non-deterministic, so one resample usually returns a real title —
+    // this mirrors the user manually re-generating. Transport errors are
+    // deterministic (auth/region/config) and propagate via `?` without a
+    // retry.
+    const MAX_ATTEMPTS: usize = 2;
+    let mut last_err: Box<dyn std::error::Error + Send + Sync> =
+        "title generation produced no candidate".into();
+
+    for _ in 0..MAX_ATTEMPTS {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Text(user_content.clone()),
+        }];
+        let response = provider
+            .chat(
+                messages,
+                vec![],
+                None,
+                Some(TITLE_SYSTEM_PROMPT),
+                None,
+                Some("none"),
+            )
+            .await?;
+        let title = response.content.ok_or("No title returned")?.trim().to_string();
+        match validate_title(title) {
+            Ok(t) => return Ok(t),
+            Err(e) => last_err = e,
+        }
     }
-    if is_prompt_echo(&title) {
-        return Err(format!("LLM echoed title prompt: {:?}", title).into());
-    }
-    Ok(title)
+    Err(last_err)
 }
 
 /// Generate a thread title via LLM and emit it as a ThreadTitleGenerated event.
@@ -159,24 +212,33 @@ pub(crate) async fn emit_generated_title(
         TitleDecision::Skip => return,
         TitleDecision::Image => "Image".to_string(),
         TitleDecision::Images => "Images".to_string(),
-        TitleDecision::Llm => match generate_thread_title(provider, message, image_description)
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => match fallback_title {
-                Some(name) => {
-                    log!(
-                        "[Thread] LLM title generation failed, using fallback: {}",
-                        e
-                    );
-                    name
-                }
-                None => {
-                    log!("[Thread] Failed to generate title: {}", e);
-                    return;
-                }
-            },
-        },
+        TitleDecision::Llm => {
+            use crate::llm::provider::LlmProvider;
+            // Log model + duration on every round-trip so a slow call
+            // (success path emits no other line) is triageable.
+            let started = std::time::Instant::now();
+            let model = provider.default_model().to_string();
+            let result = generate_thread_title(provider, message, image_description).await;
+            let outcome = match &result {
+                Ok(_) => "generated".to_string(),
+                Err(e) if fallback_title.is_some() => format!("failed ({}), using fallback", e),
+                Err(e) => format!("failed: {}", e),
+            };
+            log!(
+                "[Title] {} for {} in {:?} via {}",
+                outcome,
+                thread_id,
+                started.elapsed(),
+                model
+            );
+            match result {
+                Ok(t) => t,
+                Err(_) => match fallback_title {
+                    Some(name) => name,
+                    None => return,
+                },
+            }
+        }
     };
     if let Err(e) = bus
         .emit(crate::engine::event_bus::BusEvent::Thread {
@@ -363,15 +425,22 @@ mod tests {
     #[test]
     fn echo_detected_for_known_paraphrases() {
         assert!(is_prompt_echo("Generate Very Short Conversation Title"));
-        assert!(is_prompt_echo("conversation title"));
-        assert!(is_prompt_echo("Conversation Title Preference Analysis"));
-        assert!(is_prompt_echo("Very Short Title For Conversation"));
         assert!(is_prompt_echo("Generate a title (3-6 words)"));
+        assert!(is_prompt_echo("Title for the conversation today"));
+        assert!(is_prompt_echo("3-6 word summary please"));
     }
 
-    /// The previous detector's failure mode was a bare "title" substring
-    /// rejecting legitimate titles like "Movie title brainstorming" — pin
-    /// those so the current detector cannot regress to that pattern.
+    #[test]
+    fn echo_detected_for_bare_instruction_fragments() {
+        assert!(is_prompt_echo("conversation title"));
+        assert!(is_prompt_echo("Conversation Title"));
+        assert!(is_prompt_echo("  Very Short Title  "));
+        assert!(is_prompt_echo("Title"));
+    }
+
+    /// Substring matching on topic words used to false-reject titles
+    /// whose subject was conversation titles themselves; these pin that
+    /// regression so the detector cannot collapse back to substring rules.
     #[test]
     fn echo_not_detected_for_real_titles() {
         assert!(!is_prompt_echo("Fix auth handshake bug"));
@@ -380,6 +449,10 @@ mod tests {
         assert!(!is_prompt_echo("Conversation analysis tips"));
         assert!(!is_prompt_echo("Generated report for Q4"));
         assert!(!is_prompt_echo("Release notes for v2.1"));
+        assert!(!is_prompt_echo("Missing Conversation Title Investigation"));
+        assert!(!is_prompt_echo("Conversation Title Preference Analysis"));
+        assert!(!is_prompt_echo("Thread Title Generation Bug"));
+        assert!(!is_prompt_echo("Very short summary of Q4 revenue"));
     }
 
     /// The user-facing message sent to the LLM must contain ONLY the
@@ -414,5 +487,63 @@ mod tests {
         }
         // The conversation body itself is preserved.
         assert!(body.contains("instr rhat ids"));
+    }
+
+    /// Real string emitted as a thread title in production (thread
+    /// d4e28e98-…): the user typed "whats this app, and why does it have a
+    /// filter entry but no threads" with a screenshot, but the title path
+    /// sends only the text — so the Gemini Flash title model answered the
+    /// message instead of titling it. A 16-word sentence is not a title.
+    #[test]
+    fn oversized_detected_for_observed_production_string() {
+        assert!(is_oversized_for_title(
+            "Please provide more context, a screenshot, or the name of the app you are referring to!"
+        ));
+    }
+
+    #[test]
+    fn oversized_not_detected_for_real_titles() {
+        // 3-6 word titles the prompt asks for.
+        assert!(!is_oversized_for_title("Fix auth handshake bug"));
+        assert!(!is_oversized_for_title("Release notes for v2.1"));
+        assert!(!is_oversized_for_title("Very short summary of Q4 revenue"));
+        // A plausibly-verbose-but-still-valid 11-word title for THIS thread
+        // must pass — the check must not clip real titles.
+        assert!(!is_oversized_for_title(
+            "Why the thread filter shows entries but lists no threads"
+        ));
+    }
+
+    /// Pin the boundary so the threshold can't silently drift: exactly
+    /// MAX_TITLE_WORDS is accepted, one word over is rejected.
+    #[test]
+    fn oversized_boundary_is_max_title_words() {
+        let at_max = ["w"; MAX_TITLE_WORDS].join(" ");
+        let over_max = ["w"; MAX_TITLE_WORDS + 1].join(" ");
+        assert!(!is_oversized_for_title(&at_max));
+        assert!(is_oversized_for_title(&over_max));
+    }
+
+    #[test]
+    fn validate_title_rejects_oversized_conversational_response() {
+        assert!(validate_title(
+            "Please provide more context, a screenshot, or the name of the app you are referring to!"
+                .to_string()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_title_rejects_empty_and_echo() {
+        assert!(validate_title(String::new()).is_err());
+        assert!(validate_title("Generate conversation title".to_string()).is_err());
+    }
+
+    #[test]
+    fn validate_title_accepts_real_title() {
+        assert_eq!(
+            validate_title("Fix auth handshake bug".to_string()).unwrap(),
+            "Fix auth handshake bug"
+        );
     }
 }

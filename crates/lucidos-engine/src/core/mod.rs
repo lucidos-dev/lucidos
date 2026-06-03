@@ -5,9 +5,11 @@ pub mod blobs;
 pub mod changes;
 pub mod changes_projection;
 pub mod credentials;
+pub mod device_presence;
 pub mod devices;
 pub mod email;
 pub mod events;
+pub mod image_described_backfill;
 pub mod image_migration;
 pub mod intents;
 pub mod knowhow;
@@ -19,7 +21,6 @@ pub mod preferences;
 pub mod repositories;
 pub mod store;
 pub mod system_knowhow;
-pub mod thread_presence;
 pub mod user_dir;
 
 /// Get the database URL from the environment, with a default for local dev.
@@ -51,7 +52,7 @@ pub fn pg_env_vars_cached() -> &'static [(String, String)] {
 /// Returns an empty Vec if the URL doesn't match the expected shape — we'd
 /// rather skip the injection than emit a half-broken bundle that confuses
 /// libpq.
-pub fn pg_env_vars(database_url: &str) -> Vec<(String, String)> {
+pub(crate) fn pg_env_vars(database_url: &str) -> Vec<(String, String)> {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"^postgres(?:ql)?://([^:@/?]+):([^@/?]*)@([^:/?]+)(?::(\d+))?/([^?]+)")
             .expect("postgres URL regex must compile")
@@ -292,9 +293,9 @@ pub use preferences::{
 };
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, ResponseEvent, SessionMessage, Step,
-    ThreadEventRow, ThreadInfo,
+    ThreadEventRow, ThreadSummary,
 };
-pub use thread_presence::ThreadPresenceStore;
+pub use device_presence::DevicePresenceStore;
 
 /// Reset the index to match HEAD's tree before staging — drops any entries
 /// left behind by a previous `commit_*` call that staged but didn't commit
@@ -312,6 +313,54 @@ pub fn reset_index_to_head(
     Ok(())
 }
 
+/// Brand-new workspace: write `lucidos.toml` pinning the allocated vite
+/// port and commit it via the engine's git identity (see `commit_index`),
+/// so `git status` is clean from the first boot and the port survives any
+/// future `port-registry` drift.
+///
+/// Returns `true` when a commit was made, `false` when `lucidos.toml`
+/// already exists (in which case the file is left strictly untouched —
+/// the user may have hand-edited a pin to a different port and we don't
+/// clobber that). The caller (engine startup) gates this on "the
+/// workspace was just git-init'd by us" so existing workspaces don't get
+/// surprised by a freshly-pinned port on a later engine boot.
+///
+/// Crash-safety: if the commit phase fails after the file has been
+/// written, the file is removed so the working tree stays clean. The
+/// engine gate is one-shot — next boot won't retry the pin — but at
+/// least the workspace isn't left permanently dirty with an untracked
+/// lucidos.toml, which would defeat the whole point of the change.
+pub fn pin_workspace_vite_port(
+    workspace: &std::path::Path,
+    vite_port: u16,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let path = workspace.join("lucidos.toml");
+    if path.exists() {
+        return Ok(false);
+    }
+    let body = format!("[ports]\nvite = {}\n", vite_port);
+    std::fs::write(&path, body)?;
+
+    match commit_new_lucidos_toml(workspace) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(e)
+        }
+    }
+}
+
+fn commit_new_lucidos_toml(
+    workspace: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let repo = git2::Repository::open(workspace)?;
+    let mut index = repo.index()?;
+    index.add_path(std::path::Path::new("lucidos.toml"))?;
+    index.write()?;
+    commit_index(&repo, "chore: pin workspace vite port")?;
+    Ok(())
+}
+
 /// Create a commit from the current index state.
 pub fn commit_index(repo: &git2::Repository, message: &str) -> Result<String, git2::Error> {
     let mut index = repo.index()?;
@@ -326,6 +375,22 @@ pub fn commit_index(repo: &git2::Repository, message: &str) -> Result<String, gi
     let commit_id = repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)?;
 
     Ok(commit_id.to_string())
+}
+
+/// Reject paths that would escape the directory they get joined onto: any `..`
+/// component, or an absolute path (leading `/` or `\`). This is the single
+/// canonical traversal guard for the whole engine — HTTP handlers (`data_api`,
+/// `artifacts`, `apps`, `repositories`), LLM file tools (`search`, `import`,
+/// `image`, `email`, `intents`), the proxy script runner, and script triggers
+/// all funnel through it (directly, or via `crate::api::is_path_traversal`,
+/// which re-exports this), so the rule can never drift between call sites.
+///
+/// Deliberately conservative: it matches `..` anywhere in the string (so even a
+/// filename like `a..b` is rejected) and does not normalize or percent-decode
+/// first. Both choices fail closed — a false positive costs a rejected request,
+/// a false negative costs a path escape.
+pub fn is_path_traversal(path: &str) -> bool {
+    path.contains("..") || path.starts_with('/') || path.starts_with('\\')
 }
 
 /// Check if a file extension indicates a binary (non-text) file.
@@ -367,21 +432,31 @@ pub fn is_binary_extension(ext: &str) -> bool {
     )
 }
 
-/// Parse YAML frontmatter from a markdown file.
-/// Extracts `name:` and a configurable list field (e.g., `knowhow:`).
-/// Returns (name, list_values, body) or None if no valid frontmatter.
-pub fn parse_md_frontmatter(text: &str, list_field: &str) -> Option<(String, Vec<String>, String)> {
+/// Lower-level split: pull the `---\n...\n---\n` YAML header off a markdown
+/// file. Returns the trimmed frontmatter block and the body, or None if the
+/// document doesn't start with a frontmatter delimiter or doesn't have a
+/// closing `---`. The two field-specific parsers below (`parse_md_frontmatter`
+/// for `name` + list field; `knowhow::parse_frontmatter` for `name` +
+/// scalar `description`) share this prefix; each parses its own fields
+/// because their downstream semantics diverge (list-vs-scalar field type;
+/// description has a derive-from-body fallback that knowhow needs but
+/// `parse_md_frontmatter`'s callers don't).
+pub(crate) fn split_md_frontmatter(text: &str) -> Option<(&str, String)> {
     if !text.starts_with("---") {
         return None;
     }
-
     let parts: Vec<&str> = text.splitn(3, "---").collect();
     if parts.len() < 3 {
         return None;
     }
+    Some((parts[1].trim(), parts[2].trim_start_matches('\n').to_string()))
+}
 
-    let frontmatter = parts[1].trim();
-    let body = parts[2].trim_start_matches('\n').to_string();
+/// Parse YAML frontmatter from a markdown file.
+/// Extracts `name:` and a configurable list field (e.g., `knowhow:`).
+/// Returns (name, list_values, body) or None if no valid frontmatter.
+pub(crate) fn parse_md_frontmatter(text: &str, list_field: &str) -> Option<(String, Vec<String>, String)> {
+    let (frontmatter, body) = split_md_frontmatter(text)?;
 
     let mut name = None;
     let mut list_values = Vec::new();

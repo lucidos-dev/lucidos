@@ -1,5 +1,6 @@
-import { request, requestText, requestVoid, getBaseUrl } from './_fetch';
+import { apiUrl, getBaseUrl, request, requestText, requestVoid } from './_fetch';
 import { assertArray } from './_validate';
+import { parseAppId } from './scroll';
 
 export interface WriteResult {
   success: boolean;
@@ -37,11 +38,11 @@ export interface EditOperation {
 
 export const data = {
   read(path: string): Promise<string> {
-    return requestText(`/api/v1/data/${encodePathSegments(path)}`);
+    return requestText(`/data/${encodePathSegments(path)}`);
   },
 
   write(path: string, content: string): Promise<WriteResult> {
-    return request('/api/v1/data/' + encodePathSegments(path), {
+    return request('/data/' + encodePathSegments(path), {
       method: 'PUT',
       headers: { 'Content-Type': 'text/plain' },
       body: content,
@@ -49,14 +50,14 @@ export const data = {
   },
 
   delete(path: string): Promise<void> {
-    return requestVoid('/api/v1/data/' + encodePathSegments(path), {
+    return requestVoid('/data/' + encodePathSegments(path), {
       method: 'DELETE',
     });
   },
 
   list(pattern?: string): Promise<string[]> {
     const qs = pattern ? `?pattern=${encodeURIComponent(pattern)}` : '';
-    return request(`/api/v1/data${qs}`);
+    return request(`/data${qs}`);
   },
 
   url(path: string): string {
@@ -64,14 +65,32 @@ export const data = {
     // served by the static `/data` mount. Route it through the API endpoint
     // which dispatches to the engine's system_knowhow_dir.
     if (path.startsWith('system-knowhow/')) {
-      return `${getBaseUrl()}/api/v1/data/${encodePathSegments(path)}`;
+      return apiUrl(`/data/${encodePathSegments(path)}`);
+    }
+    // When the SDK runs inside an app iframe (`/app/<id>/...`) and the caller
+    // asks for the app's *own* bundled asset (`apps/<id>/foo.png`), route
+    // through `/app/<id>/foo.png?<carried>` instead of `/data/...`. The
+    // `/app/:app_id/*path` route honours `?thread_id=` (WIP preview from a
+    // coding-agent worktree) and `?commit=` (historical view) — the static
+    // `/data/` mount does not, so a JS-set src would 404 in WIP-preview even
+    // when the asset exists on the agent's branch. The engine's HTML rewriter
+    // (api/app_ui.rs) handles markup `<img src="…">` but skips `<script>`
+    // bodies, leaving JS-set src as the remaining footgun this closes.
+    if (typeof window !== 'undefined') {
+      const appUrl = buildAppLocalUrl(
+        path,
+        window.location.pathname,
+        window.location.search,
+        getBaseUrl(),
+      );
+      if (appUrl !== null) return appUrl;
     }
     return `${getBaseUrl()}/data/${encodePathSegments(path)}`;
   },
 
   edit(path: string, operations: EditOperation[]): Promise<void> {
     assertArray('operations', operations);
-    return requestVoid('/api/v1/data/edit', {
+    return requestVoid('/data/edit', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path, operations }),
@@ -81,7 +100,7 @@ export const data = {
   upload(file: File): Promise<UploadResult> {
     const formData = new FormData();
     formData.append('file', file);
-    return request('/api/v1/data/upload', {
+    return request('/data/upload', {
       method: 'POST',
       body: formData,
     }, 120000);
@@ -91,4 +110,42 @@ export const data = {
 /** Encode each segment of a path individually, preserving `/` separators. */
 function encodePathSegments(path: string): string {
   return path.split('/').map(encodeURIComponent).join('/');
+}
+
+/**
+ * If the SDK is loaded inside `/app/<currentAppId>/...` and `path` refers to
+ * an asset under the same app's folder (`apps/<currentAppId>/<rest>`), build
+ * the equivalent `/app/<currentAppId>/<rest>?<carried>` URL — carrying over
+ * `?thread_id=` or `?commit=` from the iframe so the asset request lands on
+ * the same WIP / historical / live branch as the iframe itself. Returns
+ * `null` for every other case so the caller falls through to the default
+ * `/data/...` mount (which serves from the live workspace).
+ *
+ * Exported for unit testing — the production call site reads `pathname` /
+ * `search` / `baseUrl` from `window` + `getBaseUrl()`.
+ */
+export function buildAppLocalUrl(
+  path: string,
+  pathname: string,
+  search: string,
+  baseUrl: string,
+): string | null {
+  const appId = parseAppId(pathname);
+  if (!appId) return null;
+  const prefix = `apps/${appId}/`;
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (!rest) return null;
+
+  const params = new URLSearchParams(search);
+  const carry = new URLSearchParams();
+  const threadId = params.get('thread_id');
+  const commit = params.get('commit');
+  if (threadId) carry.set('thread_id', threadId);
+  else if (commit) carry.set('commit', commit);
+  const qs = carry.toString();
+
+  const encodedAppId = encodeURIComponent(appId);
+  const encodedRest = encodePathSegments(rest);
+  return `${baseUrl}/app/${encodedAppId}/${encodedRest}${qs ? `?${qs}` : ''}`;
 }

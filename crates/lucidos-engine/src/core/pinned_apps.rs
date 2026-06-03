@@ -10,7 +10,9 @@ pub struct PinnedAppUi {
 pub struct PinnedAppStore;
 
 impl PinnedAppStore {
-    /// Initialize the pinned_apps table schema
+    /// Defensive double-write — the migration owns this CREATE TABLE
+    /// (see `20260517160627_consolidate_init_schema_tables.sql`). Slated
+    /// for removal in `harden-init-schema-tables-vs-migrations-pattern-finish`.
     pub async fn init_schema(
         pool: &PgPool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -43,14 +45,18 @@ impl PinnedAppStore {
         Ok(rows)
     }
 
-    /// Pin an app UI for a device (idempotent — ignores if already pinned)
+    /// Pin an app UI for a device (idempotent — ignores if already pinned).
+    /// Returns `true` if a new row was inserted, `false` if the
+    /// `(app_id, ui_id, device_id)` triple already existed. Callers gate
+    /// `PinnedAppPinned` audit emits on the bool so duplicate clicks don't
+    /// flood the events table.
     pub async fn pin(
         pool: &PgPool,
         app_id: &str,
         ui_id: &str,
         device_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        sqlx::query(
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let result = sqlx::query(
             "INSERT INTO pinned_apps (app_id, ui_id, device_id)
              VALUES ($1, $2, $3)
              ON CONFLICT (app_id, ui_id, device_id) DO NOTHING",
@@ -60,7 +66,7 @@ impl PinnedAppStore {
         .bind(device_id)
         .execute(pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Unpin an app UI for a device

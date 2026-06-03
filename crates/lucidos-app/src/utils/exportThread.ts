@@ -31,10 +31,15 @@ function triggerDownload(blob: Blob, filename: string): void {
 
 /** Wraps the events with workspace + title + exported_at so a JSON file
  *  attached to a bug report carries enough context to identify the thread
- *  without the report author having to type it out. */
+ *  without the report author having to type it out.
+ *
+ *  Passes `includeContext: true` so the dump retains `ContextCaptured.sections`
+ *  + `tools` — the snapshot endpoint strips these by default for the modal's
+ *  lazy-fetch path, but an export that drops the prompt sections defeats the
+ *  point of a bug-report attachment. */
 export async function exportThread(threadId: string, title: string): Promise<void> {
     try {
-        const snapshot = await fetchThreadEvents(threadId);
+        const snapshot = await fetchThreadEvents(threadId, { includeContext: true });
         const envelope = {
             exported_at: new Date().toISOString(),
             workspace: workspaceName.value || 'unknown',

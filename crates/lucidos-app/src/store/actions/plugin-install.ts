@@ -1,16 +1,21 @@
 import { panelOverlay, showToast, closeInlineForm } from '../store';
-import { confirmPluginInstall, cancelPluginInstall } from '../../api/client';
+import { ApiError, confirmPluginInstall, cancelPluginInstall } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 import { pushNavState } from './navigation';
+import { revealContentPane } from './pane';
 import type { PluginInstallRequest } from '../types';
 
 /** Open the plugin install panel for the staged install in `request`. The
  *  panel takes over the content pane (same surface as the credential
  *  request panel); user stays on whatever menu item they were on, and the
- *  panel resolves via Confirm/Cancel POSTs to the engine. */
+ *  panel resolves via Confirm/Cancel POSTs to the engine. Reveals the content
+ *  pane — this fires from an engine SSE event, so without it a mobile user (or
+ *  a desktop user with a collapsed split) never sees the panel that just
+ *  appeared. Mirrors the credential-request path (landOnAccountsWithOverlay). */
 export function openPluginInstallRequest(request: PluginInstallRequest): void {
   panelOverlay.value = { type: 'form', form: { type: 'plugin-install', request } };
   pushNavState();
+  revealContentPane();
 }
 
 /** User clicked Confirm — engine writes files into `data/`, emits
@@ -39,9 +44,13 @@ export async function cancelPluginInstallAction(installId: string): Promise<void
   try {
     await cancelPluginInstall(installId);
   } catch (e) {
-    // Log but don't block panel close — the user already decided. A 404
-    // (entry already gone) is the most likely failure and is harmless.
-    console.error('cancel plugin install failed:', e);
+    // 404/410 = entry already gone (harmless race with engine cleanup or a
+    // peer device's confirm/cancel); anything else means the temp dir likely
+    // wasn't dropped and the user — who explicitly clicked Cancel — should
+    // know it didn't take.
+    if (!(e instanceof ApiError) || (e.httpCode !== 404 && e.httpCode !== 410)) {
+      showToast(`Cancel plugin install failed: ${errorDetail(e)}`, 'error');
+    }
   }
   closeInlineForm();
 }

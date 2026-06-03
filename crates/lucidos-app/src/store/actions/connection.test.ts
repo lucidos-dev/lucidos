@@ -2,9 +2,12 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { panelOverlay, activeInlineForm, connectionStatus } from '../store';
 import type { CredentialRequest, EmailConfirmRequest } from '../types';
 
-// Mock all external dependencies so handleResume can run in isolation
+// Mock all external dependencies so handleResume can run in isolation.
 vi.mock('../../api/client', () => ({
-  checkHealth: vi.fn().mockResolvedValue({ workspace: 'test', workspace_path: '/tmp/test' }),
+  checkHealth: vi.fn().mockResolvedValue({
+    status: 'loaded',
+    data: { workspace: 'test', workspace_path: '/tmp/test' },
+  }),
   API_BASE: 'http://localhost:3000',
 }));
 vi.mock('./thread-sync', () => ({

@@ -5,7 +5,9 @@
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::core::AuthType;
 use crate::engine::thread_events::MessageOrigin;
+use crate::scheduler::notifications::Tap;
 
 /// System events — broadcast to SSE, selectively persisted.
 #[derive(Clone, Debug, Serialize)]
@@ -25,6 +27,22 @@ pub enum SystemEvent {
         /// the same value to push payloads for deep-linking.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thread_id: Option<String>,
+        /// Specific event UUID inside `thread_id` to scroll/pulse on land.
+        /// Lets a notification deep-link to the exact event it was raised for
+        /// (e.g. the `UserQuestionAsked` row the user should answer). Ignored
+        /// when `thread_id` is unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_id: Option<String>,
+        /// Where a tap should land. Defaults to `Tap::Modal` (open the inbox).
+        /// `Tap::Navigate { to }` deep-links via the same router the
+        /// `navigate_ui` LLM tool uses. See [`Tap`] for the wire shape.
+        #[serde(default)]
+        tap: Tap,
+        /// Who emitted the notification. Set by HTTP handlers via
+        /// `user_actor_resolved`; engine-internal sources (LLM tool, scheduler,
+        /// worktree cleanup, backup) pass `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
     },
     NotificationRead {
         id: String,
@@ -63,6 +81,25 @@ pub enum SystemEvent {
         size_bytes: u64,
     },
     BackupFailed {
+        error: String,
+    },
+    /// Restore progress tick. Transient (SSE-only). Mirrors the authoritative
+    /// `engine.restore_state` so a live client and a `GET /backup/restore-status`
+    /// refetch render the identical phase/percent.
+    RestoreProgress {
+        workspace_name: String,
+        phase: String,
+        progress: usize,
+        total: usize,
+    },
+    /// Restore finished — the new workspace is ready to start. Transient.
+    RestoreCompleted {
+        workspace_name: String,
+        workspace_path: String,
+    },
+    /// Restore failed. Transient; `error` is the user-facing message.
+    RestoreFailed {
+        workspace_name: String,
         error: String,
     },
     RecoveryProgress {
@@ -115,6 +152,41 @@ pub enum SystemEvent {
         trigger_id: String,
         payload: serde_json::Value,
     },
+    /// A user-visible folder that organizes triggers in the panel was created.
+    /// Pure label — has no schedule, runs no code, and does not coordinate trigger
+    /// firing. Each trigger may belong to at most one group via `group_id`;
+    /// ungrouped triggers render under an implicit "Ungrouped" section in the UI.
+    /// Payload: `{ group_id, name, order }`.
+    TriggerGroupCreated {
+        group_id: String,
+        payload: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The display name of a trigger group changed. Payload: `{ group_id, name }`.
+    TriggerGroupRenamed {
+        group_id: String,
+        payload: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The sort position of a trigger group changed. Payload: `{ group_id, order }`.
+    /// Batch reorders emit one event per moved group.
+    TriggerGroupReordered {
+        group_id: String,
+        payload: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A trigger group was deleted. Only emitted when the group has no members —
+    /// the HTTP handler rejects the delete with 409 otherwise so the LLM (or user)
+    /// can self-correct. Payload: `{ group_id }`.
+    TriggerGroupDeleted {
+        group_id: String,
+        payload: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// Domain event emitted via emit_event (e.g. SlideTextEdited, SleepImported).
     /// Persisted through EventBus with the inner `event_type` as the stored event type.
     /// Broadcast so the trigger subscriber can fire matching event-based triggers.
@@ -129,6 +201,14 @@ pub enum SystemEvent {
         depth: u32,
         #[serde(skip_serializing)]
         transient: bool,
+        /// Who emitted the domain event. Stamped by the HTTP handler via
+        /// `user_actor_resolved` so the UI can attribute the event to the
+        /// originating device/workspace; engine-internal sources (LLM tool,
+        /// scheduler) pass `None`. Merged into the wire payload by
+        /// `to_payload` and `to_sse_json` so persisted rows and SSE frames
+        /// carry the same `actor` key as every other actor-bearing event.
+        #[serde(skip_serializing)]
+        actor: Option<MessageOrigin>,
     },
     AppCreated {
         app_id: String,
@@ -145,6 +225,18 @@ pub enum SystemEvent {
         actor: Option<MessageOrigin>,
     },
     AppDeleted {
+        app_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// An app's iframe-bundled files changed in a way the open iframes need
+    /// to pick up. Emitted by the Apply path of an app coding-agent thread
+    /// when any merged file under `data/apps/<id>/` is an HTML / CSS / JS /
+    /// `manifest.json` / static asset (image, font, …). Transient — the SDK
+    /// in any open iframe of `app_id` listens via SSE and reloads its src.
+    /// Not persisted: the event is a UI signal, not an audit record (the
+    /// matching `ChangeApplied` already carries the file list).
+    AppUiRefreshRequested {
         app_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
@@ -188,18 +280,57 @@ pub enum SystemEvent {
     ChangeDiscarded {
         change_id: String,
     },
-    /// A device started focusing on a thread. Transient — projection lives in
-    /// the `thread_presence` table. Used by notification suppression so a
-    /// thread-scoped notification doesn't buzz the device already viewing it.
-    ThreadFocused {
-        thread_id: Uuid,
-        device_id: String,
+    /// A device has at least one visible Lucidos tab (any view, not scoped to
+    /// a thread). Transient — projection lives in `device_presence`. Used by
+    /// cross-device push suppression: if any device is visible we skip the
+    /// push to ALL devices and rely on the active device's `NotificationCreated`
+    /// SSE channel to render the in-app toast.
+    DeviceVisible { device_id: String },
+    /// A device has no more visible Lucidos tabs (last one hidden / blurred /
+    /// unloaded). Transient — removes the projection row.
+    DeviceHidden { device_id: String },
+    /// SSE-only, never persisted. Pure pong trigger — see
+    /// `system-knowhow/notifications.md` §3 (protocol, freshness gate). The
+    /// page answers with a pong; the engine then decides whether to fan out
+    /// the OS push OR instead emit [`Self::NotificationToastRequested`] (§4).
+    /// It deliberately carries NO toast content: the in-app toast is no
+    /// longer rendered on PresenceCheck receipt (that raced the push
+    /// decision and produced a toast-plus-push duplicate on slow links).
+    /// `sent_at_ms` lets the page drop a late ping (iOS PWA SSE-queue flush)
+    /// so a stale pong doesn't arrive after the engine already decided.
+    PresenceCheck {
+        notification_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_id: Option<Uuid>,
+        deadline_ms: u32,
+        sent_at_ms: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
     },
-    /// A device stopped focusing on a thread (visibility hidden, blur, switch,
-    /// or unload). Transient — removes the projection row.
-    ThreadUnfocused {
-        thread_id: Uuid,
-        device_id: String,
+    /// SSE-only, never persisted. The engine emits this AFTER the
+    /// PresenceCheck (§3) resolves to "an active device exists → suppress the
+    /// OS push": it tells active pages to render the in-app toast (§4).
+    /// Because it is emitted ONLY on the push-suppressed branch (and the OS
+    /// push is emitted ONLY on the complementary branch), a device can never
+    /// receive both a toast and a push for the same notification — they are
+    /// mutually exclusive by the engine's single decision, not by a page-side
+    /// timing race. Carries the toast content so the page renders without a
+    /// re-fetch; `sent_at_ms` drives the page-side freshness gate (drop a
+    /// toast that flushes late after an iOS PWA resume).
+    NotificationToastRequested {
+        notification_id: Uuid,
+        title: String,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_id: Option<String>,
+        /// Defaults to `Tap::Modal` (open inbox) so omitting it stays safe.
+        #[serde(default)]
+        tap: Tap,
+        sent_at_ms: i64,
     },
     /// A plugin was installed (or updated — overwrite=true reuses this variant).
     /// `manifest` carries the full parsed manifest so future fields are additive.
@@ -257,6 +388,122 @@ pub enum SystemEvent {
     /// keystroke history isn't audit-worthy. Receivers reconcile via the
     /// `origin_device_id` echo check + "don't clobber my focused textarea"
     /// guard described in `docs/plans/2026-05-03-threads-as-drafts-design.md`.
+    /// A device pinned an app to its home / dock surface. Audit-worthy because
+    /// the pinned set is what powers the app launcher on that device.
+    PinnedAppPinned {
+        app_id: String,
+        device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A device unpinned an app. Symmetric to `PinnedAppPinned`.
+    PinnedAppUnpinned {
+        app_id: String,
+        device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A device registered with the engine for the first time. Persisted so
+    /// the timeline shows when each device became part of the workspace; the
+    /// `devices` table is the projection.
+    DeviceRegistered {
+        device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A device was renamed by the user. `name: None` clears back to the
+    /// `device-<short>` fallback.
+    DeviceRenamed {
+        device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    DevicePushChanged {
+        device_id: String,
+        push_enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A device row was deleted (typically the user revoked it from settings).
+    DeviceDeleted {
+        device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    RepositoryAdded {
+        repo_id: String,
+        name: String,
+        root_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    RepositoryRemoved {
+        repo_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A credential entry was created. **Never** carry the auth value here —
+    /// the payload reaches every SSE subscriber on every connected device.
+    /// The service identifier is the only public field.
+    CredentialCreated {
+        service_name: String,
+        auth_type: AuthType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A credential's auth value was updated. Same secrecy contract as
+    /// `CredentialCreated` — only the service id is broadcast.
+    CredentialUpdated {
+        service_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A credential entry was removed.
+    CredentialDeleted {
+        service_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// An OAuth account row was removed (revoke / delete from settings).
+    OAuthAccountDeleted {
+        account_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A `PUT /api/v1/data/*path` write committed (file created or replaced).
+    /// `commit` is the resulting git sha when the path lives under `artifacts/`
+    /// (manager-committed); empty for non-artifact paths that bypass the
+    /// artifact-manager commit dance.
+    DataFileWritten {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A `DELETE /api/v1/data/*path` removed a file.
+    DataFileDeleted {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A `POST /api/v1/data/edit` ran one or more in-place operations
+    /// (JSON-path or text find/replace). `operations_count` records how many
+    /// op-blocks were applied; the per-op detail isn't broadcast because the
+    /// values may carry user data we don't want to fan out to every SSE
+    /// subscriber.
+    DataFileEdited {
+        path: String,
+        operations_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     ThreadComposeChanged {
         id: Uuid,
         text: String,
@@ -269,6 +516,87 @@ pub enum SystemEvent {
         mode: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_device_id: Option<String>,
+    },
+    /// Apply All started. Persists the full list of change IDs so the
+    /// engine can resume the batch after a mid-flight conflict or an engine
+    /// restart — the driver looks up the in-memory `ApplyAllRegistry`
+    /// (recovered from this event on startup) when each member resolves.
+    ApplyAllBatchStarted {
+        /// Engine-assigned batch identifier — used as `aggregate_id` so the
+        /// projection groups all events for one batch together.
+        batch_id: Uuid,
+        /// Change IDs to apply, in pending-list order. The driver picks
+        /// `next_pending` from this list.
+        change_ids: Vec<Uuid>,
+        /// Who clicked Apply All. Stamps each per-change `apply_change` the
+        /// driver makes so the resulting `ChangeApplied` chip reads as the
+        /// user, not "Lucidos Engine".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// Every member of an `ApplyAllBatchStarted` has resolved (applied or
+    /// failed). Closes the batch so projections and UI know the run is
+    /// over. Emitted by the driver only — the canonical signal that batch
+    /// state can be dropped from memory.
+    ApplyAllBatchCompleted {
+        batch_id: Uuid,
+        applied: Vec<Uuid>,
+        /// Per-change failures in the order they landed. Empty when the
+        /// whole batch succeeded.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failed: Vec<crate::engine::apply_all_batches::ApplyFailure>,
+    },
+    /// Bash supervisor (`scripts/lib/engine_supervisor.sh`) wrapped an
+    /// engine instance that died with a non-graceful exit code (anything
+    /// other than 0 / 130 / 138) and is spawning its replacement. The
+    /// supervisor writes a sidecar JSON file at
+    /// `<workspace>/.lucidos/engine.last-death.json` before respawning;
+    /// the next engine reads + emits + deletes the file at startup, so
+    /// the audit timeline records the respawn even though it happens
+    /// while the engine is dead. `supervisor_pid` distinguishes which
+    /// bash supervisor instance handled the respawn — useful when
+    /// multiple supervisors briefly coexist (restart races).
+    EngineSupervisorRespawned {
+        old_pid: u32,
+        exit_code: i32,
+        died_at: chrono::DateTime<chrono::Utc>,
+        supervisor_pid: u32,
+    },
+    /// Outbound email was sent successfully via SMTP. Carries only
+    /// envelope metadata (account, recipients, subject, attachment
+    /// count) — the message body is user data and stays out of the
+    /// audit trail. Emitted by the `/api/v1/email/send` HTTP handler so
+    /// the timeline records who sent what, when.
+    EmailSent {
+        /// Email account that performed the send (looked up in `email_accounts`).
+        account: String,
+        /// Primary recipients.
+        to: Vec<String>,
+        /// CC recipients. Empty when none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cc: Vec<String>,
+        /// BCC recipients. Empty when none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bcc: Vec<String>,
+        /// Subject line. Body intentionally omitted (user data).
+        subject: String,
+        /// How many files were attached. Body and contents intentionally omitted.
+        attachment_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The on-disk WASM auth-modules directory was re-scanned and the
+    /// engine's compiled-module map was swapped atomically. Persisted
+    /// because the reload changes runtime behavior of every subsequent
+    /// proxy call — a post-mortem of a suddenly-broken sign-handshake
+    /// reads this row to see when the surface changed and to what.
+    ProxyModulesReloaded {
+        /// Number of modules now loaded after the swap.
+        count: usize,
+        /// Sorted list of module names now loaded.
+        names: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
     },
 }
 
@@ -310,6 +638,10 @@ impl SystemEvent {
                 | Self::TriggerEnabled { .. }
                 | Self::TriggerDisabled { .. }
                 | Self::TriggerExecuted { .. }
+                | Self::TriggerGroupCreated { .. }
+                | Self::TriggerGroupRenamed { .. }
+                | Self::TriggerGroupReordered { .. }
+                | Self::TriggerGroupDeleted { .. }
                 | Self::TriggerCompleted { .. }
                 | Self::LanguageSet { .. }
                 | Self::TimezoneSet { .. }
@@ -322,6 +654,26 @@ impl SystemEvent {
                 | Self::PluginUninstalled { .. }
                 | Self::PluginInstallCanceled { .. }
                 | Self::PluginUninstallCanceled { .. }
+                | Self::PinnedAppPinned { .. }
+                | Self::PinnedAppUnpinned { .. }
+                | Self::DeviceRegistered { .. }
+                | Self::DeviceRenamed { .. }
+                | Self::DevicePushChanged { .. }
+                | Self::DeviceDeleted { .. }
+                | Self::RepositoryAdded { .. }
+                | Self::RepositoryRemoved { .. }
+                | Self::CredentialCreated { .. }
+                | Self::CredentialUpdated { .. }
+                | Self::CredentialDeleted { .. }
+                | Self::OAuthAccountDeleted { .. }
+                | Self::DataFileWritten { .. }
+                | Self::DataFileDeleted { .. }
+                | Self::DataFileEdited { .. }
+                | Self::ApplyAllBatchStarted { .. }
+                | Self::ApplyAllBatchCompleted { .. }
+                | Self::EngineSupervisorRespawned { .. }
+                | Self::EmailSent { .. }
+                | Self::ProxyModulesReloaded { .. }
         )
     }
 
@@ -336,6 +688,9 @@ impl SystemEvent {
             Self::BackupProgress { .. } => "BackupProgress",
             Self::BackupCompleted { .. } => "BackupCompleted",
             Self::BackupFailed { .. } => "BackupFailed",
+            Self::RestoreProgress { .. } => "RestoreProgress",
+            Self::RestoreCompleted { .. } => "RestoreCompleted",
+            Self::RestoreFailed { .. } => "RestoreFailed",
             Self::RecoveryProgress { .. } => "RecoveryProgress",
             Self::Toast { .. } => "Toast",
             Self::ArtifactImported { .. } => "ArtifactImported",
@@ -345,9 +700,14 @@ impl SystemEvent {
             Self::TriggerEnabled { .. } => "TriggerEnabled",
             Self::TriggerDisabled { .. } => "TriggerDisabled",
             Self::TriggerExecuted { .. } => "TriggerExecuted",
+            Self::TriggerGroupCreated { .. } => "TriggerGroupCreated",
+            Self::TriggerGroupRenamed { .. } => "TriggerGroupRenamed",
+            Self::TriggerGroupReordered { .. } => "TriggerGroupReordered",
+            Self::TriggerGroupDeleted { .. } => "TriggerGroupDeleted",
             Self::AppCreated { .. } => "AppCreated",
             Self::AppUpdated { .. } => "AppUpdated",
             Self::AppDeleted { .. } => "AppDeleted",
+            Self::AppUiRefreshRequested { .. } => "AppUiRefreshRequested",
             Self::DomainEvent { .. } => "DomainEvent",
             Self::ArtifactCreated { .. } => "ArtifactCreated",
             Self::ArtifactUpdated { .. } => "ArtifactUpdated",
@@ -357,13 +717,35 @@ impl SystemEvent {
             Self::RepositoryImported { .. } => "RepositoryImported",
             Self::TriggerCompleted { .. } => "TriggerCompleted",
             Self::ChangeDiscarded { .. } => "ChangeDiscarded",
-            Self::ThreadFocused { .. } => "ThreadFocused",
-            Self::ThreadUnfocused { .. } => "ThreadUnfocused",
+            Self::DeviceVisible { .. } => "DeviceVisible",
+            Self::DeviceHidden { .. } => "DeviceHidden",
+            Self::PresenceCheck { .. } => "PresenceCheck",
+            Self::NotificationToastRequested { .. } => "NotificationToastRequested",
             Self::PluginInstalled { .. } => "PluginInstalled",
             Self::PluginUninstalled { .. } => "PluginUninstalled",
             Self::PluginInstallCanceled { .. } => "PluginInstallCanceled",
             Self::PluginUninstallCanceled { .. } => "PluginUninstallCanceled",
             Self::ThreadComposeChanged { .. } => "ThreadComposeChanged",
+            Self::PinnedAppPinned { .. } => "PinnedAppPinned",
+            Self::PinnedAppUnpinned { .. } => "PinnedAppUnpinned",
+            Self::DeviceRegistered { .. } => "DeviceRegistered",
+            Self::DeviceRenamed { .. } => "DeviceRenamed",
+            Self::DevicePushChanged { .. } => "DevicePushChanged",
+            Self::DeviceDeleted { .. } => "DeviceDeleted",
+            Self::RepositoryAdded { .. } => "RepositoryAdded",
+            Self::RepositoryRemoved { .. } => "RepositoryRemoved",
+            Self::CredentialCreated { .. } => "CredentialCreated",
+            Self::CredentialUpdated { .. } => "CredentialUpdated",
+            Self::CredentialDeleted { .. } => "CredentialDeleted",
+            Self::OAuthAccountDeleted { .. } => "OAuthAccountDeleted",
+            Self::DataFileWritten { .. } => "DataFileWritten",
+            Self::DataFileDeleted { .. } => "DataFileDeleted",
+            Self::DataFileEdited { .. } => "DataFileEdited",
+            Self::ApplyAllBatchStarted { .. } => "ApplyAllBatchStarted",
+            Self::ApplyAllBatchCompleted { .. } => "ApplyAllBatchCompleted",
+            Self::EngineSupervisorRespawned { .. } => "EngineSupervisorRespawned",
+            Self::EmailSent { .. } => "EmailSent",
+            Self::ProxyModulesReloaded { .. } => "ProxyModulesReloaded",
         }
     }
 
@@ -383,6 +765,9 @@ impl SystemEvent {
         "BackupProgress",
         "BackupCompleted",
         "BackupFailed",
+        "RestoreProgress",
+        "RestoreCompleted",
+        "RestoreFailed",
         "RecoveryProgress",
         "Toast",
         "ArtifactImported",
@@ -392,9 +777,14 @@ impl SystemEvent {
         "TriggerEnabled",
         "TriggerDisabled",
         "TriggerExecuted",
+        "TriggerGroupCreated",
+        "TriggerGroupRenamed",
+        "TriggerGroupReordered",
+        "TriggerGroupDeleted",
         "AppCreated",
         "AppUpdated",
         "AppDeleted",
+        "AppUiRefreshRequested",
         "DomainEvent",
         "ArtifactCreated",
         "ArtifactUpdated",
@@ -404,13 +794,35 @@ impl SystemEvent {
         "RepositoryImported",
         "TriggerCompleted",
         "ChangeDiscarded",
-        "ThreadFocused",
-        "ThreadUnfocused",
+        "DeviceVisible",
+        "DeviceHidden",
+        "PresenceCheck",
+        "NotificationToastRequested",
         "PluginInstalled",
         "PluginUninstalled",
         "PluginInstallCanceled",
         "PluginUninstallCanceled",
         "ThreadComposeChanged",
+        "PinnedAppPinned",
+        "PinnedAppUnpinned",
+        "DeviceRegistered",
+        "DeviceRenamed",
+        "DevicePushChanged",
+        "DeviceDeleted",
+        "RepositoryAdded",
+        "RepositoryRemoved",
+        "CredentialCreated",
+        "CredentialUpdated",
+        "CredentialDeleted",
+        "OAuthAccountDeleted",
+        "DataFileWritten",
+        "DataFileDeleted",
+        "DataFileEdited",
+        "ApplyAllBatchStarted",
+        "ApplyAllBatchCompleted",
+        "EngineSupervisorRespawned",
+        "EmailSent",
+        "ProxyModulesReloaded",
         "ThreadEvent",
     ];
 
@@ -422,7 +834,8 @@ impl SystemEvent {
         match self {
             Self::NotificationCreated { .. }
             | Self::NotificationRead { .. }
-            | Self::NotificationsAllRead { .. } => "notification",
+            | Self::NotificationsAllRead { .. }
+            | Self::NotificationToastRequested { .. } => "notification",
             Self::PreferencesChanged { .. }
             | Self::LanguageSet { .. }
             | Self::TimezoneSet { .. } => "preference",
@@ -431,6 +844,9 @@ impl SystemEvent {
             | Self::BackupProgress { .. }
             | Self::BackupCompleted { .. }
             | Self::BackupFailed { .. }
+            | Self::RestoreProgress { .. }
+            | Self::RestoreCompleted { .. }
+            | Self::RestoreFailed { .. }
             | Self::RecoveryProgress { .. }
             | Self::Toast { .. } => "ops",
             Self::ArtifactImported { .. }
@@ -445,14 +861,41 @@ impl SystemEvent {
             | Self::TriggerDisabled { .. }
             | Self::TriggerExecuted { .. }
             | Self::TriggerCompleted { .. } => "trigger",
-            Self::AppCreated { .. } | Self::AppUpdated { .. } | Self::AppDeleted { .. } => "app",
+            Self::TriggerGroupCreated { .. }
+            | Self::TriggerGroupRenamed { .. }
+            | Self::TriggerGroupReordered { .. }
+            | Self::TriggerGroupDeleted { .. } => "trigger_group",
+            Self::AppCreated { .. }
+            | Self::AppUpdated { .. }
+            | Self::AppDeleted { .. }
+            | Self::AppUiRefreshRequested { .. } => "app",
             Self::DomainEvent { .. } => "domain",
-            Self::ThreadFocused { .. } | Self::ThreadUnfocused { .. } => "presence",
+            Self::DeviceVisible { .. } | Self::DeviceHidden { .. } => "device_presence",
+            Self::PresenceCheck { .. } => "presence",
             Self::PluginInstalled { .. }
             | Self::PluginUninstalled { .. }
             | Self::PluginInstallCanceled { .. }
             | Self::PluginUninstallCanceled { .. } => "plugin",
             Self::ThreadComposeChanged { .. } => "thread",
+            Self::PinnedAppPinned { .. } | Self::PinnedAppUnpinned { .. } => "pinned_app",
+            Self::DeviceRegistered { .. }
+            | Self::DeviceRenamed { .. }
+            | Self::DevicePushChanged { .. }
+            | Self::DeviceDeleted { .. } => "device",
+            Self::RepositoryAdded { .. } | Self::RepositoryRemoved { .. } => "repository",
+            Self::CredentialCreated { .. }
+            | Self::CredentialUpdated { .. }
+            | Self::CredentialDeleted { .. } => "credential",
+            Self::OAuthAccountDeleted { .. } => "oauth_account",
+            Self::DataFileWritten { .. }
+            | Self::DataFileDeleted { .. }
+            | Self::DataFileEdited { .. } => "data_file",
+            Self::ApplyAllBatchStarted { .. } | Self::ApplyAllBatchCompleted { .. } => {
+                "apply_all_batch"
+            }
+            Self::EngineSupervisorRespawned { .. } => "engine",
+            Self::EmailSent { .. } => "email",
+            Self::ProxyModulesReloaded { .. } => "proxy_modules",
         }
     }
 
@@ -471,14 +914,25 @@ impl SystemEvent {
             | Self::TriggerDisabled { trigger_id, .. }
             | Self::TriggerExecuted { trigger_id, .. } => trigger_id.clone(),
             Self::TriggerCompleted { trigger_id, .. } => trigger_id.clone(),
+            Self::TriggerGroupCreated { group_id, .. }
+            | Self::TriggerGroupRenamed { group_id, .. }
+            | Self::TriggerGroupReordered { group_id, .. }
+            | Self::TriggerGroupDeleted { group_id, .. } => group_id.clone(),
             Self::AppCreated { app_id, .. }
             | Self::AppUpdated { app_id, .. }
-            | Self::AppDeleted { app_id, .. } => app_id.clone(),
+            | Self::AppDeleted { app_id, .. }
+            | Self::AppUiRefreshRequested { app_id, .. } => app_id.clone(),
             Self::DomainEvent { event_type, .. } => event_type.clone(),
             Self::ChangeDiscarded { change_id } => change_id.clone(),
-            Self::ThreadFocused { thread_id, .. } | Self::ThreadUnfocused { thread_id, .. } => {
-                thread_id.to_string()
+            Self::DeviceVisible { device_id } | Self::DeviceHidden { device_id } => {
+                device_id.clone()
             }
+            Self::PresenceCheck {
+                notification_id, ..
+            }
+            | Self::NotificationToastRequested {
+                notification_id, ..
+            } => notification_id.to_string(),
             // Raw manifest is nested one layer in — see `InstalledRecord` for the path.
             Self::PluginInstalled { manifest, .. } => manifest
                 .get("manifest")
@@ -490,6 +944,35 @@ impl SystemEvent {
             Self::PluginInstallCanceled { id, .. } => id.clone(),
             Self::PluginUninstallCanceled { id, .. } => id.clone(),
             Self::ThreadComposeChanged { id, .. } => id.to_string(),
+            Self::PinnedAppPinned {
+                app_id, device_id, ..
+            }
+            | Self::PinnedAppUnpinned {
+                app_id, device_id, ..
+            } => {
+                // Composite id: a single app can be pinned independently on
+                // many devices, so the (app_id, device_id) pair is what
+                // identifies the row, not just app_id.
+                format!("{}@{}", app_id, device_id)
+            }
+            Self::DeviceRegistered { device_id, .. }
+            | Self::DeviceRenamed { device_id, .. }
+            | Self::DevicePushChanged { device_id, .. }
+            | Self::DeviceDeleted { device_id, .. } => device_id.clone(),
+            Self::RepositoryAdded { repo_id, .. } | Self::RepositoryRemoved { repo_id, .. } => {
+                repo_id.clone()
+            }
+            Self::CredentialCreated { service_name, .. }
+            | Self::CredentialUpdated { service_name, .. }
+            | Self::CredentialDeleted { service_name, .. } => service_name.clone(),
+            Self::OAuthAccountDeleted { account_id, .. } => account_id.clone(),
+            Self::DataFileWritten { path, .. }
+            | Self::DataFileDeleted { path, .. }
+            | Self::DataFileEdited { path, .. } => path.clone(),
+            Self::ApplyAllBatchStarted { batch_id, .. }
+            | Self::ApplyAllBatchCompleted { batch_id, .. } => batch_id.to_string(),
+            Self::EngineSupervisorRespawned { supervisor_pid, .. } => supervisor_pid.to_string(),
+            Self::EmailSent { account, .. } => account.clone(),
             _ => "global".into(),
         }
     }
@@ -501,9 +984,50 @@ impl SystemEvent {
             | Self::TriggerDeleted { payload, .. }
             | Self::TriggerEnabled { payload, .. }
             | Self::TriggerDisabled { payload, .. }
-            | Self::TriggerExecuted { payload, .. }
-            | Self::DomainEvent { payload, .. } => payload.clone(),
+            | Self::TriggerExecuted { payload, .. } => payload.clone(),
+            Self::TriggerGroupCreated { payload, actor, .. }
+            | Self::TriggerGroupRenamed { payload, actor, .. }
+            | Self::TriggerGroupReordered { payload, actor, .. }
+            | Self::TriggerGroupDeleted { payload, actor, .. } => {
+                merge_actor(payload.clone(), actor)
+            }
+            Self::DomainEvent { payload, actor, .. } => merge_actor(payload.clone(), actor),
             _ => serde_json::to_value(self).unwrap_or_default(),
         }
     }
 }
+
+/// Inject an `actor` key into the payload object when an actor is present.
+/// No-op for non-object payloads (domain events with primitive/array payloads)
+/// since `actor` is conventionally a top-level object field; callers that need
+/// to attribute a non-object payload should wrap it themselves. The drop is
+/// logged so it's visible in the engine log instead of silently swallowing
+/// the audit attribution.
+fn merge_actor(mut payload: serde_json::Value, actor: &Option<MessageOrigin>) -> serde_json::Value {
+    if let Some(a) = actor {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "actor".to_string(),
+                serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
+            );
+        } else {
+            crate::log!(
+                "[EventBus] WARNING: DomainEvent actor dropped — payload is not a JSON object (got: {}). \
+                 Wrap primitive/array payloads in an object so the actor can attach.",
+                match &payload {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => unreachable!(),
+                }
+            );
+        }
+    }
+    payload
+}
+
+#[cfg(test)]
+#[path = "event_bus_system_event_tests.rs"]
+mod tests;

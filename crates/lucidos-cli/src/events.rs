@@ -1,27 +1,7 @@
 use serde_json::{Map, Value};
 
-use crate::http::client as http_client;
+use crate::http::{client as http_client, send_and_print};
 use crate::workspace::{BoxError, Workspace};
-
-/// Send `req`, fail on non-2xx, and write the response body to stdout.
-fn send_and_print(
-    method: &str,
-    url: &str,
-    req: reqwest::blocking::RequestBuilder,
-) -> Result<(), BoxError> {
-    let resp = req
-        .send()
-        .map_err(|e| format!("{} {} failed: {}", method, url, e))?;
-    let status = resp.status();
-    let text = resp
-        .text()
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
-    if !status.is_success() {
-        return Err(format!("{} {} returned {}: {}", method, url, status, text).into());
-    }
-    println!("{}", text);
-    Ok(())
-}
 
 pub(crate) fn cmd_emit(
     ws: &Workspace,
@@ -38,7 +18,7 @@ pub(crate) fn cmd_emit(
 
     enforce_summary(obj, summary_override)?;
 
-    let url = format!("{}/api/events/emit", ws.base_url());
+    let url = format!("{}/api/v1/events/emit", ws.base_url());
     let body = serde_json::json!({
         "event_type": event_type,
         "payload": payload,
@@ -77,13 +57,43 @@ pub(crate) struct QueryFilters<'a> {
 }
 
 pub(crate) fn cmd_query(ws: &Workspace, filters: QueryFilters<'_>) -> Result<(), BoxError> {
-    let url = format!("{}/api/events/query", ws.base_url());
+    let url = format!("{}/api/v1/events/query", ws.base_url());
     let params = build_query_params(&filters);
     let mut req = http_client()?.get(&url);
     if !params.is_empty() {
         req = req.query(&params);
     }
     send_and_print("GET", &url, req)
+}
+
+pub(crate) struct CountFilters<'a> {
+    pub event_type: Option<&'a str>,
+    pub since: Option<&'a str>,
+    pub until: Option<&'a str>,
+}
+
+pub(crate) fn cmd_count(ws: &Workspace, filters: CountFilters<'_>) -> Result<(), BoxError> {
+    let url = format!("{}/api/v1/events/count", ws.base_url());
+    let params = build_count_params(&filters);
+    let mut req = http_client()?.get(&url);
+    if !params.is_empty() {
+        req = req.query(&params);
+    }
+    send_and_print("GET", &url, req)
+}
+
+fn build_count_params(filters: &CountFilters<'_>) -> Vec<(&'static str, String)> {
+    let mut params: Vec<(&'static str, String)> = Vec::new();
+    if let Some(t) = filters.event_type {
+        params.push(("type", t.to_string()));
+    }
+    if let Some(s) = filters.since {
+        params.push(("since", s.to_string()));
+    }
+    if let Some(u) = filters.until {
+        params.push(("until", u.to_string()));
+    }
+    params
 }
 
 /// Build the query-string params for `cmd_query`. Extracted so we can unit

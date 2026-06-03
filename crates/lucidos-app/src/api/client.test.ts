@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { cancelChat, fetchCCCommands, submitChat } from './client';
+import { cancelChat, checkHealth, fetchCCCommands, submitChat } from './client';
 
 // iOS Safari rejects with TypeError("Load failed") when the PWA's HTTP/2
 // connection is half-closed (typical after backgrounding). The service worker
@@ -32,7 +32,7 @@ describe('mutating fetch retry on TypeError', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
     const [url1, init1] = mockFetch.mock.calls[0];
     const [url2, init2] = mockFetch.mock.calls[1];
-    expect(url1).toContain('/api/chat/cancel');
+    expect(url1).toContain('/api/v1/chat/cancel');
     expect(url1).toBe(url2);
     expect(init1.method).toBe('POST');
     expect(init2.method).toBe('POST');
@@ -94,30 +94,107 @@ describe('fetchCCCommands url construction', () => {
   it('passes repo_id="" explicitly when repoId is empty string (default Lucidos)', async () => {
     await fetchCCCommands(undefined, '');
     const [url] = mockFetch.mock.calls[0];
-    expect(url).toBe('/api/claude-code/commands?repo_id=');
+    expect(url).toBe('/api/v1/claude-code/commands?repo_id=');
   });
 
   it('passes repo_id when a specific repoId is given', async () => {
     await fetchCCCommands(undefined, 'repo-uuid-123');
     const [url] = mockFetch.mock.calls[0];
-    expect(url).toBe('/api/claude-code/commands?repo_id=repo-uuid-123');
+    expect(url).toBe('/api/v1/claude-code/commands?repo_id=repo-uuid-123');
   });
 
   it('omits repo_id when repoId is undefined (no compose context)', async () => {
     await fetchCCCommands('thread-abc');
     const [url] = mockFetch.mock.calls[0];
-    expect(url).toBe('/api/claude-code/commands?thread_id=thread-abc');
+    expect(url).toBe('/api/v1/claude-code/commands?thread_id=thread-abc');
   });
 
   it('passes both thread_id and repo_id when both are given', async () => {
     await fetchCCCommands('thread-abc', 'repo-uuid-123');
     const [url] = mockFetch.mock.calls[0];
-    expect(url).toBe('/api/claude-code/commands?thread_id=thread-abc&repo_id=repo-uuid-123');
+    expect(url).toBe('/api/v1/claude-code/commands?thread_id=thread-abc&repo_id=repo-uuid-123');
   });
 
   it('omits the query string entirely when neither argument is given', async () => {
     await fetchCCCommands();
     const [url] = mockFetch.mock.calls[0];
-    expect(url).toBe('/api/claude-code/commands');
+    expect(url).toBe('/api/v1/claude-code/commands');
+  });
+});
+
+// The watchdog needs to tell a transport failure (engine unreachable, no
+// httpCode) from an HTTP failure (engine answered non-2xx, httpCode present)
+// to pick the right recovery action — both used to collapse to `null`.
+describe('checkHealth returns a discriminated Loadable shape', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockFetch = vi.fn();
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('returns failed (no httpCode) when fetch throws a transport error', async () => {
+    mockFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+
+    const result = await checkHealth();
+
+    expect(result.status).toBe('failed');
+    if (result.status === 'failed') {
+      expect(result.httpCode).toBeUndefined();
+      expect(result.error).toMatch(/Failed to fetch/i);
+    }
+  });
+
+  it('returns failed with httpCode when the engine returns a 5xx', async () => {
+    mockFetch.mockResolvedValueOnce(new Response('boom', { status: 503 }));
+
+    const result = await checkHealth();
+
+    expect(result.status).toBe('failed');
+    if (result.status === 'failed') {
+      expect(result.httpCode).toBe(503);
+    }
+  });
+
+  it('returns loaded with the parsed body when the engine answers 200', async () => {
+    const body = {
+      status: 'ok',
+      workspace: 'dev',
+      workspace_path: '/tmp/dev',
+      started_at: '2026-05-16T00:00:00Z',
+    };
+    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+
+    const result = await checkHealth();
+
+    expect(result.status).toBe('loaded');
+    if (result.status === 'loaded') {
+      expect(result.data.workspace).toBe('dev');
+      expect(result.data.workspace_path).toBe('/tmp/dev');
+      expect(result.data.started_at).toBe('2026-05-16T00:00:00Z');
+    }
+  });
+
+  it('transport failure and HTTP failure are distinguishable to the caller', async () => {
+    mockFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    const transport = await checkHealth();
+
+    mockFetch.mockResolvedValueOnce(new Response('', { status: 500 }));
+    const http = await checkHealth();
+
+    expect(transport.status).toBe('failed');
+    expect(http.status).toBe('failed');
+    if (transport.status === 'failed' && http.status === 'failed') {
+      expect(transport.httpCode).toBeUndefined();
+      expect(http.httpCode).toBe(500);
+    }
   });
 });

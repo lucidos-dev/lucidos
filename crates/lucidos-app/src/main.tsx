@@ -2,6 +2,8 @@ import { render } from 'preact';
 import { App } from './App';
 import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
+import { isTouchDevice } from './utils/viewport';
+import { openAppById } from './store/actions/apps';
 import './styles/global.css';
 import './styles/header.css';
 import './styles/panels.css';
@@ -14,12 +16,25 @@ import './styles/skills.css';
 import './styles/mobile.css';
 import './styles/drawer.css';
 import './store/effects';
+import './store/actions/wipPreview';
 
-if ('ontouchstart' in window || navigator.maxTouchPoints > 0) {
+if (isTouchDevice()) {
   document.body.classList.add('is-touch');
 }
 
 installActionBtnBlurListener();
+
+// E2E test hook — Playwright opens an app by id from `page.evaluate`. The
+// real `openApp(app: App)` requires an `App` object that the test doesn't
+// hold, and the production `openAppById` lives behind an ES import the
+// browser can't reach from `page.evaluate`. Gated on non-production builds
+// so the hook ships only in dev/test bundles — Lucidos's e2e runs against
+// the Vite dev server (`MODE === 'development'`) while the desktop release
+// build is `'production'`.
+if (import.meta.env.MODE !== 'production') {
+  (window as unknown as { __openApp?: (id: string) => Promise<void> }).__openApp =
+    openAppById;
+}
 
 render(<App />, document.getElementById('app')!);
 

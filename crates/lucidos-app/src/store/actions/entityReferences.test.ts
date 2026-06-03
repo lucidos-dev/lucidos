@@ -1,16 +1,38 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, pinnedApps } from '../store';
+import { panelOverlay, pinnedApps, credentials, oauthAccounts, repositories, artifacts } from '../store';
 import type { App } from '../types';
 
 // Mock loader functions to prevent API calls
 vi.mock('./apps', () => ({ loadApps: vi.fn() }));
 vi.mock('./triggers', () => ({ loadTriggers: vi.fn() }));
 vi.mock('./artifacts', () => ({ loadArtifacts: vi.fn() }));
+vi.mock('./credentials', () => ({ loadCredentials: vi.fn() }));
+vi.mock('./oauth', () => ({ loadOAuthAccounts: vi.fn() }));
+vi.mock('./repositoriesLoader', () => ({ loadRepositories: vi.fn() }));
+vi.mock('./devices', async () => {
+  const { signal } = await import('@preact/signals');
+  return {
+    loadDevices: vi.fn(),
+    devices: signal({ status: 'not-loaded' }),
+    getDeviceId: vi.fn(() => 'this-device'),
+  };
+});
+// Keep removePinnedAppLocal real (the AppDeleted test asserts on its effect),
+// stub loadPinnedApps so the PinnedApp* arms don't hit the network.
+vi.mock('./pinnedApps', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./pinnedApps')>()),
+  loadPinnedApps: vi.fn(),
+}));
 
 import { processSSEForReferences } from './entityReferences';
 import { loadApps } from './apps';
 import { loadTriggers } from './triggers';
 import { loadArtifacts } from './artifacts';
+import { loadCredentials } from './credentials';
+import { loadOAuthAccounts } from './oauth';
+import { loadRepositories } from './repositoriesLoader';
+import { loadDevices, devices } from './devices';
+import { loadPinnedApps } from './pinnedApps';
 
 const RECENTS_KEY = 'lucidos-search-recents';
 const NAV_KEY = 'lucidos-nav-history';
@@ -39,7 +61,14 @@ describe('processSSEForReferences', () => {
   beforeEach(() => {
     localStorage.clear();
     panelOverlay.value = null;
-    pinnedApps.value = [];
+    pinnedApps.value = { status: 'loaded', data: [] };
+    // Reset settings caches between tests so the gated-handler assertions
+    // can't leak `status: 'loaded'` across describe blocks.
+    credentials.value = { status: 'not-loaded' };
+    oauthAccounts.value = { status: 'not-loaded' };
+    repositories.value = { status: 'not-loaded' };
+    devices.value = { status: 'not-loaded' };
+    artifacts.value = { status: 'not-loaded' };
     vi.clearAllMocks();
   });
 
@@ -84,9 +113,9 @@ describe('processSSEForReferences', () => {
     });
 
     it('prunes from pinned apps signal', () => {
-      pinnedApps.value = [{ app_id: 'habit-tracker' }, { app_id: 'other-app' }];
+      pinnedApps.value = { status: 'loaded', data: [{ app_id: 'habit-tracker' }, { app_id: 'other-app' }] };
       processSSEForReferences('AppDeleted', { app_id: 'habit-tracker' });
-      expect(pinnedApps.value).toEqual([{ app_id: 'other-app' }]);
+      expect(pinnedApps.value).toEqual({ status: 'loaded', data: [{ app_id: 'other-app' }] });
     });
 
     it('closes app-ui overlay if matching app is open', () => {
@@ -124,7 +153,7 @@ describe('processSSEForReferences', () => {
 
     it('prunes trigger form entry from nav stack', () => {
       setNavStack([
-        { overlay: { type: 'form', form: { type: 'trigger', taskId: 'daily-check' } } },
+        { overlay: { type: 'form', form: { type: 'trigger', triggerId: 'daily-check' } } },
         { overlay: null },
       ], 0);
       processSSEForReferences('TriggerDeleted', { trigger_id: 'daily-check' });
@@ -134,7 +163,7 @@ describe('processSSEForReferences', () => {
     });
 
     it('closes trigger form overlay if matching trigger is open', () => {
-      panelOverlay.value = { type: 'form', form: { type: 'trigger', taskId: 'daily-check' } };
+      panelOverlay.value = { type: 'form', form: { type: 'trigger', triggerId: 'daily-check' } };
       processSSEForReferences('TriggerDeleted', { trigger_id: 'daily-check' });
       expect(panelOverlay.value).toBeNull();
     });
@@ -189,6 +218,25 @@ describe('processSSEForReferences', () => {
     it('calls loadArtifacts', () => {
       processSSEForReferences('ArtifactImported', { artifact_path: 'notes.md', source_type: 'local_file', source_detail: '/tmp/notes.md', commit_hash: 'abc' });
       expect(loadArtifacts).toHaveBeenCalled();
+    });
+  });
+
+  // ── Artifact*  (gated, emitted from CC apply) ────────────────────────────
+  describe('Artifact* events from change-apply', () => {
+    it('does not reload when artifacts cache is not-loaded', () => {
+      artifacts.value = { status: 'not-loaded' };
+      processSSEForReferences('ArtifactCreated', { artifact_path: 'a.md', commit: 'c', source: 'change_apply' });
+      processSSEForReferences('ArtifactUpdated', { artifact_path: 'a.md', commit: 'c', source: 'change_apply' });
+      processSSEForReferences('ArtifactDeleted', { artifact_path: 'a.md', commit: 'c' });
+      expect(loadArtifacts).not.toHaveBeenCalled();
+    });
+
+    it('reloads on each event when artifacts cache is loaded', () => {
+      artifacts.value = { status: 'loaded', data: [] };
+      processSSEForReferences('ArtifactCreated', { artifact_path: 'a.md', commit: 'c', source: 'change_apply' });
+      processSSEForReferences('ArtifactUpdated', { artifact_path: 'a.md', commit: 'c', source: 'change_apply' });
+      processSSEForReferences('ArtifactDeleted', { artifact_path: 'a.md', commit: 'c' });
+      expect(loadArtifacts).toHaveBeenCalledTimes(3);
     });
   });
 
@@ -339,6 +387,129 @@ describe('processSSEForReferences', () => {
       const nav = getNavStack()!;
       expect(nav.stack).toHaveLength(1);
       expect(nav.cursor).toBe(0);
+    });
+  });
+
+  // ── Settings-page caches (gated on `loaded`) ────────────────────────────
+  // The matching loader fires only when the matching cache is already loaded
+  // so cross-device events don't warm caches the user hasn't visited.
+
+  describe('Credential* events', () => {
+    it('does not reload when credentials cache is not-loaded', () => {
+      credentials.value = { status: 'not-loaded' };
+      processSSEForReferences('CredentialCreated', { service_name: 'openai' });
+      processSSEForReferences('CredentialUpdated', { service_name: 'openai' });
+      processSSEForReferences('CredentialDeleted', { service_name: 'openai' });
+      expect(loadCredentials).not.toHaveBeenCalled();
+    });
+
+    it('reloads on each event when credentials cache is loaded', () => {
+      credentials.value = { status: 'loaded', data: [] };
+      processSSEForReferences('CredentialCreated', { service_name: 'openai' });
+      processSSEForReferences('CredentialUpdated', { service_name: 'openai' });
+      processSSEForReferences('CredentialDeleted', { service_name: 'openai' });
+      expect(loadCredentials).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('OAuthAccountDeleted', () => {
+    it('does not reload when oauthAccounts cache is not-loaded', () => {
+      oauthAccounts.value = { status: 'not-loaded' };
+      processSSEForReferences('OAuthAccountDeleted', { account_id: 'acc-1' });
+      expect(loadOAuthAccounts).not.toHaveBeenCalled();
+    });
+
+    it('reloads when oauthAccounts cache is loaded', () => {
+      oauthAccounts.value = { status: 'loaded', data: [] };
+      processSSEForReferences('OAuthAccountDeleted', { account_id: 'acc-1' });
+      expect(loadOAuthAccounts).toHaveBeenCalled();
+    });
+  });
+
+  describe('Repository* events', () => {
+    it('does not reload when repositories cache is not-loaded', () => {
+      repositories.value = { status: 'not-loaded' };
+      processSSEForReferences('RepositoryAdded', { repo_id: 'r1', name: 'r', root_path: '/' });
+      processSSEForReferences('RepositoryRemoved', { repo_id: 'r1' });
+      expect(loadRepositories).not.toHaveBeenCalled();
+    });
+
+    it('reloads the registered-repos list only on Add/Remove (not Imported)', () => {
+      repositories.value = { status: 'loaded', data: [] };
+      processSSEForReferences('RepositoryAdded', { repo_id: 'r1', name: 'r', root_path: '/' });
+      processSSEForReferences('RepositoryRemoved', { repo_id: 'r1' });
+      expect(loadRepositories).toHaveBeenCalledTimes(2);
+    });
+
+    it('RepositoryImported refreshes artifacts (a clone into data/artifacts/), not the repo list', () => {
+      repositories.value = { status: 'loaded', data: [] };
+      artifacts.value = { status: 'loaded', data: [] };
+      processSSEForReferences('RepositoryImported', { url: 'u', branch: 'main', destination: 'd', file_count: 0, skipped_count: 0, commit: '0', files: [] });
+      expect(loadRepositories).not.toHaveBeenCalled();
+      expect(loadArtifacts).toHaveBeenCalledTimes(1);
+    });
+
+    it('RepositoryImported does not reload artifacts when that cache is not-loaded', () => {
+      artifacts.value = { status: 'not-loaded' };
+      processSSEForReferences('RepositoryImported', { url: 'u', branch: 'main', destination: 'd', file_count: 0, skipped_count: 0, commit: '0', files: [] });
+      expect(loadArtifacts).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('DataFile* events', () => {
+    it('reloads artifacts when an artifacts/ path changes and the cache is loaded', () => {
+      artifacts.value = { status: 'loaded', data: [] };
+      processSSEForReferences('DataFileWritten', { path: 'artifacts/notes.md' });
+      processSSEForReferences('DataFileEdited', { path: 'artifacts/notes.md', operations_count: 1 });
+      processSSEForReferences('DataFileDeleted', { path: 'artifacts/notes.md' });
+      expect(loadArtifacts).toHaveBeenCalledTimes(3);
+    });
+
+    it('ignores non-artifacts paths', () => {
+      artifacts.value = { status: 'loaded', data: [] };
+      processSSEForReferences('DataFileWritten', { path: 'config/apis.json' });
+      processSSEForReferences('DataFileEdited', { path: 'apps/foo/manifest.json', operations_count: 1 });
+      expect(loadArtifacts).not.toHaveBeenCalled();
+    });
+
+    it('does not reload when artifacts cache is not-loaded', () => {
+      artifacts.value = { status: 'not-loaded' };
+      processSSEForReferences('DataFileWritten', { path: 'artifacts/notes.md' });
+      expect(loadArtifacts).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('PinnedApp* events', () => {
+    it('reloads pinned apps when the event targets THIS device', () => {
+      processSSEForReferences('PinnedAppPinned', { app_id: 'a', device_id: 'this-device' });
+      processSSEForReferences('PinnedAppUnpinned', { app_id: 'a', device_id: 'this-device' });
+      expect(loadPinnedApps).toHaveBeenCalledTimes(2);
+    });
+
+    it('ignores events for a different device', () => {
+      processSSEForReferences('PinnedAppPinned', { app_id: 'a', device_id: 'other-device' });
+      processSSEForReferences('PinnedAppUnpinned', { app_id: 'a', device_id: 'other-device' });
+      expect(loadPinnedApps).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Device* events', () => {
+    it('does not reload when devices cache is not-loaded', () => {
+      devices.value = { status: 'not-loaded' };
+      processSSEForReferences('DeviceRegistered', { device_id: 'd1' });
+      processSSEForReferences('DeviceRenamed', { device_id: 'd1', name: 'phone' });
+      processSSEForReferences('DevicePushChanged', { device_id: 'd1', push_enabled: true });
+      processSSEForReferences('DeviceDeleted', { device_id: 'd1' });
+      expect(loadDevices).not.toHaveBeenCalled();
+    });
+
+    it('reloads on each event when devices cache is loaded', () => {
+      devices.value = { status: 'loaded', data: [] };
+      processSSEForReferences('DeviceRegistered', { device_id: 'd1' });
+      processSSEForReferences('DeviceRenamed', { device_id: 'd1', name: 'phone' });
+      processSSEForReferences('DevicePushChanged', { device_id: 'd1', push_enabled: true });
+      processSSEForReferences('DeviceDeleted', { device_id: 'd1' });
+      expect(loadDevices).toHaveBeenCalledTimes(4);
     });
   });
 });

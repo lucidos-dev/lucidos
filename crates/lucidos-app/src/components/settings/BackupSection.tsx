@@ -1,7 +1,8 @@
+import { Fragment, type VNode } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { backupProgress, backupListVersion, showToast } from '../../store/store';
+import { backupProgress, restoreState, backupListVersion, backupStatusVersion, showToast } from '../../store/store';
 import { grantOAuthScope } from '../../store/actions/oauth';
-import { formatDateTime } from '../../utils/formatTime';
+import { formatDateTime, formatTimeAgo } from '../../utils/formatTime';
 import { formatBytes } from '../../utils/formatBytes';
 import { Dropdown } from '../shared/Dropdown';
 import {
@@ -13,14 +14,18 @@ import {
   setBackupRetention,
   createBackup,
   listBackups,
+  getBackupStatus,
   restoreBackup,
+  getRestoreStatus,
+  clearRestoreStatus,
   validateWorkspaceName,
   startWorkspace,
   ApiError,
   type BackupEntry,
   type BackupProviderInfo,
   type BackupKeyResponse,
-  type RestoredWorkspace,
+  type BackupStatus,
+  type BackupLastRun,
   type ValidateNameResult,
 } from '../../api/client';
 import type { Loadable } from '../../store/types';
@@ -29,6 +34,7 @@ import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { errorDetail } from '../../utils/errorDetail';
 
 const PHASE_LABELS: Record<string, string> = {
+  starting: 'Starting...',
   estimating: 'Estimating...',
   dumping_db: 'Dumping database...',
   compressing: 'Compressing...',
@@ -74,18 +80,137 @@ const PROVIDER_SCOPES: Record<string, string> = {
   google_drive: 'https://www.googleapis.com/auth/drive.file',
 };
 
+/** How often to re-poll /backup/status while a backup is still running. */
+const STATUS_POLL_MS = 4000;
+
+type LiveProgress = { phase: string; progress: number; total: number } | null;
+
+/** Shared progress-bar fill used by both the health card and the restore flow.
+ *  Null when total is unknown (0) so the bar doesn't render a 0%/NaN width. */
+function progressBarFill(progress: { progress: number; total: number }): VNode | null {
+  if (progress.total <= 0) return null;
+  const pct = Math.round((progress.progress / progress.total) * 100);
+  return (
+    <div class="progress-bar">
+      <div class="progress-bar-fill" style={`width: ${pct}%`} />
+    </div>
+  );
+}
+
+/** Escalating wording for how long it's been since a good cloud backup. */
+function staleMessage(ageSeconds: number | null): string {
+  if (ageSeconds == null) return 'No cloud backup found — your data is not backed up';
+  if (ageSeconds >= 72 * 3600) return 'No successful backup in over 3 days';
+  if (ageSeconds >= 48 * 3600) return 'No successful backup in over 48 hours';
+  return 'No successful backup in over 24 hours';
+}
+
+/** "Last backup: ✓ succeeded 2h ago" / "✗ failed 5m ago — <error>". */
+function lastRunLine(lastRun: BackupLastRun | null): VNode | null {
+  if (!lastRun) return null;
+  const when = formatTimeAgo(new Date(lastRun.at));
+  if (lastRun.status === 'success') {
+    return (
+      <span class="backup-health-line">
+        Last backup: <span class="backup-health-success">{'✓'} succeeded {when}</span>
+      </span>
+    );
+  }
+  return (
+    <span class="backup-health-line">
+      Last backup:{' '}
+      <span class="backup-health-error">
+        {'✗'} failed {when}{lastRun.error ? ` — ${lastRun.error}` : ''}
+      </span>
+    </span>
+  );
+}
+
+/** The authoritative "last good cloud backup" line, escalated to a warning
+ *  when there's nothing recent. Suppressed when the provider couldn't be
+ *  listed — the muted list_error line speaks to that instead. */
+function cloudLine(s: BackupStatus): VNode | null {
+  if (s.list_error) return null;
+  if (!s.latest_backup) {
+    return <span class="backup-health-warn">{staleMessage(null)}</span>;
+  }
+  const when = formatTimeAgo(new Date(s.latest_backup.created_at));
+  const size = formatBytes(s.latest_backup.size_bytes);
+  if (s.stale) {
+    return (
+      <span class="backup-health-warn">
+        {staleMessage(s.age_seconds)} — last cloud backup {when} ({size})
+      </span>
+    );
+  }
+  return <span class="backup-health-ok">Last cloud backup: {when} ({size})</span>;
+}
+
+/** The backup health card shown at the top of the Backup section. Pure render
+ *  fn (no hooks) so it's unit-testable like `directoryPickerBody`. Answers:
+ *  running now? last run outcome? how old is the last good cloud backup? */
+export function backupHealthCard(props: {
+  status: Loadable<BackupStatus>;
+  liveProgress: LiveProgress;
+  providerName: string;
+}): VNode | null {
+  const { status, liveProgress, providerName } = props;
+
+  // Running takes precedence — driven by live SSE progress, or by the persisted
+  // `running` flag if the page loaded mid-backup before SSE reconnected.
+  const statusRunning = status.status === 'loaded' && status.data.running;
+  if (liveProgress || statusRunning) {
+    const phase = liveProgress ? (PHASE_LABELS[liveProgress.phase] || liveProgress.phase) : 'Working...';
+    return (
+      <div class="backup-health-card" data-state="running">
+        <span class="backup-health-line">Backup in progress — {phase}</span>
+        {liveProgress && progressBarFill(liveProgress)}
+      </div>
+    );
+  }
+
+  if (status.status === 'failed') {
+    return (
+      <div class="backup-health-card" data-state="failed">
+        <span class="backup-health-muted">Couldn't load backup status: {status.error}</span>
+      </div>
+    );
+  }
+  // not-loaded / loading: render nothing rather than flashing an empty card.
+  if (status.status !== 'loaded') return null;
+
+  const s = status.data;
+  return (
+    <div class="backup-health-card" data-state={s.stale ? 'stale' : 'idle'}>
+      {lastRunLine(s.last_run)}
+      {cloudLine(s)}
+      {s.list_error && (
+        <span class="backup-health-muted">Couldn't reach {providerName} to list backups</span>
+      )}
+    </div>
+  );
+}
+
+/** Whether to keep polling `/backup/status`. The engine holds
+ *  `backup_in_progress` set through post-backup pruning, so a refetch fired by
+ *  the terminal SSE can still read `running:true` and wedge the card on "Backup
+ *  in progress" forever. Poll until the flag clears — but skip while live
+ *  progress is flowing, since the terminal SSE will refresh us then. */
+export function shouldPollBackupStatus(status: Loadable<BackupStatus>, liveProgress: LiveProgress): boolean {
+  return status.status === 'loaded' && status.data.running && !liveProgress;
+}
+
 export function BackupSection() {
   const [providersLoadable, setProvidersLoadable] = useState<Loadable<BackupProviderInfo[]>>({ status: 'not-loaded' });
   const showProvidersLoading = useDelayedLoading(providersLoadable);
   const [selectedProvider, setSelectedProvider] = useState<string>('');
-  const [submittingBackup, setSubmittingBackup] = useState(false);
   const [keyInfo, setKeyInfo] = useState<BackupKeyResponse | null>(null);
   const [showKey, setShowKey] = useState(false);
   const [backupsLoadable, setBackupsLoadable] = useState<Loadable<BackupEntry[]>>({ status: 'not-loaded' });
   const showBackupsLoading = useDelayedLoading(backupsLoadable);
+  const [statusLoadable, setStatusLoadable] = useState<Loadable<BackupStatus>>({ status: 'not-loaded' });
   const [selectedBackupId, setSelectedBackupId] = useState<string | null>(null);
   const [restoreKey, setRestoreKey] = useState('');
-  const [restoring, setRestoring] = useState(false);
   const [schedule, setSchedule] = useState<string>('off');
   const [scheduleLoaded, setScheduleLoaded] = useState(false);
   const [scheduleSaving, setScheduleSaving] = useState(false);
@@ -96,7 +221,6 @@ export function BackupSection() {
   const [restoreWorkspaceName, setRestoreWorkspaceName] = useState('');
   const [nameValidation, setNameValidation] = useState<ValidateNameResult | null>(null);
   const [nameValidating, setNameValidating] = useState(false);
-  const [restoredWorkspace, setRestoredWorkspace] = useState<RestoredWorkspace | null>(null);
   const [startingWorkspace, setStartingWorkspace] = useState(false);
   const nameDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const nameSeqRef = useRef(0);
@@ -125,19 +249,79 @@ export function BackupSection() {
       setRetentionLoaded(true);
       showToast(`Failed to load backup retention: ${errorDetail(err)}`, 'error');
     });
+
+    // Re-attach to any in-flight (or just-finished) restore. This seeds the
+    // SAME restoreState shape the Restore* SSE events drive, so a page reloaded
+    // mid-restore shows the identical phase/percent — the stream and the refetch
+    // never diverge. Best-effort: a failed probe leaves restoreState null (no
+    // banner), and the next SSE event re-establishes it.
+    getRestoreStatus().then((s) => {
+      restoreState.value = s;
+    }).catch(() => { /* no banner until SSE or a successful later fetch */ });
   }, []);
 
-  const providers = providersLoadable.status === 'loaded' ? providersLoadable.data : [];
+  // Cancel any pending workspace-name validation debounce on unmount so a
+  // late timer can't call setNameValidation on a detached component.
+  useEffect(() => () => {
+    if (nameDebounceRef.current) clearTimeout(nameDebounceRef.current);
+  }, []);
 
-  const selectedReady = providers.find((p) => p.id === selectedProvider)?.ready ?? false;
+  const loadedProviders = providersLoadable.status === 'loaded' ? providersLoadable.data : null;
+
+  const providerOptions: { value: string; label: string }[] = (() => {
+    if (loadedProviders) return loadedProviders.map((p) => ({ value: p.id, label: p.name }));
+    if (providersLoadable.status === 'failed') return [{ value: '', label: 'Failed to load providers' }];
+    if (providersLoadable.status === 'loading' && showProvidersLoading) return [{ value: '', label: 'Loading providers...' }];
+    return [];
+  })();
+
+  const selectedReady = loadedProviders?.find((p) => p.id === selectedProvider)?.ready ?? false;
+
+  // Backup progress (BackupProgress SSE) is now backup-only — restore has its
+  // own RestoreProgress stream + restoreState, so there's no cross-labeling.
+  const progress = backupProgress.value;
+
+  // Restore UI is driven entirely by restoreState (seeded from getRestoreStatus
+  // on load, kept current by Restore* SSE) so a live page and a reloaded page
+  // render the identical phase/percent/result.
+  const restore = restoreState.value;
+  const restoring = restore?.status === 'running';
+  const restoreLiveProgress = restore?.status === 'running'
+    ? { phase: restore.phase, progress: restore.progress, total: restore.total }
+    : null;
+  const restoredWorkspace = restore?.status === 'completed'
+    ? { workspace_path: restore.workspace_path, workspace_name: restore.workspace_name }
+    : null;
+
   useEffect(() => {
     if (selectedProvider && selectedReady) {
-      loadBackups();
+      void loadBackups();
     }
   }, [selectedProvider, selectedReady, backupListVersion.value]);
 
+  // Backup health card — refetch on provider change and after every terminal
+  // backup SSE (backupStatusVersion bumps on BackupCompleted AND BackupFailed).
+  useEffect(() => {
+    if (selectedProvider && selectedReady) {
+      void loadStatus();
+    } else {
+      setStatusLoadable({ status: 'not-loaded' });
+    }
+  }, [selectedProvider, selectedReady, backupStatusVersion.value]);
+
+  // Poll while the engine still reports a backup running. The terminal SSE's
+  // refetch can read running:true during the post-backup pruning window (the
+  // engine clears backup_in_progress only after pruning), so without this the
+  // card could wedge on "Backup in progress" after the backup already finished.
+  useEffect(() => {
+    if (!selectedProvider || !selectedReady) return;
+    if (!shouldPollBackupStatus(statusLoadable, progress)) return;
+    const t = setTimeout(() => { void loadStatus(); }, STATUS_POLL_MS);
+    return () => clearTimeout(t);
+  }, [statusLoadable, progress, selectedProvider, selectedReady]);
+
   function selectedProviderInfo(): BackupProviderInfo | undefined {
-    return providers.find((p) => p.id === selectedProvider);
+    return loadedProviders?.find((p) => p.id === selectedProvider);
   }
 
   async function handleGrantAccess() {
@@ -167,7 +351,7 @@ export function BackupSection() {
       showToast(`${info.name} is not ready — grant access first`, 'error');
       return;
     }
-    setSubmittingBackup(true);
+    backupProgress.value = { phase: 'starting', progress: 0, total: 0 };
     try {
       await createBackup(selectedProvider);
     } catch (err) {
@@ -177,8 +361,6 @@ export function BackupSection() {
       } else {
         showToast(`Backup failed: ${errorDetail(err)}`, 'error');
       }
-    } finally {
-      setSubmittingBackup(false);
     }
   }
 
@@ -220,6 +402,17 @@ export function BackupSection() {
     }
   }
 
+  async function loadStatus() {
+    if (!selectedProvider) return;
+    setStatusLoadable({ status: 'loading' });
+    try {
+      const status = await getBackupStatus(selectedProvider);
+      setStatusLoadable({ status: 'loaded', data: status });
+    } catch (err) {
+      setStatusLoadable(toFailed(err));
+    }
+  }
+
   function handleNameChange(name: string) {
     setRestoreWorkspaceName(name);
     setNameValidation(null);
@@ -245,21 +438,31 @@ export function BackupSection() {
   async function handleRestore() {
     if (!selectedProvider || !selectedBackupId || !restoreKey.trim() || !restoreWorkspaceName.trim()) return;
     if (nameValidation && !nameValidation.valid) return;
-    setRestoring(true);
+    // Optimistically show "starting" so the bar appears before the first SSE.
+    // The engine immediately sets its own authoritative Running, and the
+    // Restore* SSE (or a reload's getRestoreStatus) keep it in lockstep.
+    restoreState.value = {
+      status: 'running',
+      workspace_name: restoreWorkspaceName.trim(),
+      phase: 'starting',
+      progress: 0,
+      total: 100,
+    };
     try {
-      const result = await restoreBackup(
-        selectedProvider,
-        selectedBackupId,
-        restoreKey.trim(),
-        restoreWorkspaceName.trim(),
-      );
-      setRestoredWorkspace(result);
-      showToast(`Workspace restored: ${result.workspace_name}`, 'success');
+      // 202 Accepted — the restore runs DETACHED on the engine and survives a
+      // tab reload/close. The outcome arrives via RestoreCompleted/RestoreFailed
+      // SSE; we must NOT await it here (that was the bug — a dropped request
+      // cancelled the restore mid-download).
+      await restoreBackup(selectedProvider, selectedBackupId, restoreKey.trim(), restoreWorkspaceName.trim());
     } catch (err) {
       showToast(`Restore failed: ${errorDetail(err)}`, 'error');
-    } finally {
-      setRestoring(false);
-      backupProgress.value = null;
+      // Reconcile with the engine's authoritative state — e.g. a 409 means a
+      // real restore is already running; don't clobber it with a fake "failed".
+      try {
+        restoreState.value = await getRestoreStatus();
+      } catch {
+        restoreState.value = { status: 'idle' };
+      }
     }
   }
 
@@ -268,11 +471,28 @@ export function BackupSection() {
     setStartingWorkspace(true);
     try {
       const result = await startWorkspace(restoredWorkspace.workspace_path);
-      window.open(result.url, '_blank');
+      if (result.ready) {
+        window.open(result.url, '_blank');
+      } else {
+        // Spawned but /health hasn't answered yet (first -b build can take
+        // minutes). Don't open a blank tab — tell the user to retry.
+        showToast('Workspace is still starting — click Open again in a moment.', 'warning');
+      }
     } catch (err) {
       showToast(`Failed to start workspace: ${errorDetail(err)}`, 'error');
     } finally {
       setStartingWorkspace(false);
+    }
+  }
+
+  async function handleDismissRestore() {
+    const prev = restoreState.value;
+    restoreState.value = { status: 'idle' };
+    try {
+      await clearRestoreStatus();
+    } catch (err) {
+      restoreState.value = prev;
+      showToast(`Failed to dismiss: ${errorDetail(err)}`, 'error');
     }
   }
 
@@ -310,21 +530,25 @@ export function BackupSection() {
   }
 
   const providerInfo = selectedProviderInfo();
-  const progress = backupProgress.value;
-  const progressLabel = progress ? (PHASE_LABELS[progress.phase] || progress.phase) : null;
-  // `submittingBackup` covers the POST-to-first-progress gap; SSE owns the rest.
-  const backingUp = submittingBackup || progress !== null;
+  const backingUp = progress !== null;
 
   return (
     <>
       <div class="settings-section">
         <div class="settings-section-title">Backup</div>
 
+        {backupHealthCard({
+          status: statusLoadable,
+          liveProgress: progress,
+          providerName: providerInfo?.name ?? selectedProvider,
+        })}
+
         <div class="settings-row" data-search-anchor="backup:provider">
           <span class="settings-row-label">Provider</span>
           <Dropdown
-            options={providers.map((p) => ({ value: p.id, label: p.name }))}
+            options={providerOptions}
             value={selectedProvider}
+            disabled={!loadedProviders}
             onChange={(v) => {
               setSelectedProvider(v);
               setBackupsLoadable({ status: 'not-loaded' });
@@ -384,19 +608,8 @@ export function BackupSection() {
           )}
         </div>
 
-        {backingUp && progress && (
-          <div style="margin-top: 0.5rem;">
-            {progress.total > 0 && (
-              <div class="progress-bar">
-                <div
-                  class="progress-bar-fill"
-                  style={`width: ${Math.round((progress.progress / progress.total) * 100)}%`}
-                />
-              </div>
-            )}
-            <span class="progress-label">{progressLabel}</span>
-          </div>
-        )}
+        {/* Live backup progress is shown by the health card at the top of this
+            section (backupHealthCard's running branch) — no duplicate bar here. */}
 
         <div style="display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.5rem;">
           <button
@@ -414,15 +627,49 @@ export function BackupSection() {
             </>
           )}
         </div>
-        {showKey && keyInfo?.is_new && (
+        {showKey && keyInfo && (
           <div style="font-size: 0.6875rem; color: var(--accent-red); margin-top: 0.25rem;">
-            Save this key — you need it to restore. It cannot be recovered.
+            Store this key somewhere safe — you need it to restore, and it cannot be recovered.
           </div>
         )}
       </div>
 
       <div class="settings-section">
         <div class="settings-section-title" data-search-anchor="backup:restore">Restore from backup</div>
+
+        {/* Restore status banner — driven entirely by restoreState (SSE + the
+            on-load getRestoreStatus seed), so it renders the same whether the
+            page watched the restore live or was reloaded mid-restore. Lives
+            outside the per-row form so it survives losing the row selection. */}
+        {restore && restore.status === 'running' && (
+          <div class="backup-health-card" data-state="running" style="margin-bottom: 0.75rem;">
+            <span class="backup-health-line">
+              Restoring "{restore.workspace_name}" — {PHASE_LABELS[restore.phase] || restore.phase}
+            </span>
+            {restoreLiveProgress && progressBarFill(restoreLiveProgress)}
+          </div>
+        )}
+        {restore && restore.status === 'completed' && (
+          <div class="backup-health-card" data-state="running" style="margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+            <span class="backup-health-line">
+              Restored "{restore.workspace_name}" to {restore.workspace_path}
+            </span>
+            <button
+              class="action-btn action-btn-confirm"
+              disabled={startingWorkspace}
+              onClick={handleOpenWorkspace}
+            >
+              {startingWorkspace ? (<><span class="mini-spinner" />{' Starting...'}</>) : 'Open workspace'}
+            </button>
+            <button class="action-btn" onClick={handleDismissRestore}>Dismiss</button>
+          </div>
+        )}
+        {restore && restore.status === 'failed' && (
+          <div class="backup-health-card" data-state="failed" style="margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+            <span class="backup-health-line">Restore failed: {restore.error}</span>
+            <button class="action-btn" onClick={handleDismissRestore}>Dismiss</button>
+          </div>
+        )}
 
         {backupsLoadable.status === 'loading' && showBackupsLoading && (
           <div class="loading-spinner" />
@@ -438,111 +685,80 @@ export function BackupSection() {
 
         {backupsLoadable.status === 'loaded' && backupsLoadable.data.length > 0 && (
           <div class="list-rows">
-            {backupsLoadable.data.map((b) => (
-              <div
-                class={`list-row ${selectedBackupId === b.id ? 'backup-selected' : ''}`}
-                key={b.id}
-                onClick={() => {
-                  if (selectedBackupId === b.id) {
-                    setSelectedBackupId(null);
-                    setRestoreWorkspaceName('');
-                    setNameValidation(null);
-                    setRestoredWorkspace(null);
-                  } else {
-                    setSelectedBackupId(b.id);
-                    const name = extractWorkspaceName(b.filename);
-                    setRestoreWorkspaceName(name);
-                    setNameValidation(null);
-                    setRestoredWorkspace(null);
-                    if (name) handleNameChange(name);
-                  }
-                }}
-              >
-                <div class="list-row-info">
-                  <div class="title">{b.filename}</div>
-                  <div class="list-row-details">
-                    <span>{formatDateTime(new Date(b.created_at))}</span>
-                    {' \u00b7 '}
-                    <span>{formatBytes(b.size_bytes)}</span>
+            {backupsLoadable.data.map((b) => {
+              const isSelected = selectedBackupId === b.id;
+              return (
+                <Fragment key={b.id}>
+                  <div
+                    class={`list-row ${isSelected ? 'backup-selected' : ''}`}
+                    onClick={() => {
+                      if (isSelected) {
+                        setSelectedBackupId(null);
+                        setRestoreWorkspaceName('');
+                        setNameValidation(null);
+                      } else {
+                        setSelectedBackupId(b.id);
+                        const name = extractWorkspaceName(b.filename);
+                        setRestoreWorkspaceName(name);
+                        setNameValidation(null);
+                        if (name) handleNameChange(name);
+                      }
+                    }}
+                  >
+                    <div class="list-row-info">
+                      <div class="title">{b.filename}</div>
+                      <div class="list-row-details">
+                        <span>{formatDateTime(new Date(b.created_at))}</span>
+                        {' \u00b7 '}
+                        <span>{formatBytes(b.size_bytes)}</span>
+                      </div>
+                    </div>
                   </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
 
-        {selectedBackupId && !restoredWorkspace && (
-          <div style="margin-top: 0.5rem; display: flex; flex-direction: column; gap: 0.5rem;">
-            <div style="display: flex; align-items: center; gap: 0.5rem;">
-              <input
-                type="text"
-                class="backup-key-input"
-                placeholder="Workspace name"
-                value={restoreWorkspaceName}
-                onInput={(e) => handleNameChange((e.target as HTMLInputElement).value)}
-              />
-              {nameValidating && <span class="mini-spinner" />}
-              {nameValidation && !nameValidation.valid && (
-                <span style="font-size: 0.6875rem; color: var(--accent-red);">
-                  {nameValidation.reason}
-                </span>
-              )}
-              {nameValidation?.valid && (
-                <span style="font-size: 0.6875rem; color: var(--accent-green);">Available</span>
-              )}
-            </div>
-            <div style="display: flex; align-items: center; gap: 0.75rem;">
-              <input
-                type="password"
-                class="backup-key-input"
-                placeholder="Enter backup key"
-                value={restoreKey}
-                onInput={(e) => setRestoreKey((e.target as HTMLInputElement).value)}
-              />
-              <button
-                class="action-btn action-btn-confirm"
-                disabled={restoring || !restoreKey.trim() || !restoreWorkspaceName.trim() || (nameValidation !== null && !nameValidation.valid)}
-                onClick={handleRestore}
-              >
-                {restoring ? 'Restoring...' : 'Restore'}
-              </button>
-            </div>
-          </div>
-        )}
-
-        {restoredWorkspace && (
-          <div style="margin-top: 0.5rem; display: flex; align-items: center; gap: 0.75rem;">
-            <span style="font-size: 0.6875rem; color: var(--text-muted);">
-              Restored to {restoredWorkspace.workspace_path}
-            </span>
-            <button
-              class="action-btn action-btn-confirm"
-              disabled={startingWorkspace}
-              onClick={handleOpenWorkspace}
-            >
-              {startingWorkspace ? (
-                <>
-                  <span class="mini-spinner" />
-                  {' Starting...'}
-                </>
-              ) : (
-                'Open workspace'
-              )}
-            </button>
-          </div>
-        )}
-
-        {restoring && progress && (
-          <div style="margin-top: 0.5rem;">
-            {progress.total > 0 && (
-              <div class="progress-bar">
-                <div
-                  class="progress-bar-fill"
-                  style={`width: ${Math.round((progress.progress / progress.total) * 100)}%`}
-                />
-              </div>
-            )}
-            <span class="progress-label">{progressLabel}</span>
+                  {isSelected && (
+                    <div style="padding: 0.5rem 0.75rem 0.75rem; display: flex; flex-direction: column; gap: 0.5rem;">
+                      <div style="display: flex; align-items: center; gap: 0.5rem;">
+                        <input
+                          type="text"
+                          class="backup-key-input"
+                          placeholder="Workspace name"
+                          value={restoreWorkspaceName}
+                          onInput={(e) => handleNameChange((e.target as HTMLInputElement).value)}
+                        />
+                        {nameValidating && <span class="mini-spinner" />}
+                        {nameValidation && !nameValidation.valid && (
+                          <span style="font-size: 0.6875rem; color: var(--accent-red);">
+                            {nameValidation.reason}
+                          </span>
+                        )}
+                        {nameValidation?.valid && (
+                          <span style="font-size: 0.6875rem; color: var(--accent-green);">Available</span>
+                        )}
+                      </div>
+                      <div style="display: flex; align-items: center; gap: 0.75rem;">
+                        <input
+                          type="password"
+                          class="backup-key-input"
+                          placeholder="Enter backup key"
+                          value={restoreKey}
+                          onInput={(e) => setRestoreKey((e.target as HTMLInputElement).value)}
+                        />
+                        <button
+                          class="action-btn action-btn-confirm"
+                          disabled={restoring || !restoreKey.trim() || !restoreWorkspaceName.trim() || (nameValidation !== null && !nameValidation.valid)}
+                          onClick={handleRestore}
+                        >
+                          {restoring ? 'Restoring...' : 'Restore'}
+                        </button>
+                      </div>
+                      {/* Live progress + the completed/failed result render in the
+                          restore-status banner above, so they survive a reload and
+                          don't depend on this row staying selected. */}
+                    </div>
+                  )}
+                </Fragment>
+              );
+            })}
           </div>
         )}
       </div>

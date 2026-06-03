@@ -1,9 +1,9 @@
 //! Per-thread coalescing of rapid-fire CC spawn requests.
 //!
 //! Phase 2 of the CC resume architecture (`docs/plans/2026-04-24-cc-resume-architecture.md`)
-//! makes every CC subprocess exit on idle. Without coalescing, two user messages
+//! makes every Claude Code subprocess exit on idle. Without coalescing, two user messages
 //! arriving within a few hundred milliseconds while CC is dead would each call
-//! `run_direct_agent` independently — racing two CC subprocesses against the
+//! `run_direct_agent` independently — racing two Claude Code subprocesses against the
 //! same worktree, or (under the prior 3-second debounce) silently dropping the
 //! second message with a "duplicate request" error.
 //!
@@ -388,7 +388,7 @@ mod tests {
     /// CC startup). Production previously passed `CC_SPAWN_DEBOUNCE` (250ms)
     /// as the leader-lock timeout, so a follow-up arriving in the multi-second
     /// spawn window after the debounce expired but before `clear()` was called
-    /// re-elected itself as a new leader and spawned a parallel CC subprocess
+    /// re-elected itself as a new leader and spawned a parallel Claude Code subprocess
     /// against the same worktree. The fix: the slot is held for the full
     /// `LEADER_LOCK_TIMEOUT` regardless of any caller-supplied window.
     #[test]
@@ -411,7 +411,7 @@ mod tests {
     }
 
     /// Regression for the bug Task 2.3 fixes: two CC spawn requests arriving
-    /// while no CC subprocess is alive must produce exactly one leader and one
+    /// while no Claude Code subprocess is alive must produce exactly one leader and one
     /// queued follower; the leader's combined input must contain BOTH
     /// messages in arrival order.
     #[test]

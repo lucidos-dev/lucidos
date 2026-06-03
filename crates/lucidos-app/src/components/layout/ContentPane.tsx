@@ -1,17 +1,19 @@
 import { useRef } from 'preact/hooks';
 import { activeMenuItem, panelOverlay, parseRepoPath, type PanelOverlay } from '../../store/store';
 import { useScrollMemory, contentScrollKey } from '../../hooks/useScrollMemory';
-import { FilesView } from '../files/FilesView';
-import { AppsView } from '../apps/AppsView';
-import { TriggersView } from '../triggers/TriggersView';
-import { SettingsView } from '../settings/SettingsView';
-import { ChangesView } from '../changes/ChangesView';
-import { NotificationsView } from '../notifications/NotificationsView';
-import { FilePreviewInline } from '../files/FilePreviewInline';
-import { RepoFilePreviewWithSidebar } from '../files/RepoFilePreview';
-import { UrlPreviewInline } from '../files/UrlPreviewInline';
-import { AppUiInline } from '../apps/AppUiInline';
-import { InlineForm } from './InlineForm';
+import { lazyComponent } from '../../utils/lazyComponent';
+
+const FilesView = lazyComponent(() => import('../files/FilesView').then(m => m.FilesView));
+const AppsView = lazyComponent(() => import('../apps/AppsView').then(m => m.AppsView));
+const TriggersView = lazyComponent(() => import('../triggers/TriggersView').then(m => m.TriggersView));
+const SettingsView = lazyComponent(() => import('../settings/SettingsView').then(m => m.SettingsView));
+const ChangesView = lazyComponent(() => import('../changes/ChangesView').then(m => m.ChangesView));
+const NotificationsView = lazyComponent(() => import('../notifications/NotificationsView').then(m => m.NotificationsView));
+const FilePreviewInline = lazyComponent(() => import('../files/FilePreviewInline').then(m => m.FilePreviewInline));
+const RepoFilePreviewWithSidebar = lazyComponent(() => import('../files/RepoFilePreview').then(m => m.RepoFilePreviewWithSidebar));
+const UrlPreviewInline = lazyComponent(() => import('../files/UrlPreviewInline').then(m => m.UrlPreviewInline));
+const AppUiInline = lazyComponent(() => import('../apps/AppUiInline').then(m => m.AppUiInline));
+const InlineForm = lazyComponent(() => import('./InlineForm').then(m => m.InlineForm));
 
 // Per-overlay scoping so scroll resets when switching between, say, two file
 // previews. Returns null when there's nothing to key on, so the hook skips.

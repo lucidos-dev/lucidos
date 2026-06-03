@@ -1,19 +1,23 @@
+import { useState } from 'preact/hooks';
 import { activeInlineForm, closeInlineForm, showToast } from '../../store/store';
 import { sendEmailConfirmed } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
+import { AutoTextarea } from '../shared/AutoTextarea';
 
 export function EmailConfirmModal() {
   const form = activeInlineForm.value;
   if (form?.type !== 'email-confirm') return null;
 
   const draft = form.request;
+  const [subject, setSubject] = useState(draft.subject);
+  const [body, setBody] = useState(draft.body);
 
   async function handleSend() {
     try {
       const result = await sendEmailConfirmed({
         to: draft.to,
-        subject: draft.subject,
-        body: draft.body,
+        subject,
+        body,
         cc: draft.cc,
         bcc: draft.bcc,
         reply_to_message_id: draft.reply_to_message_id,
@@ -22,13 +26,13 @@ export function EmailConfirmModal() {
       });
       if (result.success) {
         showToast('Email sent successfully', 'success');
+        closeInlineForm();
       } else {
         showToast(result.error || 'Failed to send email', 'error');
       }
-    } catch (e) {
-      showToast('Failed to send email: ' + errorDetail(e), 'error');
+    } catch (err) {
+      showToast('Failed to send email: ' + errorDetail(err), 'error');
     }
-    closeInlineForm();
   }
 
   return (
@@ -50,11 +54,15 @@ export function EmailConfirmModal() {
         )}
         <div class="form-group">
           <label>Subject</label>
-          <div style="padding: 0.25rem 0; color: var(--text-primary); font-weight: 500">{draft.subject}</div>
+          <input
+            type="text"
+            value={subject}
+            onInput={(e) => setSubject((e.target as HTMLInputElement).value)}
+          />
         </div>
         <div class="form-group">
           <label>Body</label>
-          <pre style="padding: 0.5rem; background: var(--bg-secondary); border-radius: 0.25rem; white-space: pre-wrap; font-size: 0.85rem; max-height: 18.75rem; overflow-y: auto; color: var(--text-primary)">{draft.body}</pre>
+          <AutoTextarea value={body} onInput={setBody} />
         </div>
         {draft.attachment_names && draft.attachment_names.length > 0 && (
           <div class="form-group">

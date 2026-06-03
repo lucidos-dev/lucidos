@@ -33,6 +33,10 @@ impl LucidosEngine {
         spawning_event_id: Option<Uuid>,
         cancel_token: &CancellationToken,
         chat_start: std::time::Instant,
+        // True when the caller knows no rapid-fire follow-up can arrive
+        // for this spawn (e.g. agent-spawned new thread via `run_thread`
+        // tool). Skips the 250ms debounce + leader-election entirely.
+        skip_coalesce: bool,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         log!(
             "[Chat] [TIMING] pre-CC overhead: {:?}",
@@ -42,7 +46,7 @@ impl LucidosEngine {
         let cc_model_str = cc_model.map(|s| s.to_string());
         let cc_effort_str = reasoning_effort.map(|s| s.to_string());
 
-        // Coalesce rapid-fire follow-ups arriving while no CC subprocess
+        // Coalesce rapid-fire follow-ups arriving while no Claude Code subprocess
         // is alive (Phase 2 made every CC exit on idle, so two messages
         // typed within ~250ms of each other both reach this branch).
         // The leader proceeds to spawn CC; followers queue their messages
@@ -50,11 +54,13 @@ impl LucidosEngine {
         // event-driven dispatcher will subsume this. See
         // `agent_session/cc_spawn_coalesce.rs` for the helper module.
         //
-        // Skip coalescing for conflict-resolution turns — those have a
-        // distinct lifecycle (per-merge worktree) and are never
-        // user-typed in rapid succession.
+        // Skip coalescing for: (a) conflict-resolution turns — distinct
+        // lifecycle (per-merge worktree), never user-typed in rapid
+        // succession; (b) caller-flagged `skip_coalesce` (agent-spawned
+        // new threads via `run_thread` — no user keyboard in the loop).
         const CC_SPAWN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
-        if conflict_change_id.is_none() {
+        let coalesce = conflict_change_id.is_none() && !skip_coalesce;
+        if coalesce {
             use crate::engine::agent_session::{LeaderElection, QueuedMessage};
             let my_msg = QueuedMessage {
                 text: user_message.to_string(),
@@ -93,13 +99,13 @@ impl LucidosEngine {
         // CC_SPAWN_DEBOUNCE land in our queue before we spawn. Single
         // messages still pay this cost, but a CC spawn takes 5-10s of
         // process startup anyway, so the overhead is in the noise. Skip
-        // for conflict resolution (no leader-election there).
-        if conflict_change_id.is_none() {
+        // when `coalesce` is false (conflict resolution / agent-spawn).
+        if coalesce {
             tokio::time::sleep(CC_SPAWN_DEBOUNCE).await;
         }
 
         // Drain any queued followups and combine with our own message.
-        let queued = if conflict_change_id.is_none() {
+        let queued = if coalesce {
             self.cc_spawn_coalesce.drain_queue(thread_id)
         } else {
             Vec::new()
@@ -119,7 +125,7 @@ impl LucidosEngine {
         }
         let combined_images_slice = combined_images.as_deref();
 
-        // Recover the prior CC session id from the event store so a follow-up
+        // Recover the prior Claude Code session id from the event store so a follow-up
         // after the in-memory entry was removed (subprocess died, engine
         // restart, change-less idle) still resumes the same conversation.
         // Without this, the resolver's auto-detect path returns no sid when
@@ -127,6 +133,12 @@ impl LucidosEngine {
         // CodingAgentIdled with a usable sid exists earlier in the timeline.
         let resume_sid =
             crate::engine::agent_session::lookup_latest_cc_session_id(&self.pool, thread_id).await;
+        // Direct run_direct_agent here is NOT a parallel path:
+        // `run_cc_chat_branch` IS the CC slow path of
+        // `process_message_with_steps_internal` (chat/process.rs's
+        // `use_claude_code == Some(true)` branch routes here). The
+        // unified router funnels every chat-driven and agent-driven CC
+        // turn through this call; it's the bottom of the funnel.
         let result = self
             .run_direct_agent(
                 request_id,
@@ -165,6 +177,9 @@ impl LucidosEngine {
                     &combined_text,
                 )
                 .await;
+                // Same as above: still inside the unified router. This
+                // is the stale-resume retry branch — fresh session with
+                // a reconstructed conversation prepended.
                 result = self
                     .run_direct_agent(
                         request_id,
@@ -188,8 +203,9 @@ impl LucidosEngine {
         }
         // Surface any follow-ups that arrived between drain and clear (a
         // small race window) as orphans so the caller re-routes them
-        // rather than dropping them silently.
-        if conflict_change_id.is_none() {
+        // rather than dropping them silently. Only relevant when we
+        // participated in the coalesce map at all.
+        if coalesce {
             let residual = self.cc_spawn_coalesce.clear(thread_id);
             if !residual.is_empty() {
                 let mut orphans = crate::engine::agent_session::queued_to_orphans(residual);

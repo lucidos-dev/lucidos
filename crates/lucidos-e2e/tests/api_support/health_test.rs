@@ -3,7 +3,7 @@ use crate::support::{base_url, http_client};
 #[tokio::test]
 async fn health_returns_ok() {
     let client = http_client();
-    let url = format!("{}/api/health", base_url());
+    let url = format!("{}/api/v1/health", base_url());
 
     let resp = client
         .get(&url)
@@ -23,7 +23,7 @@ async fn health_returns_ok() {
 #[tokio::test]
 async fn health_has_expected_fields() {
     let client = http_client();
-    let url = format!("{}/api/health", base_url());
+    let url = format!("{}/api/v1/health", base_url());
 
     let body: serde_json::Value = client
         .get(&url)

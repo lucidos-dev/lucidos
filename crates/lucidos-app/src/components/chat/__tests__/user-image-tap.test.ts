@@ -7,7 +7,10 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
+// user-image-thumb lives in UserMessageBody (chat-exchange-parts.tsx);
+// handleLinkClick stays in ChatExchange.tsx.
+const source = readFileSync(resolve(here, '../chat-exchange-parts.tsx'), 'utf-8');
+const chatExchangeSource = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
 
 /**
  * Regression: user-attached images live inside InitiatorPanel, not ResponsePanel.
@@ -20,14 +23,14 @@ const source = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
 describe('user-image-thumb tap opens popup', () => {
   it('the <img class="user-image-thumb"> element has its own onClick attached', () => {
     const match = source.match(/<img[\s\S]*?class="user-image-thumb"[\s\S]*?\/>/);
-    expect(match, 'user-image-thumb img element not found in ChatExchange.tsx').not.toBeNull();
+    expect(match, 'user-image-thumb img element not found in chat-exchange-parts.tsx').not.toBeNull();
     expect(match![0]).toMatch(/onClick=/);
   });
 
   it('handleLinkClick no longer references .user-image-thumb (dead delegation)', () => {
     // The handler is on .response-content; user images are in InitiatorPanel.
     // Listing .user-image-thumb in the closest() selector is dead code.
-    const handlerMatch = source.match(/function handleLinkClick[\s\S]*?\n\s*\}/);
+    const handlerMatch = chatExchangeSource.match(/function handleLinkClick[\s\S]*?\n\s*\}/);
     expect(handlerMatch).not.toBeNull();
     expect(handlerMatch![0]).not.toContain('user-image-thumb');
   });

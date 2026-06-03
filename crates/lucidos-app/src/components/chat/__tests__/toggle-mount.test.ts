@@ -69,9 +69,12 @@ describe('input mode toggle visibility', () => {
     expect(togglesFading).toBe(false);
   });
 
-  it('hides on terminal states (discarded, archived)', () => {
+  it('hides on the terminal state (discarded)', () => {
+    // Archived threads are NOT a separate compose-state value any more — they
+    // carry state='active' plus archive_state='archived' (orthogonal axes).
+    // Toggle visibility on archived rows is gated by the archive flag a
+    // layer up; this assertion only covers the compose-side terminal.
     expect(computeToggleVisibility('t1', false, 'discarded').togglesMounted).toBe(false);
-    expect(computeToggleVisibility('t1', false, 'archived').togglesMounted).toBe(false);
   });
 });
 

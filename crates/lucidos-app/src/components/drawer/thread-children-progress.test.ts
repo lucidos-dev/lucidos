@@ -1,11 +1,15 @@
 /**
- * Tests for children progress visibility in thread rows.
+ * Tests for children progress visibility in family toggle rows.
  *
- * Children progress ("X/Y done") must show on ALL thread rows that have
- * totalChildrenCount > 0 — regardless of section (Review, Running, Waiting,
- * Pinned, History) or whether the row is a search result.
+ * Children progress ("X/Y done") shows on the FamilyToggleRow that renders
+ * under any parent thread with totalChildrenCount > 0 — regardless of section
+ * (Review, Active, Waiting, Saved, Archive). The parent ThreadRow itself no
+ * longer carries the progress text; it lives on the chevron row to keep
+ * parent and leaf rows visually aligned and to ground the count next to its
+ * disclosure affordance.
  *
- * The waiting status icon (pulsing dot) must show when activeChildrenCount > 0.
+ * The waiting status icon (pulsing dot) must show on the parent row when
+ * activeChildrenCount > 0.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -26,16 +30,19 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
       createdAt: '2026-04-12T00:00:00Z',
       updatedAt: '2026-04-12T00:00:00Z',
       status: 'idle',
-      ccHasChanges: false,
-      ccRequiresRestart: false,
-      ccIsExternalRepo: false,
-      ccApplying: false,
+      codingAgentProposed: false,
+      codingAgentRequiresRestart: false,
+      codingAgentIsExternalRepo: false,
+      codingAgentApplying: false,
+      codingAgentHasDiff: false,
       lastRevivedAt: '',
       messageCount: 1,
       section: 'archived',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
+      blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
+      latestTodoList: null,
       ...overrides,
     },
     events: new Map(),
@@ -48,16 +55,18 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
 }
 
 /**
- * Replicate ThreadRow's rendering decisions for children progress.
- * This mirrors the logic in ThreadDrawer.tsx ThreadRow and SearchResultRow.
+ * Replicate FamilyToggleRow's rendering decisions for children progress.
+ * This mirrors the logic in ThreadDrawer.tsx FamilyToggleRow (which is
+ * rendered under any parent with totalChildrenCount > 0) and the visual-status
+ * resolution still performed on the parent ThreadRow / SearchResultRow.
  */
-function threadRowRenderState(meta: ThreadMeta, status: ThreadStatus) {
+function familyToggleRenderState(meta: ThreadMeta, status: ThreadStatus) {
   const hasChildren = meta.totalChildrenCount > 0;
   const doneCount = meta.totalChildrenCount - meta.activeChildrenCount;
   return {
     showChildrenProgress: hasChildren,
-    progressText: hasChildren ? `${doneCount}/${meta.totalChildrenCount} done` : null,
-    visualStatus: resolveVisualStatus(status, meta.activeChildrenCount > 0, meta.ccHasChanges),
+    progressText: hasChildren ? `${doneCount}/${meta.totalChildrenCount} sub-threads done` : null,
+    visualStatus: resolveVisualStatus(status, meta.activeChildrenCount > 0, meta.codingAgentProposed),
   };
 }
 
@@ -75,7 +84,7 @@ describe('children progress visibility', () => {
       { section: 'inbox', status: 'idle', saved: false, activeChildren: 0 },
       // Saved: default + saved + no active children
       { section: 'archived', status: 'idle', saved: true, activeChildren: 0 },
-      // History: default + not saved + no active children
+      // Archive: default + not saved + no active children
       { section: 'archived', status: 'idle', saved: false, activeChildren: 0 },
     ];
 
@@ -88,11 +97,11 @@ describe('children progress visibility', () => {
         activeChildrenCount: activeChildren,
       });
 
-      const display = displaySection(section, status, saved, activeChildren > 0, false);
-      const render = threadRowRenderState(thread.meta, status);
+      const display = displaySection(section, status, saved, activeChildren > 0, false, false);
+      const render = familyToggleRenderState(thread.meta, status);
 
       expect(render.showChildrenProgress).toBe(true);
-      expect(render.progressText).toBe(`${3 - activeChildren}/3 done`);
+      expect(render.progressText).toBe(`${3 - activeChildren}/3 sub-threads done`);
       // Verify this is a valid display section
       expect(['active', 'waiting', 'review', 'saved', 'archive']).toContain(display);
     }
@@ -100,7 +109,7 @@ describe('children progress visibility', () => {
 
   it('does not show progress when thread has no children', () => {
     const thread = makeThread('t1', { totalChildrenCount: 0, activeChildrenCount: 0 });
-    const render = threadRowRenderState(thread.meta, 'idle');
+    const render = familyToggleRenderState(thread.meta, 'idle');
 
     expect(render.showChildrenProgress).toBe(false);
     expect(render.progressText).toBeNull();
@@ -108,23 +117,31 @@ describe('children progress visibility', () => {
 
   it('shows 0/3 done when all children still active', () => {
     const thread = makeThread('t1', { totalChildrenCount: 3, activeChildrenCount: 3 });
-    const render = threadRowRenderState(thread.meta, 'idle');
+    const render = familyToggleRenderState(thread.meta, 'idle');
 
-    expect(render.progressText).toBe('0/3 done');
+    expect(render.progressText).toBe('0/3 sub-threads done');
   });
 
   it('shows 3/3 done when all children finished', () => {
     const thread = makeThread('t1', { totalChildrenCount: 3, activeChildrenCount: 0 });
-    const render = threadRowRenderState(thread.meta, 'idle');
+    const render = familyToggleRenderState(thread.meta, 'idle');
 
-    expect(render.progressText).toBe('3/3 done');
+    expect(render.progressText).toBe('3/3 sub-threads done');
   });
 
   it('shows 2/3 done when one child still active', () => {
     const thread = makeThread('t1', { totalChildrenCount: 3, activeChildrenCount: 1 });
-    const render = threadRowRenderState(thread.meta, 'idle');
+    const render = familyToggleRenderState(thread.meta, 'idle');
 
-    expect(render.progressText).toBe('2/3 done');
+    expect(render.progressText).toBe('2/3 sub-threads done');
+  });
+
+  // The "X/Y" form reads as a fraction, so the noun stays plural even when Y = 1.
+  it('keeps plural noun for the 1/1 case', () => {
+    const thread = makeThread('t1', { totalChildrenCount: 1, activeChildrenCount: 0 });
+    const render = familyToggleRenderState(thread.meta, 'idle');
+
+    expect(render.progressText).toBe('1/1 sub-threads done');
   });
 });
 
@@ -145,11 +162,11 @@ describe('visual status resolution', () => {
     expect(resolveVisualStatus('running', false, false)).toBe('running');
   });
 
-  it('no active children + waiting + ccHasChanges → changes (static dot)', () => {
+  it('no active children + waiting + codingAgentProposed → changes (static dot)', () => {
     expect(resolveVisualStatus('waiting', false, true)).toBe('changes');
   });
 
-  it('no active children + waiting without ccHasChanges → idle (no dot)', () => {
+  it('no active children + waiting without codingAgentProposed → idle (no dot)', () => {
     // Defensive: backend shouldn't park threads in 'waiting' without changes,
     // but historical chat threads (pre-fix ResponseAborted/Failed) might.
     expect(resolveVisualStatus('waiting', false, false)).toBe('idle');
@@ -159,7 +176,7 @@ describe('visual status resolution', () => {
     expect(resolveVisualStatus('waiting', true, false)).toBe('waiting');
   });
 
-  it('waiting + active children + ccHasChanges → changes (own changes win)', () => {
+  it('waiting + active children + codingAgentProposed → changes (own changes win)', () => {
     expect(resolveVisualStatus('waiting', true, true)).toBe('changes');
   });
 
@@ -179,47 +196,47 @@ describe('visual status resolution', () => {
     expect(resolveVisualStatus('waiting_for_user_answer', true, false)).toBe('question');
   });
 
-  it('idle + active children + ccHasChanges → changes (own changes win)', () => {
+  it('idle + active children + codingAgentProposed → changes (own changes win)', () => {
     expect(resolveVisualStatus('idle', true, true)).toBe('changes');
   });
 });
 
 describe('displaySection routing with children', () => {
   it('idle thread with active children goes to active section', () => {
-    expect(displaySection('archived', 'idle', false, true, false)).toBe('active');
+    expect(displaySection('archived', 'idle', false, true, false, false)).toBe('active');
   });
 
   it('idle thread with all children done goes to archive', () => {
-    expect(displaySection('archived', 'idle', false, false, false)).toBe('archive');
+    expect(displaySection('archived', 'idle', false, false, false, false)).toBe('archive');
   });
 
   it('inbox thread with active children goes to active (not review)', () => {
-    expect(displaySection('inbox', 'idle', false, true, false)).toBe('active');
+    expect(displaySection('inbox', 'idle', false, true, false, false)).toBe('active');
   });
 
   it('inbox thread with all children done goes to review', () => {
-    expect(displaySection('inbox', 'idle', false, false, false)).toBe('review');
+    expect(displaySection('inbox', 'idle', false, false, false, false)).toBe('review');
   });
 
   it('saved thread with active children goes to saved (save overrides everything)', () => {
-    expect(displaySection('archived', 'idle', true, true, false)).toBe('saved');
+    expect(displaySection('archived', 'idle', true, true, false, false)).toBe('saved');
   });
 
   it('saved thread with all children done goes to saved', () => {
-    expect(displaySection('archived', 'idle', true, false, false)).toBe('saved');
+    expect(displaySection('archived', 'idle', true, false, false, false)).toBe('saved');
   });
 
   it('running thread always goes to active regardless of children', () => {
-    expect(displaySection('archived', 'running', false, true, false)).toBe('active');
-    expect(displaySection('archived', 'running', false, false, false)).toBe('active');
+    expect(displaySection('archived', 'running', false, true, false, false)).toBe('active');
+    expect(displaySection('archived', 'running', false, false, false, false)).toBe('active');
   });
 
   it('archived thread with pending changes routes to review (no work lost behind archive)', () => {
-    expect(displaySection('archived', 'idle', false, false, true)).toBe('review');
+    expect(displaySection('archived', 'idle', false, false, true, false)).toBe('review');
   });
 
   it('saved thread with pending changes still saves (save wins over pending)', () => {
-    expect(displaySection('archived', 'idle', true, false, true)).toBe('saved');
+    expect(displaySection('archived', 'idle', true, false, true, false)).toBe('saved');
   });
 });
 
@@ -238,11 +255,11 @@ describe('thread title status icon', () => {
 });
 
 describe('children progress consistency across row types', () => {
-  it('ThreadRow and SearchResultRow use same rendering logic', () => {
-    // Both ThreadRow and SearchResultRow derive children progress from the same fields.
-    // This test verifies the conditions are identical by checking the same meta
-    // produces the same render state regardless of whether it comes from
-    // threadMap (ThreadRow) or a search result with live thread data (SearchResultRow).
+  it('FamilyToggleRow renders the same progress whether the parent comes from threadMap or search', () => {
+    // FamilyToggleRow renders under any parent with totalChildrenCount > 0.
+    // Whether that parent comes from threadMap (ThreadRow's source) or from
+    // search results re-hydrated via ensureThreadInMap (SearchResultRow's
+    // source), the same meta must produce the same toggle-row progress text.
     const meta: ThreadMeta = {
       id: 'search-thread',
       title: 'Search Result Thread',
@@ -252,27 +269,30 @@ describe('children progress consistency across row types', () => {
       createdAt: '2026-04-12T00:00:00Z',
       updatedAt: '2026-04-12T00:00:00Z',
       status: 'idle',
-      ccHasChanges: false,
-      ccRequiresRestart: false,
-      ccIsExternalRepo: false,
-      ccApplying: false,
+      codingAgentProposed: false,
+      codingAgentRequiresRestart: false,
+      codingAgentIsExternalRepo: false,
+      codingAgentApplying: false,
+      codingAgentHasDiff: false,
       lastRevivedAt: '',
       messageCount: 5,
       section: 'archived',
       activeChildrenCount: 1,
       totalChildrenCount: 3,
+      blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
+      latestTodoList: null,
     };
 
     // ThreadRow path
-    const threadRowRender = threadRowRenderState(meta, 'idle');
+    const threadRowRender = familyToggleRenderState(meta, 'idle');
 
     // SearchResultRow path (same logic, same meta from liveThread)
-    const searchRowRender = threadRowRenderState(meta, 'idle');
+    const searchRowRender = familyToggleRenderState(meta, 'idle');
 
     expect(threadRowRender).toEqual(searchRowRender);
     expect(threadRowRender.showChildrenProgress).toBe(true);
-    expect(threadRowRender.progressText).toBe('2/3 done');
+    expect(threadRowRender.progressText).toBe('2/3 sub-threads done');
     expect(threadRowRender.visualStatus).toBe('waiting');
   });
 
@@ -284,7 +304,7 @@ describe('children progress consistency across row types', () => {
       activeChildrenCount: 0,
     };
 
-    const render = threadRowRenderState(
+    const render = familyToggleRenderState(
       { ...makeThread('fallback').meta, ...fallbackMeta },
       'idle',
     );

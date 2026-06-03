@@ -198,6 +198,47 @@ fn hardened_query_round_trip() {
     );
 }
 
+/// `lucidos changes list` round-trip: the CLI GETs `/api/v1/changes` and
+/// echoes the payload verbatim. This is the command the nightly pipeline
+/// repeatedly guessed (and got "unrecognized subcommand 'list'") when looking
+/// for the pending change id before `apply`. Asserting the shape proves the
+/// subcommand exists and surfaces the `pending` array a caller reads ids from.
+#[test]
+fn changes_list_returns_expected_shape() {
+    let bin = lucidos_bin();
+    let ws = workspace_path();
+
+    let out = Command::new(&bin)
+        .args(["changes", "list"])
+        .env("LUCIDOS_WORKSPACE", &ws)
+        .output()
+        .expect("lucidos changes list should run");
+    assert!(
+        out.status.success(),
+        "changes list failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("changes list stdout must be JSON");
+    assert!(
+        body["pending"].is_array(),
+        "response must carry a `pending` array (the id source for `apply`): {}",
+        serde_json::to_string_pretty(&body).unwrap()
+    );
+    assert!(
+        body["applied"].is_array(),
+        "response must carry an `applied` array: {}",
+        serde_json::to_string_pretty(&body).unwrap()
+    );
+    assert!(
+        body["total_pending"].is_u64(),
+        "response must carry a numeric `total_pending`: {}",
+        serde_json::to_string_pretty(&body).unwrap()
+    );
+}
+
 fn run_git(dir: &std::path::Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -210,5 +251,142 @@ fn run_git(dir: &std::path::Path, args: &[&str]) {
         args.join(" "),
         dir.display(),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `lucidos notify` round-trip: CLI POSTs `/api/v1/notifications`, the engine
+/// produces a `NotificationCreated` event AND a notification row that
+/// `GET /api/v1/notifications` can return. Mirrors the
+/// `emit_then_query_round_trip_against_running_workspace` style.
+#[tokio::test]
+async fn notify_creates_inbox_notification_against_running_workspace() {
+    let bin = lucidos_bin();
+    let ws = workspace_path();
+
+    // Unique title so we can find this exact notification regardless of any
+    // background notifications the e2e workspace produces (auto-cleanup,
+    // backup-failure, etc.).
+    let title = unique_marker("cli-notify-title");
+    let message = unique_marker("cli-notify-message");
+
+    let out = Command::new(&bin)
+        .args(["notify", "--title", &title, "--message", &message])
+        .env("LUCIDOS_WORKSPACE", &ws)
+        .output()
+        .expect("lucidos notify should run");
+    assert!(
+        out.status.success(),
+        "notify failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("notify stdout must be JSON");
+    assert_eq!(body["success"], serde_json::json!(true));
+    let returned_id = body["notification_id"]
+        .as_str()
+        .expect("notification_id must be a string");
+    let returned_id =
+        uuid::Uuid::parse_str(returned_id).expect("notification_id must be a UUID");
+
+    // Verify via the public list endpoint that the notification is in the
+    // inbox. The CLI's returned id is the source of truth — match by id, not
+    // by title scan, so a colliding marker can never produce a false positive.
+    let client = crate::support::http_client();
+    let url = format!("{}/api/v1/notifications?limit=100", crate::support::base_url());
+    let resp: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .expect("GET /api/v1/notifications failed")
+        .json()
+        .await
+        .expect("notifications response must be JSON");
+
+    let items = resp["notifications"]
+        .as_array()
+        .expect("notifications must be an array");
+    let found = items
+        .iter()
+        .find(|n| n["id"].as_str() == Some(returned_id.to_string().as_str()))
+        .unwrap_or_else(|| {
+            panic!(
+                "notification {returned_id} not found in inbox; got: {}",
+                serde_json::to_string_pretty(&resp).unwrap()
+            )
+        });
+    assert_eq!(found["title"].as_str(), Some(title.as_str()));
+    assert_eq!(found["message"].as_str(), Some(message.as_str()));
+}
+
+#[test]
+fn notify_rejects_missing_title() {
+    let bin = lucidos_bin();
+    let ws = workspace_path();
+    let out = Command::new(&bin)
+        .args(["notify", "--message", "no title here"])
+        .env("LUCIDOS_WORKSPACE", &ws)
+        .output()
+        .expect("lucidos should run");
+    assert!(!out.status.success(), "notify without --title must fail");
+}
+
+#[test]
+fn notify_rejects_missing_message() {
+    let bin = lucidos_bin();
+    let ws = workspace_path();
+    let out = Command::new(&bin)
+        .args(["notify", "--title", "no body here"])
+        .env("LUCIDOS_WORKSPACE", &ws)
+        .output()
+        .expect("lucidos should run");
+    assert!(!out.status.success(), "notify without --message must fail");
+}
+
+/// Server-side validation: an empty title makes it past clap (it accepts the
+/// flag with an empty value) and must be rejected by the engine with 400.
+#[test]
+fn notify_rejects_empty_title_at_engine() {
+    let bin = lucidos_bin();
+    let ws = workspace_path();
+    let out = Command::new(&bin)
+        .args(["notify", "--title", "", "--message", "msg"])
+        .env("LUCIDOS_WORKSPACE", &ws)
+        .output()
+        .expect("lucidos should run");
+    assert!(
+        !out.status.success(),
+        "notify with empty --title must fail; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Direct-POST regression for the whitespace-title bypass: the engine must
+/// trim before deciding, so a title of `"   "` is rejected as a 400 even if
+/// some future client fails to normalize. Goes through the HTTP route
+/// directly because the CLI does its own trim-check before posting.
+#[tokio::test]
+async fn notify_endpoint_rejects_whitespace_only_title() {
+    let client = crate::support::http_client();
+    let url = format!(
+        "{}/api/v1/notifications",
+        crate::support::base_url()
+    );
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "title": "   ",
+            "message": "ok",
+        }))
+        .send()
+        .await
+        .expect("POST /api/v1/notifications failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "whitespace-only title must be rejected with 400; body={}",
+        resp.text().await.unwrap_or_default()
     );
 }

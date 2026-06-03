@@ -9,6 +9,7 @@ interface NavEntry {
   menuItem: string;
   settingsSubview: string;
   overlay: PanelOverlay;
+  wipPreviewThreadId: string | null;
 }
 
 function overlaysEqual(a: PanelOverlay, b: PanelOverlay): boolean {
@@ -28,7 +29,8 @@ function statesEqual(a: NavEntry, b: NavEntry): boolean {
   return (
     a.menuItem === b.menuItem &&
     a.settingsSubview === b.settingsSubview &&
-    overlaysEqual(a.overlay, b.overlay)
+    overlaysEqual(a.overlay, b.overlay) &&
+    a.wipPreviewThreadId === b.wipPreviewThreadId
   );
 }
 
@@ -40,7 +42,11 @@ function pushEntry(
   entry: NavEntry,
 ): { stack: NavEntry[]; cursor: number } | null {
   if (cursor < stack.length) {
-    if (entry.overlay && overlaysEqual(entry.overlay, stack[cursor].overlay)) return null;
+    if (
+      entry.overlay
+      && overlaysEqual(entry.overlay, stack[cursor].overlay)
+      && entry.wipPreviewThreadId === stack[cursor].wipPreviewThreadId
+    ) return null;
     if (statesEqual(entry, stack[cursor])) return null;
   }
   let newStack = [...stack.slice(0, cursor + 1), entry];
@@ -58,6 +64,7 @@ function makeEntry(overrides: Partial<NavEntry> & { overlay?: PanelOverlay } = {
     menuItem: 'files',
     settingsSubview: 'main',
     overlay: null,
+    wipPreviewThreadId: null,
     ...overrides,
   };
 }
@@ -431,5 +438,89 @@ describe('replaceEntry (latest-file-wins for diff split-view)', () => {
     const stack = [makeEntry()];
     expect(replaceEntry(stack, -1, makeEntry())).toBeNull();
     expect(replaceEntry(stack, 1, makeEntry())).toBeNull();
+  });
+});
+
+describe('wipPreviewThreadId is a nav-tracked axis', () => {
+  const appOverlay = { type: 'app-ui' as const, app: { id: 'habit-tracker' } as any };
+
+  it('statesEqual: same overlay, different wipPreviewThreadId is not equal', () => {
+    expect(statesEqual(
+      makeEntry({ overlay: appOverlay, wipPreviewThreadId: null }),
+      makeEntry({ overlay: appOverlay, wipPreviewThreadId: 'thread-abc' }),
+    )).toBe(false);
+  });
+
+  it('statesEqual: same overlay, same wipPreviewThreadId is equal', () => {
+    expect(statesEqual(
+      makeEntry({ overlay: appOverlay, wipPreviewThreadId: 'thread-abc' }),
+      makeEntry({ overlay: appOverlay, wipPreviewThreadId: 'thread-abc' }),
+    )).toBe(true);
+  });
+
+  it('pushEntry: toggling WIP on with the same app overlay pushes a new entry', () => {
+    const stack = [
+      makeEntry(),
+      makeEntry({ menuItem: 'apps', overlay: appOverlay, wipPreviewThreadId: null }),
+    ];
+    const result = pushEntry(stack, 1, makeEntry({
+      menuItem: 'apps',
+      overlay: appOverlay,
+      wipPreviewThreadId: 'thread-abc',
+    }));
+    expect(result).not.toBeNull();
+    expect(result!.stack).toHaveLength(3);
+    expect(result!.stack[2].wipPreviewThreadId).toBe('thread-abc');
+  });
+
+  it('pushEntry: toggling WIP off with the same app overlay pushes a new entry', () => {
+    const stack = [
+      makeEntry(),
+      makeEntry({ menuItem: 'apps', overlay: appOverlay, wipPreviewThreadId: 'thread-abc' }),
+    ];
+    const result = pushEntry(stack, 1, makeEntry({
+      menuItem: 'apps',
+      overlay: appOverlay,
+      wipPreviewThreadId: null,
+    }));
+    expect(result).not.toBeNull();
+    expect(result!.stack).toHaveLength(3);
+    expect(result!.stack[2].wipPreviewThreadId).toBeNull();
+  });
+
+  it('pushEntry: same overlay AND same WIP is still deduped', () => {
+    const stack = [
+      makeEntry(),
+      makeEntry({ menuItem: 'apps', overlay: appOverlay, wipPreviewThreadId: 'thread-abc' }),
+    ];
+    const result = pushEntry(stack, 1, makeEntry({
+      menuItem: 'notifications',
+      overlay: appOverlay,
+      wipPreviewThreadId: 'thread-abc',
+    }));
+    expect(result).toBeNull();
+  });
+
+  it('back/forward walks each WIP toggle', () => {
+    // Simulate: open app → toggle WIP on → toggle WIP off → toggle WIP on
+    let stack = [makeEntry({ menuItem: 'apps', overlay: appOverlay, wipPreviewThreadId: null })];
+    let cursor = 0;
+    for (const tid of ['thread-abc', null, 'thread-abc']) {
+      const r = pushEntry(stack, cursor, makeEntry({
+        menuItem: 'apps', overlay: appOverlay, wipPreviewThreadId: tid,
+      }));
+      stack = r!.stack; cursor = r!.cursor;
+    }
+    expect(stack.map(e => e.wipPreviewThreadId)).toEqual([null, 'thread-abc', null, 'thread-abc']);
+
+    cursor--;
+    expect(stack[cursor].wipPreviewThreadId).toBeNull();
+    cursor--;
+    expect(stack[cursor].wipPreviewThreadId).toBe('thread-abc');
+    cursor--;
+    expect(stack[cursor].wipPreviewThreadId).toBeNull();
+
+    cursor += 3;
+    expect(stack[cursor].wipPreviewThreadId).toBe('thread-abc');
   });
 });

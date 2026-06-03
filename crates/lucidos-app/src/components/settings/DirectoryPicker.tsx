@@ -1,10 +1,81 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
+import type { ComponentChildren } from 'preact';
 import { browseDirectories, type BrowseResult } from '../../api/client';
 import { toFailed, type Loadable } from '../../store/types';
+import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
 
 interface DirectoryPickerProps {
   onSelect: (path: string) => void;
   onCancel: () => void;
+}
+
+/** Inner children of `.dir-picker-list` — branches on all four Loadable
+ *  states so loading / failed are visually distinct from loaded-empty. */
+export function directoryPickerBody({
+  data,
+  currentPath,
+  selectedIndex,
+  onGoUp,
+  onSelectDir,
+  onHoverIndex,
+}: {
+  data: Loadable<BrowseResult>;
+  currentPath: string;
+  selectedIndex: number;
+  onGoUp: () => void;
+  onSelectDir: (dir: string) => void;
+  onHoverIndex: (idx: number) => void;
+}): ComponentChildren {
+  if (data.status === 'not-loaded' || data.status === 'loading') {
+    return (
+      <div class="dir-picker-empty loading-skeleton" data-state="loading">
+        Loading...
+      </div>
+    );
+  }
+  if (data.status === 'failed') {
+    return (
+      <div class="dir-picker-empty dir-picker-error" data-state="failed">
+        {data.error}
+      </div>
+    );
+  }
+  const dirs = data.data.directories;
+  const showParent = currentPath !== '/';
+  if (dirs.length === 0 && !showParent) {
+    return <div class="dir-picker-empty" data-state="empty">No subdirectories</div>;
+  }
+  return (
+    <>
+      {showParent && (
+        <button
+          class={`dir-picker-row${selectedIndex === 0 ? ' selected' : ''}`}
+          onClick={onGoUp}
+          onMouseEnter={() => onHoverIndex(0)}
+        >
+          <span class="dir-picker-icon">{'\u{1F4C2}'}</span>
+          <span class="dir-picker-name">..</span>
+        </button>
+      )}
+      {dirs.length === 0 && (
+        <div class="dir-picker-empty" data-state="empty">No subdirectories</div>
+      )}
+      {dirs.map((dir, i) => {
+        const idx = showParent ? i + 1 : i;
+        return (
+          <button
+            key={dir}
+            class={`dir-picker-row${idx === selectedIndex ? ' selected' : ''}`}
+            onClick={() => onSelectDir(dir)}
+            onMouseEnter={() => onHoverIndex(idx)}
+          >
+            <span class="dir-picker-icon">{'\u{1F4C1}'}</span>
+            <span class="dir-picker-name">{dir}</span>
+          </button>
+        );
+      })}
+    </>
+  );
 }
 
 export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
@@ -14,6 +85,9 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
   const [manualPath, setManualPath] = useState('');
   const [editingPath, setEditingPath] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  useDismissOnOutside(true, panelRef, null, onCancel);
 
   useEffect(() => {
     setData({ status: 'loading' });
@@ -46,13 +120,15 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
 
   const currentPath = data.status === 'loaded' ? data.data.path : browsePath || '~';
   const segments = (data.status === 'loaded' ? data.data.path : '').split('/').filter(Boolean);
-
-  const dirs = data.status === 'loaded' ? data.data.directories : [];
   const isGitRepo = data.status === 'loaded' && data.data.is_git_repo;
+  const navMaxIdx = data.status === 'loaded'
+    ? data.data.directories.length - 1 + (currentPath !== '/' ? 1 : 0)
+    : 0;
+  const joinPath = (parent: string, child: string) => parent === '/' ? '/' + child : parent + '/' + child;
 
   return (
-    <div class="confirm-overlay" onClick={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
-      <div class="dir-picker">
+    <div class="confirm-overlay">
+      <div class="dir-picker" ref={panelRef}>
         <div class="dir-picker-header">
           <span class="dir-picker-title">Select Directory</span>
           <button class="icon-btn header-icon" onClick={onCancel} aria-label="Close">
@@ -92,49 +168,28 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
         </div>
 
         <div class="dir-picker-list" onKeyDown={(e) => {
-          const maxIdx = dirs.length - 1 + (currentPath !== '/' ? 1 : 0);
-          if (e.key === 'ArrowDown') { e.preventDefault(); setSelectedIndex(i => Math.min(i + 1, maxIdx)); }
+          if (e.key === 'ArrowDown') { e.preventDefault(); setSelectedIndex(i => Math.min(i + 1, navMaxIdx)); }
           if (e.key === 'ArrowUp') { e.preventDefault(); setSelectedIndex(i => Math.max(i - 1, -1)); }
           if (e.key === 'Enter' && data.status === 'loaded') {
             e.preventDefault();
-            if (selectedIndex === 0) goUp();
-            else if (selectedIndex > 0) navigateTo(data.data.path + '/' + dirs[selectedIndex - 1]);
+            if (selectedIndex === 0 && currentPath !== '/') goUp();
+            else {
+              const dirIdx = currentPath !== '/' ? selectedIndex - 1 : selectedIndex;
+              if (dirIdx >= 0) navigateTo(joinPath(data.data.path, data.data.directories[dirIdx]));
+            }
           }
           if (e.key === 'Escape') onCancel();
         }} tabIndex={0}>
-          {data.status === 'loading' && <div class="dir-picker-empty">Loading...</div>}
-          {data.status === 'failed' && <div class="dir-picker-empty dir-picker-error">{data.error}</div>}
-          {data.status === 'loaded' && (
-            <>
-              {currentPath !== '/' && (
-                <button
-                  class={`dir-picker-row${selectedIndex === 0 ? ' selected' : ''}`}
-                  onClick={goUp}
-                  onMouseEnter={() => setSelectedIndex(0)}
-                >
-                  <span class="dir-picker-icon">{'\u{1F4C2}'}</span>
-                  <span class="dir-picker-name">..</span>
-                </button>
-              )}
-              {dirs.length === 0 && (
-                <div class="dir-picker-empty">No subdirectories</div>
-              )}
-              {dirs.map((dir, i) => {
-                const idx = currentPath !== '/' ? i + 1 : i;
-                return (
-                  <button
-                    key={dir}
-                    class={`dir-picker-row${idx === selectedIndex ? ' selected' : ''}`}
-                    onClick={() => navigateTo(data.data.path + '/' + dir)}
-                    onMouseEnter={() => setSelectedIndex(idx)}
-                  >
-                    <span class="dir-picker-icon">{'\u{1F4C1}'}</span>
-                    <span class="dir-picker-name">{dir}</span>
-                  </button>
-                );
-              })}
-            </>
-          )}
+          {directoryPickerBody({
+            data,
+            currentPath,
+            selectedIndex,
+            onGoUp: goUp,
+            onSelectDir: (dir) => {
+              if (data.status === 'loaded') navigateTo(joinPath(data.data.path, dir));
+            },
+            onHoverIndex: setSelectedIndex,
+          })}
         </div>
 
         <div class="dir-picker-footer">

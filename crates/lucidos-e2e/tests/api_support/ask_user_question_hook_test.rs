@@ -1,4 +1,4 @@
-//! E2E for POST /api/internal/ask-user-question — the long-poll endpoint
+//! E2E for POST /api/v1/internal/ask-user-question — the long-poll endpoint
 //! invoked by the lucidos-cli ask-user-question-hook subcommand from inside
 //! CC subprocesses. Drives the endpoint with HTTP only — no real CC needed.
 
@@ -52,9 +52,8 @@ async fn long_poll_returns_answer_when_user_responds() {
             sleep(Duration::from_millis(50)).await;
         }
         let resp = client_bg
-            .post(format!("{}/api/claude-code/answer-question", base_url()))
+            .post(format!("{}/api/v1/threads/{}/answer-question", base_url(), thread_id))
             .json(&json!({
-                "thread_id": thread_id.to_string(),
                 "tool_use_id": q0_id_bg,
                 "answer": { "kind": "Selected", "option_id": "opt-0" }
             }))
@@ -65,7 +64,7 @@ async fn long_poll_returns_answer_when_user_responds() {
     // Hook side — blocks until the answer arrives (or test timeout).
     let resp = tokio::time::timeout(
         Duration::from_secs(5),
-        client.post(format!("{}/api/internal/ask-user-question", base_url()))
+        client.post(format!("{}/api/v1/internal/ask-user-question", base_url()))
             .json(&json!({
                 "thread_id": thread_id.to_string(),
                 "tool_use_id": tool_use_id,
@@ -131,9 +130,8 @@ async fn multi_select_question_returns_joined_answer() {
             sleep(Duration::from_millis(50)).await;
         }
         let resp = client_bg
-            .post(format!("{}/api/claude-code/answer-question", base_url()))
+            .post(format!("{}/api/v1/threads/{}/answer-question", base_url(), thread_id))
             .json(&json!({
-                "thread_id": thread_id.to_string(),
                 "tool_use_id": q0_id_bg,
                 "answer": { "kind": "MultiSelected", "option_ids": ["opt-0", "opt-1"] }
             }))
@@ -146,7 +144,7 @@ async fn multi_select_question_returns_joined_answer() {
     let resp = tokio::time::timeout(
         Duration::from_secs(5),
         client
-            .post(format!("{}/api/internal/ask-user-question", base_url()))
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
             .json(&json!({
                 "thread_id": thread_id.to_string(),
                 "tool_use_id": tool_use_id,
@@ -224,9 +222,8 @@ async fn multi_select_empty_answer_is_rejected() {
     .expect("insert UserQuestionAsked");
 
     let resp = client
-        .post(format!("{}/api/claude-code/answer-question", base_url()))
+        .post(format!("{}/api/v1/threads/{}/answer-question", base_url(), thread_id))
         .json(&json!({
-            "thread_id": thread_id.to_string(),
             "tool_use_id": q0_id,
             "answer": { "kind": "MultiSelected", "option_ids": [] }
         }))
@@ -286,7 +283,7 @@ async fn returns_immediately_when_answer_already_persisted() {
         .execute(&pool).await.expect("insert event");
 
     let start = std::time::Instant::now();
-    let resp = client.post(format!("{}/api/internal/ask-user-question", base_url()))
+    let resp = client.post(format!("{}/api/v1/internal/ask-user-question", base_url()))
         .json(&json!({
             "thread_id": thread_id.to_string(),
             "tool_use_id": tool_use_id,

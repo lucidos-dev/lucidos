@@ -1,8 +1,8 @@
 import { test, expect } from '@playwright/test';
 import {
-  navigateToApp, sendMessage, sendFollowUp, waitForResponse, uniqueMessage,
+  navigateToApp, sendMessage, sendFollowUp, uniqueMessage,
   assertHealthy, newThread, cancelStreamingResponse, countVisibleResponses,
-  waitForStreamingToStart,
+  waitForStreamingToStart, waitForVisibleResponseCount,
 } from './helpers';
 
 test.describe('Cancel streaming response', () => {
@@ -43,9 +43,19 @@ test.describe('Cancel streaming response', () => {
     const msg2 = uniqueMessage('after-cancel');
     await sendFollowUp(page, `Say exactly: "recovered ${msg2}"`);
 
-    await waitForResponse(page, 90_000);
+    // After a cancel the only status label is the settled "Canceled" one, so a
+    // bare waitForResponse() can return before the follow-up turn even starts
+    // streaming — then the count below sees just the canceled partial and
+    // fails. Wait for the end-state instead: two visible responses with content
+    // (the canceled partial + the follow-up's reply).
+    await waitForVisibleResponseCount(page, 2);
 
-    const responseCount = await countVisibleResponses(page);
-    expect(responseCount).toBeGreaterThanOrEqual(2);
+    // Poll rather than read once: the post-cancel turn's text can still be
+    // rendering when waitForResponse returns (its "no Working/Requesting label"
+    // check can pass in the brief window before the new turn's status label
+    // mounts), so a single read races the second response into the DOM.
+    await expect
+      .poll(() => countVisibleResponses(page), { timeout: 30_000 })
+      .toBeGreaterThanOrEqual(2);
   });
 });

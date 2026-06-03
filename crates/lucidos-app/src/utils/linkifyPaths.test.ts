@@ -1,5 +1,108 @@
 import { describe, it, expect } from 'vitest';
-import { linkifyPaths } from './linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref } from './linkifyPaths';
+
+describe('extractNavTargetFromHref', () => {
+  it.each([
+    // Bare panel names — what the system prompt teaches the LLM to write
+    ['notifications', 'notifications'],
+    ['apps', 'apps'],
+    ['triggers', 'triggers'],
+    ['changes', 'changes'],
+    ['files', 'files'],
+    ['settings', 'settings'],
+    // data/ prefixed — the LLM naturally reaches for this shape mirroring artifact/app patterns
+    ['data/notifications', 'notifications'],
+    ['/data/notifications', 'notifications'],
+    ['/notifications', 'notifications'],
+    // Trailing slash / query / fragment must be tolerated
+    ['notifications/', 'notifications'],
+    ['notifications?foo=1', 'notifications'],
+    ['notifications#x', 'notifications'],
+    ['data/notifications/', 'notifications'],
+  ])('extracts %s -> %s', (href, expected) => {
+    expect(extractNavTargetFromHref(href)).toBe(expected);
+  });
+
+  it.each([
+    ['', null],
+    // Sub-paths must NOT match — `apps/foo` is an app entry, not the panel
+    ['apps/foo', null],
+    ['apps/foo/index.html', null],
+    ['notifications/foo', null],
+    ['data/apps/foo/index.html', null],
+    // External URLs that happen to contain the panel name
+    ['https://example.com/notifications', null],
+    ['mailto:user@example.com', null],
+    // Unknown panel names stay alone
+    ['unknown-panel', null],
+    ['data/random', null],
+    // Artifact-like paths must stay artifact-like, not nav
+    ['artifacts/notes.md', null],
+    ['data/artifacts/notes.md', null],
+  ])('returns null for %s', (href, expected) => {
+    expect(extractNavTargetFromHref(href)).toBe(expected);
+  });
+});
+
+describe('extractAppIdFromHref', () => {
+  it.each([
+    // Entry-point shapes — these mean "open the app"
+    ['apps/todo', 'todo'],
+    ['apps/todo/', 'todo'],
+    ['apps/todo/index.html', 'todo'],
+    ['/apps/todo/index.html', 'todo'],
+    ['data/apps/todo/index.html', 'todo'],
+    ['/data/apps/todo/index.html', 'todo'],
+    ['apps/momentum-autoresearch/index.html', 'momentum-autoresearch'],
+    // Query string / fragment on entry-point hrefs must be stripped before
+    // matching — otherwise `apps.find(a => a.id === 'todo?refresh=1')`
+    // always misses.
+    ['apps/todo?refresh=1', 'todo'],
+    ['apps/todo#section', 'todo'],
+    ['apps/todo/index.html?v=2', 'todo'],
+    ['apps/todo/index.html#anchor', 'todo'],
+    // `app:<id>` custom-scheme shorthand. LLMs invent this by analogy to the
+    // documented `thread:<UUID>` scheme — the bug report was a Momentum-app
+    // link rendered as `[Momentum app](app:momentum)` that dead-ended on
+    // macOS Chrome because no handler recognized the scheme.
+    ['app:todo', 'todo'],
+    ['app:todo/', 'todo'],
+    ['app:todo?refresh=1', 'todo'],
+    ['app:todo#section', 'todo'],
+    ['app:momentum-autoresearch', 'momentum-autoresearch'],
+  ])('extracts %s -> %s', (href, expected) => {
+    expect(extractAppIdFromHref(href)).toBe(expected);
+  });
+
+  it.each([
+    // Empty / non-apps shapes
+    ['', null],
+    ['apps/', null],
+    ['apps', null],
+    ['notapps/foo', null],
+    ['https://example.com/apps/foo/index.html', null],
+    ['/some/other/path', null],
+    ['#anchor', null],
+    ['mailto:user@example.com', null],
+    // Sub-files under an app: real files, must fall through to the
+    // artifact (file-preview) pipeline, not be claimed as "open the app".
+    ['apps/todo/styles.css', null],
+    ['apps/todo/scripts/run.sh', null],
+    ['apps/todo/main.html', null],
+    ['apps/todo/nested/deep/file.json', null],
+    // `app:` scheme rejections — empty id, sub-paths, and lookalike schemes
+    // (`apple:`, `application:`) must NOT match. Sub-paths under the scheme
+    // have no defined meaning; reject so they don't masquerade as an app id.
+    ['app:', null],
+    ['app:/', null],
+    ['app:todo/styles.css', null],
+    ['app:todo/scripts/run.sh', null],
+    ['apple:todo', null],
+    ['application:todo', null],
+  ])('returns null for %s', (href, expected) => {
+    expect(extractAppIdFromHref(href)).toBe(expected);
+  });
+});
 
 describe('linkifyPaths', () => {
   it('linkifies bare URLs in text', () => {
@@ -26,13 +129,72 @@ describe('linkifyPaths', () => {
   it('linkifies artifact paths in text', () => {
     const html = '<p>See user_profile.md for details</p>';
     const result = linkifyPaths(html, ['user_profile.md'], []);
-    expect(result).toContain('<a class="artifact-link" data-path="user_profile.md">user_profile.md</a>');
+    expect(result).toContain('<a href="#" class="artifact-link" data-path="user_profile.md">user_profile.md</a>');
   });
 
   it('does not linkify artifact paths inside <a> tags', () => {
-    const html = '<p><a href="/files">user_profile.md</a></p>';
+    // Neutral href that no rewriter claims — the point is the inner-text
+    // artifact name must not become a nested anchor. Don't use `/files`
+    // here: that's now a known nav-link target and would legitimately get
+    // rewritten by rewriteNavAnchor.
+    const html = '<p><a href="https://example.com/x">user_profile.md</a></p>';
     const result = linkifyPaths(html, ['user_profile.md'], []);
     expect(result).toBe(html);
+  });
+
+  it('rewrites anchors with data/<known-artifact> href to artifact-link', () => {
+    // Real shape from the bug report: LLM wrote
+    //   [`artifacts/foo/index.html`](data/artifacts/foo/index.html)
+    // pulldown_cmark renders that as
+    //   <a href="data/artifacts/foo/index.html"><code>artifacts/foo/index.html</code></a>
+    // Without rewriting, the click hits the engine's /data/* static mount as a
+    // top-level navigation instead of routing through openFilePreview.
+    const html = '<p>Written to <a href="data/artifacts/foo/index.html"><code>artifacts/foo/index.html</code></a> in dev</p>';
+    const result = linkifyPaths(html, ['artifacts/foo/index.html'], []);
+    expect(result).toContain('class="artifact-link"');
+    expect(result).toContain('data-path="artifacts/foo/index.html"');
+    expect(result).not.toContain('href="data/artifacts/foo/index.html"');
+    // Visible text (the inner <code>...) is preserved
+    expect(result).toContain('<code>artifacts/foo/index.html</code>');
+  });
+
+  it('rewrites anchors with absolute /data/<known-artifact> href', () => {
+    const html = '<p><a href="/data/artifacts/foo.md">link</a></p>';
+    const result = linkifyPaths(html, ['artifacts/foo.md'], []);
+    expect(result).toContain('class="artifact-link"');
+    expect(result).toContain('data-path="artifacts/foo.md"');
+  });
+
+  it('rewrites anchors with bare artifacts/ href (no data/ prefix)', () => {
+    const html = '<p><a href="artifacts/foo.md">link</a></p>';
+    const result = linkifyPaths(html, ['artifacts/foo.md'], []);
+    expect(result).toContain('class="artifact-link"');
+    expect(result).toContain('data-path="artifacts/foo.md"');
+  });
+
+  it('leaves anchors whose href does not resolve to a known artifact alone', () => {
+    const html = '<p><a href="data/artifacts/unknown.md">link</a></p>';
+    const result = linkifyPaths(html, ['artifacts/foo.md'], []);
+    expect(result).toContain('href="data/artifacts/unknown.md"');
+    expect(result).not.toContain('artifact-link');
+  });
+
+  it('leaves external-URL anchors alone even when artifact paths exist', () => {
+    const html = '<p><a href="https://example.com">site</a></p>';
+    const result = linkifyPaths(html, ['artifacts/foo.md'], []);
+    expect(result).toBe(html);
+  });
+
+  it('preserves non-href attributes when rewriting an artifact anchor', () => {
+    // pulldown_cmark doesn't emit title/target on plain markdown links today,
+    // but other renderers might — the rewrite should keep them.
+    const html = '<p><a href="data/artifacts/foo.md" title="hover" target="_blank">link</a></p>';
+    const result = linkifyPaths(html, ['artifacts/foo.md'], []);
+    expect(result).toContain('class="artifact-link"');
+    expect(result).toContain('data-path="artifacts/foo.md"');
+    expect(result).toContain('title="hover"');
+    expect(result).toContain('target="_blank"');
+    expect(result).not.toContain('href="data/artifacts/foo.md"');
   });
 
   it('linkifies artifact paths inside <code> tags (LLMs wrap paths in backticks)', () => {
@@ -42,30 +204,255 @@ describe('linkifyPaths', () => {
     expect(result).toContain('data-path="user_profile.md"');
   });
 
+  it('rewrites anchors with data/notifications href to nav-link (the bug-report shape)', () => {
+    // Real shape from the bug report — last response in the personal thread
+    // 664b657a-... wrote:
+    //   Open it: [Notifications](data/notifications)
+    // pulldown_cmark renders that as
+    //   <a href="data/notifications">Notifications</a>
+    // Without rewriting, the click hits the engine's /data/* static mount and
+    // 404s (no `notifications` folder under data/) instead of opening the
+    // notifications inbox panel.
+    const html = '<p>Open it: <a href="data/notifications">Notifications</a>.</p>';
+    const result = linkifyPaths(html, [], []);
+    expect(result).toContain('class="nav-link"');
+    expect(result).toContain('data-nav-target="notifications"');
+    expect(result).toContain('href="#"');
+    expect(result).not.toContain('href="data/notifications"');
+    expect(result).toContain('>Notifications</a>');
+  });
+
+  it.each([
+    'notifications',
+    '/notifications',
+    'data/notifications',
+    '/data/notifications',
+    'notifications/',
+    'notifications?refresh=1',
+  ])('rewrites anchor with href=%s to nav-link[notifications]', (href) => {
+    const html = `<p><a href="${href}">Inbox</a></p>`;
+    const result = linkifyPaths(html, [], []);
+    expect(result).toContain('class="nav-link"');
+    expect(result).toContain('data-nav-target="notifications"');
+  });
+
+  it.each([
+    ['apps', 'apps'],
+    ['triggers', 'triggers'],
+    ['changes', 'changes'],
+    ['files', 'files'],
+    ['settings', 'settings'],
+  ])('rewrites bare %s href to nav-link[%s]', (href, target) => {
+    const html = `<p><a href="${href}">link</a></p>`;
+    const result = linkifyPaths(html, [], []);
+    expect(result).toContain('class="nav-link"');
+    expect(result).toContain(`data-nav-target="${target}"`);
+  });
+
+  it('does NOT rewrite apps/<id>/index.html to nav-link (app rewriter must win)', () => {
+    // Regression guard: the nav rewriter must NOT claim `apps/foo/index.html`.
+    // That's the app-entry shape and belongs to the app rewriter, which is
+    // already tested above. The nav rewriter only matches the bare panel.
+    const html = '<p><a href="apps/todo/index.html">Todo</a></p>';
+    const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="todo"');
+    expect(result).not.toContain('class="nav-link"');
+  });
+
+  it('does NOT rewrite unknown bare hrefs (no false positives)', () => {
+    const html = '<p><a href="unknown-panel">link</a></p>';
+    const result = linkifyPaths(html, [], []);
+    expect(result).toContain('href="unknown-panel"');
+    expect(result).not.toContain('class="nav-link"');
+  });
+
+  it('does NOT rewrite external URLs that happen to contain a panel name', () => {
+    const html = '<p><a href="https://example.com/notifications">site</a></p>';
+    const result = linkifyPaths(html, [], []);
+    expect(result).toBe(html);
+  });
+
+  it('does NOT rewrite artifact paths to nav-link', () => {
+    // `artifacts/...` must keep flowing to the artifact rewriter, not get
+    // hijacked by a too-permissive nav matcher.
+    const html = '<p><a href="data/artifacts/notes.md">notes</a></p>';
+    const result = linkifyPaths(html, ['artifacts/notes.md'], []);
+    expect(result).toContain('class="artifact-link"');
+    expect(result).not.toContain('class="nav-link"');
+  });
+
   it('linkifies app names in text', () => {
     const html = '<p>Use the Todo app</p>';
     const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
-    expect(result).toContain('<a class="app-link" data-app-id="todo">Todo</a>');
+    expect(result).toContain('<a href="#" class="app-link" data-app-id="todo">Todo</a>');
   });
 
   it('does not linkify app names inside <a> tags', () => {
-    const html = '<p><a href="/apps">Todo</a></p>';
+    // Neutral href that no rewriter claims — the point is the inner-text
+    // app name must not become a nested anchor. Don't use `/apps` here:
+    // that's now a known nav-link target and would legitimately get
+    // rewritten by rewriteNavAnchor.
+    const html = '<p><a href="https://example.com/x">Todo</a></p>';
     const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
     expect(result).toBe(html);
+  });
+
+  it('REGRESSION: apps/<id>/index.html beats artifact-link even when path is in the artifact list', () => {
+    // Real-world scenario the unit tests missed: lucidos.data.list() returns
+    // ALL files under data/, NOT just artifacts/. So the personal-workspace
+    // `paths` array contains apps/<id>/index.html for every app. Without
+    // the app-rewriter taking precedence, rewriteArtifactAnchor matches
+    // first → .artifact-link → openFilePreview → user sees the rendered HTML
+    // file in the preview panel instead of the running app.
+    const paths = ['artifacts/notes.md', 'apps/momentum-autoresearch/index.html'];
+    const apps = [{ name: 'Momentum Autoresearch', id: 'momentum-autoresearch' }];
+    const html = '<p>Watch it in <a href="apps/momentum-autoresearch/index.html">Momentum Autoresearch</a>.</p>';
+    const result = linkifyPaths(html, paths, apps);
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="momentum-autoresearch"');
+    expect(result).not.toContain('class="artifact-link"');
+  });
+
+  it('REGRESSION: apps/<id>/<sub-file> still becomes artifact-link (user wants file preview)', () => {
+    // Inverse: sub-files under an app's folder are real files; clicking
+    // should preview them, not open the app. Only the canonical entry
+    // (id, id/, id/index.html) routes to the app.
+    const paths = ['apps/momentum-autoresearch/scripts/run.sh'];
+    const apps = [{ name: 'Momentum Autoresearch', id: 'momentum-autoresearch' }];
+    const html = '<p><a href="apps/momentum-autoresearch/scripts/run.sh">run.sh</a></p>';
+    const result = linkifyPaths(html, paths, apps);
+    expect(result).toContain('class="artifact-link"');
+    expect(result).toContain('data-path="apps/momentum-autoresearch/scripts/run.sh"');
+    expect(result).not.toContain('class="app-link"');
+  });
+
+  it('rewrites anchors with apps/<id>/index.html href to app-link (bare prefix)', () => {
+    // Real shape from the bug report: LLM wrote
+    //   [Momentum Autoresearch](apps/momentum-autoresearch/index.html)
+    // pulldown_cmark renders that as
+    //   <a href="apps/momentum-autoresearch/index.html">Momentum Autoresearch</a>
+    // Without rewriting, the click hits the engine's /data/* static mount as a
+    // top-level navigation and the user sees a file preview, not the running app.
+    const html = '<p>Watch it in <a href="apps/momentum-autoresearch/index.html">Momentum Autoresearch</a>.</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Momentum Autoresearch', id: 'momentum-autoresearch' }]);
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="momentum-autoresearch"');
+    expect(result).not.toContain('href="apps/momentum-autoresearch/index.html"');
+    expect(result).toContain('>Momentum Autoresearch</a>');
+  });
+
+  it('rewrites anchors with /apps/<id>/index.html href (leading slash)', () => {
+    const html = '<p><a href="/apps/todo/index.html">Todo</a></p>';
+    const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="todo"');
+  });
+
+  it('rewrites anchors with data/apps/<id>/index.html href', () => {
+    const html = '<p><a href="data/apps/todo/index.html">Todo</a></p>';
+    const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="todo"');
+  });
+
+  it('rewrites anchors with /data/apps/<id>/index.html href', () => {
+    const html = '<p><a href="/data/apps/todo/index.html">Todo</a></p>';
+    const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="todo"');
+  });
+
+  it('rewrites anchors with apps/<id> href (no trailing file)', () => {
+    const html = '<p><a href="apps/todo">Todo</a></p>';
+    const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="todo"');
+  });
+
+  it('does NOT rewrite anchors for apps/<id>/<sub-file> (sub-files are real files, not app entry points)', () => {
+    // Sub-files under an app's folder are real files. Clicking should
+    // preview them, not open the app. Only the canonical entry — id,
+    // id/, id/index.html — routes to the app.
+    const html = '<p><a href="apps/todo/styles.css">Todo styles</a></p>';
+    const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
+    expect(result).not.toContain('class="app-link"');
+    expect(result).toContain('href="apps/todo/styles.css"');
+  });
+
+  it('leaves apps/<unknown-id>/index.html anchors alone', () => {
+    const html = '<p><a href="apps/no-such-app/index.html">link</a></p>';
+    const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
+    expect(result).toContain('href="apps/no-such-app/index.html"');
+    expect(result).not.toContain('app-link');
+  });
+
+  it('rewrites anchors with app:<id> custom-scheme href to app-link', () => {
+    // Real shape from the bug-report thread: LLM wrote
+    //   Open the [Momentum app](app:momentum) and switch to the Backtest tab.
+    // pulldown_cmark renders that as
+    //   <a href="app:momentum">Momentum app</a>
+    // Without rewriting, the click falls through to the browser's default
+    // navigation, which tries to open the unknown `app:` URL scheme — Chrome
+    // on macOS shows "address not understood".
+    const html = '<p>Open the <a href="app:momentum">Momentum app</a>.</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Momentum', id: 'momentum' }]);
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="momentum"');
+    expect(result).not.toContain('href="app:momentum"');
+    expect(result).toContain('>Momentum app</a>');
+  });
+
+  it.each([
+    'app:todo',
+    'app:todo/',
+    'app:todo?refresh=1',
+    'app:todo#section',
+  ])('rewrites anchor with app:<id> variant href=%s to app-link', (href) => {
+    const html = `<p><a href="${href}">Todo</a></p>`;
+    const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="todo"');
+  });
+
+  it('leaves app:<unknown-id> anchors alone (same gate as apps/<unknown-id>)', () => {
+    const html = '<p><a href="app:no-such-app">link</a></p>';
+    const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
+    expect(result).toContain('href="app:no-such-app"');
+    expect(result).not.toContain('app-link');
   });
 
   it('linkifies app IDs when different from app name', () => {
     const html = '<p>Open Job Tracker: job-tracker</p>';
     const result = linkifyPaths(html, [], [{ name: 'Job Tracker', id: 'job-tracker' }]);
-    expect(result).toContain('<a class="app-link" data-app-id="job-tracker">job-tracker</a>');
-    expect(result).toContain('<a class="app-link" data-app-id="job-tracker">Job Tracker</a>');
+    expect(result).toContain('<a href="#" class="app-link" data-app-id="job-tracker">job-tracker</a>');
+    expect(result).toContain('<a href="#" class="app-link" data-app-id="job-tracker">Job Tracker</a>');
   });
 
   it('does not duplicate app entries when name equals id', () => {
     const html = '<p>Use todo for tasks</p>';
     const result = linkifyPaths(html, [], [{ name: 'todo', id: 'todo' }]);
     // Should only linkify once, not create double matches
-    expect(result).toContain('<a class="app-link" data-app-id="todo">todo</a>');
+    expect(result).toContain('<a href="#" class="app-link" data-app-id="todo">todo</a>');
+  });
+
+  it('emits href="#" on every generated link so iOS Safari/PWA fires tap→click', () => {
+    // iOS Safari (and PWA in standalone mode) silently drops tap→click
+    // translation on `<a>` without href — even with `cursor: pointer`, the
+    // delegated chat click handler never fires and the user sees a dead link.
+    // This was reported as "App link from thread doesn't work iOS PWA":
+    // an autolinked app name inside a chat message wasn't navigating to the
+    // app on iOS PWA. preventDefault in ChatExchange's handleLinkClick
+    // suppresses the `#` scroll-to-top, so href="#" is purely an iOS-
+    // clickability marker, not a navigation target.
+    const html = '<p>Check user_profile.md or open the Todo app, or follow this <a href="data/artifacts/foo.md">file link</a></p>';
+    const result = linkifyPaths(html, ['user_profile.md', 'artifacts/foo.md'], [{ name: 'Todo', id: 'todo' }]);
+    // All three linkifier paths — text artifact-link, text app-link, rewritten anchor — emit href="#".
+    expect(result).toContain('<a href="#" class="artifact-link" data-path="user_profile.md">');
+    expect(result).toContain('<a href="#" class="app-link" data-app-id="todo">');
+    expect(result).toContain('<a href="#" class="artifact-link" data-path="artifacts/foo.md">');
+    // No bare `<a class=` (i.e. href-less <a>) for any of our linkifier classes.
+    expect(result).not.toMatch(/<a class="(artifact-link|app-link)"/);
   });
 
   it('handles real-world pulldown_cmark HTML with URLs in <a> and <code>', () => {

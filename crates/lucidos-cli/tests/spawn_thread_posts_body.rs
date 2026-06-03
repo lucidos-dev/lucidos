@@ -1,5 +1,5 @@
 //! Integration tests: `lucidos spawn-thread` POSTs the expected JSON body shape
-//! to the target workspace's `/api/chat/stream`, with caller_* defaulted from
+//! to the target workspace's `/api/v1/chat/stream`, with caller_* defaulted from
 //! env, and prints a `[title](thread:ws/uuid)` markdown link on stdout.
 
 use std::path::Path;
@@ -8,13 +8,13 @@ use std::sync::{Arc, Mutex};
 type Captured = Arc<Mutex<Option<serde_json::Value>>>;
 
 /// Spawn an axum server on a random port that captures the JSON body of any
-/// POST to `/api/chat/stream` and replies with a stub `event_id`. Returns the
+/// POST to `/api/v1/chat/stream` and replies with a stub `event_id`. Returns the
 /// port and the shared slot the test inspects after running the CLI.
 async fn start_capture_server() -> (u16, Captured) {
     let captured: Captured = Arc::new(Mutex::new(None));
     let cap = captured.clone();
     let app = axum::Router::new().route(
-        "/api/chat/stream",
+        "/api/v1/chat/stream",
         axum::routing::post(move |body: axum::Json<serde_json::Value>| {
             let cap = cap.clone();
             async move {
@@ -237,11 +237,11 @@ async fn same_workspace_relation_top_omits_parent_fields() {
     assert_eq!(body["caller_event_id"], event_id);
 }
 
-/// `--relation sub` requires a same-workspace target — callbacks across
+/// `--relation child` requires a same-workspace target — callbacks across
 /// workspaces aren't wired. Mirrors the existing `--parent` cross-workspace
 /// rejection but expressed through the new flag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cross_workspace_relation_sub_errors() {
+async fn cross_workspace_relation_child_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let caller = tmp.path().join("caller");
     let other = tmp.path().join("other");
@@ -251,7 +251,7 @@ async fn cross_workspace_relation_sub_errors() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let output = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "other", "--relation", "sub",
+            "spawn-thread", "--to", "other", "--relation", "child",
             "--message", "x", "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
@@ -259,19 +259,54 @@ async fn cross_workspace_relation_sub_errors() {
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
         .output().expect("spawn cli");
-    assert!(!output.status.success(), "CLI must error on --relation sub with cross-workspace target");
+    assert!(!output.status.success(), "CLI must error on --relation child with cross-workspace target");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("relation") && (stderr.contains("same-workspace") || stderr.contains("$LUCIDOS_WORKSPACE")),
-        "stderr must explain that sub requires same-workspace, got: {}",
+        "stderr must explain that child requires same-workspace, got: {}",
         stderr
     );
 }
 
-/// `--parent` is the deprecated alias for `--relation sub`. It must still
+/// `--relation sub` is a back-compat alias for `--relation child` — clap's
+/// `#[value(alias = "sub")]` keeps older recipes working after the glossary
+/// canonicalized on *child thread* (direct descendant) vs *sub-thread*
+/// (transitive). The CLI must accept it AND apply the same same-workspace
+/// callback semantics, otherwise the alias is a lie.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relation_sub_alias_still_accepted_as_child() {
+    let (port, captured) = start_capture_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, port);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let thread_id = uuid::Uuid::new_v4().to_string();
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let status = std::process::Command::new(bin)
+        .args([
+            "spawn-thread", "--to", "dev", "--relation", "sub",
+            "--message", "compat alias", "--title", "Alias", "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", &thread_id)
+        .env("LUCIDOS_EVENT_ID", &event_id)
+        .env_remove("LUCIDOS_REPO")
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .status().expect("spawn cli");
+    assert!(status.success(), "--relation sub must remain accepted as the back-compat alias");
+
+    let body = captured.lock().unwrap().clone().expect("server received body");
+    assert_eq!(body["parent_thread_id"], thread_id, "sub alias must wire parent_thread_id like child");
+    assert_eq!(body["spawning_event_id"], event_id, "sub alias must wire spawning_event_id like child");
+    assert!(body.get("caller_workspace").is_none(), "sub alias must not emit caller_* (those are top-only)");
+}
+
+/// `--parent` is the deprecated alias for `--relation child`. It must still
 /// work for one release so existing recipes / scripts don't break, and
 /// it must print a deprecation warning to stderr so callers know to
-/// migrate. The HTTP body must look identical to a `--relation sub` call.
+/// migrate. The HTTP body must look identical to a `--relation child` call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_flag_still_works_with_deprecation_warning() {
     let (port, captured) = start_capture_server().await;
@@ -304,6 +339,108 @@ async fn parent_flag_still_works_with_deprecation_warning() {
     assert!(
         stderr.contains("--parent") && stderr.contains("deprecated"),
         "must warn about --parent being deprecated, got stderr: {}",
+        stderr
+    );
+}
+
+/// `--folder data/apps/<id> --cc` must POST a `folder` field plus
+/// `use_claude_code` so the engine spawns an *app coding-agent thread* (the
+/// same kind `run_claude(folder=…)` produces). Critically, `--folder` must
+/// SUPPRESS the `$LUCIDOS_REPO` `repo_id` default: the engine sets that env
+/// var on every CC subprocess, and it rejects a request carrying both
+/// `repo_id` and `folder`. The original bug was every spawn landing in the
+/// engine's `Lucidos` repo because the env default always won.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_with_folder_posts_folder_and_omits_repo() {
+    let (port, captured) = start_capture_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("personal");
+    write_ports_file(&caller, port);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread", "--to", "personal", "--relation", "top", "--cc",
+            "--folder", "data/apps/momentum-autoresearch",
+            "--message", "run a research session", "--title", "Research", "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env("LUCIDOS_EVENT_ID", uuid::Uuid::new_v4().to_string())
+        // The engine sets $LUCIDOS_REPO on every subprocess — --folder must
+        // win so the body does NOT carry both repo_id and folder.
+        .env("LUCIDOS_REPO", "Lucidos")
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output().expect("spawn cli");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+
+    let body = captured.lock().unwrap().clone().expect("server received body");
+    assert_eq!(body["folder"], "data/apps/momentum-autoresearch");
+    assert_eq!(body["use_claude_code"], true);
+    assert!(
+        body.get("repo_id").is_none(),
+        "--folder must suppress the $LUCIDOS_REPO repo_id default (engine 400s on both)"
+    );
+}
+
+/// `--folder` and `--repo` describe incompatible worktree targets (app folder
+/// vs registered repo). Passing both must error before any HTTP round-trip —
+/// no capture server needed because clap rejects the conflict at parse time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_folder_and_repo_are_mutually_exclusive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("personal");
+    write_ports_file(&caller, 1);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread", "--to", "personal", "--relation", "top", "--cc",
+            "--folder", "data/apps/foo", "--repo", "Lucidos",
+            "--message", "x", "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output().expect("spawn cli");
+    assert!(!output.status.success(), "CLI must reject --folder together with --repo");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("folder") && stderr.contains("repo"),
+        "stderr must explain the --folder/--repo conflict, got: {}",
+        stderr
+    );
+}
+
+/// `--folder` targets an app coding-agent thread, which only exists for CC
+/// sessions. `--folder` without `--cc` must error with a clear message before
+/// sending anything — the engine would 400 anyway (it rejects `folder`
+/// without `use_claude_code`), but a client-side check is clearer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_folder_requires_cc() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("personal");
+    write_ports_file(&caller, 1);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread", "--to", "personal", "--relation", "top",
+            "--folder", "data/apps/foo",
+            "--message", "x", "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output().expect("spawn cli");
+    assert!(!output.status.success(), "CLI must reject --folder without --cc");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--folder") && stderr.contains("--cc"),
+        "stderr must explain that --folder requires --cc, got: {}",
         stderr
     );
 }

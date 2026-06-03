@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { searchEverywhereOpen, showToast, appsList, artifacts, triggers, threadMap, settingsScrollTarget } from '../../store/store';
+import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
 import { searchEverywhere, type SearchCategory, type SearchResultItem } from '../../api/client';
-import { focusThread } from '../../store/actions/threads';
+import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
 import { switchMenuItem, openSettingsSubview } from '../../store/actions/menu';
@@ -154,18 +155,6 @@ function ResultRow({ item, index, selected, onSelect, onHover }: {
   );
 }
 
-/** Capture iOS keyboard gesture window before modal DOM exists.
- *  See composeHandlers() in promptFocus.ts for the full rationale. */
-export function focusSearchInput(): void {
-  // Only proxy when opening (signal is still false at call time)
-  if (searchEverywhereOpen.value) return;
-  const proxy = document.createElement('input');
-  proxy.style.cssText = 'position:fixed;top:-9999px;left:0;opacity:0;width:1px;height:1px;';
-  document.body.appendChild(proxy);
-  proxy.focus();
-  setTimeout(() => proxy.remove(), 500);
-}
-
 export function SearchEverywhere() {
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<SearchCategory>('all');
@@ -255,19 +244,9 @@ export function SearchEverywhere() {
     }
   }, [isOpen]);
 
-  // Close on outside click — skip the toggle button (its own handler manages state).
-  useEffect(() => {
-    if (!isOpen) return;
-    function onMouseDown(e: MouseEvent) {
-      const target = e.target as HTMLElement;
-      if (target.closest('[data-role="search-everywhere-toggle"]')) return;
-      if (modalRef.current && !modalRef.current.contains(target)) {
-        close();
-      }
-    }
-    document.addEventListener('mousedown', onMouseDown);
-    return () => document.removeEventListener('mousedown', onMouseDown);
-  }, [isOpen, close]);
+  // anchor=null: re-clicking the toggle while open dismisses + swallows
+  // (instead of letting its onClick re-flip the signal back to open).
+  useDismissOnOutside(isOpen, modalRef, null, close);
 
   // Scroll selected result into view
   useEffect(() => {
@@ -282,10 +261,10 @@ export function SearchEverywhere() {
     saveRecent(item);
     close();
     switch (item.category) {
-      case 'threads': focusThread(item.id); break;
+      case 'threads': focusThreadOrBootstrap(item.id); break;
       case 'files': openFilePreview(item.id); break;
-      case 'apps': openAppById(item.id); break;
-      case 'triggers': navigateToTrigger(item.id); break;
+      case 'apps': void openAppById(item.id); break;
+      case 'triggers': void navigateToTrigger(item.id); break;
       case 'settings': {
         const entry = findSettingsEntry(item.id);
         if (!entry) break;
@@ -294,7 +273,7 @@ export function SearchEverywhere() {
         if (entry.anchor) settingsScrollTarget.value = entry.anchor;
         break;
       }
-      case 'changes': viewChangeDiffById(item.id); break;
+      case 'changes': void viewChangeDiffById(item.id); break;
     }
   }
 

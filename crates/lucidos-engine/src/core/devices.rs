@@ -17,6 +17,9 @@ pub struct Device {
 pub struct DeviceStore;
 
 impl DeviceStore {
+    /// Defensive double-write — the migration owns this CREATE TABLE
+    /// (see `20260517160627_consolidate_init_schema_tables.sql`). Slated
+    /// for removal in `harden-init-schema-tables-vs-migrations-pattern-finish`.
     pub async fn init_schema(
         pool: &PgPool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -35,25 +38,41 @@ impl DeviceStore {
         Ok(())
     }
 
-    /// Register or update a device (upsert by id)
+    /// Register or update a device (upsert by id). Returns `(device, inserted)`
+    /// where `inserted` is true iff a new row was created (false on
+    /// last-seen-at refresh). Callers stamp `DeviceRegistered` audit events
+    /// only when `inserted` is true so a page-load refresh doesn't append a
+    /// row to the events table on every navigation.
+    ///
+    /// `xmax = 0` on PostgreSQL is the standard idiom for "INSERT path of an
+    /// ON CONFLICT DO UPDATE" — the system column holds the deleting
+    /// transaction id, which is 0 for a freshly inserted row and the
+    /// current xid for an UPDATE.
     pub async fn register(
         pool: &PgPool,
         id: &str,
         user_agent: Option<&str>,
-    ) -> Result<Device, Box<dyn std::error::Error + Send + Sync>> {
-        let device = sqlx::query_as::<_, Device>(
+    ) -> Result<(Device, bool), Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(sqlx::FromRow)]
+        struct DeviceWithInsertFlag {
+            #[sqlx(flatten)]
+            device: Device,
+            inserted: bool,
+        }
+
+        let row: DeviceWithInsertFlag = sqlx::query_as(
             "INSERT INTO devices (id, user_agent, last_seen_at)
              VALUES ($1, $2, NOW())
              ON CONFLICT (id) DO UPDATE SET
                 user_agent = COALESCE($2, devices.user_agent),
                 last_seen_at = NOW()
-             RETURNING *",
+             RETURNING id, name, user_agent, push_enabled, last_seen_at, created_at, (xmax = 0) AS inserted",
         )
         .bind(id)
         .bind(user_agent)
         .fetch_one(pool)
         .await?;
-        Ok(device)
+        Ok((row.device, row.inserted))
     }
 
     /// Get the display name for a device (falls back to truncated ID if no name set).
@@ -160,6 +179,29 @@ impl DeviceStore {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    /// List IDs of currently push-enabled devices whose `last_seen_at` is
+    /// older than `cutoff_days` days. Used by the daily prune to flip them
+    /// to `push_enabled = false`, stopping push fan-out to phantom
+    /// subscriptions (typically PWA reinstalls whose Apple/Google endpoint
+    /// hasn't 410'd yet). Filtered to push-enabled at the SELECT layer so
+    /// the caller never emits a no-op `DevicePushChanged` for rows already
+    /// disabled.
+    pub async fn list_stale_push_enabled(
+        pool: &PgPool,
+        cutoff_days: i64,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM devices
+             WHERE push_enabled = true
+               AND last_seen_at < NOW() - make_interval(days => $1::int)
+             ORDER BY last_seen_at ASC",
+        )
+        .bind(cutoff_days)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
 }
 
 /// Resolve a display name for a device: prefer the stored name, fall back to
@@ -209,4 +251,58 @@ fn parse_user_agent(ua: &str) -> String {
     };
 
     format!("{} on {}", browser, os)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn backdate_last_seen(pool: &PgPool, id: &str, days_ago: i64) {
+        sqlx::query("UPDATE devices SET last_seen_at = NOW() - make_interval(days => $1::int) WHERE id = $2")
+            .bind(days_ago)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_stale_push_enabled_filters_by_age_and_push_state() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+        // Push-enabled + old → returned
+        DeviceStore::register(&pool, "old-on", Some("UA")).await.unwrap();
+        DeviceStore::set_push_enabled(&pool, "old-on", true).await.unwrap();
+        backdate_last_seen(&pool, "old-on", 45).await;
+
+        // Push-enabled + recent → excluded (last_seen is today)
+        DeviceStore::register(&pool, "fresh-on", Some("UA")).await.unwrap();
+        DeviceStore::set_push_enabled(&pool, "fresh-on", true).await.unwrap();
+
+        // Push-disabled + old → excluded (filtered at SELECT to avoid no-op events)
+        DeviceStore::register(&pool, "old-off", Some("UA")).await.unwrap();
+        backdate_last_seen(&pool, "old-off", 45).await;
+
+        // Right on the cutoff (29 days) → excluded
+        DeviceStore::register(&pool, "almost-on", Some("UA")).await.unwrap();
+        DeviceStore::set_push_enabled(&pool, "almost-on", true).await.unwrap();
+        backdate_last_seen(&pool, "almost-on", 29).await;
+
+        let stale = DeviceStore::list_stale_push_enabled(&pool, 30).await.unwrap();
+        assert_eq!(stale, vec!["old-on".to_string()]);
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn list_stale_push_enabled_returns_empty_when_nothing_stale() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        DeviceStore::register(&pool, "fresh", Some("UA")).await.unwrap();
+        DeviceStore::set_push_enabled(&pool, "fresh", true).await.unwrap();
+
+        let stale = DeviceStore::list_stale_push_enabled(&pool, 30).await.unwrap();
+        assert!(stale.is_empty());
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
 }

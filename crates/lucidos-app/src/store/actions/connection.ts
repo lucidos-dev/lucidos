@@ -1,4 +1,4 @@
-import { connectionStatus, dismissToast, showToast, isProcessing, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired } from '../store';
+import { connectionStatus, dismissToast, showToast, isProcessing, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, TOAST_AUTO_DISMISS_MS } from '../store';
 import { checkHealth, API_BASE } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
@@ -6,9 +6,15 @@ import { refreshChangesState, RESTART_LS_KEY } from './chat-changes';
 import { refreshUnreadCount } from './notifications';
 import { isNewerVersion } from '../../utils/version';
 
-export function getDisconnectedMsg(): string {
+/** User-facing copy when `submitChat` couldn't reach the engine — laptop
+ *  woke up to a stale connection, the engine is genuinely down, etc.
+ *  Avoid claiming the engine is "disconnected": the engine is local to the
+ *  user's machine and almost never down. The browser tab's stream to it is
+ *  what broke — naming it that way + telling the user the recovery action
+ *  is more honest than blaming the engine. */
+export function getUnreachableEngineMsg(): string {
   const target = API_BASE || window.location.origin;
-  return `Disconnected from engine at ${target}`;
+  return `Could not reach engine at ${target} — check your connection and reload`;
 }
 
 /** True once we've been connected at least once (distinguishes initial connect from reconnect). */
@@ -48,7 +54,7 @@ function runResumeSync(): void {
   // timer in ThreadView can never retry a thread that had a transient failure.
   clearForcedRetries();
 
-  refreshUnreadCount();
+  void refreshUnreadCount();
   disconnectThreadEvents();
   connectThreadEvents();
   refreshChangesState();
@@ -56,6 +62,12 @@ function runResumeSync(): void {
   // Incrementally refresh already-loaded threads (append-only event log —
   // existing events stay, we just fetch what's new via ?after=maxSeq).
   // Focused thread awaited first for immediate UX, rest in parallel.
+  //
+  // The `.catch(() => {})` swallows are safe carve-outs only because
+  // `refreshThreadEvents` (thread-loading.ts) toasts user-visible failures
+  // itself via `showToast` after retrying — the outer catch keeps the parallel
+  // fan-out from rejecting the unhandled-promise tracker; per-thread errors
+  // already surfaced inside.
   const focused = focusedThreadId.value;
   const map = threadMap.value;
   const loadedIds: string[] = [];
@@ -76,9 +88,11 @@ function runResumeSync(): void {
 
   // Retry threads whose initial load failed — loadThreadEvents resets
   // eventsLoadFailed and does a full load (lastDbSeq is still 0).
-  for (const id of failedIds) loadThreadEvents(id);
+  for (const id of failedIds) void loadThreadEvents(id);
 
-  // Also load thread list to pick up any brand-new threads
+  // Also load thread list to pick up any brand-new threads. loadAllThreads
+  // stamps Loadable failed states internally; the catch is the rejection-
+  // tracker silencer.
   loadAllThreads().catch(() => {});
 }
 
@@ -108,12 +122,19 @@ export async function handleResume(): Promise<void> {
 
 export async function checkConnection(): Promise<boolean> {
   const wasConnected = connectionStatus.value === 'connected';
-  const health = await checkHealth();
+  const healthResult = await checkHealth();
+  const health = healthResult.status === 'loaded' ? healthResult.data : null;
   let connected = health !== null;
 
   // During active processing, tolerate a few health check timeouts before transitioning to
   // disconnected. The engine can be slow under heavy load, but if it fails
   // MAX_SUPPRESSED_FAILURES times in a row, it's genuinely down.
+  // Track the *real* health result separately from the displayed `connected`
+  // value so a suppressed failure doesn't reset the counter on the next line —
+  // without this guard the suppression accumulator would zero out after every
+  // suppressed failure and the cap would never fire (the engine could stay
+  // "down" for hours and we'd still display connected).
+  const healthOk = connected;
   if (!connected && isProcessing.value && wasConnected) {
     consecutiveFailures++;
     if (consecutiveFailures <= MAX_SUPPRESSED_FAILURES) {
@@ -121,7 +142,7 @@ export async function checkConnection(): Promise<boolean> {
     }
   }
 
-  if (connected) {
+  if (healthOk) {
     consecutiveFailures = 0;
   }
 
@@ -179,6 +200,8 @@ export async function checkConnection(): Promise<boolean> {
     // Retry thread list load if initial load failed — prevents permanent
     // blank screen when startup loadAllThreads hit a transient error.
     if (!threadsLoaded.value) {
+      // loadAllThreads stamps Loadable failed via thread-loading's catch path;
+      // the swallow is just the rejection-tracker silencer.
       loadAllThreads().catch(() => {});
     }
     // Recovery for focused thread with eventsLoaded=true but 0 events:
@@ -189,12 +212,13 @@ export async function checkConnection(): Promise<boolean> {
     if (focusedId) {
       const ft = threadMap.value.get(focusedId);
       if (ft && ft.eventsLoaded && ft.events.size === 0 && ft.pendingUserMessages.length === 0) {
+        // refreshThreadEvents surfaces failures via showToast itself.
         if (!emptyRefreshState || emptyRefreshState.id !== focusedId) {
           emptyRefreshState = { id: focusedId, count: 1 };
-          refreshThreadEvents(focusedId);
+          void refreshThreadEvents(focusedId);
         } else if (emptyRefreshState.count < MAX_EMPTY_REFRESHES) {
           emptyRefreshState.count++;
-          refreshThreadEvents(focusedId);
+          void refreshThreadEvents(focusedId);
         }
       }
     }
@@ -218,7 +242,7 @@ export async function checkConnection(): Promise<boolean> {
       // so the client needs a reload to pick up new assets.
       showToast('Engine restarted', 'success', {
         action: { label: 'Refresh', onClick: () => window.location.reload() },
-        autoDismissMs: 4000,
+        autoDismissMs: TOAST_AUTO_DISMISS_MS,
       });
       updateAvailable.value = true;
     }

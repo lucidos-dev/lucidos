@@ -6,7 +6,6 @@ import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { ComposeIcon, SearchIcon, FilterIcon, DraftsIcon } from '../shared/icons';
 import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
-import { threadChannelFilter, ALL_CHANNELS } from '../../store/store';
 import { unfocusThread } from '../../store/actions/threads';
 import { openUrl } from '../../store/actions/artifacts';
 import { navigateToPane, resolveSwipePane } from '../../store/actions/pane';
@@ -14,31 +13,25 @@ import { MobileAppHeader } from './MobileAppHeader';
 import { SwipeTouch } from '../../utils/swipe';
 import { PanelNav } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
-import { ControlPanel, controlPanelOpen, controlPanelBadgeCount, controlPanelBadgeTooltip } from './ControlPanel';
+import { ControlPanel, controlPanelOpen, controlPanelAnchor, controlPanelBadgeCount, controlPanelBadgeTooltip } from './ControlPanel';
 import { ThreadFilterDropdown } from './ThreadFilterDropdown';
 import { getContentTitle, getDiffDescription } from './headerHelpers';
 import { resolveHeaderDblClick } from './headerDblClick';
 import { createDblClickGate } from '../../utils/dblClickGate';
-import { useThreadSearch } from '../../hooks/useThreadSearch';
+import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
 import { isMobile } from '../../utils/viewport';
 import { isTextInput } from '../../utils/dom';
-import { tooltipWithShortcut } from '../../utils/shortcuts';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
 
 function ThreadsHeader() {
-  const [filterOpen, setFilterOpen] = useState(false);
-  const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadSearch();
-  const toggleRef = useRef<HTMLButtonElement>(null);
-  const closeFilter = useCallback(() => setFilterOpen(false), []);
-  const filterActive = threadChannelFilter.value.size < ALL_CHANNELS.length;
+  const { filterOpen, setFilterOpen, toggleRef, closeFilter, filterActive,
+          searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
 
   return (
     <div class={`threads-header${searchOpen ? ' search-active' : ''}`}>
       <ThreadToggleButton />
       <div class="thread-search-bar">
-        <svg class="thread-search-bar-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="7" cy="7" r="4.5" />
-          <path d="M10.5 10.5L14 14" />
-        </svg>
+        <SearchIcon className="thread-search-bar-icon" />
         <input
           ref={searchInputRef}
           class="thread-search-input"
@@ -258,6 +251,7 @@ export function AppHeader() {
                   // brand-label stretches with flex:1 to center its content;
                   // ignore clicks on the empty space around the visible children.
                   if (e.target === e.currentTarget) return;
+                  controlPanelAnchor.value = e.currentTarget as HTMLElement;
                   controlPanelOpen.value = !controlPanelOpen.value;
                 }}
               >
@@ -265,7 +259,7 @@ export function AppHeader() {
                 {badgeCount > 0 && <span class="badge brand-badge" data-tooltip={controlPanelBadgeTooltip()}>{badgeCount}</span>}
                 <ConnectionStatus />
               </span>
-              <ControlPanel />
+              <ControlPanel layout="desktop" />
               <SearchEverywhereButton showTooltip />
               {recoveryProgress.value && (
                 <span

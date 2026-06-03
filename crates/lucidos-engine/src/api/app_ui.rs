@@ -20,6 +20,16 @@ pub(super) fn rewrite_for_commit(html: &str, commit: Option<&str>) -> String {
     }
 }
 
+/// Append `?thread_id=<id>` to every relative `src` / `href` in the served
+/// HTML when previewing an app from an *app coding-agent thread*'s worktree.
+/// Without this, sub-resources (CSS, JS, images, fonts) resolve via the
+/// route's live-workspace branch — defeating the preview, which is meant to
+/// show the whole app from the WIP. Mirrors `rewrite_for_commit`.
+pub(super) fn rewrite_for_thread_id(html: &str, thread_id: &str) -> String {
+    let suffix = format!("?thread_id={}", thread_id);
+    append_query_to_relative_paths(html, &suffix)
+}
+
 /// Append a query string (e.g. `?commit=abc123`) to relative src/href attributes in HTML.
 /// Only rewrites in markup — skips `<script>` block *bodies* where template literals like
 /// `src="${var}"` would be incorrectly rewritten. The opening `<script>` tag's own attributes

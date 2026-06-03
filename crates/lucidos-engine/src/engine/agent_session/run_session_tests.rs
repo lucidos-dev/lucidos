@@ -34,7 +34,7 @@ async fn try_wait_detects_dead_cc_process() {
 }
 
 /// Verifies that `try_wait()` returns None for a still-running process.
-/// This ensures the watchdog doesn't false-positive on healthy CC sessions.
+/// This ensures the watchdog doesn't false-positive on healthy Claude Code sessions.
 #[tokio::test]
 async fn try_wait_returns_none_for_running_process() {
     use tokio::process::Command;

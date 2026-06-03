@@ -10,6 +10,7 @@ struct ScenarioFile {
 struct Scenario {
     name: String,
     thread_type: String,
+    // Deserialized for fixture readability; the test code never inspects it.
     #[allow(dead_code)]
     description: String,
     #[serde(default)]
@@ -135,19 +136,26 @@ fn all_scenarios_pass() {
                 } else {
                     ThreadStatus::Idle
                 };
-                let actions = resolve_actions(
+                let actions = available_thread_actions(
                     thread_type,
                     status,
                     current_section,
                     has_pending_changes,
-                    false,
+                    false, // descendants_block_archive: the cross-validation contract exhausts
+                           // this axis; this scenario file covers no-blocking-descendants only
+                    false, // has_unsent_draft: scenarios predate the draft layer
+                    false, // is_saved: scenarios assert the close set only
                 );
+                // Scenarios assert the CLOSE set (archive/apply/discard) — the
+                // Save/Unsave toggle and DiscardDraft layer postdate these
+                // fixtures, so filter them out of the comparison.
                 let action_strs: Vec<String> = actions
                     .iter()
-                    .map(|a| match a {
-                        Action::Archive => "archive".to_string(),
-                        Action::Apply => "apply".to_string(),
-                        Action::Discard => "discard".to_string(),
+                    .filter_map(|a| match a {
+                        Action::Archive => Some("archive".to_string()),
+                        Action::Apply => Some("apply".to_string()),
+                        Action::Discard => Some("discard".to_string()),
+                        Action::Save | Action::Unsave | Action::DiscardDraft => None,
                     })
                     .collect();
                 assert_eq!(

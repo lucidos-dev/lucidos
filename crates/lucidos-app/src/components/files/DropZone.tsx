@@ -1,6 +1,8 @@
 import { useEffect, useRef } from 'preact/hooks';
 import { uploadFiles } from '../../store/actions/artifacts';
+import { showToast } from '../../store/store';
 import { attachDroppedFilesToDraft } from '../chat/attachToDraft';
+import { errorDetail } from '../../utils/errorDetail';
 import { findDropZone, dispatchDrop, type DropZoneKind, type DropZoneMatch } from './dropDispatch';
 
 const ZONE_CLASS: Record<DropZoneKind, string> = {
@@ -72,10 +74,17 @@ export function DropZone() {
       const target = e.target;
       const files = e.dataTransfer?.files;
       clearHighlight();
-      await dispatchDrop(target, files, {
-        attach: attachDroppedFilesToDraft,
-        import: uploadFiles,
-      });
+      // addEventListener ignores the returned Promise — wrap the awaited work
+      // in try/catch so a rejection in dispatchDrop (or either dispatched
+      // action) surfaces as a toast instead of an unhandled rejection.
+      try {
+        await dispatchDrop(target, files, {
+          attach: attachDroppedFilesToDraft,
+          import: uploadFiles,
+        });
+      } catch (err) {
+        showToast(`Drop failed: ${errorDetail(err)}`, 'error');
+      }
     }
 
     document.addEventListener('dragenter', onDragEnter);

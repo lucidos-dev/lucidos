@@ -10,7 +10,7 @@ export type ArchiveState = 'archived' | 'inbox';
 export type DisplaySection = 'active' | 'saved' | 'review' | 'archive';
 export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'failed';
 export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';
-export type Action = 'archive' | 'apply' | 'discard';
+export type Action = 'discard_draft' | 'discard' | 'apply' | 'archive' | 'save' | 'unsave';
 export type MessageLabel = 'Requesting' | 'Working' | 'Waiting' | 'Canceled' | 'Aborted';
 
 export const LEGAL_SECTIONS: Readonly<Record<ThreadType, readonly ArchiveState[]>> = {
@@ -21,11 +21,12 @@ export const LEGAL_SECTIONS: Readonly<Record<ThreadType, readonly ArchiveState[]
 export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   MessageReceived: 'start',
   TextStreamed: 'activity',
-  Thinking: 'activity',
+  ThoughtStreamed: 'activity',
   ContextCaptured: 'metadata',
   MemorySearched: 'activity',
   ToolCalled: 'activity',
   ToolResult: 'activity',
+  TodoListWritten: 'activity',
   ResponseGenerated: 'terminal',
   ResponseCanceled: 'terminal',
   ResponseAborted: 'terminal',
@@ -39,7 +40,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   CodingAgentUserMessageSent: 'start',
   CodingAgentPromptSent: 'activity',
   CodingAgentIdled: 'action_required',
-  ContinueSignal: 'start',
+  ContinuationRequested: 'start',
   MissingHardeningDetected: 'start',
   ThreadTitleGenerated: 'metadata',
   ThreadTitleRenamed: 'metadata',
@@ -73,6 +74,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ContextDismissed: 'metadata',
   BackgroundBashStarted: 'metadata',
   BackgroundBashCompleted: 'metadata',
+  ImageDescribed: 'metadata',
 } as const;
 
 export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([
@@ -84,7 +86,7 @@ export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([
   'CodingAgentUserMessageSent',
   'CodingAgentPromptSent',
   'CodingAgentIdled',
-  'ContinueSignal',
+  'ContinuationRequested',
   'MissingHardeningDetected',
   'CodingAgentSettingsChanged',
   'UserQuestionAsked',
@@ -106,11 +108,12 @@ export const LAST_ACTIVITY_EVENTS: ReadonlySet<string> = new Set([
   'UserQuestionAnswered',
   'CodingAgentPermissionRequest',
   'CodingAgentPermissionResolved',
-  'ContinueSignal',
+  'ContinuationRequested',
   'ToolCalled',
   'ToolResult',
   'TextStreamed',
-  'Thinking',
+  'ThoughtStreamed',
+  'MemorySearched',
   'CodingAgentTextStreamed',
   'CodingAgentToolCalled',
   'CodingAgentToolResult',
@@ -126,8 +129,10 @@ export function displaySection(
   isSaved: boolean,
   hasActiveChildren: boolean,
   hasPendingChanges: boolean,
+  hasAttentionDescendants: boolean,
 ): DisplaySection {
   if (isSaved) return 'saved';
+  if (hasAttentionDescendants) return 'review';
   if (status === 'running' || hasActiveChildren) return 'active';
   if (hasPendingChanges) return 'review';
   if (stored === 'archived') return 'archive';
@@ -138,18 +143,28 @@ export function isCcOnlyEvent(eventType: string): boolean {
   return CC_ONLY_EVENTS.has(eventType);
 }
 
-export function resolveActions(
+export function availableThreadActions(
   threadType: ThreadType,
   status: ThreadStatus,
   storedSection: ArchiveState,
   hasPendingChanges: boolean,
+  descendantsBlockArchive: boolean,
+  hasUnsentDraft: boolean,
   isSaved: boolean,
 ): Action[] {
-  if (status === 'running' || status === 'waiting_for_user_answer') return [];
-  if (hasPendingChanges && threadType === 'claude_code') return ['discard', 'apply'];
-  if (isSaved) return [];
-  if (storedSection !== 'inbox') return [];
-  return ['archive'];
+  const actions: Action[] = [];
+  const live = status === 'running' || status === 'waiting_for_user_answer';
+  const ccPending = hasPendingChanges && threadType === 'claude_code';
+  if (hasUnsentDraft) actions.push('discard_draft');
+  if (!live) {
+    if (ccPending) {
+      actions.push('discard', 'apply');
+    } else if (storedSection === 'inbox' && !descendantsBlockArchive) {
+      actions.push('archive');
+    }
+  }
+  actions.push(isSaved ? 'unsave' : 'save');
+  return actions;
 }
 export const MESSAGE_COUNT_EVENTS: ReadonlySet<string> = new Set([
   'MessageReceived',

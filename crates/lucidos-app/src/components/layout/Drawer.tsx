@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { useEffect } from 'preact/hooks';
+import { useEffect, useRef } from 'preact/hooks';
 import { activeMenuItem, panelOverlay, pinnedApps, appsList, changes } from '../../store/store';
 import { switchMenuItem } from '../../store/actions/menu';
 import { openUrl } from '../../store/actions/artifacts';
@@ -8,6 +8,7 @@ import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
 import { isTauri } from '../../utils/platform';
 import { hidePanelWebview, showPanelWebview } from '../../utils/tauri';
+import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
 import type { MenuItem } from '../../store/types';
 
 const menuItems: Array<{ id: MenuItem; label: string }> = [
@@ -18,17 +19,27 @@ const menuItems: Array<{ id: MenuItem; label: string }> = [
 
 export const drawerOpen = signal(false);
 export const drawerClosing = signal(false);
+/** Hamburger button that opened the drawer. Two `.hamburger-panel` buttons
+ *  exist (dual-layout pattern); only the visible one fires openDrawer(), so
+ *  this captures the right element for the dismiss hook's anchor exemption. */
+export const drawerAnchor = signal<HTMLElement | null>(null);
 
 /** Open the drawer, resetting any stuck closing state */
-export function openDrawer() {
+export function openDrawer(anchor?: HTMLElement) {
   drawerClosing.value = false;
   drawerOpen.value = true;
+  if (anchor) drawerAnchor.value = anchor;
 }
 
-/** Close the drawer with a slide-out animation */
-export function closeDrawer() {
-  if (!drawerOpen.value || drawerClosing.value) return;
+/** Close the drawer; returns `false` when already closed/closing so the
+ *  dismiss hook keeps the paired click un-swallowed — `drawerOpen` stays
+ *  `true` for the 200ms slide-out animation, and without this signal the
+ *  hook would eat a user's tap on a neighbor button (file-search, content
+ *  actions, …) as if they meant to dismiss. */
+export function closeDrawer(): boolean {
+  if (!drawerOpen.value || drawerClosing.value) return false;
   drawerClosing.value = true;
+  return true;
 }
 
 /** Immediately close the drawer without animation (e.g. pane switching). */
@@ -42,14 +53,16 @@ interface PinnedUi {
   appName: string;
 }
 
-/** Resolve pinned app UI entries to displayable objects */
+/** Render rows only when both Loadables are `loaded` — falling through to
+ *  `[]` mid-load would look like "user unpinned" instead of "still loading". */
 function resolvedPinnedUis(): PinnedUi[] {
-  const entries = pinnedApps.value;
+  const pinned = pinnedApps.value;
   const loaded = appsList.value;
-  if (entries.length === 0 || loaded.status !== 'loaded') return [];
+  if (pinned.status !== 'loaded' || loaded.status !== 'loaded') return [];
+  if (pinned.data.length === 0) return [];
 
   const result: PinnedUi[] = [];
-  for (const entry of entries) {
+  for (const entry of pinned.data) {
     const app = loaded.data.find((s) => s.id === entry.app_id);
     if (app) result.push({ appId: app.id, appName: app.name });
   }
@@ -59,6 +72,7 @@ function resolvedPinnedUis(): PinnedUi[] {
 export function Drawer() {
   const isOpen = drawerOpen.value;
   const pinned = resolvedPinnedUis();
+  const drawerRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     if (!isOpen || !isTauri()) return;
@@ -66,30 +80,28 @@ export function Drawer() {
     return () => showPanelWebview();
   }, [isOpen]);
 
-  // Desktop backdrop only covers the panel area — catch clicks on the chat pane too
-  useEffect(() => {
-    if (!isOpen) return;
-    function handleMouseDown(e: MouseEvent) {
-      const target = e.target as HTMLElement;
-      if (target.closest('.drawer') || target.closest('.hamburger-panel') || target.closest('.thread-toggle')) return;
-      closeDrawer();
-    }
-    document.addEventListener('mousedown', handleMouseDown);
-    return () => document.removeEventListener('mousedown', handleMouseDown);
-  }, [isOpen]);
+  // Desktop backdrop only covers the panel area — outside-click on the chat
+  // pane still needs to close. Anchor is the hamburger that opened this
+  // drawer (stamped in openDrawer), so re-clicking it routes through its own
+  // toggle. The hook swallows the paired click for everything else outside.
+  useDismissOnOutside(isOpen, drawerRef, drawerAnchor.value, closeDrawer);
 
   if (!isOpen) return null;
 
-  const changeCount = changes.value.length;
+  // Badge count: only the `loaded` signal contributes a real number. While
+  // the changes Loadable is not-loaded / loading / failed, hide the badge
+  // entirely rather than render `0` (which would look like "nothing to
+  // review" during a DB outage). Reuses the existing `changeCount > 0`
+  // gate below — `null` falls through it cleanly.
+  const changesLoadable = changes.value;
+  const changeCount: number | null =
+    changesLoadable.status === 'loaded' ? changesLoadable.data.length : null;
 
   return (
-    <div
-      class={`drawer-backdrop ${drawerClosing.value ? 'closing' : ''}`}
-      onClick={closeDrawer}
-    >
+    <div class={`drawer-backdrop ${drawerClosing.value ? 'closing' : ''}`}>
       <nav
+        ref={drawerRef}
         class={`drawer ${drawerClosing.value ? 'closing' : ''}`}
-        onClick={(e) => e.stopPropagation()}
         onAnimationEnd={(e) => {
           if (drawerClosing.value && e.target === e.currentTarget) {
             drawerClosing.value = false;
@@ -149,7 +161,9 @@ export function Drawer() {
           }}
         >
           Changes
-          {changeCount > 0 && <span class="drawer-badge">{changeCount > 99 ? '99+' : changeCount}</span>}
+          {changeCount !== null && changeCount > 0 && (
+            <span class="drawer-badge">{changeCount > 99 ? '99+' : changeCount}</span>
+          )}
         </div>
 
         <div

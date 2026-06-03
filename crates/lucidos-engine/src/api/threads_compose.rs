@@ -77,12 +77,14 @@ fn validate_mode(mode: &str) -> Result<(), (StatusCode, Json<JsonValue>)> {
 
 /// Map a thread row's `state` (Option = no row) to the HTTP error for an
 /// attempted compose write, returning `Some(_)` when the request must be
-/// rejected. `Composing`, `Active`, and `Archived` accept compose updates —
-/// the latter so a re-opened archived thread can sync the keystrokes that
-/// lead up to the send that revives it (see `ThreadState` doc). `Discarded`
-/// is the only hard reject. Used by the post-UPDATE branch where `state` is
-/// read back from a `RETURNING` clause to distinguish "no row" (404) from
-/// "row but wrong state" (410).
+/// rejected. `Composing` and `Active` accept compose updates; `Discarded`
+/// is the only hard reject. Archived threads carry `state='active'` plus
+/// `archive_state='archived'` and so flow through the `Active` arm — the
+/// gmail-like revival behavior (keystrokes lead up to the send that
+/// re-surfaces the thread) is preserved without needing a separate
+/// `Archived` value on this column. Used by the post-UPDATE branch where
+/// `state` is read back from a `RETURNING` clause to distinguish "no row"
+/// (404) from "row but wrong state" (410).
 ///
 /// Listed exhaustively so a new `ThreadState` variant forces the author to
 /// make a deliberate accept/reject decision instead of inheriting whatever
@@ -92,7 +94,7 @@ fn compose_error(state: Option<ThreadState>) -> Option<(StatusCode, Json<JsonVal
         return Some(err(StatusCode::NOT_FOUND, "thread not found"));
     };
     match state {
-        ThreadState::Composing | ThreadState::Active | ThreadState::Archived => None,
+        ThreadState::Composing | ThreadState::Active => None,
         ThreadState::Discarded => Some(err(StatusCode::GONE, "thread discarded")),
     }
 }
@@ -109,16 +111,23 @@ pub(super) async fn post_thread(
 ) -> Result<StatusCode, (StatusCode, Json<JsonValue>)> {
     validate_mode(&body.mode)?;
 
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT state, compose_mode FROM thread_summaries WHERE thread_id = $1",
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT state, archive_state, compose_mode FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(body.id)
     .fetch_optional(state.engine.pool())
     .await
     .map_err(internal_err)?;
 
-    if let Some((state_str, existing_mode)) = row {
+    if let Some((state_str, archive_state_str, existing_mode)) = row {
         let existing_state = ThreadState::from_db_str(&state_str).map_err(internal_err)?;
+        // Each arm fully handles its state — no spatial-ordering dependency
+        // between an early-return and a later match. Discarded returns 410
+        // unconditionally (the `ThreadDiscarded` projection sets BOTH
+        // state='discarded' AND archive_state='archived', and the 410-Gone
+        // contract for "this id is dead, mint a new one" must not be masked
+        // by the post-collapse archive flag). Active distinguishes the
+        // archived sub-case for a more specific 409 message.
         return match existing_state {
             ThreadState::Composing => {
                 if existing_mode.as_deref() == Some(body.mode.as_str()) {
@@ -130,9 +139,14 @@ pub(super) async fn post_thread(
                     ))
                 }
             }
-            ThreadState::Active => Err(err(StatusCode::CONFLICT, "thread already active")),
+            ThreadState::Active => {
+                if archive_state_str == "archived" {
+                    Err(err(StatusCode::CONFLICT, "thread archived"))
+                } else {
+                    Err(err(StatusCode::CONFLICT, "thread already active"))
+                }
+            }
             ThreadState::Discarded => Err(err(StatusCode::GONE, "thread discarded")),
-            ThreadState::Archived => Err(err(StatusCode::CONFLICT, "thread archived")),
         };
     }
 
@@ -202,7 +216,12 @@ pub(super) async fn put_compose(
                     .map_err(|e| {
                         let status = match e {
                             crate::core::blobs::BlobError::BadEncoding(_) => StatusCode::BAD_REQUEST,
-                            _ => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            crate::core::blobs::BlobError::UnsupportedMime => {
+                                StatusCode::UNSUPPORTED_MEDIA_TYPE
+                            }
+                            crate::core::blobs::BlobError::Io(_) => {
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            }
                         };
                         err(status, &e.to_string())
                     })?;
@@ -245,7 +264,7 @@ pub(super) async fn put_compose(
                     ELSE source
                 END
           WHERE thread_id = $1
-            AND state IN ('composing', 'active', 'archived')
+            AND state IN ('composing', 'active')
             AND ($4::text IS NULL OR state = 'composing')
          RETURNING state, compose_mode, compose_images",
     )
@@ -274,13 +293,13 @@ pub(super) async fn put_compose(
                 .map(|(s,)| ThreadState::from_db_str(&s))
                 .transpose()
                 .map_err(internal_err)?;
-            // Mode locks at first send — both `Active` and `Archived` are
-            // post-send states. Without this branch the cold-path would fall
-            // through to `compose_error` which (correctly) accepts archived
-            // for compose, masking the mode lock as a silent no-op.
-            if body.mode.is_some()
-                && matches!(st, Some(ThreadState::Active | ThreadState::Archived))
-            {
+            // Mode locks at first send — once the thread leaves Composing,
+            // mode is fixed. Archived rows carry state='active' so they hit
+            // this branch naturally. Without it the cold-path would fall
+            // through to `compose_error` which (correctly) accepts compose
+            // updates from post-send states, masking the mode lock as a
+            // silent no-op.
+            if body.mode.is_some() && matches!(st, Some(ThreadState::Active)) {
                 return Err(err(
                     StatusCode::CONFLICT,
                     "mode is locked once the thread has been sent",
@@ -339,27 +358,34 @@ pub(super) async fn delete_thread(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, Json<JsonValue>)> {
-    let lookup: Option<(String,)> =
-        sqlx::query_as("SELECT state FROM thread_summaries WHERE thread_id = $1")
-            .bind(id)
-            .fetch_optional(state.engine.pool())
-            .await
-            .map_err(internal_err)?;
-    let current_state = lookup
-        .map(|(s,)| ThreadState::from_db_str(&s))
-        .transpose()
-        .map_err(internal_err)?;
+    let lookup: Option<(String, String)> = sqlx::query_as(
+        "SELECT state, archive_state FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(state.engine.pool())
+    .await
+    .map_err(internal_err)?;
+    let Some((state_str, archive_state_str)) = lookup else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    let current_state = ThreadState::from_db_str(&state_str).map_err(internal_err)?;
+    // Each arm fully handles its state — no spatial-ordering dependency.
+    // Discarded is idempotent (204). Active is rejected; the
+    // already-archived sub-case takes the more specific 409 message
+    // ("thread already archived") since `archive_state` is the sole
+    // archive flag post-collapse and archived rows now carry
+    // state='active'.
     match current_state {
-        None | Some(ThreadState::Discarded) => return Ok(StatusCode::NO_CONTENT),
-        Some(ThreadState::Composing) => {}
-        Some(ThreadState::Active) => {
+        ThreadState::Composing => {} // fall through to emit ThreadDiscarded
+        ThreadState::Discarded => return Ok(StatusCode::NO_CONTENT),
+        ThreadState::Active => {
+            if archive_state_str == "archived" {
+                return Err(err(StatusCode::CONFLICT, "thread already archived"));
+            }
             return Err(err(
                 StatusCode::CONFLICT,
                 "thread is active — use archive instead",
             ));
-        }
-        Some(ThreadState::Archived) => {
-            return Err(err(StatusCode::CONFLICT, "thread already archived"));
         }
     }
 

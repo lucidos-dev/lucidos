@@ -1,0 +1,759 @@
+/* ─── App shell ─── */
+
+.app-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    width: 100vw;
+    overflow: hidden;
+}
+
+/* ─── Content row (thread drawer + split layout) ─── */
+
+.content-row {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* ─── Split layout ─── */
+
+.split-layout {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.pane {
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.pane-collapsed {
+    pointer-events: none;
+    visibility: hidden;
+}
+
+.split-layout.snap-animate .pane {
+    transition: flex-basis 0.25s ease-out, visibility 0.25s;
+}
+
+.pane-thread {
+    min-width: 0;
+}
+
+.pane-content {
+    min-width: 0;
+}
+
+/* Prevent any text from widening a pane beyond its container */
+.pane-thread,
+.pane-content {
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+/* --- Divider --- */
+
+.split-divider {
+    width: var(--divider-width);
+    cursor: col-resize;
+    background: var(--border-color);
+    flex-shrink: 0;
+    position: relative;
+    z-index: 2;
+    transition: background-color 0.15s;
+    touch-action: none;
+}
+
+@media (hover: hover) {
+    .split-divider.collapsed:hover {
+        background: var(--accent);
+    }
+}
+
+.split-divider.collapsed {
+    cursor: pointer;
+}
+
+/* --- Pane headers --- */
+
+.pane-header {
+    --header-padding-x: 0.625rem;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0 var(--header-padding-x);
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-secondary);
+    flex-shrink: 0;
+    height: 2.5rem;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.app-header {
+    padding-top: calc(0.25rem + env(safe-area-inset-top, 0px));
+    height: calc(2.5rem + 0.25rem + env(safe-area-inset-top, 0px));
+}
+
+.pane-header-brand {
+    display: flex;
+    align-items: center;
+    cursor: default;
+    min-width: 0;
+}
+
+.pane-header-brand-label {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+}
+
+/* Pointer cursor only on the visible children (text, badge, dot), not on the
+   empty centering space the brand-label reserves with flex:1. */
+.pane-header-brand-label > * {
+    cursor: pointer;
+}
+
+.pane-header-brand .pane-header-title {
+    font-size: 0.875rem;
+    min-width: 0;
+}
+
+.recovery-indicator {
+    display: inline-flex;
+    align-items: center;
+    opacity: 0.7;
+}
+
+.recovery-spinner {
+    width: 0.875rem;
+    height: 0.875rem;
+    animation: spin 1.2s linear infinite;
+}
+
+
+
+.pane-header-title {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pane-header-spacer {
+    flex: 1;
+}
+
+.content-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* Hidden on desktop — mobile.css enables with display:flex */
+.mobile-nav-slot {
+    display: none;
+}
+
+/* --- Thread pane body --- */
+
+.thread-pane {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    position: relative;
+}
+
+/* Compose-empty: center prompt vertically */
+.thread-pane.compose-empty {
+    justify-content: center;
+}
+
+.compose-empty .thread-content-wrap {
+    flex: 0 0 auto;
+}
+
+.compose-empty .prompt-area {
+    padding-top: 0;
+    margin-top: 0;
+}
+
+/* --- Content pane body --- */
+
+.content-pane {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    position: relative;
+}
+
+.content-pane-body {
+    flex: 1;
+    min-width: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    position: relative;
+}
+
+
+/* --- Hamburger toggle (panel menu) --- */
+
+.hamburger-panel {
+    padding: 0.5rem;
+    overflow: visible;
+}
+
+/* --- Mobile/Desktop header visibility --- */
+
+/* Mobile header sections: hidden on desktop */
+.mobile-threads-header,
+.mobile-thread-header,
+.mobile-content-header,
+.mobile-thread-title-row {
+    display: none;
+}
+
+/* Desktop header: shown on desktop, hidden on mobile */
+.desktop-header {
+    display: contents; /* pass-through for desktop layout */
+}
+
+/* Transparent wrappers — collapse to display:none hides all children at once */
+.thread-header-elements,
+.content-header-elements {
+    display: contents;
+}
+
+@media (max-width: 768px) {
+    .desktop-header {
+        display: none !important;
+    }
+}
+
+/* --- Panel navigation group (drawer toggle + back) --- */
+
+.panel-nav {
+    display: flex;
+    align-items: center;
+    gap: 0.125rem;
+}
+
+/* Threads header — hidden on mobile, only shown via desktop media query */
+.threads-header {
+    display: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+/* Thread toggle button — grid icon */
+.thread-toggle {
+    overflow: visible;
+    position: relative;
+}
+
+/* Desktop: position burger, brand, and panel title to track the split layout */
+@media (min-width: 769px) {
+    /* Compute the divider x-position accounting for thread drawer offset.
+       --content-offset: thread drawer width (0px when closed, 300px when open)
+       --split-ratio: chat fraction of split layout (0–1)
+       --divider-x: actual position in the full-width header */
+    :root {
+        --co: var(--content-offset, 0px);
+        --sr: var(--split-ratio, 0.4);
+        --ddo: 0px; /* drawer-divider offset: 0 when closed */
+        --divider-x: calc(var(--co) + var(--ddo) + var(--sr) * (100% - var(--co) - var(--ddo)));
+        /* .collapsed-thread-actions footprint: left padding + 4 buttons + 3 gaps */
+        --collapsed-thread-actions-width: calc(0.5rem + 4 * 2.25rem + 3 * 0.25rem);
+    }
+
+    :root[data-thread-drawer-open] {
+        --ddo: var(--divider-width); /* account for drawer divider element */
+    }
+
+    .app-header {
+        position: relative;
+    }
+
+    /* Subtle divider between chat and panel header areas — centered on the split bar */
+    .app-header::after {
+        content: '';
+        position: absolute;
+        left: var(--divider-x);
+        top: 20%;
+        bottom: 20%;
+        width: var(--divider-width);
+        border-radius: calc(var(--divider-width) / 2);
+        background: var(--border-color);
+        opacity: 0.4;
+        pointer-events: none;
+        transition: opacity 0.3s, left var(--duration-slow) ease;
+    }
+
+    /* Divider between thread drawer and chat header — tracks drawer divider */
+    .app-header::before {
+        content: '';
+        position: absolute;
+        left: var(--co);
+        top: 20%;
+        bottom: 20%;
+        width: var(--divider-width);
+        border-radius: calc(var(--divider-width) / 2);
+        background: var(--border-color);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.3s, left var(--duration-slow) ease;
+    }
+
+    :root[data-thread-drawer-open] .app-header::before {
+        opacity: 0.4;
+    }
+
+    /* Hide header dividers when either pane is collapsed */
+    :root[data-thread-collapsed] .app-header::after,
+    :root[data-content-collapsed] .app-header::after {
+        opacity: 0;
+    }
+
+    :root[data-thread-collapsed] .app-header::before {
+        opacity: 0;
+    }
+
+    .app-header .panel-nav {
+        position: absolute;
+        left: calc(var(--divider-x) + var(--divider-width));
+        top: 50%;
+        transform: translateY(-50%);
+        display: flex;
+        align-items: center;
+        transition: left var(--duration-slow) ease;
+    }
+
+    /* Thread toggle + compose — grouped at left edge when drawer is closed.
+       z-index must beat .pane-header-brand (--z-control-panel = 2200) which
+       starts at left:0 when the drawer is closed and would otherwise swallow
+       pointer events. Width is exposed via --collapsed-thread-actions-width
+       (defined on :root above) so .pane-header-brand can reserve padding. */
+    .collapsed-thread-actions {
+        position: absolute;
+        left: 0.5rem;
+        top: 50%;
+        transform: translateY(-50%);
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+        z-index: calc(var(--z-control-panel) + 1);
+    }
+
+    /* Threads header — icon left, title centered, actions right, positioned in drawer width.
+       z-index 3 keeps the filter dropdown above .drawer-divider / .split-divider (both
+       z-index 2) — transform creates a stacking context, so the dropdown's own z-index
+       is trapped inside this one. */
+    .threads-header {
+        position: absolute;
+        left: 0;
+        width: var(--co);
+        top: 50%;
+        transform: translateY(-50%);
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+        padding: 0 0.5rem; /* toggle is a flex child, no magic offset needed */
+        z-index: 3;
+        transition: width var(--duration-slow) ease;
+    }
+
+    .threads-header-title {
+        flex: 1;
+        font-size: 0.875rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        white-space: nowrap;
+        text-align: center;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    /* Brand area spans from drawer edge to split divider. Children flow
+       left-to-right: thread-nav-group (back+compose) | brand-label (Lucidos
+       + dot + workspace, centered in available space) | search.
+       When the drawer is closed, the back+compose buttons live in
+       .collapsed-thread-actions outside the brand and overlap the brand's
+       left edge, so we reserve padding to keep them clear of brand-label. */
+    .app-header .pane-header-brand {
+        position: absolute;
+        left: calc(var(--co) + var(--ddo));
+        width: calc(var(--divider-x) - var(--co) - var(--ddo));
+        top: 50%;
+        transform: translateY(-50%);
+        z-index: var(--z-control-panel);
+        overflow-x: clip;
+        overflow-y: visible;
+        transition: left var(--duration-slow) ease, width var(--duration-slow) ease;
+    }
+
+    :root:not([data-thread-drawer-open]) .app-header .pane-header-brand {
+        padding-left: var(--collapsed-thread-actions-width);
+    }
+
+    /* brand-label fills the middle, centers Lucidos + dot + workspace inside. */
+    .app-header .pane-header-brand .pane-header-brand-label {
+        flex: 1 1 0;
+        justify-content: center;
+    }
+
+    /* Chrome bug: overflow-x:clip on a positioned ancestor blocks pointer events
+       on absolutely positioned children that overflow on the y-axis, even when
+       overflow-y is visible. Remove the clip while the control panel is open. */
+    .app-header .pane-header-brand:has(> .control-panel) {
+        overflow-x: visible;
+    }
+
+    /* Center the control panel dropdown within the brand area */
+    .app-header .control-panel {
+        left: 50%;
+        transform: translateX(-50%);
+    }
+
+    /* Center panel title between panel-nav group (left) and header action icons (right).
+       --pnav-w: panel-nav width (back + forward + hamburger: 3 × 2.25rem ≈ 7rem).
+       --ract-w: right actions width (worst case: 5 icons × 2.25rem + gaps ≈ 12rem). */
+    .app-header .pane-header-content-title {
+        --pnav-w: 7rem;
+        --ract-w: 12rem;
+        position: absolute;
+        left: calc(var(--divider-x) + var(--divider-width) + var(--pnav-w));
+        width: calc(100% - var(--divider-x) - var(--divider-width) - var(--pnav-w) - var(--ract-w));
+        top: 50%;
+        transform: translateY(-50%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: var(--dot-gap);
+        pointer-events: none;
+        font-size: 0.875rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        transition: left var(--duration-slow) ease, width var(--duration-slow) ease;
+    }
+
+    .app-header .pane-header-content-title .pane-header-title-text,
+    .app-header .pane-header-content-title .panel-url-title {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        pointer-events: auto;
+    }
+
+    /* Ensure right-side items render above the panel title */
+    .app-header .pane-header-spacer,
+    .app-header .pane-header-spacer ~ * {
+        position: relative;
+        z-index: 1;
+    }
+}
+
+.thread-nav-group {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+/* Hide brand thread-nav-group when drawer is closed — collapsed-thread-actions takes over */
+:root:not([data-thread-drawer-open]) .desktop-header .pane-header-brand .thread-nav-group {
+    display: none;
+}
+
+@media (min-width: 769px) {
+    :root[data-thread-collapsed] .thread-header-elements,
+    :root[data-thread-collapsed] .toast-container,
+    :root[data-content-collapsed] .content-header-elements {
+        display: none;
+    }
+}
+
+/* Animation: brand returns to thread pane when expanding from collapsed */
+@keyframes brand-return-in {
+    0% {
+        opacity: 0;
+        transform: translateY(-50%) translateX(var(--brand-return-x, 1.875rem));
+    }
+    15% {
+        opacity: 1;
+    }
+    100% {
+        opacity: 1;
+        transform: translateY(-50%) translateX(0);
+    }
+}
+
+:root[data-brand-returning] .app-header .pane-header-brand {
+    animation: brand-return-in 0.55s cubic-bezier(0.5, 0, 0.1, 1) both;
+    overflow: visible;
+}
+
+
+.workspace-name-label {
+    margin-left: 0.35rem;
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+    flex-shrink: 1;
+}
+
+/* Truncation priority: while a workspace label is rendered AND not hidden,
+   pin "lucidos" at its natural width so the workspace absorbs all flex shrink
+   first (instead of both labels truncating in parallel — "lucid... ● wo..."). */
+.pane-header-brand-label:has(> .workspace-name-label:not(.is-hidden)) .pane-header-title {
+    flex-shrink: 0;
+}
+
+/* Set by ConnectionStatus when even workspace shrunk to 0 plus its margin
+   gap doesn't fit. Stays in the DOM so scrollWidth keeps reporting the
+   natural text width — the JS measurement loop reads it to decide when to
+   un-hide. The :has() rule above flips lucidos back to flex-shrink: 1 once
+   this class is set, so brand can truncate with text-overflow: ellipsis. */
+.workspace-name-label.is-hidden {
+    flex: 0 0 0;
+    width: 0;
+    margin: 0;
+    visibility: hidden;
+}
+
+/* --- Connection status inline --- */
+
+.connection-status-inline {
+    display: flex;
+    align-items: center;
+    margin-left: 0.45rem;
+    margin-right: 0.125rem;
+    cursor: default;
+}
+
+/* Base status dot — shared by all contexts */
+.status-dot {
+    border-radius: 50%;
+    background: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.status-dot.connected {
+    background: var(--accent-green);
+}
+
+.status-dot.disconnected {
+    background: var(--accent-red);
+}
+
+/* Size: standard (header, panel status row) */
+.connection-status-inline .status-dot,
+.control-panel-status-row .status-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+}
+
+/* Blink animation for standard-size dots */
+.connection-status-inline .status-dot.disconnected,
+.control-panel-status-row .status-dot.disconnected {
+    animation: cc-blink-red 0.6s ease-in-out infinite;
+}
+
+/* Size: small (workspace rows) */
+.control-panel-workspace-row .status-dot {
+    width: 0.375rem;
+    height: 0.375rem;
+}
+
+/* --- Control panel (system info popover) --- */
+
+.pane-header-brand-label {
+    position: relative;
+}
+
+.control-panel {
+    position: absolute;
+    top: calc(100% + 0.5rem);
+    left: 0;
+    z-index: var(--z-control-panel);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    width: min(28rem, calc(100vw - 1rem));
+    box-shadow: var(--shadow-md);
+    font-family: var(--font-ui);
+    font-size: 0.75rem;
+    white-space: normal;
+}
+
+.control-panel-section {
+    padding: 0.625rem 0.75rem;
+}
+
+.control-panel-section + .control-panel-section {
+    border-top: 1px solid var(--border-color);
+}
+
+.control-panel-status-row {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    margin-bottom: 0.5rem;
+}
+
+.control-panel-status-text {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.control-panel-close {
+    margin-left: auto;
+    color: var(--text-muted);
+}
+
+.control-panel-close:hover {
+    color: var(--text-primary);
+}
+
+.control-panel-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.control-panel-info-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.75rem;
+}
+
+.control-panel-label {
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.control-panel-value {
+    color: var(--text-secondary);
+    text-align: right;
+    overflow-wrap: anywhere;
+    flex: 1;
+    min-width: 0;
+}
+
+.control-panel-path {
+    font-size: 0.625rem;
+}
+
+.control-panel-update {
+    color: var(--accent-yellow);
+}
+
+.control-panel-footnote {
+    margin-top: 0.5rem;
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+    line-height: 1.4;
+}
+
+.control-panel-api-url {
+    background: none;
+    border: none;
+    font: inherit;
+    padding: 0;
+}
+
+/* Actions */
+.control-panel-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.control-panel-actions .action-btn {
+    flex: 1;
+    font-size: 0.6875rem;
+}
+
+/* Other workspaces */
+.control-panel-section-title {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    margin-bottom: 0.375rem;
+}
+
+.control-panel-empty {
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+}
+
+.control-panel-workspace-row {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.25rem 0;
+    color: var(--text-secondary);
+    text-decoration: none;
+    border-radius: 0.25rem;
+    transition: color var(--duration-fast);
+}
+
+@media (hover: hover) {
+    .control-panel-workspace-row:hover {
+        color: var(--text-primary);
+    }
+}
+
+.control-panel-ws-name {
+    overflow-wrap: anywhere;
+    min-width: 0;
+}
+
+.control-panel-ws-port {
+    color: var(--text-muted);
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+/* Attention banner inside control panel */
+.control-panel-notice {
+    font-size: 0.6875rem;
+    color: var(--accent-yellow);
+    padding: 0.375rem 0.5rem;
+    margin-bottom: 0.5rem;
+    background: color-mix(in srgb, var(--accent-yellow) 10%, transparent);
+    border-radius: 0.25rem;
+    line-height: 1.4;
+    white-space: normal;
+}
+
+/* Brand badge — flex sibling of the title (not a child), so the title can
+   keep overflow:hidden / text-overflow:ellipsis and truncate when narrow.
+   Negative margin tucks the badge over the trailing character of the title;
+   it shifts up so it sits above the baseline like a notification dot. */
+.brand-badge {
+    position: relative;
+    top: -0.5rem;
+    /* Reset right from the base .badge absolute-positioning rule */
+    right: auto;
+    margin-left: -0.25rem;
+    flex-shrink: 0;
+}
+

@@ -68,7 +68,11 @@ fn format_history_steps_renders_tool_calls() {
 
 #[test]
 fn format_history_steps_marks_failures() {
-    let steps = vec![tool_step("load_knowhow", "Loading know-how 'oops'...", false)];
+    let steps = vec![tool_step(
+        "load_knowhow",
+        "Loading know-how 'oops'...",
+        false,
+    )];
     let out = format_history_steps(&steps, &no_skip()).unwrap();
     assert!(out.contains("[FAIL]"));
     assert!(!out.contains("[ok]"));
@@ -78,7 +82,13 @@ fn format_history_steps_marks_failures() {
 fn format_history_steps_capped_at_2k() {
     // 50 tool calls each with a long description should be truncated, not unbounded.
     let steps: Vec<Step> = (0..50)
-        .map(|i| tool_step("read_file", &format!("Reading {}.rs...", "x".repeat(80 + i)), true))
+        .map(|i| {
+            tool_step(
+                "read_file",
+                &format!("Reading {}.rs...", "x".repeat(80 + i)),
+                true,
+            )
+        })
         .collect();
     let out = format_history_steps(&steps, &no_skip()).unwrap();
     // Cap is 2KB on the joined inner string + a small prefix; allow some slack.
@@ -103,24 +113,46 @@ fn format_history_steps_skips_tools_in_skip_set() {
     let mut skip = HashSet::new();
     skip.insert("evt-load-id".to_string());
     let out = format_history_steps(&steps, &skip).unwrap();
-    assert!(!out.contains("Loading"), "skipped tool must not appear: {}", out);
-    assert!(out.contains("Emitting"), "non-skipped tool must remain: {}", out);
+    assert!(
+        !out.contains("Loading"),
+        "skipped tool must not appear: {}",
+        out
+    );
+    assert!(
+        out.contains("Emitting"),
+        "non-skipped tool must remain: {}",
+        out
+    );
 }
 
 #[test]
 fn short_message_unchanged() {
     let content = "Hello, how are you?";
-    assert_eq!(format_history_content(content, "user", true), content);
-    assert_eq!(format_history_content(content, "assistant", true), content);
-    assert_eq!(format_history_content(content, "user", false), content);
-    assert_eq!(format_history_content(content, "assistant", false), content);
+    let loaded: Vec<&str> = Vec::new();
+    assert_eq!(
+        format_history_content(content, "user", true, &loaded),
+        content
+    );
+    assert_eq!(
+        format_history_content(content, "assistant", true, &loaded),
+        content
+    );
+    assert_eq!(
+        format_history_content(content, "user", false, &loaded),
+        content
+    );
+    assert_eq!(
+        format_history_content(content, "assistant", false, &loaded),
+        content
+    );
 }
 
 #[test]
 fn verbatim_tail_only_safety_net() {
     // A 2000-char assistant message in the verbatim tail should NOT be compacted
     let content = "x".repeat(2000);
-    let result = format_history_content(&content, "assistant", true);
+    let loaded: Vec<&str> = Vec::new();
+    let result = format_history_content(&content, "assistant", true, &loaded);
     assert_eq!(
         result, content,
         "verbatim tail assistant msg under 15K should be untouched"
@@ -131,7 +163,8 @@ fn verbatim_tail_only_safety_net() {
 fn middle_tier_assistant_compacted() {
     // A 2000-char assistant message outside verbatim tail should be compacted to ~1500
     let content = "x".repeat(2000);
-    let result = format_history_content(&content, "assistant", false);
+    let loaded: Vec<&str> = Vec::new();
+    let result = format_history_content(&content, "assistant", false, &loaded);
     assert!(
         result.len() < 2000,
         "middle tier assistant should be compacted"
@@ -146,7 +179,8 @@ fn middle_tier_assistant_compacted() {
 fn middle_tier_user_not_compacted() {
     // A 2000-char user message outside verbatim tail should NOT be compacted
     let content = "x".repeat(2000);
-    let result = format_history_content(&content, "user", false);
+    let loaded: Vec<&str> = Vec::new();
+    let result = format_history_content(&content, "user", false, &loaded);
     assert_eq!(
         result, content,
         "user messages should never be compacted (only safety net at 15K)"
@@ -156,7 +190,8 @@ fn middle_tier_user_not_compacted() {
 #[test]
 fn safety_net_truncation_at_15k() {
     let content = "x".repeat(20_000);
-    let result = format_history_content(&content, "user", true);
+    let loaded: Vec<&str> = Vec::new();
+    let result = format_history_content(&content, "user", true, &loaded);
     assert!(result.len() < 20_000, "should be truncated");
     assert!(
         result.contains("chars omitted"),
@@ -213,6 +248,98 @@ fn trim_history_from_oldest_multibyte_safe() {
     let mut history = "hello—world\nrecent".to_string();
     trim_history_from_oldest(&mut history, 6); // byte 6 is inside the em-dash
     assert!(history.contains("recent"), "should preserve recent content");
+}
+
+#[test]
+fn strips_loaded_body_substring() {
+    // The body of a currently-loaded knowhow doc (the formatted block returned
+    // by load_one_knowhow_section) is replaced wherever it appears verbatim
+    // with a pointer to the [LOADED KNOWHOW] section. Match is by exact body
+    // substring — avoids the id-vs-name mismatch (loaded set is keyed by id,
+    // marker uses name).
+    let body = "[SYSTEM-KNOWHOW: Nightly Ops]\nfull body line 1\nfull body line 2\n[END SYSTEM-KNOWHOW]";
+    let content = format!("Before\n{body}\nAfter");
+    let out = format_history_content(&content, "user", false, &[body]);
+    assert!(
+        !out.contains("full body line 1"),
+        "body must be stripped: {}",
+        out
+    );
+    assert!(
+        !out.contains("[END SYSTEM-KNOWHOW]"),
+        "end marker must be stripped: {}",
+        out
+    );
+    assert!(
+        out.contains("(body in [LOADED KNOWHOW] section above)"),
+        "must include pointer: {}",
+        out
+    );
+    assert!(out.contains("Before"), "prefix must survive: {}", out);
+    assert!(out.contains("After"), "suffix must survive: {}", out);
+}
+
+#[test]
+fn keeps_block_when_body_not_loaded() {
+    // If the body in the history doesn't match any currently-loaded body,
+    // leave the block (markers and all) intact.
+    let unrelated_body =
+        "[SYSTEM-KNOWHOW: Some Other Doc]\nunrelated body\n[END SYSTEM-KNOWHOW]";
+    let content = format!("Before\n{unrelated_body}\nAfter");
+    let loaded = ["[SYSTEM-KNOWHOW: Nightly Ops]\nfull body\n[END SYSTEM-KNOWHOW]"];
+    let out = format_history_content(&content, "user", false, &loaded);
+    assert_eq!(out, content, "non-matching body must pass through unchanged");
+}
+
+#[test]
+fn handles_multiple_blocks() {
+    // Two blocks in history: one matches a loaded body (stripped), one doesn't (kept).
+    let body_a =
+        "[SYSTEM-KNOWHOW: Doc A]\nbody A line one\nbody A line two\n[END SYSTEM-KNOWHOW]";
+    let body_b =
+        "[SYSTEM-KNOWHOW: Doc B]\nbody B line one\nbody B line two\n[END SYSTEM-KNOWHOW]";
+    let content = format!("{body_a}\nmiddle\n{body_b}");
+    let out = format_history_content(&content, "user", false, &[body_a]);
+    assert!(
+        !out.contains("body A line one"),
+        "loaded body A must be stripped: {}",
+        out
+    );
+    assert!(
+        out.contains("body B line one"),
+        "unloaded body B must remain: {}",
+        out
+    );
+    assert!(
+        out.contains("(body in [LOADED KNOWHOW] section above)"),
+        "loaded pointer must appear: {}",
+        out
+    );
+    assert!(
+        out.contains("[SYSTEM-KNOWHOW: Doc B]"),
+        "unloaded header must remain: {}",
+        out
+    );
+    assert!(
+        out.contains("middle"),
+        "interleaved text must survive: {}",
+        out
+    );
+}
+
+#[test]
+fn organic_marker_in_assistant_text_survives() {
+    // A stray header-like marker (not part of a real loaded body substring)
+    // is organic discussion (e.g. the LLM paraphrasing what it would search
+    // for) and must not be touched.
+    let content =
+        "I think we want to grep for [SYSTEM-KNOWHOW: Nightly Ops] in the conversation and see what comes up.";
+    let loaded = ["[SYSTEM-KNOWHOW: Nightly Ops]\nbody\n[END SYSTEM-KNOWHOW]"];
+    let out = format_history_content(content, "assistant", true, &loaded);
+    assert_eq!(
+        out, content,
+        "stray marker that isn't a loaded body substring must be left alone"
+    );
 }
 
 #[test]

@@ -20,7 +20,7 @@ use uuid::Uuid;
 /// concrete `AgentRuntime` implementation in its agent registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum AgentKind {
+pub enum CodingAgent {
     ClaudeCode,
     Codex,
 }
@@ -124,7 +124,7 @@ pub struct SpawnArgs<'a> {
     /// engine-internal spawns where no parent event exists; pass the
     /// originating event id otherwise.
     pub spawning_event_id: Option<Uuid>,
-    /// Name of the repository this CC session is running in (e.g.
+    /// Name of the repository this Claude Code session is running in (e.g.
     /// `"user-acquisition"`, `"Lucidos"`). Forwarded as `LUCIDOS_REPO` so
     /// `lucidos spawn-thread` defaults `--repo` to it — a CC sidequest stays
     /// in the same repo as its caller without the model having to thread the
@@ -153,7 +153,7 @@ pub struct SpawnArgs<'a> {
 /// `AgentEvent::Exited`, and closes `events_rx`. EOF on `events_rx` is also
 /// the canonical "process gone" signal for natural exits.
 pub struct RunningAgent {
-    pub kind: AgentKind,
+    pub kind: CodingAgent,
     pub events_rx: mpsc::UnboundedReceiver<AgentEvent>,
     pub input_tx: mpsc::UnboundedSender<AgentInput>,
     pub control_tx: mpsc::UnboundedSender<ControlRequest>,
@@ -161,7 +161,7 @@ pub struct RunningAgent {
 
 #[async_trait]
 pub trait AgentRuntime: Send + Sync {
-    fn kind(&self) -> AgentKind;
+    fn kind(&self) -> CodingAgent;
 
     async fn spawn(
         &self,

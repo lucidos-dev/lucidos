@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 import {
   navigateToApp, sendMessage, sendFollowUp, waitForResponse,
   uniqueMessage, assertHealthy, countExchanges, waitForExchangeCount, newThread,
-  assertUserMessagesVisible, userMessageBody,
+  assertUserMessagesVisible, userMessageBody, waitForVisibleResponseCount,
 } from './helpers';
 
 test.describe('Chat interaction - multi-turn conversation', () => {
@@ -88,7 +88,10 @@ test.describe('Chat interaction - multi-turn conversation', () => {
     // Both user messages should be visible (helper handles dual-layout safety)
     await assertUserMessagesVisible(page, [msg1, msg2]);
 
-    // At least two visible responses should have content
+    // At least two visible responses should have content. Wait for the
+    // end-state — after the first turn settled, waitForResponse() above can
+    // resolve before the follow-up turn starts streaming.
+    await waitForVisibleResponseCount(page, 2);
     const visibleResponseCount = await page.evaluate(() => {
       const els = document.querySelectorAll('.response-content');
       return Array.from(els).filter(el => {
@@ -128,7 +131,10 @@ test.describe('Chat interaction - multi-turn conversation', () => {
     const exchanges = await countExchanges(page);
     expect(exchanges).toBeGreaterThanOrEqual(3);
 
-    // All visible responses should have content
+    // All visible responses should have content. Wait for the end-state: the
+    // last waitForResponse() can resolve before the third turn streams (the
+    // prior turn's label is already settled).
+    await waitForVisibleResponseCount(page, 3);
     const visibleResponseCount = await page.evaluate(() => {
       const els = document.querySelectorAll('.response-content');
       return Array.from(els).filter(el => {

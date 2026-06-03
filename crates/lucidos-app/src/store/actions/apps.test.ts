@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { panelOverlay, currentApp, appsList, inputMode, appRefreshKey, splitRatio } from '../store';
+import { panelOverlay, currentApp, appsList, inputMode, appRefreshKey, splitRatio, toasts, wipPreviewThreadId, threadMap, focusedThreadId, threadsLoaded } from '../store';
 import type { App } from '../types';
+import { makeOptimisticThreadState } from '../thread-events';
+// Importing the wipPreview module installs the auto-revert effect that
+// clears WIP when focusedThreadId / threadMap / currentApp drift out of
+// sync. The preserveWip tests need that effect installed so they exercise
+// the same coordination the live app does.
+import '../actions/wipPreview';
 
 // Mock API client
 const mockPostAppCapture = vi.fn().mockResolvedValue(undefined);
@@ -126,7 +132,7 @@ describe('refreshAppUI', () => {
   });
 
   it('debounces multiple rapid calls into a single reload', async () => {
-    // Three RefreshAppUI events firing in quick succession (e.g. the agentic
+    // Three AppUiRefreshRequested events firing in quick succession (e.g. the agentic
     // loop emits one per modified app + an explicit refresh_app) must collapse
     // into ONE iframe reload — otherwise the iframe is bombarded mid-navigation.
     panelOverlay.value = { type: 'app-ui', app: notesApp };
@@ -178,8 +184,8 @@ describe('refreshAppUI', () => {
 
   it('does NOT open the app when appId given but app not open (no surprise pop-ups)', async () => {
     // BUG: when the LLM edited a file under apps/finn-jobs/ in a chat thread,
-    // the post-loop RefreshAppUI surprised the user by opening the FINN app.
-    // RefreshAppUI must mean "reload if currently open", never "open from
+    // the post-loop AppUiRefreshRequested surprised the user by opening the FINN app.
+    // AppUiRefreshRequested must mean "reload if currently open", never "open from
     // closed". User-initiated opens go through openApp / app-link clicks /
     // navigate_ui — refresh is for already-open iframes only.
     expect(currentApp.value).toBeNull();
@@ -205,7 +211,7 @@ describe('refreshAppUI', () => {
   });
 
   it('cancels a pending debounce when a different app is opened', async () => {
-    // Pending RefreshAppUI for app A must not fire after the user switches to
+    // Pending AppUiRefreshRequested for app A must not fire after the user switches to
     // app B — otherwise B's iframe gets a stray refresh keyed to A's edit.
     panelOverlay.value = { type: 'app-ui', app: notesApp };
 
@@ -217,6 +223,124 @@ describe('refreshAppUI', () => {
 
     expect(currentApp.value?.id).toBe('trip-planner-2026');
     expect(appRefreshKey.value).toBe(0);
+  });
+
+  describe('preserveWip option', () => {
+    function seedWipThread(id: string, appId: string): void {
+      const thread = makeOptimisticThreadState({
+        id,
+        title: 'fix it',
+        channel: 'claude_code',
+        initiator: 'user',
+        eventsLoaded: true,
+        codingAgentKind: 'app',
+        codingAgentFolder: `/data/apps/${appId}`,
+      });
+      const next = new Map(threadMap.value);
+      next.set(id, thread);
+      threadMap.value = next;
+    }
+
+    beforeEach(() => {
+      wipPreviewThreadId.value = null;
+      threadMap.value = new Map();
+      threadsLoaded.value = true;
+      // The wipPreview effect clears WIP whenever focusedThreadId drifts from
+      // the WIP thread id. Each test pins focused to its WIP thread so the
+      // effect's auto-revert doesn't shadow whatever refreshAppUI does.
+      focusedThreadId.value = null;
+    });
+
+    afterEach(() => {
+      focusedThreadId.value = null;
+      threadsLoaded.value = false;
+    });
+
+    it('default refreshAppUI() drops WIP that matches the refreshed app (Apply / file-edit path)', async () => {
+      seedWipThread('wip-thread-1', 'notes-app');
+      panelOverlay.value = { type: 'app-ui', app: notesApp };
+      focusedThreadId.value = 'wip-thread-1';
+      wipPreviewThreadId.value = 'wip-thread-1';
+      expect(wipPreviewThreadId.value).toBe('wip-thread-1');
+
+      const { refreshAppUI } = await import('./apps');
+      await refreshAppUI('notes-app');
+
+      expect(wipPreviewThreadId.value).toBeNull();
+    });
+
+    it('refreshAppUI(undefined, { preserveWip: true }) keeps WIP set (header button)', async () => {
+      seedWipThread('wip-thread-2', 'notes-app');
+      panelOverlay.value = { type: 'app-ui', app: notesApp };
+      focusedThreadId.value = 'wip-thread-2';
+      wipPreviewThreadId.value = 'wip-thread-2';
+      expect(wipPreviewThreadId.value).toBe('wip-thread-2');
+
+      const { refreshAppUI } = await import('./apps');
+      await refreshAppUI(undefined, { preserveWip: true });
+      await vi.advanceTimersByTimeAsync(200);
+
+      expect(wipPreviewThreadId.value).toBe('wip-thread-2');
+      // And still bumps the refresh key so the iframe reloads.
+      expect(appRefreshKey.value).toBe(1);
+    });
+
+    it('refreshAppUI(appId, { preserveWip: true }) keeps WIP set for an explicit appId', async () => {
+      seedWipThread('wip-thread-3', 'notes-app');
+      panelOverlay.value = { type: 'app-ui', app: notesApp };
+      focusedThreadId.value = 'wip-thread-3';
+      wipPreviewThreadId.value = 'wip-thread-3';
+      expect(wipPreviewThreadId.value).toBe('wip-thread-3');
+
+      const { refreshAppUI } = await import('./apps');
+      await refreshAppUI('notes-app', { preserveWip: true });
+
+      expect(wipPreviewThreadId.value).toBe('wip-thread-3');
+    });
+  });
+});
+
+describe('openAppById', () => {
+  beforeEach(() => {
+    panelOverlay.value = null;
+    inputMode.value = { type: 'do' };
+    appsList.value = { status: 'not-loaded' };
+    toasts.value = [];
+    mockListAppsApi.mockReset();
+  });
+
+  it('toasts when apps fail to load — caller is not on the apps tab so the Loadable failed state is invisible', async () => {
+    mockListAppsApi.mockRejectedValue(new Error('boom'));
+
+    const { openAppById } = await import('./apps');
+    await openAppById('notes-app');
+
+    expect(panelOverlay.value).toBeNull();
+    const errors = toasts.value.filter((t) => t.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toMatch(/apps failed to load/i);
+  });
+
+  it('toasts when the app id is unknown — stale link should not silently no-op', async () => {
+    appsList.value = { status: 'loaded', data: [notesApp] };
+
+    const { openAppById } = await import('./apps');
+    await openAppById('trip-planner-2026');
+
+    expect(panelOverlay.value).toBeNull();
+    const errors = toasts.value.filter((t) => t.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toMatch(/no app with id/i);
+  });
+
+  it('opens the app when found', async () => {
+    appsList.value = { status: 'loaded', data: [notesApp] };
+
+    const { openAppById } = await import('./apps');
+    await openAppById('notes-app');
+
+    expect(panelOverlay.value).toEqual({ type: 'app-ui', app: notesApp });
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(0);
   });
 });
 

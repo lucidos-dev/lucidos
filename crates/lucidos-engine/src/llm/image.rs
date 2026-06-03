@@ -68,17 +68,19 @@ pub struct OpenAiImageProvider {
 }
 
 impl OpenAiImageProvider {
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(
+        api_key: String,
+        model: String,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let name = format!("OpenAI {}", model);
-        Self {
+        Ok(Self {
             api_key,
             model,
             name,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
-                .build()
-                .expect("Failed to build HTTP client"),
-        }
+                .build()?,
+        })
     }
 
     fn openai_size(size: ImageSize) -> &'static str {
@@ -219,24 +221,23 @@ impl VertexImagenProvider {
         project_id: String,
         location: LocationHandle,
         token_cache: TokenCache,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self {
             project_id,
             location,
             token_cache,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
-                .build()
-                .expect("Failed to build HTTP client"),
-        }
+                .build()?,
+        })
     }
 
     fn current_location(&self) -> String {
         crate::llm::vertex::read_location(&self.location)
     }
 
-    fn get_access_token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        crate::llm::vertex::get_cached_access_token(&self.token_cache)
+    async fn get_access_token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        crate::llm::vertex::get_cached_access_token(&self.token_cache).await
     }
 
     fn imagen_aspect_ratio(size: ImageSize) -> &'static str {
@@ -257,7 +258,7 @@ impl ImageProvider for VertexImagenProvider {
         input_images: Vec<Vec<u8>>,
         size: ImageSize,
     ) -> Result<ImageResult, Box<dyn std::error::Error + Send + Sync>> {
-        let token = self.get_access_token()?;
+        let token = self.get_access_token().await?;
         let aspect_ratio = Self::imagen_aspect_ratio(size);
         let location = self.current_location();
 
@@ -358,25 +359,37 @@ pub async fn build_image_provider(
         });
     let model = pref.as_deref().unwrap_or("auto");
 
-    let build_imagen = || -> Arc<dyn ImageProvider> {
+    let build_imagen = || -> Option<Arc<dyn ImageProvider>> {
         let tc = vertex_token_cache
             .clone()
             .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None)));
-        Arc::new(VertexImagenProvider::with_location_handle(
+        match VertexImagenProvider::with_location_handle(
             vertex_project_id.to_string(),
             vertex_location.clone(),
             tc,
-        ))
+        ) {
+            Ok(p) => Some(Arc::new(p)),
+            Err(e) => {
+                crate::log!("[Image] Failed to build Vertex Imagen HTTP client: {}", e);
+                None
+            }
+        }
     };
-    let build_openai = |key: &str, model: &str| -> Arc<dyn ImageProvider> {
-        Arc::new(OpenAiImageProvider::new(key.to_string(), model.to_string()))
+    let build_openai = |key: &str, model: &str| -> Option<Arc<dyn ImageProvider>> {
+        match OpenAiImageProvider::new(key.to_string(), model.to_string()) {
+            Ok(p) => Some(Arc::new(p)),
+            Err(e) => {
+                crate::log!("[Image] Failed to build OpenAI {} HTTP client: {}", model, e);
+                None
+            }
+        }
     };
 
     match model {
         "gpt-image-1" | "gpt-image-1.5" | "gpt-image-2" => match openai_api_key {
             Some(key) => {
                 crate::log!("[Image] Using OpenAI {}", model);
-                Some(build_openai(key, model))
+                build_openai(key, model)
             }
             None => {
                 crate::log!("[Image] {} selected but OPENAI_API_KEY not set", model);
@@ -389,15 +402,15 @@ pub async fn build_image_provider(
                 return None;
             }
             crate::log!("[Image] Using Vertex AI Imagen 4");
-            Some(build_imagen())
+            build_imagen()
         }
         _ => {
             if !vertex_project_id.is_empty() {
                 crate::log!("[Image] Auto-selected Vertex AI Imagen 4");
-                Some(build_imagen())
+                build_imagen()
             } else if let Some(key) = openai_api_key {
                 crate::log!("[Image] Auto-selected OpenAI gpt-image-1");
-                Some(build_openai(key, "gpt-image-1"))
+                build_openai(key, "gpt-image-1")
             } else {
                 crate::log!(
                     "[Image] No image provider available (no Vertex or OpenAI credentials)"
@@ -442,6 +455,30 @@ mod tests {
             "1024x1536"
         );
         assert_eq!(OpenAiImageProvider::openai_size(ImageSize::Auto), "auto");
+    }
+
+    /// Compile-checks that the constructors return Result (the error path
+    /// is propagated via `?`, never `.expect`). reqwest::Client::builder()
+    /// with a 120s timeout and no other config succeeds in the test env, so
+    /// the OK arm is the only one we can exercise — but the *signature*
+    /// being Result is what removes the implicit panic on a future rustls /
+    /// feature-flag flip that makes the builder fallible in a new way.
+    #[test]
+    fn image_provider_constructors_return_result() {
+        type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+        let openai: Result<OpenAiImageProvider, BoxErr> =
+            OpenAiImageProvider::new("sk-test".into(), "gpt-image-1".into());
+        assert!(openai.is_ok());
+
+        let token_cache: TokenCache = Arc::new(std::sync::Mutex::new(None));
+        let location = crate::llm::vertex::location_handle("us-central1".into());
+        let vertex: Result<VertexImagenProvider, BoxErr> =
+            VertexImagenProvider::with_location_handle(
+                "test-project".into(),
+                location,
+                token_cache,
+            );
+        assert!(vertex.is_ok());
     }
 
     #[test]

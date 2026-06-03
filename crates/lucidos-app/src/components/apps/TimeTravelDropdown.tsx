@@ -5,6 +5,7 @@ import { formatTimeAgo } from '../../utils/formatTime';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
 
 const PAGE_SIZE = 10;
 
@@ -17,38 +18,38 @@ export function TimeTravelDropdown() {
   const showLoading = useDelayedLoading(versionsLoadable);
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const lastAppId = useRef<string | null>(null);
+  const appId = app?.id ?? null;
 
+  useDismissOnOutside(open, ref, null, () => setOpen(false));
+
+  // Clicking into an iframe steals focus without firing pointerdown in our
+  // document, so the dismiss hook can't see it — the blur listener catches it.
   useEffect(() => {
     if (!open) return;
-    function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    }
-    // Clicking inside an iframe steals focus from the parent window
     function handleBlur() {
       setOpen(false);
     }
-    document.addEventListener('click', handleClick);
     window.addEventListener('blur', handleBlur);
-    return () => {
-      document.removeEventListener('click', handleClick);
-      window.removeEventListener('blur', handleBlur);
-    };
+    return () => window.removeEventListener('blur', handleBlur);
   }, [open]);
 
-  if (!app) return null;
-  const appId = app.id;
-  const versions = versionsLoadable.status === 'loaded' ? versionsLoadable.data : [];
+  // Reset cached versions when the visible app changes. Previously this lived
+  // in the render body gated by a useRef — preact lint flags that as a
+  // side-effect-in-render gotcha; this effect is the canonical place. Guarded
+  // so the initial mount (state already at the reset values) doesn't bounce
+  // through three no-op setState calls.
+  useEffect(() => {
+    setVersionsLoadable(prev => prev.status === 'not-loaded' ? prev : { status: 'not-loaded' });
+    setHasMore(prev => prev ? false : prev);
+    setLoadingMore(prev => prev ? false : prev);
+  }, [appId]);
 
-  // Reset cached versions when app changes
-  if (lastAppId.current !== appId) {
-    lastAppId.current = appId;
-    if (versionsLoadable.status !== 'not-loaded') setVersionsLoadable({ status: 'not-loaded' });
-    setHasMore(false);
-    setLoadingMore(false);
-  }
+  if (!app || appId === null) return null;
+  // Local rebind so closures below (loadPage) see the narrowed string type
+  // — TS does not propagate the early-return narrowing of `appId` into
+  // inner functions defined after this point.
+  const resolvedAppId = appId;
+  const loadedVersions = versionsLoadable.status === 'loaded' ? versionsLoadable.data : null;
 
   async function loadPage(skip: number, append: boolean) {
     if (append) {
@@ -57,7 +58,7 @@ export function TimeTravelDropdown() {
       setVersionsLoadable({ status: 'loading' });
     }
     try {
-      const page = await getAppVersions(appId, PAGE_SIZE, skip);
+      const page = await getAppVersions(resolvedAppId, PAGE_SIZE, skip);
       if (append) {
         setVersionsLoadable(prev => ({
           status: 'loaded',
@@ -74,24 +75,24 @@ export function TimeTravelDropdown() {
     }
   }
 
-  async function toggle() {
+  function toggle() {
     if (open) {
       setOpen(false);
       return;
     }
     setOpen(true);
-    if (versions.length > 0) return;
-    loadPage(0, false);
+    if (loadedVersions && loadedVersions.length > 0) return;
+    void loadPage(0, false);
   }
 
   const handleScroll = useCallback(() => {
     const menu = menuRef.current;
-    if (!menu || loadingMore || !hasMore) return;
+    if (!menu || loadingMore || !hasMore || !loadedVersions) return;
     // Load more when scrolled within 2rem (32px) of the bottom
     if (menu.scrollTop + menu.clientHeight >= menu.scrollHeight - 32) {
-      loadPage(versions.length, true);
+      void loadPage(loadedVersions.length, true);
     }
-  }, [loadingMore, hasMore, versions.length]);
+  }, [loadingMore, hasMore, loadedVersions]);
 
   function selectVersion(commit: string | null) {
     appCommit.value = commit;
@@ -126,7 +127,7 @@ export function TimeTravelDropdown() {
           {versionsLoadable.status === 'failed' && (
             <div class="time-travel-item time-travel-error">{versionsLoadable.error}</div>
           )}
-          {versions.map((v) => (
+          {loadedVersions && loadedVersions.map((v) => (
             <div
               key={v.commit}
               class={`time-travel-item${activeCommit === v.commit ? ' active' : ''}`}
@@ -138,7 +139,7 @@ export function TimeTravelDropdown() {
             </div>
           ))}
           {loadingMore && <div class="time-travel-item time-travel-loading">Loading more...</div>}
-          {versionsLoadable.status === 'loaded' && versions.length === 0 && (
+          {loadedVersions && loadedVersions.length === 0 && (
             <div class="time-travel-item time-travel-empty">No history</div>
           )}
         </div>

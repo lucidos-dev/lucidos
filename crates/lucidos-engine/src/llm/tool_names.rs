@@ -13,6 +13,7 @@ pub const DELETE_FILE: &str = "delete_file";
 
 // Execution
 pub const RUN_PYTHON: &str = "run_python";
+pub const RUN_PYTHON_BACKGROUND: &str = "run_python_background";
 pub const RUN_BASH: &str = "run_bash";
 pub const RUN_BASH_BACKGROUND: &str = "run_bash_background";
 pub const BASH_OUTPUT: &str = "bash_output";
@@ -55,6 +56,13 @@ pub const DELETE_TRIGGER: &str = "delete_trigger";
 pub const PAUSE_TRIGGER: &str = "pause_trigger";
 pub const RESUME_TRIGGER: &str = "resume_trigger";
 
+// Trigger groups (user-visible folders that organize triggers in the panel)
+pub const LIST_TRIGGER_GROUPS: &str = "list_trigger_groups";
+pub const CREATE_TRIGGER_GROUP: &str = "create_trigger_group";
+pub const RENAME_TRIGGER_GROUP: &str = "rename_trigger_group";
+pub const REORDER_TRIGGER_GROUPS: &str = "reorder_trigger_groups";
+pub const DELETE_TRIGGER_GROUP: &str = "delete_trigger_group";
+
 // Preferences
 pub const SET_LANGUAGE: &str = "set_language";
 pub const SET_TIMEZONE: &str = "set_timezone";
@@ -85,14 +93,27 @@ pub const CORRECT_MEMORY: &str = "correct_memory";
 // Events
 pub const EMIT_EVENT: &str = "emit_event";
 pub const QUERY_EVENTS: &str = "query_events";
+pub const COUNT_EVENTS: &str = "count_events";
+
+// Thread queries (script/trigger-facing introspection)
+pub const LIST_THREADS: &str = "list_threads";
+pub const COUNT_THREADS: &str = "count_threads";
+
+// Changes (pending coding-agent-proposed changes — list + apply)
+pub const LIST_CHANGES: &str = "list_changes";
+pub const APPLY_CHANGE: &str = "apply_change";
 
 // Context management
 pub const DISMISS_FROM_CONTEXT: &str = "dismiss_from_context";
+
+// Todo list (Lucidos Agent's runtime progress visibility — chat + trigger surfaces only)
+pub const TODO_WRITE: &str = "todo_write";
 
 // Notifications & UI
 pub const SEND_NOTIFICATION: &str = "send_notification";
 pub const READ_NOTIFICATIONS: &str = "read_notifications";
 pub const NAVIGATE_UI: &str = "navigate_ui";
+pub const ASK_USER_QUESTION: &str = "ask_user_question";
 
 // Image generation
 pub const GENERATE_IMAGE: &str = "generate_image";

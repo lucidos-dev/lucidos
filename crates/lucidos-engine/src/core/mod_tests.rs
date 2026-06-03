@@ -404,7 +404,7 @@ fn test_describe_cc_tool_web_search_middle_truncates() {
 
 #[test]
 fn test_describe_cc_tool_web_fetch() {
-    let args = serde_json::json!({"url": "https://example.com/api/data?q=1"});
+    let args = serde_json::json!({"url": "https://example.com/api/v1/data?q=1"});
     assert_eq!(
         describe_cc_tool("WebFetch", &args),
         "Fetch https://example.com"
@@ -597,4 +597,99 @@ fn ensure_workspace_gitignore_inserts_missing_trailing_newline() {
     ensure_workspace_gitignore_entries(dir.path()).expect("ensure ok");
     let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
     assert!(content.contains(".lucidos/\ndata/postgres/\ndata/blobs/\n"));
+}
+
+/// Brand-new workspace: helper writes `[ports]\nvite = N\n`, stages it,
+/// and commits via the engine's "Lucidos <lucidos@local>" identity. The
+/// return value is `true` so callers can log a one-liner about the pin.
+#[test]
+fn pin_workspace_vite_port_writes_and_commits_when_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.initial_head("main");
+    git2::Repository::init_opts(ws, &opts).unwrap();
+
+    let written = pin_workspace_vite_port(ws, 5174).expect("pin ok");
+    assert!(written, "missing file must report written=true");
+
+    let content = std::fs::read_to_string(ws.join("lucidos.toml")).unwrap();
+    assert_eq!(content, "[ports]\nvite = 5174\n");
+
+    let repo = git2::Repository::open(ws).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.message().unwrap(), "chore: pin workspace vite port");
+    assert_eq!(head.author().name().unwrap(), "Lucidos");
+    assert_eq!(head.author().email().unwrap(), "lucidos@local");
+    // The commit only touches lucidos.toml.
+    let tree = head.tree().unwrap();
+    assert!(tree.get_name("lucidos.toml").is_some());
+}
+
+/// If the commit phase fails after the file is written (here simulated
+/// by calling the helper against a workspace dir with no `.git/`), the
+/// helper MUST roll the file back. Otherwise lucidos.toml ends up on
+/// disk untracked AND the engine_impl gate (`workspace_was_uninitialized`,
+/// one-shot per workspace) prevents any future retry — leaving the
+/// workspace permanently dirty, which is the exact thing this whole
+/// change is meant to prevent.
+#[test]
+fn pin_workspace_vite_port_rolls_back_file_on_commit_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    // Intentionally do NOT init the repo — Repository::open inside the
+    // helper's commit phase will fail, triggering the rollback path.
+
+    let result = pin_workspace_vite_port(ws, 5174);
+    assert!(
+        result.is_err(),
+        "expected error when commit phase fails (no .git)"
+    );
+    assert!(
+        !ws.join("lucidos.toml").exists(),
+        "file must be removed on commit failure so the working tree stays clean"
+    );
+}
+
+/// If `lucidos.toml` exists (hand-written pin or prior auto-write), the
+/// helper must NOT touch it AND must NOT create a commit. Pin files are
+/// user-editable; surprising them with a rewrite would clobber overrides.
+/// Returns `false` so callers know nothing changed.
+#[test]
+fn pin_workspace_vite_port_noop_when_file_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.initial_head("main");
+    let repo = git2::Repository::init_opts(ws, &opts).unwrap();
+
+    // Seed an initial commit so we can verify no NEW commit was made.
+    // Mirrors the realistic case where engine startup has already committed
+    // .gitignore before the lucidos.toml helper runs.
+    std::fs::write(ws.join("seed"), "x").unwrap();
+    let mut idx = repo.index().unwrap();
+    idx.add_path(std::path::Path::new("seed")).unwrap();
+    idx.write().unwrap();
+    let seed_sha = commit_index(&repo, "seed").unwrap();
+
+    let existing = "# my custom pin\n[ports]\nvite = 9999\n";
+    std::fs::write(ws.join("lucidos.toml"), existing).unwrap();
+
+    let written = pin_workspace_vite_port(ws, 5174).expect("pin ok");
+    assert!(!written, "existing file must report written=false");
+
+    let after = std::fs::read_to_string(ws.join("lucidos.toml")).unwrap();
+    assert_eq!(after, existing, "existing file must not be touched");
+
+    let head_sha = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    assert_eq!(
+        head_sha, seed_sha,
+        "no new commit should be made when file exists"
+    );
 }

@@ -6,6 +6,7 @@ import {
   searchEverywhereOpen,
 } from '../store/store';
 import { drawerOpen } from '../components/layout/Drawer';
+import { isMobileOrTouch } from '../utils/viewport';
 
 const anyOverlayOpen = computed(() =>
   confirmState.value.visible ||
@@ -16,18 +17,12 @@ const anyOverlayOpen = computed(() =>
 
 let scrollY = 0;
 
-/** iOS Safari ignores overflow:hidden on body — the position:fixed trick is needed there. */
-function isMobileOrTouch(): boolean {
-  return window.matchMedia('(max-width: 768px)').matches ||
-    ('ontouchstart' in window && navigator.maxTouchPoints > 0);
-}
-
 export function useScrollLock(): void {
   useEffect(() => {
     return anyOverlayOpen.subscribe((locked) => {
       if (!isMobileOrTouch()) return;
 
-      const app = document.getElementById('app');
+      const app = document.querySelector<HTMLElement>('#app');
       if (!app) return;
 
       if (locked) {

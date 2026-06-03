@@ -15,11 +15,22 @@
 //! dropped (their MCP client returns deny), so there's nothing to recover.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use uuid::Uuid;
+
+use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 
 /// User-facing reason on a denied permission. Surfaces in the response body
 /// returned to CC's MCP middleware and in the persisted `Resolved` event.
 pub const DENIAL_REASON: &str = "User denied";
+
+/// Reason stamped on a `CodingAgentPermissionResolved` that the engine emits
+/// because the user typed a new message instead of answering the permission
+/// card. Distinct from `DENIAL_REASON` (an explicit Deny click) and from the
+/// orphan-recovery reason in `recover_orphan_cc_permission_requests` (the
+/// Claude Code subprocess died first).
+pub const SUPERSEDED_REASON: &str = "Superseded by a new message";
 
 /// Reason returned to CC's MCP middleware when `permission_prompt` auto-
 /// allows a request via a session-allow match. Echoed in the HTTP response
@@ -107,6 +118,87 @@ impl CcPermissionState {
                 self.by_request_id.remove(&entry.request_id);
             }
         }
+    }
+}
+
+/// Resolve every unresolved `CodingAgentPermissionRequest` on `thread_id` as
+/// denied, because the user typed a new message instead of clicking a button
+/// on the permission card. Two effects, mirroring
+/// `recover_orphan_cc_permission_requests` but scoped to one live thread:
+///
+///   1. Fan a `false` (deny) out to any still-blocked MCP handler via the
+///      in-memory broadcast entry, so the Claude Code subprocess's pending
+///      `tools/call` returns immediately instead of dangling until the next
+///      `gc_dead_entries` sweep.
+///   2. Emit `CodingAgentPermissionResolved { allowed: false }` so the
+///      PermissionCard's buttons stop dangling — without this the card sits
+///      clickable forever (clicking it 404s once CC interrupts and the waiter
+///      is gc'd) and the thread reads as stuck on `waiting_for_user_answer`.
+///      The projection flips the thread status back to `running`.
+///
+/// No-op when nothing is pending / everything is already resolved. The caller
+/// still routes the typed message to CC as a normal follow-up — this only
+/// clears the stale card.
+pub async fn resolve_pending_permissions_as_superseded(
+    pool: &sqlx::PgPool,
+    event_bus: &EventBus,
+    pending: &Mutex<CcPermissionState>,
+    thread_id: Uuid,
+    actor: Option<MessageOrigin>,
+) {
+    let rows: Vec<(Option<String>,)> = match sqlx::query_as(
+        "SELECT e.payload->>'request_id' \
+         FROM events e \
+         WHERE e.event_type = 'CodingAgentPermissionRequest' \
+           AND e.thread_id = $1 \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM events r \
+             WHERE r.event_type = 'CodingAgentPermissionResolved' \
+               AND r.payload->>'request_id' = e.payload->>'request_id' \
+           )",
+    )
+    .bind(thread_id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log!(
+                "[CCPermission] unresolved-permission query failed for {}: {}",
+                thread_id,
+                e
+            );
+            return;
+        }
+    };
+
+    for (request_id,) in rows {
+        let Some(request_id) = request_id.filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        // Best-effort unblock of a still-waiting MCP handler. The std Mutex is
+        // released before the `.await` below — never hold it across an await.
+        {
+            let mut state = pending.lock().unwrap();
+            if let Some(entry) = state.take(&request_id) {
+                let _ = entry.tx.send(false);
+            }
+        }
+        event_bus
+            .emit_or_log(
+                BusEvent::Thread {
+                    thread_id,
+                    event: ThreadEvent::CodingAgentPermissionResolved {
+                        request_id,
+                        allowed: false,
+                        reason: Some(SUPERSEDED_REASON.to_string()),
+                        persist_scope: None,
+                    },
+                    meta: EventMeta::with_actor(actor.clone()),
+                },
+                "[CCPermission] CodingAgentPermissionResolved (superseded)",
+            )
+            .await;
     }
 }
 

@@ -12,10 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-use super::prompts::build_merge_prompt;
-
 impl LucidosEngine {
-    /// Apply Now: keep the existing CC session alive and use it for review/conflict resolution.
+    /// Apply Now: keep the existing Claude Code session alive and use it for review/conflict resolution.
     /// Only kills CC after the merge succeeds. Falls back to stale session handling if no live session.
     ///
     /// Runs as a background task (tokio::spawn). Steps:
@@ -53,17 +51,65 @@ impl LucidosEngine {
                 }
                 _ => {
                     drop(guard);
+
+                    // Fast path: apply existing pending change directly when
+                    // there's no live agent session. Claude Code sessions
+                    // cleanly exit at idle (Phase 5.3), so "no live session" is the
+                    // expected post-clean-idle state for any thread the user
+                    // returns to apply later — not a signal that the prior
+                    // turn died mid-edit. The fast path skips the
+                    // worktree-scan + describe + propose_change round-trip
+                    // that `end_stale_waiting_session` would otherwise
+                    // perform: when a clean pending row already exists, the
+                    // recovery sweep would just re-emit a duplicate
+                    // `ChangeProposed` with the same payload, producing a
+                    // noise event in the timeline. Skipping it keeps the
+                    // history clean. (`propose_branch_changes` now derives
+                    // `incomplete` from the prior terminal event via
+                    // `last_turn_ended_cleanly`, so the recovery path no
+                    // longer flips clean rows to incomplete=true — but the
+                    // fast path is still worth keeping for the no-op-emit
+                    // reason.) See the regression test
+                    // `apply_now_no_live_session_fast_path_preserves_clean_pending_change`.
+                    let pending = self.changes().pending_for_thread(thread_id).await?;
+                    if !pending.is_empty() {
+                        log!(
+                            "[ApplyNow] No live session for thread {} but {} pending change(s) — applying directly without stale-recovery",
+                            thread_id,
+                            pending.len()
+                        );
+                        for change in pending {
+                            log!(
+                                "[ApplyNow] Applying pending change {} on resumed thread {}",
+                                change.id,
+                                thread_id
+                            );
+                            if let Err(e) = self.apply_change(change.id, actor.clone()).await {
+                                log!("[ApplyNow] apply_change for {} failed: {}", change.id, e);
+                                self.emit_apply_failed(
+                                    thread_id,
+                                    change.id,
+                                    &e.to_string(),
+                                    actor.clone(),
+                                )
+                                .await;
+                            }
+                        }
+                        return Ok(());
+                    }
+
                     log!(
-                        "[ApplyNow] No live session for thread {} — propose then chain user-initiated apply",
+                        "[ApplyNow] No live session and no pending change for thread {} — running stale-session recovery to propose then apply",
                         thread_id
                     );
-                    // Stale fallback: propose any uncommitted/committed work as
-                    // a pending change, then explicitly apply it. The apply is
-                    // stamped with the clicking user's actor, so the resulting
-                    // ChangeApplied chip reads "You" — not the engine.
+                    // Stale fallback: no pending change row exists — propose
+                    // any uncommitted/committed work on the branch, then
+                    // explicitly apply it. The apply is stamped with the
+                    // clicking user's actor, so the resulting ChangeApplied
+                    // chip reads "You" — not the engine.
                     self.end_stale_waiting_session(thread_id, false, actor.clone())
                         .await?;
-                    let pending = self.changes().pending_for_thread(thread_id).await;
+                    let pending = self.changes().pending_for_thread(thread_id).await?;
                     // Guarantee a terminal event so the frontend's `applyingNow`
                     // spinner always resolves. Without this, a stale fallback that
                     // proposes nothing (branch had no real commits) would hang
@@ -210,7 +256,7 @@ impl LucidosEngine {
                         .map(|s| s.process_exited)
                         .unwrap_or(true)
                     {
-                        return Err(format!("CC session ended while {}", context).into());
+                        return Err(format!("Claude Code session ended while {}", context).into());
                     }
                 }
             }
@@ -234,6 +280,7 @@ impl LucidosEngine {
                 text: message.to_string(),
                 images: None,
                 origin_event_id: None,
+                kind: crate::engine::AgentInputKind::User,
             })
             .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
                 "Session channel closed".into()
@@ -243,6 +290,11 @@ impl LucidosEngine {
     }
 
     /// Wait for CC to go idle, then auto-commit any changes it made.
+    ///
+    /// Propagates `git add` / `git commit` failures via `Err`. A silent failure
+    /// here would lose a real CC change — the apply-now caller treats the
+    /// returned `Ok` as proof the iteration produced a committed snapshot
+    /// before moving on to the next step (hardening, tests, merge).
     pub(crate) async fn wait_and_commit(
         &self,
         thread_id: Uuid,
@@ -252,23 +304,15 @@ impl LucidosEngine {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.wait_for_idle(thread_id, idle_notify, context).await?;
 
-        let has_changes = git_cmd(&["status", "--porcelain"], worktree_path)
-            .await
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false);
-        if has_changes {
-            let _ = git_cmd(&["add", "-A"], worktree_path).await;
-            let _ = git_cmd(
-                &[
-                    "commit",
-                    "-m",
-                    &format!("Claude Code changes ({})", context),
-                ],
-                worktree_path,
-            )
-            .await;
-        }
-        Ok(())
+        crate::engine::git_ops::commit_worktree_or_err(
+            worktree_path,
+            &format!("Claude Code changes ({})", context),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("wait_and_commit ({}): {}", context, e).into()
+        })
     }
 
     /// Inner implementation for apply_now — runs in a background task.
@@ -385,7 +429,7 @@ impl LucidosEngine {
                 description: &description,
                 files: &changed_files,
                 requires_restart,
-                channel: EventChannel::CodingAgent,
+                channel: EventChannel::ClaudeCode,
                 hardened: true, // apply_now ensures hardening before this point
                 // Apply-now propose is part of a live agent flow — origin is
                 // carried by the surrounding MessageReceived.
@@ -476,18 +520,18 @@ impl LucidosEngine {
             branch_name,
             conflict_files.len()
         );
-        self.emit_merge_conflict_detected(thread_id, change_id, conflict_files)
+        let prompt = self
+            .start_merge_and_get_prompt(thread_id, change_id, conflict_files, "main", None, None)
             .await;
-
-        let prompt = build_merge_prompt("main", None, None);
 
         if let Err(e) = msg_tx.send(AgentUserInput {
             text: prompt,
             images: None,
             origin_event_id: None,
+            kind: crate::engine::AgentInputKind::User,
         }) {
             return Err(format!(
-                "Failed to send merge prompt to CC session — receiver gone: {}",
+                "Failed to send merge prompt to Claude Code session — receiver gone: {}",
                 e
             )
             .into());
@@ -515,7 +559,7 @@ impl LucidosEngine {
         .unwrap_or(false);
         if !main_merged {
             return Err(
-                "CC session ended without completing the merge. Try applying again.".into(),
+                "Claude Code session ended without completing the merge. Try applying again.".into(),
             );
         }
 
@@ -531,7 +575,7 @@ impl LucidosEngine {
             .map_err(|e| format!("ff-merge to main failed after CC merge: {}", e).into())
     }
 
-    /// Helper: kill CC session and clean up after a successful apply.
+    /// Helper: kill Claude Code session and clean up after a successful apply.
     /// Returns the commit subjects that were merged so the caller can surface
     /// them in the API response without re-running `git log`.
     #[allow(clippy::too_many_arguments)]
@@ -549,13 +593,22 @@ impl LucidosEngine {
         actor: Option<MessageOrigin>,
     ) -> Vec<String> {
         let commits = commits_in_range(repo_root, pre_sha, post_sha).await;
+        // Title is best-effort metadata for the ChangeApplied event payload —
+        // a DB lookup error shouldn't block the apply that just succeeded.
         let thread_title = sqlx::query_scalar::<_, String>(
             "SELECT title FROM thread_summaries WHERE thread_id = $1",
         )
         .bind(thread_id)
         .fetch_optional(&self.pool)
         .await
-        .unwrap_or(None);
+        .unwrap_or_else(|e| {
+            log!(
+                "[ApplyNow] Failed to load thread title for {}: {}",
+                thread_id,
+                e
+            );
+            None
+        });
         self.emit_change_applied(
             thread_id,
             change_id,
@@ -563,11 +616,58 @@ impl LucidosEngine {
             client_update,
             commits.clone(),
             thread_title,
-            actor,
+            actor.clone(),
             Some(pre_sha.to_string()),
             Some(post_sha.to_string()),
         )
         .await;
+        // Refresh entity caches (apps, artifacts) for SSE subscribers — the
+        // CC worktree wrote files directly into `data/apps/<id>/...` /
+        // `data/artifacts/...`, so the only signal the frontend gets is
+        // ChangeApplied unless we ladder up to per-entity events here. See
+        // `emit_entity_events_for_change_apply` for the detection rules.
+        //
+        // A silent miss here resurrects the exact bug this path was added to
+        // fix ("no app with id" after Apply when CC created the app), so log
+        // any DB failure or missing-row case so it's greppable in
+        // `[ApplyNow]` traces.
+        match self.changes().get_by_id(change_id).await {
+            Ok(Some(change)) => {
+                // App coding-agent thread: reload open iframes of this app
+                // so the user sees the merged CSS/JS/HTML immediately. The
+                // sibling apply paths in `change_ops::apply_change` all
+                // pair `maybe_emit_app_ui_refresh` next to `emit_change_applied`
+                // — this in-CC in-place merge path used to skip it, leaving
+                // the iframe stale after a same-thread Apply.
+                let kind_ctx = crate::engine::change_ops::load_apply_kind_context(
+                    &self.pool,
+                    Some(thread_id),
+                )
+                .await;
+                self.maybe_emit_app_ui_refresh(&kind_ctx, &change.files, actor.as_ref())
+                    .await;
+                self.emit_entity_events_for_change_apply(
+                    &change.files,
+                    Some(pre_sha),
+                    Some(post_sha),
+                    actor,
+                )
+                .await;
+            }
+            Ok(None) => {
+                log!(
+                    "[ApplyNow] entity-event emission skipped — change {} not found post-apply",
+                    change_id
+                );
+            }
+            Err(e) => {
+                log!(
+                    "[ApplyNow] entity-event emission skipped — get_by_id({}) failed: {}",
+                    change_id,
+                    e
+                );
+            }
+        }
 
         consume_harden_marker(&self.pool, repo_root, branch_name).await;
         self.reset_worktree_and_idle(thread_id, worktree_path).await;
@@ -608,7 +708,7 @@ impl LucidosEngine {
                         requires_restart: false,
                         is_external_repo: false,
                         cc_session_id: cc_sid,
-                        agent: crate::runtime::AgentKind::ClaudeCode,
+                        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                         reason: None,
                         worktree_path: Some(worktree_path.to_string_lossy().into_owned()),
                         // Apply-now exits the loop with the worktree at the
@@ -617,6 +717,7 @@ impl LucidosEngine {
                         // here we leave it None so legacy-deserialize stays
                         // the canonical "no recorded SHA" sentinel.
                         worktree_head_sha: None,
+                        bg_bash_pending: false,
                     },
                     meta: EventMeta::NONE,
                 },
@@ -630,7 +731,7 @@ impl LucidosEngine {
 /// worktree. Returns the list of conflicting paths (empty for clean merges).
 /// Uses `git merge-tree` (read-only, no index/working-tree mutation) so it's
 /// safe to run alongside other operations in the same worktree.
-async fn probe_merge_conflicts(worktree_path: &Path) -> Vec<String> {
+pub(crate) async fn probe_merge_conflicts(worktree_path: &Path) -> Vec<String> {
     // `--name-only` (Git 2.40+) prints one conflicting path per line on stdout;
     // exit code 1 = conflicts present, 0 = clean. Anything else is unexpected.
     let out = match git_cmd(

@@ -6,12 +6,29 @@ import {
   currentApp,
   previewFile,
   panelUrl,
+  mobileView,
 } from '../store';
 import type { App } from '../types';
 
 // Mock navigation to spy on pushNavState
 const pushNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState }));
+
+// Mock pane helper — single rule across the codebase: any user-intent navigation
+// that lands content into the right pane must call revealContentPane(), so the
+// mobile user gets swiped to it AND the desktop user's collapsed split expands.
+// We mock here to verify each helper in this file calls it (or, for the pure
+// plumbing helper setActiveMenu, that it does NOT).
+const revealContentPane = vi.fn();
+const navigateToPane = vi.fn();
+vi.mock('./pane', () => ({ revealContentPane, navigateToPane }));
+
+// Force isMobile() to return true so the setActiveMenu pure-plumbing pin would
+// have ALSO failed under the pre-refactor conditional (`item !== prev &&
+// isMobile() && mobileView === 'thread'`). jsdom's default viewport is desktop;
+// without this mock the conditional would skip on isMobile() alone and the
+// pin would pass for the wrong reason — green even before the refactor.
+vi.mock('../../utils/viewport', () => ({ isMobile: () => true }));
 
 // Mock credentials loader (called by openSettingsSubview('accounts'))
 vi.mock('./credentials', () => ({ loadCredentials: vi.fn().mockResolvedValue(undefined) }));
@@ -24,7 +41,7 @@ vi.mock('../../api/client', () => ({
   listDevices: vi.fn().mockResolvedValue({ devices: [] }),
 }));
 
-const { switchMenuItem, openSettingsSubview } = await import('./menu');
+const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay } = await import('./menu');
 
 const fakeApp: App = {
   id: 'trip-planner',
@@ -38,6 +55,8 @@ describe('switchMenuItem', () => {
     activeMenuItem.value = 'files';
     panelOverlay.value = null;
     pushNavState.mockClear();
+    revealContentPane.mockClear();
+    navigateToPane.mockClear();
   });
 
   it('clears app UI overlay when switching to a different menu item', () => {
@@ -96,6 +115,25 @@ describe('switchMenuItem', () => {
     switchMenuItem('settings');
     expect(pushNavState).toHaveBeenCalledTimes(1);
   });
+
+  it('reveals the content pane on every menu switch (mobile swipe, desktop expand)', () => {
+    // The user-intent rule: any helper that puts something into the right-hand
+    // content pane must call revealContentPane(). switchMenuItem is the
+    // user-intent layer for drawer clicks, NotificationsBell, nav-link clicks,
+    // and SDK navigate_ui → handleNavigationRequest panel branches.
+    switchMenuItem('notifications');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+  });
+
+  it('reveals the content pane even when re-selecting the SAME menu item', () => {
+    // Regression for the old setActiveMenu gate that skipped pane navigation
+    // when `item === prev`. Re-tapping a link to a panel the user previously
+    // visited (e.g. activeMenuItem stuck at 'notifications' from prior visit)
+    // while looking at a thread must STILL swipe to content.
+    activeMenuItem.value = 'notifications';
+    switchMenuItem('notifications');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('openSettingsSubview', () => {
@@ -104,6 +142,8 @@ describe('openSettingsSubview', () => {
     settingsSubview.value = 'main';
     panelOverlay.value = null;
     pushNavState.mockClear();
+    revealContentPane.mockClear();
+    navigateToPane.mockClear();
   });
 
   it('clears app UI overlay when navigating to a settings subview', () => {
@@ -128,5 +168,63 @@ describe('openSettingsSubview', () => {
   it('pushes navigation state', () => {
     openSettingsSubview('memory');
     expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+
+  it('reveals the content pane (mobile swipe, desktop expand)', () => {
+    // Settings sub-sections live inside the content pane. Opening one from
+    // any source (deep link, search result, in-panel nav) must swipe to it
+    // on mobile — without this, tapping a settings deep-link from a chat on
+    // mobile silently left the user on the thread pane.
+    openSettingsSubview('devices');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('setActiveMenu (pure plumbing)', () => {
+  beforeEach(() => {
+    activeMenuItem.value = 'files';
+    panelOverlay.value = null;
+    pushNavState.mockClear();
+    revealContentPane.mockClear();
+    navigateToPane.mockClear();
+    // Force the conditions under which the OLD setActiveMenu's
+    // `if (item !== prev && isMobile() && mobileView === 'thread')` block
+    // WOULD have fired (item changes from 'files' to 'notifications', isMobile
+    // is forced true, mobileView is the default 'thread'). This makes the
+    // pin a real regression guard — if someone re-introduces the conditional,
+    // the test breaks; the test cannot pass for the wrong reason because the
+    // pre-refactor branch would have called navigateToPane here.
+    mobileView.value = 'thread';
+  });
+
+  it('does NOT touch pane navigation — that is the user-intent layer job', () => {
+    // Pin: setActiveMenu is internal plumbing used by multiple flows
+    // (switchMenuItem, landOnAccountsWithOverlay, thread-sync new-app /
+    // new-trigger branches). Each user-intent caller is responsible for
+    // calling revealContentPane() itself. Putting pane logic inside
+    // setActiveMenu — gated on `item !== prev && mobileView === 'thread'` —
+    // was the original bug: silent no-swipe when the user re-tapped the same
+    // item, or was already on the threads pane.
+    setActiveMenu('notifications');
+    expect(revealContentPane).not.toHaveBeenCalled();
+    expect(navigateToPane).not.toHaveBeenCalled();
+  });
+});
+
+describe('landOnAccountsWithOverlay', () => {
+  beforeEach(() => {
+    activeMenuItem.value = 'files';
+    settingsSubview.value = 'main';
+    panelOverlay.value = null;
+    pushNavState.mockClear();
+    revealContentPane.mockClear();
+    navigateToPane.mockClear();
+  });
+
+  it('reveals the content pane on the same render as the deep link lands', () => {
+    landOnAccountsWithOverlay({ type: 'form', form: { type: 'credential' } });
+    expect(activeMenuItem.value).toBe('settings');
+    expect(settingsSubview.value).toBe('accounts');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 });

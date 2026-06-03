@@ -2,10 +2,17 @@
 //! `LucidosEngine` — free functions and constants reusable across the chat
 //! module.
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
+use tokio::sync::Mutex as TokioMutex;
+use uuid::Uuid;
+
 use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent, TriggerInvocation};
+use crate::engine::types::AgentSession;
+use crate::engine::ThreadHandle;
 
 /// Trigger context passed into the chat process flow. None for user-driven chat.
 pub(super) struct TriggerContext {
@@ -192,3 +199,67 @@ pub(super) fn build_system_knowhow_section(
     }
     section
 }
+
+/// Bridge the race between a chat handler that has already taken
+/// `active_threads[thread_id]` (and is mid-spawn of a Claude Code subprocess) and the
+/// fast-path on a follow-up POST that needs `agent_sessions[thread_id]` to
+/// exist before it can route via `msg_tx`.
+///
+/// Without this bridge, a follow-up POST that arrives in the 1-10s window
+/// between `register_thread` and `agent_sessions.insert()` falls to the slow
+/// path, blocks 60s in `register_thread_queued`, then force-evicts the
+/// still-spawning CC. Symptoms: `ResponseAborted (cause=safety_net)` on a
+/// fresh CC turn, plus a brand-new replacement spawn that often dies
+/// immediately because its resume points at the just-killed conversation.
+///
+/// Returns `true` when `agent_sessions[thread_id]` is populated with a live
+/// (non-`process_exited`) session before the deadline. Returns `false` when:
+///   - `active_threads[thread_id]` clears before population (chat handler
+///     bailed without registering a session — fall through to a fresh spawn);
+///   - the deadline elapses (caller falls through to slow path).
+///
+/// `poll_interval` keeps the busy-loop bounded — at the default 100ms a
+/// 30-second deadline is 300 mutex acquisitions, dwarfed by the cost of CC
+/// startup itself.
+pub(super) async fn wait_for_cc_session_alive(
+    agent_sessions: &TokioMutex<HashMap<Uuid, AgentSession>>,
+    active_threads: &StdMutex<HashMap<Uuid, ThreadHandle>>,
+    thread_id: Uuid,
+    deadline: Duration,
+    poll_interval: Duration,
+) -> bool {
+    let start = std::time::Instant::now();
+    let mut logged_wait = false;
+    loop {
+        {
+            let guard = agent_sessions.lock().await;
+            if let Some(s) = guard.get(&thread_id) {
+                if !s.process_exited {
+                    return true;
+                }
+            }
+        }
+        // No chat handler is mid-spawn anymore — no point in waiting.
+        let chat_active = active_threads.lock().unwrap().contains_key(&thread_id);
+        if !chat_active {
+            return false;
+        }
+        if !logged_wait {
+            log!(
+                "[Chat] Thread {} active in chat but no agent session yet — \
+                 bridging spawn race (up to {}s)",
+                thread_id,
+                deadline.as_secs()
+            );
+            logged_wait = true;
+        }
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+#[cfg(test)]
+#[path = "process_helpers_tests.rs"]
+mod process_helpers_tests;

@@ -9,12 +9,12 @@ export type VisualStatus = ThreadStatus | 'changes' | 'question';
 export function resolveVisualStatus(
   status: ThreadStatus,
   hasActiveChildren: boolean,
-  ccHasChanges: boolean,
+  codingAgentProposed: boolean,
 ): VisualStatus {
   if (status === 'failed') return 'failed';
   if (status === 'running') return 'running';
   if (status === 'waiting_for_user_answer') return 'question';
-  if (ccHasChanges) return 'changes';
+  if (codingAgentProposed) return 'changes';
   if (hasActiveChildren) return 'waiting';
   return 'idle';
 }

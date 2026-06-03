@@ -29,19 +29,26 @@ const emptyState = {
 };
 
 beforeEach(() => {
-  changes.value = [];
-  appliedChanges.value = [];
+  changes.value = { status: 'not-loaded' };
+  appliedChanges.value = { status: 'not-loaded' };
   toasts.value = [];
   mockFetchChanges.mockReset();
 });
 
-describe('refreshChangesState retries once on AbortError', () => {
-  it('retries silently when the first fetch aborts and second succeeds', async () => {
+function loadedPendingLength(): number {
+  return changes.value.status === 'loaded' ? changes.value.data.length : 0;
+}
+function loadedAppliedLength(): number {
+  return appliedChanges.value.status === 'loaded' ? appliedChanges.value.data.length : 0;
+}
+
+describe('refreshChangesState retries once on TimeoutError', () => {
+  it('retries silently when the first fetch times out and second succeeds', async () => {
     // Simulates the iOS PWA wake case: the first fetch fired by runResumeSync
     // hits the 10s client timeout while the radio is still warming up; a
     // second attempt (on a now-warm connection) succeeds.
     mockFetchChanges
-      .mockRejectedValueOnce(new DOMException('Aborted', 'AbortError'))
+      .mockRejectedValueOnce(new DOMException('timeout', 'TimeoutError'))
       .mockResolvedValueOnce({
         ...emptyState,
         pending: [{ id: 'c1' } as never],
@@ -49,15 +56,15 @@ describe('refreshChangesState retries once on AbortError', () => {
 
     refreshChangesState();
     await vi.waitFor(() => expect(mockFetchChanges).toHaveBeenCalledTimes(2));
-    await vi.waitFor(() => expect(changes.value.length).toBe(1));
+    await vi.waitFor(() => expect(loadedPendingLength()).toBe(1));
 
     expect(toasts.value.find(t => t.message?.startsWith('Failed to fetch changes'))).toBeUndefined();
   });
 
-  it('shows the toast only when both attempts fail', async () => {
+  it('shows the toast only when both timeout attempts fail', async () => {
     mockFetchChanges
-      .mockRejectedValueOnce(new DOMException('Aborted', 'AbortError'))
-      .mockRejectedValueOnce(new DOMException('Aborted', 'AbortError'));
+      .mockRejectedValueOnce(new DOMException('timeout', 'TimeoutError'))
+      .mockRejectedValueOnce(new DOMException('timeout', 'TimeoutError'));
 
     refreshChangesState();
     await vi.waitFor(() => expect(mockFetchChanges).toHaveBeenCalledTimes(2));
@@ -70,7 +77,22 @@ describe('refreshChangesState retries once on AbortError', () => {
     expect(toast!.type).toBe('error');
   });
 
-  it('does not retry on non-abort errors', async () => {
+  it('does not retry on a manual AbortError', async () => {
+    // A bare controller.abort() is a user cancel, not a timeout — surfacing
+    // immediately is correct (no toast suppression, no retry).
+    mockFetchChanges.mockRejectedValueOnce(new DOMException('aborted', 'AbortError'));
+
+    refreshChangesState();
+    await vi.waitFor(() =>
+      expect(toasts.value.find(t => t.message?.startsWith('Failed to fetch changes'))).toBeTruthy(),
+    );
+
+    expect(mockFetchChanges).toHaveBeenCalledTimes(1);
+    const toast = toasts.value.find(t => t.message?.startsWith('Failed to fetch changes'));
+    expect(toast!.message).toBe('Failed to fetch changes: request cancelled');
+  });
+
+  it('does not retry on non-timeout errors', async () => {
     // A genuine error (e.g. 500) should surface immediately without a second
     // wasted request — retrying won't help and would just delay the toast.
     mockFetchChanges.mockRejectedValueOnce(new Error('boom'));
@@ -92,7 +114,7 @@ describe('refreshChangesState retries once on AbortError', () => {
     });
 
     refreshChangesState();
-    await vi.waitFor(() => expect(appliedChanges.value.length).toBe(1));
+    await vi.waitFor(() => expect(loadedAppliedLength()).toBe(1));
 
     expect(mockFetchChanges).toHaveBeenCalledTimes(1);
     expect(toasts.value.find(t => t.message?.startsWith('Failed to fetch changes'))).toBeUndefined();

@@ -1,7 +1,7 @@
 import { Fragment } from 'preact';
 import { useSignal, useSignalEffect, signal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
-import { showToast, ccSessionVersion, ccPendingModel, ccPendingReasoningEffort, selectedRepoId, engineRestarting } from '../../store/store';
+import { showToast, ccSessionVersion, ccPendingModel, ccPendingReasoningEffort, selectedScope, scopeToRepoId, engineRestarting } from '../../store/store';
 import { sendCCControl } from '../../store/actions/chat-claude-code';
 import { sendMessage } from '../../store/actions/chat';
 import { fetchCCCommands, type CCCommandDef, type CCCommandsResponse, type CCModelValue, type CCReasoningEffort } from '../../api/client';
@@ -9,6 +9,7 @@ import { ClaudeIcon } from '../shared/icons';
 import { isTextInput } from '../../utils/dom';
 import { errorDetail } from '../../utils/errorDetail';
 import { focusIfNeeded } from './promptFocus';
+import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
 
 // Signal for PromptInput to request opening the menu with a filter
 // Set to a string (the filter text) to open, consumed by the component
@@ -77,10 +78,13 @@ export function CCControlMenu({ threadId }: Props) {
     // when the engine is back. Same convention as loadAllThreads etc.
     if (engineRestarting.value) return;
     // Compose view (no thread) scopes commands to the user-selected repo so
-    // skills from other repos never leak into the menu. selectedRepoId === ''
-    // means "default Lucidos repo" — pass it through verbatim; the backend
-    // resolves "" to the default name.
-    const repoId = threadId ? undefined : selectedRepoId.value;
+    // skills from other repos never leak into the menu. For Lucidos and App
+    // scopes there's no repo UUID (App skills aren't surfaced this way yet —
+    // they'll appear once the live CC session loads its own command list).
+    // `scopeToRepoId` returns the external repo UUID or undefined; passing
+    // `''` to the backend resolves to the default "Lucidos" repo, which is
+    // the right fallback for both Lucidos and App.
+    const repoId = threadId ? undefined : (scopeToRepoId(selectedScope.value) ?? '');
     fetchCCCommands(threadId, repoId)
       .then((res: CCCommandsResponse) => {
         // Always update control commands (always present from backend)
@@ -91,10 +95,19 @@ export function CCControlMenu({ threadId }: Props) {
         // Update model/effort from backend response (per-thread, from events).
         // Active session: values come from the live session. No session: values
         // come from CodingAgentSettingsChanged events for this thread (may be null).
-        // Clear pending when session confirms — session values are authoritative.
+        // Clear pending ONLY when the live session has adopted that exact value.
+        // A bare `has_active_session` check would clear the user's pending pick
+        // from a stale in-flight fetch issued before the click — the next send
+        // then loses the override and the spawn uses the prior session's
+        // effort. Matching the value first guarantees we only clear pending
+        // when this response actually proves it landed.
         if (res.has_active_session) {
-          ccPendingReasoningEffort.value = null;
-          ccPendingModel.value = null;
+          if (res.current_reasoning_effort === ccPendingReasoningEffort.value) {
+            ccPendingReasoningEffort.value = null;
+          }
+          if (res.current_model === ccPendingModel.value) {
+            ccPendingModel.value = null;
+          }
         }
         currentReasoningEffort.value = (res.current_reasoning_effort as CCReasoningEffort) ?? null;
         currentModel.value = (res.current_model as CCModelValue) ?? null;
@@ -141,7 +154,7 @@ export function CCControlMenu({ threadId }: Props) {
 
   useEffect(() => {
     retryCountRef.current = 0;
-    // Compose view (no threadId) is loaded by the selectedRepoId signal effect
+    // Compose view (no threadId) is loaded by the selectedScope signal effect
     // below — fires on first render and on every repo switch. Loading here too
     // would double-fetch on mount.
     if (threadId) loadCommands();
@@ -152,7 +165,7 @@ export function CCControlMenu({ threadId }: Props) {
   // the element is still connected, properly resetting keyboardOpen.
   useEffect(() => close, []);
 
-  // Re-fetch commands when a CC session starts/resumes (SSE-driven).
+  // Re-fetch commands when a Claude Code session starts/resumes (SSE-driven).
   // useSignalEffect required — see comment below re: Preact signal optimization.
   useSignalEffect(() => {
     if (ccSessionVersion.value > 0) {
@@ -177,13 +190,13 @@ export function CCControlMenu({ threadId }: Props) {
     }
   });
 
-  // Re-fetch when the compose-view repo dropdown changes — different repo,
+  // Re-fetch when the compose-view scope dropdown changes — different repo,
   // different skills. Clear the module-level cache first so the previous
-  // repo's skills don't flash before the new fetch resolves. Thread-bound
+  // scope's skills don't flash before the new fetch resolves. Thread-bound
   // menus are bound to the thread's repo and ignore this signal.
   useSignalEffect(() => {
     // Reading the signal here is what subscribes this effect.
-    selectedRepoId.value;
+    selectedScope.value;
     if (threadId) return;
     persistedBuiltinCommands.value = null;
     persistedSkillCommands.value = null;
@@ -252,16 +265,8 @@ export function CCControlMenu({ threadId }: Props) {
     optionsListRef.current?.focus();
   }, [activeCommand.value]);
 
-  useEffect(() => {
-    if (!open.value) return;
-    function handleClick(e: MouseEvent) {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        close();
-      }
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [open.value]);
+  // Trigger and dropdown share menuRef; wrapper is panel + anchor.
+  useDismissOnOutside(open.value, menuRef, null, close);
 
   function selectCommand(subtype: string) {
     activeCommand.value = subtype;
@@ -395,12 +400,12 @@ export function CCControlMenu({ threadId }: Props) {
     if (e.key === 'Enter') {
       if (cmd && !hasOptions) {
         e.preventDefault();
-        submit();
+        void submit();
       } else if (highlightIndex.value >= 0 && highlightIndex.value < (cmd ? optionItems.length : flatItems.length)) {
         e.preventDefault();
         if (cmd && hasOptions) {
           const opt = optionItems[highlightIndex.value];
-          selectOption(cmd, opt.value, opt.label);
+          void selectOption(cmd, opt.value, opt.label);
         } else {
           const item = flatItems[highlightIndex.value];
           if (item.type === 'control') selectCommand(item.subtype);
@@ -437,7 +442,7 @@ export function CCControlMenu({ threadId }: Props) {
   return (
     <div class="cc-control-menu" data-row-item ref={menuRef}>
       {/* Never disabled — openMenu() guards against empty commands instead.
-          disabled={...} caused intermittent UX issues during CC session startup races. */}
+          disabled={...} caused intermittent UX issues during Claude Code session startup races. */}
       <button
         class={`icon-btn cc-commands-btn${hasAnyCommands(controlCommands.value, builtinCommands.value, skillCommands.value) ? ' cc-commands-btn-active' : ''}`}
         data-tooltip="CC Commands"
@@ -509,7 +514,7 @@ export function CCControlMenu({ threadId }: Props) {
                     key={opt.value}
                     class={`cc-control-item cc-control-option${i === highlightIndex.value ? ' cc-control-item-active' : ''}${isCurrent ? ' cc-control-option-current' : ''}`}
                     disabled={sending.value}
-                    onClick={() => selectOption(cmd, opt.value, opt.label)}
+                    onClick={() => void selectOption(cmd, opt.value, opt.label)}
                     onMouseEnter={() => { highlightIndex.value = i; }}
                   >
                     <span class="cc-control-option-label">

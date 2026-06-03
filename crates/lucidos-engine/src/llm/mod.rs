@@ -5,6 +5,7 @@ pub mod provider;
 pub mod routing;
 pub mod tool_names;
 pub mod tools;
+pub mod validate;
 pub mod vertex;
 
 pub use image::{ImageProvider, ImageSize};
@@ -28,6 +29,16 @@ pub fn is_retryable_status(status_code: u16) -> bool {
     status_code == 429 || status_code == 529 || status_code >= 500
 }
 
+/// True if `code` appears in `haystack` as a standalone alphanumeric token —
+/// "HTTP 529" matches, "request id 529abc..." and "1529" do not. Used by
+/// `is_transient_error` to keep the HTTP-status heuristic from false-positiving
+/// on opaque identifiers.
+fn contains_status_token(haystack: &str, code: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok == code)
+}
+
 /// Whether an error is a transient network/infrastructure issue (not a logic or auth error).
 /// Used to suppress noisy duplicate notifications for triggers.
 pub fn is_transient_error(err: &str) -> bool {
@@ -41,9 +52,9 @@ pub fn is_transient_error(err: &str) -> bool {
         || lower.contains("network error")
         || lower.contains("rate limit")
         || lower.contains("overloaded")
-        || lower.contains("529")
-        || lower.contains("503")
-        || lower.contains("502")
+        || contains_status_token(&lower, "529")
+        || contains_status_token(&lower, "503")
+        || contains_status_token(&lower, "502")
 }
 
 /// Whether a stream/parse error message indicates a retryable condition.
@@ -94,6 +105,26 @@ pub fn with_retry_context(err: impl std::fmt::Display, attempts: u32) -> String 
         format!("{} (after {} attempts)", err, attempts)
     } else {
         err.to_string()
+    }
+}
+
+/// Clamp an upstream u64 token count (from provider SSE usage blocks) into the
+/// u32 our meta/usage structs store. Above-bound values indicate corrupt
+/// upstream data; log and clamp rather than panicking or silently truncating
+/// so a single bad block can't tank the stream and we don't lose visibility
+/// on the corruption. `source` is a short tag (e.g. "OpenAI", "Vertex",
+/// "ClaudeCode") used in the log prefix.
+pub(crate) fn clamp_provider_token_count(n: u64, source: &str) -> u32 {
+    match u32::try_from(n) {
+        Ok(v) => v,
+        Err(_) => {
+            log!(
+                "[{}] Token count {} exceeds u32::MAX; clamping (likely corrupt upstream usage block)",
+                source,
+                n
+            );
+            u32::MAX
+        }
     }
 }
 
@@ -158,6 +189,22 @@ mod tests {
         assert!(is_transient_error("HTTP 503 service unavailable"));
         assert!(!is_transient_error("invalid JSON"));
         assert!(!is_transient_error("authentication failed"));
+    }
+
+    /// HTTP status token matching must be word-bounded: "529" inside an opaque
+    /// identifier like "request id 529abc..." or a longer number "1529" is not
+    /// a status code and must NOT classify the error as transient. Pre-fix
+    /// substring matching false-positived on both.
+    #[test]
+    fn test_is_transient_error_status_token_not_substring() {
+        assert!(!is_transient_error("invalid request id 529abc1234"));
+        assert!(!is_transient_error("trace 502xy"));
+        assert!(!is_transient_error("rpc code 5031 not found"));
+        assert!(!is_transient_error("port 1529 closed"));
+        // Standalone status tokens still match, regardless of surrounding punctuation.
+        assert!(is_transient_error("(529): server overloaded"));
+        assert!(is_transient_error("status=502"));
+        assert!(is_transient_error("got 503,"));
     }
 
     #[test]

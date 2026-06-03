@@ -126,7 +126,7 @@ test.describe('Message route panel', () => {
 
     try {
       psql([
-        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_cc, active_children_count, cc_has_changes, cc_requires_restart, cc_is_external_repo) VALUES ('${threadId}', 'Engine origin e2e', 'chat', '${now}', 1, false, true, 'done', 'inbox', false, 0, false, false, false)`,
+        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Engine origin e2e', 'chat', '${now}', 1, false, true, 'done', 'inbox', false, 0, false, false, false)`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${eventId}', 'MessageReceived', '${enginePayload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${respId}', 'ResponseGenerated', '{"text":"ok","images":[]}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
       ].join(';\n'));

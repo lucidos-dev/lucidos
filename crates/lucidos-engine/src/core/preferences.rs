@@ -12,7 +12,7 @@ pub const PREF_CHAT_REASONING_EFFORT: &str = "chat_reasoning_effort";
 
 /// Default chat model when neither user preference nor `LUCIDOS_MODEL` env is set.
 /// Mirrored on the frontend in `crates/lucidos-app/src/store/models.ts`.
-pub const DEFAULT_CHAT_MODEL: &str = "claude-opus-4-7";
+pub const DEFAULT_CHAT_MODEL: &str = "claude-opus-4-8@default";
 
 // Vertex AI configuration
 pub const PREF_VERTEX_REGION: &str = "vertex_region";
@@ -23,13 +23,15 @@ pub const PREF_IMAGE_MODEL: &str = "image_model";
 // When off, ContextCaptured still fires per LLM call but section
 // bodies are dropped — only the name + char_count survives. Defaults
 // to "true" to preserve historical behavior.
-pub const PREF_CAPTURE_CONTEXT: &str = "capture_context";
+pub(crate) const PREF_CAPTURE_CONTEXT: &str = "capture_context";
 
 /// Store for managing user preferences in the database
 pub struct PreferenceStore;
 
 impl PreferenceStore {
-    /// Initialize the preferences table schema
+    /// Defensive double-write — the migration owns this CREATE TABLE
+    /// (see `20260517160627_consolidate_init_schema_tables.sql`). Slated
+    /// for removal in `harden-init-schema-tables-vs-migrations-pattern-finish`.
     pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -181,21 +183,14 @@ impl PreferenceStore {
         Ok(result)
     }
 
-    /// Read the per-step context-capture toggle. Defaults to `true` when
-    /// unset or on DB error so existing workspaces keep capturing.
-    pub async fn capture_context(pool: &PgPool) -> bool {
-        match Self::get(pool, PREF_CAPTURE_CONTEXT).await {
-            Ok(Some(v)) => v != "false",
-            Ok(None) => true,
-            Err(e) => {
-                log!(
-                    "[Preferences] Failed to read {}: {}",
-                    PREF_CAPTURE_CONTEXT,
-                    e
-                );
-                true
-            }
-        }
+    /// Read the per-step context-capture toggle. Returns `Ok(true)` when
+    /// unset so existing workspaces keep capturing; DB errors propagate as
+    /// `Err` so callers can surface a real failure instead of silently
+    /// defaulting to "on".
+    pub async fn capture_context(pool: &PgPool) -> Result<bool, sqlx::Error> {
+        Self::get(pool, PREF_CAPTURE_CONTEXT)
+            .await
+            .map(|opt| opt.map(|v| v != "false").unwrap_or(true))
     }
 
     /// Read the user's chat model + reasoning effort preferences for code
@@ -258,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn capture_context_defaults_to_true_when_unset() {
         let (pool, db_name) = setup_test_db().await;
-        assert!(PreferenceStore::capture_context(&pool).await);
+        assert!(PreferenceStore::capture_context(&pool).await.unwrap());
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -269,7 +264,7 @@ mod tests {
         PreferenceStore::set(&pool, PREF_CAPTURE_CONTEXT, "false")
             .await
             .unwrap();
-        assert!(!PreferenceStore::capture_context(&pool).await);
+        assert!(!PreferenceStore::capture_context(&pool).await.unwrap());
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -280,9 +275,37 @@ mod tests {
         PreferenceStore::set(&pool, PREF_CAPTURE_CONTEXT, "true")
             .await
             .unwrap();
-        assert!(PreferenceStore::capture_context(&pool).await);
+        assert!(PreferenceStore::capture_context(&pool).await.unwrap());
         pool.close().await;
         teardown_test_db(&db_name).await;
+    }
+
+    // Pins the row-absent-vs-error distinction in one place: splitting the
+    // two assertions across separate tests would let a regression that
+    // collapses both branches back into the same `Ok(true)` (the original
+    // bug) pass each test individually.
+    #[tokio::test]
+    async fn capture_context_distinguishes_error_from_unset() {
+        let (unset_pool, unset_db) = setup_test_db().await;
+        let unset_result = PreferenceStore::capture_context(&unset_pool).await;
+        unset_pool.close().await;
+        teardown_test_db(&unset_db).await;
+
+        let (err_pool, err_db) = setup_test_db().await;
+        err_pool.close().await;
+        let err_result = PreferenceStore::capture_context(&err_pool).await;
+        teardown_test_db(&err_db).await;
+
+        assert_eq!(
+            unset_result.ok(),
+            Some(true),
+            "row-absent must remain the safe `true` default",
+        );
+        assert!(
+            err_result.is_err(),
+            "DB error must propagate as Err so callers can render a failed state, got {:?}",
+            err_result,
+        );
     }
 
     #[tokio::test]

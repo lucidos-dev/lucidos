@@ -1,7 +1,8 @@
-use super::app_ui::rewrite_for_commit;
+use super::app_ui::{rewrite_for_commit, rewrite_for_thread_id};
 use super::*;
 
-use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::engine::event_bus::SystemEvent;
+use std::path::PathBuf;
 
 /// Query params for apps list
 #[derive(Debug, Deserialize)]
@@ -17,6 +18,71 @@ pub(super) struct AppQuery {
     pub id: String,
 }
 
+/// Query params for app-UI / app-file routes — accepts `commit` (historical
+/// version from git) and `thread_id` (WIP preview from an app coding-agent
+/// thread's worktree). When `thread_id` is set, the
+/// route serves the file from an app coding-agent thread's worktree instead
+/// of the live workspace copy. The thread must (a) be a coding-agent thread,
+/// (b) have `coding_agent_kind == 'app'`, and (c) own the same `app_id` we're
+/// serving — otherwise the route returns 404. Mutually exclusive with
+/// `commit` (commit is historical, thread_id is in-flight).
+#[derive(Debug, Deserialize)]
+pub(super) struct AppUiPreviewQuery {
+    pub commit: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+/// Resolve the worktree-relative root directory to serve from when an app-UI
+/// request carries `?thread_id=<id>`. Returns `Some(<wt>/data/apps/<id>/)` on
+/// successful match, `None` to 404 the request.
+async fn resolve_preview_root(
+    state: &AppState,
+    thread_id: &str,
+    expected_app_id: &str,
+) -> Option<PathBuf> {
+    let tid = uuid::Uuid::parse_str(thread_id).ok()?;
+    let row: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT coding_agent_kind, coding_agent_folder \
+         FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(tid)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()?;
+    let (kind, folder) = (row.0?, row.1?);
+    if kind != "app" {
+        return None;
+    }
+    // folder is `<workspace>/data/apps/<id>/` — make sure the app id matches
+    // what the caller is requesting; without this, a thread spawned for
+    // `momentum` could be used to preview `habit-tracker`'s URL.
+    let folder_path = std::path::Path::new(&folder);
+    let recorded_app_id = folder_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if recorded_app_id != expected_app_id {
+        return None;
+    }
+    // The `coding_agent_folder` column persists the LIVE workspace app
+    // folder path (`<ws>/data/apps/<id>/`), not the worktree-internal path
+    // — the matching cwd inside the worktree lives at
+    // `<worktree>/data/apps/<id>/`. Resolve the actual worktree via the
+    // engine's `resolve_thread_app_worktree` helper.
+    let wt = state
+        .engine
+        .resolve_thread_app_worktree(tid)
+        .await?;
+    // Sparse-checkout worktrees mirror the workspace layout, so the served
+    // root is `<wt>/data/apps/<id>/`.
+    let app_root = wt.join("data").join("apps").join(expected_app_id);
+    if !app_root.exists() {
+        return None;
+    }
+    Some(app_root)
+}
+
 /// Validate that an app ID is safe (no path traversal)
 fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
@@ -26,7 +92,7 @@ fn is_valid_id(id: &str) -> bool {
         && !id.starts_with('.')
 }
 
-/// GET /api/apps - List all apps
+/// GET /api/v1/apps - List all apps
 pub(super) async fn list_apps(
     State(state): State<AppState>,
     Query(query): Query<AppsQuery>,
@@ -50,7 +116,7 @@ pub(super) async fn list_apps(
     }
 }
 
-/// GET /api/app?id=... - Get app details
+/// GET /api/v1/app?id=... - Get app details
 pub(super) async fn get_app(
     State(state): State<AppState>,
     Query(query): Query<AppQuery>,
@@ -69,7 +135,7 @@ pub(super) async fn get_app(
     }
 }
 
-/// DELETE /api/app?id=... - Delete an app
+/// DELETE /api/v1/app?id=... - Delete an app
 pub(super) async fn delete_app(
     State(state): State<AppState>,
     Query(query): Query<AppQuery>,
@@ -79,20 +145,18 @@ pub(super) async fn delete_app(
         return (StatusCode::BAD_REQUEST, "Invalid app ID").into_response();
     }
 
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     match state.app_manager.delete_app(&query.id) {
         Ok(commit) => {
-            if let Err(e) = state
+            state
                 .engine
                 .event_bus
-                .emit(BusEvent::System(SystemEvent::AppDeleted {
-                    app_id: query.id.clone(),
-                    actor,
-                }))
-                .await
-            {
-                log!("[Apps] Failed to emit AppDeleted event: {}", e);
-            }
+                .emit_user_system(&headers, &state.pool, "[Apps] AppDeleted", |actor| {
+                    SystemEvent::AppDeleted {
+                        app_id: query.id.clone(),
+                        actor,
+                    }
+                })
+                .await;
             Json(serde_json::json!({ "commit": commit })).into_response()
         }
         Err(e) => (
@@ -103,7 +167,7 @@ pub(super) async fn delete_app(
     }
 }
 
-/// PUT /api/app?id=... - Update app metadata (name, description)
+/// PUT /api/v1/app?id=... - Update app metadata (name, description)
 pub(super) async fn update_app(
     State(state): State<AppState>,
     Query(query): Query<AppQuery>,
@@ -122,25 +186,22 @@ pub(super) async fn update_app(
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-
     match state
         .app_manager
         .update_app_metadata(&query.id, name, description)
     {
         Ok(commit) => {
-            if let Err(e) = state
+            state
                 .engine
                 .event_bus
-                .emit(BusEvent::System(SystemEvent::AppUpdated {
-                    app_id: query.id.clone(),
-                    name: Some(name.to_string()),
-                    actor,
-                }))
-                .await
-            {
-                log!("[Apps] Failed to emit AppUpdated event: {}", e);
-            }
+                .emit_user_system(&headers, &state.pool, "[Apps] AppUpdated", |actor| {
+                    SystemEvent::AppUpdated {
+                        app_id: query.id.clone(),
+                        name: Some(name.to_string()),
+                        actor,
+                    }
+                })
+                .await;
             Json(serde_json::json!({ "commit": commit })).into_response()
         }
         Err(e) => (
@@ -151,7 +212,7 @@ pub(super) async fn update_app(
     }
 }
 
-/// GET /api/app/:app_id/source - Read app source files
+/// GET /api/v1/app/:app_id/source - Read app source files
 pub(super) async fn read_app_source(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
@@ -176,7 +237,7 @@ pub(super) async fn read_app_source(
     }
 }
 
-/// PUT /api/app/:app_id/source - Write app source files
+/// PUT /api/v1/app/:app_id/source - Write app source files
 pub(super) async fn write_app_source(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
@@ -204,22 +265,19 @@ pub(super) async fn write_app_source(
         };
         files.push((name, content));
     }
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-
     match state.app_manager.write_app_source(&app_id, &files) {
         Ok(commit) => {
-            if let Err(e) = state
+            state
                 .engine
                 .event_bus
-                .emit(BusEvent::System(SystemEvent::AppUpdated {
-                    app_id: app_id.clone(),
-                    name: None,
-                    actor,
-                }))
-                .await
-            {
-                log!("[Apps] Failed to emit AppUpdated event: {}", e);
-            }
+                .emit_user_system(&headers, &state.pool, "[Apps] AppUpdated", |actor| {
+                    SystemEvent::AppUpdated {
+                        app_id: app_id.clone(),
+                        name: None,
+                        actor,
+                    }
+                })
+                .await;
             Json(serde_json::json!({ "commit": commit })).into_response()
         }
         Err(e) => (
@@ -240,13 +298,20 @@ pub(super) async fn write_app_source(
 pub(super) async fn serve_app_ui(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
-    Query(query): Query<AppCommitQuery>,
+    Query(query): Query<AppUiPreviewQuery>,
 ) -> Response {
     if !is_valid_id(&app_id) {
         return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
     }
 
     let commit = query.commit.as_deref();
+    if commit.is_some() && query.thread_id.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "`commit` (historical) and `thread_id` (WIP preview) are mutually exclusive",
+        )
+            .into_response();
+    }
 
     // If commit is specified, serve from git history
     if let Some(commit_hash) = commit {
@@ -267,21 +332,48 @@ pub(super) async fn serve_app_ui(
         };
     }
 
-    let ui_path = state.app_manager.get_app_path(&app_id);
+    // WIP-preview path: serve index.html from an app coding-agent thread's
+    // worktree. The user reaches this by clicking the preview button in the
+    // thread's prompt row; the panel-overlay iframe URL gains `?thread_id=...`.
+    let (ui_path, preview_thread_id) = if let Some(thread_id) = query.thread_id.as_deref() {
+        match resolve_preview_root(&state, thread_id, &app_id).await {
+            Some(root) => (root.join("index.html"), Some(thread_id.to_string())),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    "App preview unavailable for this thread (not an app coding-agent thread, app id mismatch, or worktree no longer exists).",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        (state.app_manager.get_app_path(&app_id), None)
+    };
 
     if !ui_path.exists() {
         return (StatusCode::NOT_FOUND, "App UI not found").into_response();
     }
 
     match std::fs::read_to_string(&ui_path) {
-        Ok(content) => (
-            [
-                (header::CONTENT_TYPE, "text/html"),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            content,
-        )
-            .into_response(),
+        Ok(content) => {
+            // Inject `?thread_id=<id>` into every relative src/href so the
+            // iframe's CSS/JS/static asset requests route back into the
+            // WIP-preview branch of `serve_app_file` instead of falling
+            // through to the live workspace copy — which would mix the WIP
+            // HTML with live CSS/JS and defeat the preview promise.
+            let html = match preview_thread_id.as_deref() {
+                Some(tid) => rewrite_for_thread_id(&content, tid),
+                None => content,
+            };
+            (
+                [
+                    (header::CONTENT_TYPE, "text/html"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                html,
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -290,7 +382,7 @@ pub(super) async fn serve_app_ui(
 pub(super) async fn serve_app_file(
     State(state): State<AppState>,
     Path((app_id, file_path)): Path<(String, String)>,
-    Query(query): Query<AppCommitQuery>,
+    Query(query): Query<AppUiPreviewQuery>,
 ) -> Response {
     if !is_valid_id(&app_id) {
         return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
@@ -298,6 +390,13 @@ pub(super) async fn serve_app_file(
 
     if is_path_traversal(&file_path) {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+    if query.commit.is_some() && query.thread_id.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "`commit` (historical) and `thread_id` (WIP preview) are mutually exclusive",
+        )
+            .into_response();
     }
 
     let ext = std::path::Path::new(&file_path)
@@ -322,11 +421,25 @@ pub(super) async fn serve_app_file(
         };
     }
 
-    let full_path = state
-        .workspace_path
-        .join("data/apps")
-        .join(&app_id)
-        .join(&file_path);
+    // WIP-preview: serve from the named thread's worktree.
+    let full_path = if let Some(thread_id) = query.thread_id.as_deref() {
+        match resolve_preview_root(&state, thread_id, &app_id).await {
+            Some(root) => root.join(&file_path),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    "App preview unavailable for this thread (not an app coding-agent thread, app id mismatch, or worktree no longer exists).",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        state
+            .workspace_path
+            .join("data/apps")
+            .join(&app_id)
+            .join(&file_path)
+    };
 
     match std::fs::read(&full_path) {
         Ok(content) => (
@@ -381,7 +494,7 @@ pub(super) async fn serve_app_artifact(
     }
 }
 
-/// GET /api/app/versions?id=...&limit=10&skip=0 - Get git history for app (paginated)
+/// GET /api/v1/app/versions?id=...&limit=10&skip=0 - Get git history for app (paginated)
 pub(super) async fn get_app_versions(
     State(state): State<AppState>,
     Query(query): Query<AppVersionsQuery>,
@@ -410,7 +523,7 @@ pub(super) async fn get_app_versions(
     }
 }
 
-/// POST /api/app/restore?id=...&commit=... - Restore app to a historical version
+/// POST /api/v1/app/restore?id=...&commit=... - Restore app to a historical version
 pub(super) async fn restore_app_version(
     State(state): State<AppState>,
     Query(query): Query<AppRestoreQuery>,
@@ -425,7 +538,6 @@ pub(super) async fn restore_app_version(
     if super::is_dangerous_git_ref(&commit_hash) {
         return (StatusCode::BAD_REQUEST, "Invalid commit hash").into_response();
     }
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     let git_tree_path = format!("data/apps/{}", app_id);
     let app_dir = state.workspace_path.join("data/apps").join(&app_id);
@@ -479,18 +591,17 @@ pub(super) async fn restore_app_version(
                 &format!("Restore app {} to version {}", app_id, short_hash),
             ) {
                 Ok(commit) => {
-                    if let Err(e) = state
+                    state
                         .engine
                         .event_bus
-                        .emit(BusEvent::System(SystemEvent::AppUpdated {
-                            app_id: app_id.clone(),
-                            name: None,
-                            actor,
-                        }))
-                        .await
-                    {
-                        log!("[Apps] Failed to emit AppUpdated event: {}", e);
-                    }
+                        .emit_user_system(&headers, &state.pool, "[Apps] AppUpdated", |actor| {
+                            SystemEvent::AppUpdated {
+                                app_id: app_id.clone(),
+                                name: None,
+                                actor,
+                            }
+                        })
+                        .await;
                     Json(serde_json::json!({ "commit": commit })).into_response()
                 }
                 Err(e) => (

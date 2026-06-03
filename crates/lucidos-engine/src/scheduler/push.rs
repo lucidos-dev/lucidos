@@ -6,6 +6,66 @@
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+#[cfg(feature = "e2e-test-hooks")]
+use super::push_test_log;
+
+use crate::api::presence_pong::PresencePong;
+use crate::api::SharedEngine;
+
+/// Spec §3 — engine waits this long for pongs before deciding push.
+///
+/// Sized for an iOS PWA reaching the engine over cellular or a Tailscale
+/// tunnel. Two RTT bands appear in real traces:
+///
+/// - **Steady-state cellular / Tailscale relay**: 400–800 ms round-trip
+///   for the SSE-out + pong-POST cycle.
+/// - **First-packet-after-radio-idle on Tailscale**: 1100–1800 ms.
+///   Tailscale's userspace WireGuard has to renegotiate the path when the
+///   phone radio resumes from idle, and the first packet through pays
+///   that handshake cost. This band is the one that breaks "engine waits
+///   then sends the OS push on top of the in-app toast" — the page renders
+///   the toast synchronously on PresenceCheck receipt, but its pong
+///   round-trips slower than the engine's deadline.
+///
+/// The previous value of 1000 ms covered the steady state but timed out
+/// inside the wake-from-idle band. 2000 ms leaves ~200–400 ms headroom
+/// over the observed worst-case wake RTT, so even a slow first-packet
+/// pong lands before the deadline fires.
+///
+/// The wait only blocks fan-out when a candidate fails to pong; the
+/// `notify_one` short-circuit in [`run_presence_check`] wakes immediately
+/// once every expected device has answered, so increasing this only costs
+/// latency when a `device_presence` row is stale (page killed without
+/// firing `DeviceHidden`).
+pub const DEADLINE_MS: u32 = 2000;
+
+/// Spec §2 Step A — push_allowed iff no pong reports active.
+pub fn decide_push_allowed(pongs: &[PresencePong]) -> bool {
+    !pongs.iter().any(|p| p.is_active)
+}
+
+/// Spec §2 Step A / §3 — how many pongs the engine should wait for, and
+/// (via `> 0`) whether to run the PresenceCheck at all.
+///
+/// `sse_connections` is the live count of open `GET /api/v1/events` streams —
+/// the ground truth for "a page is connected and will pong". `candidate_count`
+/// is the number of fresh `device_presence` heartbeat rows. We take the max:
+///
+/// - The SSE count is the robust signal. iOS suspends the 30s heartbeat while
+///   a PWA is foregrounded, so a genuinely-active page's `device_presence` row
+///   ages past the 120s window even though its EventSource is still open and
+///   would pong `is_active`. Gating only on heartbeat freshness then skipped
+///   the PresenceCheck and fired an OS push on top of the active page.
+/// - The candidate count covers the inverse failure: a page that heartbeated
+///   within the last 120s but whose SSE connection just dropped (network blip).
+///   Counting it keeps the deadline short-circuit waiting for its pong too.
+///
+/// `0` means nobody is reachable (no open stream, no fresh heartbeat) → skip
+/// the protocol and send the push directly (the "phone in your pocket" case).
+fn expected_pong_count(sse_connections: usize, candidate_count: usize) -> usize {
+    sse_connections.max(candidate_count)
+}
+
 /// A browser push subscription (endpoint + encryption keys)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushSubscription {
@@ -28,7 +88,9 @@ pub struct VapidKeys {
 pub struct PushSubscriptionStore;
 
 impl PushSubscriptionStore {
-    /// Create the push_subscriptions table if it doesn't exist
+    /// Defensive double-write — the migration owns this CREATE TABLE
+    /// (see `20260517160627_consolidate_init_schema_tables.sql`). Slated
+    /// for removal in `harden-init-schema-tables-vs-migrations-pattern-finish`.
     pub async fn init_schema(
         pool: &PgPool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -86,16 +148,59 @@ impl PushSubscriptionStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Get push subscriptions filtered by device push_enabled setting
+    /// Get push subscriptions filtered by device push_enabled setting. Each
+    /// subscription is paired with the owning device's `user_agent` so the
+    /// caller can gate engine-side scheduled wake-pushes (Layer 3 in
+    /// `system-knowhow/notifications.md` §4.5) on `is_mac_chromium`. Legacy
+    /// rows without a `device_id` and devices with no recorded UA both come
+    /// back as `None` on the second tuple element.
     pub async fn get_push_enabled(
         pool: &PgPool,
+    ) -> Result<Vec<(PushSubscription, Option<String>)>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let rows =
+            sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>)>(
+                "SELECT ps.endpoint, ps.p256dh, ps.auth, ps.device_id, d.user_agent
+                 FROM push_subscriptions ps
+                 LEFT JOIN devices d ON ps.device_id = d.id
+                 WHERE ps.device_id IS NULL OR d.push_enabled = true",
+            )
+            .fetch_all(pool)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(endpoint, p256dh, auth, device_id, user_agent)| {
+                (
+                    PushSubscription {
+                        endpoint,
+                        p256dh,
+                        auth,
+                        device_id,
+                    },
+                    user_agent,
+                )
+            })
+            .collect())
+    }
+
+    /// Get push subscriptions for a single device. Used by the wake-push path
+    /// (`send_wake_push_to_device`, called from `schedule_mac_chromium_wakes`)
+    /// — the engine fans out a follow-up push to one device only so other
+    /// devices don't receive a duplicate notification just to unjam one SW.
+    /// Returns empty when the device has push disabled OR has no subscription.
+    pub async fn get_push_enabled_for_device(
+        pool: &PgPool,
+        device_id: &str,
     ) -> Result<Vec<PushSubscription>, Box<dyn std::error::Error + Send + Sync>> {
         let rows = sqlx::query_as::<_, (String, String, String, Option<String>)>(
             "SELECT ps.endpoint, ps.p256dh, ps.auth, ps.device_id
              FROM push_subscriptions ps
              LEFT JOIN devices d ON ps.device_id = d.id
-             WHERE ps.device_id IS NULL OR d.push_enabled = true",
+             WHERE ps.device_id = $1
+               AND (d.push_enabled IS NULL OR d.push_enabled = true)",
         )
+        .bind(device_id)
         .fetch_all(pool)
         .await?;
 
@@ -158,125 +263,712 @@ pub async fn get_or_create_vapid_keys(
 /// Non-fatal: logs errors but doesn't fail.
 /// If `notification_id` is provided, clicking the notification deep-links to it.
 pub async fn send_push_to_all(
-    pool: &PgPool,
+    engine: &SharedEngine,
     title: &str,
     body: &str,
     notification_id: Option<uuid::Uuid>,
 ) {
-    send_push_to_all_with_app(pool, title, body, notification_id, None, None).await;
+    send_push_to_all_with_app(
+        engine,
+        title,
+        body,
+        notification_id,
+        None,
+        None,
+        None,
+        crate::scheduler::notifications::Tap::Modal,
+    )
+    .await;
 }
 
-/// Like `send_push_to_all` but includes an `app_id` in the push payload for deep linking.
-///
-/// `link_thread_id` serves two roles when set:
-/// - **Suppress**: devices currently focused on that thread (according to the
-///   `thread_presence` projection) are excluded — the user is already looking
-///   at the relevant conversation.
-/// - **Deep link**: the value is included in the push payload as `thread_id`
-///   so the service worker can navigate the recipient straight to the thread
-///   when they tap the notification.
+/// Fan out an OS push notification per the §2 matrix in
+/// `system-knowhow/notifications.md`. Sends iff Step A's `push_allowed`
+/// is true; the PresenceCheck pong protocol (§3) is the authoritative
+/// decision input. Non-fatal: every DB / SSE / web-push failure is logged
+/// and execution continues so a single bad subscription doesn't sink the
+/// fan-out.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_push_to_all_with_app(
-    pool: &PgPool,
+    engine: &SharedEngine,
     title: &str,
     body: &str,
     notification_id: Option<uuid::Uuid>,
     app_id: Option<&str>,
     link_thread_id: Option<uuid::Uuid>,
+    link_event_id: Option<uuid::Uuid>,
+    tap: crate::scheduler::notifications::Tap,
 ) {
-    // Run the subscription fetch and (if applicable) presence query in
-    // parallel — they hit independent tables and we always need both before
-    // we can send.
-    let (subs_result, focused_result) = match link_thread_id {
-        Some(thread_id) => {
-            let (subs, focused) = tokio::join!(
-                PushSubscriptionStore::get_push_enabled(pool),
-                crate::core::ThreadPresenceStore::devices_focused_on(pool, thread_id),
-            );
-            (subs, Some(focused))
-        }
-        None => (PushSubscriptionStore::get_push_enabled(pool).await, None),
-    };
-
-    let subscriptions = match subs_result {
+    let pool = engine.pool();
+    // Subs first — short-circuits the no-push-permission case before
+    // bothering the PresenceCheck protocol.
+    let subs_with_ua = match PushSubscriptionStore::get_push_enabled(pool).await {
         Ok(subs) => subs,
         Err(e) => {
             log!("[Push] Failed to fetch subscriptions: {}", e);
             return;
         }
     };
-
-    if subscriptions.is_empty() {
+    if subs_with_ua.is_empty() {
         return;
     }
+    // Pick wake targets before the move below consumes the paired list.
+    let wake_targets = pick_mac_chromium_wake_targets(&subs_with_ua);
+    let subscriptions: Vec<PushSubscription> =
+        subs_with_ua.into_iter().map(|(sub, _)| sub).collect();
 
-    // Filter out subscriptions whose device is currently viewing the thread.
-    let subscriptions = match (link_thread_id, focused_result) {
-        (Some(thread_id), Some(Ok(focused))) => {
-            let before = subscriptions.len();
-            let filtered = filter_subscriptions_by_presence(subscriptions, &focused);
-            if filtered.len() != before {
-                log!(
-                    "[Push] Suppressed push to {} device(s) viewing thread {}",
-                    before - filtered.len(),
-                    thread_id
-                );
-            }
-            filtered
+    let candidates = match crate::core::DevicePresenceStore::candidates(pool).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Spec §3 failure handling: if we can't see candidates, the
+            // safer side is to send the push.
+            log!(
+                "[Push] Failed to query device_presence candidates (sending push anyway): {}",
+                e
+            );
+            Vec::new()
         }
-        (_, Some(Err(e))) => {
-            log!("[Push] Failed to query thread_presence (sending to all): {}", e);
-            subscriptions
-        }
-        _ => subscriptions,
     };
 
-    if subscriptions.is_empty() {
+    // §2 Step A / §3 — how many pongs to wait for, and (via `> 0`) whether to
+    // run the PresenceCheck at all. The robust signal is the live
+    // SSE-connection count: a page connected via SSE will pong even when its
+    // device_presence heartbeat has gone stale, which iOS does whenever it
+    // suspends the 30s timer on a foregrounded PWA. Gating only on heartbeat
+    // freshness skipped the check and fired an OS push on top of the active
+    // page. device_presence candidates cover the inverse failure mode (a
+    // freshly-heartbeated page whose SSE just dropped), so we take the max.
+    let sse_connections = engine.sse_connections.count();
+    let expected_pongs = expected_pong_count(sse_connections, candidates.len());
+
+    let push_allowed = if expected_pongs == 0 {
+        // Nobody connected and no fresh heartbeat → nobody to pong → push
+        // immediately (the common "phone in your pocket" case).
+        true
+    } else if let Some(nid) = notification_id {
+        run_presence_check(
+            &engine.event_bus,
+            &engine.presence_tracker,
+            nid,
+            link_event_id,
+            expected_pongs,
+        )
+        .await
+    } else {
+        // No notification_id to scope the pong by — can't run the
+        // protocol, so send the push (legacy callers).
+        true
+    };
+
+    if !push_allowed {
+        // An active device pong'd in → the OS push is suppressed (§2 Step A).
+        // Tell active pages to render the in-app toast INSTEAD (§4). This is
+        // the only place the toast is triggered, and it is mutually exclusive
+        // with the push fan-out below by construction: the toast event and the
+        // push live on opposite branches of this `if`, so a device can never
+        // receive both for the same notification. `notification_id` is always
+        // Some here — `push_allowed` only goes false through the
+        // `run_presence_check` arm above, which requires it.
+        if let Some(nid) = notification_id {
+            emit_toast_requested(
+                &engine.event_bus,
+                nid,
+                title,
+                body,
+                link_thread_id,
+                link_event_id,
+                app_id,
+                tap,
+            )
+            .await;
+        }
+        log!(
+            "[Push] Suppressed OS push (PresenceCheck: an active device pinged in); \
+             requested in-app toast instead"
+        );
         return;
     }
 
+    let payload_bytes = build_push_payload(
+        title,
+        body,
+        notification_id,
+        app_id,
+        link_thread_id,
+        link_event_id,
+        &tap,
+    )
+    .to_string();
+
+    fan_out_payload(pool, subscriptions, payload_bytes, "notification", notification_id).await;
+
+    // Layer 3 of the macOS-Chromium wedge mitigation (see
+    // `system-knowhow/notifications.md` §4.5). For every macOS-Chromium
+    // device that just got the real push, schedule a wake-push to land
+    // `MAC_CHROMIUM_WAKE_DELAY` later. The wake's only job is to be a
+    // second push event arriving at the SW — that drains any queued
+    // `notificationclick` (Chromium #370536109) regardless of whether
+    // the user has returned to the Lucidos tab. This is the sole
+    // recovery mechanism for the partial wedge today; if it misses, the
+    // next genuine push to the device is what eventually drains the
+    // queue.
+    //
+    // Gated on `notification_id` because `send_wake_push_to_device`
+    // loads the persisted notification to build the wake payload — a
+    // wake without an id has nothing to mirror. Empty `wake_targets`
+    // is a no-op inside `schedule_mac_chromium_wakes`.
+    if let Some(nid) = notification_id {
+        schedule_mac_chromium_wakes(
+            engine.clone(),
+            wake_targets,
+            nid,
+            MAC_CHROMIUM_WAKE_DELAY,
+        );
+    }
+}
+
+/// Delay between the original push and the engine-side follow-up wake-push
+/// for macOS-Chromium devices (Layer 3 in
+/// `system-knowhow/notifications.md` §4.5). Three seconds is short enough
+/// that a click queued in the wedged SW drains before the user gives up on
+/// the dead tap, and long enough that Chrome doesn't coalesce the two
+/// pushes as a single event (which would defeat the point — the wake needs
+/// to be a separate push dispatch to resurrect the SW worker).
+const MAC_CHROMIUM_WAKE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Spawn one delayed wake-push per device_id in `device_ids`. Fire-and-
+/// forget: each spawned task sleeps `delay`, then calls
+/// `send_wake_push_to_device` and logs the outcome. Failures are logged
+/// only — the wake is best-effort and the original push already landed,
+/// so a dropped wake leaves the user in the pre-Layer-3 state where the
+/// next genuine push to the device eventually drains the queued click.
+///
+/// Survives engine shutdown probabilistically, not by design. The spawned
+/// task holds an `Arc<LucidosEngine>` that keeps the engine struct alive,
+/// but `tokio::spawn` returns a `JoinHandle` we drop — on tokio-runtime
+/// drop, the task is aborted at its next `await` regardless of strong-
+/// count. In practice the wake usually completes because graceful
+/// shutdown (`graceful_shutdown(10s)` in `main.rs`) outlasts the 3 s
+/// sleep, but a notification fired in the final ~3 s of a restart will
+/// see its wake aborted — the next genuine push is what drains then.
+fn schedule_mac_chromium_wakes(
+    engine: SharedEngine,
+    device_ids: Vec<String>,
+    notification_id: uuid::Uuid,
+    delay: std::time::Duration,
+) {
+    for device_id in device_ids {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            match send_wake_push_to_device(&engine, &device_id, notification_id).await {
+                Ok(0) => log!(
+                    "[Push] Layer-3 wake-push for {} on {}: no subscription \
+                     (device unsubscribed during the delay window)",
+                    notification_id,
+                    device_id
+                ),
+                Ok(n) => log!(
+                    "[Push] Layer-3 wake-push for {} delivered to {} sub(s) on {}",
+                    notification_id,
+                    n,
+                    device_id
+                ),
+                Err(e) => log!(
+                    "[Push] Layer-3 wake-push for {} on {} failed: {}",
+                    notification_id,
+                    device_id,
+                    e
+                ),
+            }
+        });
+    }
+}
+
+/// Broadcast a PresenceCheck and wait up to `DEADLINE_MS` for every
+/// candidate device to pong. Returns the `push_allowed` decision per §2
+/// Step A — true iff no pong reports `is_active`. Drains the tracker
+/// slot whether or not all pongs arrived.
+///
+/// The PresenceCheck carries no toast content — the in-app toast is now
+/// triggered by [`emit_toast_requested`] AFTER this decision resolves, so
+/// the toast and the OS push can never both fire (see notifications.md
+/// §3-§4). `event_id` rides along only so the pong can report
+/// `event_in_viewport`.
+async fn run_presence_check(
+    event_bus: &crate::engine::event_bus::EventBus,
+    presence_tracker: &crate::api::presence_pong::PresenceTracker,
+    notification_id: uuid::Uuid,
+    event_id: Option<uuid::Uuid>,
+    expected_pongs: usize,
+) -> bool {
+    let sent_at_ms = crate::engine::now_epoch_millis();
+    let notify = presence_tracker.expect(notification_id, expected_pongs);
+    if let Err(e) = event_bus
+        .emit(crate::engine::event_bus::BusEvent::System(
+            crate::engine::event_bus::SystemEvent::PresenceCheck {
+                notification_id,
+                event_id,
+                deadline_ms: DEADLINE_MS,
+                sent_at_ms,
+                actor: None,
+            },
+        ))
+        .await
+    {
+        // SSE broadcast failed — without pages knowing to pong we can't
+        // make an informed decision. Drain the slot and send the push
+        // (safer side, same as the candidates-query error branch).
+        log!("[Push] Failed to broadcast PresenceCheck: {}", e);
+        let _ = presence_tracker.collect(notification_id);
+        return true;
+    }
+
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(DEADLINE_MS as u64),
+        notify.notified(),
+    )
+    .await;
+
+    let pongs = presence_tracker.collect(notification_id);
+    decide_push_allowed(&pongs)
+}
+
+/// Broadcast a [`SystemEvent::NotificationToastRequested`] so active pages
+/// render the in-app toast for a notification whose OS push was suppressed
+/// (§2 Step A found an active device). Broadcast SSE — hidden pages ignore
+/// it via the §4 row matrix, active pages render the toast (or auto-read on
+/// Row 1). Non-fatal: a failed emit is logged; the worst case is the user
+/// sees the bell badge bump (driven by `NotificationCreated`) without the
+/// transient toast. See `system-knowhow/notifications.md` §4.
+#[allow(clippy::too_many_arguments)]
+async fn emit_toast_requested(
+    event_bus: &crate::engine::event_bus::EventBus,
+    notification_id: uuid::Uuid,
+    title: &str,
+    body: &str,
+    thread_id: Option<uuid::Uuid>,
+    event_id: Option<uuid::Uuid>,
+    app_id: Option<&str>,
+    tap: crate::scheduler::notifications::Tap,
+) {
+    let sent_at_ms = crate::engine::now_epoch_millis();
+    if let Err(e) = event_bus
+        .emit(crate::engine::event_bus::BusEvent::System(
+            crate::engine::event_bus::SystemEvent::NotificationToastRequested {
+                notification_id,
+                title: title.to_string(),
+                body: body.to_string(),
+                thread_id,
+                event_id,
+                app_id: app_id.map(|s| s.to_string()),
+                tap,
+                sent_at_ms,
+            },
+        ))
+        .await
+    {
+        log!(
+            "[Push] Failed to broadcast NotificationToastRequested for {}: {}",
+            notification_id,
+            e
+        );
+    }
+}
+
+/// Decides whether a device with the given `user_agent` is affected by
+/// Chromium #370536109 — the macOS-Chromium dispatcher bug where
+/// `notificationclick` is silently queued until a new push event drains
+/// the SW. Used to gate the engine-side scheduled follow-up wake-push
+/// (Layer 3 in `system-knowhow/notifications.md` §4.5) so Safari / iOS /
+/// non-macOS Chromium / Firefox don't pay an extra push per notification.
+///
+/// `user_agent` is captured at `POST /api/v1/devices/register` time (see
+/// `api/settings.rs::register_device` → `DeviceStore::register`) and stored
+/// on the `devices` row, so the engine can decide purely from database
+/// state — no per-push round trip to the page.
+fn is_mac_chromium(user_agent: &str) -> bool {
+    user_agent.contains("Macintosh")
+        && user_agent.contains("Chrome/")
+        && !user_agent.contains("iPhone")
+        && !user_agent.contains("iPad")
+        && !user_agent.contains("iPod")
+}
+
+/// Pure: from the just-pushed subscriptions paired with each device's
+/// `user_agent`, return the deduplicated device_ids that should receive a
+/// follow-up wake-push. Used by the engine-side scheduling layer to decide
+/// which devices need the Layer 3 wake (see `is_mac_chromium` above for the
+/// gate and `system-knowhow/notifications.md` §4.5 for the full mitigation
+/// stack).
+///
+/// Dedup matters: two browser tabs on the same device produce two
+/// subscriptions sharing the same `device_id`. `send_wake_push_to_device`
+/// already fans out to every subscription on that device, so spawning two
+/// delayed wake tasks would deliver the wake-push twice per SW. Once is
+/// enough to drain the queued `notificationclick`.
+///
+/// Subscriptions with `device_id = None` (legacy rows) and devices with no
+/// recorded `user_agent` are conservatively skipped — both signal "we can't
+/// confidently target this device". The wake is the only recovery mechanism
+/// today, so a skipped device falls back to "next genuine push drains the
+/// queue" — same as a wake-task aborted at engine shutdown.
+fn pick_mac_chromium_wake_targets(
+    subs_with_ua: &[(PushSubscription, Option<String>)],
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (sub, ua) in subs_with_ua {
+        let Some(ua) = ua.as_deref() else { continue };
+        if !is_mac_chromium(ua) {
+            continue;
+        }
+        let Some(device_id) = sub.device_id.as_deref() else {
+            continue;
+        };
+        if seen.insert(device_id.to_string()) {
+            out.push(device_id.to_string());
+        }
+    }
+    out
+}
+
+/// Send a wake-push to a single device — the workaround for Chromium
+/// #370536109 (`notificationclick` silently queued on macOS-Chrome). Looks up
+/// the notification by id, builds a `wake: true` payload carrying the SAME
+/// content (so Chrome counts the push as visible, see §4.5), filters
+/// subscriptions to the requesting device, and fans out. Returns the number
+/// of subscriptions actually delivered to.
+///
+/// Per web.dev `push-notifications-common-issues`, sending a push is the
+/// canonical mechanism to wake an inactive SW — any push event resurrects
+/// the worker thread and drains queued `notificationclick` events as a side
+/// effect. The trigger is `schedule_mac_chromium_wakes` further down in this
+/// file: every real push to a macOS-Chrome subscription spawns a delayed
+/// `send_wake_push_to_device` MAC_CHROMIUM_WAKE_DELAY later so the queued
+/// click drains without the user having to come back to the tab.
+pub(crate) async fn send_wake_push_to_device(
+    engine: &crate::engine::LucidosEngine,
+    device_id: &str,
+    notification_id: uuid::Uuid,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let pool = engine.pool();
+    let notification =
+        match crate::scheduler::NotificationStore::get_by_id(pool, notification_id).await? {
+            Some(n) => n,
+            None => return Ok(0),
+        };
+
+    let subscriptions =
+        PushSubscriptionStore::get_push_enabled_for_device(pool, device_id).await?;
+    if subscriptions.is_empty() {
+        return Ok(0);
+    }
+
+    let payload_bytes = build_wake_payload(&notification).to_string();
+    Ok(fan_out_payload(
+        pool,
+        subscriptions,
+        payload_bytes,
+        "wake",
+        Some(notification_id),
+    )
+    .await)
+}
+
+/// Default notification tag — used when `notification_id` is absent so the
+/// browser still deduplicates repeat pushes for the same logical channel.
+/// Mirrors `DEFAULT_NOTIFICATION_TAG` in `sw.js`.
+const DEFAULT_NOTIFICATION_TAG: &str = "lucidos-notification";
+
+/// Top-level magic that opts the payload into Declarative Web Push parsing
+/// (RFC 8030 homage). Required by Safari 18.5+ to handle the notification
+/// declaratively without running the SW push handler. See
+/// `system-knowhow/notifications.md` §4.5.
+const DECLARATIVE_WEB_PUSH_MAGIC: i64 = 8030;
+
+/// Build the `key=value&…` deep-link param string shared by both navigate URL
+/// forms (see [`navigate_url_ios`] / [`navigate_url_sw`]). Empty when there's
+/// nothing to deep-link, so the callers can fall back to a bare `/`.
+///
+/// The Push API base URL for resolving a declarative `navigate` is the push
+/// subscription's scope, so the callers emit a leading-slash relative URL that
+/// resolves to the PWA origin without the engine knowing its own hostname
+/// (Tailscale, localhost, public domain).
+///
+/// The `tap` JSON is only emitted for non-modal kinds — modal-kind URLs stay
+/// short, and the page safely demotes a missing `tap` param to the modal
+/// default.
+fn build_navigate_params(
+    notification_id: Option<uuid::Uuid>,
+    link_thread_id: Option<uuid::Uuid>,
+    link_event_id: Option<uuid::Uuid>,
+    tap: &crate::scheduler::notifications::Tap,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(id) = notification_id {
+        parts.push(format!(
+            "notification={}",
+            urlencoding::encode(&id.to_string())
+        ));
+    }
+    if let Some(tid) = link_thread_id {
+        parts.push(format!("thread={}", urlencoding::encode(&tid.to_string())));
+    }
+    if let Some(eid) = link_event_id {
+        parts.push(format!("event={}", urlencoding::encode(&eid.to_string())));
+    }
+    if !matches!(tap, crate::scheduler::notifications::Tap::Modal) {
+        let tap_json = serde_json::to_string(tap).expect("Tap serializes infallibly");
+        parts.push(format!("tap={}", urlencoding::encode(&tap_json)));
+    }
+    parts.join("&")
+}
+
+/// iOS Safari declarative-push navigate URL — a **cross-document** (query
+/// string) URL.
+///
+/// Safari handles a declarative push in the parent process and reuses the
+/// already-open PWA window on tap. A same-document (hash-only) navigation is
+/// NOT applied to that open window — WebKit just focuses it, the URL never
+/// changes, and the page-side hash router finds nothing to route (the "tap
+/// nav to thread only focuses the app" bug). A query string changes the
+/// document, so iOS performs a real navigation the page picks up on load /
+/// resume via `parseDeepLinkFromUrl` (which reads query params). See
+/// `system-knowhow/notifications.md` §4.5.
+fn navigate_url_ios(params: &str) -> String {
+    if params.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/?{params}")
+    }
+}
+
+/// Chrome service-worker navigate URL — a **hash** URL, read off
+/// `notification.data.navigate` by the `notificationclick` handler and passed
+/// to `client.navigate()`. A hash-only change keeps a warm Chrome tap
+/// reload-free (same-document navigation, routed by the page's `hashchange`
+/// listener). The wedge/declarative concerns that force iOS to use a query
+/// URL don't apply here — Chrome's SW drives the navigation itself.
+fn navigate_url_sw(params: &str) -> String {
+    if params.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/#{params}")
+    }
+}
+
+/// Build a `wake: true` push payload from a stored notification. Mirrors
+/// `build_push_payload` field-for-field so the SW path is symmetric — the
+/// only wire difference is the added top-level `wake: true` flag (sibling to
+/// `web_push` / `notification`, NOT inside the notification object) so Safari
+/// ignores it while the SW reads it to gate `renotify` / `silent`. Safari
+/// never sees wake pushes (filtered by `is_mac_chromium`); the flag is
+/// purely for Chrome's SW.
+fn build_wake_payload(
+    notification: &crate::scheduler::notifications::Notification,
+) -> serde_json::Value {
+    let mut payload = build_push_payload(
+        &notification.title,
+        &notification.message,
+        Some(notification.id),
+        notification.app_id.as_deref(),
+        notification.thread_id,
+        notification.event_id,
+        &notification.tap,
+    );
+    payload["wake"] = serde_json::Value::Bool(true);
+    payload
+}
+
+/// Build the JSON payload delivered to the push transport.
+///
+/// Wire shape is the Declarative Web Push envelope (W3C Push API
+/// "Declarative Web Push", merged Aug 2025; WebKit blog
+/// `meet-declarative-web-push`):
+///
+/// ```json
+/// {
+///   "web_push": 8030,
+///   "notification": {
+///     "title": "...",
+///     "body": "...",
+///     "navigate": "/?notification=...&thread=...&event=...&tap=...",
+///     "tag": "<notification_id or lucidos-notification>",
+///     "data": {
+///       "notification_id": "...",
+///       "thread_id": "...",
+///       "event_id": "...",
+///       "app_id": "...",
+///       "tap": { "kind": "modal" | "none" | "navigate", ... },
+///       "navigate": "/#notification=...  (HASH form, for the Chrome SW notificationclick path)"
+///     }
+///   }
+/// }
+/// ```
+///
+/// **Two navigate URL forms, same params.** `notification.navigate` (consumed
+/// by iOS Safari) is a **query** URL; `notification.data.navigate` (consumed by
+/// the Chrome SW) is a **hash** URL. They carry identical deep-link params and
+/// differ only in the `?` vs `#` prefix — see [`navigate_url_ios`] /
+/// [`navigate_url_sw`] for why.
+///
+/// **iOS Safari 18.5+** sees the `web_push: 8030` magic and handles the
+/// notification declaratively — `showNotification` / `notificationclick` are
+/// bypassed entirely. On tap the OS navigates the existing top-level
+/// traversable to `notification.navigate` (resolved against the subscription's
+/// scope, hence the relative URL). It MUST be a cross-document (query) URL: a
+/// same-document (hash-only) navigation is not applied to an already-open PWA
+/// window — WebKit just focuses it — so a hash URL silently no-ops the deep
+/// link. The page's `handleHashLocation` → `dispatchDeepLink` chain reads the
+/// query params on load/resume and marks-read + routes.
+///
+/// **Chrome / Firefox** don't recognize the magic, so the SW `push` handler
+/// fires as usual, reads `data.notification.*` to populate `showNotification`,
+/// and the existing `notificationclick` path runs on tap — routing off the
+/// hash `data.navigate` via `client.navigate()` (warm = no reload).
+///
+/// `tap` is ALWAYS encoded as part of the `data` block — the page's tap
+/// dispatcher routes on `tap.kind` (`modal` opens the inbox, `none` is
+/// passive, `navigate` deep-links). Modal-kind taps are omitted from the
+/// `navigate` URL params to keep them short (the page demotes missing `tap` to
+/// modal).
+#[allow(clippy::too_many_arguments)]
+fn build_push_payload(
+    title: &str,
+    body: &str,
+    notification_id: Option<uuid::Uuid>,
+    app_id: Option<&str>,
+    link_thread_id: Option<uuid::Uuid>,
+    link_event_id: Option<uuid::Uuid>,
+    tap: &crate::scheduler::notifications::Tap,
+) -> serde_json::Value {
+    let params = build_navigate_params(notification_id, link_thread_id, link_event_id, tap);
+    let navigate_ios = navigate_url_ios(&params);
+    let navigate_sw = navigate_url_sw(&params);
+    let tag = notification_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| DEFAULT_NOTIFICATION_TAG.to_string());
+
+    let mut data = serde_json::Map::new();
+    if let Some(id) = notification_id {
+        data.insert(
+            "notification_id".into(),
+            serde_json::Value::String(id.to_string()),
+        );
+    }
+    if let Some(aid) = app_id {
+        data.insert("app_id".into(), serde_json::Value::String(aid.to_string()));
+    }
+    if let Some(tid) = link_thread_id {
+        data.insert(
+            "thread_id".into(),
+            serde_json::Value::String(tid.to_string()),
+        );
+    }
+    if let Some(eid) = link_event_id {
+        data.insert(
+            "event_id".into(),
+            serde_json::Value::String(eid.to_string()),
+        );
+    }
+    data.insert(
+        "tap".into(),
+        serde_json::to_value(tap).expect("Tap serializes infallibly"),
+    );
+    // HASH form inside `data` so the Chrome SW `notificationclick` handler can
+    // read the engine-built URL straight off `event.notification.data` (and
+    // `client.navigate()` it warm-no-reload) instead of rebuilding it.
+    data.insert(
+        "navigate".into(),
+        serde_json::Value::String(navigate_sw),
+    );
+
+    serde_json::json!({
+        "web_push": DECLARATIVE_WEB_PUSH_MAGIC,
+        "notification": {
+            "title": title,
+            "body": body,
+            // QUERY form — iOS Safari's declarative-push parent-process
+            // navigation needs a cross-document URL to navigate an open window.
+            "navigate": navigate_ios,
+            "tag": tag,
+            "data": serde_json::Value::Object(data),
+        },
+    })
+}
+
+/// Dispatch the per-subscription send loop. `kind` appears in log lines for
+/// grepping. Non-fatal — per-subscription failures are logged and the loop
+/// continues. Under `e2e-test-hooks` the network send is replaced with a
+/// write to `push_log` so browser e2e tests can assert delivery without
+/// waiting on APNs/FCM.
+async fn fan_out_payload(
+    pool: &PgPool,
+    subscriptions: Vec<PushSubscription>,
+    payload_bytes: String,
+    kind: &str,
+    notification_id: Option<uuid::Uuid>,
+) -> usize {
+    #[cfg(feature = "e2e-test-hooks")]
+    {
+        fan_out_to_push_log(pool, subscriptions, &payload_bytes, kind, notification_id).await
+    }
+    #[cfg(not(feature = "e2e-test-hooks"))]
+    {
+        let _ = notification_id;
+        fan_out_to_web_push(pool, subscriptions, payload_bytes, kind).await
+    }
+}
+
+#[cfg(not(feature = "e2e-test-hooks"))]
+async fn fan_out_to_web_push(
+    pool: &PgPool,
+    subscriptions: Vec<PushSubscription>,
+    payload_bytes: String,
+    kind: &str,
+) -> usize {
     let keys = match get_or_create_vapid_keys(pool).await {
         Ok(k) => k,
         Err(e) => {
-            log!("[Push] Failed to get VAPID keys: {}", e);
-            return;
+            log!("[Push] Failed to get VAPID keys for {}: {}", kind, e);
+            return 0;
         }
     };
-
-    let payload_bytes =
-        build_push_payload(title, body, notification_id, app_id, link_thread_id).to_string();
 
     let client = match web_push::IsahcWebPushClient::new() {
         Ok(c) => c,
         Err(e) => {
-            log!("[Push] Failed to create push client: {}", e);
-            return;
+            log!("[Push] Failed to create push client for {}: {}", kind, e);
+            return 0;
         }
     };
 
-    let mut stale_endpoints = Vec::new();
+    let mut stale_endpoints: Vec<String> = Vec::new();
+    let mut delivered = 0usize;
 
     for sub in &subscriptions {
+        let endpoint_label = &sub.endpoint[..sub.endpoint.floor_char_boundary(60)];
         let sub_info = web_push::SubscriptionInfo::new(&sub.endpoint, &sub.p256dh, &sub.auth);
 
-        // Build VAPID signature from PEM
         let sig = match web_push::VapidSignatureBuilder::from_pem(
             keys.private_key_pem.as_bytes(),
             &sub_info,
         ) {
             Ok(mut builder) => {
-                // VAPID `sub` claim is required by FCM (Chrome) and Apple push services.
-                // Must be a valid mailto: or https: URL — Apple rejects localhost.
+                // VAPID `sub` claim is required by FCM (Chrome) and Apple push
+                // services. Must be a valid mailto: or https: URL — Apple
+                // rejects localhost.
                 builder.add_claim("sub", "mailto:push@lucidos.app");
                 match builder.build() {
                     Ok(sig) => sig,
                     Err(e) => {
-                        log!("[Push] Failed to build VAPID signature: {}", e);
+                        log!("[Push] Failed to build VAPID signature for {}: {}", kind, e);
                         continue;
                     }
                 }
             }
             Err(e) => {
-                log!("[Push] Failed to create VAPID builder: {}", e);
+                log!("[Push] Failed to create VAPID builder for {}: {}", kind, e);
                 continue;
             }
         };
@@ -291,7 +983,7 @@ pub async fn send_push_to_all_with_app(
         let message = match msg_builder.build() {
             Ok(m) => m,
             Err(e) => {
-                log!("[Push] Failed to build push message: {}", e);
+                log!("[Push] Failed to build {} message: {}", kind, e);
                 continue;
             }
         };
@@ -299,10 +991,8 @@ pub async fn send_push_to_all_with_app(
         use web_push::WebPushClient;
         match client.send(message).await {
             Ok(_) => {
-                log!(
-                    "[Push] Sent notification to {}",
-                    &sub.endpoint[..sub.endpoint.floor_char_boundary(60)]
-                );
+                delivered += 1;
+                log!("[Push] Sent {} to {}", kind, endpoint_label);
             }
             Err(e) => {
                 let err_str = e.to_string();
@@ -310,162 +1000,63 @@ pub async fn send_push_to_all_with_app(
                 if err_str.contains("410") || err_str.contains("Gone") {
                     log!(
                         "[Push] Subscription expired (410), will remove: {}",
-                        &sub.endpoint[..sub.endpoint.floor_char_boundary(60)]
+                        endpoint_label
                     );
                     stale_endpoints.push(sub.endpoint.clone());
                 } else {
-                    log!(
-                        "[Push] Failed to send to {}: {}",
-                        &sub.endpoint[..sub.endpoint.floor_char_boundary(60)],
-                        e
-                    );
+                    log!("[Push] Failed to send {} to {}: {}", kind, endpoint_label, e);
                 }
             }
         }
     }
 
-    // Clean up stale subscriptions
     for endpoint in stale_endpoints {
         if let Err(e) = PushSubscriptionStore::unsubscribe(pool, &endpoint).await {
             log!("[Push] Failed to remove stale subscription: {}", e);
         }
     }
+
+    delivered
 }
 
-/// Build the JSON payload delivered to the service worker.
-///
-/// `title` and `body` are always present. The optional fields are included only
-/// when set so the service worker can rely on `if (data.thread_id)` to detect a
-/// deep link without seeing `null`/`undefined` strings.
-fn build_push_payload(
-    title: &str,
-    body: &str,
-    notification_id: Option<uuid::Uuid>,
-    app_id: Option<&str>,
-    link_thread_id: Option<uuid::Uuid>,
-) -> serde_json::Value {
-    let mut payload = serde_json::json!({
-        "title": title,
-        "body": body,
-    });
-    if let Some(id) = notification_id {
-        payload["notification_id"] = serde_json::json!(id.to_string());
-    }
-    if let Some(aid) = app_id {
-        payload["app_id"] = serde_json::json!(aid);
-    }
-    if let Some(tid) = link_thread_id {
-        payload["thread_id"] = serde_json::json!(tid.to_string());
-    }
-    payload
-}
-
-/// Drop subscriptions whose device_id is in `focused_device_ids`. Subscriptions
-/// without a device_id (legacy rows) are always kept — we have no way to know
-/// whether they belong to a focused device.
-fn filter_subscriptions_by_presence(
+#[cfg(feature = "e2e-test-hooks")]
+async fn fan_out_to_push_log(
+    pool: &PgPool,
     subscriptions: Vec<PushSubscription>,
-    focused_device_ids: &[String],
-) -> Vec<PushSubscription> {
-    if focused_device_ids.is_empty() {
-        return subscriptions;
+    payload: &str,
+    kind: &str,
+    notification_id: Option<uuid::Uuid>,
+) -> usize {
+    let Some(nid) = notification_id else {
+        // No notification_id to attribute the log row to — no caller does
+        // this today, and tests can't assert on an untagged row anyway.
+        return 0;
+    };
+    let mut delivered = 0usize;
+    for sub in &subscriptions {
+        let endpoint_label = &sub.endpoint[..sub.endpoint.floor_char_boundary(60)];
+        // Legacy rows without a device_id can't be attributed; skip so the
+        // test log only contains rows tests will actually assert against.
+        let Some(device_id) = sub.device_id.as_deref() else {
+            continue;
+        };
+        match push_test_log::record(pool, device_id, nid, payload).await {
+            Ok(()) => {
+                delivered += 1;
+                log!("[Push:test] Logged {} to {}", kind, endpoint_label);
+            }
+            Err(e) => {
+                log!(
+                    "[Push:test] Failed to write push_log for {}: {}",
+                    endpoint_label,
+                    e
+                );
+            }
+        }
     }
-    let focused: std::collections::HashSet<&str> =
-        focused_device_ids.iter().map(String::as_str).collect();
-    subscriptions
-        .into_iter()
-        .filter(|s| match &s.device_id {
-            Some(d) => !focused.contains(d.as_str()),
-            None => true,
-        })
-        .collect()
+    delivered
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sub(endpoint: &str, device_id: Option<&str>) -> PushSubscription {
-        PushSubscription {
-            endpoint: endpoint.into(),
-            p256dh: "p256dh".into(),
-            auth: "auth".into(),
-            device_id: device_id.map(String::from),
-        }
-    }
-
-    #[test]
-    fn no_focused_devices_keeps_everything() {
-        let subs = vec![
-            sub("https://endpoint/a", Some("dev-1")),
-            sub("https://endpoint/b", Some("dev-2")),
-        ];
-        let filtered = filter_subscriptions_by_presence(subs, &[]);
-        assert_eq!(filtered.len(), 2);
-    }
-
-    #[test]
-    fn drops_only_focused_devices() {
-        let subs = vec![
-            sub("https://endpoint/a", Some("dev-1")),
-            sub("https://endpoint/b", Some("dev-2")),
-            sub("https://endpoint/c", Some("dev-3")),
-        ];
-        let filtered = filter_subscriptions_by_presence(subs, &["dev-2".into()]);
-        assert_eq!(filtered.len(), 2);
-        let ids: Vec<&str> = filtered
-            .iter()
-            .filter_map(|s| s.device_id.as_deref())
-            .collect();
-        assert_eq!(ids, vec!["dev-1", "dev-3"]);
-    }
-
-    #[test]
-    fn payload_minimal_has_title_and_body_only() {
-        let payload = build_push_payload("Hi", "There", None, None, None);
-        assert_eq!(payload["title"], "Hi");
-        assert_eq!(payload["body"], "There");
-        assert!(payload.get("notification_id").is_none());
-        assert!(payload.get("app_id").is_none());
-        assert!(payload.get("thread_id").is_none());
-    }
-
-    #[test]
-    fn payload_includes_thread_id_for_deep_link() {
-        let tid = uuid::Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
-        let payload = build_push_payload("Claude is asking", "Pick one", None, None, Some(tid));
-        assert_eq!(payload["thread_id"], tid.to_string());
-    }
-
-    #[test]
-    fn payload_omits_thread_id_when_link_absent() {
-        // Regression guard: the SW relies on `if (data.thread_id)` — never emit
-        // the key as a literal string "null" or empty value.
-        let payload = build_push_payload("Hi", "There", None, Some("app-x"), None);
-        assert!(payload.get("thread_id").is_none());
-        assert_eq!(payload["app_id"], "app-x");
-    }
-
-    #[test]
-    fn payload_carries_all_fields_when_provided() {
-        let nid = uuid::Uuid::new_v4();
-        let tid = uuid::Uuid::new_v4();
-        let payload = build_push_payload("T", "B", Some(nid), Some("the-app"), Some(tid));
-        assert_eq!(payload["notification_id"], nid.to_string());
-        assert_eq!(payload["app_id"], "the-app");
-        assert_eq!(payload["thread_id"], tid.to_string());
-    }
-
-    #[test]
-    fn keeps_subscriptions_with_no_device_id() {
-        // Legacy push subscriptions without a device_id — we can't tell which
-        // device they belong to, so we conservatively keep them.
-        let subs = vec![
-            sub("https://endpoint/legacy", None),
-            sub("https://endpoint/a", Some("dev-1")),
-        ];
-        let filtered = filter_subscriptions_by_presence(subs, &["dev-1".into()]);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].endpoint, "https://endpoint/legacy");
-    }
-}
+#[path = "push_tests.rs"]
+mod tests;

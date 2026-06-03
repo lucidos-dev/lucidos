@@ -11,6 +11,7 @@
 //!   ever indexing them, so rebuild and live indexing diverged.
 
 use std::sync::Arc;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
@@ -25,7 +26,22 @@ pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
         let stream = BroadcastStream::new(rx);
         tokio::pin!(stream);
 
-        while let Some(Ok(emitted)) = stream.next().await {
+        // Loop body must survive both lag and unrelated stream hiccups.
+        // `while let Some(Ok(_))` would exit the loop on `Some(Err(Lagged))`,
+        // silently killing the indexer for the rest of the engine's lifetime
+        // (same failure mode as `todo_consumer::spawn` — see note there).
+        while let Some(result) = stream.next().await {
+            let emitted = match result {
+                Ok(e) => e,
+                Err(BroadcastStreamRecvError::Lagged(n)) => {
+                    log!(
+                        @Memory,
+                        "Broadcast lagged by {} events — indexing skipped for those events; continuing",
+                        n
+                    );
+                    continue;
+                }
+            };
             match &emitted.typed {
                 BusEvent::Thread {
                     thread_id,
@@ -88,8 +104,9 @@ pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
 /// Read the artifact at the given commit and index it.
 /// Silently skips when the read fails — that covers missing files (event for a
 /// path under a non-`artifacts/` data subdir, e.g. python tool writing to apps/)
-/// and PDFs whose binary content can't be UTF-8 decoded (`post_import_index`
-/// indexes those out-of-band via the .txt sidecar).
+/// and any binary content that can't be UTF-8 decoded (PDFs, images,
+/// archives, …). Binaries get no memory index; their text is no longer
+/// extracted server-side.
 ///
 /// The extension/path filter runs BEFORE the git read so binary writes
 /// (images, archives, .so/.dll/.exe) don't pay for a full blob fetch under

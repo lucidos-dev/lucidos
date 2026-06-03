@@ -66,10 +66,15 @@ test.describe('Section-aware Save/Archive buttons', () => {
     await waitForResponse(page);
     const threadId = await getFocusedThreadId(page);
 
-    const archResp = await page.request.post('/api/threads/archive', {
+    const archResp = await page.request.post('/api/v1/threads/archive', {
       data: { thread_id: threadId },
     });
     expect(archResp.ok()).toBeTruthy();
+    // Desktop chromium hides the drawer by default — open it so
+    // waitForThreadInSection can find the section's DOM. Mobile/webkit
+    // projects keep the drawer mounted, so openThreadDrawer is a no-op
+    // there.
+    await openThreadDrawer(page);
     await waitForThreadInSection(page, threadId, 'archive');
 
     await focusThreadFromDrawer(page, threadId);
@@ -89,10 +94,15 @@ test.describe('Section-aware Save/Archive buttons', () => {
     await waitForResponse(page);
     const threadId = await getFocusedThreadId(page);
 
-    const saveResp = await page.request.post('/api/threads/save', {
+    const saveResp = await page.request.post('/api/v1/threads/save', {
       data: { thread_id: threadId },
     });
     expect(saveResp.ok()).toBeTruthy();
+    // Desktop chromium hides the drawer by default — open it so
+    // waitForThreadInSection can find the section's DOM. Mobile/webkit
+    // projects keep the drawer mounted, so openThreadDrawer is a no-op
+    // there.
+    await openThreadDrawer(page);
     await waitForThreadInSection(page, threadId, 'saved');
 
     await focusThreadFromDrawer(page, threadId);

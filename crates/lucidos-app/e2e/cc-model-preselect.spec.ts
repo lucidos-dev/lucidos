@@ -32,7 +32,7 @@ test.describe('CC model pre-session selection', () => {
 
     let sentThreadId: string | null = null;
     page.on('request', (req) => {
-      if (req.url().includes('/api/chat/stream') && req.method() === 'POST') {
+      if (req.url().includes('/api/v1/chat/stream') && req.method() === 'POST') {
         try {
           const body = req.postDataJSON();
           sentThreadId = body?.thread_id ?? null;

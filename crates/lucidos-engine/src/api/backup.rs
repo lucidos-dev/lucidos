@@ -2,6 +2,7 @@ use super::*;
 use crate::core::backup::{self, crypto};
 use crate::core::oauth::OAuthStore;
 use crate::core::PreferenceStore;
+use futures::FutureExt;
 use std::path::PathBuf;
 
 #[derive(Serialize)]
@@ -55,6 +56,11 @@ pub struct StartWorkspaceRequest {
 #[derive(Serialize)]
 pub struct StartWorkspaceResponse {
     pub url: String,
+    /// True only once the freshly started workspace answered `/health`. The
+    /// frontend opens the tab only when this is true — otherwise it would open a
+    /// blank page against an engine still building/booting (first `-b` build can
+    /// take minutes). False means "spawned, not healthy yet — try again".
+    pub ready: bool,
 }
 
 #[derive(Deserialize)]
@@ -81,22 +87,23 @@ fn json_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<E
 }
 
 pub(crate) fn progress_sender(
-    sender: tokio::sync::broadcast::Sender<crate::engine::event_bus::EmittedEvent>,
+    event_bus: crate::engine::event_bus::EventBus,
 ) -> impl Fn(&str, usize, usize) + Send + Sync + 'static {
     move |phase: &str, current: usize, total: usize| {
-        let _ = sender.send(crate::engine::event_bus::EmittedEvent {
-            event_id: uuid::Uuid::new_v4(),
-            seq: None,
-            created: chrono::Utc::now(),
-            typed: crate::engine::event_bus::BusEvent::System(
-                crate::engine::event_bus::SystemEvent::BackupProgress {
-                    phase: phase.to_string(),
-                    progress: current,
-                    total,
-                },
-            ),
-            aggregate: None,
-        });
+        // Broadcast synchronously and in-order — NOT via tokio::spawn. A
+        // detached task per tick let the final "uploading 100%" land on the
+        // wire AFTER the terminal BackupCompleted/BackupFailed that run_backup
+        // emits right after, re-setting the frontend's backupProgress signal the
+        // terminal event had just cleared and wedging the Backup card on
+        // "in progress". A sync send keeps progress strictly before the terminal
+        // event and works from both async and spawn_blocking callers.
+        event_bus.broadcast_transient_system(
+            crate::engine::event_bus::SystemEvent::BackupProgress {
+                phase: phase.to_string(),
+                progress: current,
+                total,
+            },
+        );
     }
 }
 
@@ -184,8 +191,8 @@ pub async fn create_backup(
     let database_url = crate::core::database_url();
 
     tokio::spawn(async move {
-        let _guard = guard;
         crate::scheduler::run_backup(
+            guard,
             &engine,
             &pool,
             &workspace,
@@ -218,6 +225,88 @@ pub async fn list_backups(
     Ok(Json(entries))
 }
 
+/// A backup is "stale" once the newest cloud backup is older than this (or none
+/// exists at all). 24h matches the most aggressive built-in schedule.
+const BACKUP_STALE_AFTER_SECONDS: i64 = 24 * 60 * 60;
+
+/// Aggregated backup health for the Settings → Backup page. Answers: is a backup
+/// running right now, did the last run succeed or fail (and when), and how old is
+/// the last good cloud backup. Survives engine restarts because `last_run` and
+/// `latest_backup` come from persisted state, not ephemeral SSE.
+#[derive(Serialize)]
+pub struct BackupStatusResponse {
+    /// True while a backup is in progress (mirrors `engine.backup_in_progress`).
+    pub running: bool,
+    /// Persisted outcome of the last run, or null if never recorded.
+    pub last_run: Option<backup::BackupLastRun>,
+    /// Newest backup the provider holds — the authoritative "last good cloud
+    /// backup". Null if there are none or the provider couldn't be listed.
+    pub latest_backup: Option<backup::BackupEntry>,
+    /// Age of `latest_backup` in seconds, or null if none.
+    pub age_seconds: Option<i64>,
+    /// True when there's no recent good backup (none, or older than 24h).
+    pub stale: bool,
+    /// Set when listing the provider failed, so the page can still render
+    /// running/last_run while surfacing that the cloud list is unavailable.
+    pub list_error: Option<String>,
+}
+
+/// Pure assembly of the status response from its inputs. Split out so the
+/// staleness/sorting/error-tolerance logic is unit-testable without an engine
+/// or a live provider (mirrors `emit_schedule_preferences_changed`).
+fn build_backup_status(
+    running: bool,
+    last_run: Option<backup::BackupLastRun>,
+    list_result: Result<Vec<backup::BackupEntry>, String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> BackupStatusResponse {
+    let (latest_backup, list_error) = match list_result {
+        // The provider's order is not guaranteed (Drive returns by file id, not
+        // creation time), so pick the newest explicitly rather than trusting [0].
+        Ok(entries) => (entries.into_iter().max_by_key(|e| e.created_at), None),
+        Err(e) => (None, Some(e)),
+    };
+
+    let age_seconds = latest_backup
+        .as_ref()
+        .map(|b| (now - b.created_at).num_seconds());
+    // No backup at all is the worst kind of stale (engine down at cron time).
+    let stale = age_seconds.is_none_or(|age| age > BACKUP_STALE_AFTER_SECONDS);
+
+    BackupStatusResponse {
+        running,
+        last_run,
+        latest_backup,
+        age_seconds,
+        stale,
+        list_error,
+    }
+}
+
+/// GET /api/v1/backup/status?provider=<id> — backup health for the page.
+pub async fn get_backup_status(
+    State(state): State<AppState>,
+    Query(params): Query<BackupRequest>,
+) -> Result<Json<BackupStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let provider = resolve_provider(&params.provider, &state.pool)?;
+
+    let running = state
+        .engine
+        .backup_in_progress
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let last_run = backup::load_last_run(&state.pool).await;
+    // Tolerate a list failure (e.g. Drive unreachable): the page must still
+    // render running/last_run, just without the latest-backup line.
+    let list_result = provider.list_backups().await.map_err(|e| e.to_string());
+
+    Ok(Json(build_backup_status(
+        running,
+        last_run,
+        list_result,
+        chrono::Utc::now(),
+    )))
+}
+
 pub async fn validate_workspace_name(
     Query(params): Query<ValidateNameQuery>,
 ) -> Json<ValidateNameResponse> {
@@ -233,33 +322,218 @@ pub async fn validate_workspace_name(
     }
 }
 
+/// The ONLY place a (broadcast-bearing) restore-state transition happens: write
+/// `engine.restore_state` AND broadcast the matching `Restore*` SSE derived from
+/// the SAME value. Routing every Running/Completed/Failed transition through here
+/// makes "the stream and a restore-status refetch never diverge" true by
+/// construction — you can't update one without the other. `Idle` carries no SSE
+/// (the DELETE endpoint clears it; clients reconcile on their next refetch).
+fn set_restore_state(engine: &SharedEngine, next: backup::RestoreState) {
+    use crate::engine::event_bus::SystemEvent;
+    let event = match &next {
+        backup::RestoreState::Running {
+            workspace_name,
+            phase,
+            progress,
+            total,
+        } => Some(SystemEvent::RestoreProgress {
+            workspace_name: workspace_name.clone(),
+            phase: phase.clone(),
+            progress: *progress,
+            total: *total,
+        }),
+        backup::RestoreState::Completed {
+            workspace_name,
+            workspace_path,
+        } => Some(SystemEvent::RestoreCompleted {
+            workspace_name: workspace_name.clone(),
+            workspace_path: workspace_path.clone(),
+        }),
+        backup::RestoreState::Failed {
+            workspace_name,
+            error,
+        } => Some(SystemEvent::RestoreFailed {
+            workspace_name: workspace_name.clone(),
+            error: error.clone(),
+        }),
+        backup::RestoreState::Idle => None,
+    };
+    if let Ok(mut st) = engine.restore_state.write() {
+        *st = next;
+    }
+    if let Some(event) = event {
+        engine.event_bus.broadcast_transient_system(event);
+    }
+}
+
+/// Progress callback for restore. Routes through `set_restore_state` so each tick
+/// updates the refetchable state and the SSE together. Guarded on `is_running` so
+/// a late tick can't resurrect a state a terminal arm already moved off Running.
+fn restore_progress_sender(
+    engine: SharedEngine,
+    workspace_name: String,
+) -> impl Fn(&str, usize, usize) + Send + Sync + 'static {
+    move |phase: &str, current: usize, total: usize| {
+        let still_running = engine
+            .restore_state
+            .read()
+            .map(|st| st.is_running())
+            .unwrap_or(false);
+        if still_running {
+            set_restore_state(
+                &engine,
+                backup::RestoreState::Running {
+                    workspace_name: workspace_name.clone(),
+                    phase: phase.to_string(),
+                    progress: current,
+                    total,
+                },
+            );
+        }
+    }
+}
+
+/// Queues a restore and returns 202 immediately. Progress + terminal state flow
+/// through the `Restore*` SSE events AND the refetchable
+/// `GET /api/v1/backup/restore-status` — both serialize the one
+/// `engine.restore_state` — so a page reload mid-restore re-attaches to the
+/// identical phase/percent and a completed/failed result survives the reload.
+///
+/// The work runs in a detached `tokio::spawn` that OWNS the pipeline (and its
+/// staging `TempDir`). The old design awaited the multi-minute, multi-GB restore
+/// inside the request handler: a tab reload or network blip dropped the HTTP
+/// connection, axum cancelled the handler future, the `TempDir` auto-deleted,
+/// and the whole download was lost with nothing to reconnect to.
 pub async fn restore_backup(
     State(state): State<AppState>,
     Json(req): Json<RestoreRequest>,
-) -> Result<Json<backup::RestoredWorkspace>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
+    // Validate synchronously so obvious mistakes are a clean 4xx, not a failure
+    // the user only discovers via SSE after the spawn.
     let provider = resolve_provider(&req.provider, &state.pool)?;
-
     let key = crypto::key_from_base64(&req.key)
         .map_err(|e| json_error(StatusCode::BAD_REQUEST, format!("Invalid key: {e}")))?;
+    // Same target-exists check the pipeline does, surfaced up front as a 400
+    // before we flip state to Running.
+    backup::resolve_restore_workspace_path(&req.workspace_name)
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let progress = progress_sender(state.engine.event_bus.sender());
+    // Atomically claim the single restore slot. Holding the write lock across
+    // the check-and-set (inside try_start) makes it indivisible, so two
+    // concurrent requests can't both win. The first progress tick (or terminal
+    // arm) broadcasts the first Restore* SSE moments later; the initiating tab
+    // already shows its optimistic "starting" and other tabs reconcile via the
+    // restore-status refetch on their next mount.
+    {
+        let mut st = state
+            .engine
+            .restore_state
+            .write()
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "restore state poisoned"))?;
+        if !st.try_start(&req.workspace_name) {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "A restore is already in progress",
+            ));
+        }
+    }
 
-    let result = backup::restore_backup(
-        &req.workspace_name,
-        &key,
-        &req.backup_id,
-        provider.as_ref(),
-        progress,
-    )
-    .await
-    .map_err(|e| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Restore failed: {e}"),
-        )
-    })?;
+    let engine = state.engine.clone();
+    let workspace_name = req.workspace_name.clone();
+    let backup_id = req.backup_id.clone();
 
-    Ok(Json(result))
+    tokio::spawn(async move {
+        let progress = restore_progress_sender(engine.clone(), workspace_name.clone());
+        // catch_unwind so a panic in the pipeline's async body (outside the
+        // spawn_blocking phases, whose panics already surface as Err) still moves
+        // restore_state off Running — otherwise a panicked task would strand the
+        // slot and 409 every future restore until an engine restart.
+        let outcome = std::panic::AssertUnwindSafe(backup::restore_backup(
+            &workspace_name,
+            &key,
+            &backup_id,
+            provider.as_ref(),
+            progress,
+        ))
+        .catch_unwind()
+        .await;
+        match outcome {
+            Ok(Ok(restored)) => {
+                log!("[Backup] Restore completed: {}", restored.workspace_name);
+                set_restore_state(
+                    &engine,
+                    backup::RestoreState::Completed {
+                        workspace_name: restored.workspace_name,
+                        workspace_path: restored.workspace_path,
+                    },
+                );
+            }
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                log!("[Backup] Restore failed: {}", msg);
+                set_restore_state(
+                    &engine,
+                    backup::RestoreState::Failed {
+                        workspace_name,
+                        error: msg,
+                    },
+                );
+            }
+            Err(_panic) => {
+                log!("[Backup] Restore task panicked — releasing slot");
+                set_restore_state(
+                    &engine,
+                    backup::RestoreState::Failed {
+                        workspace_name,
+                        error: "Restore crashed unexpectedly. Check the engine log.".to_string(),
+                    },
+                );
+            }
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "status": "started" })),
+    ))
+}
+
+/// GET /api/v1/backup/restore-status — the authoritative restore state. The
+/// frontend fetches this on load so a reload mid-restore (or right after it
+/// finishes) re-attaches to the exact phase/percent/result the `Restore*` SSE
+/// stream also broadcasts. Idle when no restore has run since startup.
+pub async fn get_restore_status(
+    State(state): State<AppState>,
+) -> Result<Json<backup::RestoreState>, (StatusCode, Json<ErrorResponse>)> {
+    let st = state
+        .engine
+        .restore_state
+        .read()
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "restore state poisoned"))?
+        .clone();
+    Ok(Json(st))
+}
+
+/// DELETE /api/v1/backup/restore-status — drop a terminal (completed/failed)
+/// restore result back to Idle so the banner clears and a reload agrees.
+/// Refused with 409 while a restore is running so a stray call can't wipe live
+/// progress.
+pub async fn clear_restore_status(
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let mut st = state
+        .engine
+        .restore_state
+        .write()
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "restore state poisoned"))?;
+    if st.is_running() {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "A restore is in progress",
+        ));
+    }
+    *st = backup::RestoreState::Idle;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn start_workspace(
@@ -336,7 +610,7 @@ pub async fn start_workspace(
 
     // Poll for health (up to 60s)
     let url = format!("{proto}://localhost:{port}");
-    let health_url = format!("{url}/api/health");
+    let health_url = format!("{url}/api/v1/health");
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
@@ -350,12 +624,14 @@ pub async fn start_workspace(
     for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         if client.get(&health_url).send().await.is_ok() {
-            return Ok(Json(StartWorkspaceResponse { url }));
+            return Ok(Json(StartWorkspaceResponse { url, ready: true }));
         }
     }
 
-    // Workspace started but not healthy yet — return URL anyway
-    Ok(Json(StartWorkspaceResponse { url }))
+    // Spawned but not healthy within the window (a first `-b` build can take
+    // longer). Report ready=false so the frontend tells the user it's still
+    // starting instead of opening a blank tab against a not-yet-booted engine.
+    Ok(Json(StartWorkspaceResponse { url, ready: false }))
 }
 
 pub async fn get_schedule(
@@ -393,6 +669,7 @@ pub async fn get_schedule(
 
 pub async fn set_schedule(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ScheduleRequest>,
 ) -> Result<Json<ScheduleResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Validate provider exists
@@ -415,16 +692,32 @@ pub async fn set_schedule(
         None
     };
 
-    let mut scheduler = state.scheduler.lock().await;
-    scheduler
-        .set_backup_schedule(cron, &req.provider)
-        .await
-        .map_err(|e| {
-            json_error(
-                StatusCode::BAD_REQUEST,
-                format!("Failed to set schedule: {e}"),
-            )
-        })?;
+    {
+        let mut scheduler = state.scheduler.lock().await;
+        scheduler
+            .set_backup_schedule(cron, &req.provider)
+            .await
+            .map_err(|e| {
+                json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to set schedule: {e}"),
+                )
+            })?;
+    }
+
+    // Mirror set_retention: emit PreferencesChanged for every preference the
+    // scheduler wrote so timeline and UI projections can react. Without this
+    // the scheduler mutates state silently — no "you set a backup schedule"
+    // entry appears in the audit timeline.
+    emit_schedule_preferences_changed(
+        &state.engine.event_bus,
+        &headers,
+        &state.pool,
+        active,
+        &req.schedule,
+        &req.provider,
+    )
+    .await;
 
     if active {
         Ok(Json(ScheduleResponse {
@@ -436,6 +729,58 @@ pub async fn set_schedule(
             schedule: None,
             provider: None,
         }))
+    }
+}
+
+/// Emit `PreferencesChanged` for the keys `scheduler.set_backup_schedule`
+/// wrote: when `active`, both `PREF_BACKUP_SCHEDULE` (cron expression) and
+/// `PREF_BACKUP_PROVIDER`; when inactive, only `PREF_BACKUP_SCHEDULE`
+/// (= `"off"`). Pulled out of the axum handler so it can be unit-tested
+/// without spinning up the scheduler.
+pub(crate) async fn emit_schedule_preferences_changed(
+    bus: &crate::engine::event_bus::EventBus,
+    headers: &HeaderMap,
+    pool: &PgPool,
+    active: bool,
+    schedule: &str,
+    provider: &str,
+) {
+    let actor = crate::api::actor::user_actor_resolved(headers, pool, None).await;
+    if active {
+        bus.emit_or_log(
+            crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::PreferencesChanged {
+                    key: backup::PREF_BACKUP_SCHEDULE.to_string(),
+                    value: Some(schedule.to_string()),
+                    actor: actor.clone(),
+                },
+            ),
+            "[Backup] PreferencesChanged",
+        )
+        .await;
+        bus.emit_or_log(
+            crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::PreferencesChanged {
+                    key: backup::PREF_BACKUP_PROVIDER.to_string(),
+                    value: Some(provider.to_string()),
+                    actor,
+                },
+            ),
+            "[Backup] PreferencesChanged",
+        )
+        .await;
+    } else {
+        bus.emit_or_log(
+            crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::PreferencesChanged {
+                    key: backup::PREF_BACKUP_SCHEDULE.to_string(),
+                    value: Some("off".to_string()),
+                    actor,
+                },
+            ),
+            "[Backup] PreferencesChanged",
+        )
+        .await;
     }
 }
 
@@ -458,6 +803,7 @@ pub async fn get_retention(
 
 pub async fn set_retention(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RetentionRequest>,
 ) -> Result<Json<RetentionResponse>, (StatusCode, Json<ErrorResponse>)> {
     if req.keep == 0 {
@@ -466,17 +812,239 @@ pub async fn set_retention(
             "Must keep at least 1 backup",
         ));
     }
-    PreferenceStore::set(
-        &state.pool,
-        backup::PREF_BACKUP_RETENTION,
-        &req.keep.to_string(),
-    )
-    .await
-    .map_err(|e| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to save retention: {e}"),
-        )
-    })?;
+    let value = req.keep.to_string();
+    PreferenceStore::set(&state.pool, backup::PREF_BACKUP_RETENTION, &value)
+        .await
+        .map_err(|e| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save retention: {e}"),
+            )
+        })?;
+    state
+        .engine
+        .event_bus
+        .emit_user_system(&headers, &state.pool, "[Backup] PreferencesChanged", |actor| {
+            crate::engine::event_bus::SystemEvent::PreferencesChanged {
+                key: backup::PREF_BACKUP_RETENTION.to_string(),
+                value: Some(value.clone()),
+                actor,
+            }
+        })
+        .await;
     Ok(Json(RetentionResponse { keep: req.keep }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::event_bus::EventBus;
+    use chrono::{Duration, Utc};
+
+    fn entry(id: &str, age: Duration) -> backup::BackupEntry {
+        backup::BackupEntry {
+            id: id.to_string(),
+            filename: format!("lucidos-backup-{id}.enc"),
+            size_bytes: 1024,
+            created_at: Utc::now() - age,
+        }
+    }
+
+    /// Pull the SSE `type` discriminator off a broadcast event via its public
+    /// wire form — avoids reaching into the typed enum from the test.
+    fn sse_event_type(e: &crate::engine::event_bus::EmittedEvent) -> String {
+        let v: serde_json::Value = serde_json::from_str(&e.to_sse_json()).unwrap();
+        v["type"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// A backup's progress ticks must reach SSE subscribers BEFORE the terminal
+    /// `BackupCompleted` that `run_backup` emits immediately after the upload
+    /// finishes. The original `progress_sender` spawned a detached task per
+    /// tick, so the final "uploading 100%" tick could be delivered AFTER
+    /// `BackupCompleted` — re-setting the frontend's `backupProgress` signal the
+    /// completion had just cleared, wedging the Settings → Backup card on
+    /// "Backup in progress — Uploading…" long after the backup had finished.
+    #[tokio::test]
+    async fn progress_sender_orders_progress_before_terminal_event() {
+        use crate::engine::event_bus::{BusEvent, SystemEvent};
+
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _parent_rx) = EventBus::new(pool.clone());
+        let mut rx = bus.subscribe();
+
+        // Mirror run_backup's tail: a final upload progress tick, then the
+        // inline terminal completion emit.
+        let progress = progress_sender(bus.clone());
+        progress("uploading", 100, 100);
+        bus.emit_or_log(
+            BusEvent::System(SystemEvent::BackupCompleted {
+                filename: "lucidos-backup-test.enc".to_string(),
+                size_bytes: 1024,
+            }),
+            "[Backup] BackupCompleted",
+        )
+        .await;
+
+        let first = sse_event_type(&rx.recv().await.expect("a progress event"));
+        let second = sse_event_type(&rx.recv().await.expect("a terminal event"));
+        assert_eq!(
+            first, "BackupProgress",
+            "progress must reach subscribers before the terminal event"
+        );
+        assert_eq!(second, "BackupCompleted");
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// `running` must pass straight through to the response in both states —
+    /// the handler feeds it the `engine.backup_in_progress` AtomicBool.
+    #[test]
+    fn build_status_mirrors_running_flag() {
+        let now = Utc::now();
+        let on = build_backup_status(true, None, Ok(vec![]), now);
+        assert!(on.running);
+        let off = build_backup_status(false, None, Ok(vec![]), now);
+        assert!(!off.running);
+    }
+
+    /// Newest entry wins regardless of list order, and a recent backup is not
+    /// stale; age is measured from the entry's creation time.
+    #[test]
+    fn build_status_picks_newest_and_not_stale_when_recent() {
+        let now = Utc::now();
+        let entries = vec![
+            entry("old", Duration::hours(40)),
+            entry("newest", Duration::hours(1)),
+            entry("mid", Duration::hours(10)),
+        ];
+        let status = build_backup_status(false, None, Ok(entries), now);
+        let latest = status.latest_backup.expect("a latest backup");
+        assert_eq!(latest.id, "newest");
+        assert!(!status.stale, "a 1h-old backup is fresh");
+        let age = status.age_seconds.expect("age");
+        assert!((3000..4200).contains(&age), "≈1h in seconds, got {age}");
+        assert!(status.list_error.is_none());
+    }
+
+    /// A backup older than 24h is stale.
+    #[test]
+    fn build_status_stale_when_old() {
+        let now = Utc::now();
+        let status = build_backup_status(false, None, Ok(vec![entry("old", Duration::hours(30))]), now);
+        assert!(status.stale);
+        assert!(status.age_seconds.unwrap() > BACKUP_STALE_AFTER_SECONDS);
+    }
+
+    /// No backups at all → stale with null latest/age. This is the "engine was
+    /// down at cron time, nothing was ever uploaded" case.
+    #[test]
+    fn build_status_stale_when_none() {
+        let now = Utc::now();
+        let status = build_backup_status(false, None, Ok(vec![]), now);
+        assert!(status.stale);
+        assert!(status.latest_backup.is_none());
+        assert!(status.age_seconds.is_none());
+        assert!(status.list_error.is_none());
+    }
+
+    /// A provider/list failure must not 500 the status: latest is null, the
+    /// error surfaces in `list_error`, and the page falls back to "stale".
+    #[test]
+    fn build_status_tolerates_list_error() {
+        let now = Utc::now();
+        let status = build_backup_status(
+            false,
+            Some(backup::BackupLastRun::failure("disk full")),
+            Err("Drive unreachable".to_string()),
+            now,
+        );
+        assert!(status.latest_backup.is_none());
+        assert_eq!(status.list_error.as_deref(), Some("Drive unreachable"));
+        assert!(status.stale);
+        // last_run still flows through even when the cloud list is unavailable.
+        assert!(matches!(
+            status.last_run.unwrap().status,
+            backup::BackupRunStatus::Failure
+        ));
+    }
+
+    /// Active schedule: scheduler writes both keys (cron + provider).
+    /// The handler must emit two `PreferencesChanged` rows so timeline /
+    /// projections can react. Mirrors the convention `set_retention` already
+    /// uses for `PREF_BACKUP_RETENTION`.
+    #[tokio::test]
+    async fn emit_schedule_preferences_changed_active_emits_both_keys() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _parent_rx) = EventBus::new(pool.clone());
+        let headers = HeaderMap::new();
+
+        emit_schedule_preferences_changed(
+            &bus,
+            &headers,
+            &pool,
+            true,
+            "0 0 3 * * *",
+            "google_drive",
+        )
+        .await;
+
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT event_type, payload FROM events \
+             WHERE event_type = 'PreferencesChanged' ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 2, "expected one row per written preference");
+        let keys: Vec<&str> = rows
+            .iter()
+            .map(|(_, p)| p["data"]["key"].as_str().unwrap())
+            .collect();
+        assert!(keys.contains(&backup::PREF_BACKUP_SCHEDULE));
+        assert!(keys.contains(&backup::PREF_BACKUP_PROVIDER));
+
+        for (_, payload) in &rows {
+            let key = payload["data"]["key"].as_str().unwrap();
+            let value = payload["data"]["value"].as_str().unwrap();
+            if key == backup::PREF_BACKUP_SCHEDULE {
+                assert_eq!(value, "0 0 3 * * *");
+            } else if key == backup::PREF_BACKUP_PROVIDER {
+                assert_eq!(value, "google_drive");
+            }
+        }
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Inactive schedule: scheduler writes only `PREF_BACKUP_SCHEDULE = "off"`
+    /// and leaves the provider preference untouched. The emit must match —
+    /// one row for the schedule key, no row for the provider key (an
+    /// uncorrected emit would falsely suggest a provider change).
+    #[tokio::test]
+    async fn emit_schedule_preferences_changed_inactive_emits_only_schedule() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _parent_rx) = EventBus::new(pool.clone());
+        let headers = HeaderMap::new();
+
+        emit_schedule_preferences_changed(&bus, &headers, &pool, false, "off", "google_drive")
+            .await;
+
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT event_type, payload FROM events \
+             WHERE event_type = 'PreferencesChanged' ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 1, "expected only the schedule key to emit");
+        assert_eq!(
+            rows[0].1["data"]["key"].as_str().unwrap(),
+            backup::PREF_BACKUP_SCHEDULE
+        );
+        assert_eq!(rows[0].1["data"]["value"].as_str().unwrap(), "off");
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
 }

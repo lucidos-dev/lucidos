@@ -15,6 +15,25 @@ async fn insert_event(pool: &PgPool, id: Uuid, event_type: &str, created: DateTi
         .expect("insert event");
 }
 
+/// Like [`insert_event`] but lets the test pin the payload byte size — used
+/// by the `count_events` tests to verify the `byte_total` aggregate.
+async fn insert_event_with_payload(
+    pool: &PgPool,
+    id: Uuid,
+    event_type: &str,
+    created: DateTime<Utc>,
+    payload: serde_json::Value,
+) {
+    sqlx::query("INSERT INTO events (id, event_type, payload, created) VALUES ($1, $2, $3, $4)")
+        .bind(id)
+        .bind(event_type)
+        .bind(payload)
+        .bind(created)
+        .execute(pool)
+        .await
+        .expect("insert event with payload");
+}
+
 /// `before_event_id` returns events strictly older than the cursor under
 /// `(created, id)` lexicographic ordering. When five events share one
 /// timestamp and the middle one is the cursor, only the two with smaller
@@ -169,6 +188,128 @@ async fn query_events_returns_cursor_not_found_when_uuid_missing() {
         .await
         .expect("query_events_paged should succeed");
     assert!(matches!(after_result, QueryEventsResult::CursorNotFound));
+
+    teardown_test_db(&db).await;
+}
+
+/// `count_events` with a type filter returns just the matching rows; the
+/// `byte_total` is the `SUM(octet_length(payload::text))` over those rows,
+/// which is what callers use to budget a subsequent `query_events` drill.
+#[tokio::test]
+async fn count_events_with_type_filter_returns_matching_count_and_byte_total() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let ts = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let payload = json!({ "summary": "x".repeat(100) });
+    for _ in 0..3 {
+        insert_event_with_payload(&pool, Uuid::new_v4(), "Matching", ts, payload.clone()).await;
+    }
+    insert_event_with_payload(&pool, Uuid::new_v4(), "Other", ts, payload.clone()).await;
+
+    let (count, byte_total) = store
+        .count_events(Some("Matching"), None, None)
+        .await
+        .expect("count_events");
+    assert_eq!(count, 3, "only the 3 Matching rows count");
+    assert!(byte_total > 0, "byte_total must be > 0 for non-empty payload");
+    // The byte_total should be the sum across the 3 matching rows. Each row's
+    // payload serializes to the same length (deterministic JSON), so the
+    // total must be evenly divisible by the per-row size.
+    assert_eq!(byte_total % 3, 0, "even split across 3 identical payloads");
+
+    teardown_test_db(&db).await;
+}
+
+/// `count_events` with no rows in the window must return `(0, 0)` — never
+/// `(0, NULL)` leaking out as a panic from `unwrap_or`.
+#[tokio::test]
+async fn count_events_returns_zero_bytes_when_no_matches() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let (count, byte_total) = store
+        .count_events(Some("Nonexistent"), None, None)
+        .await
+        .expect("count_events");
+    assert_eq!(count, 0);
+    assert_eq!(byte_total, 0);
+
+    teardown_test_db(&db).await;
+}
+
+/// `count_events_by_type` returns a per-type breakdown sorted by count desc
+/// (with `event_type` ASC as the tiebreaker). This is the LLM's "what's
+/// noisy this window" view — order matters because the LLM relies on the
+/// sort to decide which types to drill into first.
+#[tokio::test]
+async fn count_events_by_type_returns_breakdown_sorted_by_count_desc() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let ts = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let payload = json!({ "summary": "fixture" });
+    for _ in 0..5 {
+        insert_event_with_payload(&pool, Uuid::new_v4(), "Noisy", ts, payload.clone()).await;
+    }
+    for _ in 0..2 {
+        insert_event_with_payload(&pool, Uuid::new_v4(), "Quiet", ts, payload.clone()).await;
+    }
+    insert_event_with_payload(&pool, Uuid::new_v4(), "Singleton", ts, payload.clone()).await;
+
+    let rows = store
+        .count_events_by_type(None, None)
+        .await
+        .expect("count_events_by_type");
+
+    let types: Vec<&str> = rows.iter().map(|(t, _, _)| t.as_str()).collect();
+    let counts: Vec<i64> = rows.iter().map(|(_, c, _)| *c).collect();
+    assert_eq!(types, vec!["Noisy", "Quiet", "Singleton"], "count desc order");
+    assert_eq!(counts, vec![5, 2, 1]);
+    for (_, _, byte_total) in &rows {
+        assert!(*byte_total > 0, "byte_total per type must be > 0");
+    }
+
+    teardown_test_db(&db).await;
+}
+
+/// Time-window filtering: only events strictly after `since` and strictly
+/// before `until` count. Mirrors `query_events` semantics so a `count_events`
+/// + `query_events` call pair sees the same population.
+#[tokio::test]
+async fn count_events_respects_since_until_window() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let payload = json!({ "summary": "fixture" });
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let t1 = Utc.timestamp_opt(1_700_001_000, 0).unwrap();
+    let t2 = Utc.timestamp_opt(1_700_002_000, 0).unwrap();
+
+    insert_event_with_payload(&pool, Uuid::new_v4(), "Windowed", t0, payload.clone()).await;
+    insert_event_with_payload(&pool, Uuid::new_v4(), "Windowed", t1, payload.clone()).await;
+    insert_event_with_payload(&pool, Uuid::new_v4(), "Windowed", t2, payload.clone()).await;
+
+    // `since = t0` is strict (> t0), so only t1 and t2 should count.
+    let (count, _) = store
+        .count_events(Some("Windowed"), Some(t0), None)
+        .await
+        .expect("count_events with since");
+    assert_eq!(count, 2, "since is strictly greater than");
+
+    // `until = t2` is strict (< t2), so only t0 and t1 should count.
+    let (count, _) = store
+        .count_events(Some("Windowed"), None, Some(t2))
+        .await
+        .expect("count_events with until");
+    assert_eq!(count, 2, "until is strictly less than");
+
+    // Combined: only t1 is in the open interval (t0, t2).
+    let (count, _) = store
+        .count_events(Some("Windowed"), Some(t0), Some(t2))
+        .await
+        .expect("count_events with since+until");
+    assert_eq!(count, 1, "open interval excludes both endpoints");
 
     teardown_test_db(&db).await;
 }

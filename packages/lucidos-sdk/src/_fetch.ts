@@ -1,13 +1,24 @@
 /**
  * Internal fetch wrapper. Single point for:
  * - Base URL resolution
+ * - Auto-prefixing the engine's `/api/v1` HTTP surface
  * - Future auth headers (lucidos.configure({ token }))
  * - Timeout handling
  * - Consistent error shape
+ *
+ * Public-surface files (notifications.ts, threads.ts, …) pass the path
+ * *suffix only* — e.g. `request('/threads/list')`. The `/api/v1` prefix is
+ * stamped here so individual SDK files can't drift. Files that need to build
+ * a URL for the browser (e.g. `lucidos.data.url(path)`, `sse.ts`) call
+ * `apiUrl(suffix)` for the same auto-prefixing.
  */
 
 let _baseUrl = '';
 let _authToken: string | undefined;
+
+/** Sole hard-coded reference to the API version. Every other file in the SDK
+ *  routes through `request*` (which prepends this) or `apiUrl` (same). */
+const API_V1 = '/api/v1';
 
 export function configure(opts: { baseUrl?: string; token?: string }) {
   if (opts.baseUrl !== undefined) _baseUrl = opts.baseUrl;
@@ -16,6 +27,14 @@ export function configure(opts: { baseUrl?: string; token?: string }) {
 
 export function getBaseUrl(): string {
   return _baseUrl;
+}
+
+/** Resolve an `/api/v1`-relative suffix to an absolute URL (for `EventSource`,
+ *  `<script src>`, anchor hrefs, etc.). Pass the path *after* `/api/v1`, e.g.
+ *  `apiUrl('/events')` → `<baseUrl>/api/v1/events`. */
+export function apiUrl(suffix: string): string {
+  const normalized = suffix.startsWith('/') ? suffix : `/${suffix}`;
+  return `${_baseUrl}${API_V1}${normalized}`;
 }
 
 export class SdkError extends Error {
@@ -38,8 +57,9 @@ async function rawFetch(
   const headers: Record<string, string> = {};
   if (_authToken) headers['Authorization'] = `Bearer ${_authToken}`;
 
+  const normalized = path.startsWith('/') ? path : `/${path}`;
   try {
-    const res = await fetch(`${_baseUrl}${path}`, {
+    const res = await fetch(`${_baseUrl}${API_V1}${normalized}`, {
       ...init,
       signal: controller.signal,
       headers: { ...headers, ...(init?.headers as Record<string, string>) },

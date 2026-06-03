@@ -81,7 +81,7 @@ export function CredentialItem({ credential }: Props) {
           <button
             key={target.label}
             class="action-btn"
-            onClick={() => copyCredential(credential.service_name, target)}
+            onClick={() => void copyCredential(credential.service_name, target)}
           >
             Copy {target.label}
           </button>
@@ -94,7 +94,7 @@ export function CredentialItem({ credential }: Props) {
         </button>
         <button
           class="action-btn action-btn-danger"
-          onClick={() => deleteCredential(credential.service_name)}
+          onClick={() => void deleteCredential(credential.service_name)}
         >
           Delete
         </button>

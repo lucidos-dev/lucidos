@@ -1,4 +1,4 @@
-import { getBaseUrl } from './_fetch';
+import { apiUrl } from './_fetch';
 
 /**
  * Generic API proxy. Configure backends in `data/config/apis.json`:
@@ -35,7 +35,7 @@ export function proxy(name: string): ProxyClient {
   return {
     fetch(path: string, init?: RequestInit): Promise<Response> {
       const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-      return fetch(`${getBaseUrl()}/api/v1/proxy/${safeName}${normalizedPath}`, init);
+      return fetch(apiUrl(`/proxy/${safeName}${normalizedPath}`), init);
     },
   };
 }

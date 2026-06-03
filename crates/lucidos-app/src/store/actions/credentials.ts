@@ -1,6 +1,5 @@
 import {
   credentials,
-  activeInlineForm,
   closeInlineForm,
   showToast,
   showConfirm,
@@ -13,6 +12,8 @@ import {
   updateCredential,
   deleteCredentialApi,
 } from '../../api/client';
+import type { ApiResult } from '../../api/types';
+import type { UpdateCredentialBody } from '../../api/client/settings';
 import { landOnAccountsWithOverlay } from './menu';
 import { pushNavState } from './navigation';
 import { errorDetail } from '../../utils/errorDetail';
@@ -46,7 +47,28 @@ export function closeCredentialForm(): void {
   closeInlineForm();
 }
 
-export async function submitCredential(
+/** Shared success/error/reload handling for credential saves. */
+async function runCredentialSave(
+  apiCall: () => Promise<ApiResult>,
+  failMsg: string
+): Promise<boolean> {
+  try {
+    const data = await apiCall();
+    if (!data.success) {
+      showToast(data.error || failMsg, 'error');
+      return false;
+    }
+    closeCredentialForm();
+    await loadCredentials();
+    return true;
+  } catch (error) {
+    showToast(`${failMsg}: ${errorDetail(error)}`, 'error');
+    return false;
+  }
+}
+
+/** Create a brand-new credential (also used by the engine credential-request flow). */
+export async function submitNewCredential(
   service: string,
   baseUrl: string,
   authType: AuthType,
@@ -56,42 +78,28 @@ export async function submitCredential(
     showToast('Service name and base URL are required', 'error');
     return false;
   }
-
-  const form = activeInlineForm.value;
-  const editing = form?.type === 'credential' ? form.editing : undefined;
-
-  if (!editing && !authValue) {
+  if (!authValue) {
     showToast('Token/API key is required', 'error');
     return false;
   }
-
-  try {
-    if (editing && authValue) {
-      const data = await updateCredential(service, authValue);
-      if (!data.success) {
-        showToast(data.error || 'Failed to update credential', 'error');
-        return false;
-      }
-    } else if (!editing) {
-      const data = await createCredential({
+  return runCredentialSave(
+    () =>
+      createCredential({
         service_name: service,
         base_url: baseUrl,
         auth_type: authType,
         auth_value: authValue,
-      });
-      if (!data.success) {
-        showToast(data.error || 'Failed to save credential', 'error');
-        return false;
-      }
-    }
+      }),
+    'Failed to save credential'
+  );
+}
 
-    closeCredentialForm();
-    await loadCredentials();
-    return true;
-  } catch (error) {
-    showToast('Failed to save credential: ' + errorDetail(error), 'error');
-    return false;
-  }
+/** Update every editable field of an existing credential. */
+export async function submitCredentialEdit(
+  service: string,
+  body: UpdateCredentialBody
+): Promise<boolean> {
+  return runCredentialSave(() => updateCredential(service, body), 'Failed to update credential');
 }
 
 export async function deleteCredential(serviceName: string): Promise<void> {

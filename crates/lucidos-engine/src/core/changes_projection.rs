@@ -96,7 +96,8 @@ impl ChangesProjection {
 
     /// Per-commit `ChangeProposed` (empty change_id, commit_sha set): bump
     /// description, OR the restart flag, and invalidate the harden marker on
-    /// the still-pending row matched by branch.
+    /// the still-pending row matched by branch. Replay-only — no live
+    /// emitter — and UPDATE-only so replay can never create a row.
     pub(crate) async fn write_proposed_per_commit(
         tx: &mut Transaction<'_, Postgres>,
         branch_name: &str,
@@ -222,76 +223,64 @@ impl ChangesProjection {
     }
 
     // --- Read API ---
+    //
+    // Every read returns `Result<_, sqlx::Error>` so a DB outage is
+    // distinguishable from "no rows". Degradation lives at the call site,
+    // not in the projection.
 
     /// All pending changes (status = "pending"), ordered by created_at ASC.
-    pub async fn list_pending(&self) -> Vec<Change> {
+    pub async fn list_pending(&self) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE status = 'pending' ORDER BY created_at ASC"
         ))
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] list_pending: {}", e);
-            Vec::new()
-        })
     }
 
     /// Get a single change by id.
-    pub async fn get_by_id(&self, id: Uuid) -> Option<Change> {
+    pub async fn get_by_id(&self, id: Uuid) -> sqlx::Result<Option<Change>> {
         sqlx::query_as(&format!("{SELECT_CHANGE} WHERE id = $1"))
             .bind(id)
             .fetch_optional(&self.pool)
             .await
-            .unwrap_or_else(|e| {
-                crate::log!("[ChangesProjection] get_by_id({}): {}", id, e);
-                None
-            })
     }
 
     /// Get the pending change for a given branch, if one exists.
-    pub async fn get_pending_by_branch(&self, branch_name: &str) -> Option<Change> {
+    pub async fn get_pending_by_branch(&self, branch_name: &str) -> sqlx::Result<Option<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE branch_name = $1 AND status = 'pending' LIMIT 1"
         ))
         .bind(branch_name)
         .fetch_optional(&self.pool)
         .await
-        .unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] get_pending_by_branch({}): {}", branch_name, e);
-            None
-        })
     }
 
     /// All pending changes for a specific thread.
-    pub async fn pending_for_thread(&self, thread_id: Uuid) -> Vec<Change> {
+    pub async fn pending_for_thread(&self, thread_id: Uuid) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE status = 'pending' AND thread_id = $1 ORDER BY created_at ASC"
         ))
         .bind(thread_id)
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] pending_for_thread({}): {}", thread_id, e);
-            Vec::new()
-        })
     }
 
     /// Whether any pending change exists for the given branch.
-    pub async fn has_pending_for_branch(&self, branch_name: &str) -> bool {
+    pub async fn has_pending_for_branch(&self, branch_name: &str) -> sqlx::Result<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM changes WHERE status = 'pending' AND branch_name = $1)",
         )
         .bind(branch_name)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] has_pending_for_branch({}): {}", branch_name, e);
-            false
-        })
     }
 
     /// Whether any OTHER pending change exists for the given branch (excluding `exclude_id`).
-    pub async fn other_pending_for_branch(&self, branch_name: &str, exclude_id: Uuid) -> bool {
+    pub async fn other_pending_for_branch(
+        &self,
+        branch_name: &str,
+        exclude_id: Uuid,
+    ) -> sqlx::Result<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM changes \
              WHERE status = 'pending' AND branch_name = $1 AND id <> $2)",
@@ -300,28 +289,15 @@ impl ChangesProjection {
         .bind(exclude_id)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or_else(|e| {
-            crate::log!(
-                "[ChangesProjection] other_pending_for_branch({}, {}): {}",
-                branch_name,
-                exclude_id,
-                e
-            );
-            false
-        })
     }
 
     /// Distinct branch names with at least one applied or discarded change.
-    pub async fn list_completed_branches(&self) -> Vec<String> {
+    pub async fn list_completed_branches(&self) -> sqlx::Result<Vec<String>> {
         sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT branch_name FROM changes WHERE status IN ('applied', 'discarded')",
         )
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] list_completed_branches: {}", e);
-            Vec::new()
-        })
     }
 
     /// Recently applied or reverted changes, newest `resolved_at` first.
@@ -330,7 +306,7 @@ impl ChangesProjection {
         &self,
         limit: i64,
         before: Option<DateTime<Utc>>,
-    ) -> Vec<Change> {
+    ) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE status IN ('applied', 'reverted') \
              AND ($2::timestamptz IS NULL OR resolved_at < $2) \
@@ -340,21 +316,19 @@ impl ChangesProjection {
         .bind(before)
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] list_recently_applied: {}", e);
-            Vec::new()
-        })
     }
 
     /// Pending + recently applied/reverted changes for a single repo.
     /// Returns `(pending, applied, has_more)` — fetches `applied_limit + 1`
     /// internally so `has_more` reflects whether more applied items exist.
+    /// A failure on either query fails the whole call: partial results would
+    /// silently underreport `has_more` or hide pending changes.
     pub async fn list_for_repo(
         &self,
         repo_root: &str,
         applied_limit: i64,
         before: Option<DateTime<Utc>>,
-    ) -> (Vec<Change>, Vec<Change>, bool) {
+    ) -> sqlx::Result<(Vec<Change>, Vec<Change>, bool)> {
         let fetch_limit = applied_limit.max(0) + 1;
         let pending_sql = format!(
             "{SELECT_CHANGE} WHERE status = 'pending' AND repo_root = $1 \
@@ -374,25 +348,19 @@ impl ChangesProjection {
                 .fetch_all(&self.pool),
         );
 
-        let pending = pending_r.unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] list_for_repo pending: {}", e);
-            Vec::new()
-        });
-        let mut applied: Vec<Change> = applied_r.unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] list_for_repo applied: {}", e);
-            Vec::new()
-        });
+        let pending: Vec<Change> = pending_r?;
+        let mut applied: Vec<Change> = applied_r?;
 
         let has_more = applied.len() as i64 > applied_limit;
         if has_more {
             applied.truncate(applied_limit.max(0) as usize);
         }
-        (pending, applied, has_more)
+        Ok((pending, applied, has_more))
     }
 
     /// Whether any restart-required change has been applied since `since`.
     /// Used to derive the in-app "restart required" toast from durable state.
-    pub async fn requires_restart_since(&self, since: DateTime<Utc>) -> bool {
+    pub async fn requires_restart_since(&self, since: DateTime<Utc>) -> sqlx::Result<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM changes \
              WHERE status = 'applied' AND requires_restart AND resolved_at > $1)",
@@ -400,16 +368,12 @@ impl ChangesProjection {
         .bind(since)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] requires_restart_since: {}", e);
-            false
-        })
     }
 
     /// Whether any applied change since `since` touches frontend files
     /// (`.ts`, `.tsx`, `.css`, `.html`, `.js`, `.jsx`). Used to nudge clients
     /// to reload after a hot-fix.
-    pub async fn client_update_since(&self, since: DateTime<Utc>) -> bool {
+    pub async fn client_update_since(&self, since: DateTime<Utc>) -> sqlx::Result<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM changes c, unnest(c.files) AS f \
              WHERE c.status = 'applied' AND c.resolved_at > $1 \
@@ -419,17 +383,16 @@ impl ChangesProjection {
         .bind(since)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] client_update_since: {}", e);
-            false
-        })
     }
 
     /// Restart groups (one per originating thread) for restart-required
     /// applied changes since `since`. Commits from multiple changes on the
     /// same thread are merged in apply order. `thread_title` is left `None`;
     /// callers enrich via `thread_summaries` if needed.
-    pub async fn restart_groups_since(&self, since: DateTime<Utc>) -> Vec<RestartGroup> {
+    pub async fn restart_groups_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> sqlx::Result<Vec<RestartGroup>> {
         let rows: Vec<(Option<Uuid>, Vec<String>)> = sqlx::query_as(
             "SELECT thread_id, commits FROM changes \
              WHERE status = 'applied' AND requires_restart AND resolved_at > $1 \
@@ -437,11 +400,7 @@ impl ChangesProjection {
         )
         .bind(since)
         .fetch_all(&self.pool)
-        .await
-        .unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] restart_groups_since: {}", e);
-            Vec::new()
-        });
+        .await?;
 
         let mut groups: Vec<RestartGroup> = Vec::new();
         for (thread_id, commits) in rows {
@@ -459,21 +418,17 @@ impl ChangesProjection {
                 });
             }
         }
-        groups
+        Ok(groups)
     }
 
     /// Pending changes that have an active merge worktree (used for
     /// startup cleanup of stale merge dirs).
-    pub async fn with_merge_worktree(&self) -> Vec<Change> {
+    pub async fn with_merge_worktree(&self) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE status = 'pending' AND merge_worktree_path IS NOT NULL"
         ))
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_else(|e| {
-            crate::log!("[ChangesProjection] with_merge_worktree: {}", e);
-            Vec::new()
-        })
     }
 
     /// Recover change rows referenced by `events` but missing from `changes`
@@ -554,7 +509,14 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
         return Ok(false);
     };
     // Latest aggregate ChangeProposed wins for description/files/restart/hardened.
-    let latest = rows.iter().rev().find(|r| is_aggregate_proposed(r)).unwrap();
+    // Invariant: the forward `find` above returned Some, so the same predicate
+    // applied in reverse over the same `rows` slice must also match — the last
+    // matching row (= the "latest" we want here) is therefore guaranteed.
+    let latest = rows
+        .iter()
+        .rev()
+        .find(|r| is_aggregate_proposed(r))
+        .expect("forward find above guarantees at least one aggregate ChangeProposed row");
 
     let str_field = |p: &serde_json::Value, k: &str| {
         p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
@@ -664,5 +626,17 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
 }
 
 #[cfg(test)]
-#[path = "changes_projection_tests.rs"]
-mod tests;
+#[path = "changes_projection_tests/helpers.rs"]
+mod cp_helpers;
+
+#[cfg(test)]
+#[path = "changes_projection_tests/projection.rs"]
+mod projection_tests;
+
+#[cfg(test)]
+#[path = "changes_projection_tests/queries.rs"]
+mod queries_tests;
+
+#[cfg(test)]
+#[path = "changes_projection_tests/rebuild.rs"]
+mod rebuild_tests;

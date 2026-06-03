@@ -1,8 +1,10 @@
+import { apiUrl } from './_fetch';
+
 type Html2Canvas = (element: HTMLElement, opts: Record<string, unknown>) => Promise<HTMLCanvasElement>;
 
 const DOM_MAX = 48000;
 const TEXT_MAX = 150;
-const HTML2CANVAS_URL = '/api/static/html2canvas.min.js';
+const HTML2CANVAS_URL = apiUrl('/static/html2canvas.min.js');
 
 let html2canvasPromise: Promise<Html2Canvas> | undefined;
 

@@ -55,6 +55,12 @@ pub async fn run_handshake_script(
     script_rel_path: &str,
     env_vars: Vec<(String, String)>,
 ) -> Result<HandshakeOutput, RunError> {
+    // The script path comes from workspace config (`apis.json`). Reject any
+    // value that would escape the workspace tree (`..`, absolute path) before
+    // joining — otherwise a crafted config could run an arbitrary host script.
+    if crate::api::is_path_traversal(script_rel_path) {
+        return Err(RunError::NotFound(script_rel_path.to_string()));
+    }
     let script_abs = workspace_path.join(script_rel_path);
     if !script_abs.exists() {
         // The pre-check gives a clean "script not found" error before we
@@ -151,6 +157,25 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
         match err {
             RunError::NotFound(_) => {}
             other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn traversal_script_path_rejected_before_spawn() {
+        // The script path comes from workspace config (`apis.json`), so a
+        // crafted `..` escape must be rejected by the `is_path_traversal` guard
+        // before we ever join it onto the workspace and spawn python3. The
+        // traversal branch returns the *original* relative path, whereas the
+        // on-disk-not-found branch returns the joined absolute path — asserting
+        // on the relative value proves the guard fired (and is still wired in),
+        // not merely that the file happens to be absent.
+        let tmp = tempfile::tempdir().unwrap();
+        let err = run_handshake_script(tmp.path(), "../../etc/evil.py", vec![])
+            .await
+            .expect_err("traversal path must be rejected");
+        match err {
+            RunError::NotFound(p) => assert_eq!(p, "../../etc/evil.py"),
+            other => panic!("expected NotFound for traversal, got {:?}", other),
         }
     }
 

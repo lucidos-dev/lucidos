@@ -1,7 +1,9 @@
 import { test, expect, Page } from '@playwright/test';
 import { assertHealthy, waitForVisibleInput, isMobileViewport, blurActiveElement, ensureOnThreadPane, openFilesPanel } from './helpers';
 
-/** Open file search — tap on mobile, click on desktop */
+/** Open file search — tap on mobile, click on desktop. Waits for the
+ *  signal-driven Preact render to apply the open state before returning,
+ *  so callers can immediately assert on overlay/input visibility. */
 async function openFileSearch(page: Page): Promise<void> {
   await blurActiveElement(page);
   await page.waitForTimeout(100);
@@ -13,6 +15,10 @@ async function openFileSearch(page: Page): Promise<void> {
   } else {
     await btn.click();
   }
+  await page.waitForFunction(() => {
+    const overlay = document.querySelector('.file-search-overlay');
+    return overlay !== null && !overlay.classList.contains('file-search-closed');
+  }, undefined, { timeout: 3_000 });
 }
 
 async function isSearchOpen(page: Page): Promise<boolean> {

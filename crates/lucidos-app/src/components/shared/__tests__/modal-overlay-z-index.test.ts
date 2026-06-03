@@ -7,7 +7,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
-const css = readFileSync(resolve(here, '../../../styles/global.css'), 'utf-8');
+// global.css is an @import barrel; the :root design tokens live in the base partial.
+const css = readFileSync(resolve(here, '../../../styles/global/base.css'), 'utf-8');
 
 /**
  * Regression test: a modal overlay (StepDetailModal, NotificationsModal,

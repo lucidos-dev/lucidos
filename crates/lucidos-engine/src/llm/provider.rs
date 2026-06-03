@@ -38,6 +38,15 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Opaque encrypted reasoning state Gemini 3 attaches to the first
+        /// `functionCall` part of every turn. Must be echoed back verbatim
+        /// on the next request or the API rejects with HTTP 400
+        /// INVALID_ARGUMENT "Function call is missing a thought_signature".
+        /// `None` for providers / models that don't emit one (Claude,
+        /// Gemini ≤ 2.5, OpenAI). Skipped on serialize so existing event
+        /// payloads still deserialize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -63,6 +72,12 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Opaque signature Gemini 3 returns on `functionCall` parts that the
+    /// next request must echo back verbatim. Captured here so callers
+    /// (agentic loop) can plumb it into the matching `ContentBlock::ToolUse`.
+    /// `None` for providers / models that don't emit one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +110,15 @@ pub struct LlmResponse {
     /// distinguishes "thought hard then gave up" from "said nothing".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_chars: Option<usize>,
+    /// Count of SSE shapes the provider parser saw but couldn't classify
+    /// (unknown `content_block` types or unknown delta types, excluding
+    /// known-quiet metadata). Non-zero with empty content + empty
+    /// `tool_calls` means the provider's stream changed shape and the
+    /// parser dropped the model's output — the empty-completion
+    /// diagnostic surfaces this so it isn't reported as intentional
+    /// silence. Defaults to 0 for providers that don't track it.
+    #[serde(default)]
+    pub unknown_sse_dropped: u32,
 }
 
 #[async_trait]

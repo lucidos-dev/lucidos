@@ -50,7 +50,7 @@ pub(super) struct McpConsentResponse {
     pub persist_scope: Option<AllowScope>,
 }
 
-/// POST /api/mcp/consent — Respond to an MCP tool consent request.
+/// POST /api/v1/mcp/consent — Respond to an MCP tool consent request.
 ///
 /// Two distinct flows share this endpoint:
 ///   1. CC permission prompts (deduped, multi-listener) — `pending_cc_permission`
@@ -122,7 +122,7 @@ pub(super) struct McpAutoApproveRequest {
     pub auto_approve: bool,
 }
 
-/// PUT /api/mcp/auto-approve — Set auto-approve for an MCP server.
+/// PUT /api/v1/mcp/auto-approve — Set auto-approve for an MCP server.
 pub(super) async fn set_mcp_auto_approve(
     State(state): State<AppState>,
     Json(body): Json<McpAutoApproveRequest>,
@@ -138,7 +138,7 @@ pub(super) async fn set_mcp_auto_approve(
     }
 }
 
-/// GET /api/mcp/servers — List MCP servers with status.
+/// GET /api/v1/mcp/servers — List MCP servers with status.
 pub(super) async fn list_mcp_servers(State(state): State<AppState>) -> impl IntoResponse {
     match state.engine.mcp_manager.list_servers().await {
         Ok(servers) => Json(serde_json::json!({ "servers": servers })).into_response(),

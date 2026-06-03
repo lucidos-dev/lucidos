@@ -8,6 +8,7 @@ if (typeof (globalThis as any).innerWidth === 'undefined') {
   (globalThis as any).innerWidth = 1024;
 }
 if (typeof globalThis.document === 'undefined') {
+  const docListeners: Record<string, Function[]> = {};
   (globalThis as any).document = {
     createElement: (tag: string) => ({
       tagName: tag.toUpperCase(),
@@ -17,6 +18,22 @@ if (typeof globalThis.document === 'undefined') {
     }),
     querySelector: () => null,
     querySelectorAll: () => [],
+    // Default to "page is active" so isPageActive() returns true for tests
+    // that don't explicitly simulate a blurred window. Tests that want to
+    // exercise the inactive branch override document.hasFocus per-test.
+    hasFocus: () => true,
+    visibilityState: 'visible',
+    addEventListener: (type: string, fn: Function) => {
+      (docListeners[type] ??= []).push(fn);
+    },
+    removeEventListener: (type: string, fn: Function) => {
+      const fns = docListeners[type];
+      if (fns) docListeners[type] = fns.filter(f => f !== fn);
+    },
+    dispatchEvent: (event: any) => {
+      for (const fn of docListeners[event.type] ?? []) fn(event);
+      return true;
+    },
     documentElement: {
       style: { setProperty: () => {}, getPropertyValue: () => '', removeProperty: () => {} },
       toggleAttribute: () => {},
@@ -37,10 +54,25 @@ function makeStorage(): Storage {
     key: (i: number) => Object.keys(store)[i] ?? null,
   };
 }
-if (typeof globalThis.localStorage === 'undefined') {
+// Node ≥22 ships an experimental Web Storage global that throws on access
+// unless the process was started with `--localstorage-file <path>`. A bare
+// `typeof === 'undefined'` guard leaves that broken global in place, so every
+// test importing a store module crashes at import with
+// "localStorage.getItem is not a function". Install the in-memory stub
+// whenever the real one is missing OR non-functional.
+function storageWorks(s: unknown): boolean {
+  try {
+    if (!s || typeof (s as Storage).getItem !== 'function') return false;
+    (s as Storage).getItem('__probe__');
+    return true;
+  } catch {
+    return false;
+  }
+}
+if (!storageWorks((globalThis as any).localStorage)) {
   (globalThis as any).localStorage = makeStorage();
 }
-if (typeof globalThis.sessionStorage === 'undefined') {
+if (!storageWorks((globalThis as any).sessionStorage)) {
   (globalThis as any).sessionStorage = makeStorage();
 }
 // Minimal EventTarget on window — enough for addEventListener/dispatchEvent in tests.

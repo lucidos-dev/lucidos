@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { renderMarkdown } from './renderMarkdown';
+import { renderMarkdown, renderMarkdownInline } from './renderMarkdown';
 
 describe('renderMarkdown', () => {
   it('converts basic markdown to HTML', () => {
@@ -311,6 +311,69 @@ Use this pattern for all prompts.`;
       const matches = html.match(/copyable-block/g);
       // Each block has the class once in the element, so at least 2
       expect(matches!.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  describe('renderMarkdownInline (phrasing-content-only)', () => {
+    it('renders inline tokens — bold, italic, code, breaks', () => {
+      const html = renderMarkdownInline('**bold** *it* `code` line\nbreak');
+      expect(html).toContain('<strong>bold</strong>');
+      expect(html).toContain('<em>it</em>');
+      expect(html).toContain('<code>code</code>');
+      expect(html).toContain('<br');
+    });
+
+    it('does NOT emit block elements — paragraphs, lists, headings stay as literal text', () => {
+      // The whole point: the output must be safe to nest inside <button> /
+      // <span>, so block markdown is left as-is rather than wrapped in
+      // <p>/<ul>/<h*>. Otherwise we'd reintroduce the HTML-validity bug the
+      // helper exists to avoid.
+      const html = renderMarkdownInline('# heading\n- item one\n- item two');
+      expect(html).not.toContain('<p>');
+      expect(html).not.toContain('<ul>');
+      expect(html).not.toContain('<li>');
+      expect(html).not.toContain('<h1');
+      // Dashes survive as visual bullets, content is preserved.
+      expect(html).toContain('# heading');
+      expect(html).toContain('- item one');
+      expect(html).toContain('- item two');
+    });
+
+    it('strips <a> from markdown links but keeps the label text', () => {
+      // <a> is interactive content; inside the AskUserQuestion option <button>
+      // that's interactive-in-interactive (HTML spec violation). The renderer
+      // returns label text only.
+      const html = renderMarkdownInline('see [docs](https://example.com) for more');
+      expect(html).not.toContain('<a ');
+      expect(html).not.toContain('href');
+      expect(html).toContain('see docs for more');
+    });
+
+    it('preserves nested inline markdown inside link text after stripping', () => {
+      // Without parser.parseInline on the link's child tokens, **bold** inside
+      // link text would survive as literal asterisks instead of <strong>.
+      const html = renderMarkdownInline('[**bold link**](https://x)');
+      expect(html).toContain('<strong>bold link</strong>');
+      expect(html).not.toContain('<a ');
+    });
+
+    it('discards javascript:-scheme link targets along with the wrapper', () => {
+      // Bonus property of dropping the href: dangerous URL schemes never reach
+      // the DOM. The label text survives, the target does not.
+      const html = renderMarkdownInline('[click me](javascript:alert(1))');
+      expect(html).toContain('click me');
+      expect(html).not.toContain('javascript:');
+      expect(html).not.toContain('<a ');
+    });
+
+    it('still escapes dangerous tags from raw source', () => {
+      const html = renderMarkdownInline('try <script>x</script> here');
+      expect(html).not.toContain('<script>');
+      expect(html).toContain('&lt;script&gt;');
+    });
+
+    it('handles empty input', () => {
+      expect(renderMarkdownInline('')).toBe('');
     });
   });
 

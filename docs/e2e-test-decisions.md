@@ -33,7 +33,7 @@ Lucidos uses HTTPS even in dev (Vite TLS). Both Playwright (`ignoreHTTPSErrors: 
 Both test layers read the workspace ports from `<workspace>/.lucidos/ports`. The workspace path is configurable via `E2E_WORKSPACE` environment variable, defaulting to `~/workspaces/e2e-test`.
 
 ### Unknown API routes return SPA fallback
-The engine proxies unknown `/api/*` routes to Vite, which returns the SPA HTML fallback with status 200. The Rust error test verifies the response is not valid JSON (i.e., it's HTML) rather than asserting a specific HTTP status code.
+The engine proxies unknown `/api/v1/*` routes to Vite, which returns the SPA HTML fallback with status 200. The Rust error test verifies the response is not valid JSON (i.e., it's HTML) rather than asserting a specific HTTP status code.
 
 ### Unique message markers
 Every test uses `uniqueMessage(prefix)` to generate collision-free messages with timestamps and random suffixes. This prevents test interference when running against a shared workspace with existing data.
@@ -45,7 +45,7 @@ Several tests send messages to the LLM and assert on responses. These tests use 
 The streaming test captures text at two points during response generation. It asserts both snapshots are truthy (content appeared) rather than asserting the second is longer than the first, which is flaky with fast models that complete before the 1.5s delay.
 
 ### Rust API test module structure
-Rust's module system doesn't allow both `tests/api.rs` and `tests/api/mod.rs`. The solution uses `#[path]` attributes in `tests/api.rs` (in the `lucidos-e2e` crate) to include submodules from a `tests/api_support/` directory.
+Rust's module system doesn't allow both `tests/api.rs` and `tests/api/v1/mod.rs`. The solution uses `#[path]` attributes in `tests/api.rs` (in the `lucidos-e2e` crate) to include submodules from a `tests/api_support/` directory.
 
 ### Separate `lucidos-e2e` crate
 API tests live in their own workspace member crate, not in `lucidos-engine`'s `tests/`. This keeps `cargo test -p lucidos-engine` from compiling them (so it stays fast and infra-free) and removes the need for `#[ignore]` on tests that require a running workspace. Run via `./scripts/e2e-api.sh` or the umbrella `./scripts/e2e.sh`.

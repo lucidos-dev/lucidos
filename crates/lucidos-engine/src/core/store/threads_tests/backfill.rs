@@ -1,0 +1,224 @@
+use super::*;
+use super::test_helpers::*;
+
+#[tokio::test]
+async fn backfill_trigger_id_rewrites_v5_hashes_to_config_ids() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let live_config_id = "5633f3e1-110c-4df4-a6fc-c0df8fd36df4";
+    let v5_hash = crate::scheduler::trigger_id_to_uuid(live_config_id).to_string();
+    let untouched_config_id = "08f22aed-ab0f-498d-83d7-2d7e420141ff";
+
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, aggregate, aggregate_id) \
+             VALUES ($1, 'TriggerCreated', $2, 'trigger', $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(serde_json::json!({"trigger_id": live_config_id, "name": "Job Listing Check"}))
+    .bind(live_config_id)
+    .execute(&pool)
+    .await
+    .expect("insert TriggerCreated");
+
+    let legacy = insert_trigger_thread(&pool, &v5_hash, "Job Listing Check", 60).await;
+    let already_correct =
+        insert_trigger_thread(&pool, untouched_config_id, "Check Bank Balance", 60).await;
+    let orphan_v5 = insert_trigger_thread(
+        &pool,
+        "deadbeef-dead-5eed-dead-deaddeaddead",
+        "Some deleted trigger",
+        60,
+    )
+    .await;
+
+    let updated = store
+        .backfill_trigger_id_v5_to_config_id()
+        .await
+        .expect("backfill");
+    assert_eq!(updated, 1, "exactly one row had a known v5 hash");
+
+    let legacy_after: String =
+        sqlx::query_scalar("SELECT trigger_id FROM thread_summaries WHERE thread_id = $1")
+            .bind(legacy)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(legacy_after, live_config_id);
+
+    let untouched_after: String =
+        sqlx::query_scalar("SELECT trigger_id FROM thread_summaries WHERE thread_id = $1")
+            .bind(already_correct)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(untouched_after, untouched_config_id);
+
+    let orphan_after: String =
+        sqlx::query_scalar("SELECT trigger_id FROM thread_summaries WHERE thread_id = $1")
+            .bind(orphan_v5)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        orphan_after, "deadbeef-dead-5eed-dead-deaddeaddead",
+        "v5 hash with no matching TriggerCreated stays as-is"
+    );
+
+    let second = store
+        .backfill_trigger_id_v5_to_config_id()
+        .await
+        .expect("idempotent");
+    assert_eq!(second, 0, "second run touches nothing");
+
+    teardown_test_db(&db).await;
+}
+
+/// Regression for the work-workspace bug where every trigger thread
+/// rendered with NULL `trigger_id` because the
+/// `20260429214800_addtriggeridtothreadsummaries.sql` backfill only read
+/// `payload->>'trigger_id'` and ignored legacy events that stored the id
+/// under `task_id`. The runtime backfill below recovers the value from
+/// `events`, COALESCEing both shapes.
+#[tokio::test]
+async fn backfill_trigger_id_from_events_reads_legacy_task_id() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let legacy = insert_null_trigger_thread(&pool, 90).await;
+    insert_trigger_started_event(
+        &pool,
+        legacy,
+        serde_json::json!({
+            "task_id": "364d689e-0620-5712-9739-c9ceb1d12fe1",
+            "task_name": "Legacy Trigger",
+            "channel": "trigger",
+        }),
+    )
+    .await;
+
+    let modern = insert_null_trigger_thread(&pool, 60).await;
+    insert_trigger_started_event(
+        &pool,
+        modern,
+        serde_json::json!({
+            "trigger_id": "a969c963-dbc0-4f5f-8ebb-58c7f2b80c96",
+            "trigger_name": "Modern Trigger",
+            "channel": "trigger",
+        }),
+    )
+    .await;
+
+    // Already-set trigger_id must NOT be overwritten — the runtime
+    // projection populated it, so events would just confirm what's there.
+    let preset = insert_trigger_thread(&pool, "preset-id", "Preset Name", 30).await;
+    insert_trigger_started_event(
+        &pool,
+        preset,
+        serde_json::json!({
+            "trigger_id": "different-id-should-be-ignored",
+            "trigger_name": "Different Name",
+        }),
+    )
+    .await;
+
+    // Trigger-source thread with no TriggerStarted event in `events`
+    // (corruption / lost event). Must stay NULL — never invent values.
+    let orphan = insert_null_trigger_thread(&pool, 20).await;
+
+    let updated = store
+        .backfill_trigger_id_from_events()
+        .await
+        .expect("backfill_trigger_id_from_events");
+    assert_eq!(updated, 2, "two NULL-trigger rows had matching events");
+
+    let (legacy_id, legacy_name) = fetch_trigger_pair(&pool, legacy).await;
+    assert_eq!(
+        legacy_id.as_deref(),
+        Some("364d689e-0620-5712-9739-c9ceb1d12fe1"),
+        "legacy task_id must be COALESCEd into trigger_id"
+    );
+    assert_eq!(legacy_name.as_deref(), Some("Legacy Trigger"));
+
+    let (modern_id, modern_name) = fetch_trigger_pair(&pool, modern).await;
+    assert_eq!(
+        modern_id.as_deref(),
+        Some("a969c963-dbc0-4f5f-8ebb-58c7f2b80c96")
+    );
+    assert_eq!(modern_name.as_deref(), Some("Modern Trigger"));
+
+    let (preset_id, preset_name) = fetch_trigger_pair(&pool, preset).await;
+    assert_eq!(
+        preset_id.as_deref(),
+        Some("preset-id"),
+        "row that already had trigger_id must not be overwritten"
+    );
+    assert_eq!(preset_name.as_deref(), Some("Preset Name"));
+
+    let (orphan_id, orphan_name) = fetch_trigger_pair(&pool, orphan).await;
+    assert_eq!(orphan_id, None, "no event = no value invented");
+    assert_eq!(orphan_name, None);
+
+    let second = store
+        .backfill_trigger_id_from_events()
+        .await
+        .expect("idempotent");
+    assert_eq!(second, 0, "second run touches nothing (marker set)");
+
+    teardown_test_db(&db).await;
+}
+
+/// Reproduce the original work-workspace bug end-to-end: a legacy event
+/// with `task_id` set to the v5 hash of `config.id`, and a NULL row in
+/// `thread_summaries`. After both backfills run in startup order the
+/// dropdown filter (which sends `config.id`) must match.
+#[tokio::test]
+async fn both_backfills_compose_legacy_task_id_to_config_id() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let config_id = "a969c963-dbc0-4f5f-8ebb-58c7f2b80c96";
+    let v5_hash = crate::scheduler::trigger_id_to_uuid(config_id).to_string();
+
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, aggregate, aggregate_id) \
+             VALUES ($1, 'TriggerCreated', $2, 'trigger', $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(serde_json::json!({"trigger_id": config_id, "name": "UA Analysis Runner"}))
+    .bind(config_id)
+    .execute(&pool)
+    .await
+    .expect("insert TriggerCreated");
+
+    let thread = insert_null_trigger_thread(&pool, 60).await;
+    insert_trigger_started_event(
+        &pool,
+        thread,
+        serde_json::json!({
+            "task_id": v5_hash,
+            "task_name": "UA Analysis Runner",
+        }),
+    )
+    .await;
+
+    let from_events = store
+        .backfill_trigger_id_from_events()
+        .await
+        .expect("step 1");
+    assert_eq!(from_events, 1);
+    let v5_to_cfg = store
+        .backfill_trigger_id_v5_to_config_id()
+        .await
+        .expect("step 2");
+    assert_eq!(v5_to_cfg, 1);
+
+    let (final_id, _) = fetch_trigger_pair(&pool, thread).await;
+    assert_eq!(
+        final_id.as_deref(),
+        Some(config_id),
+        "legacy task_id (v5 hash) must end up as the live config.id so the dropdown filter matches"
+    );
+
+    teardown_test_db(&db).await;
+}

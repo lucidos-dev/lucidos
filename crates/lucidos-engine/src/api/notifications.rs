@@ -1,6 +1,108 @@
 use super::*;
 
+use crate::scheduler::notifications::Tap;
 use crate::scheduler::{NotificationStore, PushSubscriptionStore};
+
+/// Body for `POST /api/v1/notifications` — used by the `lucidos notify` CLI
+/// (and any other engine subprocess) to send a push notification without
+/// going through an LLM thread / `send_notification` tool. Mirrors the LLM
+/// tool's shape: `title` and `message` required, `app_id` / `thread_id` /
+/// `tap` optional with the same deep-link semantics.
+#[derive(Debug, Deserialize)]
+pub(super) struct CreateNotificationRequest {
+    pub title: String,
+    pub message: String,
+    #[serde(default)]
+    pub app_id: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Specific event UUID inside `thread_id` to deep-link to. When set the
+    /// inbox modal's "Open thread" button and a `Tap::Navigate { to.target =
+    /// Thread, to.event_id = .. }` tap scroll and briefly pulse this event on
+    /// land. Ignored without `thread_id`.
+    #[serde(default)]
+    pub event_id: Option<String>,
+    /// Structured tap behavior — see [`Tap`]. Absent / null defaults to
+    /// `Tap::Modal`. The serde decode rejects the old string forms
+    /// ("modal" / "open_app" / "open_thread" / "none") so out-of-date scripts
+    /// fail loudly with a 400 instead of silently routing to the inbox.
+    #[serde(default)]
+    pub tap: Option<Tap>,
+}
+
+fn bad_request(msg: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": msg.into() })),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/notifications` — script-facing endpoint that produces the
+/// same notification a `send_notification` LLM tool call would: persisted
+/// to the inbox AND pushed to subscribed devices, with the same `app_id`
+/// deep-link semantics. Shares its body with `execute_send_notification`
+/// via `LucidosEngine::create_notification`.
+pub(super) async fn create_notification(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateNotificationRequest>,
+) -> Response {
+    if body.title.trim().is_empty() {
+        return bad_request("title is required");
+    }
+    if body.message.trim().is_empty() {
+        return bad_request("message is required");
+    }
+
+    let app_id = body
+        .app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let link_thread_id = match super::parse_optional_uuid_trimmed(body.thread_id.as_deref()) {
+        Ok(v) => v,
+        Err(raw) => return bad_request(format!("invalid thread_id: {raw}")),
+    };
+
+    let link_event_id = match super::parse_optional_uuid_trimmed(body.event_id.as_deref()) {
+        Ok(v) => v,
+        Err(raw) => return bad_request(format!("invalid event_id: {raw}")),
+    };
+
+    // Structured tap — `to.target`-specific required fields (e.g. `app_id`
+    // for `target=app`) are enforced by the page-side router, not here.
+    // The serde decode above already rejected malformed shapes with 400.
+    let tap = body.tap.unwrap_or_default();
+
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+
+    match state
+        .engine
+        .create_notification(
+            &body.title,
+            &body.message,
+            app_id,
+            link_thread_id,
+            link_event_id,
+            tap,
+            actor,
+        )
+        .await
+    {
+        Ok(id) => Json(serde_json::json!({
+            "success": true,
+            "notification_id": id.to_string(),
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
 
 // ===== Notification Endpoints =====
 
@@ -11,6 +113,10 @@ pub(super) async fn get_notifications(
     let filter = query.filter.as_deref().unwrap_or("all");
     // Clamp upper bound so a misconfigured client can't ask for an unbounded
     // page; sibling list endpoints (changes, applied changes) cap at 100 too.
+    // Lower bound is 0 — `refreshUnreadCount` deliberately passes limit=0 to
+    // fetch only the unread_count without items, so we honor it explicitly
+    // below instead of bumping it to 1 (which would waste one DB row per call
+    // and the caller would discard it anyway).
     let limit = query.limit.clamp(0, 100);
 
     let before_ts = query.before.map(super::parse_unix_ts);
@@ -24,6 +130,18 @@ pub(super) async fn get_notifications(
                 format!("Failed to count notifications: {}", e),
             )
         })?;
+
+    // Short-circuit limit=0: skip the row fetch and return an empty list with
+    // has_more=false. Without this, the old code would `get_filtered(.., 1, ..)`
+    // then truncate(0), reporting `has_more=true` for a page the caller cannot
+    // reach.
+    if limit == 0 {
+        return Ok(Json(NotificationsResponse {
+            notifications: Vec::new(),
+            unread_count,
+            has_more: false,
+        }));
+    }
 
     // Fetch limit+1 to detect has_more
     let mut items = NotificationStore::get_filtered(&state.pool, filter, limit + 1, before_ts)
@@ -93,20 +211,20 @@ pub(super) async fn mark_notification_read(
         })?;
 
     if success {
-        let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
         state
             .engine
             .event_bus
-            .emit_or_log(
-                crate::engine::event_bus::BusEvent::System(
-                    crate::engine::event_bus::SystemEvent::NotificationRead {
-                        id: id.to_string(),
-                        actor,
-                    },
-                ),
-                "[Notifications] NotificationRead",
-            )
+            .emit_user_system(&headers, &state.pool, "[Notifications] NotificationRead", |actor| {
+                crate::engine::event_bus::SystemEvent::NotificationRead {
+                    id: id.to_string(),
+                    actor,
+                }
+            })
             .await;
+        // No cross-device read-marker push — see work-tracker
+        // `pwa-read-on-another-device-noise`. OS-level banners on other
+        // devices persist until manually swiped; in-app unread state still
+        // syncs via the `NotificationRead` SSE event above.
     }
 
     Ok(Json(MarkReadResponse { success }))
@@ -127,17 +245,15 @@ pub(super) async fn mark_all_notifications_read(
         })?;
 
     if count > 0 {
-        let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
         state
             .engine
             .event_bus
-            .emit_or_log(
-                crate::engine::event_bus::BusEvent::System(
-                    crate::engine::event_bus::SystemEvent::NotificationsAllRead { actor },
-                ),
-                "[Notifications] NotificationsAllRead",
-            )
+            .emit_user_system(&headers, &state.pool, "[Notifications] NotificationsAllRead", |actor| {
+                crate::engine::event_bus::SystemEvent::NotificationsAllRead { actor }
+            })
             .await;
+        // No cross-device read-marker push — see work-tracker
+        // `pwa-read-on-another-device-noise`.
     }
 
     Ok(Json(MarkReadResponse { success: count > 0 }))
@@ -163,7 +279,7 @@ pub(super) async fn get_notification(
 
 // ===== Push Notification Endpoints =====
 
-/// GET /api/push/vapid-key — return the VAPID public key for browser subscription
+/// GET /api/v1/push/vapid-key — return the VAPID public key for browser subscription
 pub(super) async fn get_vapid_key(
     State(state): State<AppState>,
 ) -> Result<Json<VapidKeyResponse>, (StatusCode, String)> {
@@ -181,7 +297,7 @@ pub(super) async fn get_vapid_key(
     }))
 }
 
-/// POST /api/push/subscribe — store a browser push subscription
+/// POST /api/v1/push/subscribe — store a browser push subscription
 pub(super) async fn push_subscribe(
     State(state): State<AppState>,
     Json(request): Json<PushSubscribeRequest>,
@@ -198,7 +314,7 @@ pub(super) async fn push_subscribe(
     }
 }
 
-/// POST /api/push/unsubscribe — remove a browser push subscription
+/// POST /api/v1/push/unsubscribe — remove a browser push subscription
 pub(super) async fn push_unsubscribe(
     State(state): State<AppState>,
     Json(request): Json<PushUnsubscribeRequest>,
@@ -209,117 +325,70 @@ pub(super) async fn push_unsubscribe(
     }
 }
 
-/// POST /api/notification-clicked — SW notificationclick stores the tapped notification ID.
-/// Bypasses client-side IDB/Cache/postMessage issues on iOS Safari by using
-/// a simple server round-trip that both SW and page can access via fetch().
-pub(super) async fn notification_clicked(
+// ===== Test-only push log =====
+//
+// Backs the `expectPushSent` / `expectNoPushSent` helpers used by Playwright
+// e2e tests. The handler, the query/row types, and the route registration
+// in api/mod.rs are all gated on the `e2e-test-hooks` cargo feature; the
+// production binary never compiles them in. See
+// system-knowhow/notifications.md §5.4.
+
+#[cfg(feature = "e2e-test-hooks")]
+#[derive(serde::Deserialize)]
+pub(super) struct PushLogQuery {
+    #[serde(default)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub notification_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub(super) struct PushLogEntry {
+    pub device_id: String,
+    pub notification_id: uuid::Uuid,
+    pub sent_at: chrono::DateTime<chrono::Utc>,
+    /// The push payload bytes the engine would have encrypted + sent. Let
+    /// e2e tests assert on the Declarative Web Push envelope shape rather
+    /// than just delivery. Nullable for rows that pre-date the migration —
+    /// always populated by the current write path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+}
+
+/// GET /api/v1/_test/push-log — return rows the push-transport stub appended
+/// (see crates/lucidos-engine/src/scheduler/push_test_log.rs). Optional
+/// `since`, `notification_id`, `device_id` filter the result; the response
+/// is sorted ascending by `sent_at` for deterministic test assertions.
+#[cfg(feature = "e2e-test-hooks")]
+pub(super) async fn get_push_log(
     State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
-) -> StatusCode {
-    if let Some(id) = body.get("notification_id").and_then(|v| v.as_str()) {
-        *state.pending_notification_click.lock().unwrap() = Some(id.to_string());
-    }
-    StatusCode::NO_CONTENT
+    Query(q): Query<PushLogQuery>,
+) -> Result<Json<Vec<PushLogEntry>>, (StatusCode, String)> {
+    // Build the query with positional binds. sqlx::query_as won't accept
+    // optional WHERE clauses dynamically, so use a fixed SELECT with
+    // COALESCE-style "match all when filter absent" expressions.
+    let rows: Vec<PushLogEntry> = sqlx::query_as::<_, PushLogEntry>(
+        "SELECT device_id, notification_id, sent_at, payload FROM push_log \
+         WHERE ($1::timestamptz IS NULL OR sent_at >= $1) \
+           AND ($2::uuid IS NULL OR notification_id = $2) \
+           AND ($3::text IS NULL OR device_id = $3) \
+         ORDER BY sent_at ASC",
+    )
+    .bind(q.since)
+    .bind(q.notification_id)
+    .bind(q.device_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to query push_log: {}", e),
+        )
+    })?;
+
+    Ok(Json(rows))
 }
 
-/// GET /api/notification-clicked — returns and clears the pending notification ID.
-pub(super) async fn get_notification_clicked(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
-    let id = state.pending_notification_click.lock().unwrap().take();
-    Json(serde_json::json!({ "notification_id": id }))
-}
-
-/// POST /api/notification-pushed — SW push event stores the notification ID.
-/// This is a fallback for iOS where notificationclick fires too late (after
-/// the page's visibilitychange check) or doesn't fire at all on warm resume.
-pub(super) async fn notification_pushed(
-    State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
-) -> StatusCode {
-    if let Some(id) = body.get("notification_id").and_then(|v| v.as_str()) {
-        *state.pending_notification_push.lock().unwrap() =
-            Some((id.to_string(), std::time::Instant::now()));
-    }
-    StatusCode::NO_CONTENT
-}
-
-/// GET /api/notification-pushed — returns and clears the pending push notification ID,
-/// but only if it was stored within the last 60 seconds (avoids showing stale pushes
-/// when the user opens the app independently).
-pub(super) async fn get_notification_pushed(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
-    let maybe = state.pending_notification_push.lock().unwrap().take();
-    let id = maybe.and_then(|(id, at)| {
-        if at.elapsed() < std::time::Duration::from_secs(60) {
-            Some(id)
-        } else {
-            None
-        }
-    });
-    Json(serde_json::json!({ "notification_id": id }))
-}
-
-/// Clear the pending push if it matches the dismissed notification id.
-fn clear_pending_push_if_matches(
-    pending: &std::sync::Arc<std::sync::Mutex<Option<(String, std::time::Instant)>>>,
-    dismissed_id: &str,
-) {
-    let mut guard = pending.lock().unwrap();
-    if guard.as_ref().is_some_and(|(stored, _)| stored == dismissed_id) {
-        *guard = None;
-    }
-}
-
-/// POST /api/notification-dismissed — SW notificationclose clears the pending push
-/// when the user dismisses the OS notification (close button or notification-center
-/// swipe). Without this, the push fallback (/api/notification-pushed, 60s window)
-/// fires the next time the app gains focus, auto-opening the modal for a
-/// notification the user explicitly dismissed.
-pub(super) async fn notification_dismissed(
-    State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
-) -> StatusCode {
-    if let Some(id) = body.get("notification_id").and_then(|v| v.as_str()) {
-        clear_pending_push_if_matches(&state.pending_notification_push, id);
-    }
-    StatusCode::NO_CONTENT
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-    use std::time::Instant;
-
-    fn pending_with(id: &str) -> Arc<Mutex<Option<(String, Instant)>>> {
-        Arc::new(Mutex::new(Some((id.to_string(), Instant::now()))))
-    }
-
-    #[test]
-    fn dismiss_clears_pending_when_id_matches() {
-        let pending = pending_with("notif-abc");
-        clear_pending_push_if_matches(&pending, "notif-abc");
-        assert!(pending.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn dismiss_keeps_pending_when_id_differs() {
-        // Push for notif-A is stored, but the user dismisses notif-B (e.g. an
-        // earlier push that was overwritten before the user touched it). The
-        // newer pending entry must survive.
-        let pending = pending_with("notif-A");
-        clear_pending_push_if_matches(&pending, "notif-B");
-        let guard = pending.lock().unwrap();
-        let (kept, _) = guard.as_ref().expect("pending should still be set");
-        assert_eq!(kept, "notif-A");
-    }
-
-    #[test]
-    fn dismiss_is_noop_when_no_pending() {
-        let pending: Arc<Mutex<Option<(String, Instant)>>> = Arc::new(Mutex::new(None));
-        clear_pending_push_if_matches(&pending, "notif-abc");
-        assert!(pending.lock().unwrap().is_none());
-    }
-}

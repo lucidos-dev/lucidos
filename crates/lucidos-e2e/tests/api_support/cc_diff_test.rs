@@ -3,7 +3,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 /// External-repo CC threads idled before the May-2026 cleanup consolidation
-/// kept their branch + `cc_has_changes=true` after `agent_recovery` removed
+/// kept their branch + `coding_agent_proposed=true` after `agent_recovery` removed
 /// the worktree dir. The handler used to 404 with "Worktree not found on disk"
 /// even though the diff was still recoverable from `SessionStarted.repo_id` +
 /// `branch`.
@@ -76,7 +76,7 @@ async fn cc_diff_falls_back_to_branch_when_worktree_missing() {
 
     let resp = client
         .get(format!(
-            "{}/api/threads/{}/cc-diff",
+            "{}/api/v1/threads/{}/cc-diff",
             base_url(),
             thread_id
         ))

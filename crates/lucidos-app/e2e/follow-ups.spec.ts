@@ -3,6 +3,7 @@ import {
   navigateToApp, sendMessage, sendFollowUp, waitForResponse,
   uniqueMessage, assertHealthy, countExchanges, newThread,
   waitForStreamingToStart, assertUserMessagesVisible, countVisibleResponses,
+  waitForVisibleResponseCount,
 } from './helpers';
 
 test.describe('Follow-ups during and after streaming', () => {
@@ -68,6 +69,9 @@ test.describe('Follow-ups during and after streaming', () => {
     const exchanges = await countExchanges(page);
     expect(exchanges).toBeGreaterThanOrEqual(2);
 
+    // The waitForResponse() above can resolve before the follow-up turn streams
+    // (turn 1's label is already settled), so wait for the end-state first.
+    await waitForVisibleResponseCount(page, 2);
     const responseCount = await countVisibleResponses(page);
     expect(responseCount).toBeGreaterThanOrEqual(2);
   });
@@ -124,6 +128,10 @@ test.describe('Follow-ups during and after streaming', () => {
 
     await assertUserMessagesVisible(page, markers);
 
+    // The final waitForResponse() in the loop can resolve before the third turn
+    // streams (the prior turn's label is already settled), so wait for the
+    // end-state — three responses with content — before counting.
+    await waitForVisibleResponseCount(page, 3);
     const responseCount = await countVisibleResponses(page);
     expect(responseCount).toBeGreaterThanOrEqual(3);
   });

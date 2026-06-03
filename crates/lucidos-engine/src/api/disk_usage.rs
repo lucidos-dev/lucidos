@@ -7,10 +7,10 @@
 //!
 //! Endpoints:
 //!
-//! - `GET  /api/disk-usage/worktrees`               — inventory of all
+//! - `GET  /api/v1/disk-usage/worktrees`               — inventory of all
 //!   `<workspace>/.lucidos/worktrees/thread-<short>` directories paired
 //!   with their thread metadata, sorted by size descending.
-//! - `POST /api/disk-usage/worktrees/:thread_id/cleanup` with body
+//! - `POST /api/v1/disk-usage/worktrees/:thread_id/cleanup` with body
 //!   `{ "tier": 1 | 2 | 3 }`:
 //!   - **Tier 1** strips regenerable build artifacts (`target/`,
 //!     `node_modules/`, `.lucidos/cache/`). Worktree dir stays.
@@ -37,11 +37,12 @@ use crate::engine::git_ops::worktrees_dir;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::worktree_cleanup::{
     available_disk_bytes, deterministic_worktree_for, directory_size_bytes, inventory_worktrees,
-    is_worktree_dirty, prune_build_artifacts, remove_worktree_and_optionally_delete_branch,
-    FREE_DISK_HARD_BYTES, FREE_DISK_SOFT_BYTES,
+    is_worktree_dirty, prune_build_artifacts, remove_stranded_worktree,
+    remove_worktree_and_optionally_delete_branch, worktree_git_admin_missing, FREE_DISK_HARD_BYTES,
+    FREE_DISK_SOFT_BYTES,
 };
 
-/// GET /api/disk-usage/worktrees — inventory of all known per-thread worktrees.
+/// GET /api/v1/disk-usage/worktrees — inventory of all known per-thread worktrees.
 pub(super) async fn list_worktrees(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -49,7 +50,7 @@ pub(super) async fn list_worktrees(
     Ok(Json(serde_json::json!({ "worktrees": rows })))
 }
 
-/// Body for `POST /api/disk-usage/worktrees/:thread_id/cleanup`.
+/// Body for `POST /api/v1/disk-usage/worktrees/:thread_id/cleanup`.
 #[derive(Debug, Deserialize)]
 pub struct CleanupRequest {
     /// 1 = strip build artifacts; 2 = remove worktree (clean only);
@@ -57,7 +58,7 @@ pub struct CleanupRequest {
     pub tier: u8,
 }
 
-/// POST /api/disk-usage/worktrees/:thread_id/cleanup — on-demand cleanup.
+/// POST /api/v1/disk-usage/worktrees/:thread_id/cleanup — on-demand cleanup.
 pub(super) async fn cleanup_worktree(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -89,15 +90,31 @@ pub(super) async fn cleanup_worktree(
             (freed, false)
         }
         2 | 3 => {
-            let outcome = remove_worktree_and_optionally_delete_branch(&worktree, None)
-                .await
-                .ok_or_else(|| {
+            // Stranded worktree (git admin dir gone): the git-based helper
+            // can't resolve a repo root and would 500. Remove the directory
+            // directly — the inventory already surfaces these rows as dirty, so
+            // the UI reaches here via tier 3 (force).
+            if worktree_git_admin_missing(&worktree) {
+                let dir = worktrees_dir(state.engine.workspace_path());
+                let pre_size = directory_size_bytes(&worktree);
+                let freed = remove_stranded_worktree(&dir, &worktree, pre_size).ok_or_else(|| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to remove worktree".to_string(),
+                        "Failed to remove stranded worktree".to_string(),
                     )
                 })?;
-            (outcome.freed_bytes, outcome.branch_deleted)
+                (freed, false)
+            } else {
+                let outcome = remove_worktree_and_optionally_delete_branch(&worktree, None)
+                    .await
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to remove worktree".to_string(),
+                        )
+                    })?;
+                (outcome.freed_bytes, outcome.branch_deleted)
+            }
         }
         other => {
             return Err((
@@ -137,7 +154,7 @@ pub(super) async fn cleanup_worktree(
     })))
 }
 
-/// GET /api/disk-usage/summary — free-disk stats + thresholds for the page header.
+/// GET /api/v1/disk-usage/summary — free-disk stats + thresholds for the page header.
 ///
 /// `free_bytes` and `total_bytes` are `null` when the OS disk-info call fails
 /// (rare; typically only when the workspace volume is unreadable). Frontend

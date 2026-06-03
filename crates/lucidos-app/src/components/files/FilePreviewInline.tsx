@@ -8,6 +8,8 @@ import { isMobile, viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { ApiError, fetchKnowhowEntries, knowhowPreviewPath, type KnowhowEntry } from '../../api/client';
 import { openFilePreview } from '../../store/actions/artifacts';
+import { RENDERABLE_EXTS } from './previewExts';
+import { LoadableError } from '../shared/LoadableError';
 
 const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp'];
 // .ogg is treated as audio (Vorbis/Opus is by far the most common modern usage);
@@ -21,9 +23,6 @@ const textExts = [
   'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'log', 'sql', 'graphql',
   'vue', 'svelte', 'slides',
 ];
-
-/** Extensions that have a rendered view and can toggle to source. */
-export const RENDERABLE_EXTS = ['md', 'html', 'htm', 'csv', 'svg', 'slides'];
 
 /** Last `/`-separated segment of `path`, or `''` for empty / trailing-slash input. */
 export function basename(path: string): string {
@@ -82,10 +81,10 @@ function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string;
   if (loadable.status === 'failed') {
     const knowhowPath = loadable.httpCode === 404 ? toKnowhowId(path) : null;
     return (
-      <div class="empty-state error-text">
-        <p>Failed to load: {loadable.error}</p>
+      <>
+        <LoadableError noun="file" error={loadable.error} />
         {knowhowPath && <KnowhowSuggestions missingId={knowhowPath} />}
-      </div>
+      </>
     );
   }
   if (loadable.status !== 'loaded') return showLoading ? <div class="loading-spinner" /> : null;

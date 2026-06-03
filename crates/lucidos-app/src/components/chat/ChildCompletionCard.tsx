@@ -1,4 +1,4 @@
-import { focusThread } from '../../store/actions/threads';
+import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import type { ChildCompletionStatus } from '../../store/thread-events';
 
@@ -47,7 +47,7 @@ export function ChildCompletionCard(props: Props) {
         <button
           type="button"
           class="accent-link"
-          onClick={() => focusThread(props.childThreadId)}
+          onClick={() => focusThreadOrBootstrap(props.childThreadId)}
           data-thread-id={props.childThreadId}
         >
           {titleText}

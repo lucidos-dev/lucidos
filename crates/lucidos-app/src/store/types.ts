@@ -58,6 +58,12 @@ export interface Step {
   contextCapture?: ContextCapture;
 }
 
+/** API role bucket a `ContextSection` belongs to. Mirrors the three buckets
+ *  in the LLM API call: the system prompt, prior messages (verbatim resume
+ *  tool blocks), and this turn's user message. Wire values come from the
+ *  Rust `ContextRole` enum with `#[serde(rename_all = "snake_case")]`. */
+export type ContextRole = 'system' | 'prior_message' | 'user';
+
 /** One labeled chunk of the LLM's assembled prompt. `char_count` is the
  *  original length; `content` is omitted when the `capture_context`
  *  preference is off (the modal still renders the section with its name and
@@ -66,6 +72,14 @@ export interface ContextSection {
   name: string;
   content?: string;
   char_count: number;
+  /** Optional for backward compatibility with snapshots persisted before
+   *  role-tagging existed. Default is `'user'` (matches Rust
+   *  `default_context_role`). */
+  role?: ContextRole;
+  /** Inner-group label used by the viewer to nest sections within the
+   *  user-message role. Absent for system-role sections, prior-message rows,
+   *  and legacy events. */
+  group?: string;
 }
 
 /** `cache_*` are Anthropic-only; zero on OpenAI / Gemini. */
@@ -80,7 +94,13 @@ export type ContextProducer = 'main_llm' | 'claude_code';
 
 /** Mirrors the Rust `ContextCaptured` ThreadEvent. `usage` is absent on
  *  pre-call snapshots and on providers that don't report it (OpenAI,
- *  Gemini). `legacy` is set by `synthesizeContextCapture` for old rows. */
+ *  Gemini). `legacy` is set by `synthesizeContextCapture` for old rows.
+ *
+ *  `sections_stripped` + `event_id` cover the lazy-load contract: the
+ *  snapshot endpoint drops `sections` and `tools` to keep the events
+ *  list cheap (a single capture can be ~50 kB; a heavy thread carries
+ *  hundreds). When the user opens the step-detail modal, the frontend
+ *  fetches the full sections + tools via `GET /events/:event_id/context`. */
 export interface ContextCapture {
   producer: ContextProducer;
   model: string;
@@ -91,6 +111,12 @@ export interface ContextCapture {
   usage?: ApiUsage;
   trimmed: boolean;
   legacy?: boolean;
+  /** Server stripped sections + tools on this snapshot. Modal must lazy-fetch. */
+  sections_stripped?: boolean;
+  /** Event id used by the lazy-fetch endpoint. Stamped by `capturedEventToData`
+   *  from the originating row. Absent on legacy syntheses (those have no single
+   *  source event to fetch). */
+  event_id?: string;
 }
 
 /** @deprecated kept for the `ResponseEvent.context` slot until that wiring
@@ -120,6 +146,16 @@ export type ResponseEvent =
       created?: string;
       result?: string;
       result_images?: string[];
+      /** `true` when the source ToolResult event had its `result` field
+       *  stripped on the snapshot endpoint (see `strip_tool_result_content`
+       *  in `api/threads.rs`). Paired with `result_event_id` so the
+       *  step-detail modal can lazy-fetch the full text on open. */
+      result_stripped?: boolean;
+      /** The `_eventId` of the source ToolResult event — populated whenever
+       *  the snapshot replay routed the result onto this step. Live SSE
+       *  emits also stamp it. Used as the route key for
+       *  `GET /events/:event_id/tool-result`. */
+      result_event_id?: string;
       /** @deprecated kept for legacy backend payloads. */
       context?: ContextAssembledData;
       contextCapture?: ContextCapture;
@@ -147,23 +183,44 @@ export type ResponseEvent =
       resolved?: { allowed: boolean; reason?: string };
     };
 
+import type { Tap } from '@lucidos/sdk';
+
 // A notification
 export interface Notification {
   id: string;
   task_id?: string;
   app_id?: string;
-  /** Originating thread, when the notification has one. Drives the inbox
-   *  modal's "Open thread" action. */
+  /** Originating thread, when the notification has one. Used by the §4
+   *  in-app matrix to drive Row 1's auto-mark-read when the user is
+   *  looking at the source thread. Distinct from `tap.to.id` on a
+   *  `tap.kind === 'navigate'` to a thread — that's the navigation target. */
   thread_id?: string;
+  /** Specific event UUID inside `thread_id` that raised this notification —
+   *  used by the §4 in-app matrix to silently mark-read when the user is
+   *  looking at the source event. Distinct from `tap.to.event_id` (which
+   *  controls the scroll-and-pulse target when the tap navigates). */
+  event_id?: string;
   title: string;
   message: string;
   created_at: string;
   read: boolean;
+  tap?: Tap;
 }
 
 export type TriggerRun =
   | { type: 'intent'; intent: string }
   | { type: 'script'; path: string };
+
+/** One event a trigger listens for, with an optional payload filter scoped
+ *  to that event. A trigger fires when an incoming event matches any entry's
+ *  `event_type` AND that entry's `condition` (if set) evaluates true against
+ *  the payload. Conditions are per-entry, so a single trigger can subscribe
+ *  to events with different payload shapes without one filter constraining
+ *  the others. */
+export interface EventSubscription {
+  event_type: string;
+  condition?: Record<string, unknown>;
+}
 
 // A trigger config (event-sourced).
 // Configs may be schedule-only, event-only, or hybrid; `deriveTriggerType()`
@@ -178,18 +235,36 @@ export interface TriggerInfo {
   last_run?: string;
   next_run?: string;
   run: TriggerRun;
-  on?: string;
-  condition?: Record<string, unknown>;
+  /** Event subscriptions. Engine omits the field when there are none, so
+   *  readers must tolerate absence. */
+  on?: EventSubscription[];
   app_id?: string;
   /** When true, threads spawned by this trigger surface in REVIEW on completion
-   *  instead of going straight to HISTORY. Absent or false = HISTORY (default). */
+   *  instead of going straight to ARCHIVE. Absent or false = ARCHIVE (default). */
   go_to_review?: boolean;
+  /** Owning *trigger group* id; absent renders the trigger under the implicit
+   *  "Ungrouped" section in the panel. Orthogonal to `app_id`. */
+  group_id?: string;
 }
 
-/** An active (non-paused) trigger has no more runs when it has no next_run and no event trigger.
+/** A user-visible folder that organizes triggers in the panel. Pure label —
+ *  belongs to no agent, has no schedule, runs no code. Sorted by `order` asc;
+ *  ties broken by `created`. */
+export interface TriggerGroup {
+  id: string;
+  name: string;
+  order: number;
+  /** RFC3339 UTC timestamp from the originating `TriggerGroupCreated` event. */
+  created: string;
+  /** Number of triggers whose `group_id` references this group at fetch time.
+   *  Used by the panel to render the "(N)" badge on the section header. */
+  member_count: number;
+}
+
+/** An active (non-paused) trigger has no more runs when it has no next_run and no event subscriptions.
  *  Paused triggers are "Paused", not "No more runs". */
 export function hasNoMoreRuns(trigger: TriggerInfo): boolean {
-  return !trigger.paused && !trigger.next_run && !trigger.on;
+  return !trigger.paused && !trigger.next_run && !(trigger.on && trigger.on.length > 0);
 }
 
 /** A trigger that has ever spawned a thread. `name` and `last_activity` are
@@ -205,7 +280,7 @@ export type TriggerType = 'schedule' | 'event' | 'hybrid';
 
 export function deriveTriggerType(trigger: TriggerInfo): TriggerType {
   const hasCron = trigger.cron_expressions.length > 0;
-  const hasEvent = !!trigger.on;
+  const hasEvent = !!(trigger.on && trigger.on.length > 0);
   if (hasCron && hasEvent) return 'hybrid';
   if (hasEvent) return 'event';
   return 'schedule';
@@ -218,7 +293,26 @@ export interface CredentialInfo {
   service_name: string;
   base_url: string;
   auth_type: AuthType;
+  auth_header: string;
   created_at: string;
+}
+
+// Email account server settings (no password) — used to pre-fill the edit form
+// for an `email_password` credential. Mirrors the engine's `EmailAccountInfo`.
+export interface EmailAccountInfo {
+  id: string;
+  name: string;
+  email_address: string;
+  imap_host: string;
+  imap_port: number;
+  smtp_host: string;
+  smtp_port: number;
+  username: string;
+  use_tls: boolean;
+  require_send_confirmation: boolean;
+  oauth_account_id: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 // An OAuth connected account
@@ -304,6 +398,17 @@ export interface CredentialRequest {
   base_url?: string;
   auth_type?: AuthType;
   prompt?: string;
+  /** Pre-fill values for `oauth_client` requests. The agent supplies these from
+   *  the `oauth-providers` system-knowhow (auth/token/userinfo URLs + default
+   *  scopes) so the modal pre-fills them. Absence — or a missing field —
+   *  signals "not pre-filled": the modal auto-expands its endpoint section so
+   *  the user fills the URLs in by hand. */
+  defaults?: {
+    auth_url?: string;
+    token_url?: string;
+    userinfo_url?: string | null;
+    scopes?: string;
+  };
 }
 
 /** Plugin install awaiting user confirmation in the install panel. Mirrors

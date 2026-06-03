@@ -4,14 +4,16 @@ import {
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
   activeMenuItem, repositories, showToast,
   panelOverlay, parseRepoPath, encodeRepoPath, SELECTED_CHANGE_KEY,
+  threadMap,
 } from '../store';
-import { listRepoFiles, getChangeDiff, getChangeById, getRepoChanges, getThreadCcDiff } from '../../api/client';
+import { listRepoFiles, getChangeDiff, getChangeById, getRepoChanges, getThreadCcDiff, ApiError } from '../../api/client';
 import type { Change, ThreadCcDiff } from '../../api/client';
 import { toFailed, loadedOr, setLoadingIfFresh } from '../types';
 import { revealContentPane } from './pane';
 import { loadRepositories } from './chat';
 import { pushNavState, replaceNavState } from './navigation';
 import { errorDetail } from '../../utils/errorDetail';
+import { appIdFromFolder } from '../../utils/appIdFromFolder';
 
 export async function switchRepoSource(repoId: string | null): Promise<void> {
   repoSource.value = repoId;
@@ -203,8 +205,10 @@ export async function loadChangeContextById(changeId: string): Promise<void> {
 
 /** Restore the user's last-selected change after a reload. Without this, the
  *  Files panel always lands on the All Files tree even if the user was
- *  viewing a Diff. Stale IDs (change deleted, pruned) are dropped silently —
- *  surfacing a toast on every reload would be noise. */
+ *  viewing a Diff. Only definitively-gone IDs (404 from the engine) drop the
+ *  saved id; transient failures (network, 5xx) keep it so the next reload
+ *  retries — silently nuking on transient errors would lose the user's
+ *  selection because of a momentary outage. */
 export async function restoreRepoSelectionFromStorage(): Promise<void> {
   const savedId = localStorage.getItem(SELECTED_CHANGE_KEY);
   if (!savedId) return;
@@ -219,8 +223,11 @@ export async function restoreRepoSelectionFromStorage(): Promise<void> {
   try {
     const change = await getChangeById(savedId);
     await loadChangeContext(change);
-  } catch {
-    localStorage.removeItem(SELECTED_CHANGE_KEY);
+  } catch (e) {
+    if (e instanceof ApiError && e.httpCode === 404) {
+      localStorage.removeItem(SELECTED_CHANGE_KEY);
+    }
+    // Transient errors (network, 5xx): keep the saved id and let next reload retry.
   }
 }
 
@@ -246,8 +253,17 @@ export function openRepoFilePreview(path: string, mode: 'file' | 'diff'): void {
   else pushNavState();
 }
 
-/** Open the Files panel on the 3-dot diff of a CC worktree's branch — for
- *  external-repo sessions that have no `Change` row to bind to. */
+/** Open the Files panel on the 3-dot diff of a CC worktree's branch.
+ *
+ *  Three flavors of CC threads land here:
+ *  - **External-repo / Lucidos-source**: the worktree's git root maps to a
+ *    registered `Repository` row. Bind to that repo and load file tree at the
+ *    branch ref alongside the diff.
+ *  - **App coding-agent**: the worktree's git root is the *workspace* (not a
+ *    registered repo). Skip the registry lookup, stub `repoFiles` to empty
+ *    (the "All Files" tab is meaningless without a registered repo), and pump
+ *    the diff straight into the Changes view. The backend already scopes the
+ *    response to `data/apps/<id>/`. */
 export async function viewThreadCcDiff(threadId: string): Promise<void> {
   activeMenuItem.value = 'files';
   panelOverlay.value = null;
@@ -274,7 +290,31 @@ export async function viewThreadCcDiff(threadId: string): Promise<void> {
 
   const repos = loadedOr(repositories.value, []);
   const repo = repos.find(r => r.path === diff.repo_root);
+
   if (!repo) {
+    const meta = threadMap.value.get(threadId)?.meta;
+    if (meta?.codingAgentKind === 'app') {
+      // App CC thread: no registered repo to bind to. The backend's response
+      // is already scoped to data/apps/<id>/. Route through switchRepoSource
+      // first to wipe any prior registered-repo state (repoExpandedFolders,
+      // selectedLines, repoChanges) — then layer the app-CC diff over the
+      // clean slate. Without the reset, lingering signals from a previous
+      // repo session would still observe stale paths.
+      const appId = appIdFromFolder(meta.codingAgentFolder);
+      await switchRepoSource(null);
+      repoPending.value = {
+        branch_name: diff.branch_name,
+        files: diff.files.map(f => f.path),
+        description: appId
+          ? `${diff.branch_name} vs ${diff.base_ref} — ${appId}`
+          : `${diff.branch_name} vs ${diff.base_ref}`,
+        thread_id: threadId,
+      };
+      repoViewMode.value = 'changes';
+      repoDiff.value = { status: 'loaded', data: { files: diff.files } };
+      pushNavState();
+      return;
+    }
     repoDiff.value = { status: 'not-loaded' };
     showToast(
       `Repo at ${diff.repo_root} is not registered — add it under Repositories to browse files`,

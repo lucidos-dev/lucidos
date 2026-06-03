@@ -39,7 +39,7 @@ test.describe('Apply and discard changes', () => {
     const change = createTestChange(suffix);
 
     try {
-      const resp = await page.request.post(`/api/changes/${change.id}/apply`);
+      const resp = await page.request.post(`/api/v1/changes/${change.id}/apply`);
       expect(resp.ok()).toBeTruthy();
       const body = await resp.json();
       expect(body.message).toBeTruthy();
@@ -65,7 +65,7 @@ test.describe('Apply and discard changes', () => {
     const change = createTestChange(suffix);
 
     try {
-      const resp = await page.request.post(`/api/changes/${change.id}/discard`);
+      const resp = await page.request.post(`/api/v1/changes/${change.id}/discard`);
       expect(resp.ok()).toBeTruthy();
       const body = await resp.json();
       expect(body.message).toContain('discarded');
@@ -75,7 +75,7 @@ test.describe('Apply and discard changes', () => {
       expect(fileExists).toBe('no');
 
       // Verify the change is no longer in the pending list
-      const changesResp = await page.request.get('/api/changes');
+      const changesResp = await page.request.get('/api/v1/changes');
       expect(changesResp.ok()).toBeTruthy();
       const changesBody = await changesResp.json();
       const pending = changesBody.pending as Array<{ id: string }>;
@@ -91,7 +91,7 @@ test.describe('Apply and discard changes', () => {
 
     try {
       // Verify our test change appears in pending list
-      const changesResp = await page.request.get('/api/changes');
+      const changesResp = await page.request.get('/api/v1/changes');
       const changesBody = await changesResp.json();
       const pending = changesBody.pending as Array<{ id: string; description: string }>;
       const ourChange = pending.find(c => c.id === change.id);
@@ -99,11 +99,11 @@ test.describe('Apply and discard changes', () => {
       expect(ourChange!.description).toContain(suffix);
 
       // Apply via API
-      const applyResp = await page.request.post(`/api/changes/${change.id}/apply`);
+      const applyResp = await page.request.post(`/api/v1/changes/${change.id}/apply`);
       expect(applyResp.ok()).toBeTruthy();
 
       // Verify it moved to applied list
-      const afterResp = await page.request.get('/api/changes');
+      const afterResp = await page.request.get('/api/v1/changes');
       const afterBody = await afterResp.json();
       const afterPending = afterBody.pending as Array<{ id: string }>;
       expect(afterPending.find(c => c.id === change.id)).toBeUndefined();
@@ -121,13 +121,13 @@ test.describe('Apply and discard changes', () => {
     const change2 = createTestChange(suffix2);
 
     try {
-      const resp = await page.request.post('/api/changes/discard-all');
+      const resp = await page.request.post('/api/v1/changes/discard-all');
       expect(resp.ok()).toBeTruthy();
       const body = await resp.json();
       expect(body.message).toContain('discarded');
 
       // Verify no pending changes remain for our test changes
-      const changesResp = await page.request.get('/api/changes');
+      const changesResp = await page.request.get('/api/v1/changes');
       const changesBody = await changesResp.json();
       const pending = changesBody.pending as Array<{ id: string }>;
       expect(pending.find(c => c.id === change1.id)).toBeUndefined();
@@ -144,11 +144,11 @@ test.describe('Apply and discard changes', () => {
 
     try {
       // Apply first time
-      const resp1 = await page.request.post(`/api/changes/${change.id}/apply`);
+      const resp1 = await page.request.post(`/api/v1/changes/${change.id}/apply`);
       expect(resp1.ok()).toBeTruthy();
 
       // Apply second time — should either succeed idempotently or return error
-      const resp2 = await page.request.post(`/api/changes/${change.id}/apply`, {
+      const resp2 = await page.request.post(`/api/v1/changes/${change.id}/apply`, {
         failOnStatusCode: false,
       });
       // The API may return 200 (idempotent) or 400 (already applied) — both are valid
@@ -164,7 +164,7 @@ test.describe('Apply and discard changes', () => {
 
   test('discarding non-existent change returns error', async ({ page }) => {
     const fakeId = randomUUID();
-    const resp = await page.request.post(`/api/changes/${fakeId}/discard`, {
+    const resp = await page.request.post(`/api/v1/changes/${fakeId}/discard`, {
       failOnStatusCode: false,
     });
     expect(resp.status()).toBeGreaterThanOrEqual(400);

@@ -14,8 +14,8 @@
 //!   `docs/plans/2026-04-24-cc-resume-spike-q7.md` for the deferral
 //!   rationale.
 //!
-//! - `ContinueSignal` — emitted by the recovery path (Phase 5.3) when a
-//!   mid-turn-interrupted CC session needs to resume without a new user
+//! - `ContinuationRequested` — emitted by the recovery path (Phase 5.3) when a
+//!   mid-turn-interrupted Claude Code session needs to resume without a new user
 //!   message. Production-active: the dispatcher pushes a [`SpawnRequest`]
 //!   onto an mpsc channel that a long-running task on `LucidosEngine`
 //!   consumes, calling `run_direct_agent` with empty input so CC re-enters
@@ -29,7 +29,7 @@
 //!
 //! Phase 3 (`PermissionResolved`) is still blocked by the spike outcome
 //! documented in `docs/plans/2026-04-24-cc-resume-spike-q7.md`. Until then
-//! the [`SpawnTrigger`] enum carries only `UserMessage` and `ContinueSignal`.
+//! the [`SpawnTrigger`] enum carries only `UserMessage` and `ContinuationRequested`.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -51,13 +51,13 @@ use crate::engine::thread_events::{EventChannel, ThreadEvent};
 /// `SpawnRequest` and a receiver branch — never a string discriminator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnRequest {
-    /// Re-enter a CC session that was interrupted mid-turn. The receiver
+    /// Re-enter a Claude Code session that was interrupted mid-turn. The receiver
     /// invokes `run_direct_agent` with empty input so CC reconnects via
     /// `--resume` against its existing session id and continues without a
     /// new user message.
     Continue {
         thread_id: Uuid,
-        /// The originating `ContinueSignal` event id — used downstream for
+        /// The originating `ContinuationRequested` event id — used downstream for
         /// idempotency and tracing.
         event_id: Uuid,
     },
@@ -87,13 +87,13 @@ pub(crate) enum SpawnTrigger {
     /// in an interrupted state. The spawn re-enters CC with the prior context
     /// and no new prompt. Production-active: the dispatcher pushes a
     /// [`SpawnRequest::Continue`] onto its outbound channel.
-    ContinueSignal { thread_id: Uuid, event_id: Uuid },
+    ContinuationRequested { thread_id: Uuid, event_id: Uuid },
 }
 
 impl SpawnTrigger {
     pub(crate) fn event_id(&self) -> Uuid {
         match self {
-            Self::UserMessage { event_id, .. } | Self::ContinueSignal { event_id, .. } => {
+            Self::UserMessage { event_id, .. } | Self::ContinuationRequested { event_id, .. } => {
                 *event_id
             }
         }
@@ -101,7 +101,7 @@ impl SpawnTrigger {
 }
 
 /// Subscribes to the EventBus and dispatches CC spawns based on classified
-/// triggers. Production-active for `ContinueSignal`; shadow-only for
+/// triggers. Production-active for `ContinuationRequested`; shadow-only for
 /// `UserMessage` (see module-level docs).
 pub struct SpawnDispatcher {
     pool: PgPool,
@@ -109,7 +109,7 @@ pub struct SpawnDispatcher {
     /// Outbound channel — the dispatcher sends [`SpawnRequest`]s here and a
     /// receiver task on `LucidosEngine` calls `run_direct_agent` for each.
     /// `Unbounded` because dropping a continuation request would leave a
-    /// thread stuck "Working" forever; the volume of `ContinueSignal`s is
+    /// thread stuck "Working" forever; the volume of `ContinuationRequested`s is
     /// inherently bounded by the number of mid-turn-interrupted threads on
     /// startup, not by ambient traffic.
     spawn_tx: UnboundedSender<SpawnRequest>,
@@ -218,7 +218,7 @@ impl SpawnDispatcher {
             ThreadEvent::MessageReceived { text, .. } => {
                 // Only CC-channel messages drive the CC dispatcher. Chat-channel
                 // messages reach the regular LLM loop and are out of scope.
-                let is_cc_channel = meta.channel.as_ref() == Some(&EventChannel::CodingAgent);
+                let is_cc_channel = meta.channel.as_ref() == Some(&EventChannel::ClaudeCode);
                 if !is_cc_channel {
                     return None;
                 }
@@ -228,7 +228,7 @@ impl SpawnDispatcher {
                     text: text.clone(),
                 })
             }
-            ThreadEvent::ContinueSignal { .. } => Some(SpawnTrigger::ContinueSignal {
+            ThreadEvent::ContinuationRequested { .. } => Some(SpawnTrigger::ContinuationRequested {
                 thread_id: *thread_id,
                 event_id,
             }),
@@ -274,7 +274,7 @@ impl SpawnDispatcher {
 
     /// Mark a trigger as handled and route it according to its kind.
     ///
-    /// - `ContinueSignal`: send a [`SpawnRequest::Continue`] on the outbound
+    /// - `ContinuationRequested`: send a [`SpawnRequest::Continue`] on the outbound
     ///   channel for the engine-side receiver to actuate.
     /// - `UserMessage`: shadow only — log + counter bump. The chat HTTP
     ///   handler still owns spawning for this trigger.
@@ -286,7 +286,7 @@ impl SpawnDispatcher {
             .insert(trigger.event_id());
 
         match trigger {
-            SpawnTrigger::ContinueSignal {
+            SpawnTrigger::ContinuationRequested {
                 thread_id,
                 event_id,
             } => {
@@ -327,7 +327,7 @@ impl SpawnDispatcher {
     }
 
     /// On startup, prime the in-memory idempotency set with every recent
-    /// trigger event whose CC session has already produced a follow-up event.
+    /// trigger event whose Claude Code session has already produced a follow-up event.
     /// Without this, the broadcast replay (or events arriving immediately
     /// after subscribe) would re-dispatch every historical user message.
     ///

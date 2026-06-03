@@ -1,0 +1,963 @@
+/* Thread toggle inside chat pane — mobile only */
+.thread-pane-toggle {
+    display: none;
+}
+
+/* ThreadDrawer inside ThreadPane — mobile only, hidden on desktop */
+.thread-pane > .thread-drawer {
+    display: none;
+}
+
+/* thread-pane-body wrapper — transparent on desktop */
+.thread-pane-body {
+    display: contents;
+}
+
+/* Wrapper for repo selector + input mode toggle */
+.input-toggles-wrapper {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.125rem;
+    width: fit-content;
+    padding: 0.375rem 0 0.375rem 0.375rem;
+    transition: opacity var(--duration-slow) ease;
+}
+
+/* Fade out wrapper when transitioning to a focused thread */
+.input-toggles-wrapper.fading-out {
+    opacity: 0;
+    position: absolute;
+    width: 100%;
+    pointer-events: none;
+}
+
+
+.cc-repo-submenu {
+    display: flex;
+    align-items: center;
+    gap: 0.125rem;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
+
+.cc-repo-submenu .cc-repo-selector {
+    margin-bottom: 0;
+    flex-shrink: 1;
+    min-width: 0;
+}
+
+.cc-repo-submenu .cc-repo-selector .dropdown-trigger {
+    min-width: 0;
+}
+
+.cc-repo-submenu .cc-repo-selector .dropdown-sizer > *,
+.cc-repo-submenu .cc-repo-selector .dropdown-option {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Input target tab toggle — uses .segmented-control / .segmented-btn */
+.input-target-tabs {
+    position: relative;
+}
+
+.prompt-input-container {
+    width: 100%;
+    max-width: var(--content-max-width);
+    margin: 0 auto;
+    position: relative;
+}
+
+.url-context-pill {
+    padding: 0.25rem 0.625rem;
+    margin-bottom: 0.375rem;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-radius: 1rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    cursor: default;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    max-width: 100%;
+}
+.url-context-pill svg {
+    flex-shrink: 0;
+    opacity: 0.7;
+}
+.url-context-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.image-preview-strip {
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.5rem 0;
+    flex-wrap: wrap;
+}
+
+.image-preview-item {
+    position: relative;
+    width: 5rem;
+    height: 5rem;
+    border-radius: 0.375rem;
+    border: 1px solid var(--border-color);
+}
+
+.image-preview-thumb {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    cursor: pointer;
+    border-radius: 0.3125rem;
+    overflow: hidden;
+}
+
+/* Overlay close button for image thumbnails */
+.image-preview-remove {
+    position: absolute;
+    top: -0.375rem;
+    right: -0.375rem;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    color: #fff;
+    padding: 0;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.image-preview-remove svg {
+    width: 0.75rem;
+    height: 0.75rem;
+}
+
+@media (hover: hover) {
+    .image-preview-remove:hover {
+        background: var(--accent-red);
+        color: white;
+        border-color: var(--accent-red);
+    }
+}
+
+/* User image thumbnails in chat exchange */
+.user-images {
+    display: flex;
+    gap: 0.375rem;
+    margin-top: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.user-image-thumb {
+    width: 5rem;
+    height: 5rem;
+    object-fit: cover;
+    border-radius: 0.25rem;
+    border: 1px solid var(--border-color);
+    cursor: pointer;
+    /* Skeleton-toned fill so the loading <img> doesn't show the dark page
+       background through it (the visible "black flash" on iOS PWA when
+       the preview re-fetches after HTTP-cache eviction). */
+    background-color: var(--bg-tertiary);
+}
+
+/* Generated image inline in response */
+.generated-image {
+    margin: 0.75rem 0;
+}
+
+.prompt-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    position: relative;
+}
+
+.prompt-row .prompt-textarea {
+    flex: 1;
+}
+
+.prompt-clear {
+    color: var(--text-muted);
+    align-self: flex-start;
+    margin-top: 0.5rem;
+    margin-right: 0.5rem;
+    flex-shrink: 0;
+}
+
+@media (max-width: 768px) {
+    .prompt-clear {
+        width: 2.25rem;
+        height: 2.25rem;
+        margin-top: 0.125rem;
+        margin-right: 0.125rem;
+        padding: 0;
+        justify-content: center;
+        -webkit-tap-highlight-color: transparent;
+    }
+
+    .prompt-clear svg {
+        width: var(--icon-size-lg);
+        height: var(--icon-size-lg);
+    }
+}
+
+.prompt-actions-row {
+    display: flex;
+    align-items: flex-end;
+    padding: 0 0.75rem 0.5rem 0.5rem;
+    /* Anchor for absolutely-positioned fade-out children. The row width is
+     * stable across cluster reflows, unlike .prompt-actions-right (which has
+     * margin-left:auto and shifts when its leftmost child leaves flow). */
+    position: relative;
+}
+
+.image-attach-anchor {
+    position: relative;
+}
+
+/* Center-align the 2.25rem image icon with the shorter action buttons:
+ * shift its visual box ~6px down so the SVG center matches the action
+ * button center. Tap area moves with it but stays inside the row's
+ * 0.5rem bottom padding. */
+.prompt-actions-row .icon-btn.header-icon {
+    transform: translateY(0.375rem);
+}
+
+.prompt-actions-right {
+    display: flex;
+    align-items: flex-end;
+    gap: 0.5rem;
+    margin-left: auto;
+}
+
+/* Stacked variant — useFitsInOneRow detected overflow, so the secondary
+ * button (Diff for the banner, Discard draft for compose) lifts onto a
+ * sub-row directly above the primary buttons. Stays inside this column so
+ * the icons (siblings on the left of .prompt-actions-row) don't introduce a
+ * tall flex-end gap above the primary sub-row. */
+.prompt-actions-right.is-stacked {
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.5rem;
+}
+
+.prompt-actions-subrow {
+    display: flex;
+    align-items: flex-end;
+    gap: 0.5rem;
+}
+
+.save-thread-btn {
+    padding-right: 1rem;
+}
+
+.changes-bulk-actions {
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.625rem 0.75rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.change-description {
+    display: block;
+    font-size: 0.75rem;
+    font-weight: 400;
+}
+
+.cc-control-menu {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.cc-commands-btn {
+    flex-shrink: 0;
+    transition: color 0.3s ease;
+}
+
+.cc-commands-btn svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+}
+
+.cc-commands-btn-active {
+    color: var(--initiator-cc);
+    animation: cc-connect-pulse 0.6s ease-out;
+}
+
+@keyframes cc-connect-pulse {
+    0% { transform: scale(1); }
+    40% { transform: scale(1.3); }
+    100% { transform: scale(1); }
+}
+
+@media (hover: hover) {
+    .cc-commands-btn:hover:not(:disabled) {
+        color: var(--accent);
+    }
+}
+
+.cc-control-dropdown {
+    position: absolute;
+    bottom: calc(100% + 0.375rem);
+    left: 0;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-sm);
+    min-width: 12rem;
+    height: 20rem;
+    overflow-y: auto;
+    z-index: 100;
+}
+
+.cc-control-list {
+    display: flex;
+    flex-direction: column;
+    padding: 0.25rem;
+}
+
+.cc-control-filter {
+    margin: 0.25rem;
+}
+
+.cc-control-empty {
+    padding: 0.5rem 0.625rem;
+    font-size: 0.8125rem;
+    color: var(--text-secondary);
+}
+
+.cc-control-section-label {
+    padding: 0.25rem 0.625rem;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.cc-control-item {
+    display: block;
+    width: 100%;
+    padding: 0.375rem 0.625rem;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 0.25rem;
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    cursor: pointer;
+}
+
+.cc-control-item:hover,
+.cc-control-item-active {
+    background: var(--bg-hover);
+}
+
+.cc-control-option {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.cc-control-option-label {
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.cc-control-checkmark {
+    color: var(--accent);
+    font-size: 0.75rem;
+    font-weight: 700;
+}
+
+.cc-control-current-value {
+    color: var(--text-muted);
+    font-weight: 400;
+}
+
+.cc-control-option-current {
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.cc-control-option-desc {
+    font-size: 0.6875rem;
+    color: var(--text-secondary);
+}
+
+.cc-control-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    padding: 0.5rem;
+}
+
+.cc-control-form-title {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.cc-control-input {
+    padding: 0.375rem 0.5rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+}
+
+.cc-control-input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.cc-control-form-actions {
+    display: flex;
+    gap: 0.375rem;
+    justify-content: flex-end;
+}
+
+.image-attach-menu {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 0.25rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    box-shadow: var(--shadow-md);
+    overflow: hidden;
+    z-index: var(--z-dropdown);
+    min-width: 8.75rem;
+}
+
+.image-attach-menu button,
+.image-attach-menu label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    background: none;
+    border: none;
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    font-family: var(--font-ui);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+@media (hover: hover) {
+    .image-attach-menu button:hover,
+    .image-attach-menu label:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.image-attach-menu button svg,
+.image-attach-menu label svg {
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+/* Camera capture overlay */
+.camera-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: 500;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.camera-container {
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    overflow: hidden;
+    max-width: 40rem;
+    width: 90%;
+}
+
+.camera-video {
+    width: 100%;
+    display: block;
+    background: #000;
+}
+
+.camera-controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    padding: 0.75rem;
+}
+
+.camera-capture-btn {
+    width: 3rem;
+    height: 3rem;
+    border-radius: 50%;
+    border: 0.1875rem solid var(--text-primary);
+    background: none;
+    color: var(--text-primary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity 0.15s;
+}
+
+@media (hover: hover) {
+    .camera-capture-btn:hover {
+        opacity: 0.8;
+    }
+}
+
+.thread-content-wrap {
+    flex: 1;
+    position: relative;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.thread-content {
+    display: none;
+    min-height: 3.75rem;
+    /* Use absolute positioning instead of height: 100% — iOS Safari (WebKit) doesn't
+       resolve percentage heights correctly when the parent's height comes from flex: 1.
+       Parent .thread-content-wrap has position: relative, so inset: 0 fills it. */
+    position: absolute;
+    inset: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overflow-anchor: none; /* manual scroll anchoring — prevent browser interference */
+    overscroll-behavior: contain;
+    padding: 0.5rem 0.75rem 0.75rem;
+}
+
+.thread-content.visible {
+    display: block;
+}
+
+/* Constrain transcript children to the same width as the prompt below so
+   messages line up with it on wide screens. The scroll container itself
+   stays full-width to keep the scrollbar at the pane edge. */
+.thread-content > * {
+    max-width: var(--content-max-width);
+    margin-left: auto;
+    margin-right: auto;
+}
+
+/* Spinner is always visible — no opacity animation. iOS Safari drops CSS
+   animations inside scroll-snap containers after prolonged use, leaving
+   the spinner permanently at opacity:0 and the screen completely blank. */
+
+/* Clipping container for thread-view slide animation — thread slides in
+   from the bottom, clipped so it doesn't bleed over the prompt area. */
+.thread-view-clip {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* Slide the entire thread (title + content) up from below.
+   The parent .thread-view-clip clips the sliding element. */
+.thread-view.revealing {
+    animation: thread-slide-in var(--duration-slow) ease-out both;
+}
+
+@keyframes thread-slide-in {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .thread-view.revealing {
+        animation: none;
+    }
+}
+
+.scroll-to-top,
+.scroll-to-bottom {
+    position: absolute;
+    right: 1.125rem;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+    backdrop-filter: blur(0.5rem);
+    -webkit-backdrop-filter: blur(0.5rem);
+    border: 0.125rem solid var(--border-color);
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s, background-color 0.15s, color 0.15s, border-color 0.15s;
+    z-index: calc(var(--z-float) + 1);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+}
+
+.scroll-to-top { top: max(calc(env(safe-area-inset-top, 0px) + 0.75rem), calc(var(--mobile-header-height, 0rem) + 0.25rem)); }
+.scroll-to-bottom { bottom: 0.75rem; }
+
+.scroll-to-top.visible,
+.scroll-to-bottom.visible {
+    opacity: 0.85;
+    pointer-events: auto;
+}
+
+@media (min-width: 769px) {
+    .scroll-to-top,
+    .scroll-to-bottom {
+        right: 1.8125rem;
+    }
+}
+
+@media (hover: hover) {
+    .scroll-to-top { top: max(0.75rem, calc(env(safe-area-inset-top, 0px) + 0.75rem)); }
+    .scroll-to-top:hover,
+    .scroll-to-bottom:hover {
+        opacity: 1;
+        background: var(--bg-hover);
+        color: var(--text-primary);
+        border-color: var(--text-muted);
+    }
+}
+
+.load-more-trigger {
+    min-height: 1px;
+    display: flex;
+    justify-content: center;
+    padding: 0.5rem 0;
+}
+
+.load-more-trigger .loading-text {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+}
+
+.artifacts-desktop {
+    padding: 0.25rem 0.5rem;
+    min-height: 6.25rem;
+}
+
+.artifacts-desktop:empty::before {
+    content: 'No files yet';
+    display: block;
+    text-align: center;
+    padding: 1.5rem;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
+
+.artifact-icon {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    padding: 0.75rem;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background-color 0.2s;
+}
+
+@media (hover: hover) {
+    .artifact-icon:hover {
+        border-color: var(--accent);
+        background: var(--bg-tertiary);
+    }
+}
+
+.artifact-icon .emoji {
+    font-size: 1.75rem;
+    margin-bottom: 0.375rem;
+}
+
+.artifact-icon .name {
+    font-size: 0.6875rem;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.exchange-status-label {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+}
+
+.exchange-status-check {
+    color: var(--accent-green);
+    font-size: 0.8rem;
+    font-weight: bold;
+    margin-left: -0.1875rem;
+    vertical-align: middle;
+}
+
+.exchange-status-x {
+    color: var(--accent-red);
+    font-size: 0.8rem;
+    font-weight: bold;
+}
+
+.exchange-status-warning {
+    color: var(--accent-yellow);
+    font-size: 0.8rem;
+    font-weight: bold;
+}
+
+.exchange-status-queued {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+}
+
+.exchange-status-awaiting {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    font-weight: bold;
+}
+
+.exchange-status-continued {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+}
+
+
+.progress-dot {
+    display: inline-block;
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: 50%;
+}
+
+.progress-dot-waiting {
+    background: var(--text-secondary);
+    animation: cc-pulse 2s ease-in-out infinite;
+}
+
+.progress-dot-changes {
+    background: var(--text-secondary);
+}
+
+.thread-status-question-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 0.7rem;
+    height: 0.7rem;
+    border-radius: 50%;
+    background: var(--text-secondary);
+}
+
+html[data-theme="light"] .thread-status-question-badge {
+    background: var(--text-muted);
+}
+
+.thread-status-question-badge::after {
+    content: "?";
+    font-size: 0.55rem;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--text-on-accent);
+}
+
+html[data-theme="dark"] .thread-status-question-badge::after {
+    color: #000;
+}
+
+.progress-dot-loading {
+    background: var(--border-color);
+    animation: cc-pulse 2s ease-in-out infinite;
+    opacity: 0.5;
+}
+
+.progress-dot-failed {
+    background: var(--accent-red);
+}
+
+.progress-dot-red {
+    background: var(--accent-red);
+    animation: cc-blink-red 0.6s ease-in-out infinite;
+}
+
+@keyframes cc-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+@keyframes cc-blink-red {
+    0%, 100% { background: var(--accent-red); }
+    50% { background: transparent; }
+}
+
+/* --- Initiator panel — bordered card describing who/what started an exchange.
+   Variants: user (accent left border), system (engine/auto-hardening/auto-merge),
+   trigger (scheduled/event-driven). Two-tone header/body matches response panel:
+   header sits on bg-secondary (with optional variant tint), body sits on bg-primary.
+   Header is clickable to collapse the body when there is content to hide. */
+.initiator-panel {
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    margin: 0.5rem 0;
+    background: var(--bg-primary);
+    overflow: hidden;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+}
+
+.initiator-panel-user {
+    border-left: 0.1875rem solid var(--initiator-you);
+}
+
+.initiator-panel-lucidos {
+    border-left: 0.1875rem solid var(--initiator-agent);
+}
+
+/* Engine — shared accent for system + trigger + every change-lifecycle variant
+   (ChangeApplied/Failed/Discarded/Reverted always render with variant: 'system',
+   so .initiator-panel-system already covers them; no per-change border needed). */
+.initiator-panel-system,
+.initiator-panel-trigger {
+    border-left: 0.1875rem solid var(--initiator-engine);
+}
+
+.initiator-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+}
+
+.initiator-panel-system .initiator-header,
+.initiator-panel-trigger .initiator-header {
+    background: color-mix(in srgb, var(--initiator-engine) 4%, var(--bg-secondary));
+}
+
+.initiator-panel-lucidos .initiator-header {
+    background: color-mix(in srgb, var(--initiator-agent) 4%, var(--bg-secondary));
+}
+
+/* Shared with .response-header-clickable below — both are panel headers that
+   collapse the panel when clicked. Hover-out is delayed so brief cursor exits
+   caused by the collapse-driven layout shift don't flash the base color back
+   in before the cursor re-enters. */
+.initiator-header-clickable,
+.response-header-clickable {
+    cursor: pointer;
+    user-select: none;
+    transition: background var(--duration-normal) ease 80ms;
+}
+
+@media (hover: hover) {
+    .initiator-header-clickable:hover,
+    .response-header-clickable:hover {
+        background: color-mix(in srgb, var(--bg-secondary) 85%, var(--accent));
+        transition-delay: 0s;
+    }
+}
+
+.initiator-panel-collapsed .initiator-header {
+    border-bottom: none;
+}
+
+.initiator-icon {
+    flex-shrink: 0;
+    font-size: 0.875rem;
+    line-height: 1;
+}
+
+.initiator-label {
+    font-weight: 500;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+    min-width: 0;
+}
+
+.initiator-timestamp {
+    margin-left: auto;
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+}
+
+.initiator-actor,
+.response-executor {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.125rem 0.375rem;
+    margin: -0.125rem -0.375rem;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    border-radius: 0.25rem;
+    color: inherit;
+    font: inherit;
+    transition: background var(--duration-fast);
+    text-align: left;
+}
+button.initiator-actor,
+.response-executor {
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    button.initiator-actor:hover,
+    .response-executor:hover {
+        background: color-mix(in srgb, var(--bg-secondary) 80%, var(--accent));
+    }
+}
+
+.initiator-body {
+    padding: 0.625rem 0.875rem;
+    color: var(--text-primary);
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+
+.initiator-summary {
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.initiator-summary + .change-body,
+.initiator-summary + .markdown-content,
+.initiator-summary + .initiator-files {
+    margin-top: 0.25rem;
+}
+
+.initiator-files {
+    margin: 0;
+    padding-left: 1.25rem;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.initiator-files li {
+    margin: 0.125rem 0;
+}
+

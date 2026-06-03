@@ -68,6 +68,20 @@ const HARDENING_RULE: &str = "HARDENING: Once your implementation is complete an
     phases when no relevant layers were touched. The harden marker only exists if you actually \
     invoke `/harden` — without the marker, the user pays the wait when they click Apply.";
 
+/// Tell CC that "Task not found" / "task already completed" after a task ends
+/// is expected — the engine evicts the bg-bash registry record on completion,
+/// and CC's own task-list entries also get cleaned up. CC was treating these
+/// as failures and retrying (nightly workspace-learning flagged 5/day on
+/// `TaskOutput`, then 3 `TaskUpdate` in one thread within 1 minute). The rule
+/// covers all three lookup tools so a single sighting in any prompt
+/// inoculates the model. Applies to chat-style prompts only; merge-conflict
+/// sessions don't run bg tasks.
+const TASK_LIFECYCLE_RULE: &str = "TASK LIFECYCLE: After a background task ends, its registry \
+    record is evicted — so subsequent `TaskOutput`, `TaskUpdate`, or `TaskList` calls referencing \
+    that id return errors like \"Task not found\" or \"task already completed\". This is \
+    **expected**, not a bug. Treat the error as confirmation the task is done; do NOT retry the \
+    call.";
+
 /// Encourage CC to ask via the structured `AskUserQuestion` tool — which the
 /// Lucidos UI renders as clickable buttons — instead of listing options in
 /// plaintext that the user has to retype. Applies to chat-style prompts only;
@@ -76,7 +90,11 @@ const ASK_USER_QUESTION_RULE: &str =
     "ASKING USERS: When you need an answer from the user — a yes/no decision, picking \
      between approaches, choosing from a small list — use the `AskUserQuestion` tool. \
      The Lucidos UI renders its options as clickable buttons; options listed only in your \
-     message text force the user to type their reply instead of clicking. ALWAYS use \
+     message text force the user to type their reply instead of clicking. ALWAYS provide the \
+     `question` field — the full question text shown on the card; the optional `header` \
+     chip-label is never a substitute, so don't put the question only in `header` (or only \
+     in your prose) and leave `question` empty. The engine rejects a call whose `question` \
+     is missing and makes you re-ask. ALWAYS use \
      `AskUserQuestion` for any question with 2-4 discrete answers, including the binary \
      yes/no case. This applies at ANY point in your reply, not just the end — mid-stream \
      checkpoints (\"does the framing look right so far?\", \"is this the right direction \
@@ -87,20 +105,28 @@ const ASK_USER_QUESTION_RULE: &str =
      not position in the message. If you find yourself typing a question mark and then \
      waiting for the user to answer, stop and route it through `AskUserQuestion`. Reserve \
      plaintext questions for genuinely open-ended ones (\"What name should I use for X?\") \
-     where pre-baked options would be guesses.";
+     where pre-baked options would be guesses. \
+     NEVER parallel-call `AskUserQuestion` alongside other tools — if you're asking a \
+     question, stop the assistant message after the `AskUserQuestion` tool_use and do not \
+     include any sibling tool_uses (no Bash, no Read, no TaskOutput, no second \
+     AskUserQuestion). Lucidos's PreToolUse hook blocks `AskUserQuestion` for up to 24h, \
+     but any sibling tool_uses in the same message dispatch in parallel and emit progression \
+     events while the question is still on-screen — at which point the user's typed comment \
+     can no longer be safely routed as a free-text answer, and your own parallel work has \
+     wasted tokens on an unconfirmed direction. Wait for the answer, THEN continue.";
 
 /// Permission allowlist rule shared across all CC system prompts.
 /// Lucidos passes `--allowedTools` when spawning CC, which overrides settings.json
 /// permission rules — so tool allowlist edits MUST go in `~/.lucidos/cc-allowed-tools`.
 const PERMISSION_CONFIG_RULE: &str = "\n\n\
-    PERMISSION CONFIG: Lucidos passes `--allowedTools` to your CC subprocess. This flag \
+    PERMISSION CONFIG: Lucidos passes `--allowedTools` to your Claude Code subprocess. This flag \
     OVERRIDES `~/.claude/settings.json` permission rules — adding a tool to settings.json's \
     `permissions.allow` has NO effect for sessions spawned by Lucidos, and the user will keep \
     seeing the permission prompt. \
     Three ways to remember a granted permission, picked via the buttons on the prompt card: \
     (1) `Always allow Tool(scope)` (narrow) and (2) `Always allow` (broad) append to \
     `~/.lucidos/cc-allowed-tools` (one entry per line, blank lines and `#` comments ignored). \
-    The file is read on each subprocess spawn — the next CC session (or `claude_code` tool \
+    The file is read on each subprocess spawn — the next Claude Code session (or `claude_code` tool \
     call) picks it up immediately, no engine restart needed. The currently-running subprocess \
     keeps its frozen `--allowedTools` flag, so a freshly-persisted entry only takes effect on \
     the next session. The compiled-in default lives at \
@@ -116,8 +142,11 @@ const PERMISSION_CONFIG_RULE: &str = "\n\n\
     every tool and every path including the CC-protected ones. Lost on engine restart, scoped \
     to one thread.";
 
-/// Build the system prompt for Claude Code worktree sessions.
-/// Used by both user-initiated CC sessions and LLM-invoked `claude_code` tool calls.
+/// Build the system prompt for Lucidos-source coding-agent threads.
+/// Used by both user-initiated Claude Code sessions and LLM-invoked
+/// `claude_code` tool calls when editing the Lucidos source tree. Three
+/// sibling builders exist for the other worktree flavors:
+/// `external_repo_system_prompt`, `app_worktree_system_prompt`.
 pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) -> String {
     format!(
         "{preamble}\n\n\
@@ -149,6 +178,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          {no_pull_requests}\n\n\
          {hardening}\n\n\
          {ask_user_question}\n\n\
+         {task_lifecycle}\n\n\
          SESSION SUMMARY: After hardening completes, output a structured summary of what \
          was implemented in this session. List each change with its status (committed, applied, \
          pending). Include file names and brief descriptions. This is the last thing you output \
@@ -162,6 +192,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
         apply_restart = APPLY_RESTART_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        task_lifecycle = TASK_LIFECYCLE_RULE,
         process_safety = process_safety_rule(true),
         permission_config = PERMISSION_CONFIG_RULE,
     )
@@ -181,10 +212,12 @@ pub(super) fn external_repo_system_prompt(
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Commit or discard anything unintentional.\n\n\
          {ask_user_question}\n\n\
+         {task_lifecycle}\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or stop, \
          simply say goodbye and finish your response — the Lucidos engine manages your lifecycle. \
          Running `exit` in bash can crash the host application.{process_safety}{permission_config}",
         ask_user_question = ASK_USER_QUESTION_RULE,
+        task_lifecycle = TASK_LIFECYCLE_RULE,
         process_safety = process_safety_rule(false),
         permission_config = PERMISSION_CONFIG_RULE,
     )
@@ -205,18 +238,22 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Commit or discard anything unintentional.\n\n\
          {ask_user_question}\n\n\
+         {task_lifecycle}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}{permission_config}",
         branch = branch_name,
         repo = repo_name,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        task_lifecycle = TASK_LIFECYCLE_RULE,
         process_safety = process_safety_rule(false),
         permission_config = PERMISSION_CONFIG_RULE,
     )
 }
 
-/// Build the system prompt for recovered orphaned worktree sessions.
+/// Build the system prompt for recovered Lucidos-source worktree sessions.
 /// The LLM already has the original thread's message history, so this prompt
 /// just explains the restart context and tells it to review and continue.
+/// Three sibling recovery builders exist for the other worktree flavors:
+/// `external_repo_recovery_system_prompt`, `app_worktree_recovery_system_prompt`.
 pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) -> String {
     format!(
         "{preamble}\n\n\
@@ -237,6 +274,7 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          {no_pull_requests}\n\n\
          {hardening}\n\n\
          {ask_user_question}\n\n\
+         {task_lifecycle}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}{permission_config}",
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
@@ -244,7 +282,112 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
         apply_restart = APPLY_RESTART_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        task_lifecycle = TASK_LIFECYCLE_RULE,
         process_safety = process_safety_rule(true),
+        permission_config = PERMISSION_CONFIG_RULE,
+    )
+}
+
+/// Build the system prompt for app coding-agent threads — sparse-checkout
+/// worktrees of the user's workspace git narrowed to a single
+/// `data/apps/<id>/` folder.
+///
+/// `app_manifest_json` is the parsed contents of the app's `manifest.json`,
+/// serialized as a pretty JSON string. The agent reads this inline; other
+/// app artifacts (intents, knowhow, scripts) are discovered via Read on
+/// demand.
+pub(super) fn app_worktree_system_prompt(
+    branch_name: &str,
+    workspace_name: &str,
+    app_id: &str,
+    app_manifest_json: &str,
+) -> String {
+    format!(
+        "WORKSPACE: You were spawned by the \"{workspace_name}\" Lucidos workspace. \
+         You are editing the `{app_id}` app in this workspace.\n\n\
+         APP WORKTREE CONTEXT: You are running in an isolated git worktree of the user's \
+         Lucidos *workspace* git (not the Lucidos source repo). The worktree is \
+         sparse-checkout-narrowed to a single app folder on branch `{branch_name}`. \
+         Your cwd is the app folder at `data/apps/{app_id}/`. The worktree root sits two \
+         levels up, but only this app folder (plus top-level files like the workspace \
+         `.gitignore`) is materialised. Other app folders, knowhow, triggers, artifacts — \
+         all gitignored from your view via sparse-checkout.\n\n\
+         APP MANIFEST:\n{app_manifest_json}\n\n\
+         The rest of the app's structure — `index.html`, knowhow / intents / scripts \
+         files, etc. — is on disk inside the app folder; use Read on demand.\n\n\
+         ISOLATION RULES: Your worktree is your entire world. ALL file edits MUST happen \
+         inside the app folder under your cwd. Don't reach for absolute paths to other \
+         workspace folders — the Apply review surface shows every changed file across the \
+         worktree, so accidental writes are visible to the user, but you should narrow \
+         your edits to this app folder by default. For workspace-wide data (knowhow, \
+         triggers, artifacts, intents outside this app), use the `lucidos` CLI in \
+         `run_bash` — that writes to live workspace data on `main`, not into your worktree.\n\n\
+         You don't have `cargo`, `npx tsc`, `scripts/web-dev.sh`, or any Lucidos-source \
+         build tooling here. Run the app's own test/lint commands if it ships any.\n\n\
+         APPLY: When you finish, the user sees a pending *change* in the Apply panel. \
+         Apply ff-merges your branch into the workspace git's `main`. **No engine \
+         restart** ever happens (data-tree changes don't restart the engine). **No \
+         `/harden`** runs (apps own their hardening; if this app ships its own \
+         `.claude/commands/harden.md` use it on demand, otherwise rely on your own \
+         bug-check pass). Apply emits a transient `AppUiRefreshRequested` if you touched \
+         any iframe-bundled file (`index.html`, CSS, JS, `manifest.json`, static assets) \
+         — open iframes of this app will reload to pick up your changes.\n\n\
+         CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check \
+         for uncommitted changes. If you abandoned an approach and took a different one, \
+         the old edits may still be in the working tree. Discard them with `git \
+         checkout -- <file>`. Only intentional changes should remain.\n\n\
+         COMMANDS: Never use /cpa — it is for the main working tree only. \
+         Just commit directly with `git add <file>` + `git commit -m \"message\"`.\n\n\
+         NO PULL REQUESTS: This workspace's git is local — there is no remote and no PR \
+         workflow. Never run `gh pr create`, never `git push` your branch, never tell the \
+         user to \"open a PR\" or \"submit a PR\". The engine is the merge mechanism: when \
+         the user clicks Apply, your branch lands on the workspace git's `main`.\n\n\
+         {ask_user_question}\n\n\
+         {task_lifecycle}\n\n\
+         SESSION SUMMARY: Output a structured summary of what was implemented in this \
+         session. List each change with a brief description. This is the last thing you \
+         output before finishing.\n\n\
+         CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or \
+         stop, simply say goodbye and finish your response — the Lucidos engine manages \
+         your lifecycle. Running `exit` in bash can crash the host application.{process_safety}{permission_config}",
+        ask_user_question = ASK_USER_QUESTION_RULE,
+        task_lifecycle = TASK_LIFECYCLE_RULE,
+        process_safety = process_safety_rule(false),
+        permission_config = PERMISSION_CONFIG_RULE,
+    )
+}
+
+/// Build the system prompt for recovered orphaned app worktree sessions.
+pub(super) fn app_worktree_recovery_system_prompt(
+    branch_name: &str,
+    workspace_name: &str,
+    app_id: &str,
+) -> String {
+    format!(
+        "WORKSPACE: You were spawned by the \"{workspace_name}\" Lucidos workspace. \
+         You are editing the `{app_id}` app in this workspace.\n\n\
+         RECOVERED SESSION: The Lucidos engine restarted while you were working on branch \
+         `{branch_name}` in an isolated app worktree (sparse-checkout of the workspace git \
+         narrowed to `data/apps/{app_id}/`). Your previous session was interrupted but \
+         the worktree is intact.\n\n\
+         Review the message history above to understand what you were working on, then:\n\
+         1. Run `git log --oneline main..HEAD` to see what commits were made\n\
+         2. Run `git diff` to check for uncommitted changes\n\
+         3. If the work looks complete, clean up and finish\n\
+         4. If incomplete, continue where you left off\n\n\
+         When you finish, the user sees a pending *change* in the Apply panel. Apply \
+         ff-merges your branch into the workspace git's `main`. No engine restart; no \
+         `/harden` (apps own their hardening). Apply emits `AppUiRefreshRequested` if any \
+         iframe-bundled file changed.\n\n\
+         CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check \
+         for uncommitted changes. Discard unintentional changes with `git checkout -- <file>`.\n\n\
+         COMMANDS: Never use /cpa. Just commit with `git add` + `git commit -m \"…\"`.\n\n\
+         {ask_user_question}\n\n\
+         {task_lifecycle}\n\n\
+         CRITICAL: Never run `exit` as a bash command.{process_safety}{permission_config}",
+        ask_user_question = ASK_USER_QUESTION_RULE,
+        task_lifecycle = TASK_LIFECYCLE_RULE,
+        process_safety = process_safety_rule(false),
         permission_config = PERMISSION_CONFIG_RULE,
     )
 }
@@ -259,13 +402,21 @@ pub(super) fn conflict_resolution_system_prompt() -> &'static str {
      3. Edit the file to combine both changes correctly (remove all conflict markers)\n\
      4. Run `git add <file>` to mark it as resolved\n\n\
      When ALL conflicts are resolved, run `git commit --no-edit` to complete the merge.\n\n\
+     AFTER the commit succeeds, write ONE short final assistant message that summarizes \
+     what you resolved — name each file and one sentence on the merge decision. \
+     The user opens this recovery thread to see what happened; without a summary the \
+     thread sits at Idle with no visible signal that the merge succeeded, and the user \
+     has to git-log + diff to reconstruct the resolution themselves. Example: \
+     \"Resolved 3 conflicts. crates/foo/src/lib.rs — kept main's signature, merged \
+     your error-handling. crates/bar/src/mod.rs — combined both new tests. \
+     packages/baz/index.ts — adopted main's import order around your new export.\"\n\n\
      If any conflict is ambiguous, ask the user before proceeding.\n\n\
      COMMANDS: Never use /cpa — it is for the main working tree only. \
      Just use `git add` + `git commit` directly.\n\n\
      CRITICAL: Never run `exit` as a bash command."
 }
 
-/// Build a merge prompt for CC sessions.
+/// Build a merge prompt for Claude Code sessions.
 /// `merge_target` is the branch to merge (e.g. "main" or a feature branch name).
 /// `context` is an optional prefix (e.g. "You are running in a temporary merge worktree.").
 /// `description` is an optional change description appended at the end.
@@ -319,6 +470,70 @@ mod tests {
             assert!(
                 !prompt.contains(token),
                 "{label} must not mention `{token}` — it does not resolve in external repos",
+            );
+        }
+    }
+
+    #[test]
+    fn app_worktree_prompt_inlines_manifest_and_branch() {
+        let manifest = r#"{"name":"Momentum","icon":"target"}"#;
+        let prompt = app_worktree_system_prompt(
+            "claude-code/app/momentum/20260527-100000-abc123",
+            "personal",
+            "momentum",
+            manifest,
+        );
+        assert!(
+            prompt.contains("`momentum`"),
+            "must name the app id so CC knows which folder it owns",
+        );
+        assert!(
+            prompt.contains("personal"),
+            "must name the workspace so cross-workspace context is clear",
+        );
+        assert!(
+            prompt.contains("claude-code/app/momentum/20260527-100000-abc123"),
+            "must surface the branch name for the user-side Apply chip",
+        );
+        assert!(
+            prompt.contains("Momentum"),
+            "must inline the manifest so CC has the app's display name without an extra Read",
+        );
+        assert!(
+            prompt.contains("AppUiRefreshRequested"),
+            "must mention the iframe refresh signal so CC knows Apply is non-destructive",
+        );
+        assert!(
+            prompt.contains("`/harden`"),
+            "must explicitly opt out of /harden so CC doesn't try to run it",
+        );
+        // App prompts must not advertise Lucidos-source scripts (cargo,
+        // npx tsc, web-dev.sh, e2e.sh) — those don't resolve from the app
+        // worktree's cwd. `/harden` and `/cpa` are intentionally NAMED in
+        // the prompt (as opt-outs), so the Lucidos-only-token check is
+        // narrower for app prompts than for external-repo ones.
+        for token in &["./scripts/stop.sh", "./scripts/web-dev.sh", "./scripts/e2e"] {
+            assert!(
+                !prompt.contains(token),
+                "app_worktree_system_prompt must not advertise `{token}` — it does not resolve in app worktrees",
+            );
+        }
+    }
+
+    #[test]
+    fn app_worktree_recovery_prompt_inlines_branch_and_app() {
+        let prompt = app_worktree_recovery_system_prompt(
+            "claude-code/app/momentum/20260527-100000-abc123",
+            "personal",
+            "momentum",
+        );
+        assert!(prompt.contains("`momentum`"));
+        assert!(prompt.contains("claude-code/app/momentum/20260527-100000-abc123"));
+        assert!(prompt.contains("RECOVERED"));
+        for token in &["./scripts/stop.sh", "./scripts/web-dev.sh", "./scripts/e2e"] {
+            assert!(
+                !prompt.contains(token),
+                "app_worktree_recovery_system_prompt must not advertise `{token}`",
             );
         }
     }
@@ -401,6 +616,11 @@ mod tests {
                  examples freely, but fails loudly if mid-stream coverage gets dropped \
                  entirely",
             );
+            assert!(
+                prompt.contains("NEVER parallel-call"),
+                "{label} must forbid parallel-calling `AskUserQuestion` alongside other \
+                 tools (see ASK_USER_QUESTION_RULE)",
+            );
         }
     }
 
@@ -476,5 +696,112 @@ mod tests {
                 "{label} must point at the engine function (`files_require_restart`)",
             );
         }
+    }
+
+    /// Background-task lookup tools (`TaskOutput`, `TaskUpdate`, `TaskList`)
+    /// return "Task not found" / "task already completed" once the engine has
+    /// evicted a finished task's registry record. Without explicit guidance,
+    /// CC was treating these as failures and retrying — nightly workspace-
+    /// learning flagged the same shape on two consecutive nights (5/day on
+    /// `TaskOutput`, then 3 `TaskUpdate` in a single thread within 1 minute).
+    /// Pin the lifecycle note in every chat-style prompt so the inoculation
+    /// can't be dropped by a future edit. The conflict-resolution prompt is
+    /// intentionally excluded — it doesn't run bg tasks.
+    #[test]
+    fn chat_style_prompts_carry_task_lifecycle_note() {
+        let cases: &[(&str, String)] = &[
+            (
+                "worktree_system_prompt",
+                worktree_system_prompt("feature/x", "dev"),
+            ),
+            (
+                "external_repo_system_prompt",
+                external_repo_system_prompt("Acme", "feature/x", "origin/main"),
+            ),
+            (
+                "recovery_system_prompt",
+                recovery_system_prompt("feature/x", "dev"),
+            ),
+            (
+                "external_repo_recovery_system_prompt",
+                external_repo_recovery_system_prompt("Acme", "feature/x"),
+            ),
+        ];
+        for (label, prompt) in cases {
+            assert!(
+                prompt.contains("TASK LIFECYCLE"),
+                "{label} must carry the TASK LIFECYCLE rule so CC stops retrying \
+                 \"Task not found\" errors on completed bg tasks",
+            );
+            // Assert the exact comma-joined trio phrase. A per-tool
+            // `prompt.contains("TaskOutput")` would trivially pass because
+            // ASK_USER_QUESTION_RULE also mentions `TaskOutput` ("no Bash,
+            // no Read, no TaskOutput, no second AskUserQuestion") — so a
+            // future edit could drop TASK_LIFECYCLE_RULE entirely and the
+            // single-name check would still be satisfied. Pinning the
+            // contiguous phrase guarantees the trio is named *together* and
+            // can only come from TASK_LIFECYCLE_RULE.
+            assert!(
+                prompt.contains("`TaskOutput`, `TaskUpdate`, or `TaskList`"),
+                "{label} must name all three lookup tools in the lifecycle \
+                 rule's exact comma-joined form — partial coverage would let \
+                 CC keep retrying the missing tool against stale ids",
+            );
+            // The expected-behavior framing is what stops the retry — without
+            // it, CC reads the named tools and the "not found" string as
+            // diagnosis instructions instead of as a benign signal.
+            assert!(
+                prompt.contains("expected"),
+                "{label} must frame the error as expected behavior, not a bug",
+            );
+            assert!(
+                prompt.contains("do NOT retry") || prompt.contains("do not retry"),
+                "{label} must explicitly tell CC not to retry the call",
+            );
+        }
+    }
+
+    /// Conflict-resolution sessions run unattended in a temp worktree — the
+    /// user never sees a back-and-forth with them. When CC finishes (commits
+    /// the merge) and the engine ff-merges to main, the thread sits in
+    /// "Idle" with whatever CC happened to say last. If CC was terse ("done."
+    /// or no text at all) the user opens the thread and sees no closure —
+    /// the original bug the user complained about: "It just stopped. Its
+    /// output didnt say it was resolved."
+    ///
+    /// Pin that the prompt requires a one-sentence summary as CC's final
+    /// assistant message so the recovery thread always carries a visible
+    /// statement of what was resolved.
+    #[test]
+    fn conflict_resolution_prompt_requires_user_facing_summary() {
+        let prompt = conflict_resolution_system_prompt();
+        let prompt_lower = prompt.to_lowercase();
+        // Concept words — multiple acceptable phrasings (summary / summarize /
+        // explain) so future rewrites can reword without tripping the test,
+        // but at least one of these MUST appear to ensure the closure
+        // message stays an explicit instruction, not optional.
+        assert!(
+            prompt_lower.contains("summar") || prompt_lower.contains("explain what"),
+            "conflict_resolution_system_prompt must instruct CC to summarize what it \
+             resolved as its final assistant message — otherwise terse CC turns \
+             ('done.', empty text) leave the user with no closure: the recovery \
+             thread sits at Idle with no visible signal that the merge succeeded"
+        );
+        // The summary must be the LAST step, after the commit. If CC sends
+        // a summary BEFORE the commit, the engine's ff-merge hasn't happened
+        // yet and the message would be misleading.
+        let commit_pos = prompt
+            .find("git commit")
+            .expect("prompt must mention the merge commit step");
+        let summary_pos = prompt_lower
+            .find("summar")
+            .or_else(|| prompt_lower.find("explain what"))
+            .expect("checked above");
+        assert!(
+            summary_pos > commit_pos,
+            "the summary instruction must come AFTER the commit step in the prompt — \
+             a pre-commit summary would mislead the user about whether the merge \
+             actually succeeded"
+        );
     }
 }

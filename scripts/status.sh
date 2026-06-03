@@ -144,7 +144,7 @@ show_workspace_status() {
 
     # API health
     if [ -n "$api_port" ]; then
-        if curl -sk "https://localhost:$api_port/api/health" >/dev/null 2>&1 || curl -s "http://localhost:$api_port/api/health" >/dev/null 2>&1; then
+        if curl -sk "https://localhost:$api_port/api/v1/health" >/dev/null 2>&1 || curl -s "http://localhost:$api_port/api/v1/health" >/dev/null 2>&1; then
             echo "  API:       localhost:$api_port (healthy)"
         else
             echo "  API:       not responding"
@@ -207,7 +207,7 @@ json_workspace_status() {
     # Engine version from health endpoint
     local engine_version=""
     if [ "$engine_running" = "true" ] && [ -n "$api_port" ]; then
-        engine_version=$(curl -sk --connect-timeout 2 --max-time 3 "https://localhost:$api_port/api/health" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('engine_version',''))" 2>/dev/null || echo "")
+        engine_version=$(curl -sk --connect-timeout 2 --max-time 3 "https://localhost:$api_port/api/v1/health" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('engine_version',''))" 2>/dev/null || echo "")
     fi
 
     # Build JSON — use jq for safe escaping of paths/names

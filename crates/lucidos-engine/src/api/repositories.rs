@@ -1,6 +1,6 @@
 use axum::{
     extract::{Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use super::AppState;
 use crate::core::repositories::{Repository, RepositoryStore};
+use crate::engine::event_bus::SystemEvent;
 
 fn expand_tilde(path: &str) -> String {
     if path == "~" {
@@ -48,6 +49,7 @@ pub struct AddRepositoryRequest {
 
 pub async fn add_repository(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<AddRepositoryRequest>,
 ) -> Result<(StatusCode, Json<Repository>), (StatusCode, String)> {
     let expanded_path = expand_tilde(&req.path);
@@ -81,28 +83,54 @@ pub async fn add_repository(
         ));
     }
 
-    RepositoryStore::add(
+    let repo = RepositoryStore::add(
         &state.pool,
         &req.name,
         &expanded_path,
         req.description.as_deref(),
     )
     .await
-    .map(|repo| (StatusCode::CREATED, Json(repo)))
     .map_err(|e| {
         (
             StatusCode::CONFLICT,
             format!("Failed to add repository: {}", e),
         )
-    })
+    })?;
+
+    state
+        .engine
+        .event_bus
+        .emit_user_system(&headers, &state.pool, "[Repositories] RepositoryAdded", |actor| {
+            SystemEvent::RepositoryAdded {
+                repo_id: repo.id.to_string(),
+                name: repo.name.clone(),
+                root_path: repo.path.clone(),
+                actor,
+            }
+        })
+        .await;
+    Ok((StatusCode::CREATED, Json(repo)))
 }
 
 pub async fn remove_repository(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
     match RepositoryStore::remove(&state.pool, id).await {
-        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(true) => {
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Repositories] RepositoryRemoved", |actor| {
+                    SystemEvent::RepositoryRemoved {
+                        repo_id: id.to_string(),
+                        actor,
+                    }
+                })
+                .await;
+            Ok(StatusCode::NO_CONTENT)
+        }
         Ok(false) => Err((StatusCode::NOT_FOUND, "Repository not found".to_string())),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -135,12 +163,12 @@ pub async fn list_repo_files(
         return Err((StatusCode::BAD_REQUEST, "Invalid ref".into()));
     }
 
-    let output = tokio::process::Command::new("git")
-        .args(["ls-tree", "-r", "--name-only", git_ref])
-        .current_dir(&repo.path)
-        .output()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git error: {e}")))?;
+    let output = crate::engine::git_ops::git_cmd(
+        &["ls-tree", "-r", "--name-only", git_ref],
+        std::path::Path::new(&repo.path),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -266,12 +294,12 @@ pub async fn get_repo_diff(
     }
 
     let range = format!("main...{}", query.branch);
-    let output = tokio::process::Command::new("git")
-        .args(["diff", &range, "--no-color"])
-        .current_dir(&repo.path)
-        .output()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git error: {e}")))?;
+    let output = crate::engine::git_ops::git_cmd(
+        &["diff", &range, "--no-color"],
+        std::path::Path::new(&repo.path),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -287,6 +315,88 @@ pub async fn get_repo_diff(
     Ok(Json(RepoDiff { files }))
 }
 
+/// Decode git's C-quoted path form (`"foo\360..."`) back to raw UTF-8.
+/// Returns `path` unchanged when not surrounded by `"`.
+fn unquote_git_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return path.to_string();
+    }
+    let inner = &bytes[1..bytes.len() - 1];
+    let mut out: Vec<u8> = Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while i < inner.len() {
+        let b = inner[i];
+        if b == b'\\' && i + 1 < inner.len() {
+            let next = inner[i + 1];
+            if (b'0'..=b'7').contains(&next) && i + 3 < inner.len() {
+                let d2 = inner[i + 2];
+                let d3 = inner[i + 3];
+                if (b'0'..=b'7').contains(&d2) && (b'0'..=b'7').contains(&d3) {
+                    let val = ((next - b'0') << 6) | ((d2 - b'0') << 3) | (d3 - b'0');
+                    out.push(val);
+                    i += 4;
+                    continue;
+                }
+            }
+            let standard = match next {
+                b'\\' => Some(b'\\'),
+                b'"' => Some(b'"'),
+                b'a' => Some(0x07),
+                b'b' => Some(0x08),
+                b't' => Some(b'\t'),
+                b'n' => Some(b'\n'),
+                b'v' => Some(0x0B),
+                b'f' => Some(0x0C),
+                b'r' => Some(b'\r'),
+                _ => None,
+            };
+            if let Some(v) = standard {
+                out.push(v);
+                i += 2;
+                continue;
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extract the b-side path from a `diff --git ...` header. Handles both bare
+/// (`a/X b/X`) and quoted (`"a/X" "b/X"`) forms. Empty string when nothing
+/// matches — never let the raw header bleed through as a filename.
+fn parse_diff_git_path(line: &str) -> String {
+    if let Some(idx) = line.rfind(" \"b/") {
+        let quoted = &line[idx + 1..];
+        if quoted.ends_with('"') {
+            let unquoted = unquote_git_path(quoted);
+            if let Some(rest) = unquoted.strip_prefix("b/") {
+                return rest.to_string();
+            }
+        }
+    }
+    if let Some(idx) = line.rfind(" b/") {
+        return line[idx + 3..].to_string();
+    }
+    String::new()
+}
+
+fn parse_diff_plus_path(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("+++ b/") {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = line.strip_prefix("+++ ") {
+        if rest.starts_with('"') && rest.ends_with('"') {
+            let unquoted = unquote_git_path(rest);
+            if let Some(stripped) = unquoted.strip_prefix("b/") {
+                return Some(stripped.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn parse_diff_output(output: &str) -> Vec<DiffFile> {
     let mut files = Vec::new();
     let mut current_file: Option<DiffFile> = None;
@@ -300,16 +410,14 @@ fn parse_diff_output(output: &str) -> Vec<DiffFile> {
                 }
                 files.push(f);
             }
-            // Extract path from "diff --git a/path b/path" as fallback for renames
-            let fallback_path = line.split(" b/").last().unwrap_or("").to_string();
             current_file = Some(DiffFile {
-                path: fallback_path,
+                path: parse_diff_git_path(line),
                 status: "modified".into(),
                 hunks: Vec::new(),
             });
-        } else if let Some(rest) = line.strip_prefix("+++ b/") {
+        } else if let Some(path) = parse_diff_plus_path(line) {
             if let Some(ref mut f) = current_file {
-                f.path = rest.to_string();
+                f.path = path;
             }
         } else if line.starts_with("--- /dev/null") {
             if let Some(ref mut f) = current_file {
@@ -394,7 +502,7 @@ fn parse_range(s: &str) -> (u32, u32) {
     }
 }
 
-/// GET /api/changes/:id/diff — compute diff for any change (pending or applied)
+/// GET /api/v1/changes/:id/diff — compute diff for any change (pending or applied)
 pub async fn get_change_diff(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
@@ -404,19 +512,14 @@ pub async fn get_change_diff(
         .changes()
         .get_by_id(id)
         .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "Change not found".into()))?;
 
-    let repo_root = &change.repo_root;
-
-    let diff_args = if change.status == "pending" {
+    let range = if change.status == "pending" {
         if super::is_dangerous_git_ref(&change.branch_name) {
             return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
         }
-        vec![
-            "diff".to_string(),
-            format!("main...{}", change.branch_name),
-            "--no-color".to_string(),
-        ]
+        format!("main...{}", change.branch_name)
     } else {
         let pre_sha = change.pre_merge_sha.as_deref().ok_or((
             StatusCode::BAD_REQUEST,
@@ -427,19 +530,15 @@ pub async fn get_change_diff(
             .post_merge_sha
             .as_deref()
             .ok_or((StatusCode::BAD_REQUEST, "No post-merge SHA recorded".into()))?;
-        vec![
-            "diff".to_string(),
-            format!("{}..{}", pre_sha, post_sha),
-            "--no-color".to_string(),
-        ]
+        format!("{}..{}", pre_sha, post_sha)
     };
 
-    let output = tokio::process::Command::new("git")
-        .args(&diff_args)
-        .current_dir(repo_root)
-        .output()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git error: {e}")))?;
+    let output = crate::engine::git_ops::git_cmd(
+        &["diff", &range, "--no-color"],
+        std::path::Path::new(&change.repo_root),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -462,35 +561,94 @@ pub struct ThreadCcDiff {
     pub base_ref: String,
 }
 
-/// GET /api/threads/:thread_id/cc-diff — 3-dot diff of the CC worktree's
+/// GET /api/v1/threads/:thread_id/cc-diff — 3-dot diff of the CC worktree's
 /// branch vs the repo's default remote branch. Used for external-repo CC
 /// sessions that never create a Lucidos `Change` row.
 ///
 /// Falls back to the registered repo + branch ref when the recorded worktree
 /// is gone — pre-May-2026 `agent_recovery` removed worktrees for idle
 /// external-repo sessions without emitting `WorktreeCleaned`, so the
-/// historical state is `cc_has_changes=true` + branch alive + worktree dir
+/// historical state is `coding_agent_proposed=true` + branch alive + worktree dir
 /// missing.
 pub async fn get_thread_cc_diff(
     State(state): State<AppState>,
     axum::extract::Path(thread_id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ThreadCcDiff>, (StatusCode, String)> {
+    // For app coding-agent threads the worktree's git root is the workspace
+    // and the relevant changes live under `data/apps/<id>/`. Scoping the diff
+    // to that pathspec keeps stray writes outside the app folder out of the
+    // Diff button's response — the user asked for the diff scoped to the
+    // app, not to whatever the agent happened to touch.
+    let app_pathspec = lookup_app_pathspec(&state.pool, thread_id).await;
     if let Some(worktree_path) =
         crate::engine::agent_session::resume::lookup_latest_worktree_path(&state.pool, thread_id)
             .await
             .filter(|p| p.exists())
     {
-        return diff_via_worktree(&worktree_path).await.map(Json);
+        return diff_via_worktree(&worktree_path, app_pathspec.as_deref())
+            .await
+            .map(Json);
     }
-    diff_via_branch_ref(&state.pool, thread_id).await.map(Json)
+    diff_via_branch_ref(&state.pool, thread_id, app_pathspec.as_deref())
+        .await
+        .map(Json)
+}
+
+/// Look up the in-app pathspec for an app coding-agent thread, e.g.
+/// `data/apps/momentum-autoresearch`. Returns None for Lucidos-source and
+/// external-repo threads (and for legacy app rows with a NULL folder, in
+/// which case the unscoped diff is the best we can do).
+///
+/// Validates the folder shape matches `<…>/data/apps/<id>` exactly — same
+/// contract the frontend's `appIdFromFolder` enforces. Without this, a
+/// corrupted row with `kind = 'app'` but `folder = '/ws/projects/foo'`
+/// would silently scope the diff to a phantom `data/apps/foo` and the
+/// user would see an empty diff with no error.
+async fn lookup_app_pathspec(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT coding_agent_kind, coding_agent_folder FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let (kind, folder) = row?;
+    if kind.as_deref() != Some("app") {
+        return None;
+    }
+    let folder = folder?;
+    let app_id = extract_app_id(&folder)?;
+    Some(format!("data/apps/{app_id}"))
+}
+
+/// Extract the app id from a `coding_agent_folder` value. Mirrors the
+/// frontend's `appIdFromFolder` validation: requires the folder to end in
+/// `…/data/apps/<id>` with a non-empty, non-traversal id, with `data`
+/// immediately before `apps`.
+fn extract_app_id(folder: &str) -> Option<String> {
+    let segments: Vec<&str> = folder.split('/').filter(|s| !s.is_empty()).collect();
+    let apps_idx = segments.iter().rposition(|s| *s == "apps")?;
+    if apps_idx == segments.len() - 1 {
+        return None;
+    }
+    if apps_idx == 0 || segments[apps_idx - 1] != "data" {
+        return None;
+    }
+    let id = segments[apps_idx + 1];
+    if id.is_empty() || id == "." || id == ".." {
+        return None;
+    }
+    Some(id.to_string())
 }
 
 async fn diff_via_worktree(
     worktree_path: &std::path::Path,
+    pathspec: Option<&str>,
 ) -> Result<ThreadCcDiff, (StatusCode, String)> {
     let (branch_opt, base_ref, repo_root_res) = tokio::join!(
         crate::engine::git_ops::worktree_current_branch(worktree_path),
-        resolve_diff_base_ref(worktree_path),
+        crate::engine::git_ops::default_local_branch(worktree_path),
         resolve_worktree_repo_root(worktree_path),
     );
     let branch_name = branch_opt.ok_or((
@@ -504,7 +662,7 @@ async fn diff_via_worktree(
             "git worktree list returned no main worktree entry".into(),
         ))?;
 
-    let files = run_git_diff(worktree_path, &format!("{}...HEAD", base_ref)).await?;
+    let files = run_git_diff(worktree_path, &format!("{}...HEAD", base_ref), pathspec).await?;
     Ok(ThreadCcDiff {
         files,
         repo_root,
@@ -516,6 +674,7 @@ async fn diff_via_worktree(
 async fn diff_via_branch_ref(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
+    pathspec: Option<&str>,
 ) -> Result<ThreadCcDiff, (StatusCode, String)> {
     let (repo_id_str, branch_name) =
         crate::engine::agent_session::resume::lookup_latest_session_repo_and_branch(
@@ -549,8 +708,13 @@ async fn diff_via_branch_ref(
         ))?;
 
     let repo_root = std::path::PathBuf::from(&repo.path);
-    let base_ref = resolve_diff_base_ref(&repo_root).await;
-    let files = run_git_diff(&repo_root, &format!("{}...{}", base_ref, branch_name)).await?;
+    let base_ref = crate::engine::git_ops::default_local_branch(&repo_root).await;
+    let files = run_git_diff(
+        &repo_root,
+        &format!("{}...{}", base_ref, branch_name),
+        pathspec,
+    )
+    .await?;
     Ok(ThreadCcDiff {
         files,
         repo_root: repo.path,
@@ -562,8 +726,14 @@ async fn diff_via_branch_ref(
 async fn run_git_diff(
     cwd: &std::path::Path,
     range: &str,
+    pathspec: Option<&str>,
 ) -> Result<Vec<DiffFile>, (StatusCode, String)> {
-    let output = crate::engine::git_ops::git_cmd(&["diff", range, "--no-color"], cwd)
+    let mut args: Vec<&str> = vec!["diff", range, "--no-color"];
+    if let Some(p) = pathspec {
+        args.push("--");
+        args.push(p);
+    }
+    let output = crate::engine::git_ops::git_cmd(&args, cwd)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if !output.status.success() {
@@ -576,26 +746,6 @@ async fn run_git_diff(
         ));
     }
     Ok(parse_diff_output(&String::from_utf8_lossy(&output.stdout)))
-}
-
-/// Pick the ref to diff a CC branch against. Prefers `origin/HEAD`'s symbolic
-/// target (handles non-`main` defaults like `master`/`develop`); falls back to
-/// the local default branch.
-async fn resolve_diff_base_ref(worktree_path: &std::path::Path) -> String {
-    if let Ok(o) = crate::engine::git_ops::git_cmd(
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        worktree_path,
-    )
-    .await
-    {
-        if o.status.success() {
-            let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !v.is_empty() {
-                return v;
-            }
-        }
-    }
-    crate::engine::git_ops::default_local_branch(worktree_path).await
 }
 
 /// Resolve the main worktree's working-tree root for a (possibly linked)
@@ -623,7 +773,7 @@ pub struct ChangeFileQuery {
     pub path: String,
 }
 
-/// GET /api/changes/:id/file?path=X — fetch the full "after" version of a file
+/// GET /api/v1/changes/:id/file?path=X — fetch the full "after" version of a file
 /// at the change's branch (pending) or post-merge SHA (applied).
 pub async fn get_change_file(
     State(state): State<AppState>,
@@ -631,8 +781,12 @@ pub async fn get_change_file(
     Query(query): Query<ChangeFileQuery>,
 ) -> Response {
     let change = match state.engine.changes().get_by_id(id).await {
-        Some(c) => c,
-        None => return (StatusCode::NOT_FOUND, "Change not found").into_response(),
+        Ok(Some(c)) => c,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Change not found").into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
+                .into_response();
+        }
     };
 
     let git_ref = if change.status == "pending" {
@@ -731,350 +885,5 @@ pub async fn browse_directories(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_modified_file_diff() {
-        let input = concat!(
-            "diff --git a/src/main.rs b/src/main.rs\n",
-            "--- a/src/main.rs\n",
-            "+++ b/src/main.rs\n",
-            "@@ -1,3 +1,4 @@\n",
-            " fn main() {\n",
-            "-    println!(\"old\");\n",
-            "+    println!(\"new\");\n",
-            "+    println!(\"extra\");\n",
-            " }\n",
-        );
-        let files = parse_diff_output(input);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "src/main.rs");
-        assert_eq!(files[0].status, "modified");
-        assert_eq!(files[0].hunks.len(), 1);
-        assert_eq!(files[0].hunks[0].old_start, 1);
-        assert_eq!(files[0].hunks[0].old_count, 3);
-        assert_eq!(files[0].hunks[0].new_start, 1);
-        assert_eq!(files[0].hunks[0].new_count, 4);
-        // 2 context + 1 deletion + 2 additions = 5
-        assert_eq!(files[0].hunks[0].lines.len(), 5);
-    }
-
-    #[test]
-    fn parse_added_file_diff() {
-        let input = concat!(
-            "diff --git a/new.rs b/new.rs\n",
-            "new file mode 100644\n",
-            "--- /dev/null\n",
-            "+++ b/new.rs\n",
-            "@@ -0,0 +1,2 @@\n",
-            "+fn new_fn() {\n",
-            "+}\n",
-        );
-        let files = parse_diff_output(input);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].status, "added");
-        assert_eq!(files[0].path, "new.rs");
-    }
-
-    #[test]
-    fn parse_deleted_file_diff() {
-        let input = concat!(
-            "diff --git a/old.rs b/old.rs\n",
-            "deleted file mode 100644\n",
-            "--- a/old.rs\n",
-            "+++ /dev/null\n",
-            "@@ -1,2 +0,0 @@\n",
-            "-fn old_fn() {\n",
-            "-}\n",
-        );
-        let files = parse_diff_output(input);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].status, "deleted");
-        assert_eq!(files[0].path, "old.rs");
-    }
-
-    #[test]
-    fn parse_multiple_files() {
-        let input = concat!(
-            "diff --git a/a.rs b/a.rs\n",
-            "--- a/a.rs\n",
-            "+++ b/a.rs\n",
-            "@@ -1 +1 @@\n",
-            "-old\n",
-            "+new\n",
-            "diff --git a/b.rs b/b.rs\n",
-            "--- a/b.rs\n",
-            "+++ b/b.rs\n",
-            "@@ -1 +1 @@\n",
-            "-x\n",
-            "+y\n",
-        );
-        let files = parse_diff_output(input);
-        assert_eq!(files.len(), 2);
-        assert_eq!(files[0].path, "a.rs");
-        assert_eq!(files[1].path, "b.rs");
-    }
-
-    #[test]
-    fn parse_empty_diff() {
-        let files = parse_diff_output("");
-        assert!(files.is_empty());
-    }
-
-    #[test]
-    fn parse_diff_output_filters_engine_injected_paths() {
-        let input = concat!(
-            "diff --git a/.lucidos-workspace b/.lucidos-workspace\n",
-            "new file mode 100644\n",
-            "--- /dev/null\n",
-            "+++ b/.lucidos-workspace\n",
-            "@@ -0,0 +1,2 @@\n",
-            "+/Users/me/workspaces/dev\n",
-            "+abc-uuid\n",
-            "diff --git a/.lucidos/bin/lucidos b/.lucidos/bin/lucidos\n",
-            "new file mode 120000\n",
-            "--- /dev/null\n",
-            "+++ b/.lucidos/bin/lucidos\n",
-            "@@ -0,0 +1 @@\n",
-            "+/usr/local/bin/lucidos\n",
-            "diff --git a/.claude/skills/lucidos-cli/SKILL.md b/.claude/skills/lucidos-cli/SKILL.md\n",
-            "new file mode 100644\n",
-            "--- /dev/null\n",
-            "+++ b/.claude/skills/lucidos-cli/SKILL.md\n",
-            "@@ -0,0 +1,2 @@\n",
-            "+# lucidos-cli skill\n",
-            "+content\n",
-            "diff --git a/src/real.rs b/src/real.rs\n",
-            "--- a/src/real.rs\n",
-            "+++ b/src/real.rs\n",
-            "@@ -1 +1 @@\n",
-            "-old\n",
-            "+new\n",
-        );
-        let files = parse_diff_output(input);
-        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(
-            paths,
-            vec!["src/real.rs"],
-            "engine-injected paths must be filtered from parse_diff_output, got: {:?}",
-            paths
-        );
-    }
-
-    #[test]
-    fn parse_binary_file_skipped() {
-        // Binary files have no hunks — parser should produce a file with empty hunks
-        let input = concat!(
-            "diff --git a/image.png b/image.png\n",
-            "new file mode 100644\n",
-            "Binary files /dev/null and b/image.png differ\n",
-        );
-        let files = parse_diff_output(input);
-        assert_eq!(files.len(), 1);
-        assert!(files[0].hunks.is_empty());
-    }
-
-    #[test]
-    fn parse_rename_diff() {
-        let input = concat!(
-            "diff --git a/old_name.rs b/new_name.rs\n",
-            "similarity index 100%\n",
-            "rename from old_name.rs\n",
-            "rename to new_name.rs\n",
-        );
-        let files = parse_diff_output(input);
-        assert_eq!(files.len(), 1);
-        // Path extracted from "diff --git a/old b/new" header
-        assert_eq!(files[0].path, "new_name.rs");
-        assert!(files[0].hunks.is_empty());
-    }
-
-    #[test]
-    fn parse_multiple_hunks() {
-        let input = concat!(
-            "diff --git a/lib.rs b/lib.rs\n",
-            "--- a/lib.rs\n",
-            "+++ b/lib.rs\n",
-            "@@ -1,2 +1,2 @@\n",
-            "-old1\n",
-            "+new1\n",
-            " same\n",
-            "@@ -10,3 +10,4 @@\n",
-            " ctx\n",
-            "-old2\n",
-            "+new2\n",
-            "+extra\n",
-            " ctx\n",
-        );
-        let files = parse_diff_output(input);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].hunks.len(), 2);
-        assert_eq!(files[0].hunks[0].old_start, 1);
-        assert_eq!(files[0].hunks[0].lines.len(), 3); // 1 del + 1 add + 1 ctx
-        assert_eq!(files[0].hunks[1].old_start, 10);
-        // 1 ctx + 1 del + 2 add + 1 ctx = 5
-        assert_eq!(files[0].hunks[1].lines.len(), 5);
-    }
-
-    #[test]
-    fn parse_no_newline_at_eof() {
-        // git diff outputs "\ No newline at end of file" — parser should skip it
-        let input = concat!(
-            "diff --git a/f.rs b/f.rs\n",
-            "--- a/f.rs\n",
-            "+++ b/f.rs\n",
-            "@@ -1 +1 @@\n",
-            "-old\n",
-            "\\ No newline at end of file\n",
-            "+new\n",
-            "\\ No newline at end of file\n",
-        );
-        let files = parse_diff_output(input);
-        assert_eq!(files.len(), 1);
-        // Only the -old and +new lines, not the backslash lines
-        assert_eq!(files[0].hunks[0].lines.len(), 2);
-    }
-
-    #[test]
-    fn parse_hunk_header_no_count() {
-        // Single-line hunk: @@ -5 +5 @@ (no comma count)
-        let hunk = parse_hunk_header("@@ -5 +5 @@").unwrap();
-        assert_eq!(hunk.old_start, 5);
-        assert_eq!(hunk.old_count, 1);
-        assert_eq!(hunk.new_start, 5);
-        assert_eq!(hunk.new_count, 1);
-    }
-
-    #[test]
-    fn parse_hunk_header_with_function_context() {
-        // Real git often appends function name: @@ -10,3 +10,4 @@ fn main()
-        let hunk = parse_hunk_header("@@ -10,3 +10,4 @@ fn main()").unwrap();
-        assert_eq!(hunk.old_start, 10);
-        assert_eq!(hunk.old_count, 3);
-        assert_eq!(hunk.new_start, 10);
-        assert_eq!(hunk.new_count, 4);
-    }
-
-    #[test]
-    fn parse_hunk_header_malformed() {
-        // Too few tokens — need at least @@ -x +y @@
-        assert!(parse_hunk_header("@@").is_none());
-        assert!(parse_hunk_header("@@ -1").is_none());
-    }
-
-    #[test]
-    fn parse_range_basic() {
-        assert_eq!(parse_range("5,3"), (5, 3));
-        assert_eq!(parse_range("1"), (1, 1));
-        assert_eq!(parse_range("0,0"), (0, 0));
-    }
-
-    #[test]
-    fn browse_rejects_path_traversal() {
-        assert!(super::is_dangerous_browse_path("../etc"));
-        assert!(super::is_dangerous_browse_path("/foo/../bar"));
-        assert!(super::is_dangerous_browse_path(""));
-        assert!(!super::is_dangerous_browse_path("/Users/me/projects"));
-        assert!(!super::is_dangerous_browse_path("/tmp"));
-    }
-
-    #[test]
-    fn expand_tilde_handles_all_cases() {
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(super::expand_tilde("~"), home);
-        assert!(super::expand_tilde("~/projects").starts_with(&home));
-        assert_eq!(
-            super::expand_tilde("~/projects"),
-            format!("{}/projects", home)
-        );
-        assert_eq!(super::expand_tilde("/absolute/path"), "/absolute/path");
-        assert_eq!(super::expand_tilde("relative"), "relative");
-    }
-
-    /// End-to-end of the worktree-diff helpers against a real git repo +
-    /// linked worktree on a feature branch with one extra commit. Asserts
-    /// the base ref resolves to a usable target and the diff range produces
-    /// the expected single-file change.
-    #[tokio::test]
-    async fn worktree_diff_helpers_against_real_repo() {
-        async fn run(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
-            tokio::process::Command::new("git")
-                .args(args)
-                .current_dir(cwd)
-                .output()
-                .await
-                .unwrap()
-        }
-
-        let main_repo = tempfile::tempdir().unwrap();
-        let main_path = main_repo.path();
-
-        // `-c init.defaultBranch=main` makes the test pass on hosts where the
-        // user's git defaults differ (master vs main). Without it,
-        // `git init` creates `master` and our subsequent `worktree add ... main`
-        // fails with "invalid reference: main".
-        run(
-            &["-c", "init.defaultBranch=main", "init", "-q"],
-            main_path,
-        )
-        .await;
-        run(&["config", "user.email", "test@example.com"], main_path).await;
-        run(&["config", "user.name", "Test"], main_path).await;
-        tokio::fs::write(main_path.join("README.md"), "init\n")
-            .await
-            .unwrap();
-        run(&["add", "."], main_path).await;
-        run(&["commit", "-q", "-m", "init"], main_path).await;
-
-        // Linked worktree on a new branch, one extra commit.
-        let wt_dir = tempfile::tempdir().unwrap();
-        let wt_path = wt_dir.path().join("wt");
-        run(
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "feature/diff-helpers",
-                wt_path.to_str().unwrap(),
-                "main",
-            ],
-            main_path,
-        )
-        .await;
-        tokio::fs::write(wt_path.join("README.md"), "init\nadded line\n")
-            .await
-            .unwrap();
-        run(&["add", "."], &wt_path).await;
-        run(&["commit", "-q", "-m", "edit readme"], &wt_path).await;
-
-        // Base ref: no `origin` remote, so symbolic-ref fails — fallback chain
-        // must land on local `main`.
-        let base = super::resolve_diff_base_ref(&wt_path).await;
-        assert_eq!(
-            base, "main",
-            "expected fallback to local main when no origin remote is set, got {base}"
-        );
-
-        // Repo root: must point back at the main worktree, not the linked one.
-        let root = super::resolve_worktree_repo_root(&wt_path)
-            .await
-            .unwrap()
-            .unwrap();
-        let canonical_main = main_path.canonicalize().unwrap();
-        let canonical_root = std::path::PathBuf::from(&root).canonicalize().unwrap();
-        assert_eq!(
-            canonical_root, canonical_main,
-            "repo root should be the main worktree: got {root}"
-        );
-
-        // 3-dot diff against the resolved base: exactly one modified file.
-        let range = format!("{}...HEAD", base);
-        let out = run(&["diff", &range, "--no-color"], &wt_path).await;
-        assert!(out.status.success(), "git diff failed: {:?}", out);
-        let files = super::parse_diff_output(&String::from_utf8_lossy(&out.stdout));
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "README.md");
-        assert_eq!(files[0].status, "modified");
-    }
-}
+#[path = "repositories_tests.rs"]
+mod tests;

@@ -21,14 +21,17 @@ mod cc_bash_guard;
 mod cc_edit_preread;
 mod cc_read_coerce;
 mod cc_stop_reminder;
+mod changes;
 mod data;
 mod data_store;
 mod events;
 mod hardened;
 mod http;
 mod mcp_permission_server;
+mod notify;
 mod proxy;
 mod spawn_thread;
+mod threads;
 mod workspace;
 
 use data::WriteSource;
@@ -118,6 +121,9 @@ enum Command {
     /// parent_thread_id/spawning_event_id instead (same-workspace callback).
     /// `--repo <name>` defaults from $LUCIDOS_REPO so a CC subprocess inherits
     /// the calling thread's repo without callers passing it explicitly.
+    /// `--folder <path>` instead targets an app folder (`data/apps/<id>`),
+    /// spawning an app coding-agent thread (mutually exclusive with `--repo`,
+    /// requires `--cc`).
     #[command(name = "spawn-thread")]
     SpawnThread(SpawnThreadArgs),
     /// Call a backend configured in `data/config/apis.json` through the
@@ -125,6 +131,115 @@ enum Command {
     /// stdout; exit 0 by default even on 4xx/5xx. Use `--fail` to mirror
     /// `curl --fail`, `--include` to mirror `curl -i`.
     Proxy(ProxyCliArgs),
+    /// Send a push notification via the parent workspace. Persists to the
+    /// inbox AND pushes to subscribed devices, identical to the
+    /// `send_notification` LLM tool. Use from scripts that need to nudge the
+    /// user without going through an LLM thread.
+    Notify(NotifyArgs),
+    /// Query thread summaries on the parent workspace. The same shape returned
+    /// by `GET /api/v1/threads/list` and the `list_threads` LLM tool — a flat
+    /// newest-first list of every thread (with optional filters), distinct
+    /// from the UI-shaped `/api/v1/threads`.
+    Threads {
+        #[command(subcommand)]
+        action: ThreadsCmd,
+    },
+    /// Operations on pending / applied changes: `list` and `apply`. `apply`
+    /// wraps `POST /api/v1/changes/<id>/apply`, forwarding the subprocess-origin
+    /// headers via `client()` so the engine stamps the resulting
+    /// `ChangeApplied` as `Api { mode: Agent }` instead of `Api { mode: Human }`
+    /// (which the UI renders as "You"). Hand-rolled urllib / curl from inside
+    /// a `run_python` / `run_bash` tool loses those headers — use this
+    /// subcommand instead. `list` GETs `/api/v1/changes` so a script can find
+    /// the pending change id without guessing a command or scanning events.
+    Changes {
+        #[command(subcommand)]
+        action: ChangesCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChangesCmd {
+    /// List pending + applied changes as JSON (the `GET /api/v1/changes`
+    /// payload verbatim: `{ pending, applied, total_pending, … }`). The
+    /// canonical way to find a pending change's id before `apply` — read
+    /// `.pending[].id` from the output. Exit non-zero on transport / HTTP
+    /// error.
+    List,
+    /// Apply a pending change by id. Echoes the engine's typed
+    /// `ApplyChangeResult` JSON to stdout (see `docs/apply-change-api.md`).
+    /// Exit non-zero on transport / HTTP error; the engine's error body is
+    /// surfaced verbatim on stderr.
+    Apply {
+        /// UUID of the change to apply. Get it from `lucidos changes list`
+        /// (`.pending[].id`), `ChangeProposed` event payloads, or the
+        /// `changes` table.
+        change_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ThreadsCmd {
+    /// List thread summaries as JSON. Newest-first.
+    ///
+    /// `--active` restricts to threads where the agentic loop is mid-flow
+    /// (`status` of `running` or `waiting_for_user_answer`). Status
+    /// `waiting` is *not* active — it means CC has stopped and proposed
+    /// changes the user must act on; the loop has paused.
+    List {
+        /// Restrict to active threads only.
+        #[arg(long)]
+        active: bool,
+        /// Comma-separated source filter (`chat`, `trigger`, `claude_code`).
+        #[arg(long)]
+        source: Option<String>,
+        /// Max rows to return. Server clamps to 1..=1000 (default 100).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Count thread summaries matching the same filters as `list`.
+    /// Outputs `{ "count": N }`.
+    Count {
+        /// Restrict to active threads only.
+        #[arg(long)]
+        active: bool,
+        /// Comma-separated source filter (`chat`, `trigger`, `claude_code`).
+        #[arg(long)]
+        source: Option<String>,
+    },
+}
+
+#[derive(Args)]
+pub(crate) struct NotifyArgs {
+    /// Notification title (required, non-empty).
+    #[arg(long)]
+    pub(crate) title: String,
+    /// Notification message body (required, non-empty).
+    #[arg(long)]
+    pub(crate) message: String,
+    /// Optional deep-link target. Set only when tapping the notification
+    /// should open that app to act on it — same rule the LLM tool follows.
+    #[arg(long = "app-id")]
+    pub(crate) app_id: Option<String>,
+    /// Where a tap should land. `modal` (default) opens the inbox modal;
+    /// `none` is passive (no destination, marks read on display); `navigate`
+    /// deep-links via the same router `navigate_ui` uses — the CLI infers
+    /// the target from the other flags (presence of `--thread-id` →
+    /// navigate-to-thread carrying `--event-id` if set; otherwise presence
+    /// of `--app-id` → navigate-to-app). Scripts needing fuller control over
+    /// the navigate target should POST `/api/v1/notifications` directly with
+    /// a structured `tap` body.
+    #[arg(long, value_enum)]
+    pub(crate) tap: Option<notify::CliTap>,
+    /// Thread the notification originated from. With `--tap navigate` and no
+    /// `--app-id`, drives a thread deep-link. Also drives the inbox modal's
+    /// "Open thread" button regardless of tap.
+    #[arg(long = "thread-id")]
+    pub(crate) thread_id: Option<String>,
+    /// Specific event id inside `--thread-id` to scroll to and briefly pulse
+    /// when the tap lands. Ignored without `--thread-id`.
+    #[arg(long = "event-id")]
+    pub(crate) event_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -173,12 +288,16 @@ impl CliMode {
     }
 }
 
-/// Wire-format relation accepted by `--relation`. `sub` = same-workspace
+/// Wire-format relation accepted by `--relation`. `child` = same-workspace
 /// parent-with-callback (the spawned thread reports back when it
-/// finishes); `top` = independent top-level thread, no callback.
+/// finishes); `top` = independent top-level thread, no callback. `sub` is
+/// accepted as a back-compat alias for `child` (the pre-glossary wire
+/// name; *child thread* is the direct descendant the spawn produces, while
+/// *sub-thread* is the transitive descendant concept).
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum CliRelation {
-    Sub,
+    #[value(alias = "sub")]
+    Child,
     Top,
 }
 
@@ -212,20 +331,34 @@ pub(crate) struct SpawnThreadArgs {
     /// workspace default even when the env var is set.
     #[arg(long)]
     pub(crate) repo: Option<String>,
+    /// Target a folder instead of a repo — creates an *app coding-agent
+    /// thread*. Accepts a workspace-relative path (`data/apps/momentum`), an
+    /// absolute path, or a registered repo name; resolved on the TARGET
+    /// workspace (`--to`). With `--cc`, a `data/apps/<id>` value spawns a
+    /// sparse-checkout worktree narrowed to that app folder whose Apply
+    /// ff-merges into the workspace's main (no `/harden`, no engine restart) —
+    /// exactly what the `run_claude` tool's `folder` argument produces. Only
+    /// whole app folders are valid; the engine rejects other `data/` paths,
+    /// app subpaths, and non-existent folders. Mutually exclusive with
+    /// `--repo`; requires `--cc`. When set, the `$LUCIDOS_REPO` default is
+    /// suppressed so the request never carries both a repo and a folder.
+    #[arg(long, conflicts_with = "repo")]
+    pub(crate) folder: Option<String>,
     /// Override the upstream actor mode. Defaults to "agent".
     #[arg(long, value_enum, default_value_t = CliMode::Agent)]
     pub(crate) mode: CliMode,
     /// Relationship of the spawned thread to the calling thread.
-    /// `sub` = same-workspace parent-with-callback (the spawned thread
+    /// `child` = same-workspace parent-with-callback (the spawned thread
     /// reports back when it finishes — emits `parent_thread_id` /
     /// `spawning_event_id`). `top` = independent top-level thread, no
-    /// callback (emits `caller_*` fields). `sub` requires `--to` to
-    /// resolve to the same workspace as `$LUCIDOS_WORKSPACE`. When
-    /// omitted, defaults to `top` so existing cross-workspace recipes
-    /// keep their fire-and-forget behavior.
+    /// callback (emits `caller_*` fields). `child` requires `--to` to
+    /// resolve to the same workspace as `$LUCIDOS_WORKSPACE`. `sub` is
+    /// accepted as a back-compat alias for `child`. When omitted,
+    /// defaults to `top` so existing cross-workspace recipes keep their
+    /// fire-and-forget behavior.
     #[arg(long, value_enum, conflicts_with = "parent")]
     pub(crate) relation: Option<CliRelation>,
-    /// DEPRECATED — alias for `--relation sub`. Same-workspace
+    /// DEPRECATED — alias for `--relation child`. Same-workspace
     /// parent-with-callback spawn. Will be removed in a future release.
     #[arg(long)]
     pub(crate) parent: bool,
@@ -238,10 +371,10 @@ pub(crate) struct SpawnThreadArgs {
 enum HardenedCmd {
     /// Mark the current branch (in $PWD) as hardened at its current HEAD.
     /// Resolves repo_root, branch, and HEAD SHA from git, then POSTs to the
-    /// parent engine's `/api/internal/mark-hardened`.
+    /// parent engine's `/api/v1/internal/mark-hardened`.
     Mark,
     /// Print the hardening state of the current branch (in $PWD): `FRESH`,
-    /// `STALE`, or `MISSING`. GETs `/api/internal/hardened-state`. Used by
+    /// `STALE`, or `MISSING`. GETs `/api/v1/internal/hardened-state`. Used by
     /// the `harden.md` skill (skip `/harden` iff `FRESH`) and the
     /// `pre-push.sh` hook (allow push iff `FRESH`).
     Query,
@@ -326,6 +459,21 @@ enum EventsCmd {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// Count events by type/time without materialising payloads. Outputs
+    /// `{count, byte_total}` when `--type` is given; otherwise a per-type
+    /// breakdown `{by_type:[...], total_count, total_byte_total}` sorted by
+    /// count desc. Use before `query` to size a sweep.
+    Count {
+        /// Filter by event type. Omit for a per-type breakdown.
+        #[arg(long = "type", value_name = "TYPE")]
+        event_type: Option<String>,
+        /// ISO 8601 lower bound (inclusive).
+        #[arg(long)]
+        since: Option<String>,
+        /// ISO 8601 upper bound (exclusive).
+        #[arg(long)]
+        until: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -387,6 +535,18 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                         limit,
                     },
                 )?,
+                EventsCmd::Count {
+                    event_type,
+                    since,
+                    until,
+                } => events::cmd_count(
+                    &ws,
+                    events::CountFilters {
+                        event_type: event_type.as_deref(),
+                        since: since.as_deref(),
+                        until: until.as_deref(),
+                    },
+                )?,
             }
             Ok(0)
         }
@@ -444,6 +604,52 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     fail: args.fail,
                 },
             )
+        }
+        Command::Notify(args) => {
+            let ws = resolve_from_env()?;
+            notify::cmd_notify(
+                &ws,
+                &args.title,
+                &args.message,
+                notify::NotifyExtras {
+                    app_id: args.app_id.as_deref(),
+                    tap: args.tap,
+                    thread_id: args.thread_id.as_deref(),
+                    event_id: args.event_id.as_deref(),
+                },
+            )?;
+            Ok(0)
+        }
+        Command::Threads { action } => {
+            let ws = resolve_from_env()?;
+            match action {
+                ThreadsCmd::List {
+                    active,
+                    source,
+                    limit,
+                } => threads::cmd_list(
+                    &ws,
+                    threads::ListFilters {
+                        active: if active { Some(true) } else { None },
+                        source: source.as_deref(),
+                        limit,
+                    },
+                )?,
+                ThreadsCmd::Count { active, source } => threads::cmd_count(
+                    &ws,
+                    if active { Some(true) } else { None },
+                    source.as_deref(),
+                )?,
+            }
+            Ok(0)
+        }
+        Command::Changes { action } => {
+            let ws = resolve_from_env()?;
+            match action {
+                ChangesCmd::List => changes::cmd_list(&ws)?,
+                ChangesCmd::Apply { change_id } => changes::cmd_apply(&ws, &change_id)?,
+            }
+            Ok(0)
         }
     }
 }

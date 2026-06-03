@@ -57,7 +57,7 @@ Regenerate: `cargo test -p lucidos-engine generate_typescript_file -- --ignored 
 
 Staleness checks run as part of `cargo test`.
 
-**When to update:** Changes to `resolve_actions()`, `display_section()`, or their types.
+**When to update:** Changes to `available_thread_actions()`, `display_section()`, or their types.
 
 ## WASM Signer E2E (Rust)
 

@@ -3,13 +3,24 @@ import { navigateToApp, waitForVisibleInput, assertHealthy } from './helpers';
 
 /** Dispatch a real paste event with the given clipboard text, mimicking the
  *  browser's clipboard delivery. Bypasses permission prompts that block real
- *  clipboard reads in Playwright. */
-async function pasteText(input: Locator, text: string) {
-  await input.evaluate((el: HTMLTextAreaElement, payload: string) => {
-    const dt = new DataTransfer();
-    dt.setData('text/plain', payload);
-    el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-  }, text);
+ *  clipboard reads in Playwright.
+ *
+ *  `selection` (optional [start, end]) is re-applied in the SAME evaluate as the
+ *  dispatch. Setting the selection in an earlier evaluate races on WebKit: the
+ *  prior value/input re-render can land between the two round-trips and collapse
+ *  the selection, so the handler sees no selection and falls through (no
+ *  substitution). Applying it atomically with the dispatch closes that window. */
+async function pasteText(input: Locator, text: string, selection?: [number, number]) {
+  await input.evaluate(
+    (el: HTMLTextAreaElement, { payload, sel }: { payload: string; sel?: [number, number] }) => {
+      el.focus();
+      if (sel) el.setSelectionRange(sel[0], sel[1]);
+      const dt = new DataTransfer();
+      dt.setData('text/plain', payload);
+      el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    },
+    { payload: text, sel: selection },
+  );
 }
 
 test.describe('Paste link substitution (Slack-style)', () => {
@@ -26,10 +37,9 @@ test.describe('Paste link substitution (Slack-style)', () => {
       el.focus();
       el.value = 'See yesterday for context.';
       el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.setSelectionRange(4, 13); // "yesterday"
     });
 
-    await pasteText(input, ref);
+    await pasteText(input, ref, [4, 13]); // select "yesterday"
 
     const value = await input.evaluate((el: HTMLTextAreaElement) => el.value);
     expect(value).toBe(`See [yesterday](${ref}) for context.`);
@@ -43,10 +53,9 @@ test.describe('Paste link substitution (Slack-style)', () => {
       el.focus();
       el.value = 'Read the article first.';
       el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.setSelectionRange(9, 16); // "article"
     });
 
-    await pasteText(input, '[Original Title](https://vg.no/news/123)');
+    await pasteText(input, '[Original Title](https://vg.no/news/123)', [9, 16]); // select "article"
 
     const value = await input.evaluate((el: HTMLTextAreaElement) => el.value);
     expect(value).toBe('Read the [article](https://vg.no/news/123) first.');
@@ -59,12 +68,11 @@ test.describe('Paste link substitution (Slack-style)', () => {
     await input.evaluate((el: HTMLTextAreaElement) => {
       el.focus();
       el.value = '';
-      el.setSelectionRange(0, 0);
     });
 
     // No selection → handler must not preventDefault → textarea stays empty
     // (real paste fills it; our synthesized event has no native default).
-    await pasteText(input, 'https://vg.no/article');
+    await pasteText(input, 'https://vg.no/article', [0, 0]);
     const value = await input.evaluate((el: HTMLTextAreaElement) => el.value);
     expect(value).toBe('');
   });
@@ -77,10 +85,9 @@ test.describe('Paste link substitution (Slack-style)', () => {
       el.focus();
       el.value = 'hello world';
       el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.setSelectionRange(6, 11); // "world"
     });
 
-    await pasteText(input, 'localhost:3000');
+    await pasteText(input, 'localhost:3000', [6, 11]); // select "world"
     const value = await input.evaluate((el: HTMLTextAreaElement) => el.value);
     // Handler should not intercept; selection stays as-is (no default-paste
     // happens for synthesized events, so value is unchanged).
@@ -95,10 +102,9 @@ test.describe('Paste link substitution (Slack-style)', () => {
       el.focus();
       el.value = 'see array[0] now';
       el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.setSelectionRange(4, 12); // "array[0]"
     });
 
-    await pasteText(input, 'https://vg.no/x');
+    await pasteText(input, 'https://vg.no/x', [4, 12]); // select "array[0]"
     const value = await input.evaluate((el: HTMLTextAreaElement) => el.value);
     expect(value).toBe('see [array[0\\]](https://vg.no/x) now');
   });
@@ -111,13 +117,12 @@ test.describe('Paste link substitution (Slack-style)', () => {
       el.focus();
       el.value = 'click here please';
       el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.setSelectionRange(6, 10); // "here"
     });
 
     // Crafted payload: if the handler accepted this verbatim it would emit
     // [here](https://evil/)[real](https://good) — two links, with "here"
     // pointing at the attacker's URL.
-    await pasteText(input, 'https://evil/)[real](https://good');
+    await pasteText(input, 'https://evil/)[real](https://good', [6, 10]); // select "here"
     const value = await input.evaluate((el: HTMLTextAreaElement) => el.value);
     // No substitution → value unchanged (synthesized event, no default).
     expect(value).toBe('click here please');

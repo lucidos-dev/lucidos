@@ -6,7 +6,7 @@
 //! Postgres pool + `EventBus`. This mirrors how `event_bus_tests.rs`
 //! exercises bus paths.
 
-use super::dismiss_from_context_impl;
+use super::{dismiss_from_context_impl, parse_apply_change_id};
 use crate::engine::event_bus::EventBus;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use serde_json::json;
@@ -307,4 +307,163 @@ async fn dismiss_from_context_accepts_evt_prefixed_form() {
 
     pool.close().await;
     teardown_test_db(&db).await;
+}
+
+// ============================================================================
+// `build_query_events_response` — byte-budget + wrapper shape
+//
+// Pure synchronous fn that fans the LLM-tool result through a compact-JSON
+// budget. No DB needed — we feed `EventRow`s directly. Motivating bug: a
+// single `query_events(event_type=ToolResult, limit=300)` returned 2.3 MB
+// and blew the 1M-token prompt cap on the next turn.
+// ============================================================================
+
+mod build_query_events_response_tests {
+    use crate::core::EventRow;
+    use crate::engine::tools::build_query_events_response;
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn row(event_type: &str, payload_chars: usize) -> EventRow {
+        EventRow {
+            id: Uuid::new_v4(),
+            event_type: event_type.to_string(),
+            payload: json!({ "summary": "x".repeat(payload_chars) }),
+            created: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            thread_id: None,
+            sequence: None,
+        }
+    }
+
+    /// Plenty of budget → every event passes through. `truncated:false`, no
+    /// `hint`. The wrapper shape is the contract — the LLM tool description
+    /// promises it, so keep this test load-bearing.
+    #[test]
+    fn returns_full_set_when_under_budget() {
+        let events = vec![row("Small", 10), row("Small", 10), row("Small", 10)];
+        let out = build_query_events_response(&events, 100_000);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
+        assert_eq!(parsed["total_matching"], 3);
+        assert_eq!(parsed["returned"], 3);
+        assert_eq!(parsed["truncated"], false);
+        assert!(parsed.get("hint").is_none(), "no hint when not truncated");
+        assert_eq!(parsed["events"].as_array().unwrap().len(), 3);
+    }
+
+    /// Stop on the first event that doesn't fit; include everything before.
+    /// `truncated:true` plus a non-empty `hint` is the LLM's signal to
+    /// narrow the next call.
+    #[test]
+    fn stops_mid_list_when_byte_limit_hit() {
+        let events = vec![
+            row("Tiny", 10),
+            row("Tiny", 10),
+            row("Huge", 50_000),
+            row("Tiny", 10),
+        ];
+        // Enough room for the two small events but not the 50 KB blob.
+        let out = build_query_events_response(&events, 1_000);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
+        assert_eq!(parsed["total_matching"], 4);
+        assert_eq!(parsed["returned"], 2);
+        assert_eq!(parsed["truncated"], true);
+        assert!(parsed["hint"].as_str().unwrap().contains("narrow"));
+    }
+
+    /// A first event larger than the entire budget must return zero events,
+    /// `truncated:true`, and a hint — never an unbounded blob, never a
+    /// silent empty array that looks like "no matching events".
+    #[test]
+    fn empty_events_when_first_alone_exceeds_budget() {
+        let events = vec![row("Huge", 50_000)];
+        let out = build_query_events_response(&events, 1_000);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
+        assert_eq!(parsed["total_matching"], 1);
+        assert_eq!(parsed["returned"], 0);
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["byte_size"], 0);
+        assert!(parsed["hint"].is_string());
+    }
+
+    /// Empty store input round-trips to an empty array with no hint.
+    #[test]
+    fn empty_input_yields_empty_array_no_hint() {
+        let out = build_query_events_response(&[], 100_000);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
+        assert_eq!(parsed["total_matching"], 0);
+        assert_eq!(parsed["returned"], 0);
+        assert_eq!(parsed["truncated"], false);
+        assert_eq!(parsed["byte_size"], 0);
+        assert!(parsed.get("hint").is_none());
+        assert_eq!(parsed["events"].as_array().unwrap().len(), 0);
+    }
+
+    /// The whole point of the byte budget is to keep the wire small. Verify
+    /// the output is compact (no pretty-print whitespace) — the original
+    /// bug was a `to_string_pretty` call that inflated every result ~30%.
+    #[test]
+    fn output_is_compact_json_not_pretty_printed() {
+        let events = vec![row("Tiny", 10)];
+        let out = build_query_events_response(&events, 100_000);
+        assert!(
+            !out.contains("\n  "),
+            "result must be compact JSON (no indentation): {}",
+            out
+        );
+    }
+
+    /// Pin the per-call caps that gate `query_events`. The May 25
+    /// workspace-learning trigger sent 1.54 M tokens to a 1 M-cap Opus
+    /// API after chaining 8 calls at the prior (looser) defaults
+    /// (`limit: 300/500`, `byte_limit: 256 KB`). The tightened bounds
+    /// must not silently regress in a future "let me bump this for
+    /// flexibility" refactor — the LLM cannot enforce its own
+    /// discipline if the schema lets it bypass.
+    #[test]
+    fn query_events_caps_match_workspace_learning_recipe() {
+        use crate::engine::tools::{query_events_byte_budget, query_events_limit};
+        assert_eq!(query_events_limit::DEFAULT, 50);
+        assert_eq!(query_events_limit::MAX, 200);
+        assert_eq!(query_events_byte_budget::DEFAULT, 128 * 1024);
+        assert_eq!(query_events_byte_budget::MAX, 512 * 1024);
+    }
+}
+
+// ============================================================================
+// `parse_apply_change_id` — the `apply_change` tool's required-UUID guard.
+//
+// Pure synchronous fn (factored out of the handler so these validation
+// branches need no engine). The handler refuses to call the heavyweight
+// `LucidosEngine::apply_change` merge pipeline without a well-formed target.
+// ============================================================================
+
+#[test]
+fn apply_change_rejects_missing_change_id() {
+    // Missing, null, empty, and whitespace-only all collapse to "required".
+    for bad in [json!({}), json!({"change_id": null}), json!({"change_id": ""}), json!({"change_id": "   "})] {
+        let out = parse_apply_change_id(&bad);
+        assert!(
+            matches!(&out, Err(msg) if msg.contains("change_id is required")),
+            "{bad:?} should error as required, got: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn apply_change_rejects_malformed_change_id() {
+    let out = parse_apply_change_id(&json!({"change_id": "not-a-uuid"}));
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("not a valid UUID")),
+        "malformed change_id should error, got: {out:?}"
+    );
+}
+
+#[test]
+fn apply_change_accepts_valid_uuid_trimming_whitespace() {
+    let id = Uuid::new_v4();
+    // Surrounding whitespace is trimmed before parsing — the LLM occasionally
+    // pads string args.
+    let out = parse_apply_change_id(&json!({"change_id": format!("  {id}  ")}));
+    assert_eq!(out.expect("valid padded UUID must parse"), id);
 }

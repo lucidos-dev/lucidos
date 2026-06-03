@@ -2,6 +2,7 @@
 //! wasmtime module loaded from `data/auth-modules/<name>.wasm`.
 
 use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, BodyView, LayerInput};
+use crate::api::proxy_hex::hex_lower;
 use crate::api::proxy_wasm_host::{register_host_imports, HostState};
 use async_trait::async_trait;
 use axum::http::{HeaderName, StatusCode};
@@ -294,7 +295,7 @@ impl AuthLayer for WasmSignerLayer {
                 bytes: serde_bytes::ByteBuf::from(bytes.to_vec()),
             },
             BodyViewOwned::HashOnly { sha256, length } => SignInputBody::HashOnly {
-                sha256_hex: hex_string(sha256),
+                sha256_hex: hex_lower(sha256),
                 length: *length,
             },
         };
@@ -464,14 +465,6 @@ impl AuthLayer for WasmSignerLayer {
             ..Default::default()
         })
     }
-}
-
-fn hex_string(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
 }
 
 #[cfg(test)]

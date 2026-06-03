@@ -4,6 +4,31 @@ use crate::engine::thread_events::ActorMode;
 use crate::engine::thread_state::ThreadState;
 use crate::engine::InjectedPrompt;
 use std::collections::VecDeque;
+use std::path::PathBuf;
+
+/// Allow/deny matrix for a subprocess-originated chat POST. Allowed:
+/// `lucidos spawn-thread` (`mode = Agent|Engine`, `parent_thread_id == source`)
+/// and same-thread follow-up (`target_thread_id == source`). Denied: any
+/// `mode = Human` (agents never claim user identity) and cross-thread agent
+/// posts (the original incident shape).
+///
+/// Pure function — unit-testable without booting a router.
+pub(crate) fn subprocess_chat_legitimate(
+    mode: ActorMode,
+    source_thread_id: Option<Uuid>,
+    target_thread_id: Option<Uuid>,
+    parent_thread_id: Option<Uuid>,
+) -> bool {
+    let target_matches_source = target_thread_id.is_some() && target_thread_id == source_thread_id;
+    let parent_matches_source = match (parent_thread_id, source_thread_id) {
+        (Some(p), Some(s)) => p == s,
+        _ => false,
+    };
+    match mode {
+        ActorMode::Human => false,
+        ActorMode::Agent | ActorMode::Engine => target_matches_source || parent_matches_source,
+    }
+}
 
 /// Re-process orphaned injections sequentially until the chain settles.
 ///
@@ -147,8 +172,7 @@ fn validate_mode_and_spawn(request: &ChatRequest) -> Result<ValidatedSpawn, Stat
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let has_parent =
-        request.parent_thread_id.is_some() || request.spawning_event_id.is_some();
+    let has_parent = request.parent_thread_id.is_some() || request.spawning_event_id.is_some();
 
     if has_caller && has_parent {
         return Err(StatusCode::BAD_REQUEST);
@@ -209,8 +233,16 @@ pub(super) fn validate_thread_continuity(
     let existing_is_cc = source == CC_SOURCE;
     let requested_is_cc = requested_use_cc == Some(true);
     if existing_is_cc != requested_is_cc {
-        let from = if existing_is_cc { "Claude Code" } else { "Lucidos" };
-        let to = if requested_is_cc { "Claude Code" } else { "Lucidos" };
+        let from = if existing_is_cc {
+            "Claude Code"
+        } else {
+            "Lucidos"
+        };
+        let to = if requested_is_cc {
+            "Claude Code"
+        } else {
+            "Lucidos"
+        };
         return Err((
             StatusCode::CONFLICT,
             format!("Thread is locked to {from} mode; cannot switch to {to}"),
@@ -328,6 +360,31 @@ pub(super) async fn chat_submit(
         caller_event_id,
     } = validate_mode_and_spawn(&request)?;
     let mode = request.mode;
+
+    // Parse target thread id up front so the subprocess gate can see it.
+    let target_thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
+
+    // Subprocess gate — see `subprocess_chat_legitimate` for the matrix.
+    // Skipped on the cross-workspace path: those requests have their own
+    // origin contract (Workspace variant) and don't route through the
+    // per-engine subprocess token channel.
+    if request.caller_workspace.is_none() {
+        if let crate::api::actor::SubprocessOrigin::Subprocess { source_thread_id } =
+            crate::api::actor::subprocess_origin(&headers)
+        {
+            if !subprocess_chat_legitimate(mode, source_thread_id, target_thread_id, parent_thread_id) {
+                log!(
+                    "[Chat] Rejecting subprocess chat POST: mode={:?}, source_thread={:?}, target_thread={:?}, parent_thread={:?}",
+                    mode,
+                    source_thread_id,
+                    target_thread_id,
+                    parent_thread_id
+                );
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
+    }
+
     let engine_clone = state.engine.clone();
     let message = request.message.clone();
     let model = request.model.clone();
@@ -348,6 +405,8 @@ pub(super) async fn chat_submit(
             _ => None,
         }
     };
+    // Parent title is best-effort display metadata stamped onto the new thread's
+    // origin — a transient DB error shouldn't fail the user's send.
     let parent_lookup = async {
         match parent_thread_id {
             Some(ptid) => state
@@ -355,23 +414,31 @@ pub(super) async fn chat_submit(
                 .event_store()
                 .get_thread_title(ptid)
                 .await
-                .unwrap_or(None),
+                .unwrap_or_else(|e| {
+                    log!(
+                        "[Chat] Failed to load parent thread title for {}: {}",
+                        ptid,
+                        e
+                    );
+                    None
+                }),
             None => None,
         }
     };
     let (device_label, parent_thread_title) = tokio::join!(device_lookup, parent_lookup);
 
-    let caller = request
-        .caller_workspace
-        .as_ref()
-        .map(|workspace| crate::api::actor::CallerOrigin {
-            workspace: workspace.clone(),
-            thread_id: caller_thread_id,
-            event_id: caller_event_id,
-            // For a cross-workspace POST, the body `mode` describes the upstream
-            // (calling workspace's) actor — that's exactly what CallerOrigin.mode wants.
-            mode,
-        });
+    let caller =
+        request
+            .caller_workspace
+            .as_ref()
+            .map(|workspace| crate::api::actor::CallerOrigin {
+                workspace: workspace.clone(),
+                thread_id: caller_thread_id,
+                event_id: caller_event_id,
+                // For a cross-workspace POST, the body `mode` describes the upstream
+                // (calling workspace's) actor — that's exactly what CallerOrigin.mode wants.
+                mode,
+            });
 
     let origin = build_message_origin(
         &headers,
@@ -399,7 +466,10 @@ pub(super) async fn chat_submit(
         let mut resolved = Vec::with_capacity(hashes.len());
         for hash in &hashes {
             match crate::core::blobs::read_blob_as_base64(state.engine.workspace_path(), hash) {
-                Some((data, mime_type)) => resolved.push(ChatImage { base64: data, mime_type }),
+                Some((data, mime_type)) => resolved.push(ChatImage {
+                    base64: data,
+                    mime_type,
+                }),
                 None => log!(
                     "[Chat] image_hashes: blob {} missing on disk, dropping from message",
                     hash
@@ -413,9 +483,10 @@ pub(super) async fn chat_submit(
     let use_claude_code = request.use_claude_code;
     let cc_model = request.cc_model;
     let event_id = request.event_id;
-    // Reject malformed ids with 400 instead of silently dropping them and
-    // starting a fresh thread / unscoped change (CLAUDE.md "no silent defaults").
-    let thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
+    // Re-bind under the existing name so the rest of the handler reads
+    // exactly as before (this is the same value parsed above for the
+    // subprocess-origin gate). Re-parsing would double the 400 branch.
+    let thread_id = target_thread_id;
     let conflict_change_id = parse_optional_uuid(request.conflict_change_id.as_deref())?;
     // `repo_id` accepts either a UUID or a registered repo name (the
     // `lucidos spawn-thread --repo <name>` CLI sends names). UUIDs pass
@@ -426,7 +497,9 @@ pub(super) async fn chat_submit(
     // 400 here instead of a 500 from deep inside worktree creation.
     let repo_id = match request.repo_id.as_deref() {
         Some(s) if !s.is_empty() && Uuid::parse_str(s).is_err() => {
-            match crate::core::repositories::RepositoryStore::get_by_name(state.engine.pool(), s).await {
+            match crate::core::repositories::RepositoryStore::get_by_name(state.engine.pool(), s)
+                .await
+            {
                 Ok(Some(repo)) => Some(repo.id.to_string()),
                 Ok(None) => {
                     log!("[Chat] Unknown repo name '{}' in chat_submit", s);
@@ -439,6 +512,174 @@ pub(super) async fn chat_submit(
             }
         }
         _ => request.repo_id,
+    };
+
+    // Scope-picker payload: `folder` is the new wire field used by the
+    // compose-view scope picker. Resolve through the shared
+    // `coding_agent_kind` pipeline to a `(repo_id, app stash)` pair so the
+    // downstream spawn path is unchanged — see
+    // `engine::agent_session::coding_agent_kind` for the rules.
+    //
+    // Mutual exclusion with `repo_id`: the back-compat path keeps the old
+    // wire field; new callers send `folder` exclusively. Both set is a 400 so
+    // a half-migrated frontend can't silently win one but lose the other.
+    let folder_in = request.folder.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let (repo_id, thread_id, app_id_to_stash) = if let Some(folder_str) = folder_in {
+        if repo_id.as_deref().is_some_and(|s| !s.is_empty()) {
+            log!("[Chat] chat_submit received both `folder` and `repo_id` — rejecting");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        // `folder` is a CC-spawn payload — when CC isn't requested, the
+        // resolved app_id_to_stash would sit forever in `pending_app_spawn`
+        // because the chat agent path never pops it. Reject early.
+        if use_claude_code != Some(true) {
+            log!(
+                "[Chat] chat_submit received `folder` without `use_claude_code=true` — rejecting"
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        // Canonicalize workspace_root too — classify_resolved_folder's
+        // `.starts_with(workspace_root.join("data"))` check uses this prefix
+        // and `folder_abs` is already canonicalized, so a symlinked
+        // workspace (macOS LUCIDOS_WORKSPACE=/var/folders/T/... canonicalizes
+        // to /private/var/...) would otherwise miss the App branch and
+        // 400 with "not the Lucidos source repo".
+        let workspace_root = {
+            let raw = state.engine.workspace_path().to_path_buf();
+            match std::fs::canonicalize(&raw) {
+                Ok(p) => p,
+                Err(e) => {
+                    log!("[Chat] canonicalize workspace_root {:?} failed ({}); falling back to raw path — symlinked workspaces may misclassify", raw, e);
+                    raw
+                }
+            }
+        };
+        // Pre-fetch the registry once; reuse for both `lookup_repo_path` (sync
+        // closure inside `resolve_folder_input`) and `external_repo_match`
+        // (sync closure inside `classify_resolved_folder`). Sync closures keep
+        // both helpers free of `async` plumbing.
+        let registered_repos = match crate::core::repositories::RepositoryStore::list(state.engine.pool()).await {
+            Ok(v) => v,
+            Err(e) => {
+                log!("[Chat] failed to list repos for folder resolution: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        // Canonicalize each registered path once. Both `resolve_folder_input`
+        // and `classify_resolved_folder` canonicalize their working
+        // `folder_abs`; without symmetric canonicalization here, a
+        // registered repo under a symlinked ancestor (macOS `/var/...` →
+        // `/private/var/...`, /home → /Users, …) would miss the External
+        // branch and fall through to the unrecognised-path refusal.
+        let registered_canonical: Vec<(uuid::Uuid, PathBuf)> = registered_repos
+            .iter()
+            .map(|r| {
+                let raw = PathBuf::from(&r.path);
+                let canon = match std::fs::canonicalize(&raw) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log!("[Chat] canonicalize repo {} path {:?} failed ({}); using raw — match may miss for symlinked / deleted paths", r.id, raw, e);
+                        raw
+                    }
+                };
+                (r.id, canon)
+            })
+            .collect();
+        let lucidos_repo_root = match registered_repos
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(crate::engine::LucidosEngine::DEFAULT_REPO_NAME))
+        {
+            Some(repo) => {
+                let raw = PathBuf::from(&repo.path);
+                match std::fs::canonicalize(&raw) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log!("[Chat] canonicalize Lucidos repo path {:?} failed ({}); using raw — Lucidos classification may misfire", raw, e);
+                        raw
+                    }
+                }
+            }
+            None => {
+                log!("[Chat] Lucidos repo not registered — cannot classify folder");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        let lookup_repo_path = |id_or_name: &str| -> Result<Option<PathBuf>, String> {
+            if let Ok(uuid) = Uuid::parse_str(id_or_name) {
+                if let Some(r) = registered_repos.iter().find(|r| r.id == uuid) {
+                    return Ok(Some(PathBuf::from(&r.path)));
+                }
+            }
+            Ok(registered_repos
+                .iter()
+                .find(|r| r.name.eq_ignore_ascii_case(id_or_name))
+                .map(|r| PathBuf::from(&r.path)))
+        };
+        let folder_abs = match crate::engine::agent_session::coding_agent_kind::resolve_folder_input(
+            folder_str,
+            &workspace_root,
+            lookup_repo_path,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                log!("[Chat] folder `{}` failed to resolve: {}", folder_str, e);
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        };
+        let external_repo_match = |path: &std::path::Path| -> Option<PathBuf> {
+            registered_canonical
+                .iter()
+                .find_map(|(_, canon)| if canon == path { Some(canon.clone()) } else { None })
+        };
+        use crate::engine::agent_session::coding_agent_kind::{
+            classify_resolved_folder, FolderClassification,
+        };
+        let classification = match classify_resolved_folder(
+            &folder_abs,
+            &workspace_root,
+            &lucidos_repo_root,
+            external_repo_match,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                log!("[Chat] folder `{}` classification failed: {}", folder_str, e);
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        };
+        match classification {
+            FolderClassification::Lucidos { .. } => (None, thread_id, None),
+            FolderClassification::External { repo_root } => {
+                // Reuse the canonicalized snapshot — same paths
+                // `external_repo_match` consulted, so this find is the
+                // mirror lookup that converts the canonical path back to a
+                // UUID. No race possible (single in-process snapshot).
+                let repo = registered_canonical
+                    .iter()
+                    .find(|(_, canon)| canon == &repo_root);
+                let repo_uuid = match repo {
+                    Some((id, _)) => id.to_string(),
+                    None => {
+                        log!(
+                            "[Chat] external repo {:?} not found in canonical snapshot — \
+                             external_repo_match invariant violated",
+                            repo_root
+                        );
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                };
+                (Some(repo_uuid), thread_id, None)
+            }
+            FolderClassification::App { app_id, .. } => {
+                // App spawns need the thread_id at stash-time so
+                // `run_direct_agent` can pop the entry. Generate one when the
+                // frontend didn't send a draft (raw new send) — matches what
+                // `spawn_agent_thread` does for the LLM tool path.
+                let tid = thread_id.unwrap_or_else(Uuid::new_v4);
+                (None, Some(tid), Some((tid, app_id)))
+            }
+        }
+    } else {
+        (repo_id, thread_id, None)
     };
 
     // Lock thread to its first (mode, repo). Switching either mid-thread
@@ -482,6 +723,27 @@ pub(super) async fn chat_submit(
             }
         }
     }
+
+    // Stash the app spawn AFTER every early-return gate above (continuity
+    // lock, thread_summaries lookup error). Earlier-stamped entries would
+    // leak in the in-memory map when those gates reject — `run_direct_agent`
+    // is the only popper, and it's never reached on the 4xx/5xx paths.
+    // Mutex poisoning: parking_lot would be cleaner, but the rest of the
+    // engine uses std::sync::Mutex with the same `match` guard; matching
+    // that pattern means a panic in any other holder of this lock degrades
+    // app-spawn dispatching to a 500 instead of crashing the worker.
+    if let Some((tid, app_id)) = app_id_to_stash {
+        match state.engine.pending_app_spawn.lock() {
+            Ok(mut guard) => {
+                guard.insert(tid, app_id);
+            }
+            Err(e) => {
+                log!("[Chat] pending_app_spawn poisoned, cannot stash: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
     let title = request.title;
     // Generate an event_id for tracking progress events
     let response_event_id = event_id
@@ -526,7 +788,16 @@ pub(super) async fn chat_submit(
             Ok(ref res) => {
                 if res.proposed_change {
                     if res.auto_apply {
-                        let pending = engine_clone.changes().list_pending().await;
+                        let pending = match engine_clone.changes().list_pending().await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log!(
+                                    "[Chat] auto-apply: list_pending: {} — skipping auto-apply",
+                                    e
+                                );
+                                Vec::new()
+                            }
+                        };
                         if let Some(change) =
                             pending.iter().find(|c| c.request_id == res.request_id)
                         {
@@ -559,39 +830,57 @@ pub(super) async fn chat_submit(
                         }
                     }
                     let proj = engine_clone.changes();
-                    let mut pending = proj.list_pending().await;
-                    let mut applied = proj.list_recently_applied(15, None).await;
-                    let restart = proj.requires_restart_since(result_started_at).await;
-                    let (r1, r2) = tokio::join!(
-                        crate::core::changes::enrich_thread_titles(
-                            engine_clone.pool(),
-                            &mut pending,
-                        ),
-                        crate::core::changes::enrich_thread_titles(
-                            engine_clone.pool(),
-                            &mut applied,
-                        ),
+                    let (pending_r, applied_r, restart_r) = tokio::join!(
+                        proj.list_pending(),
+                        proj.list_recently_applied(15, None),
+                        proj.requires_restart_since(result_started_at),
                     );
-                    if let Err(e) = r1 {
-                        log!("[Chat] enrich pending titles: {}", e);
+                    match (pending_r, applied_r, restart_r) {
+                        (Ok(mut pending), Ok(mut applied), Ok(restart)) => {
+                            let (r1, r2) = tokio::join!(
+                                crate::core::changes::enrich_thread_titles(
+                                    engine_clone.pool(),
+                                    &mut pending,
+                                ),
+                                crate::core::changes::enrich_thread_titles(
+                                    engine_clone.pool(),
+                                    &mut applied,
+                                ),
+                            );
+                            if let Err(e) = r1 {
+                                log!("[Chat] enrich pending titles: {}", e);
+                            }
+                            if let Err(e) = r2 {
+                                log!("[Chat] enrich applied titles: {}", e);
+                            }
+                            engine_clone
+                                .event_bus
+                                .emit_or_log(
+                                    crate::engine::event_bus::BusEvent::System(
+                                        crate::engine::event_bus::SystemEvent::ChangesUpdated {
+                                            total_pending: pending.len(),
+                                            pending,
+                                            applied,
+                                            restart_required: restart,
+                                        },
+                                    ),
+                                    "[Chat] ChangesUpdated",
+                                )
+                                .await;
+                        }
+                        (perr, aerr, rerr) => {
+                            if let Err(e) = perr {
+                                log!("[Chat] post-process list_pending: {}", e);
+                            }
+                            if let Err(e) = aerr {
+                                log!("[Chat] post-process list_recently_applied: {}", e);
+                            }
+                            if let Err(e) = rerr {
+                                log!("[Chat] post-process requires_restart_since: {}", e);
+                            }
+                            log!("[Chat] skipping post-turn ChangesUpdated broadcast");
+                        }
                     }
-                    if let Err(e) = r2 {
-                        log!("[Chat] enrich applied titles: {}", e);
-                    }
-                    engine_clone
-                        .event_bus
-                        .emit_or_log(
-                            crate::engine::event_bus::BusEvent::System(
-                                crate::engine::event_bus::SystemEvent::ChangesUpdated {
-                                    total_pending: pending.len(),
-                                    pending,
-                                    applied,
-                                    restart_required: restart,
-                                },
-                            ),
-                            "[Chat] ChangesUpdated",
-                        )
-                        .await;
                 }
 
                 // Re-submit orphaned injections (follow-ups that arrived after
@@ -629,7 +918,7 @@ pub(super) async fn chat_submit(
     });
 
     // Monitor the spawned task — if it panics, emit ResponseFailed + SessionEnded
-    // and clean up the CC session so the thread doesn't get stuck in "running" state.
+    // and clean up the Claude Code session so the thread doesn't get stuck in "running" state.
     if let Some(tid) = thread_id_for_panic {
         LucidosEngine::monitor_cc_task(engine_for_panic, tid, handle);
     } else {
@@ -654,475 +943,37 @@ pub(super) struct CancelChatQuery {
 
 pub(super) async fn cancel_chat(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<CancelChatQuery>,
 ) -> Result<StatusCode, StatusCode> {
-    match parse_optional_uuid(query.thread_id.as_deref())? {
+    let thread_id = parse_optional_uuid(query.thread_id.as_deref())?;
+    // Resolve actor once and reuse for both the question-card resolution
+    // and the cancel-thread call — the actor stamps `ResponseCanceled.actor`
+    // so the timeline records which device clicked Stop.
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    // Resolve any pending question card before firing the cancel token —
+    // otherwise the chat agent's `ask_user_question` tool stays blocked on
+    // `walk_question_batch.recv()` (no cancel-aware select) and the cancel
+    // token is never observed. Mirrors `claude_code_stop`'s behavior; without
+    // it, canceling a chat thread with an active question card hangs
+    // indefinitely in the "Canceling…" state.
+    if let Some(tid) = thread_id {
+        crate::engine::agent_question::resolve_pending_question_as_canceled(
+            &state.engine,
+            tid,
+            actor.clone(),
+        )
+        .await;
+    }
+    match thread_id {
         Some(uuid) => {
-            state.engine.cancel_thread(uuid);
+            state.engine.cancel_thread(uuid, actor);
         }
-        None => state.engine.cancel_all_threads(),
+        None => state.engine.cancel_all_threads(actor),
     }
     Ok(StatusCode::OK)
 }
 
-#[derive(Deserialize)]
-pub(super) struct InjectRequest {
-    thread_id: String,
-    message: String,
-    event_id: Option<String>,
-}
-
-/// POST /api/chat/inject — inject a user prompt into an active agentic loop.
-/// The injected text is picked up between tool iterations, allowing mid-flight corrections.
-/// Returns 409 if the thread is not currently active.
-pub(super) async fn inject_prompt(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(request): Json<InjectRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let thread_id = Uuid::parse_str(&request.thread_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    if request.message.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Reject malformed event_id with 400 instead of silently dropping the
-    // injection's correlation handle (CLAUDE.md "no silent defaults").
-    let event_id = parse_optional_uuid(request.event_id.as_deref())?;
-
-    // Stamp the user actor so the injected MessageReceived event carries the
-    // device that submitted it (mutating-endpoint actor rule).
-    let origin = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-
-    if state.engine.inject_prompt(
-        thread_id,
-        request.message,
-        event_id,
-        crate::engine::thread_events::ActorMode::Human,
-        None,
-        origin,
-    ) {
-        Ok(StatusCode::OK)
-    } else {
-        Err(StatusCode::CONFLICT)
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn base_req(mode: ActorMode) -> ChatRequest {
-        ChatRequest {
-            message: "hi".into(),
-            model: None,
-            app_context: None,
-            file_context: None,
-            url_context: None,
-            repo_file_context: None,
-            reasoning_effort: None,
-            images: None,
-            image_hashes: None,
-            device_id: None,
-            use_claude_code: None,
-            cc_model: None,
-            event_id: None,
-            thread_id: None,
-            conflict_change_id: None,
-            repo_id: None,
-            title: None,
-            mode,
-            parent_thread_id: None,
-            spawning_event_id: None,
-            caller_workspace: None,
-            caller_thread_id: None,
-            caller_event_id: None,
-        }
-    }
-
-    #[test]
-    fn human_mode_with_no_spawn_context_is_valid() {
-        let req = base_req(ActorMode::Human);
-        let v = validate_mode_and_spawn(&req).unwrap();
-        assert_eq!(v.parent_thread_id, None);
-        assert_eq!(v.spawning_event_id, None);
-    }
-
-    #[test]
-    fn human_mode_with_parent_thread_id_returns_400() {
-        let mut req = base_req(ActorMode::Human);
-        req.parent_thread_id = Some(Uuid::new_v4().to_string());
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn human_mode_with_spawning_event_id_returns_400() {
-        let mut req = base_req(ActorMode::Human);
-        req.spawning_event_id = Some(Uuid::new_v4().to_string());
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn agent_mode_with_parent_and_spawning_event_is_valid() {
-        let parent_uuid = Uuid::new_v4();
-        let event_uuid = Uuid::new_v4();
-        let mut req = base_req(ActorMode::Agent);
-        req.parent_thread_id = Some(parent_uuid.to_string());
-        req.spawning_event_id = Some(event_uuid.to_string());
-        let v = validate_mode_and_spawn(&req).unwrap();
-        assert_eq!(v.parent_thread_id, Some(parent_uuid));
-        assert_eq!(v.spawning_event_id, Some(event_uuid));
-    }
-
-    #[test]
-    fn agent_mode_without_parent_thread_id_returns_400() {
-        let req = base_req(ActorMode::Agent);
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn engine_mode_without_parent_thread_id_returns_400() {
-        let req = base_req(ActorMode::Engine);
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn engine_mode_with_caller_workspace_is_valid() {
-        let mut req = base_req(ActorMode::Engine);
-        req.caller_workspace = Some("personal".into());
-        assert!(validate_mode_and_spawn(&req).is_ok());
-    }
-
-    #[test]
-    fn invalid_parent_uuid_returns_400() {
-        let mut req = base_req(ActorMode::Agent);
-        req.parent_thread_id = Some("not-a-uuid".into());
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn invalid_spawning_event_uuid_returns_400() {
-        let mut req = base_req(ActorMode::Agent);
-        req.parent_thread_id = Some(Uuid::new_v4().to_string());
-        req.spawning_event_id = Some("not-a-uuid".into());
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn chat_request_requires_mode() {
-        let body = serde_json::json!({
-            "message": "spawned task",
-            "use_claude_code": true,
-        });
-        let result: Result<ChatRequest, _> = serde_json::from_value(body);
-        assert!(result.is_err(), "ChatRequest must require mode field");
-    }
-
-    #[test]
-    fn chat_request_mode_field_deserializes() {
-        let body = serde_json::json!({
-            "message": "hi",
-            "mode": "human",
-        });
-        let req: ChatRequest = serde_json::from_value(body).unwrap();
-        assert_eq!(req.mode, ActorMode::Human);
-    }
-
-    #[test]
-    fn caller_workspace_with_parent_thread_id_returns_400() {
-        let mut req = base_req(ActorMode::Agent);
-        req.caller_workspace = Some("personal".into());
-        req.parent_thread_id = Some(Uuid::new_v4().to_string());
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn caller_workspace_with_spawning_event_id_returns_400() {
-        let mut req = base_req(ActorMode::Agent);
-        req.caller_workspace = Some("personal".into());
-        req.spawning_event_id = Some(Uuid::new_v4().to_string());
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn caller_thread_id_without_caller_workspace_returns_400() {
-        // caller_thread_id only meaningful in conjunction with caller_workspace —
-        // an orphan caller id is a malformed request, not a silent drop.
-        let mut req = base_req(ActorMode::Human);
-        req.caller_thread_id = Some(Uuid::new_v4().to_string());
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn caller_event_id_without_caller_workspace_returns_400() {
-        let mut req = base_req(ActorMode::Human);
-        req.caller_event_id = Some(Uuid::new_v4().to_string());
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn caller_thread_id_invalid_uuid_returns_400() {
-        let mut req = base_req(ActorMode::Agent);
-        req.caller_workspace = Some("personal".into());
-        req.caller_thread_id = Some("not-a-uuid".into());
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn caller_event_id_invalid_uuid_returns_400() {
-        let mut req = base_req(ActorMode::Agent);
-        req.caller_workspace = Some("personal".into());
-        req.caller_event_id = Some("not-a-uuid".into());
-        assert_eq!(
-            validate_mode_and_spawn(&req),
-            Err(StatusCode::BAD_REQUEST)
-        );
-    }
-
-    #[test]
-    fn caller_workspace_with_only_workspace_field_is_valid() {
-        // Caller workspace alone is fine — caller_thread_id / caller_event_id
-        // are optional. Common case: human curl from another workspace.
-        let mut req = base_req(ActorMode::Human);
-        req.caller_workspace = Some("personal".into());
-        let v = validate_mode_and_spawn(&req).unwrap();
-        assert_eq!(v.parent_thread_id, None);
-        assert_eq!(v.spawning_event_id, None);
-    }
-
-    #[test]
-    fn caller_workspace_with_all_three_fields_is_valid() {
-        let mut req = base_req(ActorMode::Agent);
-        req.caller_workspace = Some("personal".into());
-        req.caller_thread_id = Some(Uuid::new_v4().to_string());
-        req.caller_event_id = Some(Uuid::new_v4().to_string());
-        assert!(validate_mode_and_spawn(&req).is_ok());
-    }
-
-    // -- validate_thread_continuity ---------------------------------------
-
-    #[test]
-    fn continuity_new_thread_is_always_ok() {
-        // No existing summary => new thread, anything goes
-        assert!(validate_thread_continuity(None, None, None, None).is_ok());
-        assert!(validate_thread_continuity(None, None, Some(true), Some("repo-a")).is_ok());
-    }
-
-    #[test]
-    fn continuity_chat_thread_with_chat_followup_is_ok() {
-        assert!(validate_thread_continuity(Some("chat"), None, None, None).is_ok());
-        assert!(validate_thread_continuity(Some("chat"), None, Some(false), None).is_ok());
-    }
-
-    #[test]
-    fn continuity_chat_thread_rejects_cc_followup() {
-        let err = validate_thread_continuity(Some("chat"), None, Some(true), Some("repo-a"))
-            .unwrap_err();
-        assert_eq!(err.0, StatusCode::CONFLICT);
-        assert!(err.1.contains("Lucidos"));
-        assert!(err.1.contains("Claude Code"));
-    }
-
-    #[test]
-    fn continuity_cc_thread_rejects_chat_followup() {
-        let err = validate_thread_continuity(Some("claude_code"), Some("repo-a"), None, None)
-            .unwrap_err();
-        assert_eq!(err.0, StatusCode::CONFLICT);
-        let err = validate_thread_continuity(
-            Some("claude_code"),
-            Some("repo-a"),
-            Some(false),
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(err.0, StatusCode::CONFLICT);
-    }
-
-    #[test]
-    fn continuity_cc_thread_with_matching_repo_is_ok() {
-        assert!(validate_thread_continuity(
-            Some("claude_code"),
-            Some("repo-a"),
-            Some(true),
-            Some("repo-a"),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn continuity_cc_thread_rejects_different_repo() {
-        let err = validate_thread_continuity(
-            Some("claude_code"),
-            Some("repo-a"),
-            Some(true),
-            Some("repo-b"),
-        )
-        .unwrap_err();
-        assert_eq!(err.0, StatusCode::CONFLICT);
-        assert!(err.1.contains("repo-a"));
-        assert!(err.1.contains("repo-b"));
-    }
-
-    #[test]
-    fn continuity_cc_thread_with_no_request_repo_is_ok() {
-        // Request omits repo_id => frontend will inherit from the thread.
-        // Don't 409 just because the field is missing.
-        assert!(validate_thread_continuity(
-            Some("claude_code"),
-            Some("repo-a"),
-            Some(true),
-            None,
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn continuity_cc_thread_with_no_existing_repo_is_ok() {
-        // First CC session bound but cc_repo_id wasn't recorded (e.g. older
-        // event before SessionStarted carried repo_id). Don't gate on a
-        // missing existing value — just let the request through.
-        assert!(validate_thread_continuity(
-            Some("claude_code"),
-            None,
-            Some(true),
-            Some("repo-b"),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn continuity_trigger_thread_treated_as_chat() {
-        // Trigger threads aren't claude_code, so use_claude_code=true is a
-        // mode switch and must be rejected.
-        let err = validate_thread_continuity(Some("trigger"), None, Some(true), None).unwrap_err();
-        assert_eq!(err.0, StatusCode::CONFLICT);
-    }
-
-    // ── drain_orphan_queue ──
-
-    fn make_orphan(text: &str) -> InjectedPrompt {
-        InjectedPrompt {
-            text: text.to_string(),
-            event_id: Some(Uuid::new_v4()),
-            mode: ActorMode::Human,
-            spawning_event_id: None,
-            images: None,
-            origin: None,
-            kind: crate::engine::InjectedPromptKind::UserText,
-        }
-    }
-
-    #[tokio::test]
-    async fn drain_orphan_queue_processes_each_initial_orphan_in_order() {
-        let initial = vec![make_orphan("a"), make_orphan("b"), make_orphan("c")];
-        let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let processed_clone = processed.clone();
-        drain_orphan_queue(initial, move |orphan| {
-            let processed = processed_clone.clone();
-            async move {
-                processed.lock().unwrap().push(orphan.text.clone());
-                Vec::new()
-            }
-        })
-        .await;
-        assert_eq!(*processed.lock().unwrap(), vec!["a", "b", "c"]);
-    }
-
-    // Regression: a re-processed orphan whose own loop produces NEW orphans
-    // (the in-the-wild thread 9b5a05aa scenario where the user sent two
-    // follow-ups in quick succession during recovery) used to lose those
-    // child orphans because the spawned task discarded the ProcessResult.
-    // The chain must keep draining until every appended orphan is processed.
-    #[tokio::test]
-    async fn drain_orphan_queue_processes_orphans_of_orphans() {
-        // Orphan "a" produces orphan "b" when processed; orphan "b" produces
-        // nothing. Both must be processed.
-        let initial = vec![make_orphan("a")];
-        let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let processed_clone = processed.clone();
-        drain_orphan_queue(initial, move |orphan| {
-            let processed = processed_clone.clone();
-            async move {
-                let text = orphan.text.clone();
-                processed.lock().unwrap().push(text.clone());
-                if text == "a" {
-                    vec![make_orphan("b")]
-                } else {
-                    Vec::new()
-                }
-            }
-        })
-        .await;
-        assert_eq!(*processed.lock().unwrap(), vec!["a", "b"]);
-    }
-
-    #[tokio::test]
-    async fn drain_orphan_queue_handles_deep_chains() {
-        // Each orphan produces one more orphan, four levels deep.
-        let initial = vec![make_orphan("0")];
-        let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let processed_clone = processed.clone();
-        drain_orphan_queue(initial, move |orphan| {
-            let processed = processed_clone.clone();
-            async move {
-                let n: i32 = orphan.text.parse().unwrap();
-                processed.lock().unwrap().push(orphan.text);
-                if n < 4 {
-                    vec![make_orphan(&(n + 1).to_string())]
-                } else {
-                    Vec::new()
-                }
-            }
-        })
-        .await;
-        assert_eq!(*processed.lock().unwrap(), vec!["0", "1", "2", "3", "4"]);
-    }
-
-    #[tokio::test]
-    async fn drain_orphan_queue_no_op_for_empty_initial() {
-        let processed = std::sync::Arc::new(std::sync::Mutex::new(0usize));
-        let processed_clone = processed.clone();
-        drain_orphan_queue(vec![], move |_orphan| {
-            let processed = processed_clone.clone();
-            async move {
-                *processed.lock().unwrap() += 1;
-                Vec::new()
-            }
-        })
-        .await;
-        assert_eq!(*processed.lock().unwrap(), 0);
-    }
-}
+#[path = "chat_tests.rs"]
+mod tests;

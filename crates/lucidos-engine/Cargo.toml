@@ -11,6 +11,14 @@ edition.workspace = true
 #     cargo test -p lucidos-engine --features real-embedder-tests
 real-embedder-tests = []
 
+# Compiles in test-only HTTP endpoints (e.g. `GET /api/_test/push-log`) and
+# swaps the real web-push transport for an in-process logger that appends to
+# the `push_log` table. The e2e workspace builds with this feature enabled;
+# production binaries never include the test endpoints or the stub
+# transport. See `system-knowhow/notifications.md` §5.4 for the e2e harness
+# this feature backs.
+e2e-test-hooks = []
+
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
@@ -39,11 +47,8 @@ sha2 = "0.10"
 sha1 = "0.10"
 hmac = "0.12"
 rand = "0.8"
-pdf-extract = "0.10"
 tempfile = "3"
 glob = "0.3"
-# OCR using PaddleOCR via ocr-rs (pure Rust, supports Latin/Norwegian)
-ocr-rs = "2"
 image = "0.25"
 kamadak-exif = "0.6"
 urlencoding = "2.1.3"

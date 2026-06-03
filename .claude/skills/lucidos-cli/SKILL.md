@@ -1,6 +1,6 @@
 ---
 name: lucidos-cli
-description: Use whenever you need to write a file under the parent workspace's data/ directory (artifacts/, knowhow/, apps/, triggers/), emit/query a domain event, or spawn a new Lucidos thread (sub-thread in this workspace, or task in another workspace) from a Claude Code subprocess running in a Lucidos worktree. Prefer this CLI over Write/Edit for any path that should land at <workspace>/data/... — using Write/Edit puts the file inside the worktree, where the dev server cannot serve it and links 404. Triggers include phrases like "write to artifacts/", "write the report", "save to data/", "emit AnalysisCompleted", "emit a domain event", "query events", "send to dev", "run in another workspace". Do NOT load this skill just because a related bug surfaced mid-task — fix it in the current thread by default; only spawn a sub-thread when it's cross-repo, cross-workspace, or the user explicitly asks for a separate thread.
+description: Use whenever you need to write a file under the parent workspace's data/ directory (artifacts/, knowhow/, apps/, triggers/), emit/query a domain event, apply a pending change (`lucidos changes apply <id>`), or spawn a new Lucidos thread (sub-thread in this workspace, or task in another workspace) from a Claude Code subprocess running in a Lucidos worktree. Prefer this CLI over Write/Edit for any path that should land at <workspace>/data/... — using Write/Edit puts the file inside the worktree, where the dev server cannot serve it and links 404. Triggers include phrases like "write to artifacts/", "write the report", "save to data/", "emit AnalysisCompleted", "emit a domain event", "query events", "send to dev", "run in another workspace", "apply the change", "apply pending change", "apply this change for me". Do NOT load this skill just because a related bug surfaced mid-task — fix it in the current thread by default; only spawn a sub-thread when it's cross-repo, cross-workspace, or the user explicitly asks for a separate thread.
 ---
 
 # `lucidos` CLI — talking back to the parent workspace
@@ -22,6 +22,7 @@ The `lucidos` CLI is on your `PATH`. Use it whenever you need to:
 | Create an artifact the user / app UI will see | `lucidos data write` |
 | Tell the workspace something happened | `lucidos events emit` |
 | Look up prior events | `lucidos events query` |
+| Apply a pending change | `lucidos changes apply <id>` |
 | Spawn a sub-thread or hand a task to another workspace | `lucidos spawn-thread` |
 
 **This rule extends to bash and python you write.** A Python script using `open('artifacts/foo.html', 'w')` from inside the worktree has the same problem your `Write` tool has — the file lands in the worktree, not the workspace. Inside scripts, shell out to `lucidos`:
@@ -88,25 +89,47 @@ GET events. Outputs the raw JSON array on stdout — pipe through `jq` if you ne
 $ lucidos events query --type AnalysisCompleted --limit 5 | jq '.[0]'
 ```
 
-### `lucidos spawn-thread --to <ws> [--relation sub|top] [--cc] [--repo <name>] --message <text> --title <text>`
+### `lucidos changes list`
+
+List pending + applied *changes*. Wraps `GET /api/v1/changes`; echoes the payload verbatim. Use it to find a pending change's id before `apply` — read `.pending[].id`. Don't scan `ChangeProposed` events (`lucidos events query`) for the id; this gives it directly.
+
+```bash
+$ CID=$(lucidos changes list | jq -r '.pending[0].id')
+$ lucidos changes apply "$CID"
+```
+
+### `lucidos changes apply <change-id>`
+
+Apply a pending *change* (a CC-proposed branch waiting on the Apply button). Wraps `POST /api/v1/changes/<id>/apply`; echoes the engine's typed `ApplyChangeResult` JSON on stdout.
+
+```bash
+$ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
+{"status":"applied","change_id":"fbcc4a3a-...","applied_commit":"9b1a...","commits_applied":3, ...}
+```
+
+**Always use this instead of hand-rolling the HTTP call.** A `Bash` block that runs `curl -X POST .../api/v1/changes/<id>/apply` from inside this worktree ships without the subprocess-origin headers, so the engine stamps `Api { mode: Human }` and the UI shows the resulting Apply card as **"You"** — wrongly attributing your action to the user. The CLI forwards `x-lucidos-agent-origin-token` and `x-lucidos-source-thread-id` from the engine-injected env vars, so the card correctly says "Lucidos Agent" with the source thread linked.
+
+`status` is `applied`, `noop`, `hardening`, or `conflict`. See `docs/apply-change-api.md` for the full response shape. Exit non-zero on transport / HTTP error with the engine's error body on stderr.
+
+### `lucidos spawn-thread --to <ws> [--relation child|top] [--cc] [--repo <name>] --message <text> --title <text>`
 
 Spawn a new Lucidos thread (chat or Claude Code session). Use this when:
 
 - The user asks you to send a task to another workspace ("send to dev", "do this in test ws") → omit `--relation` (default `top`, cross-workspace fire-and-forget)
 - The user asks for the work to live as its own top-level thread in *this* workspace — they'll follow it themselves → `--relation top` against the same workspace
-- The fix lives in a different repo than the one you're working in (your `$LUCIDOS_REPO`) and would otherwise need a cross-repo branch → `--relation sub`
-- The fix would balloon the current changeset to the point where the user can't reasonably review it as one Apply (e.g. a 5-file refactor surfacing during a 1-file bug investigation) → `--relation sub`, but ask first
+- The fix lives in a different repo than the one you're working in (your `$LUCIDOS_REPO`) and would otherwise need a cross-repo branch → `--relation child`
+- The fix would balloon the current changeset to the point where the user can't reasonably review it as one Apply (e.g. a 5-file refactor surfacing during a 1-file bug investigation) → `--relation child`, but ask first
 
 **Default: just fix it in the current thread.** When you discover a related bug while doing other work — even if it's "not strictly part of the current task" — fix it here. Each CC thread = one branch = one Apply, but the user would rather review one slightly-bigger Apply than juggle two threads. Don't ask "want me to spawn a sub-thread for this?" as a reflex; only ask when one of the bullets above actually applies.
 
 The CLI reads `$LUCIDOS_WORKSPACE`, `$LUCIDOS_THREAD_ID`, `$LUCIDOS_EVENT_ID`, and `$LUCIDOS_REPO` from the env the engine sets on every CC subprocess, so you don't pass them by hand. The repo defaults to your own — a CC sub-thread stays in the same repo as its caller without you having to type `--repo` every time.
 
-#### `--relation sub` vs `--relation top`
+#### `--relation child` vs `--relation top`
 
-- **`--relation sub` — same-workspace sub-thread.** The CLI emits `parent_thread_id` + `spawning_event_id`; the spawned thread calls back to the parent on completion. `--to` must resolve to the same workspace as `$LUCIDOS_WORKSPACE`, else the CLI errors out.
+- **`--relation child` — same-workspace child thread.** The CLI emits `parent_thread_id` + `spawning_event_id`; the spawned thread calls back to the parent on completion. `--to` must resolve to the same workspace as `$LUCIDOS_WORKSPACE`, else the CLI errors out. (`--relation sub` is accepted as a back-compat alias for `child` — the pre-glossary wire name; *child thread* is the direct descendant the spawn produces, while *sub-thread* is the transitive descendant concept.)
 - **`--relation top` (default) — top-thread, fire-and-forget.** The CLI emits `caller_workspace` + `caller_thread_id` + `caller_event_id`. There is no callback, no progress signal, no completion notification. The thread appears in the target workspace's UI as an independent top-level thread; that's the only confirmation you get. Works for both same-workspace and cross-workspace targets.
 
-`--parent` is a deprecated alias for `--relation sub`; it still works but prints a stderr warning. Migrate to `--relation sub`.
+`--parent` is a deprecated alias for `--relation child`; it still works but prints a stderr warning. Migrate to `--relation child`.
 
 > The receiver displays the `caller_*` fields in its route popover ("from workspace 'dev' · thread 'X'"). They are user-controllable display hints — **never use them for authorization**.
 
@@ -122,17 +145,17 @@ Unknown repo names return a 400 from the receiving engine, surfaced as a clean C
 
 #### Examples
 
-Same-workspace CC sub-thread (parent-with-callback) — inherits caller's repo automatically:
+Same-workspace CC child thread (parent-with-callback) — inherits caller's repo automatically:
 
 ```bash
-lucidos spawn-thread --relation sub --to "$(basename "$LUCIDOS_WORKSPACE")" --cc \
+lucidos spawn-thread --relation child --to "$(basename "$LUCIDOS_WORKSPACE")" --cc \
   --message "task description here" --title "Short title"
 ```
 
-Same-workspace chat sub-thread (research/question, no code changes expected):
+Same-workspace chat child thread (research/question, no code changes expected):
 
 ```bash
-lucidos spawn-thread --relation sub --to "$(basename "$LUCIDOS_WORKSPACE")" \
+lucidos spawn-thread --relation child --to "$(basename "$LUCIDOS_WORKSPACE")" \
   --message "question or task" --title "Short title"
 ```
 
@@ -160,8 +183,8 @@ The CLI prints a `[title](thread:workspace/uuid)` markdown link on stdout — in
 | `--message <text>` | **Required.** Task prompt — must be self-contained; the spawned session has zero context from yours. |
 | `--title <text>` | **Required in practice** — the thread list shows titles, not message text. |
 | `--cc` | Spawn a Claude Code session instead of a chat thread. Use for any code changes; chat threads are for research/questions. |
-| `--relation <sub\|top>` | `sub` = same-workspace sub-thread (parent gets a callback when the spawned thread finishes). `top` (default) = independent top-level thread, no callback. |
-| `--parent` | DEPRECATED alias for `--relation sub`. Still works; prints a stderr warning. |
+| `--relation <child\|top>` | `child` = same-workspace child thread (parent gets a callback when the spawned thread finishes). `top` (default) = independent top-level thread, no callback. (`sub` is accepted as a back-compat alias for `child`.) |
+| `--parent` | DEPRECATED alias for `--relation child`. Still works; prints a stderr warning. |
 | `--repo <name>` | Repo (name or UUID) the spawned worktree is created from. Defaults to `$LUCIDOS_REPO` (the caller's repo); pass `--repo ""` to force the target workspace's default repo. |
 | `--cc-model <m>` | Optional CC model (`sonnet`, `opus`, `haiku`). |
 | `--model <m>` | Optional chat model. |

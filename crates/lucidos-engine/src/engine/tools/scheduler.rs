@@ -1,7 +1,7 @@
 use super::super::LucidosEngine;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::llm::tool_names as tn;
-use crate::triggers::TriggerRun;
+use crate::triggers::{EventSubscription, TriggerRun};
 use std::str::FromStr;
 
 /// Hard guard: scheduling tools (`create_trigger`, `update_trigger`,
@@ -92,14 +92,12 @@ impl LucidosEngine {
         match name {
             "create_trigger" => {
                 let name = args["name"].as_str().unwrap_or("");
-                let on_event = args
-                    .get("on_event")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                let condition = args.get("condition").filter(|v| !v.is_null()).cloned();
+                let subscriptions = match parse_on_arg(args.get("on")) {
+                    Ok(subs) => subs,
+                    Err(e) => return Ok(e),
+                };
 
-                // Parse cron: accepts a single string or an array of strings (optional if on_event is set)
+                // Parse cron: accepts a single string or an array of strings (optional if on is set)
                 let cron_expressions = if args.get("cron").is_some() && !args["cron"].is_null() {
                     match parse_cron_arg(&args["cron"]) {
                         Ok(exprs) => exprs,
@@ -112,9 +110,10 @@ impl LucidosEngine {
                 if name.is_empty() {
                     return Ok("Error: name is required".to_string());
                 }
-                if cron_expressions.is_empty() && on_event.is_none() {
+                if cron_expressions.is_empty() && subscriptions.is_empty() {
                     return Ok(
-                        "Error: At least one of 'cron' or 'on_event' is required".to_string()
+                        "Error: At least one of 'cron' or 'on' (event subscriptions) is required"
+                            .to_string(),
                     );
                 }
 
@@ -150,11 +149,9 @@ impl LucidosEngine {
                     "timezone": tz_val,
                     "run": serde_json::to_value(&run).unwrap(),
                 });
-                if let Some(ref ev) = on_event {
-                    event_payload["on"] = serde_json::json!(ev);
-                }
-                if let Some(ref cond) = condition {
-                    event_payload["condition"] = cond.clone();
+                if !subscriptions.is_empty() {
+                    event_payload["on"] = serde_json::to_value(&subscriptions)
+                        .expect("EventSubscription serialization is infallible");
                 }
                 // Owning app dir (e.g. "trigger-workflow"); stamped onto notifications
                 // emitted from this trigger so the popover can deep-link to the app.
@@ -173,6 +170,24 @@ impl LucidosEngine {
                 {
                     event_payload["go_to_review"] = serde_json::json!(true);
                 }
+                // Optional trigger group membership. Validate against the
+                // in-memory registry so dangling references can't slip in via
+                // the LLM tool surface — the HTTP API rejects the same case.
+                if let Some(gid) = args
+                    .get("group_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let known = self.trigger_groups.read().unwrap().contains_key(gid);
+                    if !known {
+                        return Ok(format!(
+                            "Error: Unknown group_id '{}'. Use list_trigger_groups to find an existing id or create_trigger_group first.",
+                            gid
+                        ));
+                    }
+                    event_payload["group_id"] = serde_json::json!(gid);
+                }
 
                 self.event_bus
                     .emit(BusEvent::System(SystemEvent::TriggerCreated {
@@ -182,7 +197,7 @@ impl LucidosEngine {
                     }))
                     .await?;
 
-                let trigger_desc = trigger_description(&cron_display, on_event.as_deref());
+                let trigger_desc = trigger_description(&cron_display, &subscriptions);
                 let run_desc = match &run {
                     TriggerRun::Intent { intent } => {
                         let end = intent.floor_char_boundary(50);
@@ -229,15 +244,19 @@ impl LucidosEngine {
                         } else {
                             String::new()
                         };
-                        let event_display = if let Some(ref ev) = config.on {
-                            let cond = config
-                                .condition
-                                .as_ref()
-                                .map(|c| format!(" when {}", c))
-                                .unwrap_or_default();
-                            format!("  Event: on {}{}\n", ev, cond)
-                        } else {
+                        let event_display = if config.on.is_empty() {
                             String::new()
+                        } else {
+                            let rendered = config
+                                .on
+                                .iter()
+                                .map(|sub| match &sub.condition {
+                                    Some(c) => format!("{} when {}", sub.event_type, c),
+                                    None => sub.event_type.clone(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!("  Event: on {}\n", rendered)
                         };
                         result.push_str(&format!(
                             "- **{}** (ID: {}) [{}]\n{}{}  Status: {}\n  Last run: {}\n  Run: {}\n\n",
@@ -259,23 +278,18 @@ impl LucidosEngine {
                         .map_err(|e| format!("Invalid 'run' field: {}. Expected {{ type: 'intent', text: '...' }} or {{ type: 'script', path: '...' }}", e))?),
                     None => None,
                 };
-                // Parse on_event once — reused for payload and validation
-                let new_on_event: Option<Option<String>> = if args.get("on_event").is_some() {
-                    Some(
-                        args["on_event"]
-                            .as_str()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty()),
-                    )
+                // Subscriptions are sent as a full replacement: None = absent
+                // (keep existing), Some(empty) = clear, Some(non-empty) = set.
+                // `on: null` collapses to "no subscriptions" so the LLM can
+                // clear by passing null without an explicit empty array.
+                let new_on: Option<Vec<EventSubscription>> = if args.get("on").is_some() {
+                    Some(match parse_on_arg(args.get("on")) {
+                        Ok(subs) => subs,
+                        Err(e) => return Ok(e),
+                    })
                 } else {
                     None
                 };
-                let new_condition: Option<Option<serde_json::Value>> =
-                    if args.get("condition").is_some() {
-                        Some(args.get("condition").filter(|v| !v.is_null()).cloned())
-                    } else {
-                        None
-                    };
                 // Parse cron: Option<Vec<String>>
                 // None = not provided (keep existing), Some(vec![]) = clear, Some(vec![...]) = set
                 let new_cron: Option<Vec<String>> = if args.get("cron").is_some() {
@@ -304,15 +318,35 @@ impl LucidosEngine {
                 };
                 let new_go_to_review: Option<bool> =
                     args.get("go_to_review").and_then(|v| v.as_bool());
+                // group_id: Some(None) = clear, Some(Some(s)) = set, None = absent
+                let new_group_id: Option<Option<String>> = if args.get("group_id").is_some() {
+                    Some(
+                        args["group_id"]
+                            .as_str()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
+                    )
+                } else {
+                    None
+                };
+                if let Some(Some(ref gid)) = new_group_id {
+                    let known = self.trigger_groups.read().unwrap().contains_key(gid);
+                    if !known {
+                        return Ok(format!(
+                            "Error: Unknown group_id '{}'. Use list_trigger_groups to find an existing id or create_trigger_group first.",
+                            gid
+                        ));
+                    }
+                }
 
                 if new_name.is_none()
                     && new_run.is_none()
                     && new_cron.is_none()
-                    && new_on_event.is_none()
-                    && new_condition.is_none()
+                    && new_on.is_none()
                     && new_paused.is_none()
                     && new_app_id.is_none()
                     && new_go_to_review.is_none()
+                    && new_group_id.is_none()
                 {
                     return Ok(
                         "Error: At least one field besides trigger_id must be provided".to_string(),
@@ -347,13 +381,10 @@ impl LucidosEngine {
                     update_payload["run"] = serde_json::to_value(run).unwrap();
                     updated_fields.push("run");
                 }
-                if let Some(ref on) = new_on_event {
-                    update_payload["on"] = serde_json::json!(on);
-                    updated_fields.push("on_event");
-                }
-                if let Some(ref cond) = new_condition {
-                    update_payload["condition"] = serde_json::json!(cond);
-                    updated_fields.push("condition");
+                if let Some(ref subs) = new_on {
+                    update_payload["on"] = serde_json::to_value(subs)
+                        .expect("EventSubscription serialization is infallible");
+                    updated_fields.push("on");
                 }
                 if let Some(paused) = new_paused {
                     update_payload["paused"] = serde_json::json!(paused);
@@ -367,13 +398,17 @@ impl LucidosEngine {
                     update_payload["go_to_review"] = serde_json::json!(v);
                     updated_fields.push("go_to_review");
                 }
+                if let Some(ref gid) = new_group_id {
+                    update_payload["group_id"] = serde_json::json!(gid);
+                    updated_fields.push("group_id");
+                }
 
                 // Ensure trigger still has at least one firing mechanism
                 let updated_schedule = new_cron.as_ref().unwrap_or(&existing.schedule);
-                let updated_on = new_on_event.clone().unwrap_or_else(|| existing.on.clone());
-                if updated_schedule.is_empty() && updated_on.is_none() {
+                let updated_on = new_on.as_ref().unwrap_or(&existing.on);
+                if updated_schedule.is_empty() && updated_on.is_empty() {
                     return Ok(
-                        "Error: Trigger must have at least one cron schedule or event type"
+                        "Error: Trigger must have at least one cron schedule or event subscription"
                             .to_string(),
                     );
                 }
@@ -463,18 +498,276 @@ impl LucidosEngine {
                 let action = if paused { "Paused" } else { "Resumed" };
                 Ok(format!("[ACTION COMPLETED] {} trigger '{}' (ID: {}).", action, existing.name, trigger_id))
             }
+            "list_trigger_groups" => {
+                let mut groups: Vec<crate::triggers::TriggerGroup> = {
+                    let g = self.trigger_groups.read().unwrap();
+                    g.values().cloned().collect()
+                };
+                groups.sort_by(|a, b| a.order.cmp(&b.order).then(a.created.cmp(&b.created)));
+
+                if groups.is_empty() {
+                    return Ok("No trigger groups found.".to_string());
+                }
+
+                // Denormalize member counts from the trigger registry — no
+                // projection table; the in-memory state is already authoritative.
+                let mut counts: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                {
+                    let configs = self.trigger_configs.read().unwrap();
+                    for c in configs.values() {
+                        if let Some(ref gid) = c.group_id {
+                            *counts.entry(gid.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let mut result = format!("Found {} trigger group(s):\n\n", groups.len());
+                for g in &groups {
+                    let n = counts.get(&g.id).copied().unwrap_or(0);
+                    result.push_str(&format!(
+                        "- **{}** (ID: {}) order={} members={}\n",
+                        g.name, g.id, g.order, n
+                    ));
+                }
+                Ok(result)
+            }
+            "create_trigger_group" => {
+                use crate::engine::trigger_group_writes::CreateTriggerGroupError;
+                let raw_name = args["name"].as_str().unwrap_or("");
+                let explicit_order = args
+                    .get("order")
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n as i32);
+                match self
+                    .create_trigger_group_serialized(raw_name, explicit_order, None)
+                    .await
+                {
+                    Ok(c) => Ok(format!(
+                        "[ACTION COMPLETED] Created trigger group '{}' (ID: {}, order: {}).",
+                        c.name, c.group_id, c.order
+                    )),
+                    Err(CreateTriggerGroupError::EmptyName) => {
+                        Ok("Error: name is required".to_string())
+                    }
+                    Err(CreateTriggerGroupError::DuplicateName { existing_name }) => {
+                        Ok(format!(
+                            "Error: A group named '{}' already exists",
+                            existing_name
+                        ))
+                    }
+                    Err(CreateTriggerGroupError::EmitFailed(msg)) => {
+                        Err(msg.into())
+                    }
+                }
+            }
+            "rename_trigger_group" => {
+                use crate::engine::trigger_group_writes::RenameTriggerGroupError;
+                let group_id = match args["group_id"].as_str() {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => return Ok("Error: group_id is required".to_string()),
+                };
+                let raw_new_name = args["name"].as_str().unwrap_or("");
+                match self
+                    .rename_trigger_group_serialized(&group_id, raw_new_name, None)
+                    .await
+                {
+                    Ok(_) => Ok(format!(
+                        "[ACTION COMPLETED] Renamed trigger group (ID: {}) to '{}'.",
+                        group_id,
+                        raw_new_name.trim()
+                    )),
+                    Err(RenameTriggerGroupError::EmptyName) => {
+                        Ok("Error: name is required".to_string())
+                    }
+                    Err(RenameTriggerGroupError::NotFound) => {
+                        Ok(format!("Error: No group found with ID {}", group_id))
+                    }
+                    Err(RenameTriggerGroupError::DuplicateName { existing_name }) => {
+                        Ok(format!(
+                            "Error: A group named '{}' already exists",
+                            existing_name
+                        ))
+                    }
+                    Err(RenameTriggerGroupError::EmitFailed(msg)) => Err(msg.into()),
+                }
+            }
+            "reorder_trigger_groups" => {
+                let ordering = match args.get("ordering").and_then(|v| v.as_array()) {
+                    Some(arr) => arr.clone(),
+                    None => return Ok("Error: ordering array is required".to_string()),
+                };
+                let to_change: Vec<(String, i32)> = {
+                    let g = self.trigger_groups.read().unwrap();
+                    let mut acc = Vec::with_capacity(ordering.len());
+                    for entry in &ordering {
+                        let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        let order = entry.get("order").and_then(|v| v.as_i64()).map(|n| n as i32);
+                        if id.is_empty() || order.is_none() {
+                            return Ok(
+                                "Error: each ordering entry needs string id and integer order"
+                                    .to_string(),
+                            );
+                        }
+                        let order = order.unwrap();
+                        let current = match g.get(id) {
+                            Some(g) => g,
+                            None => {
+                                return Ok(format!("Error: Unknown group_id '{}'", id));
+                            }
+                        };
+                        if current.order != order {
+                            acc.push((id.to_string(), order));
+                        }
+                    }
+                    acc
+                };
+                let n = to_change.len();
+                for (group_id, order) in to_change {
+                    let payload =
+                        serde_json::json!({ "group_id": group_id, "order": order });
+                    self.event_bus
+                        .emit(BusEvent::System(SystemEvent::TriggerGroupReordered {
+                            group_id,
+                            payload,
+                            actor: None,
+                        }))
+                        .await?;
+                }
+                Ok(format!(
+                    "[ACTION COMPLETED] Reordered {} trigger group(s).",
+                    n
+                ))
+            }
+            "delete_trigger_group" => {
+                let group_id = match args["group_id"].as_str() {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => return Ok("Error: group_id is required".to_string()),
+                };
+                let group_name = {
+                    let g = self.trigger_groups.read().unwrap();
+                    match g.get(&group_id) {
+                        Some(g) => g.name.clone(),
+                        None => return Ok(format!("Error: No group found with ID {}", group_id)),
+                    }
+                };
+                // Block-delete-if-non-empty: surface the members so the LLM can
+                // either move them (update_trigger group_id) or delete them.
+                let members: Vec<String> = {
+                    let configs = self.trigger_configs.read().unwrap();
+                    configs
+                        .values()
+                        .filter(|c| c.group_id.as_deref() == Some(&group_id))
+                        .map(|c| c.id.clone())
+                        .collect()
+                };
+                if !members.is_empty() {
+                    return Ok(format!(
+                        "Error: Group '{}' still has {} member trigger(s): {}. \
+                         Move them with update_trigger (group_id: null) or delete them, then retry.",
+                        group_name,
+                        members.len(),
+                        members.join(", ")
+                    ));
+                }
+                let payload = serde_json::json!({ "group_id": group_id });
+                self.event_bus
+                    .emit(BusEvent::System(SystemEvent::TriggerGroupDeleted {
+                        group_id: group_id.clone(),
+                        payload,
+                        actor: None,
+                    }))
+                    .await?;
+                Ok(format!(
+                    "[ACTION COMPLETED] Deleted trigger group '{}' (ID: {}).",
+                    group_name, group_id
+                ))
+            }
             _ => Ok(format!("Unknown scheduler tool: {}", name)),
         }
     }
 }
 
 /// Build human-readable trigger description for create responses.
-fn trigger_description(cron_display: &str, on_event: Option<&str>) -> String {
-    match (cron_display.is_empty(), on_event) {
+fn trigger_description(cron_display: &str, subscriptions: &[EventSubscription]) -> String {
+    let event_display = if subscriptions.is_empty() {
+        None
+    } else {
+        Some(
+            subscriptions
+                .iter()
+                .map(|s| s.event_type.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    };
+    match (cron_display.is_empty(), event_display) {
         (false, Some(ev)) => format!("schedule '{}' AND event '{}'", cron_display, ev),
         (true, Some(ev)) => format!("event '{}'", ev),
         _ => format!("schedule '{}'", cron_display),
     }
+}
+
+/// Parse the LLM tool's `on` argument into a Vec of subscriptions, accepting:
+///
+/// 1. Absent / `null` → empty Vec.
+/// 2. Single string `"EventName"` → one entry, no condition.
+/// 3. Array of strings `["A", "B"]` → entries with no conditions.
+/// 4. Array of subscription objects
+///    `[{"event_type": "X", "condition": {...}}, ...]` → as-is.
+/// 5. Single subscription object → one-entry Vec.
+///
+/// Returns the parsed Vec on success; otherwise an `Error: ...` string the
+/// LLM can read directly. Blank `event_type` strings are dropped.
+pub(crate) fn parse_on_arg(value: Option<&serde_json::Value>) -> Result<Vec<EventSubscription>, String> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let mut subscriptions = Vec::new();
+    let push_string = |out: &mut Vec<EventSubscription>, s: &str| {
+        let t = s.trim();
+        if !t.is_empty() {
+            out.push(EventSubscription {
+                event_type: t.to_string(),
+                condition: None,
+            });
+        }
+    };
+    if let Some(s) = value.as_str() {
+        push_string(&mut subscriptions, s);
+        return Ok(subscriptions);
+    }
+    if let Some(obj) = value.as_object() {
+        let sub = EventSubscription::from_object_entry(obj).ok_or_else(|| {
+            "Error: 'on' object must carry an 'event_type' (and optional 'condition')"
+                .to_string()
+        })?;
+        subscriptions.push(sub);
+        return Ok(subscriptions);
+    }
+    if let Some(arr) = value.as_array() {
+        for entry in arr {
+            if let Some(s) = entry.as_str() {
+                push_string(&mut subscriptions, s);
+                continue;
+            }
+            let Some(obj) = entry.as_object() else {
+                return Err(
+                    "Error: each entry in 'on' must be an event-type string or a \
+                     subscription object {event_type, condition?}"
+                        .to_string(),
+                );
+            };
+            let sub = EventSubscription::from_object_entry(obj).ok_or_else(|| {
+                "Error: subscription object in 'on' missing 'event_type'".to_string()
+            })?;
+            subscriptions.push(sub);
+        }
+        return Ok(subscriptions);
+    }
+    Err(
+        "Error: 'on' must be an event-type string, a subscription object, or an array of either"
+            .to_string(),
+    )
 }
 
 /// Translate the day-of-week field from standard cron convention (0=Sun, 1=Mon, ..., 6=Sat, 7=Sun)
@@ -581,396 +874,5 @@ pub(crate) fn next_occurrence_multi(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    // -- parse_cron_arg tests --
-
-    #[test]
-    fn parse_cron_arg_single_string() {
-        let val = json!("0 0 8 * * *");
-        let result = parse_cron_arg(&val).unwrap();
-        assert_eq!(result, vec!["0 0 8 * * *"]);
-    }
-
-    #[test]
-    fn parse_cron_arg_array_of_strings() {
-        let val = json!(["0 0 8 * * *", "0 0 20 * * *"]);
-        let result = parse_cron_arg(&val).unwrap();
-        assert_eq!(result, vec!["0 0 8 * * *", "0 0 20 * * *"]);
-    }
-
-    #[test]
-    fn parse_cron_arg_single_element_array() {
-        let val = json!(["0 30 9 * * 1-5"]);
-        let result = parse_cron_arg(&val).unwrap();
-        assert_eq!(result, vec!["0 30 9 * * 1-5"]);
-    }
-
-    #[test]
-    fn parse_cron_arg_rejects_empty_array() {
-        let val = json!([]);
-        let result = parse_cron_arg(&val);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must not be empty"));
-    }
-
-    #[test]
-    fn parse_cron_arg_rejects_non_string_in_array() {
-        let val = json!(["0 0 8 * * *", 42]);
-        let result = parse_cron_arg(&val);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must be a string"));
-    }
-
-    #[test]
-    fn parse_cron_arg_rejects_number() {
-        let val = json!(42);
-        let result = parse_cron_arg(&val);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must be a string or array"));
-    }
-
-    #[test]
-    fn parse_cron_arg_rejects_null() {
-        let val = json!(null);
-        let result = parse_cron_arg(&val);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_cron_arg_validates_field_count() {
-        let val = json!("0 0 8 * *"); // 5 fields instead of 6
-        let result = parse_cron_arg(&val);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Must have 6 fields"));
-    }
-
-    #[test]
-    fn parse_cron_arg_validates_syntax() {
-        let val = json!("0 0 25 * * *"); // hour 25 is invalid
-        let result = parse_cron_arg(&val);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Check syntax"));
-    }
-
-    #[test]
-    fn parse_cron_arg_validates_all_expressions_in_array() {
-        // First is valid, second has wrong field count
-        let val = json!(["0 0 8 * * *", "0 0 8 * *"]);
-        let result = parse_cron_arg(&val);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Must have 6 fields"));
-    }
-
-    // -- next_occurrence_multi tests --
-
-    #[test]
-    fn next_occurrence_multi_picks_earliest() {
-        use chrono::Timelike;
-        use std::str::FromStr;
-
-        // 8am daily and 6am daily — 6am should be next (or same day if before both)
-        let s1 = cron::Schedule::from_str("0 0 8 * * *").unwrap();
-        let s2 = cron::Schedule::from_str("0 0 6 * * *").unwrap();
-
-        let tz: chrono_tz::Tz = "UTC".parse().unwrap();
-        let next = next_occurrence_multi(&[s1, s2], tz);
-        assert!(next.is_some());
-
-        // The earliest should be the 6am one (or same day if before both)
-        let next_time = next.unwrap();
-        assert!(next_time.hour() == 6 || next_time.hour() == 8);
-        // Verify it's truly the minimum
-        let s1_next = cron::Schedule::from_str("0 0 8 * * *")
-            .unwrap()
-            .upcoming(tz)
-            .next()
-            .unwrap();
-        let s2_next = cron::Schedule::from_str("0 0 6 * * *")
-            .unwrap()
-            .upcoming(tz)
-            .next()
-            .unwrap();
-        assert_eq!(next_time, s1_next.min(s2_next));
-    }
-
-    #[test]
-    fn next_occurrence_multi_single_schedule() {
-        use std::str::FromStr;
-
-        let s = cron::Schedule::from_str("0 0 12 * * *").unwrap();
-        let tz: chrono_tz::Tz = "UTC".parse().unwrap();
-        let next = next_occurrence_multi(std::slice::from_ref(&s), tz);
-        assert_eq!(next, s.upcoming(tz).next());
-    }
-
-    #[test]
-    fn next_occurrence_multi_empty_returns_none() {
-        let tz: chrono_tz::Tz = "UTC".parse().unwrap();
-        let next = next_occurrence_multi(&[], tz);
-        assert!(next.is_none());
-    }
-
-    // -- day-of-week translation tests --
-
-    #[test]
-    fn cron_crate_dow_5_is_friday_after_translation() {
-        use chrono::{Datelike, TimeZone};
-
-        // Standard cron: 5 = Friday. After translation, dow=5 should schedule on Friday.
-        let translated = translate_dow_for_cron_crate("0 0 12 * * 5");
-        let schedule = cron::Schedule::from_str(&translated).unwrap();
-
-        // Start from a known Monday (April 13, 2026) to avoid ambiguity
-        let monday = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 4, 13, 0, 0, 0)
-            .unwrap();
-        let next = schedule.after(&monday).next().unwrap();
-        assert_eq!(
-            next.weekday(),
-            chrono::Weekday::Fri,
-            "dow=5 should map to Friday (standard cron convention)"
-        );
-    }
-
-    #[test]
-    fn cron_crate_dow_0_is_sunday_after_translation() {
-        use chrono::{Datelike, TimeZone};
-
-        let translated = translate_dow_for_cron_crate("0 0 12 * * 0");
-        let schedule = cron::Schedule::from_str(&translated).unwrap();
-
-        let monday = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 4, 13, 0, 0, 0)
-            .unwrap();
-        let next = schedule.after(&monday).next().unwrap();
-        assert_eq!(next.weekday(), chrono::Weekday::Sun);
-    }
-
-    #[test]
-    fn cron_crate_dow_range_1_5_is_weekdays_after_translation() {
-        use chrono::{Datelike, TimeZone};
-
-        let translated = translate_dow_for_cron_crate("0 0 12 * * 1-5");
-        let schedule = cron::Schedule::from_str(&translated).unwrap();
-
-        // Start from Saturday April 11, 2026
-        let saturday = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 4, 11, 13, 0, 0)
-            .unwrap();
-        let next = schedule.after(&saturday).next().unwrap();
-        assert_eq!(
-            next.weekday(),
-            chrono::Weekday::Mon,
-            "1-5 range should map to Mon-Fri"
-        );
-    }
-
-    #[test]
-    fn cron_crate_dow_comma_list_after_translation() {
-        use chrono::{Datelike, TimeZone};
-
-        // Standard cron: 0,6 = Sunday,Saturday
-        let translated = translate_dow_for_cron_crate("0 0 12 * * 0,6");
-        let schedule = cron::Schedule::from_str(&translated).unwrap();
-
-        // Start from Monday April 13, 2026
-        let monday = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 4, 13, 0, 0, 0)
-            .unwrap();
-        let next = schedule.after(&monday).next().unwrap();
-        assert!(
-            next.weekday() == chrono::Weekday::Sat || next.weekday() == chrono::Weekday::Sun,
-            "0,6 should map to weekend days, got {:?}",
-            next.weekday()
-        );
-    }
-
-    #[test]
-    fn translate_dow_wildcard_unchanged() {
-        assert_eq!(translate_dow_for_cron_crate("0 0 12 * * *"), "0 0 12 * * *");
-    }
-
-    #[test]
-    fn translate_dow_named_days_unchanged() {
-        assert_eq!(
-            translate_dow_for_cron_crate("0 0 12 * * MON-FRI"),
-            "0 0 12 * * MON-FRI"
-        );
-        assert_eq!(
-            translate_dow_for_cron_crate("0 0 12 * * SAT,SUN"),
-            "0 0 12 * * SAT,SUN"
-        );
-    }
-
-    #[test]
-    fn translate_dow_7_wraps_to_sunday() {
-        // Standard cron: 7 is alias for Sunday (same as 0)
-        let translated = translate_dow_for_cron_crate("0 0 12 * * 7");
-        // Should become 1 (Sunday in cron crate)
-        assert_eq!(translated, "0 0 12 * * 1");
-    }
-
-    #[test]
-    fn translate_dow_out_of_range_passes_through() {
-        // Out-of-range values should pass through untranslated for the cron parser to reject
-        let translated = translate_dow_for_cron_crate("0 0 12 * * 8");
-        assert_eq!(translated, "0 0 12 * * 8");
-        assert!(parse_standard_cron("0 0 12 * * 8").is_err());
-
-        let translated = translate_dow_for_cron_crate("0 0 12 * * 999");
-        assert_eq!(translated, "0 0 12 * * 999");
-        assert!(parse_standard_cron("0 0 12 * * 999").is_err());
-    }
-
-    // -- trigger helpers tests --
-
-    #[test]
-    fn trigger_description_schedule_only() {
-        let desc = trigger_description("0 0 8 * * *", None);
-        assert_eq!(desc, "schedule '0 0 8 * * *'");
-    }
-
-    #[test]
-    fn trigger_description_event_only() {
-        let desc = trigger_description("", Some("OuraSleepImported"));
-        assert_eq!(desc, "event 'OuraSleepImported'");
-    }
-
-    #[test]
-    fn trigger_description_hybrid() {
-        let desc = trigger_description("0 0 8 * * *", Some("OuraSleepImported"));
-        assert_eq!(desc, "schedule '0 0 8 * * *' AND event 'OuraSleepImported'");
-    }
-
-    // -- Layer 2: hard tool-layer guards during trigger fires --
-    //
-    // The guard is a pure function: tests pass `active_trigger_id` directly.
-    // The dispatcher reads the `ACTIVE_TRIGGER_ID` task-local once and feeds
-    // it in — that wiring is exercised by the call site in
-    // `execute_scheduler_tool`.
-
-    #[test]
-    fn guard_allows_create_trigger_outside_fire() {
-        // No active trigger id — normal user chat. All scheduling calls must
-        // pass through unchanged. This is the path the user takes when they
-        // ask the LLM "create a trigger that ..." in a regular message.
-        let result = check_scheduling_tool_in_trigger(tn::CREATE_TRIGGER, None, None, None);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn guard_blocks_create_trigger_during_fire() {
-        // The infinite-loop bug: a fired trigger asks the LLM to do X, the LLM
-        // mistakenly responds by creating a near-identical trigger to do X
-        // again. The guard must reject create_trigger unconditionally.
-        let result = check_scheduling_tool_in_trigger(
-            tn::CREATE_TRIGGER,
-            None,
-            Some("firing-id"),
-            Some("Daily news"),
-        );
-        let err = result.expect("create_trigger inside fire must be rejected");
-        assert!(err.to_lowercase().contains("disabled"));
-        assert!(err.contains("Daily news"));
-        assert!(err.contains("firing-id"));
-    }
-
-    #[test]
-    fn guard_blocks_update_trigger_during_fire() {
-        // Update is the same shape of risk as create — letting the LLM rewrite
-        // its own schedule mid-fire could shift the next-fire time, expand
-        // condition matchers, or rewrite the intent. Reject all updates.
-        let result = check_scheduling_tool_in_trigger(
-            tn::UPDATE_TRIGGER,
-            Some("firing-id"),
-            Some("firing-id"),
-            Some("Daily news"),
-        );
-        assert!(
-            result.is_some(),
-            "update_trigger inside fire must be rejected even on self id"
-        );
-    }
-
-    #[test]
-    fn guard_allows_self_delete_during_fire() {
-        // The trigger's intent text may legitimately say "stop firing after
-        // this" — the LLM's only correct call is delete_trigger on its own id.
-        // Already covered by the existing `is_self_deleting_trigger` plumbing
-        // for cancellation; this guard must let that call through.
-        let result = check_scheduling_tool_in_trigger(
-            tn::DELETE_TRIGGER,
-            Some("self-id"),
-            Some("self-id"),
-            Some("Once"),
-        );
-        assert!(result.is_none(), "self-delete must be allowed");
-    }
-
-    #[test]
-    fn guard_blocks_cross_delete_during_fire() {
-        // A fired trigger trying to delete some OTHER trigger is not a pattern
-        // we want to support — the user did not consent to that scheduling
-        // change at fire time. Block it.
-        let result = check_scheduling_tool_in_trigger(
-            tn::DELETE_TRIGGER,
-            Some("other-id"),
-            Some("self-id"),
-            Some("Daily news"),
-        );
-        let err = result.expect("cross-trigger delete must be rejected");
-        assert!(err.contains("self-id"));
-    }
-
-    #[test]
-    fn guard_allows_self_pause_during_fire() {
-        // Symmetric to self-delete: pausing oneself is the polite version of
-        // self-delete and must be allowed.
-        let result = check_scheduling_tool_in_trigger(
-            tn::PAUSE_TRIGGER,
-            Some("self-id"),
-            Some("self-id"),
-            None,
-        );
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn guard_blocks_cross_pause_during_fire() {
-        // Pausing a different trigger from inside this one's fire is not user
-        // intent — block it.
-        let result = check_scheduling_tool_in_trigger(
-            tn::PAUSE_TRIGGER,
-            Some("other-id"),
-            Some("self-id"),
-            None,
-        );
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn guard_blocks_resume_other_during_fire() {
-        // Resume of a different trigger is the same risk as cross-pause.
-        let result = check_scheduling_tool_in_trigger(
-            tn::RESUME_TRIGGER,
-            Some("other-id"),
-            Some("self-id"),
-            None,
-        );
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn guard_passes_unrelated_tool_names_through() {
-        // The guard only cares about the five trigger-mutating tools. Any other
-        // tool name (including list_triggers, which is read-only) must always
-        // be allowed. Defensive: the dispatcher should never call us for those,
-        // but the guard returning None for them keeps it honest.
-        let result =
-            check_scheduling_tool_in_trigger(tn::LIST_TRIGGERS, None, Some("self-id"), None);
-        assert!(result.is_none());
-    }
-}
+#[path = "scheduler_tests.rs"]
+mod tests;

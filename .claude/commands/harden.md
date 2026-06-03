@@ -18,30 +18,38 @@ If the output is `ALREADY_HARDENED`, inform the user: "Already hardened — skip
 
 Run `git diff main...HEAD --name-only`. If every changed file ends in `.md` or `.txt`, the diff is **docs-only**. In docs-only mode:
 
-- Skip Phase 1 (`/simplify` looks for code-shaped issues that don't apply to prose).
+- Skip Phase 1 (`/code-review` looks for code-shaped bugs that don't apply to prose).
 - Skip Phase 2 Agent 1 (no code logic to bug-check).
 - Phase 2 Agents 2 and 3 (compliance, regression), Phase 3, Phase 4, Phase 5 still run.
 - Phase 4.5 already auto-skips for docs-only via its test-selection table.
 
 Do NOT extend this fast path to "string-only" or "comment-only" `.rs` edits. Strings can carry format args, escape sequences, regexes, or be parsed at runtime — any `.rs` change keeps the full cycle.
 
-## Phase 1: Run /simplify
+## Phase 1: Run /code-review
 
 **Docs-only fast path:** if Phase 0.5 flagged this diff as docs-only, skip this phase entirely and proceed to Phase 2.
 
-Invoke the `/simplify` skill using the Skill tool. This reviews the branch diff for code reuse, quality, and efficiency issues and auto-fixes them.
+Invoke the `code-review` skill at **medium** effort using the Skill tool (`Skill skill: "code-review" args: "medium"`). It reviews the branch diff for correctness bugs at the high-confidence end of the precision/recall slider — fewer findings, very low false-positive rate, complementary to Phase 2's broader bug-detection agent.
 
-Wait for simplify to complete. If it made changes, commit them before proceeding.
+(Background: this phase used to invoke a built-in `/simplify` skill that also auto-fixed. Claude Code 2.1.147 renamed `/simplify` to `/code-review` and dropped auto-apply, so the apply step now lives here in the harden orchestrator instead of in the skill.)
+
+When `code-review` returns its findings:
+
+- **No bugs flagged:** record that, proceed to Phase 2.
+- **Bugs flagged:** for each finding, read the cited file, confirm the bug is real (false-positive triage — same standard as Phase 3 validation), and **fix the real ones directly**. Skip findings that are false positives, depend on uncertain runtime state, or duplicate something Phase 2 will catch better.
+- **Commit any fixes** before proceeding to Phase 2 — Phase 2's diff input needs to include them.
+
+Do NOT pass `--comment` (that mode posts to GitHub PRs, which Lucidos does not use).
 
 ## Phase 2: Launch Three Hardening Agents in Parallel
 
-Run `git diff main...HEAD` to get the current diff (including any simplify fixes). Also run `git diff main...HEAD --name-only` to get the list of changed files. Launch three agents in parallel:
+Run `git diff main...HEAD` to get the current diff (including any Phase 1 fixes). Also run `git diff main...HEAD --name-only` to get the list of changed files. Launch three agents in parallel:
 
 ### Agent 1: Bug Detection
 
 **Docs-only fast path:** if Phase 0.5 flagged this diff as docs-only, skip this agent (Agents 2 and 3 still run).
 
-Scan the diff for bugs and incorrect logic. Tag each finding with a severity:
+Scan the diff for bugs and incorrect logic that Phase 1's `code-review medium` would have missed at its high-confidence threshold. Tag each finding with a severity:
 
 - 🔴 **Bug** — will break production, must fix before merging
 - 🟡 **Nit** — worth fixing but not blocking
@@ -54,7 +62,7 @@ Focus on:
 - Security vulnerabilities in the changed code (injection, auth bypass, data exposure)
 
 **HIGH SIGNAL ONLY.** Do NOT flag:
-- Code style or quality concerns (already handled by simplify)
+- Code style or quality concerns (already covered by Phase 1 `code-review`)
 - Potential issues that depend on specific inputs or state
 - Subjective suggestions or improvements
 
@@ -98,18 +106,20 @@ Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-s
 - CSS-only / docs-only → skip
 - Mixed → run both **in parallel**
 
-When the diff is mixed, kick the Rust and TS suites off concurrently — they're independent toolchains (cargo vs npm) with no shared state, so running them serially wastes wall-clock. Use the Bash tool's `run_in_background: true` for each, then `BashOutput` to join. Pattern:
+When the diff is mixed, kick the Rust and TS suites off concurrently — they're independent toolchains (cargo vs npm) with no shared state, so running them serially wastes wall-clock. Use the Bash tool's `run_in_background: true` for each, then `TaskOutput` to join. Pattern:
 
 ```
 # Launch both in parallel
 Bash(cmd="cargo check && cargo test -p lucidos-engine", run_in_background=true)  → task_id A
 Bash(cmd="cd crates/lucidos-app && npx tsc --noEmit && npm test", run_in_background=true)  → task_id B
-# Then BashOutput on A and B until both finish
+# Then TaskOutput on A and B until both finish
 ```
+
+**Never pipe the test command through `| tail` / `| head` / `| grep` to trim output.** Under zsh / bash a pipeline reports the *last* command's exit code, not cargo's — so `cargo test ... | tail` exits 0 even when a Rust test failed, and Phase 4.5 reports a false PASSED on a red run (this has actually shipped a failing nightly). Run each suite un-piped (the `run_in_background` + `TaskOutput` pattern above already preserves the real exit), or if you must trim, redirect to a log and capture `$?` first: `cargo test -p lucidos-engine > /tmp/t.log 2>&1; echo "EXIT: $?"` then read the log. A "tests pass" claim needs the real exit code AND the `test result: ok.` / `0 failed` line — see `/clean-build`'s "Reading exit codes honestly" section for the full mechanism.
 
 If everything passes, proceed to Phase 5.
 
-If anything fails: fix the failures (or the code that caused them), commit the fixes, and **return to Phase 1**. Fixes are new code that hasn't been reviewed by `/simplify` or the hardening agents — re-run the cycle on the updated diff. Iterate until tests pass on a fully-hardened diff.
+If anything fails: fix the failures (or the code that caused them), commit the fixes, and **return to Phase 1**. Fixes are new code that hasn't been reviewed by `/code-review` or the hardening agents — re-run the cycle on the updated diff. Iterate until tests pass on a fully-hardened diff.
 
 ## Phase 5: Create Marker
 

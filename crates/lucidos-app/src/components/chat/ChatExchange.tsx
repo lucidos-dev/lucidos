@@ -1,55 +1,25 @@
 import type { ComponentChildren } from 'preact';
-import { useEffect, useMemo, useRef } from 'preact/hooks';
-import { useSignal } from '@preact/signals';
+import { memo } from 'preact/compat';
+import { useMemo, useRef } from 'preact/hooks';
 import { loadedOr } from '../../store/types';
-import type { Loadable, ResponseEvent, App } from '../../store/types';
-import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import type { Exchange } from '../../store/thread-events';
-import {
-  ENGINE_LABEL,
-  LUCIDOS_AGENT_ICON,
-  LUCIDOS_AGENT_LABEL,
-  actorInitiator,
-  exchangeUserMessage,
-  exchangeUserImageHashes,
-  exchangeTimestamp,
-  exchangeResponseTimestamp,
-  exchangeResponseText,
-  exchangeSteps,
-  exchangeResponseEvents,
-  exchangeStatus,
-  exchangeError,
-  stepStatus,
-  isEmptyContinuedExchange,
-  findPermissionResolution,
-  findQuestionAnswer,
-  isChangeLifecycleEvent,
-  modeToInitiator,
-  originMode,
-  responseAbortedSummary,
-  RESPONSE_CANCELED_SUMMARY,
-  resumeEngineNote,
-} from '../../store/thread-events';
-import type { Change } from '../../api/client';
-import { continueThread, blobPreviewUrl } from '../../api/client';
-import { getSessionBlobUrlForHash } from './pastedImages';
-import { artifacts, appsList, openImagePopupFromGroup, stepsExpanded, detailsExpanded, threadMap, findChangeById, lazyChanges, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel, showToast, cancelingThreadIds, isThreadQuiescent, stepDetailModal } from '../../store/store';
-import { ClaudeIcon } from '../shared/icons';
+import type { ResponseEvent, App } from '../../store/types';
+import type { Exchange, ThreadEvent } from '../../store/thread-events';
+import { ENGINE_LABEL, LUCIDOS_AGENT_ICON, LUCIDOS_AGENT_LABEL, actorInitiator, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, isEmptyContinuedExchange, isCanceledQuestionDivider, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, responseAbortedSummary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { artifacts, appsList, openImagePopupFromGroup, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
+import { preserveOnToggle } from './scrollState';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openApp } from '../../store/actions/apps';
-import { revertChange, ensureChangeLoaded } from '../../store/actions/chat-changes';
-import { viewChangeDiff } from '../../store/actions/repositories';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
 import { PermissionBody } from './PermissionCard';
 import { ChildCompletionCard } from './ChildCompletionCard';
 import { getEventToggleState, getCollapsedVisibleEvents, splitEventSections } from '../../store/event-rendering';
-import { statusLabel as getStatusLabel, isActive as isStatusActive } from '../../store/exchange-status';
+import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { linkifyPaths } from '../../utils/linkifyPaths';
-import { formatTokens, contextPercent } from '../../utils/formatTokens';
-import { highlightEllipsis } from './highlightEllipsis';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref } from '../../utils/linkifyPaths';
+import { handleNavigationRequest } from '../../store/actions/thread-sync';
+import { ChangeBody, ContinueButton, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, UserMessageBody, changeAccent, changeActions, describeExecutor } from './chat-exchange-parts';
 
 // Stable refs so loadedOr fallback doesn't yield a fresh [] each render —
 // without these, every dependent useMemo invalidates on every render whenever
@@ -70,9 +40,17 @@ interface Props {
    *  later ContinuationStarted in the thread — the only one that shows the
    *  Continue button. */
   isUnresumedAbort?: boolean;
+  /** Lifted from `threadMap.value.get(threadId)?.meta.channel === 'claude_code'`
+   *  in `renderExchanges` so this component does not subscribe to threadMap
+   *  itself — see `chatExchangePropsEqual` below for the memo contract. */
+  threadIsCC: boolean;
+  /** Lifted from `isThreadQuiescent(threadMap.value.get(threadId)?.meta.status)`. */
+  threadIdle: boolean;
+  /** Lifted from `cancelingThreadIds.value.has(threadId)`. */
+  threadCanceling: boolean;
 }
 
-export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasPriorActive, imageOffset = 0, priorModel, priorEffort, isUnresumedAbort }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, threadId, hasPriorActive, imageOffset = 0, priorModel, priorEffort, isUnresumedAbort, threadIsCC, threadIdle, threadCanceling }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
@@ -83,18 +61,21 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
   const userImageHashes = exchangeUserImageHashes(exchange);
   const timestamp = exchangeTimestamp(exchange);
   const responseTextRaw = exchangeResponseText(exchange);
-  const threadMeta = threadMap.value.get(threadId)?.meta;
-  const threadIsCC = threadMeta?.channel === 'claude_code';
-  const threadIdle = isThreadQuiescent(threadMeta?.status);
   const steps = exchangeSteps(exchange, isLast, threadIdle);
   const events = exchangeResponseEvents(exchange, imageOffset, isLast, threadIdle);
   const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle);
   const error = exchangeError(exchange);
 
+  // Cap detection reads ResponseGenerated.text directly via exchangeEngineLimitDetail —
+  // the cap is emitted without a preceding TextStreamed, so it never lands in
+  // responseTextRaw (which only concatenates streamed text). Without this side
+  // channel the agent appears to stop silently mid-task.
+  const engineLimitDetail = !streamingBuffer ? exchangeEngineLimitDetail(exchange) : '';
+  const isEngineLimit = !!engineLimitDetail;
   const streamingHtml = streamingBuffer ? renderMarkdown(streamingBuffer) : '';
   const responseHtml = responseTextRaw ? renderMarkdown(responseTextRaw) : '';
-  const responseText = streamingHtml || responseHtml;
-  const hasResponse = !!responseText;
+  const responseHtmlCombined = streamingHtml || responseHtml;
+  const hasResponse = !!responseHtmlCombined || isEngineLimit;
 
   const userMessageHtml = useMemo(
     () => linkifyPaths(renderMarkdown(userMessage), artifactPaths, apps),
@@ -136,6 +117,43 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
       }
       return;
     }
+
+    const navTarget = (e.target as HTMLElement).closest('.nav-link') as HTMLElement | null;
+    if (navTarget) {
+      e.preventDefault();
+      const target = navTarget.dataset.navTarget;
+      if (target) handleNavigationRequest({ target });
+      return;
+    }
+
+    // Defense-in-depth: intercept plain anchors whose href points at an app
+    // folder (apps/<id>/...) or a Lucidos navigation panel
+    // (notifications, apps, triggers, …) even when linkifyPaths didn't
+    // rewrite them. Catches: stale memo result rendered before the apps
+    // list loaded; iOS PWA JS bundle predating the rewriter; any markdown
+    // link the LLM writes. Without this, the browser would navigate to
+    // the relative URL — for app entries to a file preview (via the
+    // engine's /data/* static mount), for panel names to a 404 on a
+    // non-existent /data/<panel> folder.
+    const anchorTarget = (e.target as HTMLElement).closest('a') as HTMLAnchorElement | null;
+    if (anchorTarget) {
+      const rawHref = anchorTarget.getAttribute('href') || '';
+      const appId = extractAppIdFromHref(rawHref);
+      if (appId) {
+        const app = apps.find((a) => a.id === appId);
+        if (app) {
+          e.preventDefault();
+          openApp(app);
+          return;
+        }
+      }
+      const navName = extractNavTargetFromHref(rawHref);
+      if (navName) {
+        e.preventDefault();
+        handleNavigationRequest({ target: navName });
+        return;
+      }
+    }
   }
 
   function toggleDetails() {
@@ -152,7 +170,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
 
   const exchangeActive = isStatusActive(status);
   const isEmptyContinued = isEmptyContinuedExchange(status, hasResponse, events, isLast);
-  const isCanceling = exchangeActive && cancelingThreadIds.value.has(threadId);
+  const isCanceling = exchangeActive && threadCanceling;
   const sl = isCanceling
     ? { label: 'Canceling', className: 'working' }
     : getStatusLabel(status, hasSteps);
@@ -202,12 +220,12 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
         const collapsed = getCollapsedVisibleEvents(events);
         visible = collapsed.visibleEvents;
         if (collapsed.needsFallback) {
-          fallback = responseText;
+          fallback = responseHtmlCombined;
         }
       }
     }
     return { visibleEvents: visible, collapsedFallbackText: fallback };
-  }, [hasEvents, showDetails, showMoreToggle, events, responseText]);
+  }, [hasEvents, showDetails, showMoreToggle, events, responseHtmlCombined]);
 
   // Memoize linkified HTML — linkifyPaths builds 15+ regex batches per call when
   // the workspace has many artifacts. Without memoization, every re-render of
@@ -228,14 +246,16 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
     [collapsedFallbackText, artifactPaths, apps],
   );
 
-  const responseTextHtml = useMemo(
-    () => linkifyPaths(responseText, artifactPaths, apps),
-    [responseText, artifactPaths, apps],
+  const responseHtmlLinkified = useMemo(
+    () => linkifyPaths(responseHtmlCombined, artifactPaths, apps),
+    [responseHtmlCombined, artifactPaths, apps],
   );
 
+  const responseTerminated = isTerminated(status) || exchange.questionOvertaken === true;
+
   const initiator = useMemo(
-    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId),
-    [exchange, userMessageHtml, userImageHashes, threadId],
+    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated),
+    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated],
   );
   const canCollapseInitiator = !!initiator.summary || !!initiator.details;
   const isInitiatorCollapsed = canCollapseInitiator
@@ -243,10 +263,12 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
   const isChangePanel = isChangeLifecycleEvent(exchange.userEvent);
   const isAbortPanel = exchange.userEvent.type === 'ResponseAborted';
   const isCancelPanel = exchange.userEvent.type === 'ResponseCanceled';
-  // Change lifecycle, abort-boundary, and cancel-boundary exchanges are
-  // terminal — they have no response, just the initiator panel with optional
-  // actions (Diff/Revert on change panels, Continue on the unresumed abort).
-  const showResponsePanel = !isChangePanel && !isAbortPanel && !isCancelPanel && !isEmptyContinued && (hasResponse || hasEvents || showStatus);
+  const isCanceledDivider = isCanceledQuestionDivider(exchange);
+  // Change lifecycle, abort-boundary, cancel-boundary, and canceled-question-
+  // divider exchanges are terminal — they have no response, just the initiator
+  // panel with optional actions (Diff/Revert on change panels, Continue on the
+  // unresumed abort, the QuestionCard's own ✓ Cancel button on the divider).
+  const showResponsePanel = !isChangePanel && !isAbortPanel && !isCancelPanel && !isCanceledDivider && !isEmptyContinued && (hasResponse || hasEvents || showStatus);
   let initiatorActions: ComponentChildren | undefined;
   if (isChangePanel) {
     initiatorActions = changeActions(
@@ -270,7 +292,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
   }
 
   return (
-    <div class="chat-exchange" ref={rootRef}>
+    <div class="chat-exchange" ref={rootRef} data-event-id={exchange.userEvent._eventId}>
       <InitiatorPanel
         initiator={initiator}
         timestamp={formatMessageTimestamp(timestamp)}
@@ -290,7 +312,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
           executor={executor}
           onExecutorClick={(e) => openInfoPanel('executor', e)}
           hasBody={hasResponse || hasEvents}
-          status={showStatus ? (
+          status={showStatus && shouldShowResponseStatusBadge(exchange.userEvent.type, statusClass) ? (
             <span class={`exchange-status-label exchange-status-${statusClass}`}>
               {statusLabelText}
               {statusClass === 'queued' && <span class="exchange-status-queued">{'○'}</span>}
@@ -308,7 +330,10 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
           collapsible={canCollapse}
           collapsed={isCollapsed}
           onToggle={canCollapse
-            ? () => toggleExchangeCollapsed(threadId, exchange.userSeq)
+            ? () => {
+                preserveOnToggle();
+                toggleExchangeCollapsed(threadId, exchange.userSeq);
+              }
             : undefined}
         >
           {hasEvents && hasSections ? (
@@ -328,8 +353,14 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
                   renderResponseEvents(visibleEvents)
                 )
               ) : (
-                <div dangerouslySetInnerHTML={{ __html: responseTextHtml }} />
+                <div dangerouslySetInnerHTML={{ __html: responseHtmlLinkified }} />
               )}
+            </div>
+          )}
+          {isEngineLimit && (
+            <div class="exchange-engine-limit" role="status">
+              <strong>Per-turn cap reached</strong>
+              <p>{engineLimitDetail}</p>
             </div>
           )}
         </ResponsePanel>
@@ -345,6 +376,61 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
   );
 }
 
+/** Custom prop equality for the `memo`-wrapped `ChatExchange` below.
+ *
+ *  Default `memo` would shallow-compare props, but `exchange` is a fresh
+ *  object every `computeExchanges` invocation, so the default would re-render
+ *  every child on every SSE event. We compare the **content-relevant**
+ *  fingerprint of an Exchange instead:
+ *
+ *   - `userSeq` — the exchange boundary; switching to a different exchange.
+ *   - `steps.length` + last step's `seq` — a new event landed in this
+ *     exchange. Events are append-only via `Map.set(seq, …)` with fresh
+ *     sequence numbers (never mutated in place — see CLAUDE.md "Events are
+ *     immutable, append-only"), so "same length + same last seq" reliably
+ *     implies same content.
+ *   - `questionOvertaken` — divider exchange flips this when the agent
+ *     ignored a question; renders differently.
+ *
+ *  All other props are primitives or strings — Object.is per field. When
+ *  every field matches we return `true` to skip the re-render entirely.
+ */
+function chatExchangePropsEqual(prev: Props, next: Props): boolean {
+  if (prev.streamingBuffer !== next.streamingBuffer) return false;
+  if (prev.isLast !== next.isLast) return false;
+  if (prev.threadId !== next.threadId) return false;
+  if (prev.hasPriorActive !== next.hasPriorActive) return false;
+  if (prev.imageOffset !== next.imageOffset) return false;
+  if (prev.priorModel !== next.priorModel) return false;
+  if (prev.priorEffort !== next.priorEffort) return false;
+  if (prev.isUnresumedAbort !== next.isUnresumedAbort) return false;
+  if (prev.threadIsCC !== next.threadIsCC) return false;
+  if (prev.threadIdle !== next.threadIdle) return false;
+  if (prev.threadCanceling !== next.threadCanceling) return false;
+  const a = prev.exchange;
+  const b = next.exchange;
+  if (a.userSeq !== b.userSeq) return false;
+  if (a.questionOvertaken !== b.questionOvertaken) return false;
+  if (a.steps.length !== b.steps.length) return false;
+  const aLast = a.steps[a.steps.length - 1]?.seq;
+  const bLast = b.steps[b.steps.length - 1]?.seq;
+  if (aLast !== bLast) return false;
+  return true;
+}
+
+/** Memo-wrapped public component. Drops the 28 unchanged sibling re-renders
+ *  on every per-SSE-event ThreadView re-render of the heavy thread. */
+export const ChatExchange = memo(ChatExchangeImpl, chatExchangePropsEqual);
+
+/** Hide the response panel's "Canceled ✕" badge when the question card's
+ *  own Cancel-as-picked button already carries the same signal. */
+export function shouldShowResponseStatusBadge(
+  userEventType: ThreadEvent['type'],
+  statusClass: string,
+): boolean {
+  return !(userEventType === 'UserQuestionAsked' && statusClass === 'canceled');
+}
+
 // ---------------------------------------------------------------------------
 // Initiator panel — bordered card describing who/what started this exchange.
 //
@@ -357,7 +443,7 @@ export function ChatExchange({ exchange, streamingBuffer, isLast, threadId, hasP
 
 type InitiatorVariant = 'user' | 'system' | 'trigger' | 'lucidos';
 
-interface InitiatorDescriptor {
+export interface InitiatorDescriptor {
   variant: InitiatorVariant;
   icon: string;
   /** WHO performed this — always the initiator's display name. */
@@ -382,7 +468,9 @@ interface InitiatorDescriptor {
 function initiatorSummary(ev: Exchange['userEvent']): string {
   switch (ev.type) {
     case 'TriggerStarted':           return 'Trigger fired';
-    case 'ContinuationStarted':         return 'Resumed after engine restart';
+    case 'ContinuationStarted':         return originMode(ev.actor) === 'human'
+      ? 'Continued the response'
+      : 'Resumed after engine restart';
     case 'ResponseAborted':            return responseAbortedSummary(ev.actor, ev.cause);
     case 'ResponseCanceled':           return RESPONSE_CANCELED_SUMMARY;
     case 'MissingHardeningDetected': return 'Hardening required';
@@ -435,6 +523,10 @@ export function describeInitiator(
   userMessageHtml: string,
   userImageHashes: string[],
   threadId: string,
+  /** Forwarded to the `UserQuestionAsked` and `CodingAgentPermissionRequest`
+   *  arms to disable their buttons. Default `false` so the many existing unit
+   *  tests covering unrelated user events don't need to thread it through. */
+  responseTerminated: boolean = false,
 ): InitiatorDescriptor {
   const ev = exchange.userEvent;
   const summary = initiatorSummary(ev);
@@ -550,6 +642,7 @@ export function describeInitiator(
             options={ev.options ?? []}
             multiSelect={ev.multi_select}
             resolved={answered?.answer}
+            terminated={responseTerminated}
           />
         ),
       });
@@ -574,6 +667,7 @@ export function describeInitiator(
               summary: ev.summary,
             }}
             resolved={resolved}
+            terminated={responseTerminated}
           />
         ),
       });
@@ -591,326 +685,4 @@ export function describeInitiator(
   }
 }
 
-const CHANGE_ACCENT = {
-  ChangeApplied: 'change-applied',
-  ChangeDiscarded: 'change-discarded',
-  ChangeReverted: 'change-reverted',
-} as const;
-
-function changeAccent(type: keyof typeof CHANGE_ACCENT): string {
-  return CHANGE_ACCENT[type];
-}
-
-function MarkdownBlock({ html }: { html: string }) {
-  return <div class="markdown-content" dangerouslySetInnerHTML={{ __html: html }} />;
-}
-
-function FileList({ files }: { files: string[] }) {
-  return (
-    <ul class="initiator-files">
-      {files.map(f => <li key={f}><code>{f}</code></li>)}
-    </ul>
-  );
-}
-
-function UserMessageBody({ html, imageHashes }: { html: string; imageHashes: string[] }) {
-  return (
-    <>
-      {html && <div class="markdown-content" dangerouslySetInnerHTML={{ __html: html }} />}
-      {imageHashes.length > 0 && (
-        <div class="user-images">
-          {imageHashes.map((hash, i) => {
-            const src = getSessionBlobUrlForHash(hash) ?? blobPreviewUrl(hash);
-            return (
-              <img
-                key={hash + ':' + i}
-                src={src}
-                class="user-image-thumb"
-                alt=""
-                onClick={(e) => openImagePopupFromGroup(e.currentTarget.src, e.currentTarget)}
-              />
-            );
-          })}
-        </div>
-      )}
-    </>
-  );
-}
-
-/** Body for change lifecycle initiator panels — surfaces the change description,
- *  file count, and (when failed) the error message. The resolved timestamp is
- *  the panel header timestamp (the change-lifecycle event time IS resolved_at). */
-function ChangeBody({ changeId, error }: { changeId?: string; error?: string }) {
-  const change: Change | undefined = changeId ? findChangeById(changeId) : undefined;
-  const lazy: Loadable<Change> = (changeId ? lazyChanges.value.get(changeId) : undefined) ?? { status: 'not-loaded' };
-  const showLoading = useDelayedLoading(lazy);
-
-  useEffect(() => {
-    if (changeId) void ensureChangeLoaded(changeId);
-  }, [changeId]);
-
-  // Lifecycle error and live data both win over the lazy-fetch state — a 404
-  // for a row that arrives via SSE moments later shouldn't strand a stale
-  // "Failed to load" row beneath the now-resolved description.
-  const lazyFailedError = !error && !change && lazy.status === 'failed'
-    ? `Failed to load change details: ${lazy.error}`
-    : undefined;
-  const lazyLoading = !change && lazy.status === 'loading' && showLoading;
-
-  const desc = change ? change.description.split('\n')[0] : undefined;
-  const fileCount = change?.file_count;
-
-  if (!desc && fileCount == null && !error && !lazyFailedError && !lazyLoading) return null;
-  return (
-    <div class="change-body">
-      {desc && <div class="change-body-desc">{desc}</div>}
-      {fileCount != null && (
-        <div class="change-body-meta">{fileCount} file{fileCount !== 1 ? 's' : ''}</div>
-      )}
-      {error && <div class="change-body-error">{error}</div>}
-      {lazyFailedError && <div class="change-body-error">{lazyFailedError}</div>}
-      {lazyLoading && <div class="change-body-meta">Loading...</div>}
-    </div>
-  );
-}
-
-/** "Continue" button rendered on the most recent unresumed ResponseAborted
- *  exchange. Disables itself between click and response so a double-click
- *  can't double-emit. Surfaces network failures via toast and re-enables. */
-function ContinueButton({ threadId }: { threadId: string }) {
-  const inFlight = useSignal(false);
-  const onClick = async (e: MouseEvent) => {
-    e.stopPropagation();
-    if (inFlight.value) return;
-    inFlight.value = true;
-    try {
-      await continueThread(threadId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      showToast(`Failed to continue: ${msg}`, 'error');
-      inFlight.value = false;
-      return;
-    }
-    // ContinuationStarted will arrive via SSE and remove the button by hiding
-    // this exchange's `isUnresumedAbort` — re-enable as a safety net in case
-    // the SSE event is delayed.
-    setTimeout(() => { inFlight.value = false; }, 5000);
-  };
-  return (
-    <button class="action-btn" onClick={onClick} disabled={inFlight.value}>
-      {inFlight.value ? 'Continuing...' : 'Continue'}
-    </button>
-  );
-}
-
-/** Render the engine note for a ContinuationStarted exchange — a one-line
- *  subline followed by a `<details>` expansion showing the full injected text.
- *  Returns null when no engine note is present (e.g. CC resume path). */
-function ResumeNoteBody({ exchange }: { exchange: Exchange }) {
-  const note = resumeEngineNote(exchange);
-  if (!note) return null;
-  const subline = note.toolCount > 0
-    ? `Reminded the model about ${note.toolCount} prior tool call${note.toolCount === 1 ? '' : 's'}`
-    : 'Reminded the model that no actions had completed';
-  return (
-    <details class="resume-note">
-      <summary>{subline}</summary>
-      <pre class="resume-note-body">{note.text}</pre>
-    </details>
-  );
-}
-
-/** Diff/Revert action buttons rendered in the initiator panel's action slot
- *  for ChangeApplied/Discarded/Reverted exchanges. Returns null when the
- *  change has no relevant actions (e.g. ChangeApplyFailed leaves the change
- *  pending — user reads the error, doesn't diff/revert). */
-function changeActions(changeId?: string, suppress?: boolean): ComponentChildren {
-  if (suppress || !changeId) return null;
-  const change = findChangeById(changeId);
-  if (!change) return null;
-  const showDiff = change.status === 'pending' || !!change.pre_merge_sha;
-  const showRevert = change.status === 'applied';
-  if (!showDiff && !showRevert) return null;
-  return (
-    <>
-      {showDiff && <button class="action-btn" onClick={() => viewChangeDiff(change)}>Diff</button>}
-      {showRevert && <button class="action-btn action-btn-danger" onClick={() => revertChange(change.id)}>Revert</button>}
-    </>
-  );
-}
-
-/** Shared header click handler for InitiatorPanel/ResponsePanel — toggles the
- *  panel's collapsed state, but ignores clicks that originated on a button or
- *  link inside the header (actor info, executor info, stop). */
-function handlePanelHeaderClick(e: MouseEvent, onToggle?: () => void): void {
-  if (!onToggle) return;
-  if ((e.target as HTMLElement).closest('button, a')) return;
-  onToggle();
-}
-
-interface InitiatorPanelProps {
-  initiator: InitiatorDescriptor;
-  timestamp: string;
-  onActorClick?: (e: MouseEvent) => void;
-  actions?: ComponentChildren;
-  collapsible: boolean;
-  collapsed: boolean;
-  onToggle?: () => void;
-}
-
-function ActorChipBody({ initiator }: { initiator: InitiatorDescriptor }) {
-  return (
-    <>
-      <span class="initiator-icon">{initiator.icon}</span>
-      <span class="initiator-label">{initiator.label}</span>
-    </>
-  );
-}
-
-function InitiatorPanel({ initiator, timestamp, onActorClick, actions, collapsible, collapsed, onToggle }: InitiatorPanelProps) {
-  const accentClass = initiator.accent ? ` initiator-panel-${initiator.accent}` : '';
-  const hasBody = !!initiator.summary || !!initiator.details;
-
-  return (
-    <div class={`initiator-panel initiator-panel-${initiator.variant}${accentClass}${collapsed ? ' initiator-panel-collapsed' : ''}`}>
-      <div
-        class={`initiator-header${collapsible ? ' initiator-header-clickable' : ''}`}
-        onClick={(e) => handlePanelHeaderClick(e, onToggle)}
-      >
-        {onActorClick ? (
-          <button
-            type="button"
-            class="initiator-actor"
-            onClick={onActorClick}
-            aria-label={`Show info for ${initiator.label}`}
-          >
-            <ActorChipBody initiator={initiator} />
-          </button>
-        ) : (
-          <span class="initiator-actor">
-            <ActorChipBody initiator={initiator} />
-          </span>
-        )}
-        <span class="initiator-timestamp">{timestamp}</span>
-      </div>
-      {hasBody && !collapsed && (
-        <div class="initiator-body">
-          {initiator.summary && <div class="initiator-summary">{initiator.summary}</div>}
-          {initiator.details}
-        </div>
-      )}
-      {actions && !collapsed && <div class="initiator-footer">{actions}</div>}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Response panel — bordered card wrapping the executor's reply. Header carries
-// executor + status + (optional) stop button + timestamp + collapse toggle.
-// Body is the response content; collapses when the user clicks the header.
-// ---------------------------------------------------------------------------
-
-/** Triggers invoke the Lucidos agent rather than running their own executor,
- *  so the label always reflects the LLM that produced the response. The model
- *  is shown in the executor info popover, not in the header. The "Lucidos
- *  Agent" name matches the initiator label used when one Lucidos thread
- *  spawns another — same entity, same display. */
-export function describeExecutor(
-  isCC: boolean,
-): { icon: ComponentChildren; label: string } {
-  if (isCC) return { icon: <ClaudeIcon />, label: 'Claude Code' };
-  return { icon: LUCIDOS_AGENT_ICON, label: LUCIDOS_AGENT_LABEL };
-}
-
-interface ResponsePanelProps {
-  executor: { icon: ComponentChildren; label: string };
-  onExecutorClick?: (e: MouseEvent) => void;
-  status: ComponentChildren;
-  timestamp: string;
-  collapsible: boolean;
-  collapsed: boolean;
-  onToggle?: () => void;
-  hasBody: boolean;
-  children: ComponentChildren;
-}
-
-function ResponsePanel({
-  executor, onExecutorClick, status, timestamp, collapsible, collapsed, onToggle, hasBody, children,
-}: ResponsePanelProps) {
-  return (
-    <div class={`response-panel${collapsed ? ' response-panel-collapsed' : ''}${hasBody ? '' : ' response-panel-bodyless'}`}>
-      <div
-        class={`response-header${collapsible ? ' response-header-clickable' : ''}`}
-        onClick={(e) => handlePanelHeaderClick(e, onToggle)}
-      >
-        <button
-          type="button"
-          class="response-executor"
-          onClick={onExecutorClick}
-          aria-label="Show executor info"
-        >
-          <span class="response-executor-icon">{executor.icon}</span>
-          <span class="response-executor-label">{executor.label}</span>
-        </button>
-        <span class="response-meta">
-          {status}
-          <span class="response-timestamp">{timestamp}</span>
-        </span>
-      </div>
-      {hasBody && !collapsed && (
-        <div class="response-body">
-          {children}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Generated image rendered inline in the response. */
-function GeneratedImage({ event }: { event: Extract<ResponseEvent, { type: 'image' }> }) {
-  const src = `data:${event.mime_type};base64,${event.base64}`;
-  return (
-    <div class="generated-image" data-tooltip={`thread:${event.index}`}>
-      <img
-        src={src}
-        class="image-thumbnail"
-        alt="Generated image"
-        loading="lazy"
-      />
-    </div>
-  );
-}
-
-/** Prefers `contextCapture` (new emissions + legacy synth); falls back
- *  to the legacy `context_tokens` projection so old DB rows still render. */
-function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
-  const { className } = stepStatus(event.success);
-  const snap = event.contextCapture;
-  const used = snap?.usage?.input_tokens ?? snap?.estimated_total_tokens ?? event.context_tokens;
-  const window = snap?.context_window;
-  const trimmed = snap?.trimmed ?? event.trimmed;
-  const hasContext = used != null;
-
-  return (
-    <button
-      type="button"
-      class={`inline-step ${className}`}
-      data-role="inline-step"
-      onClick={() => { stepDetailModal.value = event; }}
-    >
-      <span class="step-icon">
-        {event.success === null ? <span class="mini-spinner" /> : event.success ? '✓' : '⚠'}
-      </span>
-      <span class="step-description">{highlightEllipsis(event.description)}</span>
-      {event.detail && <span class="step-detail">{highlightEllipsis(event.detail)}</span>}
-      {hasContext && (
-        <span class={`step-context${trimmed ? ' trimmed' : ''}`}>
-          {window
-            ? `${formatTokens(used!)} / ${formatTokens(window)} (${contextPercent(used!, window)}%)`
-            : `${formatTokens(used!)} tokens${event.context_messages != null ? `, ${event.context_messages} msgs` : ''}`}
-          {trimmed && ' · trimmed'}
-        </span>
-      )}
-    </button>
-  );
-}
+export { describeExecutor } from './chat-exchange-parts';

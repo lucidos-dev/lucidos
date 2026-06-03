@@ -164,7 +164,8 @@ resolve_workspace() {
 # ── detect_tls ──────────────────────────────────────────────────────────
 # Check for TLS certs. Checks .certs/ dir first, then falls back to
 # LUCIDOS_TLS_CERT/KEY env vars (needed in worktrees where .certs/ is gitignored).
-# Sets PROTO, exports LUCIDOS_TLS_CERT/KEY.
+# Sets PROTO, exports LUCIDOS_TLS_CERT/KEY. Persists PROTO= to the ports
+# file so the CLI and cross-workspace callers know the protocol.
 detect_tls() {
     local cert_dir="$PROJECT_DIR/.certs"
     if [ -f "$cert_dir/cert.pem" ] && [ -f "$cert_dir/key.pem" ]; then
@@ -175,6 +176,10 @@ detect_tls() {
         PROTO="https"
     else
         PROTO="http"
+    fi
+    local ports_file="$WORKSPACE/.lucidos/ports"
+    if [ -f "$ports_file" ]; then
+        echo "PROTO=$PROTO" >> "$ports_file"
     fi
 }
 
@@ -401,7 +406,7 @@ _migrate_postgres_volume_if_needed() {
     fi
 
     # Run inside the postgres image so `chown postgres` resolves to the right
-    # uid (999 in pgvector/pgvector:pg16; using the name keeps this correct if
+    # uid (999 in pgvector/pgvector:pg17; using the name keeps this correct if
     # the base image ever changes). Postgres refuses to start with PGDATA perms
     # other than 0700, and `cp -a` preserves the host's perms (often 0755 on
     # macOS bind mounts) — chmod here, not after the container starts.
@@ -409,7 +414,7 @@ _migrate_postgres_volume_if_needed() {
     if ! docker run --rm \
         -v "$pg_data_dir:/src:ro" \
         -v "$volume_name:/dst" \
-        pgvector/pgvector:pg16 \
+        pgvector/pgvector:pg17 \
         sh -c 'cp -a /src/. /dst/ && chown -R postgres:postgres /dst && chmod 700 /dst'; then
         echo "ERROR: failed to copy PGDATA into volume $volume_name. Removing partial volume." >&2
         docker volume rm "$volume_name" >/dev/null 2>&1 || true
@@ -436,11 +441,51 @@ _migrate_postgres_volume_if_needed() {
 }
 
 _start_postgres_container() {
+    # Resolve a free PG host port BEFORE creating the container. The nominal
+    # 5432+offset slot may be squatted by a sibling workspace's sticky container;
+    # walk forward to a free (or our own) port so `docker compose up` doesn't
+    # collide. This is decoupled from the vite/api offset on purpose — ports.sh
+    # no longer drifts the user-facing ports for a PG conflict, so it's resolved
+    # here instead. `_pg_port_is_ours_or_free` accepts our own container (we
+    # recreate it below). Re-export so docker-compose and DATABASE_URL pick it up.
+    local pg_steps=0
+    while ! _pg_port_is_ours_or_free "$PG_PORT"; do
+        local squatter
+        squatter=$(docker ps --filter "publish=$PG_PORT" --format "{{.Names}}" 2>/dev/null | head -1)
+        echo "[ports] PG port $PG_PORT occupied${squatter:+ by container $squatter}, trying $(( PG_PORT + 1 ))" >&2
+        PG_PORT=$(( PG_PORT + 1 ))
+        pg_steps=$(( pg_steps + 1 ))
+        if [ "$pg_steps" -gt 1000 ]; then
+            echo "ERROR: could not find a free PostgreSQL port near $(( PG_PORT - pg_steps ))" >&2
+            return 1
+        fi
+    done
+    export PG_PORT
+    export LUCIDOS_PG_PORT="$PG_PORT"
+
     echo "Starting PostgreSQL for workspace: $WORKSPACE (port $PG_PORT, container lucidos-pg-$PG_NAME)"
 
     docker rm -f "lucidos-pg-$PG_NAME" 2>/dev/null || true
 
-    docker compose -p "lucidos-$PG_NAME" -f "$PROJECT_DIR/docker-compose.dev.yml" up -d
+    if ! docker compose -p "lucidos-$PG_NAME" -f "$PROJECT_DIR/docker-compose.dev.yml" up -d 2>&1; then
+        local squatter
+        squatter=$(docker ps --filter "publish=$PG_PORT" --format "{{.Names}}" 2>/dev/null | head -1)
+        if [ -n "$squatter" ]; then
+            echo "ERROR: port $PG_PORT is already bound by container '$squatter'" >&2
+            echo "Stop it first: docker stop $squatter" >&2
+        else
+            local pid
+            pid=$(lsof -ti :"$PG_PORT" -sTCP:LISTEN 2>/dev/null | head -1)
+            if [ -n "$pid" ]; then
+                local cmd
+                cmd=$(ps -p "$pid" -o command= 2>/dev/null | head -c 80)
+                echo "ERROR: port $PG_PORT is already bound by pid $pid ($cmd)" >&2
+            else
+                echo "ERROR: docker compose up failed (see output above)" >&2
+            fi
+        fi
+        return 1
+    fi
 
     echo -n "Waiting for PostgreSQL"
     for i in {1..30}; do
@@ -455,6 +500,110 @@ _start_postgres_container() {
     docker exec "lucidos-pg-$PG_NAME" psql -U lucidos -d lucidos -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1 || true
 }
 
+# ── _pid_in_list ────────────────────────────────────────────────────────
+# True if pid $1 appears in the space-separated list $2.
+_pid_in_list() {
+    local needle="$1" hay="$2" p
+    for p in $hay; do
+        if [ "$p" = "$needle" ]; then return 0; fi
+    done
+    return 1
+}
+
+# ── _await_engine_port_released ─────────────────────────────────────────
+# Poll until BOTH every pid in $2 has exited (kill -0 fails) AND port $1 is
+# free (port_is_free), or $3 seconds elapse. Returns 0 if both conditions
+# held before the deadline, 1 on timeout. Polls at 0.2s.
+#
+# Both conditions matter: a dead pid whose socket is still closing would let
+# a port-only check return too early, and a freed port with the old process
+# still alive means it could re-bind. SECONDS is integer wall-clock; the
+# 0.2s poll keeps the loop responsive without busy-spinning.
+_await_engine_port_released() {
+    local port="$1"
+    local pids="$2"
+    local timeout_s="$3"
+    local deadline=$(( SECONDS + timeout_s ))
+    while (( SECONDS < deadline )); do
+        local pid still_alive=""
+        for pid in $pids; do
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                still_alive=1
+                break
+            fi
+        done
+        if [ -z "$still_alive" ] && port_is_free "$port"; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+# ── wait_for_engine_shutdown ────────────────────────────────────────────
+# Block until the old engine has fully released the engine port so the
+# caller can build + launch the replacement without racing it onto an
+# occupied socket (`Error: Os { code: 48, kind: AddrInUse }`, after which
+# the replacement dies and the engine never recovers).
+#
+# The engine's graceful-shutdown budget is 10s (crates/lucidos-engine/src/
+# main.rs), and draining an in-flight Claude Code session uses most of it —
+# the previous fixed `sleep 1` returned long before the port was free. Poll
+# up to 15s (comfortably past the 10s budget). If the deadline passes with a
+# lucidos-engine still bound, escalate to SIGKILL — a wedged shutdown must
+# not block the rebuild forever — then give the kernel a moment to reclaim
+# the socket. Keeps the SIGUSR1-first convention: SIGKILL is the last resort,
+# only after a full graceful window.
+#
+# Args: $1 = engine port (VITE_PORT — the engine binds it after swap_ports),
+#       $2 = space-separated pids that were sent SIGUSR1,
+#       $3 = overall timeout in seconds (default 15).
+wait_for_engine_shutdown() {
+    local port="$1"
+    local pids="$2"
+    local timeout_s="${3:-15}"
+
+    if _await_engine_port_released "$port" "$pids" "$timeout_s"; then
+        return 0
+    fi
+
+    # Deadline passed. Force-kill a wedged engine still bound to the port.
+    if port_is_free "$port"; then
+        return 0
+    fi
+    local occupant occupant_cmd
+    occupant=$(lsof -ti :"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+    if [ -n "$occupant" ]; then
+        occupant_cmd=$(ps -p "$occupant" -o comm= 2>/dev/null || true)
+        if [[ "$occupant_cmd" == *lucidos-engine* ]]; then
+            # Stop the engine's supervisor BEFORE the SIGKILL. engine_supervisor.sh
+            # treats a SIGKILL'd engine (exit 137) as an unexpected death and
+            # respawns it right back onto this port — re-creating the AddrInUse
+            # we're clearing. In --engine-only (in-app) restarts the old
+            # supervisor is NOT torn down (the stale-dev-script sweep is skipped),
+            # so it would win the race. The supervisor is the engine's parent;
+            # its SIGTERM handler checks shutdown_requested before the exit-code
+            # branch, so it forwards a final SIGUSR1 and exits without respawning.
+            # (The engine itself only ever gets SIGUSR1 then SIGKILL — never
+            # SIGTERM — so the SIGUSR1-stop convention is preserved.) Skip pid 1
+            # (orphaned engine: no supervisor to stop) and our own pid.
+            local sup_pid
+            sup_pid=$(ps -p "$occupant" -o ppid= 2>/dev/null | tr -d ' ' || true)
+            if [ -n "$sup_pid" ] && [ "$sup_pid" != "1" ] && [ "$sup_pid" != "$$" ]; then
+                kill -TERM "$sup_pid" 2>/dev/null || true
+            fi
+            echo "Engine did not release port $port within ${timeout_s}s — force-killing PID $occupant..." >&2
+            kill -KILL "$occupant" 2>/dev/null || true
+        fi
+    fi
+    # Brief grace for the kernel to reclaim the socket after SIGKILL.
+    if _await_engine_port_released "$port" "" 3; then
+        return 0
+    fi
+    echo "WARNING: port $port still occupied after force-kill — the replacement engine may fail to bind." >&2
+    return 1
+}
+
 # ── kill_stale_processes ────────────────────────────────────────────────
 # Kill stale dev script processes and old frontend for this workspace.
 # With -b: also kills the engine (need fresh build). Without -b: leaves
@@ -462,6 +611,9 @@ _start_postgres_container() {
 kill_stale_processes() {
     local self_pid=$$
     local killed=""
+    # PIDs we sent SIGUSR1 to that must fully exit before the caller builds +
+    # launches the replacement engine (see wait_for_engine_shutdown below).
+    local engine_pids_to_reap=""
 
     # In --engine-only mode, skip killing parent dev scripts (they manage Vite/Tauri)
     if [ -z "$ENGINE_ONLY" ]; then
@@ -477,28 +629,38 @@ kill_stale_processes() {
         done < <(pgrep -f "(dev|web-dev|tauri-dev)\\.sh.*$WORKSPACE" 2>/dev/null || true)
     fi
 
-    # With -b: kill existing engine so we start the freshly built one
+    # With -b: kill existing engine so we start the freshly built one.
+    # Use SIGUSR1, not SIGTERM — the engine ignores SIGTERM to survive
+    # accidental `xargs kill` from CC subprocess test scripts (see
+    # main.rs shutdown_signal). SIGUSR1 is the legitimate stop signal.
     if [ -n "$BUILD" ]; then
         if [ -f "$ENGINE_PIDFILE" ]; then
             local old_pid
             old_pid="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
             if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
                 echo "Stopping existing engine for rebuild (PID $old_pid)..."
-                kill "$old_pid" 2>/dev/null || true
+                kill -USR1 "$old_pid" 2>/dev/null || true
+                engine_pids_to_reap="$old_pid"
                 killed=1
             fi
             rm -f "$ENGINE_PIDFILE"
         fi
 
-        # Kill any orphaned engine still holding our port
-        if ! port_is_free "$API_PORT"; then
+        # Kill any orphaned engine still holding the engine port. The engine
+        # binds VITE_PORT after swap_ports (API_PORT is Vite's internal port —
+        # see swap_ports), so an orphaned engine squats VITE_PORT, NOT API_PORT.
+        # Skip the pid we already signaled above: in --engine-only restarts the
+        # engine we just SIGUSR1'd is still draining on this port, and is not a
+        # separate orphan.
+        if ! port_is_free "$VITE_PORT"; then
             local occupant occupant_cmd
-            occupant=$(lsof -ti :"$API_PORT" 2>/dev/null || true)
-            if [ -n "$occupant" ]; then
+            occupant=$(lsof -ti :"$VITE_PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+            if [ -n "$occupant" ] && ! _pid_in_list "$occupant" "$engine_pids_to_reap"; then
                 occupant_cmd=$(ps -p "$occupant" -o comm= 2>/dev/null || true)
                 if [[ "$occupant_cmd" == *lucidos-engine* ]]; then
-                    echo "Killing orphaned engine on port $API_PORT (PID $occupant)..."
-                    kill "$occupant" 2>/dev/null || true
+                    echo "Killing orphaned engine on port $VITE_PORT (PID $occupant)..."
+                    kill -USR1 "$occupant" 2>/dev/null || true
+                    engine_pids_to_reap="${engine_pids_to_reap:+$engine_pids_to_reap }$occupant"
                     killed=1
                 fi
             fi
@@ -517,8 +679,24 @@ kill_stale_processes() {
         rm -f "$FRONTEND_PIDFILE"
     fi
 
-    # Wait briefly for killed processes to release ports
-    if [ -n "$killed" ]; then sleep 1; fi
+    # Wait for killed processes to release their ports before the caller
+    # builds + launches the replacements. The engine needs an explicit wait:
+    # its graceful-shutdown budget is 10s (main.rs) and draining an in-flight
+    # Claude Code session uses most of it, so a fixed `sleep 1` raced the
+    # rebuild onto a still-bound port (Error: AddrInUse, engine never
+    # recovered). wait_for_engine_shutdown blocks until the engine is gone AND
+    # the port is free. A frontend-only kill (Vite releases its port almost
+    # instantly on SIGTERM) keeps the short fixed wait.
+    if [ -n "$engine_pids_to_reap" ]; then
+        # Best-effort: `|| true` so an unrecoverable port (the rare case where
+        # even SIGKILL doesn't free it, where wait_for_engine_shutdown returns
+        # non-zero after warning) doesn't abort the caller under `set -e`. We
+        # still want to proceed to the rebuild + start_engine, which surfaces
+        # any bind error itself rather than dying silently here.
+        wait_for_engine_shutdown "$VITE_PORT" "$engine_pids_to_reap" || true
+    elif [ -n "$killed" ]; then
+        sleep 1
+    fi
 }
 
 # ── build_or_find_engine ────────────────────────────────────────────────
@@ -542,13 +720,26 @@ build_or_find_engine() {
         # lands next to `lucidos-engine`. The engine adds its directory to
         # PATH for spawned CC sessions; without the binary it skips that and
         # the lucidos-cli skill is not installed.
+        #
+        # ENGINE_BUILD_FEATURES is a space-separated list of cargo features
+        # the caller wants enabled on `lucidos-engine`. e2e scripts set it
+        # to `e2e-test-hooks` so the engine compiles in the push-log stub
+        # and the `GET /api/v1/_test/push-log` endpoint.
+        local feature_args=()
+        if [ -n "${ENGINE_BUILD_FEATURES:-}" ]; then
+            feature_args=(--features "$ENGINE_BUILD_FEATURES")
+        fi
         if [ -n "$RELEASE" ]; then
-            cargo build -p lucidos-engine -p lucidos-cli --release
+            cargo build -p lucidos-engine "${feature_args[@]}" -p lucidos-cli --release
             ENGINE_BIN="$PROJECT_DIR/target/release/lucidos-engine"
         else
-            cargo build -p lucidos-engine -p lucidos-cli
+            cargo build -p lucidos-engine "${feature_args[@]}" -p lucidos-cli
             ENGINE_BIN="$PROJECT_DIR/target/debug/lucidos-engine"
         fi
+        # Re-sign the freshly built binary with the stable dev identity so macOS
+        # TCC permission grants persist across rebuilds (best-effort; no-op off
+        # macOS or until ./scripts/dev-codesign-setup.sh has been run once).
+        sign_engine_binary "$ENGINE_BIN"
     else
         if [ -n "$RELEASE" ] && [ -f "$PROJECT_DIR/target/release/lucidos-engine" ]; then
             ENGINE_BIN="$PROJECT_DIR/target/release/lucidos-engine"
@@ -583,6 +774,8 @@ EOF
 }
 
 source "$(dirname "${BASH_SOURCE[0]}")/sleep.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/engine_supervisor.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/codesign.sh"
 
 # ── enable_clamshell_prevention ────────────────────────────────────────
 enable_clamshell_prevention() {
@@ -621,7 +814,7 @@ start_engine() {
         local existing_pid
         existing_pid="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
         if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
-            if curl -sk "$PROTO://localhost:$ENGINE_PORT/api/health" >/dev/null 2>&1; then
+            if curl -sk "$PROTO://localhost:$ENGINE_PORT/api/v1/health" >/dev/null 2>&1; then
                 echo ""
                 echo "Reusing existing engine (PID $existing_pid) on port $ENGINE_PORT"
                 ENGINE_PID="$existing_pid"
@@ -647,24 +840,53 @@ start_engine() {
     ulimit -n 8192 2>/dev/null
 
     start_caffeinate
-    "$ENGINE_BIN" >> "$ENGINE_LOG" 2>&1 &
-    ENGINE_PID=$!
-    echo $ENGINE_PID > "$ENGINE_PIDFILE"
+
+    # Spawn the supervisor (engine_supervisor.sh:run_supervised) as a
+    # backgrounded subshell. It loops the engine binary so an unexpected
+    # kill (SIGKILL from a stale worktree's ports.sh, OOM, panic) becomes
+    # a 1–30 s blip instead of a session outage. Legit stops (exit 0 /
+    # 130 / 138 from SIGUSR1/SIGINT, or SIGTERM to the supervisor itself
+    # from kill_stale_processes' `pkill -P`) flow through cleanly.
+    ( run_supervised "$ENGINE_PIDFILE" "$ENGINE_LOG" "$ENGINE_BIN" ) &
+    ENGINE_SUPERVISOR_PID=$!
+
+    # Wait for the supervisor to write the engine pid. The supervisor
+    # rewrites the pidfile on every (re)start, so this also picks up a
+    # within-startup restart (engine crashes immediately, supervisor
+    # respawns it).
+    local pid_deadline=$(( $(date +%s) + 5 ))
+    while [ "$(date +%s)" -lt "$pid_deadline" ]; do
+        if [ -s "$ENGINE_PIDFILE" ]; then
+            ENGINE_PID="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
+            [ -n "$ENGINE_PID" ] && kill -0 "$ENGINE_PID" 2>/dev/null && break
+        fi
+        sleep 0.1
+    done
+    if [ -z "${ENGINE_PID:-}" ] || ! kill -0 "$ENGINE_PID" 2>/dev/null; then
+        echo ""
+        echo "ERROR: Engine supervisor did not start the engine within 5s. Check logs:"
+        tail -10 "$ENGINE_LOG"
+        kill -KILL "$ENGINE_SUPERVISOR_PID" 2>/dev/null || true
+        exit 1
+    fi
 
     # Wait for engine to be ready. Cold boot does pgvector init, migrations,
     # memory index load, and embedding model warmup — which can push past 30s
     # on a fresh workspace or a slow disk. Give it 90s before declaring failure.
+    # Re-read $ENGINE_PIDFILE each tick so a supervisor restart during
+    # startup updates ENGINE_PID rather than failing the kill -0 check.
     echo -n "Waiting for engine"
     local engine_ready=""
     for i in {1..90}; do
-        if ! kill -0 $ENGINE_PID 2>/dev/null; then
-            echo ""
-            echo "ERROR: Engine crashed on startup. Check logs:"
-            echo "  tail -50 $ENGINE_LOG"
-            tail -10 "$ENGINE_LOG"
-            exit 1
+        ENGINE_PID="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
+        if [ -z "$ENGINE_PID" ] || ! kill -0 "$ENGINE_PID" 2>/dev/null; then
+            # Supervisor is between restarts; wait one tick for the next
+            # spawn before checking health.
+            echo -n "."
+            sleep 1
+            continue
         fi
-        if curl -sk "$PROTO://localhost:$ENGINE_PORT/api/health" >/dev/null 2>&1; then
+        if curl -sk "$PROTO://localhost:$ENGINE_PORT/api/v1/health" >/dev/null 2>&1; then
             echo " ready!"
             engine_ready="yes"
             break
@@ -677,6 +899,7 @@ start_engine() {
         echo ""
         echo "ERROR: Engine failed to start within 90 seconds. Check logs:"
         tail -20 "$ENGINE_LOG"
+        kill -KILL "$ENGINE_SUPERVISOR_PID" 2>/dev/null || true
         exit 1
     fi
 }
@@ -885,12 +1108,6 @@ sleep_prevention_status() {
 show_banner() {
     local mode="${1:-web}"
 
-    # Detect OCR
-    local ocr_status="Not available (install with: brew install tesseract poppler)"
-    if command -v pdftoppm >/dev/null 2>&1 && command -v tesseract >/dev/null 2>&1; then
-        ocr_status="Available (tesseract + poppler)"
-    fi
-
     # Detect network
     local local_ip ts_hostname
     local_ip=$(ipconfig getifaddr en0 2>/dev/null || echo "unknown")
@@ -914,7 +1131,6 @@ show_banner() {
     echo "  Vite HMR:    $PROTO://localhost:$INTERNAL_VITE_PORT"
     echo "  PostgreSQL:  localhost:$PG_PORT"
     echo "  Engine:      Native macOS"
-    echo "  OCR:         $ocr_status"
     echo "  Sleep:       $(sleep_prevention_status)"
     echo "  Log:         $ENGINE_LOG"
     echo "========================================"

@@ -1197,6 +1197,8 @@ Felt {} today. {} were a bit tight during the first kilometer but loosened up af
     }
 }
 
+// Nested `format!` keeps the seed-data templates visually contiguous; collapsing
+// them into outer-format placeholders would scatter the literal text.
 #[allow(clippy::format_in_format_args)]
 fn generate_analysis_artifact(
     day: i64,
@@ -2276,6 +2278,8 @@ POST /webhooks
     }
 }
 
+// Same rationale as `generate_analysis_artifact`: nested format! keeps the seed
+// templates readable as literal blocks.
 #[allow(clippy::format_in_format_args)]
 fn generate_security_artifact(
     day: i64,
@@ -2610,6 +2614,8 @@ This report presents findings from the security assessment conducted on {}. The 
     }
 }
 
+// Many context inputs (project / date / person / org) feed the seed templates;
+// nested format! preserves their readability — see other generator helpers above.
 #[allow(clippy::too_many_arguments, clippy::format_in_format_args)]
 fn generate_general_artifact(
     day: i64,
@@ -3662,6 +3668,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Some(task_id),
             Some("morning-brief"),
             None,
+            None,
+            lucidos_engine::scheduler::notifications::Tap::Modal,
             morning_time,
         )
         .await?;

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { groupIntoExchanges, exchangeResponseEvents, exchangeStatus, type StoredEvent, type ThreadEvent } from '../thread-events';
+import { groupIntoExchanges, exchangeResponseEvents, exchangeSteps, exchangeStatus, type StoredEvent, type ThreadEvent } from '../thread-events';
 
 function ev(seq: number, e: ThreadEvent, created = `2026-05-03T12:00:${String(seq).padStart(2, '0')}Z`) {
   return [seq, { ...e, created }] as const;
@@ -37,6 +37,73 @@ describe('groupIntoExchanges — ActionRequired events as exchange boundaries', 
     expect(exchanges[1].userEvent.type).toBe('CodingAgentPermissionRequest');
   });
 
+  it('chat agent post-answer text/response routes to the question exchange (rendered below the answer)', () => {
+    // The agent's reply text must land in the question divider so it renders
+    // BELOW the question card, not back in the MR exchange (which would put
+    // the reply ABOVE the question). `ToolResult` for the question-asking
+    // tool itself carries `tool_called_event_id` and is routed by the
+    // sibling "Executing ask_user_question..." spinner test — it pairs with
+    // its `ToolCalled` exchange (MR1), not the divider.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'ask me a q', _eventId: 'msg-1', created: '2026-05-03T12:00:01Z' } as StoredEvent],
+      [2, { type: 'ThoughtStreamed', text: 'thinking', request_event_id: 'msg-1', created: '2026-05-03T12:00:02Z' } as StoredEvent],
+      [3, { type: 'ToolCalled', name: 'ask_user_question', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-05-03T12:00:03Z' } as StoredEvent],
+      [4, { type: 'UserQuestionAsked', tool_use_id: 'tu-outer-0', cc_session_id: '', question: 'evening?', options: [{ id: 'a', label: 'Code' }], created: '2026-05-03T12:00:04Z' } as StoredEvent],
+      [5, { type: 'UserQuestionAnswered', tool_use_id: 'tu-outer-0', answer: { kind: 'Selected', option_id: 'a' }, created: '2026-05-03T12:00:05Z' } as StoredEvent],
+      [6, { type: 'ToolResult', name: 'ask_user_question', result: 'ok', tool_called_event_id: 'tc-1', request_event_id: 'msg-1', created: '2026-05-03T12:00:06Z' } as StoredEvent],
+      [7, { type: 'TextStreamed', text: "A coder's evening — fitting.", request_event_id: 'msg-1', created: '2026-05-03T12:00:07Z' } as StoredEvent],
+      [8, { type: 'ResponseGenerated', text: "A coder's evening — fitting.", request_event_id: 'msg-1', created: '2026-05-03T12:00:08Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual(['MessageReceived', 'UserQuestionAsked']);
+
+    const qSteps = exchanges[1].steps.map(s => s.event.type);
+    expect(qSteps).toContain('UserQuestionAnswered');
+    expect(qSteps).toContain('TextStreamed');
+    expect(qSteps).toContain('ResponseGenerated');
+    expect(qSteps).not.toContain('ToolResult');
+
+    const mrSteps = exchanges[0].steps.map(s => s.event.type);
+    expect(mrSteps).not.toContain('TextStreamed');
+    expect(mrSteps).not.toContain('ResponseGenerated');
+    expect(mrSteps).toContain('ToolResult');
+  });
+
+  it('live chat ToolResult resolves the "Executing ask_user_question..." spinner on the MR exchange', () => {
+    // Regression: after the user answers, the agent loop emits ToolResult so
+    // the next iteration can proceed. ToolCalled lives in the MR exchange;
+    // UserQuestionAsked split off a divider, so the post-answer redirect
+    // points at the divider. Without explicit pairing the live ToolResult
+    // followed the redirect into the divider and never resolved the original
+    // call's pending step — the MR exchange kept showing "↻ Executing
+    // ask_user_question..." forever, even though the question card already
+    // displayed the picked answer.
+    //
+    // Fix: the engine stamps `tool_called_event_id` on every live chat
+    // ToolResult (not just synthetic recovery backfills), so the result
+    // routes back to the ToolCalled's exchange via `chatToolCallOwners`.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'ask me a q', _eventId: 'msg-1', created: '2026-05-03T12:00:01Z' } as StoredEvent],
+      [2, { type: 'ThoughtStreamed', text: 'thinking', request_event_id: 'msg-1', created: '2026-05-03T12:00:02Z' } as StoredEvent],
+      [3, { type: 'ToolCalled', name: 'ask_user_question', args: {}, description: 'Executing ask_user_question...', _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-05-03T12:00:03Z' } as StoredEvent],
+      [4, { type: 'UserQuestionAsked', tool_use_id: 'tu-outer-0', cc_session_id: '', question: 'evening?', options: [{ id: 'a', label: 'Code' }], created: '2026-05-03T12:00:04Z' } as StoredEvent],
+      [5, { type: 'UserQuestionAnswered', tool_use_id: 'tu-outer-0', answer: { kind: 'Selected', option_id: 'a' }, created: '2026-05-03T12:00:05Z' } as StoredEvent],
+      [6, { type: 'ToolResult', name: 'ask_user_question', result: 'ok', tool_called_event_id: 'tc-1', request_event_id: 'msg-1', created: '2026-05-03T12:00:06Z' } as StoredEvent],
+      [7, { type: 'ThoughtStreamed', text: 'next round', request_event_id: 'msg-1', created: '2026-05-03T12:00:07Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const mrEx = exchanges.find(e => e.userEvent.type === 'MessageReceived')!;
+    // ToolResult lands with its ToolCalled, not in the question divider.
+    expect(mrEx.steps.map(s => s.event.type)).toContain('ToolResult');
+    const questionEx = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    expect(questionEx.steps.map(s => s.event.type)).not.toContain('ToolResult');
+    // The user-visible bug: the steps panel for the MR exchange.
+    const steps = exchangeSteps(mrEx, /* _isLast */ false, /* threadIdle */ false);
+    const askStep = steps.find(s => s.description === 'Executing ask_user_question...');
+    expect(askStep).toBeDefined();
+    expect(askStep!.success).toBe(true);
+  });
+
   it('multiple pauses in one CC turn produce one divider per pause (MP1)', () => {
     const events = thread(
       ev(1, { type: 'MessageReceived', text: 'do stuff' }),
@@ -53,6 +120,85 @@ describe('groupIntoExchanges — ActionRequired events as exchange boundaries', 
       'UserQuestionAsked',
       'CodingAgentPermissionRequest',
     ]);
+  });
+});
+
+describe('groupIntoExchanges — question divider marked overtaken when agent progresses past it without an answer', () => {
+  // CC's parallel-tool-call race: AskUserQuestion is emitted alongside
+  // sibling tool_uses; the hook blocks the question while the siblings
+  // dispatch and emit CodingAgent{TextStreamed,ToolCalled,ToolResult,…}
+  // as steps of the divider before any answer lands. `questionOvertaken`
+  // lets ChatExchange disable the QuestionCard buttons in that window.
+
+  it('CC TextStreamed after UserQuestionAsked (no answer) marks divider as overtaken', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'do stuff' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu-q', cc_session_id: 's', question: 'X?', options: [{ id: 'a', label: 'X' }] }),
+      ev(3, { type: 'CodingAgentTextStreamed', text: 'parallel work' }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    expect(divider.questionOvertaken).toBe(true);
+  });
+
+  it('CC ToolCalled after UserQuestionAsked (no answer) marks divider as overtaken', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'do stuff' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu-q', cc_session_id: 's', question: 'X?', options: [{ id: 'a', label: 'X' }] }),
+      ev(3, { type: 'CodingAgentToolCalled', name: 'Bash', args: {}, tool_use_id: 'tu-sibling' }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    expect(divider.questionOvertaken).toBe(true);
+  });
+
+  it('chat TextStreamed after UserQuestionAsked marks divider as overtaken (chat symmetry)', () => {
+    // Chat-agent path. Today this only happens if the agentic loop misbehaves
+    // — the tool blocks sequentially — but the projection treats both agents
+    // uniformly so a future regression can't reintroduce live buttons on a
+    // question the agent has already raced past.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'ask me', _eventId: 'msg-1', created: '2026-05-19T12:00:01Z' } as StoredEvent],
+      [2, { type: 'UserQuestionAsked', tool_use_id: 'tu-q', cc_session_id: '', question: 'X?', options: [{ id: 'a', label: 'X' }], created: '2026-05-19T12:00:02Z' } as StoredEvent],
+      [3, { type: 'TextStreamed', text: 'chat-agent kept talking', request_event_id: 'msg-1', created: '2026-05-19T12:00:03Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    expect(divider.questionOvertaken).toBe(true);
+  });
+
+  it('matching UserQuestionAnswered beats progression — divider is NOT overtaken', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'do stuff' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu-q', cc_session_id: 's', question: 'X?', options: [{ id: 'a', label: 'X' }] }),
+      ev(3, { type: 'CodingAgentTextStreamed', text: 'parallel work' }),
+      ev(4, { type: 'UserQuestionAnswered', tool_use_id: 'tu-q', answer: { kind: 'Selected', option_id: 'a' } }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    expect(divider.questionOvertaken).toBe(false);
+  });
+
+  it('question is the last event in the thread — divider is NOT overtaken', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'ask' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu-q', cc_session_id: 's', question: 'X?', options: [{ id: 'a', label: 'X' }] }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    expect(divider.questionOvertaken).toBe(false);
+  });
+
+  it('answer for a DIFFERENT tool_use_id does not save an overtaken question', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'do stuff' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu-q', cc_session_id: 's', question: 'X?', options: [{ id: 'a', label: 'X' }] }),
+      ev(3, { type: 'CodingAgentTextStreamed', text: 'parallel work' }),
+      ev(4, { type: 'UserQuestionAnswered', tool_use_id: 'tu-OTHER', answer: { kind: 'Selected', option_id: 'a' } }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    expect(divider.questionOvertaken).toBe(true);
   });
 });
 
@@ -110,6 +256,177 @@ describe('exchangeStatus on divider exchanges', () => {
   });
 });
 
+describe('groupIntoExchanges — ResponseCanceled on a UserQuestion', () => {
+  it('skips the boundary exchange when the question itself resolved as Canceled (the question card\'s cancel-as-picked button carries the signal)', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'hi' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu1', cc_session_id: 's', question: 'q', options: [] }),
+      ev(3, { type: 'UserQuestionAnswered', tool_use_id: 'tu1', answer: { kind: 'Canceled' } }),
+      ev(4, { type: 'ResponseCanceled' }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual(['MessageReceived', 'UserQuestionAsked']);
+    // The cancel itself still lives on the question exchange's steps so the
+    // audit trail (and status='canceled' computation) stay intact.
+    const div = exchanges[1];
+    expect(div.steps.some(s => s.event.type === 'ResponseCanceled')).toBe(true);
+  });
+
+  it('keeps the boundary exchange when the user picked an option (Selected) before canceling — the picked option is shown, not a cancel button, so the You-panel is the only signal', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'hi' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu1', cc_session_id: 's', question: 'q', options: [{ id: 'a', label: 'A' }] }),
+      ev(3, { type: 'UserQuestionAnswered', tool_use_id: 'tu1', answer: { kind: 'Selected', option_id: 'a' } }),
+      ev(4, { type: 'CodingAgentTextStreamed', text: 'partial reply' }),
+      ev(5, { type: 'ResponseCanceled' }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived',
+      'UserQuestionAsked',
+      'ResponseCanceled',
+    ]);
+  });
+
+  it('keeps the boundary exchange when the user picked MultiSelected before canceling', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'hi' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu1', cc_session_id: 's', question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] }),
+      ev(3, { type: 'UserQuestionAnswered', tool_use_id: 'tu1', answer: { kind: 'MultiSelected', option_ids: ['a', 'b'] } }),
+      ev(4, { type: 'ResponseCanceled' }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived',
+      'UserQuestionAsked',
+      'ResponseCanceled',
+    ]);
+  });
+
+  it('keeps the boundary exchange when the user typed FreeText before canceling', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'hi' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu1', cc_session_id: 's', question: 'q', options: [] }),
+      ev(3, { type: 'UserQuestionAnswered', tool_use_id: 'tu1', answer: { kind: 'FreeText', text: 'go' } }),
+      ev(4, { type: 'ResponseCanceled' }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived',
+      'UserQuestionAsked',
+      'ResponseCanceled',
+    ]);
+  });
+
+  it('keeps the boundary when ResponseCanceled lands with no UserQuestionAnswered yet — the question card has no resolution to render, so the You-panel is the only signal', () => {
+    // Engine normally emits UserQuestionAnswered (kind: Canceled) ahead of
+    // ResponseCanceled for an open question; this test pins the safe fallback
+    // in case the ordering ever inverts or the engine drops the answer event.
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'hi' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu1', cc_session_id: 's', question: 'q', options: [] }),
+      ev(3, { type: 'ResponseCanceled' }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived',
+      'UserQuestionAsked',
+      'ResponseCanceled',
+    ]);
+  });
+
+  it('still creates the separate boundary exchange when ResponseCanceled cancels a regular chat MessageReceived', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'hi' }),
+      ev(2, { type: 'TextStreamed', text: 'partial' }),
+      ev(3, { type: 'ResponseCanceled' }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual(['MessageReceived', 'ResponseCanceled']);
+  });
+
+  it('still creates the separate boundary exchange when ResponseCanceled cancels a CodingAgentPermissionRequest divider', () => {
+    // Permission requests own their own resolution UI (the picked button on
+    // PermissionCard); a cancel that lands on a permission divider isn't the
+    // user pressing Deny inside the card, so the You-panel attribution still
+    // adds value. Keep the boundary exchange here.
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'do stuff' }),
+      ev(2, { type: 'CodingAgentPermissionRequest', request_id: 'r1', tool_use_id: 'tu1', tool_name: 'Bash', input: {}, summary: 'Bash ls' }),
+      ev(3, { type: 'ResponseCanceled' }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived',
+      'CodingAgentPermissionRequest',
+      'ResponseCanceled',
+    ]);
+  });
+});
+
+describe('groupIntoExchanges — answer/resolution routing across an intervening boundary', () => {
+  // Real thread 3e54cacb: a chat agent woken by a spawned CC sub-thread asks a
+  // question. The sub-thread finishing emits ChildThreadCompleted — an exchange
+  // boundary that becomes `current` BEFORE the answer lands. The answer
+  // (FreeText, actor=thread_link) is NOT request-id routed, so it followed
+  // `current` into the ChildThreadCompleted exchange instead of grouping with
+  // its UserQuestionAsked divider. The divider then never saw its answer and
+  // stayed stuck on 'awaiting-answer' forever even though the agent had resumed
+  // and completed. Fix: route the answer to its divider by tool_use_id, the
+  // same way CodingAgentToolResult is routed back to its call across a boundary.
+  it('UserQuestionAnswered routes to its divider when a ChildThreadCompleted boundary intervened', () => {
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'check backups', _eventId: 'msg-1', created: '2026-05-30T04:21:00Z' } as StoredEvent],
+      [2, { type: 'ToolCalled', name: 'ask_user_question', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-05-30T04:21:01Z' } as StoredEvent],
+      [3, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'How surfaced?', options: [{ id: 'a', label: 'Toast' }], created: '2026-05-30T04:21:02Z' } as StoredEvent],
+      [4, { type: 'ChildThreadCompleted', child_thread_id: 'child-1', status: 'success', summary: 'engine fix landed', _eventId: 'ctc-1', created: '2026-05-30T04:26:15Z' } as StoredEvent],
+      [5, { type: 'UserQuestionAnswered', tool_use_id: 'tu-1', answer: { kind: 'FreeText', text: 'toast' }, created: '2026-05-30T04:26:15Z' } as StoredEvent],
+      [6, { type: 'TextStreamed', text: 'Manual backup still grinding…', request_event_id: 'msg-1', created: '2026-05-30T04:26:35Z' } as StoredEvent],
+      [7, { type: 'ResponseGenerated', text: 'Manual backup still grinding…', request_event_id: 'msg-1', created: '2026-05-30T04:26:36Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    const ctc = exchanges.find(e => e.userEvent.type === 'ChildThreadCompleted')!;
+
+    // The answer groups with its divider, not the intervening boundary.
+    expect(divider.steps.map(s => s.event.type)).toContain('UserQuestionAnswered');
+    expect(ctc.steps.map(s => s.event.type)).not.toContain('UserQuestionAnswered');
+
+    // With the answer present, the question is resolved — not overtaken, and the
+    // status reflects the completed response instead of a stuck 'awaiting-answer'.
+    expect(divider.questionOvertaken).toBe(false);
+    expect(exchangeStatus(divider, '', false, false, false)).toBe('done');
+  });
+
+  it('CodingAgentPermissionResolved routes to its divider when a boundary intervened', () => {
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'edit foo', _eventId: 'msg-1', created: '2026-05-30T04:00:00Z' } as StoredEvent],
+      [2, { type: 'CodingAgentPermissionRequest', request_id: 'r1', tool_use_id: 'tu', tool_name: 'Edit', input: {}, summary: 'Edit /foo', created: '2026-05-30T04:00:01Z' } as StoredEvent],
+      [3, { type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'x', _eventId: 'ctc-1', created: '2026-05-30T04:00:02Z' } as StoredEvent],
+      [4, { type: 'CodingAgentPermissionResolved', request_id: 'r1', allowed: true, created: '2026-05-30T04:00:03Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const divider = exchanges.find(e => e.userEvent.type === 'CodingAgentPermissionRequest')!;
+    const ctc = exchanges.find(e => e.userEvent.type === 'ChildThreadCompleted')!;
+    expect(divider.steps.map(s => s.event.type)).toContain('CodingAgentPermissionResolved');
+    expect(ctc.steps.map(s => s.event.type)).not.toContain('CodingAgentPermissionResolved');
+  });
+
+  it('answer with no matching divider falls back to current-exchange routing', () => {
+    // A UserQuestionAnswered whose tool_use_id matches no divider (legacy data,
+    // or an answer that arrived before its Asked) must not vanish — fall through
+    // to `current` so it still renders somewhere.
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'hi' }),
+      ev(2, { type: 'CodingAgentTextStreamed', text: 'working' }),
+      ev(3, { type: 'UserQuestionAnswered', tool_use_id: 'tu-orphan', answer: { kind: 'FreeText', text: 'go' } }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges).toHaveLength(1);
+    expect(exchanges[0].steps.map(s => s.event.type)).toContain('UserQuestionAnswered');
+  });
+});
+
 describe('groupIntoExchanges — CodingAgentToolResult routing across permission boundaries', () => {
   it('routes tool result back to its originating exchange when a permission request split them', () => {
     const events = thread(
@@ -157,5 +474,98 @@ describe('groupIntoExchanges — CodingAgentToolResult routing across permission
     const steps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step');
     const step = steps.find(s => s.tool_name === 'Bash');
     expect(step?.success).toBe(true);
+  });
+});
+
+describe('groupIntoExchanges — synthetic ToolResult routing via tool_called_event_id', () => {
+  // Regression: when the engine restarts mid-`ask_user_question`, the chat
+  // agent has emitted ToolCalled+UserQuestionAsked but no ToolResult. The
+  // post-restart recovery sweep emits a synthetic ToolResult with
+  // `tool_called_event_id` pointing back at the orphan ToolCalled. Without
+  // routing on that id, the synthetic result flows via `request_event_id`
+  // through the UserQuestionAsked redirect into the ResponseAborted boundary
+  // exchange — leaving the ToolCalled's "Executing ask_user_question..."
+  // spinner spinning forever in its original (CTC/MR) exchange.
+  it('synthetic ToolResult lands in the same exchange as its ToolCalled', () => {
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'do it', _eventId: 'msg-1', created: '2026-05-22T06:51:40Z' } as StoredEvent],
+      [2, { type: 'TextStreamed', text: 'Want me to:', request_event_id: 'msg-1', created: '2026-05-22T06:51:40Z' } as StoredEvent],
+      [3, { type: 'ToolCalled', name: 'ask_user_question', args: {}, description: 'Executing ask_user_question...', _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-05-22T06:51:40Z' } as StoredEvent],
+      [4, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'X?', options: [{ id: 'a', label: 'X' }], created: '2026-05-22T06:51:40Z' } as StoredEvent],
+      [5, { type: 'ResponseAborted', text: 'interrupted by engine restart', cause: 'engine_shutdown', request_event_id: 'msg-1', created: '2026-05-22T06:52:18Z' } as StoredEvent],
+      // Synthetic emit from `recover_orphan_tool_calls` — carries
+      // tool_called_event_id pointing back at the orphan ToolCalled but NO
+      // request_event_id (the recovery emit doesn't set one).
+      [6, { type: 'ToolResult', name: 'ask_user_question', result: '[Tool execution interrupted by engine restart — original ToolCalled event_id: tc-1]', tool_called_event_id: 'tc-1', created: '2026-05-22T06:53:49Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    // Three exchanges: MR (with TextStreamed + ToolCalled + synthetic ToolResult),
+    // UserQuestionAsked (with ResponseAborted via dual-push), ResponseAborted boundary.
+    const mrEx = exchanges.find(e => e.userEvent.type === 'MessageReceived')!;
+    const mrSteps = mrEx.steps.map(s => s.event.type);
+    expect(mrSteps).toContain('ToolCalled');
+    expect(mrSteps).toContain('ToolResult');
+
+    // The synthetic ToolResult must NOT land in the UserQuestionAsked or
+    // ResponseAborted boundary exchanges — that would strand the original
+    // ToolCalled's spinner.
+    const questionEx = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    expect(questionEx.steps.map(s => s.event.type)).not.toContain('ToolResult');
+
+    // Pairing succeeds: the InlineStep for the ToolCalled resolves (success
+    // becomes non-null after the ToolResult lands in the same exchange).
+    const mrResponseEvents = exchangeResponseEvents(mrEx);
+    const askStep = mrResponseEvents.find(e => e.type === 'step' && e.tool_name === 'ask_user_question');
+    expect(askStep).toBeDefined();
+    expect(askStep!.type === 'step' && askStep!.success).not.toBeNull();
+  });
+
+  it('synthetic ToolResult without tool_called_event_id falls back to current-exchange routing', () => {
+    // Backward compat: legacy synthetic ToolResults (pre-tool_called_event_id)
+    // still fall through to current — the wire field is optional, so
+    // un-stamped emits must keep the old behavior.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'do it', _eventId: 'msg-1', created: '2026-05-22T06:51:40Z' } as StoredEvent],
+      [2, { type: 'ToolCalled', name: 'run_python', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-05-22T06:51:40Z' } as StoredEvent],
+      [3, { type: 'ToolResult', name: 'run_python', result: 'ok', request_event_id: 'msg-1', created: '2026-05-22T06:51:41Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges).toHaveLength(1);
+    const steps = exchanges[0].steps.map(s => s.event.type);
+    expect(steps).toContain('ToolResult');
+  });
+});
+
+describe('exchangeStatus + responseTerminated — UserQuestionAsked exchange aborted by engine restart', () => {
+  // The user-facing bug: a chat agent woken from ChildThreadCompleted asks a
+  // question, the engine restarts, recovery emits ResponseAborted carrying
+  // the ORIGINATING event's id (the CTC, not an older MR). The abort routes
+  // via reqIdRedirect into the UserQuestionAsked exchange. Status should be
+  // 'aborted' so the QuestionBody renders terminated (disabled buttons).
+  it('ResponseAborted with the originating req_id terminates the UserQuestionAsked exchange', () => {
+    const events = new Map<number, StoredEvent>([
+      // ChildThreadCompleted is the originating event of the in-flight turn.
+      [1, { type: 'ChildThreadCompleted', child_thread_id: 'child-1', child_thread_title: 'child', status: 'success', summary: 'done', _eventId: 'ctc-1', created: '2026-05-22T06:51:27Z' } as StoredEvent],
+      [2, { type: 'TextStreamed', text: 'Want me to:', request_event_id: 'ctc-1', created: '2026-05-22T06:51:40Z' } as StoredEvent],
+      [3, { type: 'ToolCalled', name: 'ask_user_question', args: {}, _eventId: 'tc-1', request_event_id: 'ctc-1', created: '2026-05-22T06:51:40Z' } as StoredEvent],
+      [4, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'Both pending Apply. Next?', options: [{ id: 'a', label: 'Apply both' }], created: '2026-05-22T06:51:40Z' } as StoredEvent],
+      [5, { type: 'ResponseAborted', text: 'interrupted', cause: 'engine_shutdown', request_event_id: 'ctc-1', channel: 'chat', created: '2026-05-22T06:52:18Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const questionEx = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+
+    // The dual-push pushes ResponseAborted into the question exchange's
+    // steps (via the redirect set when the question was processed).
+    expect(questionEx.steps.map(s => s.event.type)).toContain('ResponseAborted');
+
+    // Status is 'aborted' — ChatExchange's `responseTerminated` then derives
+    // `true` and forwards `terminated={true}` to QuestionBody, which renders
+    // every option as a disabled button.
+    expect(exchangeStatus(questionEx, '', false, false, false)).toBe('aborted');
+
+    // The Layer-2 questionOvertaken flag also fires — defense in depth so
+    // the buttons disable even if some other code path bypassed the status
+    // check.
+    expect(questionEx.questionOvertaken).toBe(true);
   });
 });

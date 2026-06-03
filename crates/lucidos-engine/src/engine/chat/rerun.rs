@@ -34,7 +34,9 @@ use crate::engine::LucidosEngine;
 
 /// Caps for the engine system note's bullet list.
 const MAX_BULLET_ENTRIES: usize = 50;
-const MAX_FIELD_CHARS: usize = 200;
+/// Byte cap for bullet-field truncation; `floor_char_boundary` rounds the
+/// cut down to the nearest UTF-8 char boundary.
+const MAX_FIELD_BYTES: usize = 200;
 
 /// Outcome of `continue_chat` — used by the HTTP handler to log clearly.
 #[derive(Debug, PartialEq, Eq)]
@@ -111,16 +113,20 @@ impl LucidosEngine {
 
         // Resolve the originating event. Prefer `request_event_id` stamped on
         // the ResponseAborted (set by the engine-restart paths). Fall back to
-        // the most recent MessageReceived/TriggerStarted before the abort for
-        // legacy DB rows that lack the field.
+        // the most recent originating event before the abort for legacy DB
+        // rows that lack the field. Uses `CHAT_ORIGINATING_EVENT_TYPES` so a
+        // chat-agent turn woken from a finished child resolves to the CTC,
+        // not a stale older MR from a previous completed turn.
         let originating_event_id = match abort_request_event_id {
             Some(id) => Some(id),
-            None => crate::engine::agent_session::latest_originating_event_id(
-                self.pool(),
-                thread_id,
-                &["MessageReceived", "TriggerStarted"],
-            )
-            .await,
+            None => {
+                crate::engine::agent_session::latest_originating_event_id(
+                    self.pool(),
+                    thread_id,
+                    crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+                )
+                .await
+            }
         };
 
         let originating_event_id = match originating_event_id {
@@ -234,11 +240,7 @@ impl LucidosEngine {
                 )
                 .await
             {
-                log!(
-                    "[Continue] Rerun for thread {} failed: {}",
-                    thread_id,
-                    e
-                );
+                log!("[Continue] Rerun for thread {} failed: {}", thread_id, e);
             }
         });
 
@@ -250,7 +252,7 @@ impl LucidosEngine {
 /// Returns either a non-empty markdown bullet list or an explanatory line.
 fn build_side_effect_summary(events: &[(String, serde_json::Value)]) -> String {
     // Pair ToolCalled + ToolResult by walking forward; the ToolResult event
-    // for a call may follow immediately or after Thinking/TextStreamed events.
+    // for a call may follow immediately or after ThoughtStreamed/TextStreamed events.
     let mut summary_lines: Vec<String> = Vec::new();
     let mut pending_calls: Vec<(String, String)> = Vec::new(); // (tool_name, args_summary)
 
@@ -284,13 +286,15 @@ fn build_side_effect_summary(events: &[(String, serde_json::Value)]) -> String {
                 if let Some((name, args)) = pending_calls.pop() {
                     summary_lines.push(format!("- {}({}) → {}", name, args, result_summary));
                     if summary_lines.len() >= MAX_BULLET_ENTRIES {
-                        summary_lines
-                            .push(format!("- ...(truncated at {} entries)", MAX_BULLET_ENTRIES));
+                        summary_lines.push(format!(
+                            "- ...(truncated at {} entries)",
+                            MAX_BULLET_ENTRIES
+                        ));
                         break;
                     }
                 }
             }
-            _ => {} // Thinking + TextStreamed don't appear in the LLM-visible summary
+            _ => {} // ThoughtStreamed + TextStreamed don't appear in the LLM-visible summary
         }
     }
 
@@ -303,8 +307,8 @@ fn build_side_effect_summary(events: &[(String, serde_json::Value)]) -> String {
 
 fn truncate_for_note(s: &str) -> String {
     let trimmed = s.trim().replace('\n', " ");
-    if trimmed.chars().count() > MAX_FIELD_CHARS {
-        let cut = trimmed.floor_char_boundary(MAX_FIELD_CHARS);
+    if trimmed.len() > MAX_FIELD_BYTES {
+        let cut = trimmed.floor_char_boundary(MAX_FIELD_BYTES);
         format!("{}...", &trimmed[..cut])
     } else {
         trimmed
@@ -344,14 +348,17 @@ mod tests {
             ),
         ];
         let s = build_side_effect_summary(&events);
-        assert!(s.contains("- send_notification(Notify: Ping) → ok"), "got {}", s);
+        assert!(
+            s.contains("- send_notification(Notify: Ping) → ok"),
+            "got {}",
+            s
+        );
     }
 
     #[test]
     fn summary_handles_zero_pairs() {
-        let events: Vec<(String, serde_json::Value)> = vec![
-            ("Thinking".to_string(), json!({"text": "musing"})),
-        ];
+        let events: Vec<(String, serde_json::Value)> =
+            vec![("Thinking".to_string(), json!({"text": "musing"}))];
         let s = build_side_effect_summary(&events);
         assert_eq!(s, "No actions completed before the abort.");
     }
@@ -370,7 +377,11 @@ mod tests {
             ),
         ];
         let s = build_side_effect_summary(&events);
-        assert!(!s.contains("thinking"), "summary must not include thinking text: {}", s);
+        assert!(
+            !s.contains("thinking"),
+            "summary must not include thinking text: {}",
+            s
+        );
         assert!(s.contains("read_file"));
     }
 
@@ -389,11 +400,14 @@ mod tests {
         ];
         let s = build_side_effect_summary(&events);
         assert!(s.contains("..."), "expected ellipsis on truncation: {}", s);
-        // Args + result both capped at 200 chars
+        // Args + result both capped at 200 bytes (truncate_for_note's contract).
         for line in s.lines() {
             for field in line.split("→") {
-                assert!(field.chars().count() < MAX_FIELD_CHARS + 50,
-                    "field too long: {}", field);
+                assert!(
+                    field.len() < MAX_FIELD_BYTES + 50,
+                    "field too long: {}",
+                    field
+                );
             }
         }
     }
@@ -413,9 +427,17 @@ mod tests {
         }
         let s = build_side_effect_summary(&events);
         let line_count = s.lines().count();
-        assert!(line_count <= MAX_BULLET_ENTRIES + 1,
-            "expected ≤{} bullet lines, got {}", MAX_BULLET_ENTRIES + 1, line_count);
-        assert!(s.contains("(truncated"), "expected truncation marker: {}", s);
+        assert!(
+            line_count <= MAX_BULLET_ENTRIES + 1,
+            "expected ≤{} bullet lines, got {}",
+            MAX_BULLET_ENTRIES + 1,
+            line_count
+        );
+        assert!(
+            s.contains("(truncated"),
+            "expected truncation marker: {}",
+            s
+        );
     }
 
     #[test]

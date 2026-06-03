@@ -33,12 +33,15 @@ function makeThread(id: string, overrides: Partial<ThreadState['meta']> = {}): T
       section: 'archived',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
-      ccHasChanges: false,
-      ccRequiresRestart: false,
-      ccIsExternalRepo: false,
-      ccApplying: false,
+      blockingDescendantCount: 0, attentionDescendantCount: 0,
+      codingAgentProposed: false,
+      codingAgentRequiresRestart: false,
+      codingAgentIsExternalRepo: false,
+      codingAgentApplying: false,
+      codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
+      latestTodoList: null,
       ...overrides,
     },
     events: new Map(),
@@ -81,7 +84,7 @@ describe('Phantom thread prevention', () => {
 
     handleThreadEvent({
       thread_id: threadId,
-      event: { type: 'TextStreaming', text: 'partial...' },
+      event: { type: 'CumulativeTextUpdated', text: 'partial...' },
       created: '2026-04-16T12:00:00Z',
     });
 
@@ -123,6 +126,115 @@ describe('Phantom thread prevention', () => {
     const parent = threadMap.value.get(parentId)!;
     expect(parent.meta.activeChildrenCount).toBe(2);
     expect(parent.meta.totalChildrenCount).toBe(3);
+  });
+
+  it('ChildrenCountChanged does not bump meta.updatedAt to the broadcast NOW()', () => {
+    // 42aab0773 broadcasts each ancestor's aggregate via ChildrenCountChanged
+    // whenever a descendant flips is_blocking. The ancestor isn't doing
+    // anything itself — without the targeted exclusion in handleEvent the
+    // transient-event branch would set meta.updatedAt = broadcast NOW(),
+    // churning the drawer's "X ago" timestamp on every leaf state change
+    // across the entire ancestor chain.
+    const ancestorId = 'ancestor';
+    const ancestorOwnLastActivity = '2026-04-01T00:00:00Z';
+    const map = threadMap.value;
+    map.set(ancestorId, makeThread(ancestorId, {
+      updatedAt: ancestorOwnLastActivity,
+      activeChildrenCount: 3,
+      totalChildrenCount: 5,
+      blockingDescendantCount: 1, attentionDescendantCount: 1,
+    }));
+    threadMap.value = new Map(map);
+
+    handleThreadEvent({
+      thread_id: ancestorId,
+      event: { type: 'ChildrenCountChanged', active: 3, total: 5 },
+      created: '2026-04-16T12:00:00Z', // broadcast NOW() — must NOT propagate
+      aggregate: {
+        // Real backend carries the ancestor's OWN unchanged last_activity in
+        // the aggregate (update_parent_after_child_terminal doesn't touch
+        // last_activity). applyAggregateToMeta overlays it as a no-op.
+        threadId: ancestorId,
+        title: 'Test Thread',
+        channel: 'chat',
+        initiator: 'user',
+        createdAt: '2026-01-01T00:00:00Z',
+        lastActivity: ancestorOwnLastActivity,
+        messageCount: 1,
+        section: 'archived',
+        activeChildrenCount: 3,
+        totalChildrenCount: 5,
+        blockingDescendantCount: 2, attentionDescendantCount: 2, // descendant flipped → ancestor count moves
+        status: 'idle',
+        codingAgentHasDiff: false,
+        codingAgentProposed: false,
+        codingAgentRequiresRestart: false,
+        codingAgentIsExternalRepo: false,
+        codingAgentApplying: false,
+        lastRevivedAt: null,
+        isSaved: false,
+        hasResponse: true,
+        parentThreadId: null,
+        parentThreadTitle: null,
+        state: 'active',
+        latestTodoList: null,
+      } as unknown as Parameters<typeof handleThreadEvent>[0]['aggregate'],
+    });
+
+    const ancestor = threadMap.value.get(ancestorId)!;
+    expect(ancestor.meta.blockingDescendantCount).toBe(2);
+    expect(ancestor.meta.updatedAt).toBe(ancestorOwnLastActivity); // NOT bumped
+  });
+
+  it('ChildrenCountChanged with section flip applies the section change', () => {
+    // Regression guard for the broken-short-circuit bug: when a CC child fires
+    // ResponseFailed/ResponseCanceled after callback_already_sent, the backend
+    // calls update_parent_after_child_terminal(decrement=false, surface_to_inbox=true)
+    // — counts stay equal but archive_state flips to 'inbox'. Earlier short-
+    // circuit would have dropped the section change. With the cleaner targeted
+    // updatedAt exclusion, applyAggregateToMeta still runs and the section moves.
+    const parentId = 'parent';
+    const map = threadMap.value;
+    map.set(parentId, makeThread(parentId, {
+      activeChildrenCount: 0,
+      totalChildrenCount: 1,
+      section: 'archived',
+    }));
+    threadMap.value = new Map(map);
+
+    handleThreadEvent({
+      thread_id: parentId,
+      event: { type: 'ChildrenCountChanged', active: 0, total: 1 },
+      created: '2026-04-16T12:00:00Z',
+      aggregate: {
+        threadId: parentId,
+        title: 'Test Thread',
+        channel: 'chat',
+        initiator: 'user',
+        createdAt: '2026-01-01T00:00:00Z',
+        lastActivity: '2026-04-01T00:00:00Z',
+        messageCount: 1,
+        section: 'inbox', // <-- surfaced
+        activeChildrenCount: 0,
+        totalChildrenCount: 1,
+        blockingDescendantCount: 0, attentionDescendantCount: 0,
+        status: 'idle',
+        codingAgentHasDiff: false,
+        codingAgentProposed: false,
+        codingAgentRequiresRestart: false,
+        codingAgentIsExternalRepo: false,
+        codingAgentApplying: false,
+        lastRevivedAt: null,
+        isSaved: false,
+        hasResponse: true,
+        parentThreadId: null,
+        parentThreadTitle: null,
+        state: 'active',
+        latestTodoList: null,
+      } as unknown as Parameters<typeof handleThreadEvent>[0]['aggregate'],
+    });
+
+    expect(threadMap.value.get(parentId)!.meta.section).toBe('inbox');
   });
 
   it('CodingAgentThreadSpawned for unknown parent still creates the child thread', () => {

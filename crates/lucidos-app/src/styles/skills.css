@@ -78,6 +78,123 @@
     color: var(--accent);
 }
 
+.trigger-event-list {
+    list-style: none;
+    padding: 0;
+    margin: 0.125rem 0 0;
+}
+
+/* ===== Trigger groups (panel sections) ===== */
+
+.trigger-group-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.trigger-group-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.375rem 0.5rem;
+    margin-top: 0.5rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+    user-select: none;
+}
+
+.trigger-group-section:first-child .trigger-group-header {
+    margin-top: 0;
+}
+
+.trigger-group-header-ungrouped {
+    /* The synthetic Ungrouped header is informational only — no chevron, no
+       per-section actions. Give it a quieter background so it visually
+       reads as a separator rather than a real group. */
+    background: transparent;
+    border-top: 1px solid var(--border-color);
+    border-radius: 0;
+    padding-left: 0.25rem;
+    margin-top: 0.75rem;
+}
+
+.trigger-group-toggle {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+    color: inherit;
+    font: inherit;
+    min-width: 0;
+}
+
+.trigger-group-chevron {
+    color: var(--text-muted);
+    font-size: 0.625rem;
+    width: 0.75rem;
+    flex-shrink: 0;
+}
+
+.trigger-group-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.trigger-group-name-input {
+    font-weight: 600;
+    color: var(--text-primary);
+    background: var(--bg-primary);
+    border: 1px solid var(--accent);
+    border-radius: 0.1875rem;
+    padding: 0.125rem 0.25rem;
+    font: inherit;
+    min-width: 0;
+    flex: 1;
+}
+
+.trigger-group-count {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    font-weight: 400;
+}
+
+.trigger-group-actions {
+    display: flex;
+    gap: 0.25rem;
+    flex-shrink: 0;
+}
+
+.trigger-add-row {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+
+.trigger-add-row > .list-row-add-card {
+    flex: 1;
+}
+
+.trigger-group-create-row {
+    display: flex;
+    margin-top: 0.5rem;
+    padding: 0.375rem 0.5rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+}
+
+.trigger-group-create-row > .trigger-group-name-input {
+    width: 100%;
+}
+
 .trigger-event-info {
     display: flex;
     align-items: baseline;
@@ -95,6 +212,17 @@
     font-family: var(--font-ui);
     font-size: 0.625rem;
     color: var(--text-muted);
+}
+
+.trigger-subscription-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    padding: 0.5rem;
+    margin-bottom: 0.5rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
 }
 
 .inline-form-body {
@@ -185,12 +313,14 @@
 
 .removable-input-row {
     display: flex;
-    gap: 0.375rem;
-    align-items: center;
+    gap: 0.5rem;
+    align-items: stretch;
 }
 
-.removable-input-row input {
+.removable-input-row input,
+.removable-input-row .dropdown {
     flex: 1;
+    min-width: 0;
 }
 
 .removable-input-row input.input-error {

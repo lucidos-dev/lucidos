@@ -1,9 +1,13 @@
-import { threadMap, focusedThreadId, showToast, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, ALL_CHANNELS, type ThreadChannel, threadChannelFilter, selectedTriggerIds, selectedRepoIds, ccSessionVersion, engineRestarting } from '../store';
+import { threadMap, focusedThreadId, setFocusedThread, showToast, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, ALL_CHANNELS, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, filterFacets, ccSessionVersion, engineRestarting, archivingThreadIds } from '../store';
+import { threadPassesChannelFilter } from '../threadFilter';
 import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
+import { bumpThreadEvents } from '../threadActivity';
 import { applyDraftBatch, setDraft, clearDraft, type ComposeDraft } from '../composeDrafts';
-import { fetchThreads, fetchThreadEvents, fetchOlderThreads } from '../../api/threads';
-import type { ThreadInfo, ThreadEventRow } from '../../api/threads';
+import { fetchThreads, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets } from '../../api/threads';
+import type { ThreadSummary, ThreadEventRow } from '../../api/threads';
+import { toFailed } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
+import { postClientLog } from '../../utils/liveness';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
 import { pendingComposePuts, composeEditedAt } from './compose';
 
@@ -12,7 +16,19 @@ import { pendingComposePuts, composeEditedAt } from './compose';
  *  not N. `null` means clear the entry. Caller flushes via `applyDraftBatch`. */
 type DraftBatch = Map<string, ComposeDraft | null>;
 
-function makeThreadState(info: ThreadInfo, saved: boolean, batch?: DraftBatch): ThreadState {
+/** Per-thread timestamp of the last local archive-flip (Date.now()). Mirrors
+ *  composeEditedAt: upsertThread consults this and skips overwriting `section`
+ *  + `codingAgentProposed` when the GET went out before the flip. Without it,
+ *  a stale GET (e.g. resyncLoadedThreads' /api/v1/threads fired before the user
+ *  clicked Archive) whose response lands AFTER the optimistic flip silently
+ *  overwrites section back to 'inbox' — the row flickers back into Review
+ *  until the SSE ThreadArchived event finally confirms the move. Stays set
+ *  forever (no expiry); legitimate fresh GETs capture requestStartedAt AFTER
+ *  the last flip and the guard naturally lets them through. Stamped per
+ *  cascade member by handleArchiveThread (threads.ts). */
+export const sectionMutatedAt = new Map<string, number>();
+
+function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch): ThreadState {
   stageDraftFromApi(info, batch);
   return {
     meta: {
@@ -28,10 +44,13 @@ function makeThreadState(info: ThreadInfo, saved: boolean, batch?: DraftBatch): 
       section: (info.section as ThreadMeta['section']) || 'archived',
       activeChildrenCount: info.active_children_count || 0,
       totalChildrenCount: info.total_children_count || 0,
-      ccHasChanges: info.cc_has_changes || false,
-      ccRequiresRestart: info.cc_requires_restart || false,
-      ccIsExternalRepo: info.cc_is_external_repo || false,
-      ccApplying: info.cc_applying || false,
+      blockingDescendantCount: info.blocking_descendant_count || 0,
+      attentionDescendantCount: info.attention_descendant_count || 0,
+      codingAgentHasDiff: info.coding_agent_has_diff || false,
+      codingAgentProposed: info.coding_agent_proposed || false,
+      codingAgentRequiresRestart: info.coding_agent_requires_restart || false,
+      codingAgentIsExternalRepo: info.coding_agent_is_external_repo || false,
+      codingAgentApplying: info.coding_agent_applying || false,
       lastRevivedAt: info.last_revived_at || '',
       parentThreadId: info.parent_thread_id || undefined,
       parentThreadTitle: info.parent_thread_title || undefined,
@@ -39,7 +58,10 @@ function makeThreadState(info: ThreadInfo, saved: boolean, batch?: DraftBatch): 
       triggerName: info.trigger_name || undefined,
       repoId: info.cc_repo_id || undefined,
       repoName: info.cc_repo_name || undefined,
+      codingAgentKind: info.coding_agent_kind || undefined,
+      codingAgentFolder: info.coding_agent_folder || undefined,
       state: info.state,
+      latestTodoList: null,
     },
     events: new Map(),
     streamingBuffer: '',
@@ -55,7 +77,7 @@ function makeThreadState(info: ThreadInfo, saved: boolean, batch?: DraftBatch): 
  *  (single-thread upserts from search/link bootstrapping). Empty server-side
  *  drafts clear the entry instead of populating it — `EMPTY_DRAFT` covers
  *  reads, and an empty entry would only inflate the Map for no reason. */
-function stageDraftFromApi(info: ThreadInfo, batch?: DraftBatch): void {
+function stageDraftFromApi(info: ThreadSummary, batch?: DraftBatch): void {
   const text = info.compose_text || '';
   // The backend column is still named `compose_images` (Phase 5 cleanup
   // will rename it); post-migration the JSONB array contains hash strings.
@@ -82,7 +104,7 @@ function stageDraftFromApi(info: ThreadInfo, batch?: DraftBatch): void {
  *  don't gate on a real GET) so the staleness check is always false. */
 export function upsertThread(
   map: Map<string, ThreadState>,
-  info: ThreadInfo,
+  info: ThreadSummary,
   saved: boolean,
   requestStartedAt: number = Number.MAX_SAFE_INTEGER,
   draftBatch?: DraftBatch,
@@ -95,20 +117,33 @@ export function upsertThread(
     if (info.title && info.title !== PENDING_TITLE_PLACEHOLDER && !generatedTitleIds.has(info.thread_id)) existing.meta.title = info.title;
     if (info.created_at) existing.meta.createdAt = info.created_at;
     const apiTime = info.last_activity || info.created_at;
+    // ISO-8601 UTC timestamps from the backend (`...Z`) are lexicographically
+    // ordered the same way they're chronologically ordered — fixed-width
+    // YYYY-MM-DDTHH:MM:SS.fffZ with the same timezone suffix. A string `>`
+    // is the cheapest valid "newer than" test; no Date parse needed.
     if (apiTime && apiTime > existing.meta.updatedAt) existing.meta.updatedAt = apiTime;
     if (info.channel) existing.meta.channel = info.channel as ThreadMeta['channel'];
     if (info.initiator) existing.meta.initiator = info.initiator;
     // Update status from API — the backend is authoritative.
     if (info.status) existing.meta.status = info.status as ThreadStatus;
     if (info.message_count) existing.meta.messageCount = info.message_count;
-    if (info.section) existing.meta.section = info.section as ThreadMeta['section'];
+    // Skip section + codingAgentProposed when a local archive-flip happened
+    // AT OR AFTER this GET went out — its snapshot is stale by definition.
+    // See `sectionMutatedAt` for the full race description.
+    const sectionEditedSinceRequest = (sectionMutatedAt.get(info.thread_id) ?? 0) >= requestStartedAt;
+    if (!sectionEditedSinceRequest) {
+      if (info.section) existing.meta.section = info.section as ThreadMeta['section'];
+      existing.meta.codingAgentProposed = info.coding_agent_proposed || false;
+    }
     existing.meta.activeChildrenCount = info.active_children_count || 0;
     existing.meta.totalChildrenCount = info.total_children_count || 0;
+    existing.meta.blockingDescendantCount = info.blocking_descendant_count || 0;
+    existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
     // Update CC state fields from API
-    existing.meta.ccHasChanges = info.cc_has_changes || false;
-    existing.meta.ccRequiresRestart = info.cc_requires_restart || false;
-    existing.meta.ccIsExternalRepo = info.cc_is_external_repo || false;
-    existing.meta.ccApplying = info.cc_applying || false;
+    existing.meta.codingAgentHasDiff = info.coding_agent_has_diff || false;
+    existing.meta.codingAgentRequiresRestart = info.coding_agent_requires_restart || false;
+    existing.meta.codingAgentIsExternalRepo = info.coding_agent_is_external_repo || false;
+    existing.meta.codingAgentApplying = info.coding_agent_applying || false;
     if (info.last_revived_at) existing.meta.lastRevivedAt = info.last_revived_at;
     if (info.parent_thread_id) existing.meta.parentThreadId = info.parent_thread_id;
     if (info.parent_thread_title) existing.meta.parentThreadTitle = info.parent_thread_title;
@@ -116,6 +151,8 @@ export function upsertThread(
     if (info.trigger_name) existing.meta.triggerName = info.trigger_name;
     if (info.cc_repo_id) existing.meta.repoId = info.cc_repo_id;
     if (info.cc_repo_name) existing.meta.repoName = info.cc_repo_name;
+    if (info.coding_agent_kind) existing.meta.codingAgentKind = info.coding_agent_kind;
+    if (info.coding_agent_folder) existing.meta.codingAgentFolder = info.coding_agent_folder;
     // Refresh compose state from API. Without this, an SSE skeleton stuck at
     // state='composing' (because MessageReceived was dropped) stays invisible
     // forever — categorizeThreads skips composing rows, so the thread never
@@ -141,6 +178,21 @@ export function upsertThread(
   }
 }
 
+/** Thread IDs loaded ONLY as a family extension (ancestor/descendant of a
+ *  paginated thread). Excluded from the `loadOlderThreads` cursor so an
+ *  eagerly-loaded family member from way back in history doesn't advance
+ *  the pagination cursor past every thread between "now" and itself. An
+ *  ID is removed from this set when natural pagination later returns it
+ *  as a base thread — at that point it's no longer family-only. */
+const familyExtensionIds = new Set<string>();
+
+/** Test-only reset hook. Vitest's per-test `beforeEach` mounts a fresh
+ *  threadMap; module-level state needs to follow. Production code never
+ *  calls this. */
+export function _clearFamilyExtensionIdsForTest(): void {
+  familyExtensionIds.clear();
+}
+
 /** Prevents duplicate concurrent loadAllThreads calls (e.g. 5s health poll + resume). */
 let loadingAll = false;
 
@@ -153,6 +205,19 @@ export async function loadAllThreads(): Promise<void> {
     await loadAllThreadsInner();
   } finally {
     loadingAll = false;
+  }
+}
+
+/** Fetch the complete set of selectable filter facets (every trigger/repo/app
+ *  that has a thread) so the drawer "Show" dropdown lists them all, not just
+ *  facets present in the loaded window. Best-effort: a failure leaves the
+ *  dropdown seeded from loaded threads + registries (the prior behavior). */
+export async function loadFilterFacets(): Promise<void> {
+  if (filterFacets.value.status !== 'loaded') filterFacets.value = { status: 'loading' };
+  try {
+    filterFacets.value = { status: 'loaded', data: await fetchFilterFacets() };
+  } catch (e) {
+    filterFacets.value = toFailed(e);
   }
 }
 
@@ -171,24 +236,68 @@ async function loadAllThreadsInner(): Promise<void> {
   // Build/update thread states from metadata
   for (const info of response.saved) {
     upsertThread(map, info, true, requestStartedAt, draftBatch);
+    familyExtensionIds.delete(info.thread_id);
   }
-  for (const info of [...response.active_threads, ...response.history, ...response.composing]) {
+  for (const info of [...response.active_threads, ...response.archive, ...response.composing]) {
     upsertThread(map, info, false, requestStartedAt, draftBatch);
+    familyExtensionIds.delete(info.thread_id);
   }
   // Focused thread may be too old for recent list, not saved, not active
   if (response.focused_thread) {
     upsertThread(map, response.focused_thread, false, requestStartedAt, draftBatch);
+    familyExtensionIds.delete(response.focused_thread.thread_id);
+  }
+  // Family members of the loaded set that weren't already loaded. The
+  // drawer's family-aware sort needs every member present in threadMap to
+  // nest them under their parent — but these threads MUST stay out of the
+  // pagination cursor (see `familyExtensionIds`) since their own
+  // `last_activity` can be arbitrarily old. The `?? []` keeps the legacy
+  // `(fetchThreads as any).mockResolvedValue({...})` test mocks (which
+  // skip optional fields) green — "no family extension" is the field's
+  // correct semantic default, not a value-masking fallback.
+  for (const info of response.family_threads ?? []) {
+    upsertThread(map, info, false, requestStartedAt, draftBatch);
+    familyExtensionIds.add(info.thread_id);
+  }
+
+  // Ghost focused-thread: the persisted focusedThreadId references a thread
+  // the backend doesn't know about (deleted, never committed because the user
+  // never sent, or wrong workspace). Without this clear, loadThreadEvents is
+  // gated on threadInMap and never fires — the UI shows an indefinite spinner
+  // that turns into "Taking too long? Tap to reload" after 8s, and the same
+  // ghost id survives every reload until the user manually picks another
+  // thread. The fetchThreads request above already passed `focused` as a hint
+  // so the backend gets a chance to include it via `response.focused_thread`;
+  // if the id is still missing from the map after every upsert, the thread
+  // does not exist server-side.
+  //
+  // The `focusedThreadId.peek() === focused` guard prevents wiping a fresh
+  // user navigation that landed during the await: if the user tapped a real
+  // thread between the captured-`focused` and now, peek() returns that new id
+  // and we leave it alone. Without the guard, a workspace with a ghost id in
+  // localStorage would snap any concurrent navigation back to the compose
+  // screen.
+  let ghostFocusedThread: string | null = null;
+  if (focused && !map.has(focused) && focusedThreadId.peek() === focused) {
+    ghostFocusedThread = focused;
+    setFocusedThread(null);
+    postClientLog('lifecycle', 'cleared_ghost_focus', { thread_id: focused });
   }
 
   applyDraftBatch(draftBatch);
   threadMap.value = new Map(map);
   threadsLoaded.value = true;
 
+  // Refresh the complete filter-facet set (fire-and-forget) so the drawer
+  // "Show" dropdown reflects newly-created / archived threads. Best-effort:
+  // the option lists still work from loaded threads if this fails.
+  void loadFilterFacets();
+
   // Load events for focused, active, and saved threads; others load lazily
   // on focus. Saved threads are always few and need events for correct
   // drawer status (e.g. waiting CC threads after engine restart).
   const loads: Promise<void>[] = [];
-  if (focused) loads.push(loadThreadEvents(focused));
+  if (focused && focused !== ghostFocusedThread) loads.push(loadThreadEvents(focused));
   for (const t of map.values()) {
     if (t.meta.id !== focused && (activeSet.has(t.meta.id) || t.meta.saved)) {
       loads.push(loadThreadEvents(t.meta.id));
@@ -206,7 +315,7 @@ async function loadAllThreadsInner(): Promise<void> {
 }
 
 /** Ensure a thread exists in threadMap, bootstrapping from metadata if needed, then load its events. */
-export async function ensureThreadInMap(info: ThreadInfo): Promise<void> {
+export async function ensureThreadInMap(info: ThreadSummary): Promise<void> {
   const map = threadMap.value;
   if (!map.has(info.thread_id)) {
     upsertThread(map, info, false);
@@ -220,7 +329,7 @@ export async function ensureThreadInMap(info: ThreadInfo): Promise<void> {
  *  Used by thread-link clicks (and any other flow that knows only the ID,
  *  not the metadata) so the link works even when the thread is too old to be
  *  in the loaded thread list — e.g. an archived thread beyond the per-source
- *  History window. Returns true if the thread is now in the map, false if
+ *  Archive window. Returns true if the thread is now in the map, false if
  *  the API has no record of this ID. Network/HTTP failures propagate so the
  *  caller can surface the real error instead of a generic "not found". */
 export async function ensureThreadByIdInMap(threadId: string): Promise<boolean> {
@@ -228,13 +337,13 @@ export async function ensureThreadByIdInMap(threadId: string): Promise<boolean> 
   const requestStartedAt = Date.now();
   const response = await fetchThreads(threadId);
   // The backend returns the focused thread separately when it isn't already
-  // in saved/active/history. When it IS already there, we still need to
+  // in saved/active/archive. When it IS already there, we still need to
   // pluck it out of those lists.
   const info =
     response.focused_thread
     ?? response.saved.find(t => t.thread_id === threadId)
     ?? response.active_threads.find(t => t.thread_id === threadId)
-    ?? response.history.find(t => t.thread_id === threadId);
+    ?? response.archive.find(t => t.thread_id === threadId);
   if (!info) return false;
   const isSaved = response.saved.some(t => t.thread_id === threadId);
   const map = threadMap.value;
@@ -336,7 +445,16 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
   }
 }
 
-/** Fetch only new events since the thread's last DB-loaded sequence and append them. */
+/** Fetch only new events since the thread's last DB-loaded sequence and append them.
+ *
+ *  Retries once on DOMException (TimeoutError or AbortError). The
+ *  runResumeSync / resyncLoadedThreads paths fan this out across every loaded
+ *  thread on SSE reconnect or iOS PWA wake; iOS Safari frequently cancels
+ *  in-flight fetches mid-flight (suspend/resume, lifecycle, network change),
+ *  surfacing as transient AbortErrors that succeed on retry. Without the
+ *  retry the user gets one toast per cancelled thread — dozens at once in a
+ *  single wake cycle. Mirrors the retry-on-TimeoutError pattern in
+ *  refreshChangesState. */
 export async function refreshThreadEvents(threadId: string): Promise<void> {
   if (engineRestarting.value) return;
   const map = threadMap.value;
@@ -344,7 +462,11 @@ export async function refreshThreadEvents(threadId: string): Promise<void> {
   if (!thread || !thread.eventsLoaded) return;
 
   try {
-    const snapshot = await fetchThreadEvents(threadId, thread.lastDbSeq || undefined);
+    const snapshot = await fetchThreadEvents(threadId, thread.lastDbSeq || undefined)
+      .catch(err => {
+        if (!(err instanceof DOMException)) throw err;
+        return fetchThreadEvents(threadId, thread.lastDbSeq || undefined);
+      });
     // Always apply currentAggregate even when no new events arrived — the
     // snapshot may have advanced (e.g. status flipped) since the last refresh.
     if (snapshot.events.length > 0 || snapshot.currentAggregate) {
@@ -353,10 +475,44 @@ export async function refreshThreadEvents(threadId: string): Promise<void> {
     }
   } catch (err) {
     if (engineRestarting.value) return;
+    // Telemetry carve-out (.claude/rules/frontend.md): on iOS PWA wake the
+    // engine is reachable and SSE will deliver any events we miss, but
+    // WebKit aborts every in-flight fetch on the suspend/resume boundary —
+    // sometimes both the original AND the retry. The user did NOT initiate
+    // this refresh (resyncLoadedThreads / runResumeSync did, behind their
+    // back); a toast per aborted thread shows up to a dozen at once on wake
+    // and the user can't do anything with the information. Self-recovery:
+    // the next SSE event (constant on any active thread) re-syncs via
+    // handleThreadEvent, or the next resync cycle (engine wake-up, SSE
+    // reconnect) refreshes successfully now that WebKit has settled.
+    // Genuine errors (5xx, parse, network unreachable) still toast.
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      console.warn(`[ThreadLoading] refresh aborted for ${threadId} (iOS PWA wake or visibility change); SSE will recover`);
+      return;
+    }
     console.warn(`[ThreadLoading] Failed to refresh events for ${threadId}:`, err);
     const title = threadMap.value.get(threadId)?.meta.title || threadId.slice(0, 8);
     showToast(`Failed to refresh thread events for "${title}": ${errorDetail(err)}`, 'error');
   }
+}
+
+/** Re-arm pagination and eagerly fetch the first page of threads matching the
+ *  newly-applied filter.
+ *
+ *  The drawer's IntersectionObserver sentinel cannot be relied on to populate a
+ *  freshly-filtered view: it is suppressed while the Archive section is collapsed
+ *  (`shouldLoadOlderOnIntersection`) and only re-observes when `threadHasMore`
+ *  flips, so selecting a facet whose matches are all archived/old would strand
+ *  the user on "No threads" until they manually scrolled. The drawer calls this
+ *  whenever the channel / trigger / repo / app selection changes so that
+ *  "select a facet → see its threads" is deterministic. `loadOlderThreads`
+ *  self-guards against concurrent calls and falls back to a now()-cursor when
+ *  no loaded thread matches, so this is safe to fire on every filter change. */
+export async function reloadAfterFilterChange(): Promise<void> {
+  // Different filter = different cursor space; clear any stale "no more" from
+  // the previous selection before fetching, or loadOlderThreads early-returns.
+  threadHasMore.value = true;
+  await loadOlderThreads();
 }
 
 /** Load older threads for infinite scroll. Self-guards against concurrent calls.
@@ -380,15 +536,21 @@ export async function loadOlderThreads(): Promise<void> {
     const triggerIds = triggerIdSet.size > 0 ? [...triggerIdSet] : undefined;
     const repoIdSet = selectedRepoIds.value;
     const repoIds = repoIdSet.size > 0 ? [...repoIdSet] : undefined;
+    const appIdSet = selectedAppIds.value;
+    const appIds = appIdSet.size > 0 ? [...appIdSet] : undefined;
 
     let oldestTime: string | null = null;
     for (const t of map.values()) {
       if (t.meta.saved) continue;
-      if (isFiltered && !filter.has(t.meta.channel as ThreadChannel)) continue;
-      if (triggerIds && t.meta.channel === 'trigger'
-          && (t.meta.triggerId == null || !triggerIdSet.has(t.meta.triggerId))) continue;
-      if (repoIds && t.meta.channel === 'claude_code'
-          && (t.meta.repoId == null || !repoIdSet.has(t.meta.repoId))) continue;
+      // Family-extension threads are loaded eagerly so the drawer can nest
+      // them under their parent, but their own `last_activity` can be
+      // arbitrarily old. Letting one drive the cursor would jump natural
+      // pagination over every intervening thread.
+      if (familyExtensionIds.has(t.meta.id)) continue;
+      // Same predicate the display uses, so the cursor is the oldest loaded
+      // thread that actually matches the active filter (channel + trigger +
+      // repo/app union) — never drifts from what's shown.
+      if (!threadPassesChannelFilter(t, filter, triggerIdSet, repoIdSet, appIdSet)) continue;
       if (!oldestTime || t.meta.updatedAt < oldestTime) oldestTime = t.meta.updatedAt;
     }
 
@@ -396,14 +558,14 @@ export async function loadOlderThreads(): Promise<void> {
     // can find matches in history. Without this, a freshly-applied filter
     // permanently halts with "no more" even though matches exist on disk.
     if (!oldestTime) {
-      if (!isFiltered && !triggerIds && !repoIds) {
+      if (!isFiltered && !triggerIds && !repoIds && !appIds) {
         threadHasMore.value = false;
         return;
       }
       oldestTime = new Date().toISOString();
     }
 
-    const response = await fetchOlderThreads(oldestTime, 15, sources, triggerIds, repoIds);
+    const response = await fetchOlderThreads(oldestTime, 15, sources, triggerIds, repoIds, appIds);
     if (response.threads.length === 0) {
       threadHasMore.value = false;
       return;
@@ -414,6 +576,16 @@ export async function loadOlderThreads(): Promise<void> {
       if (!map.has(info.thread_id)) {
         upsertThread(map, info, false);
         added++;
+      }
+      // Promote: a thread previously loaded as a family extension that now
+      // shows up in natural pagination is no longer family-only and should
+      // contribute to the cursor on subsequent calls.
+      familyExtensionIds.delete(info.thread_id);
+    }
+    for (const info of response.family_threads ?? []) {
+      if (!map.has(info.thread_id)) {
+        upsertThread(map, info, false);
+        familyExtensionIds.add(info.thread_id);
       }
     }
 
@@ -457,5 +629,26 @@ function applyEventRows(
   // per-event mutations during replay don't leak through to thread.meta.
   if (currentAggregate) {
     applyAggregateToMeta(thread.meta, currentAggregate);
+    // Same archive race guard as the SSE path in thread-sync.ts: a replay
+    // initiated before the user's Archive click ships a pre-archive
+    // aggregate that would otherwise revert the optimistic flip.
+    if (archivingThreadIds.value.has(threadId)) {
+      thread.meta.section = 'archived';
+      thread.meta.codingAgentProposed = false;
+    }
   }
+
+  // Ring the per-thread bell once after the batch replay so subscribers to
+  // this thread's `events` / `streamingBuffer` recompute (focused
+  // ChatExchange, activeStreamingBuffer, activeExchanges). Cheaper than
+  // calling per-row. The caller separately writes `threadMap` to fire wide
+  // meta subscribers. The aggregate-only branch (`rows=[]` +
+  // `currentAggregate`, hit by `refreshThreadEvents` when the snapshot
+  // delivered no new events but the aggregate moved meta) deliberately does
+  // NOT bump: `computeExchanges` reads only `meta.channel` + events +
+  // pendingUserMessages, and `meta.channel` is the only `meta` field a bump
+  // subscriber would read — but `channel` only changes via the per-row
+  // `isChannelDefiningEvent` branch above, which requires `rows.length > 0`.
+  // So aggregate-only refreshes wake no useful work via the bump path.
+  if (rows.length > 0) bumpThreadEvents(threadId);
 }

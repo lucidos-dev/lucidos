@@ -5,7 +5,7 @@ description: How to apply CC-proposed changes from a thread worktree to main, ve
 
 # Apply Change API
 
-`POST /api/changes/:id/apply` merges a CC-proposed change branch into `main`.
+`POST /api/v1/changes/:id/apply` merges a CC-proposed change branch into `main`.
 The response is a typed JSON body that makes verification self-contained —
 callers no longer need to poll thread state to confirm "did this land,
 and at what SHA."
@@ -13,7 +13,7 @@ and at what SHA."
 ## Endpoint
 
 ```
-POST /api/changes/{change_id}/apply
+POST /api/v1/changes/{change_id}/apply
 ```
 
 - Path: `change_id` — the UUID returned when CC proposed the change
@@ -24,8 +24,12 @@ POST /api/changes/{change_id}/apply
 ## Response shape
 
 Always JSON. `200 OK` on accepted requests (including `noop`, `hardening`,
-`conflict`); `400 Bad Request` only when the engine could not even consider
-the change (missing change, invalid status, etc.).
+`conflict`); `400 Bad Request` when the engine could not even consider
+the change (missing change, invalid status, etc.); `409 Conflict` when the
+owning thread's current state doesn't offer Apply (the server-side mirror of
+the UI gate — e.g. the thread is mid-turn / Running). An idempotent re-apply
+of an already-applied change is NOT gated: it falls through to the engine and
+returns `200` with `status: "noop"`.
 
 ```ts
 type ApplyStatus = 'applied' | 'noop' | 'hardening' | 'conflict';
@@ -119,7 +123,16 @@ For automated callers (CC sessions, agentic loops, the assistant itself):
 1. **CC commits in the worktree.** The proposed change must have at least
    one commit on the branch (uncommitted work is auto-committed by the
    apply path's recovery step, but committing explicitly is safer).
-2. **POST** to `/api/changes/{change_id}/apply`.
+2. **Call the apply path.** Two surfaces:
+   - **From inside a Lucidos-spawned subprocess (`run_python`, `run_bash`,
+     scheduled scripts, CC sessions)** — use the `lucidos changes apply
+     <id>` CLI. It auto-forwards the subprocess-origin headers (see "Actor
+     attribution" below). Hand-rolling `urllib` / `curl` from the same
+     contexts is a bug — see the example in `system-knowhow/lucidos-cli.md`
+     § `lucidos changes apply`.
+   - **From the frontend / a typed TS client** — call `applyChange()` in
+     `crates/lucidos-app/src/api/client.ts` (which posts directly to the
+     HTTP endpoint with the browser's device-id header).
 3. **Verify the response.** Check `status`:
    - `"applied"` → `applied_commit` is the SHA on main. Done.
    - `"noop"` → nothing to merge. If this was unexpected, investigate
@@ -131,10 +144,37 @@ For automated callers (CC sessions, agentic loops, the assistant itself):
    `ProjectHardened` (or whatever domain event is appropriate) referencing
    `applied_commit` so downstream consumers can correlate.
 
-The verification step used to require a separate `GET /api/threads/:id`
+The verification step used to require a separate `GET /api/v1/threads/:id`
 call (or polling SSE) because the apply response was an empty `200 OK`.
 That round-trip is gone — `applied_commit` in the response body is the
 authoritative answer.
+
+## Actor attribution
+
+The handler resolves an actor from the request headers via
+`api::actor::user_actor_resolved` and stamps it onto the emitted
+`ChangeApplied` event. Two headers drive the agent-vs-human distinction:
+
+- **`x-lucidos-agent-origin-token`** — must match the per-engine-startup
+  token. Set by the `lucidos` CLI from the `LUCIDOS_AGENT_ORIGIN_TOKEN`
+  env var that the engine injects into every spawned subprocess.
+- **`x-lucidos-source-thread-id`** — the spawning thread id (UUID). Set
+  by the CLI from `LUCIDOS_THREAD_ID`. Only trusted when paired with a
+  valid token.
+
+When both are present, the actor stamps as `Api { mode: Agent,
+source_thread_id }`. The UI renders that chip as **"Lucidos Agent"** and
+the popover links back to the spawning thread. Drop either header and the
+actor falls through to `Api { mode: Human, user_agent: <UA> }`, which the
+UI renders as **"You"** — wrong attribution for an agent-driven apply.
+
+This is why the CLI exists: a `run_python` block calling
+`urllib.request.urlopen(...)` ships with `User-Agent: Python-urllib/X.Y`
+and no subprocess-origin headers, so the resulting `ChangeApplied`
+misattributes to "You". The `lucidos changes apply <id>` subcommand
+forwards the headers automatically; see
+`system-knowhow/lucidos-cli.md` § `lucidos changes apply` for the
+worked example.
 
 ## Common failure modes
 
@@ -142,6 +182,7 @@ authoritative answer.
 |---|---|
 | `400` `{"error":"Change not found"}` | Wrong `change_id`, or change was discarded |
 | `400` `{"error":"Change is already applied"}` | Stale UUID — the engine treats this as an error, not idempotent. The idempotent-applied path returns `200` with `status: "noop"`. |
+| `409` `{"error":"This change can't be applied in the thread's current state"}` | The owning thread doesn't currently offer Apply (e.g. mid-turn / Running). Mirrors the UI gate. Re-applying an *already-applied* change is exempt — that returns `200 noop`. |
 | `200` `{"status":"noop", "commits_applied":0, ...}` | Branch existed but had no commits, or the change was already applied via another path |
 | `200` `{"status":"hardening", ...}` | The change wasn't hardened. The recovery session will auto-apply when done. |
 | `200` `{"status":"conflict", "conflict_thread_id":"..."}` | The merge needs human/agent intervention. Focus the thread. |
@@ -177,3 +218,8 @@ happened.
 - TypeScript client: `applyChange()` in
   `crates/lucidos-app/src/api/client.ts` — typed wrapper. The
   `ApplyChangeResult` interface mirrors the JSON shape above.
+- CLI subcommand: `lucidos changes apply <id>` in
+  `crates/lucidos-cli/src/changes.rs` — canonical caller for any
+  subprocess context. Auto-forwards the actor-attribution headers via
+  `crate::http::client()`; see `system-knowhow/lucidos-cli.md` for the
+  user-facing reference.

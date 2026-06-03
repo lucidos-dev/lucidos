@@ -13,7 +13,7 @@ function eventsMap(entries: [number, StoredEvent][]): Map<number, StoredEvent> {
   return new Map(entries);
 }
 
-describe('exchangeResponseModel for CC sessions', () => {
+describe('exchangeResponseModel for Claude Code sessions', () => {
   it('returns model from CodingAgentSettingsChanged in a CC exchange', () => {
     const events = eventsMap([
       [1, { type: 'MessageReceived', text: 'fix the bug', channel: 'claude_code', created: '2026-01-01T00:00:01Z' }],

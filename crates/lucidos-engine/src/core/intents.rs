@@ -70,7 +70,7 @@ impl IntentStore {
     /// - `data/triggers/{id}/{id}.md`
     /// - First `.md` in `data/triggers/{id}/`
     pub fn load(data_dir: &Path, id: &str) -> Option<Intent> {
-        if id.contains("..") || id.starts_with('/') || id.starts_with('\\') {
+        if super::is_path_traversal(id) {
             log!("[Intents] Rejected invalid intent id: {}", id);
             return None;
         }

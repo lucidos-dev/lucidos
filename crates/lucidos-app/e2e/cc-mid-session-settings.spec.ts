@@ -30,7 +30,7 @@ test.describe('CC mid-session model/effort persistence', () => {
     // Capture thread ID from the chat request
     let sentThreadId: string | null = null;
     page.on('request', (req) => {
-      if (req.url().includes('/api/chat/stream') && req.method() === 'POST') {
+      if (req.url().includes('/api/v1/chat/stream') && req.method() === 'POST') {
         try {
           const body = req.postDataJSON();
           sentThreadId = body?.thread_id ?? null;
@@ -64,7 +64,7 @@ test.describe('CC mid-session model/effort persistence', () => {
 
     // === Core assertion: effort must still be 'max' after respawn ===
     await expect(async () => {
-      const cmdResp = await page.request.get(`/api/claude-code/commands?thread_id=${sentThreadId}`);
+      const cmdResp = await page.request.get(`/api/v1/claude-code/commands?thread_id=${sentThreadId}`);
       expect(cmdResp.ok()).toBeTruthy();
       const cmdData = await cmdResp.json();
       expect(cmdData.current_reasoning_effort).toBe('max');
@@ -93,7 +93,7 @@ test.describe('CC mid-session model/effort persistence', () => {
 
     let sentThreadId: string | null = null;
     page.on('request', (req) => {
-      if (req.url().includes('/api/chat/stream') && req.method() === 'POST') {
+      if (req.url().includes('/api/v1/chat/stream') && req.method() === 'POST') {
         try {
           const body = req.postDataJSON();
           sentThreadId = body?.thread_id ?? null;
@@ -124,7 +124,7 @@ test.describe('CC mid-session model/effort persistence', () => {
 
     // === Core assertion: model must still be 'haiku' after respawn ===
     await expect(async () => {
-      const cmdResp = await page.request.get(`/api/claude-code/commands?thread_id=${sentThreadId}`);
+      const cmdResp = await page.request.get(`/api/v1/claude-code/commands?thread_id=${sentThreadId}`);
       expect(cmdResp.ok()).toBeTruthy();
       const cmdData = await cmdResp.json();
       expect(cmdData.current_model).toBe('haiku');

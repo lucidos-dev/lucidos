@@ -1,6 +1,12 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
+
+vi.mock('../../../store/actions/threads', () => ({
+  focusThreadOrBootstrap: vi.fn(),
+}));
+
 import { ChildCompletionCard } from '../ChildCompletionCard';
+import { focusThreadOrBootstrap } from '../../../store/actions/threads';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; class?: string; [k: string]: unknown }> {}
 
@@ -50,6 +56,10 @@ const baseProps = {
 };
 
 describe('ChildCompletionCard', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('renders the verb-prefix + linked title + badge in one header row', () => {
     const tree = ChildCompletionCard(baseProps);
     const row = findByClass(tree, 'child-completion-header-row');
@@ -65,6 +75,15 @@ describe('ChildCompletionCard', () => {
     expect(link).not.toBeNull();
     expect(link!.type).toBe('button');
     expect((link!.props as Record<string, unknown>)['data-thread-id']).toBe('child-uuid-1');
+  });
+
+  it('title-link click routes through focusThreadOrBootstrap so an out-of-window child still opens', () => {
+    const tree = ChildCompletionCard(baseProps);
+    const link = findByClass(tree, 'accent-link');
+    expect(link).not.toBeNull();
+    const onClick = (link!.props as Record<string, unknown>).onClick as () => void;
+    onClick();
+    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('child-uuid-1');
   });
 
   it('falls back to the shared "Untitled thread" placeholder when child_thread_title is missing', () => {

@@ -6,7 +6,7 @@ import type { PersistScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
 import { preserveAtBottom } from './scrollState';
 
-export interface PermissionEvent {
+interface PermissionEvent {
   request_id: string;
   tool_use_id: string;
   tool_name: string;
@@ -14,9 +14,12 @@ export interface PermissionEvent {
   summary: string;
 }
 
-export interface PermissionBodyProps {
+interface PermissionBodyProps {
   event: PermissionEvent;
   resolved?: { allowed: boolean; reason?: string; persist_scope?: PersistScope };
+  /** Surrounding response was canceled / aborted / failed / superseded
+   *  without a resolution landing — render every button disabled. */
+  terminated?: boolean;
 }
 
 /** Frame the prompt around the tool name itself ("the **Edit** tool on `/path`")
@@ -41,8 +44,11 @@ export function renderQuestion(toolName: string, summary: string) {
 /** Mirrors the engine's `derive_allow_pattern` for the narrow scope: returns
  *  the pattern that would be persisted if the user clicks "Always allow" with
  *  narrow scope, or null when the tool has no meaningful sub-scope (so the
- *  card hides the narrow button). Keep in sync with `claude_code.rs`. */
-function narrowPattern(toolName: string, input: Record<string, unknown>): string | null {
+ *  card hides the narrow button). Returns null also when the input
+ *  references a CC-protected path — see `inputTouchesProtectedPath`. Keep in
+ *  sync with `claude_code.rs`. */
+export function narrowPattern(toolName: string, input: Record<string, unknown>): string | null {
+  if (inputTouchesProtectedPath(toolName, input)) return null;
   if (toolName === 'Skill') {
     const skill = typeof input.skill === 'string' ? input.skill : null;
     if (!skill) return null;
@@ -56,6 +62,34 @@ function narrowPattern(toolName: string, input: Record<string, unknown>): string
     return first ? `Bash(${first}:*)` : null;
   }
   return null;
+}
+
+/** Substrings that mark a path CC treats specially for destructive Bash
+ *  commands. Empirically (probed 2026-05-16): `Bash rm -rf .../.claude/...`
+ *  surfaces a permission card even when bare `Bash` is in `--allowedTools`,
+ *  so persisting a Broad (`Bash`) or Narrow (`Bash(rm:*)`) grant from that
+ *  card lies about future suppression. The trailing `/` anchors to the
+ *  actual directory — `.gitignore` / `.claude_backup` are unaffected.
+ *  Mirror of `CC_PROTECTED_PATH_MARKERS` in `claude_code.rs`. */
+const CC_PROTECTED_PATH_MARKERS: readonly string[] = ['.claude/', '.git/'];
+
+/** True when a `Bash` command references a path CC keeps under special
+ *  permission routing (`.claude/` or `.git/`). The card hides Broad
+ *  ("Always allow") and Narrow ("Always allow Bash(rm:*)") in that case —
+ *  those buttons would persist patterns CC ignores for the same path.
+ *  Session ("Allow for this thread") still works because the engine
+ *  intercepts before CC's gate. Restricted to Bash because that's the only
+ *  tool we've empirically observed surfacing the card on these paths under
+ *  the user's bare-allowlist setup (Read / Edit / cat all auto-approved
+ *  silently). Mirror of `input_touches_protected_path` in `claude_code.rs`. */
+export function inputTouchesProtectedPath(
+  toolName: string,
+  input: Record<string, unknown>,
+): boolean {
+  if (toolName !== 'Bash') return false;
+  const command = input.command;
+  return typeof command === 'string'
+    && CC_PROTECTED_PATH_MARKERS.some(m => command.includes(m));
 }
 
 /** Path-tools where the session-allow scope is per-file: subsequent prompts
@@ -102,8 +136,9 @@ export function sessionLabel(toolName: string, input: Record<string, unknown>): 
  *      reviewed by the user before the assistant continues.
  *  The "Always allow" broad button is hidden for these tools; users wanting
  *  in-thread persistence should use the session-allow button, which the engine
- *  intercepts before CC's gate. Keep in sync with `BROAD_ALLOW_INEFFECTIVE` in
- *  `claude_code.rs`. */
+ *  intercepts before CC's gate. See `inputTouchesProtectedPath` for the
+ *  per-input variant of the same rule (Bash commands targeting protected
+ *  paths). Keep in sync with `BROAD_ALLOW_INEFFECTIVE` in `claude_code.rs`. */
 export const BROAD_ALLOW_INEFFECTIVE: ReadonlySet<string> = new Set([
   'Edit',
   'ExitPlanMode',
@@ -124,11 +159,30 @@ export function resolvedChoice(resolved: {
   return resolved.persist_scope ?? 'allow';
 }
 
+/** Per-button disabled + state-class. `answered` styling (picked / rejected)
+ *  wins over `terminated` so the user's recorded decision stays visible even
+ *  if a later abort lands. */
+export function permissionButtonState({
+  answered,
+  terminated,
+  isPicked,
+}: {
+  answered: boolean;
+  terminated: boolean;
+  isPicked: boolean;
+}): { disabled: boolean; stateClass: string } {
+  const disabled = answered || terminated;
+  const stateClass = !answered ? ''
+    : isPicked ? ' cc-permission-btn-picked'
+    : ' cc-permission-btn-rejected';
+  return { disabled, stateClass };
+}
+
 /** Body of a `CodingAgentPermissionRequest` divider exchange — rendered inside
  *  the initiator panel which provides the chrome. `pending` is an optimistic
  *  override; SSE swaps in `resolved` once the paired
  *  `CodingAgentPermissionResolved` event arrives. */
-export function PermissionBody({ event, resolved }: PermissionBodyProps) {
+export function PermissionBody({ event, resolved, terminated }: PermissionBodyProps) {
   const pending = useSignal<{ allowed: boolean; persist_scope?: PersistScope } | null>(null);
 
   const effective = resolved ?? pending.value;
@@ -148,8 +202,9 @@ export function PermissionBody({ event, resolved }: PermissionBodyProps) {
     }
   };
 
-  const narrow = narrowPattern(event.tool_name, event.input);
-  const showBroad = !BROAD_ALLOW_INEFFECTIVE.has(event.tool_name);
+  const touchesProtected = inputTouchesProtectedPath(event.tool_name, event.input);
+  const narrow = touchesProtected ? null : narrowPattern(event.tool_name, event.input);
+  const showBroad = !BROAD_ALLOW_INEFFECTIVE.has(event.tool_name) && !touchesProtected;
   const session = sessionLabel(event.tool_name, event.input);
 
   const selected = effective ? resolvedChoice(effective) : null;
@@ -171,7 +226,7 @@ export function PermissionBody({ event, resolved }: PermissionBodyProps) {
       label: 'Deny',
       ariaLabel: 'Deny this permission request',
       row: 'primary',
-      onClick: () => decide(false),
+      onClick: () => void decide(false),
     },
     {
       choice: 'allow',
@@ -179,7 +234,7 @@ export function PermissionBody({ event, resolved }: PermissionBodyProps) {
       label: 'Allow once',
       ariaLabel: 'Allow this permission request once',
       row: 'primary',
-      onClick: () => decide(true),
+      onClick: () => void decide(true),
     },
     {
       choice: 'session',
@@ -187,7 +242,7 @@ export function PermissionBody({ event, resolved }: PermissionBodyProps) {
       label: 'Allow for this thread',
       ariaLabel: `Allow ${session ?? event.tool_name} for the rest of this thread`,
       row: 'secondary',
-      onClick: () => decide(true, 'session'),
+      onClick: () => void decide(true, 'session'),
     },
     ...(narrow ? [{
       choice: 'narrow' as const,
@@ -195,7 +250,7 @@ export function PermissionBody({ event, resolved }: PermissionBodyProps) {
       label: <>Always allow <code>{narrow}</code></>,
       ariaLabel: `Always allow ${narrow}`,
       row: 'secondary' as const,
-      onClick: () => decide(true, 'narrow'),
+      onClick: () => void decide(true, 'narrow'),
     }] : []),
     ...(showBroad ? [{
       choice: 'broad' as const,
@@ -203,21 +258,23 @@ export function PermissionBody({ event, resolved }: PermissionBodyProps) {
       label: 'Always allow',
       ariaLabel: `Always allow ${event.tool_name}`,
       row: 'secondary' as const,
-      onClick: () => decide(true, 'broad'),
+      onClick: () => void decide(true, 'broad'),
     }] : []),
   ];
 
   const renderButton = (spec: ButtonSpec) => {
     const isPicked = selected === spec.choice;
-    const stateClass = !answered ? ''
-      : isPicked ? ' cc-permission-btn-picked'
-      : ' cc-permission-btn-rejected';
+    const { disabled, stateClass } = permissionButtonState({
+      answered,
+      terminated: !!terminated,
+      isPicked,
+    });
     return (
       <button
         type="button"
         class={`${spec.btnClass}${stateClass}`}
-        onClick={answered ? undefined : spec.onClick}
-        disabled={answered}
+        onClick={disabled ? undefined : spec.onClick}
+        disabled={disabled}
         aria-pressed={answered ? isPicked : undefined}
         aria-label={spec.ariaLabel}
       >
@@ -230,9 +287,12 @@ export function PermissionBody({ event, resolved }: PermissionBodyProps) {
   const primary = buttons.filter(b => b.row === 'primary');
   const secondary = buttons.filter(b => b.row === 'secondary');
 
+  const bodyStateClass = answered ? ' cc-permission-body-answered'
+    : terminated ? ' cc-permission-body-terminated'
+    : '';
   return (
     <div
-      class={`cc-permission-body${answered ? ' cc-permission-body-answered' : ''}`}
+      class={`cc-permission-body${bodyStateClass}`}
       data-request-id={event.request_id}
     >
       <div class="cc-permission-text">{renderQuestion(event.tool_name, event.summary)}</div>

@@ -11,6 +11,7 @@ import { sse } from './sse';
 import { utils } from './utils';
 import { capture } from './capture';
 import { proxy } from './proxy';
+import { oauth } from './oauth';
 
 export const lucidos = {
   configure,
@@ -25,6 +26,7 @@ export const lucidos = {
   sse,
   utils,
   proxy,
+  oauth,
   _capture: capture,
 };
 

@@ -1,11 +1,11 @@
-//! E2E for POST /api/internal/permission-prompt — the endpoint invoked by
+//! E2E for POST /api/v1/internal/permission-prompt — the endpoint invoked by
 //! lucidos-cli's MCP permission server when CC asks for a tool-call decision.
 //!
 //! Drives the endpoint with HTTP only — no MCP subprocess required. The
 //! handler:
 //!   1. Registers a oneshot in `Engine.pending_mcp_consent` keyed by request_id.
 //!   2. Emits `CodingAgentPermissionRequest` (persisted) with that request_id.
-//!   3. Blocks until POST /api/mcp/consent resolves the oneshot, then emits
+//!   3. Blocks until POST /api/v1/mcp/consent resolves the oneshot, then emits
 //!      `CodingAgentPermissionResolved` and returns `{ allowed, reason? }`.
 
 use crate::support::{base_url, db_url, http_client, seed_cc_thread_summary};
@@ -31,7 +31,7 @@ async fn lock_cc_allowed_tools() -> MutexGuard<'static, ()> {
 async fn permission_prompt_rejects_invalid_thread_id() {
     let client = http_client();
     let resp = client
-        .post(format!("{}/api/internal/permission-prompt", base_url()))
+        .post(format!("{}/api/v1/internal/permission-prompt", base_url()))
         .json(&json!({
             "thread_id": "not-a-uuid",
             "tool_use_id": "tu_1",
@@ -58,10 +58,9 @@ async fn permission_prompt_resolves_when_consent_posted() {
     // poll for the persisted request event in parallel.
     let prompt_task = {
         let client = client.clone();
-        let thread_id = thread_id;
         tokio::spawn(async move {
             client
-                .post(format!("{}/api/internal/permission-prompt", base_url()))
+                .post(format!("{}/api/v1/internal/permission-prompt", base_url()))
                 .json(&json!({
                     "thread_id": thread_id.to_string(),
                     "tool_use_id": "tu_perm_1",
@@ -81,7 +80,7 @@ async fn permission_prompt_resolves_when_consent_posted() {
         wait_for_permission_request(&pool, thread_id, std::time::Duration::from_secs(10)).await;
 
     let consent = client
-        .post(format!("{}/api/mcp/consent", base_url()))
+        .post(format!("{}/api/v1/mcp/consent", base_url()))
         .json(&json!({ "request_id": request_id, "allowed": true }))
         .send()
         .await
@@ -143,7 +142,7 @@ async fn permission_prompt_deduplicates_concurrent_identical_requests() {
         body["tool_use_id"] = json!(format!("tu_dup_{}", i + 1));
         tasks.push(tokio::spawn(async move {
             client
-                .post(format!("{}/api/internal/permission-prompt", base_url()))
+                .post(format!("{}/api/v1/internal/permission-prompt", base_url()))
                 .json(&body)
                 .send()
                 .await
@@ -175,7 +174,7 @@ async fn permission_prompt_deduplicates_concurrent_identical_requests() {
     );
 
     let consent = client
-        .post(format!("{}/api/mcp/consent", base_url()))
+        .post(format!("{}/api/v1/mcp/consent", base_url()))
         .json(&json!({ "request_id": request_id, "allowed": true }))
         .send()
         .await
@@ -374,7 +373,7 @@ async fn permission_prompt_without_persist_scope_does_not_write_file() {
         let plugin = plugin.clone();
         tokio::spawn(async move {
             client
-                .post(format!("{}/api/internal/permission-prompt", base_url()))
+                .post(format!("{}/api/v1/internal/permission-prompt", base_url()))
                 .json(&json!({
                     "thread_id": thread_id.to_string(),
                     "tool_use_id": format!("tu_{}", Uuid::new_v4()),
@@ -394,7 +393,7 @@ async fn permission_prompt_without_persist_scope_does_not_write_file() {
         wait_for_permission_request(&pool, thread_id, std::time::Duration::from_secs(10)).await;
 
     let consent = client
-        .post(format!("{}/api/mcp/consent", base_url()))
+        .post(format!("{}/api/v1/mcp/consent", base_url()))
         .json(&json!({ "request_id": request_id, "allowed": true }))
         .send()
         .await
@@ -416,7 +415,7 @@ async fn permission_prompt_without_persist_scope_does_not_write_file() {
 /// Read the current ~/.lucidos/cc-allowed-tools via the settings endpoint.
 async fn read_cc_allowed_tools(client: &reqwest::Client) -> String {
     let resp = client
-        .get(format!("{}/api/cc-allowed-tools", base_url()))
+        .get(format!("{}/api/v1/cc-allowed-tools", base_url()))
         .send()
         .await
         .expect("GET cc-allowed-tools failed");
@@ -428,7 +427,7 @@ async fn read_cc_allowed_tools(client: &reqwest::Client) -> String {
 /// Restore the settings file to a previously-snapshotted state.
 async fn restore_cc_allowed_tools(client: &reqwest::Client, contents: &str) {
     let resp = client
-        .put(format!("{}/api/cc-allowed-tools", base_url()))
+        .put(format!("{}/api/v1/cc-allowed-tools", base_url()))
         .json(&json!({ "contents": contents }))
         .send()
         .await
@@ -452,7 +451,7 @@ fn count_line(contents: &str, pattern: &str) -> usize {
 }
 
 /// End-to-end: open a permission_prompt, wait for the canonical request event,
-/// then resolve via /api/mcp/consent with the given persist_scope.
+/// then resolve via /api/v1/mcp/consent with the given persist_scope.
 async fn persist_via_consent(
     client: &reqwest::Client,
     pool: &PgPool,
@@ -467,7 +466,7 @@ async fn persist_via_consent(
         let input = input.clone();
         tokio::spawn(async move {
             client
-                .post(format!("{}/api/internal/permission-prompt", base_url()))
+                .post(format!("{}/api/v1/internal/permission-prompt", base_url()))
                 .json(&json!({
                     "thread_id": thread_id.to_string(),
                     "tool_use_id": format!("tu_{}", Uuid::new_v4()),
@@ -487,7 +486,7 @@ async fn persist_via_consent(
         wait_for_permission_request(pool, thread_id, std::time::Duration::from_secs(10)).await;
 
     let consent = client
-        .post(format!("{}/api/mcp/consent", base_url()))
+        .post(format!("{}/api/v1/mcp/consent", base_url()))
         .json(&json!({
             "request_id": request_id,
             "allowed": true,

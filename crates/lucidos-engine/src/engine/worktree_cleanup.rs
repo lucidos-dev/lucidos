@@ -136,6 +136,32 @@ pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// already accelerates from 24h to 1h under the same condition.
 pub const TIER_0_GRACE: Duration = Duration::from_secs(60 * 60);
 
+/// Grace window before a *stranded* worktree (its git admin dir under
+/// `.git/worktrees/<name>` is gone, so every git call fails) is removed.
+/// Equal to [`TIER_0_GRACE`] (1 h) but — unlike Tier 0 — it does NOT drop to
+/// 0 under disk pressure. Tier 0 can prove "zero information on disk" via git
+/// (clean status, branch at main) before accelerating; a stranded worktree
+/// can't be inspected by git at all, so the fixed floor is what rules out
+/// nuking an in-flight `git worktree add` whose admin dir is mid-creation.
+pub const STRANDED_GRACE: Duration = TIER_0_GRACE;
+
+/// Grace window (by directory mtime) before an orphaned *temporary* worktree
+/// (`harden-`/`apply-`/`merge-` left by a crashed apply/harden/merge flow) is
+/// removed. Fixed 2 h, never accelerated under disk pressure: the primary
+/// liveness gate is the change row's status (a still-`pending` change may be
+/// retried and need its worktree); mtime is only a coarse backstop for the
+/// "DB says resolved but cleanup never ran" window. The cost of deleting an
+/// in-flight merge/harden worktree (the user re-does conflict resolution) far
+/// outweighs the disk reclaimed by accelerating.
+pub const TEMP_WORKTREE_GRACE: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Directory-name prefixes for the temporary worktrees the apply/harden/merge
+/// flows create under the worktrees dir. The background sweep collects these
+/// when their change is resolved (see [`WorktreeCleanup::try_temp_worktree`]).
+/// `cc-` (random-suffix recovery worktrees) is deliberately NOT here — those
+/// are treated as legacy and skipped, same as any non-`thread-<8hex>` name.
+const TEMP_WORKTREE_PREFIXES: &[&str] = &["harden-", "apply-", "merge-"];
+
 /// Threshold above which Lucidos's own worktree footprint is "meaningful"
 /// in the disk-low notification. Below this, the heads-up message tells the
 /// user the pressure is from their machine overall (other apps), not Lucidos
@@ -171,6 +197,13 @@ pub struct WorktreeCleanup {
     free_soft_bytes: u64,
     free_hard_bytes: u64,
     force_tier1_idle: Duration,
+    /// Grace before a stranded worktree is removed. Defaults to
+    /// [`STRANDED_GRACE`]; a struct field (like `force_tier1_idle`) so tests
+    /// can drive removal of a freshly-created fixture without aging its mtime.
+    stranded_grace: Duration,
+    /// Grace before an orphaned temp worktree is removed. Defaults to
+    /// [`TEMP_WORKTREE_GRACE`]; overridable in tests for the same reason.
+    temp_worktree_grace: Duration,
     /// Boundary used by [`emit_disk_low_alert`] to pick the
     /// look-elsewhere vs. clean-from-Settings body variant.
     large_footprint_bytes: u64,
@@ -198,6 +231,8 @@ impl WorktreeCleanup {
             free_soft_bytes: FREE_DISK_SOFT_BYTES,
             free_hard_bytes: FREE_DISK_HARD_BYTES,
             force_tier1_idle: FORCE_TIER_1_IDLE,
+            stranded_grace: STRANDED_GRACE,
+            temp_worktree_grace: TEMP_WORKTREE_GRACE,
             large_footprint_bytes: LARGE_FOOTPRINT_BYTES,
             alerts: Mutex::new(AlertState::default()),
             changes,
@@ -276,6 +311,19 @@ impl WorktreeCleanup {
             };
             let pre_size = directory_size_bytes(&path);
 
+            // Orphaned temporary worktrees (`harden-`/`apply-`/`merge-`) left by
+            // a crashed apply/harden/merge flow. Checked before `parse_thread_short`
+            // so `cc-<uuid>` and other non-`thread-` names still fall through to
+            // the legacy skip below.
+            if TEMP_WORKTREE_PREFIXES.iter().any(|p| name.starts_with(p)) {
+                if let Some(freed) = self.try_temp_worktree(&dir, name, &path, pre_size).await {
+                    if under_hard {
+                        total_freed_under_hard = total_freed_under_hard.saturating_add(freed);
+                    }
+                }
+                continue;
+            }
+
             let Some(short) = parse_thread_short(name) else {
                 continue;
             };
@@ -297,7 +345,7 @@ impl WorktreeCleanup {
                     lucidos_footprint_bytes =
                         lucidos_footprint_bytes.saturating_add(pre_size);
 
-                    // A live CC subprocess parked on `AskUserQuestion` emits
+                    // A live Claude Code subprocess parked on `AskUserQuestion` emits
                     // no events while the user thinks, so `last_activity_age`
                     // crosses the tier-0 grace and we'd `git branch -D` the
                     // branch out from under it — destroying the recorded
@@ -314,6 +362,18 @@ impl WorktreeCleanup {
                     }
 
                     if let Some(age) = last_activity_age(&self.pool, thread_id).await {
+                        // Stranded worktree (git admin dir gone): git-based tier
+                        // checks all fail, so remove directly before the ladder.
+                        if let Some(freed) = self
+                            .try_stranded(thread_id, &dir, &path, pre_size, age)
+                            .await
+                        {
+                            if under_hard {
+                                total_freed_under_hard =
+                                    total_freed_under_hard.saturating_add(freed);
+                            }
+                            continue;
+                        }
                         if age >= zero_info_grace {
                             if let Some(freed) =
                                 self.try_tier_0(thread_id, &path, pre_size).await
@@ -347,7 +407,7 @@ impl WorktreeCleanup {
                     // Orphan worktrees are excluded from the footprint to
                     // match `inventory_worktrees` (Settings → Disk Usage).
                     if let Some(freed) =
-                        self.try_orphan_path(&path, pre_size, zero_info_grace).await
+                        self.try_orphan_path(&dir, &path, pre_size, zero_info_grace).await
                     {
                         if under_hard {
                             total_freed_under_hard =
@@ -393,8 +453,20 @@ impl WorktreeCleanup {
         worktree: &Path,
         pre_size: u64,
     ) -> Option<u64> {
-        if !self.changes.pending_for_thread(thread_id).await.is_empty() {
-            return None;
+        // On DB error, treat as if pending changes exist — skipping tier-0 cleanup
+        // is safer than deleting a worktree whose pending-state we can't verify.
+        match self.changes.pending_for_thread(thread_id).await {
+            Ok(v) if v.is_empty() => {}
+            Ok(_) => return None,
+            Err(e) => {
+                crate::log!(
+                    "[WorktreeCleanup] tier-0 pending_for_thread({}): {} — \
+                     skipping cleanup defensively",
+                    thread_id,
+                    e
+                );
+                return None;
+            }
         }
         if is_worktree_dirty(worktree).await {
             return None;
@@ -426,10 +498,28 @@ impl WorktreeCleanup {
     /// `WorktreeCleaned` emit because that event is keyed on `thread_id`.
     async fn try_orphan_path(
         &self,
+        worktrees_dir: &Path,
         worktree: &Path,
         pre_size: u64,
         mtime_grace: Duration,
     ) -> Option<u64> {
+        // Stranded orphan: the git admin dir is gone, so every git check below
+        // fails (and `remove_worktree_and_optionally_delete_branch` can't
+        // resolve a repo root). Remove the directory directly after the fixed
+        // stranded grace — no event, since orphan paths carry no thread_id.
+        if worktree_git_admin_missing(worktree) {
+            if directory_age(worktree).unwrap_or(Duration::ZERO) < self.stranded_grace {
+                return None;
+            }
+            let freed = remove_stranded_worktree(worktrees_dir, worktree, pre_size)?;
+            log!(
+                "[WorktreeCleanup] stranded orphan-path freed {} bytes at {} (git admin dir missing)",
+                freed,
+                worktree.display()
+            );
+            return Some(freed);
+        }
+
         if directory_age(worktree).unwrap_or(Duration::ZERO) < mtime_grace {
             return None;
         }
@@ -448,6 +538,108 @@ impl WorktreeCleanup {
             remove_worktree_and_optionally_delete_branch(worktree, Some(pre_size)).await?;
         log!(
             "[WorktreeCleanup] orphan-path freed {} bytes at {} (branch_deleted={})",
+            outcome.freed_bytes,
+            worktree.display(),
+            outcome.branch_deleted
+        );
+        Some(outcome.freed_bytes)
+    }
+
+    /// Stranded-worktree removal for a `thread-<8hex>` dir that resolves to a
+    /// thread but whose git admin dir is gone (see [`worktree_git_admin_missing`]).
+    /// Returns `None` — falling through to the normal git-based tier ladder —
+    /// when the worktree is NOT stranded. The caller has already skipped active
+    /// threads and computed `age` from the events table.
+    ///
+    /// Uses [`STRANDED_GRACE`] (fixed 1 h, no disk-pressure acceleration): git
+    /// can't prove the tree is information-free here, so the floor is what
+    /// rules out racing an in-flight `git worktree add`.
+    async fn try_stranded(
+        &self,
+        thread_id: Uuid,
+        worktrees_dir: &Path,
+        worktree: &Path,
+        pre_size: u64,
+        age: Duration,
+    ) -> Option<u64> {
+        if !worktree_git_admin_missing(worktree) {
+            return None;
+        }
+        if age < self.stranded_grace {
+            return None;
+        }
+        let freed = remove_stranded_worktree(worktrees_dir, worktree, pre_size)?;
+        log!(
+            "[WorktreeCleanup] stranded freed {} bytes for thread {} (git admin dir missing)",
+            freed,
+            thread_id
+        );
+        // tier 2 = entire worktree removed; branch_deleted is false because a
+        // stranded dir has no resolvable repo to delete a branch from (and the
+        // branch ref, if any, lives safely in the main repo regardless).
+        self.emit_cleaned(thread_id, 2, freed, false).await;
+        Some(freed)
+    }
+
+    /// Sweep an orphaned temporary worktree (`harden-`/`apply-`/`merge-`) left
+    /// on disk by an apply/harden/merge flow that crashed or was interrupted
+    /// between create and inline-remove. No `WorktreeCleaned` emit — these are
+    /// keyed on a change id, not a thread.
+    ///
+    /// Liveness gates (all required): the dir name parses to a change id whose
+    /// row is absent or NOT `pending` (a pending change may still be retried and
+    /// need the worktree; a DB error is treated as in-use), the tree is clean,
+    /// and it's
+    /// been untouched past [`TEMP_WORKTREE_GRACE`]. Removal goes through
+    /// [`remove_worktree_and_optionally_delete_branch`] so git's bookkeeping is
+    /// cleaned and a fully-merged temp/thread branch is dropped.
+    async fn try_temp_worktree(
+        &self,
+        worktrees_dir: &Path,
+        name: &str,
+        worktree: &Path,
+        pre_size: u64,
+    ) -> Option<u64> {
+        if !is_safe_subpath(worktrees_dir, worktree) {
+            log!(
+                "[WorktreeCleanup] refusing to act on temp path outside worktrees dir: {}",
+                worktree.display()
+            );
+            return None;
+        }
+        let change_id = parse_temp_change_id(name)?;
+
+        // Coarse mtime backstop first — short-circuits the common "temp dir of
+        // an in-flight apply" case without a DB round-trip.
+        if directory_age(worktree).unwrap_or(Duration::ZERO) < self.temp_worktree_grace {
+            return None;
+        }
+
+        // Primary liveness gate: the change row's status.
+        match self.changes.get_by_id(change_id).await {
+            Ok(Some(change)) if change.status == "pending" => return None,
+            Ok(_) => {}
+            Err(e) => {
+                log!(
+                    "[WorktreeCleanup] temp sweep get_by_id({}): {} — skipping defensively",
+                    change_id,
+                    e
+                );
+                return None;
+            }
+        }
+
+        // Don't drop a tree with uncommitted edits (this also skips a *stranded*
+        // temp dir, where `git status` errors and is treated as dirty — rare;
+        // left for manual cleanup).
+        if is_worktree_dirty(worktree).await {
+            return None;
+        }
+
+        let outcome =
+            remove_worktree_and_optionally_delete_branch(worktree, Some(pre_size)).await?;
+        log!(
+            "[WorktreeCleanup] temp worktree freed {} bytes at {} (branch_deleted={})",
             outcome.freed_bytes,
             worktree.display(),
             outcome.branch_deleted
@@ -624,6 +816,9 @@ impl WorktreeCleanup {
                     task_id: None,
                     app_id: None,
                     thread_id: None,
+                    event_id: None,
+                    tap: crate::scheduler::notifications::Tap::Modal,
+                    actor: None,
                 }),
                 &format!("[WorktreeCleanup] {} NotificationCreated", log_tag),
             )
@@ -631,440 +826,22 @@ impl WorktreeCleanup {
     }
 }
 
-/// Recognize a deterministic worktree directory name (`thread-<8-hex>`) and
-/// return the lowercase 8-char short id. Returns `None` for legacy /
-/// random-suffix names so the caller skips them.
-///
-/// The short id is used as a prefix lookup against the `events.aggregate_id`
-/// column to recover the full thread `Uuid`. We don't reconstruct a Uuid by
-/// zero-padding because the original Uuid is random across all 32 hex chars
-/// and the padded form would never match.
-fn parse_thread_short(dir_name: &str) -> Option<String> {
-    let stripped = dir_name.strip_prefix("thread-")?;
-    if stripped.len() != THREAD_WORKTREE_ID_LEN {
-        return None;
-    }
-    if !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(stripped.to_ascii_lowercase())
-}
-
-/// True iff `child` is strictly inside `parent` after canonicalization. Used to
-/// guard `remove_dir_all` against symlink escapes and accidental top-level
-/// deletes. Falls back to a literal prefix check if canonicalization fails
-/// (e.g. the path no longer exists), which is fine for the worktree-removal
-/// path because the failure case is "child doesn't exist" → no harm done.
-fn is_safe_subpath(parent: &Path, child: &Path) -> bool {
-    let parent_canon = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
-    let child_canon = child.canonicalize().unwrap_or_else(|_| child.to_path_buf());
-    child_canon.starts_with(&parent_canon) && child_canon != parent_canon
-}
-
-/// Free space on the filesystem hosting `path`, in bytes.
-///
-/// Returns `None` when the path doesn't exist or the platform call fails.
-/// We call this on `<workspace>/.lucidos/worktrees/` (or the workspace root
-/// when the worktrees dir is missing) — both live on the same volume.
-pub(crate) fn available_disk_bytes(path: &Path) -> Option<u64> {
-    fs2::available_space(path).ok()
-}
-
-/// Time since `path`'s mtime, or `None` if the metadata read fails. Used by
-/// the orphan-path sweep to apply a grace window without an event stream.
-fn directory_age(path: &Path) -> Option<Duration> {
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta.modified().ok()?;
-    mtime.elapsed().ok()
-}
-
-/// Sum file sizes under `path` recursively. Best-effort — silently skips
-/// entries we can't stat. Returns 0 if the path doesn't exist.
-pub(crate) fn directory_size_bytes(path: &Path) -> u64 {
-    let mut total: u64 = 0;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else if meta.is_file() {
-                total = total.saturating_add(meta.len());
-            }
-            // Symlinks: counted as 0; we do not follow.
-        }
-    }
-    total
-}
-
-/// Resolve the main working tree (the one whose `.git` is a real directory,
-/// not a `.git` file pointing at `worktrees/<name>`) by asking the worktree
-/// itself: `git rev-parse --path-format=absolute --show-superproject-working-tree`
-/// returns nothing for a top-level repo, so we use
-/// `git rev-parse --git-common-dir` (the canonical `.git` directory) and
-/// strip the trailing `.git` segment to get the working tree.
-///
-/// Returns `None` when the worktree path isn't a recognized git repo (e.g.
-/// the user manually deleted `.git/worktrees/<name>` so the worktree is now
-/// stranded). Tier 2 callers fall back to a `remove_dir_all` in that case.
-async fn resolve_repo_root_from_worktree(worktree: &Path) -> Option<PathBuf> {
-    let out = git_cmd(&["rev-parse", "--git-common-dir"], worktree).await.ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        return None;
-    }
-    // `--git-common-dir` may return a relative path (relative to the worktree)
-    // or an absolute path. Resolve to absolute against the worktree.
-    let common = PathBuf::from(&raw);
-    let abs = if common.is_absolute() {
-        common
-    } else {
-        worktree.join(common)
-    };
-    // Strip the trailing `.git` segment to get the main working tree root.
-    let parent = abs.parent()?.to_path_buf();
-    Some(parent)
-}
-
-/// True iff the worktree has any uncommitted changes (tracked or untracked).
-pub(crate) async fn is_worktree_dirty(worktree: &Path) -> bool {
-    match git_cmd(&["status", "--porcelain"], worktree).await {
-        Ok(o) if o.status.success() => !o.stdout.is_empty(),
-        Ok(o) => {
-            // `git status` failing usually means the path is no longer a git
-            // worktree (e.g. someone deleted `.git/worktrees/<name>` out of
-            // band). Treat as dirty so we don't silently nuke it.
-            log!(
-                "[WorktreeCleanup] git status failed in {}: {} — treating as dirty",
-                worktree.display(),
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            true
-        }
-        Err(e) => {
-            log!(
-                "[WorktreeCleanup] git status errored in {}: {} — treating as dirty",
-                worktree.display(),
-                e
-            );
-            true
-        }
-    }
-}
-
-/// Outcome of [`remove_worktree_and_optionally_delete_branch`].
-pub(crate) struct RemoveWorktreeOutcome {
-    /// Bytes reclaimed from the on-disk worktree (best-effort directory size
-    /// captured before removal).
-    pub freed_bytes: u64,
-    /// True iff the worktree's branch was fully merged and deleted.
-    pub branch_deleted: bool,
-}
-
-/// Strip regenerable build artifacts (`target/`, `node_modules/`,
-/// `.lucidos/cache/`) from a worktree. Reused by the background cleanup
-/// worker (Tier 1) and by the disk-usage settings page so the user can
-/// reclaim space on demand without waiting for the hourly tick.
-///
-/// Returns the bytes freed, or `None` if there was nothing to prune.
-pub(crate) fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
-    let mut freed: u64 = 0;
-    let mut pruned: Vec<&'static str> = Vec::new();
-    for sub in TIER_1_PRUNE_DIRS {
-        let target = worktree.join(sub);
-        if !target.exists() {
-            continue;
-        }
-        if !is_safe_subpath(worktree, &target) {
-            log!(
-                "[WorktreeCleanup] refusing prune of suspicious path {}",
-                target.display()
-            );
-            continue;
-        }
-        let size = directory_size_bytes(&target);
-        match std::fs::remove_dir_all(&target) {
-            Ok(()) => {
-                freed = freed.saturating_add(size);
-                pruned.push(sub);
-            }
-            Err(e) => {
-                log!(
-                    "[WorktreeCleanup] prune failed for {}: {}",
-                    target.display(),
-                    e
-                );
-            }
-        }
-    }
-    if pruned.is_empty() {
-        None
-    } else {
-        log!(
-            "[WorktreeCleanup] pruned build artifacts in {}: {:?} ({} bytes)",
-            worktree.display(),
-            pruned,
-            freed
-        );
-        Some(freed)
-    }
-}
-
-/// Remove a worktree directory and (when its branch is fully merged into
-/// main) delete the branch. Reused by the background cleanup worker (Tier 2)
-/// and by the user-facing close + disk-usage endpoints.
-///
-/// `pre_size` lets the Tier 2 worker pass the directory size it already
-/// surveyed at the top of `run_once`, avoiding a second walk of the same
-/// tree (worktrees can be tens of GB). Callers without a precomputed size
-/// pass `None` and the helper measures.
-///
-/// Returns `None` when the repo root cannot be resolved from the worktree
-/// (e.g. the worktree was already removed manually). The caller decides
-/// whether absence is a hard error.
-pub(crate) async fn remove_worktree_and_optionally_delete_branch(
-    worktree: &Path,
-    pre_size: Option<u64>,
-) -> Option<RemoveWorktreeOutcome> {
-    // Capture the branch + repo root BEFORE we remove the worktree —
-    // once the directory is gone we can't read either.
-    let branch = crate::engine::git_ops::worktree_current_branch(worktree).await;
-    let repo_root = match resolve_repo_root_from_worktree(worktree).await {
-        Some(p) => p,
-        None => {
-            log!(
-                "[WorktreeCleanup] cannot resolve repo root from worktree {}",
-                worktree.display()
-            );
-            return None;
-        }
-    };
-
-    let total_size = pre_size.unwrap_or_else(|| directory_size_bytes(worktree));
-
-    // Use `git worktree remove --force` so git's bookkeeping (the
-    // `worktrees/<name>` admin dir under `.git/`) is cleaned up too. If
-    // git doesn't know about the path (e.g. it was moved/copied), fall
-    // back to `remove_dir_all` so we still reclaim the bytes.
-    let removed_via_git = match git_cmd(
-        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
-        &repo_root,
-    )
-    .await
-    {
-        Ok(o) if o.status.success() => true,
-        Ok(o) => {
-            log!(
-                "[WorktreeCleanup] git worktree remove failed for {}: {}",
-                worktree.display(),
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            false
-        }
-        Err(e) => {
-            log!(
-                "[WorktreeCleanup] git worktree remove errored for {}: {}",
-                worktree.display(),
-                e
-            );
-            false
-        }
-    };
-    if !removed_via_git && worktree.exists() {
-        if let Err(e) = std::fs::remove_dir_all(worktree) {
-            log!(
-                "[WorktreeCleanup] remove_dir_all failed for {}: {}",
-                worktree.display(),
-                e
-            );
-            return None;
-        }
-    }
-
-    // Branch deletion (Phase 10.3): only when fully merged. `has_branch_commits`
-    // returns true on error (conservative) so we keep branches when in doubt.
-    let mut branch_deleted = false;
-    if let Some(branch_name) = branch.as_deref() {
-        if !has_branch_commits(&repo_root, branch_name).await {
-            match git_cmd(&["branch", "-D", branch_name], &repo_root).await {
-                Ok(o) if o.status.success() => {
-                    branch_deleted = true;
-                    log!(
-                        "[WorktreeCleanup] deleted fully-merged branch {}",
-                        branch_name
-                    );
-                }
-                Ok(o) => log!(
-                    "[WorktreeCleanup] git branch -D {} failed: {}",
-                    branch_name,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
-                Err(e) => log!(
-                    "[WorktreeCleanup] git branch -D {} errored: {}",
-                    branch_name,
-                    e
-                ),
-            }
-        } else {
-            log!(
-                "[WorktreeCleanup] preserving branch {} — has unmerged commits",
-                branch_name
-            );
-        }
-    }
-
-    Some(RemoveWorktreeOutcome {
-        freed_bytes: total_size,
-        branch_deleted,
-    })
-}
-
-/// One row in the disk-usage inventory served by `/api/disk-usage/worktrees`.
-/// Combines on-disk facts (path, size, dirty) with thread metadata
-/// (title, last activity, saved).
-#[derive(Debug, serde::Serialize)]
-pub struct WorktreeInventoryRow {
-    pub thread_id: Uuid,
-    pub thread_title: Option<String>,
-    pub worktree_path: String,
-    pub size_bytes: u64,
-    pub last_activity: Option<chrono::DateTime<Utc>>,
-    pub is_dirty: bool,
-    pub is_saved: bool,
-}
-
-/// Snapshot the worktrees directory and pair each `thread-<short>` directory
-/// with its thread metadata. Sorted by `size_bytes` descending so the disk-
-/// usage page shows the largest worktrees first.
-///
-/// Skips legacy random-suffix worktrees and orphaned directories whose short
-/// id doesn't resolve to a thread — same rules as the cleanup worker.
-pub(crate) async fn inventory_worktrees(
-    pool: &sqlx::PgPool,
-    workspace_root: &Path,
-) -> Vec<WorktreeInventoryRow> {
-    let dir = worktrees_dir(workspace_root);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) => {
-            log!(
-                "[WorktreeCleanup] cannot read worktrees dir {}: {}",
-                dir.display(),
-                e
-            );
-            return Vec::new();
-        }
-    };
-    let mut rows: Vec<WorktreeInventoryRow> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Some(short) = parse_thread_short(name) else {
-            continue;
-        };
-        let thread_id = match lookup_thread_by_short(pool, &short).await {
-            Some(id) => id,
-            None => continue,
-        };
-        let size_bytes = directory_size_bytes(&path);
-        let is_dirty = is_worktree_dirty(&path).await;
-        let (title, is_saved) = lookup_thread_summary(pool, thread_id).await;
-        let last_activity = lookup_last_activity(pool, thread_id).await;
-        rows.push(WorktreeInventoryRow {
-            thread_id,
-            thread_title: title,
-            worktree_path: path.to_string_lossy().into_owned(),
-            size_bytes,
-            last_activity,
-            is_dirty,
-            is_saved,
-        });
-    }
-    rows.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-    rows
-}
-
-/// Resolve a `thread-<8-hex>` directory's short id back to a full `Uuid`
-/// by prefix-matching against the events table. The 8-char prefix is
-/// effectively unique across the per-workspace thread space (collision
-/// probability ~ N²/2³², so for ~10k threads/workspace the expected
-/// collisions are ≪ 1). On the rare collision — or any sqlx error —
-/// returns `None` so the caller skips the worktree. Refusing to act is
-/// always safer than acting on the wrong thread.
-async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> Option<Uuid> {
-    // The id column is uuid; cast to text for the prefix LIKE. We match
-    // against `aggregate_id` (the canonical per-event thread id) instead
-    // of the legacy `thread_id` column to stay aligned with the rest of
-    // the codebase.
-    let pattern = format!("{}%", short);
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT DISTINCT aggregate_id::uuid FROM events \
-         WHERE aggregate = 'thread' AND aggregate_id LIKE $1 \
-         LIMIT 2",
-    )
-    .bind(pattern)
-    .fetch_all(pool)
-    .await
-    .ok()?;
-    if rows.len() != 1 {
-        None
-    } else {
-        Some(rows[0].0)
-    }
-}
-
-/// Time since the most recent thread event, or `None` when no events exist
-/// (a stranded worktree) or the lookup fails. The cleanup worker treats
-/// `None` as "don't act" rather than guessing.
-async fn last_activity_age(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<Duration> {
-    let last = lookup_last_activity(pool, thread_id).await?;
-    let delta = Utc::now().signed_duration_since(last);
-    // Negative deltas (clock skew) round to zero so we don't accidentally
-    // treat a freshly-emitted event as ancient.
-    Some(delta.to_std().unwrap_or(Duration::ZERO))
-}
-
-async fn lookup_thread_summary(
-    pool: &sqlx::PgPool,
-    thread_id: Uuid,
-) -> (Option<String>, bool) {
-    let row: Option<(Option<String>, bool)> = sqlx::query_as(
-        "SELECT title, is_saved FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    match row {
-        Some((title, saved)) => (title, saved),
-        None => (None, false),
-    }
-}
-
-async fn lookup_last_activity(
-    pool: &sqlx::PgPool,
-    thread_id: Uuid,
-) -> Option<chrono::DateTime<Utc>> {
-    let row: Option<(Option<chrono::DateTime<Utc>>,)> = sqlx::query_as(
-        "SELECT MAX(created) FROM events \
-         WHERE aggregate = 'thread' AND aggregate_id = $1::text",
-    )
-    .bind(thread_id)
-    .fetch_optional(pool)
-    .await
-    .ok()?;
-    row.and_then(|(opt,)| opt)
-}
+#[path = "worktree_cleanup_ops.rs"]
+mod ops;
+pub(crate) use ops::*;
 
 #[cfg(test)]
-#[path = "worktree_cleanup_tests.rs"]
-mod tests;
+#[path = "worktree_cleanup_tests/common.rs"]
+mod common;
+
+#[cfg(test)]
+#[path = "worktree_cleanup_tests/tiers.rs"]
+mod tiers_tests;
+
+#[cfg(test)]
+#[path = "worktree_cleanup_tests/parsers.rs"]
+mod parsers_tests;
+
+#[cfg(test)]
+#[path = "worktree_cleanup_tests/stranded.rs"]
+mod stranded_tests;

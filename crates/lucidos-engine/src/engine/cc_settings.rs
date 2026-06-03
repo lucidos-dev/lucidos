@@ -50,6 +50,13 @@ pub(crate) fn build_cc_settings_json() -> String {
                         "type": "command",
                         "command": "lucidos cc-edit-preread"
                     }]
+                },
+                {
+                    "matcher": "Write",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "lucidos cc-edit-preread"
+                    }]
                 }
             ],
             "Stop": [{
@@ -141,6 +148,25 @@ mod tests {
         assert_eq!(
             read_entry["hooks"][0]["command"], "lucidos cc-read-coerce",
             "must invoke the cc-read-coerce subcommand the engine ships",
+        );
+    }
+
+    #[test]
+    fn json_registers_pretooluse_hook_for_write_preread() {
+        // Write also requires a prior Read for existing files; without
+        // the matcher those calls bypass the preread hook entirely.
+        let json = build_cc_settings_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries = parsed["hooks"]["PreToolUse"].as_array().expect("array");
+        let write_entry = entries
+            .iter()
+            .find(|e| e["matcher"] == "Write")
+            .expect("must register a Write matcher");
+        assert_eq!(write_entry["hooks"][0]["type"], "command");
+        assert_eq!(
+            write_entry["hooks"][0]["command"], "lucidos cc-edit-preread",
+            "Write matcher must reuse the cc-edit-preread command — the hook \
+             reads tool_name from the payload to switch behaviour"
         );
     }
 

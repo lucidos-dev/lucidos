@@ -361,4 +361,33 @@ mod tests {
         let loaded = load_key_file(&path).unwrap().unwrap();
         assert_eq!(key, loaded);
     }
+
+    /// The scheduled backup (and the manual path) rely on `ensure_key` to never
+    /// skip when no key exists: it must generate + persist a fresh 32-byte key
+    /// at the workspace's `.lucidos/backup.key`, then return the same key
+    /// idempotently on subsequent calls. This is the exact shared helper the
+    /// scheduled cron now uses instead of skipping the backup.
+    #[test]
+    fn test_ensure_key_generates_when_absent_and_is_idempotent() {
+        let workspace = tempfile::tempdir().unwrap();
+        let key_path = crate::core::backup::key_file_path(workspace.path());
+
+        // No pre-existing key — the scheduled-backup precondition.
+        assert!(load_key_file(&key_path).unwrap().is_none());
+
+        // First call generates + persists: is_new is true, never a skip.
+        let (key, is_new) = ensure_key(workspace.path()).unwrap();
+        assert!(is_new, "first ensure_key must report a freshly generated key");
+        assert_eq!(key.len(), 32, "generated key must be a 32-byte AES-256 key");
+
+        // The key landed at the same path the manual path writes to, in the
+        // same base64-on-disk format `load_key_file` round-trips.
+        assert!(key_path.exists());
+        assert_eq!(load_key_file(&key_path).unwrap().unwrap(), key);
+
+        // Second call is idempotent: same key, no regeneration.
+        let (key2, is_new2) = ensure_key(workspace.path()).unwrap();
+        assert!(!is_new2, "second ensure_key must reuse the existing key");
+        assert_eq!(key, key2);
+    }
 }

@@ -21,6 +21,12 @@ Knowhow captures *technical detail you'd otherwise re-derive*: API quirks, paylo
 
 If a fact is stable across users and would be the same in every workspace, it might belong in `docs/` or `system-knowhow/` instead. If it's specific to *this* workspace's setup, it's knowhow.
 
+## Lifecycle: load-once-stays-loaded
+
+When the engine LLM calls `load_knowhow` on a doc, the body lives in the `[LOADED KNOWHOW]` block of every subsequent turn's user message — the LLM does **not** need to re-call `load_knowhow` for the same id later in the thread. Calling it twice for the same id is a no-op (the loaded set is keyed by id; the second insert overwrites with the same body). The engine restores the loaded set from events on restart, so the doc stays loaded across engine restarts within the same thread. There is no auto-unload and no LRU; once loaded, a knowhow doc stays loaded for the whole thread's lifetime — matching Claude Code Skills (loaded once → persists for the session) and Codex AGENTS.md (re-sent each turn via stateless conversation history).
+
+Practical implication for knowhow authors: write the body assuming it will be in context for the rest of the thread once it's been loaded. Don't structure it to be re-read on each turn, and don't worry about it being evicted partway through. The LLM Context Viewer surfaces loaded docs under the **Loaded knowhow** tier inside the user-message group so you can see exactly what's currently in context.
+
 ## Questions to settle with the user before creating
 
 A new top-level knowhow file shows up in retrieval forever — confirm before adding one. Skip questions only when the user has already answered them.

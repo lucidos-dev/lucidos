@@ -1,0 +1,1016 @@
+//! The chat-turn orchestrator: `process_message_with_steps_internal`. Walks the
+//! per-turn pipeline — routing fast-paths, thread registration, the
+//! MessageReceived boundary, title emission, history + system-prompt + context
+//! assembly, and the agentic loop. The big sub-phases live in sibling modules
+//! (`titles`, `history`, `system_prompt`, `context_sections`); this file wires
+//! them together exactly as the original single function did.
+
+use crate::core::{PreferenceStore, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY};
+use crate::engine::context::{agent_context_char_budget, trim_history_from_oldest};
+use crate::engine::thread_events::{ActorMode, EventChannel, MessageOrigin};
+use crate::engine::types::*;
+use crate::engine::LucidosEngine;
+use crate::llm::{
+    get_default_tools, get_image_generation_tool, get_mcp_tools, get_notification_tool,
+    get_save_thread_image_tool, Message,
+};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use super::super::events::{describe_images, emit_routing_failure, make_message_received};
+use super::super::images::{build_user_content_with_images, save_images_to_tmp};
+use super::super::process_helpers::{
+    build_trigger_started_event, classify_or_fallback, TriggerContext,
+};
+use super::context_build::{build_capture_sections, build_loaded_knowhow_block};
+
+impl LucidosEngine {
+    /// Internal: Process a message with optional trigger context
+    // Same wide signature as `process_message_with_steps` plus trigger context.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn process_message_with_steps_internal(
+        &self,
+        user_message: &str,
+        model_override: Option<&str>,
+        trigger: Option<TriggerContext>, // None for user-driven chat; Some when fired by the scheduler
+        app_context: Option<AppContext>, // app context if chatting from within an app
+        file_context: Option<String>,    // file path if user is viewing a file
+        reasoning_effort: Option<&str>,  // unified reasoning level: none/low/medium/high/xhigh/max
+        user_images: Option<&[crate::api::ChatImage]>, // base64-encoded images pasted by user
+        device_id: Option<&str>,         // device that sent this message
+        use_claude_code: Option<bool>,   // bypass LLM and spawn Claude Code directly
+        event_id: Option<&str>,          // client-generated UUID for reliable matching
+        thread_id: Option<Uuid>,         // None = new thread, Some = follow-up
+        conflict_change_id: Option<Uuid>, // change ID for merge conflict resolution
+        repo_id: Option<&str>,           // external repository ID for CC worktree
+        url_context: Option<crate::api::UrlContext>, // webpage content from Tauri panel webview
+        parent_thread_id: Option<Uuid>,  // parent thread if spawned by run_thread
+        spawning_event_id: Option<Uuid>, // event in parent thread that triggered the spawn (mode != Human only)
+        mode: ActorMode,
+        cc_model: Option<&str>, // CC-specific model override (from compose view pre-session selection)
+        pre_emitted_origin: Option<Uuid>, // skip MessageReceived if already emitted by spawn_thread
+        title: Option<&str>,    // caller-provided title (skips async LLM title gen)
+        origin: Option<MessageOrigin>,
+        external_cancel: Option<CancellationToken>, // forwarded into the per-thread cancel_token (used by triggers)
+    ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
+        let chat_start = std::time::Instant::now();
+        // Track whether a pending change was proposed during this request
+        // (set to true when Claude Code proposes changes, used to trigger SSE broadcast)
+        let mut proposed_change = false;
+
+        // Mutable so the non-CC fast-path can mark the event as already on
+        // the wire when injection loses the race with a thread that completed
+        // between the has_active check and the send — the slow path then
+        // skips its own MessageReceived emit to avoid a duplicate.
+        let mut pre_emitted_origin = pre_emitted_origin;
+
+        let is_trigger = trigger.is_some();
+
+        // `None` here means "use the user's chat defaults", not "use
+        // `LlmProvider::default_model()`" — which strips the `[1m]` suffix and
+        // doesn't carry an effort, so without this resolve the stamp drifts
+        // away from the user's selection on every internal re-entry path.
+        let (resolved_model, resolved_effort) = PreferenceStore::resolve_chat_overrides(
+            &self.pool,
+            model_override.map(str::to_string),
+            reasoning_effort.map(str::to_string),
+        )
+        .await;
+        let model_override = resolved_model.as_deref();
+        let reasoning_effort = resolved_effort.as_deref();
+
+        // Resolve device tooltip info for the MessageReceived event
+        let device_name = if let Some(did) = device_id {
+            crate::core::DeviceStore::tooltip_info(&self.pool, did).await
+        } else {
+            None
+        };
+
+        // Spawn Flash image description in background (don't block main LLM flow).
+        // Returns `(description, model)` so the agentic loop can emit
+        // `ImageDescribed { model, .. }` with the actual model that produced
+        // the description (the user's `model_image_description` preference, or
+        // the extractor's default when the preference is empty / "default").
+        let description_handle = if let (Some(imgs), Some(ref extractor)) =
+            (user_images, &self.extractor)
+        {
+            if !imgs.is_empty() {
+                let img_desc_model = PreferenceStore::get(&self.pool, PREF_MODEL_IMAGE_DESCRIPTION)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                match extractor.provider_for_model(&img_desc_model) {
+                    Ok(provider) => {
+                        // Resolve the model name we'll record on the event. The
+                        // pref string wins when set; otherwise fall back to the
+                        // provider's default (which is the model the call actually
+                        // hits via `provider_for_model`'s "" / "default" branch).
+                        let recorded_model =
+                            if img_desc_model.is_empty() || img_desc_model == "default" {
+                                use crate::llm::provider::LlmProvider;
+                                provider.default_model().to_string()
+                            } else {
+                                img_desc_model
+                            };
+                        let imgs: Vec<crate::api::ChatImage> = imgs.to_vec();
+                        Some(tokio::spawn(async move {
+                            match describe_images(&provider, &imgs).await {
+                                Ok(desc) => Some((desc, recorded_model)),
+                                Err(e) => {
+                                    log!("[Chat] Image description failed: {}", e);
+                                    None
+                                }
+                            }
+                        }))
+                    }
+                    Err(e) => {
+                        log!("[Chat] Failed to build image-description provider: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Generate a per-request ID for ProcessResult tracking
+        let request_id = Uuid::new_v4();
+        // A new thread is one where the caller didn't supply a thread_id
+        // (backwards compat: if no thread_id, use request_id).
+        // The frontend now always sends thread_id, but scheduled tasks and
+        // tool-invoked CC may still omit it.
+        let is_new_thread = thread_id.is_none();
+        let thread_id = thread_id.unwrap_or(request_id);
+        let thread_id_str = thread_id.to_string();
+
+        // AskUserQuestion free-form path: if the thread is currently waiting
+        // on a `UserQuestionAsked` and the user typed instead of clicking an
+        // option, route the message to the answer-question handler with
+        // `FreeText` instead of creating a new exchange. Applies to BOTH chat
+        // and CC threads — the chat agent's `ask_user_question` tool blocks
+        // on the same wait registry as CC's hook, so without this routing the
+        // typed text would spawn a brand-new turn while the prior turn's tool
+        // stays blocked, leaving the thread stuck "Requesting" forever.
+        //
+        // Uses `lookup_active_question_tool_use_id` (not `..pending..`) so a
+        // question orphaned by a prior `ResponseAborted`/`Canceled`/`Failed`/
+        // `CodingAgentIdled` doesn't intercept the follow-up — otherwise the
+        // typed text would be silently consumed as the dead question's answer
+        // and `MessageReceived` would never be emitted.
+        if !is_new_thread && !user_message.is_empty() {
+            if let Some(pending_tool_use_id) =
+                crate::engine::agent_question::lookup_active_question_tool_use_id(
+                    self.pool(),
+                    thread_id,
+                )
+                .await
+            {
+                use crate::engine::agent_question::{answer_pending_question, AnswerResult};
+                use crate::engine::thread_events::AnswerKind;
+                let engine_arc: std::sync::Arc<Self> = self.clone_arc();
+                let answer = AnswerKind::FreeText {
+                    text: user_message.to_string(),
+                };
+                match answer_pending_question(
+                    &engine_arc,
+                    thread_id,
+                    pending_tool_use_id,
+                    answer,
+                    origin.clone(),
+                )
+                .await
+                {
+                    AnswerResult::Resumed => {
+                        log!(
+                            "[Chat] Free-form answer routed to pending question for thread {}",
+                            thread_id
+                        );
+                    }
+                    AnswerResult::Conflict(msg) => {
+                        log!(
+                            "[Chat] Free-form answer conflict for thread {}: {}",
+                            thread_id,
+                            msg
+                        );
+                        emit_routing_failure(&self.event_bus, thread_id, &msg).await?;
+                    }
+                }
+                return Ok(ProcessResult {
+                    response: String::new(),
+                    steps: vec![],
+                    images: vec![],
+                    request_id,
+                    thread_id,
+                    proposed_change: false,
+                    auto_apply: false,
+                    orphaned_injections: vec![],
+                });
+            }
+        }
+
+        // Permission supersede: if this CC thread is waiting on a permission
+        // card and the user typed a message instead of clicking a button,
+        // resolve the pending permission(s) as denied so the card's buttons
+        // stop dangling — otherwise the thread reads as stuck on the prompt
+        // while CC moves on, and clicking the (still-rendered) buttons 404s
+        // once CC interrupts and the in-memory waiter is gc'd. Unlike the
+        // question free-form path above, this does NOT consume the message —
+        // the typed text still routes to CC below as a normal follow-up.
+        if use_claude_code == Some(true) && !is_new_thread && !user_message.is_empty() {
+            crate::engine::cc_permission::resolve_pending_permissions_as_superseded(
+                self.pool(),
+                &self.event_bus,
+                &self.pending_cc_permission,
+                thread_id,
+                origin.clone(),
+            )
+            .await;
+        }
+
+        // Fast-path for CC follow-ups: route via msg_tx BEFORE register_thread_queued
+        // so a follow-up arriving during an active Claude Code session is picked up by the
+        // running event loop instead of spawning a new Claude Code session (or blocking on
+        // the prior turn's still-held ThreadGuard).
+        //
+        // This handles both idle sessions (msg picked up immediately) and busy sessions
+        // (msg queued in the channel, picked up after current work finishes).
+        if use_claude_code == Some(true) && !is_new_thread {
+            // Check if there's a live Claude Code session to route to.
+            let has_session = {
+                let sessions = self.agent_sessions.lock().await;
+                sessions
+                    .get(&thread_id)
+                    .map(|s| !s.process_exited)
+                    .unwrap_or(false)
+            };
+
+            // Race-bridge: when CC's spawn is still in flight, agent_sessions
+            // is empty but active_threads holds the thread. Wait for the
+            // session to register so this follow-up routes via msg_tx as the
+            // fast-path intends. See `wait_for_cc_session_alive`.
+            let has_session = has_session
+                || super::super::process_helpers::wait_for_cc_session_alive(
+                    &self.agent_sessions,
+                    &self.active_threads,
+                    thread_id,
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_millis(100),
+                )
+                .await;
+
+            if has_session {
+                // Emit MessageReceived FIRST — guarantees it gets a lower sequence
+                // number and earlier timestamp than CodingAgentPromptSent (emitted by
+                // the CC event loop when it picks up the message). Without this
+                // ordering, CodingAgentPromptSent can race ahead and end up in the
+                // wrong exchange, causing a brief "interrupted" flash and incorrect
+                // thread section placement.
+                //
+                // Skip the emit on a child-wake (`pre_emitted_origin` set) — see
+                // `AgentInputKind::WakeFromChild` docs.
+                let (origin_event_id, input_kind) = if let Some(id) = pre_emitted_origin {
+                    (Some(id), AgentInputKind::WakeFromChild)
+                } else {
+                    use crate::engine::thread_events::EventMeta;
+                    self.event_bus
+                        .emit(crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: make_message_received(
+                                &self.workspace_path,
+                                user_message,
+                                user_images,
+                                device_id,
+                                device_name,
+                                parent_thread_id,
+                                spawning_event_id,
+                                mode,
+                                None,
+                                None,
+                                origin.clone(),
+                            ),
+                            meta: EventMeta {
+                                event_id: event_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                                channel: Some(EventChannel::ClaudeCode),
+                                ..EventMeta::NONE
+                            },
+                        })
+                        .await?;
+                    (
+                        event_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                        AgentInputKind::User,
+                    )
+                };
+
+                let images = user_images.map(|imgs| imgs.to_vec());
+                let send_ok = {
+                    let sessions = self.agent_sessions.lock().await;
+                    if let Some(session) = sessions.get(&thread_id) {
+                        if !session.process_exited {
+                            // Track the expected Result before sending. If the
+                            // send fails (channel dropped between the lookup
+                            // and the send), undo the increment so the
+                            // existing session's idle-exit cancel doesn't get
+                            // suppressed by a phantom pending follow-up.
+                            session
+                                .pending_followups
+                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                            let send_result = session.msg_tx.send(AgentUserInput {
+                                text: user_message.to_string(),
+                                images,
+                                origin_event_id,
+                                kind: input_kind,
+                            });
+                            if send_result.is_err() {
+                                session
+                                    .pending_followups
+                                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                                false
+                            } else {
+                                true
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                if !send_ok {
+                    // `emit_routing_failure` lands the terminator and returns
+                    // Ok; the explicit Ok(ProcessResult) return below keeps
+                    // the outer api/chat handler from emitting a second one
+                    // from its Err branch.
+                    emit_routing_failure(
+                        &self.event_bus,
+                        thread_id,
+                        "Claude Code session ended while routing message. Please try again.",
+                    )
+                    .await?;
+                    log!(
+                        "[Chat] CC follow-up routing failed for thread {} — emitted ResponseFailed",
+                        thread_id,
+                    );
+                } else {
+                    log!("[Chat] CC follow-up routed via msg_tx for thread {} (bypassed register_thread_queued)", thread_id);
+                }
+                return Ok(ProcessResult {
+                    response: String::new(),
+                    steps: vec![],
+                    images: vec![],
+                    request_id,
+                    thread_id,
+                    proposed_change: false,
+                    auto_apply: false,
+                    orphaned_injections: vec![],
+                });
+            }
+        }
+
+        // Fast-path for non-CC follow-ups: if the thread already has an active
+        // agentic loop, inject the message (with images) mid-flight instead of
+        // blocking in register_thread_queued for up to 60s. This mirrors the CC
+        // fast-path above but uses injection_tx instead of msg_tx.
+        if use_claude_code != Some(true) && !is_new_thread {
+            let has_active = {
+                let threads = self.active_threads.lock().unwrap();
+                threads.contains_key(&thread_id)
+            };
+
+            if has_active {
+                // Emit MessageReceived FIRST — same ordering guarantee as the CC
+                // fast-path. The agentic loop emits UserPromptInjected when it
+                // picks up the injection; without this ordering, UserPromptInjected
+                // can race ahead and create a duplicate exchange boundary.
+                //
+                // Skip the emit on a child-wake (`pre_emitted_origin` set) and
+                // inject as `WakeFromChild` instead — see
+                // `InjectedPromptKind::WakeFromChild` docs.
+                use crate::engine::thread_events::EventMeta;
+                let inject_kind = if pre_emitted_origin.is_some() {
+                    crate::engine::InjectedPromptKind::WakeFromChild
+                } else {
+                    let emit_result = self
+                        .event_bus
+                        .emit(crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: make_message_received(
+                                &self.workspace_path,
+                                user_message,
+                                user_images,
+                                device_id,
+                                device_name.clone(),
+                                parent_thread_id,
+                                spawning_event_id,
+                                mode,
+                                model_override,
+                                reasoning_effort,
+                                origin.clone(),
+                            ),
+                            meta: EventMeta {
+                                event_id: event_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                                channel: Some(EventChannel::Chat),
+                                ..EventMeta::NONE
+                            },
+                        })
+                        .await?;
+                    // Stash the emit for the race-recovery handoff below.
+                    if let Some(result) = emit_result {
+                        pre_emitted_origin = Some(result.event_id);
+                    }
+                    crate::engine::InjectedPromptKind::UserText
+                };
+
+                let images = user_images.map(|imgs| imgs.to_vec());
+                let injected = {
+                    let threads = self.active_threads.lock().unwrap();
+                    if let Some(handle) = threads.get(&thread_id) {
+                        handle
+                            .injection_tx
+                            .send(crate::engine::InjectedPrompt {
+                                text: user_message.to_string(),
+                                event_id: event_id.and_then(|s| Uuid::parse_str(s).ok()),
+                                mode,
+                                spawning_event_id,
+                                images,
+                                origin: origin.clone(),
+                                kind: inject_kind,
+                            })
+                            .is_ok()
+                    } else {
+                        false
+                    }
+                };
+
+                if injected {
+                    log!("[Chat] Follow-up injected into active thread {} (bypassed register_thread_queued)", thread_id);
+                    return Ok(ProcessResult {
+                        response: String::new(),
+                        steps: vec![],
+                        images: vec![],
+                        request_id,
+                        thread_id,
+                        proposed_change: false,
+                        auto_apply: false,
+                        orphaned_injections: vec![],
+                    });
+                }
+
+                // Injection failed — the agentic loop completed (and dropped its
+                // injection receiver) between the has_active check and the send.
+                // Fall through to the slow path so register_thread_queued can
+                // start a fresh loop for this message. The slow path uses
+                // `pre_emitted_origin` (set above whether MessageReceived was
+                // freshly emitted OR the caller passed it for a child-wake) so
+                // it doesn't double-emit a starter event.
+                log!(
+                    "[Chat] Follow-up injection lost the race for thread {} — falling back to slow path",
+                    thread_id
+                );
+            }
+        }
+
+        // Wait for any in-progress request on this thread to finish, then register.
+        // This queues follow-up messages instead of cancelling in-progress work.
+        // The _guard ensures the thread is automatically unregistered on all exit
+        // paths (normal return, error, or panic) via its Drop impl.
+        let (cancel_token, mut injection_rx, _guard) = self.register_thread_queued(thread_id).await;
+
+        // Trigger-driven runs hand the scheduler's per-trigger cancel down here.
+        // Forward it onto the per-thread token so deleting/disabling/updating the
+        // trigger mid-flight signals the agentic loop to exit cleanly (the loop
+        // observes `cancel_token` between iterations) instead of being aborted
+        // — which would tear it down mid-tool and leave the thread "running".
+        // The DropGuard fires when this fn returns so the forwarder exits even
+        // when the trigger completes without `ext` ever being cancelled —
+        // otherwise one forwarder leaks per trigger run.
+        let _forwarder_done_guard = external_cancel.map(|ext| {
+            let thread_token = cancel_token.clone();
+            let done = CancellationToken::new();
+            let done_in_forwarder = done.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = ext.cancelled() => { thread_token.cancel(); }
+                    _ = done_in_forwarder.cancelled() => {}
+                }
+            });
+            done.drop_guard()
+        });
+
+        // RequestId was used by the forwarder to route events — no longer needed
+        // since the bus emits directly with thread_id.
+
+        // Persist + broadcast the exchange boundary event via EventBus.
+        // When pre_emitted_origin is set, MessageReceived was already emitted by
+        // spawn_thread — skip to avoid double-emitting (and double-incrementing
+        // the parent's active_children_count).
+        use crate::engine::thread_events::EventMeta;
+        let origin_id = if let Some(id) = pre_emitted_origin {
+            id
+        } else {
+            let (user_thread_event, user_meta) = if let Some(ref tc) = trigger {
+                build_trigger_started_event(
+                    &tc.trigger_id,
+                    &tc.trigger_name,
+                    &tc.invocation,
+                    user_message,
+                    tc.go_to_review,
+                )
+            } else {
+                let is_cc = use_claude_code == Some(true);
+                let (req_model, req_effort) = if is_cc {
+                    (None, None)
+                } else {
+                    (model_override, reasoning_effort)
+                };
+                (
+                    make_message_received(
+                        &self.workspace_path,
+                        user_message,
+                        user_images,
+                        device_id,
+                        device_name.clone(),
+                        parent_thread_id,
+                        spawning_event_id,
+                        mode,
+                        req_model,
+                        req_effort,
+                        origin.clone(),
+                    ),
+                    EventMeta {
+                        event_id: event_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                        channel: Some(if is_cc {
+                            EventChannel::ClaudeCode
+                        } else {
+                            EventChannel::Chat
+                        }),
+                        ..EventMeta::NONE
+                    },
+                )
+            };
+
+            let emit_result = self
+                .event_bus
+                .emit(crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event: user_thread_event,
+                    meta: user_meta,
+                })
+                .await?
+                .expect("persisted event must return EmitResult");
+            emit_result.event_id
+        };
+
+        // Auto-save images to .lucidos/tmp/images/ so the LLM can reference them by path
+        let saved_image_paths = if let Some(imgs) = user_images {
+            save_images_to_tmp(&self.workspace_path, imgs)
+        } else {
+            Vec::new()
+        };
+
+        self.maybe_emit_titles(
+            thread_id,
+            &thread_id_str,
+            title,
+            is_trigger,
+            is_new_thread,
+            &trigger,
+            user_message,
+            user_images,
+        )
+        .await?;
+
+        // `_guard` MUST stay alive across this await so cancel_thread lands
+        // on the per-thread cancel_token (see process_cc.rs module doc).
+        if use_claude_code == Some(true) {
+            // Agent-spawned threads via a parent's tool call (run_thread →
+            // spawn_agent_thread) skip the 250ms CC_SPAWN_DEBOUNCE — no
+            // user keyboard in the loop, no rapid-fire to coalesce.
+            // Discriminator: mode=Agent + parent linkage (the spawn comes
+            // from a tool call). Wake-from-child callbacks also pass
+            // mode=Agent but have parent_thread_id=None, so they keep
+            // coalescing as before.
+            let skip_coalesce = mode == ActorMode::Agent
+                && parent_thread_id.is_some()
+                && spawning_event_id.is_some();
+            return self
+                .run_cc_chat_branch(
+                    thread_id,
+                    request_id,
+                    user_message,
+                    user_images,
+                    repo_id,
+                    cc_model,
+                    reasoning_effort,
+                    conflict_change_id,
+                    origin_id,
+                    spawning_event_id,
+                    &cancel_token,
+                    chat_start,
+                    skip_coalesce,
+                )
+                .await;
+        }
+
+        // Snapshot RwLock values once per request
+        let user_timezone = self.user_timezone.read().await.clone();
+        let user_language = self.user_language.read().await.clone();
+        let user_profile = self.user_profile.read().await.clone();
+
+        // Read memory model preference once for use in summarization and classification
+        let memory_model_pref = PreferenceStore::get(&self.pool, PREF_MODEL_MEMORY)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        // Resume tool blocks + conversation history + per-thread loaded
+        // knowhow, all derived from a single events fetch (see
+        // `load_chat_history`).
+        let super::history::ChatHistoryLoad {
+            resume_tool_blocks,
+            loaded_knowhow_docs,
+            mut history_context,
+            conversation_summary,
+            history_image_hashes,
+        } = self
+            .load_chat_history(
+                is_trigger,
+                is_new_thread,
+                thread_id,
+                &thread_id_str,
+                user_message,
+                &memory_model_pref,
+            )
+            .await;
+
+        // Build extraction context for tool execution (artifact writes, imports)
+        let base_ctx = self.extraction_context_base().await;
+        let extraction_ctx =
+            Self::extraction_context_with_conversation(&base_ctx, &conversation_summary);
+
+        // Memory indexing is handled by the EventBus memory consumer —
+        // it reacts to persisted MessageReceived/ResponseGenerated events.
+
+        let classification = {
+            if let Some(ref extractor) = self.extractor {
+                let ctx = if conversation_summary.is_empty() {
+                    None
+                } else {
+                    Some(conversation_summary.as_str())
+                };
+                classify_or_fallback(extractor.classify_query(
+                    user_message,
+                    ctx,
+                    Some(&memory_model_pref),
+                ))
+                .await
+            } else {
+                crate::memory::QueryClassification::default()
+            }
+        };
+
+        // Retrieve relevant context from memory (skipped if classification says not needed)
+        let response_meta = crate::engine::thread_events::EventMeta {
+            request_event_id: Some(origin_id),
+            channel: if is_trigger {
+                Some(EventChannel::Trigger)
+            } else {
+                None
+            },
+            ..crate::engine::thread_events::EventMeta::NONE
+        };
+        let (mut memory_context, memory_results) =
+            self.retrieve_context(user_message, &classification).await;
+
+        // Emit MemorySearched step so the frontend can show it
+        if classification.needs_memory {
+            self.event_bus
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::Thread {
+                        thread_id,
+                        event: crate::engine::thread_events::ThreadEvent::MemorySearched {
+                            results: memory_results,
+                            queries: classification.sub_queries.clone(),
+                        },
+                        meta: response_meta,
+                    },
+                    "[Chat] MemorySearched",
+                )
+                .await;
+        }
+
+        let (system_prompt, missing_pref_keys, image_provider_available) = self
+            .build_chat_system_prompt(
+                &user_timezone,
+                &user_language,
+                device_id,
+                is_trigger,
+                &trigger,
+            )
+            .await;
+
+        if !memory_context.is_empty() {
+            log!(@Memory, "Retrieved {}KB of context", memory_context.len() / 1024);
+        }
+
+        let super::context_sections::ChatContextSections {
+            file_list_context,
+            profile_context,
+            credentials_context,
+            email_accounts_context,
+            oauth_context,
+            app_context_section,
+            file_context_section,
+            url_context_section,
+            thread_depth_context,
+        } = self
+            .build_chat_context_sections(
+                &classification,
+                &user_profile,
+                app_context.as_ref(),
+                file_context.as_deref(),
+                url_context.as_ref(),
+                parent_thread_id,
+            )
+            .await;
+
+        let mut tools = get_default_tools();
+        tools.push(get_notification_tool());
+        tools.push(crate::llm::get_read_notifications_tool());
+        tools.push(crate::llm::get_navigate_ui_tool());
+        tools.push(crate::llm::get_manage_repositories_tool());
+        tools.push(get_save_thread_image_tool());
+        if image_provider_available {
+            tools.push(get_image_generation_tool());
+        }
+        tools.extend(get_mcp_tools());
+        // Add discovered tools from running MCP servers
+        tools.extend(self.mcp_manager.get_tool_definitions().await);
+
+        let response_channel: Option<EventChannel> = if is_trigger {
+            Some(EventChannel::Trigger)
+        } else {
+            None
+        };
+
+        // Budget for messages = model-derived total budget minus system prompt + tool
+        // definitions overhead. The budget scales with the resolved model's context
+        // window (e.g. ~1.49M chars for Opus `[1m]` vs ~288k chars for default
+        // 200k-token Claude), so Opus turns aren't trimmed back to the smaller
+        // model's limit.
+        let resolved_model = model_override.unwrap_or_else(|| self.llm.default_model());
+        let total_budget = agent_context_char_budget(resolved_model);
+        let prompt_overhead: usize = system_prompt.len()
+            + tools
+                .iter()
+                .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len() + 100)
+                .sum::<usize>();
+        let message_budget = total_budget.saturating_sub(prompt_overhead);
+
+        // `loaded_knowhow_docs` was already populated up in the follow-up
+        // branch (or left empty for triggers / new threads). Build the block
+        // here so its byte size counts against fixed_size below — knowhow
+        // bodies can be large and were previously un-budgeted.
+        let loaded_knowhow_block = build_loaded_knowhow_block(&loaded_knowhow_docs);
+
+        // Trim expendable context sections if the initial message would exceed budget
+        let fixed_size = profile_context.len()
+            + file_list_context.len()
+            + credentials_context.len()
+            + email_accounts_context.len()
+            + oauth_context.len()
+            + app_context_section.len()
+            + file_context_section.len()
+            + url_context_section.len()
+            + loaded_knowhow_block.as_deref().map_or(0, str::len)
+            + user_message.len()
+            + 500; // 500 for formatting
+        let expendable_budget = message_budget.saturating_sub(fixed_size);
+        let expendable_size = memory_context.len() + history_context.len();
+        if expendable_size > expendable_budget {
+            log!("[Chat] Initial context ({}KB) exceeds message budget ({}KB, prompt overhead {}KB), trimming",
+                (fixed_size + expendable_size) / 1024, message_budget / 1024, prompt_overhead / 1024);
+            let excess = expendable_size - expendable_budget;
+            // Trim memory first (most expendable), then history from oldest (start)
+            if memory_context.len() >= excess {
+                memory_context.truncate(memory_context.len() - excess);
+                if let Some(pos) = memory_context.rfind('\n') {
+                    memory_context.truncate(pos);
+                }
+            } else {
+                let remaining = excess - memory_context.len();
+                memory_context.clear();
+                // Trim oldest history first — preserves recent messages
+                trim_history_from_oldest(&mut history_context, remaining);
+            }
+        }
+
+        // Build user message from contextual sections
+        let mut user_message_parts: Vec<&str> = Vec::new();
+        if !profile_context.is_empty() {
+            user_message_parts.push(&profile_context);
+        }
+        if !memory_context.is_empty() {
+            user_message_parts.push(&memory_context);
+        }
+        if !history_context.is_empty() {
+            user_message_parts.push(&history_context);
+        }
+        if !file_list_context.is_empty() {
+            user_message_parts.push(&file_list_context);
+        }
+        if !credentials_context.is_empty() {
+            user_message_parts.push(&credentials_context);
+        }
+        if !email_accounts_context.is_empty() {
+            user_message_parts.push(&email_accounts_context);
+        }
+        if !oauth_context.is_empty() {
+            user_message_parts.push(&oauth_context);
+        }
+        // Phase 3: per-thread loaded knowhow gets a dedicated section between
+        // workspace inventory (oauth/credentials/etc.) and active context
+        // (app/file/url) — the semantic tier between "what exists in this
+        // workspace" and "what the user is currently working with". Phase 4
+        // stubs the matching resume tool blocks so the body isn't billed
+        // twice. The block lives in this turn's user message because the
+        // LLM cannot see across turns without it (the resume blocks no
+        // longer carry the body). Built earlier so its bytes count against
+        // `fixed_size` for the trim-or-not decision.
+        if let Some(block) = loaded_knowhow_block.as_deref() {
+            user_message_parts.push(block);
+        }
+        if !app_context_section.is_empty() {
+            user_message_parts.push(&app_context_section);
+        }
+        if !file_context_section.is_empty() {
+            user_message_parts.push(&file_context_section);
+        }
+        if !url_context_section.is_empty() {
+            user_message_parts.push(&url_context_section);
+        }
+        if !thread_depth_context.is_empty() {
+            user_message_parts.push(&thread_depth_context);
+        }
+        // Add stopped MCP servers context so the LLM knows they exist.
+        // Initialised to empty `String` (not a conditional `let mcp_stopped_context;`)
+        // so the same `&str` reference can be reused by `build_capture_sections`
+        // below without violating control-flow init checks. Empty strings are
+        // filtered out of both the user-message parts and the capture rows.
+        let stopped_summaries = self.mcp_manager.get_stopped_server_summaries().await;
+        let mcp_stopped_context = if !stopped_summaries.is_empty() {
+            format!(
+                "[STOPPED MCP SERVERS]\nThese MCP servers are configured but not running:\n{}\n[END STOPPED MCP SERVERS]",
+                stopped_summaries.join("\n")
+            )
+        } else {
+            String::new()
+        };
+        if !mcp_stopped_context.is_empty() {
+            user_message_parts.push(&mcp_stopped_context);
+        }
+        let setup_reminder = if !is_trigger && !missing_pref_keys.is_empty() {
+            let missing_list = missing_pref_keys.join(", ");
+            format!("CRITICAL: The following preferences are not set: {}. Do NOT proceed with the user's request. Ask the user to configure these first.", missing_list)
+        } else {
+            String::new()
+        };
+        if !setup_reminder.is_empty() {
+            user_message_parts.push(&setup_reminder);
+        }
+        let request_line = format!("Request: {}", user_message);
+        user_message_parts.push(&request_line);
+
+        let user_message_text = {
+            let base = user_message_parts.join("\n\n");
+            if saved_image_paths.is_empty() {
+                base
+            } else {
+                let path_annotations: Vec<String> = saved_image_paths
+                    .iter()
+                    .map(|p| format!("[Image saved to {}]", p))
+                    .collect();
+                format!("{}\n\n{}", base, path_annotations.join("\n"))
+            }
+        };
+
+        // Section *shape* (name + char_count) is always built so the
+        // modal can render the breakdown; only the body is gated by
+        // `capture_context`. Body cap (8 KB) prevents a 100 KB system
+        // prompt from bloating every events row. The actual assembly —
+        // tagging each section with role + inner-tier group, plus the
+        // per-loaded-knowhow and per-resume-tool-pair rows — lives in
+        // `build_capture_sections` so it can be unit-tested without
+        // standing up a full engine.
+        let capture_body = PreferenceStore::capture_context(&self.pool).await?;
+        let capture_sections = build_capture_sections(
+            &system_prompt,
+            &profile_context,
+            &file_list_context,
+            &credentials_context,
+            &email_accounts_context,
+            &oauth_context,
+            &memory_context,
+            &history_context,
+            &app_context_section,
+            &file_context_section,
+            &url_context_section,
+            &mcp_stopped_context,
+            &setup_reminder,
+            &thread_depth_context,
+            user_message,
+            &loaded_knowhow_docs,
+            &resume_tool_blocks,
+            capture_body,
+        );
+        let capture_tools: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+        let capture_model = resolved_model.to_string();
+
+        let user_content = build_user_content_with_images(
+            user_message_text,
+            &self.workspace_path,
+            &history_image_hashes,
+            user_images,
+        );
+
+        // Prepend reconstructed (ToolUse, ToolResult) Message pairs for the
+        // most recent N tool calls (Phase 3). This keeps tool result bodies —
+        // notably `load_knowhow` recipe contents — alive across resumes so
+        // multi-step trigger pipelines don't collapse to the stringified
+        // `[tools: ...]` summary on the next turn. See
+        // `core::store::build_resume_tool_blocks_with_skip_ids`.
+        let mut messages = resume_tool_blocks;
+        messages.push(Message {
+            role: "user".to_string(),
+            content: user_content,
+        });
+
+        // Run the agentic loop (LLM call → parse response → execute tools → repeat)
+        let mut terminator_emitted = false;
+        let result = self
+            .run_agentic_loop(
+                &mut messages,
+                &system_prompt,
+                &tools,
+                request_id,
+                thread_id,
+                response_channel,
+                message_budget,
+                &extraction_ctx,
+                description_handle,
+                origin_id,
+                &mut proposed_change,
+                user_images,
+                device_id,
+                model_override,
+                reasoning_effort,
+                &cancel_token,
+                &mut injection_rx,
+                &mut terminator_emitted,
+                crate::engine::agentic_loop::ContextCaptureSeed {
+                    sections: &capture_sections,
+                    tools: &capture_tools,
+                    model: &capture_model,
+                    capture_body,
+                },
+            )
+            .await;
+
+        // Defensive: if the loop returned without emitting a terminator for
+        // this request, emit ResponseAborted so the UI's "running" state
+        // clears. Skipped on the success path because the flag tracks every
+        // emit site — the SQL existence check has no functional index on
+        // `payload->>'request_event_id'` and would walk the whole thread
+        // on every chat turn otherwise.
+        if !terminator_emitted {
+            crate::engine::agentic_loop::ensure_terminator_emitted(
+                &self.event_bus,
+                &self.pool,
+                thread_id,
+                origin_id,
+                response_channel,
+            )
+            .await;
+        }
+
+        // Recover messages that the fast-path send (above) landed on
+        // `injection_tx` after the loop's last try_recv() but before the
+        // guard dropped — without this they'd be silently lost when
+        // injection_rx is dropped on function return. Attach to the result
+        // so chat_submit can re-submit them as regular follow-ups.
+        let orphans = Self::drain_orphaned_injections(&mut injection_rx);
+        if !orphans.is_empty() {
+            log!("[Chat] {} orphaned injection(s) after agentic loop exit for thread {} — will re-submit as follow-ups",
+                orphans.len(), thread_id);
+        }
+
+        result.map(|mut r| {
+            r.orphaned_injections = orphans;
+            r
+        })
+    }
+}

@@ -21,12 +21,23 @@ pub(crate) fn parse_ask_user_question_inputs(
     arr.iter().map(parse_one_question).collect()
 }
 
-fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
-    let question = q
-        .get("question")
+/// The question text for one entry, trimmed. Reads ONLY the `question` field —
+/// the `header` chip-label is supplementary, never a substitute. Returns
+/// `None` when `question` is absent or whitespace-only, so
+/// `walk_question_batch` rejects the batch up front and bounces it back to the
+/// model to re-ask. The tool schema marks `question` `required`, but
+/// tool-call schemas are advisory (the model can still omit it — that was the
+/// "(no question text)" bug), so the engine is the actual gate.
+pub(crate) fn question_text(q: &serde_json::Value) -> Option<String> {
+    q.get("question")
         .and_then(|v| v.as_str())
-        .unwrap_or("(no question text)")
-        .to_string();
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
+    let question = question_text(q).unwrap_or_default();
     let options: Vec<crate::engine::thread_events::QuestionOption> = q
         .get("options")
         .and_then(|o| o.as_array())
@@ -70,7 +81,7 @@ mod tests {
 
     fn placeholder() -> ParsedQuestion {
         ParsedQuestion {
-            question: "(no question text)".into(),
+            question: String::new(),
             options: Vec::new(),
             multi_select: false,
         }
@@ -114,12 +125,64 @@ mod tests {
     }
 
     #[test]
-    fn parse_uses_placeholder_text_for_question_without_text() {
-        // The handler still needs a renderable question even if CC sent a
-        // malformed entry — placeholder keeps the loop honest about the index.
+    fn parse_reads_question_field_and_ignores_header() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Which approach?",
+                "header": "Approach",
+                "options": [{"label": "A"}, {"label": "B"}],
+            }],
+        });
+        let parsed = parse_ask_user_question_inputs(&input);
+        assert_eq!(parsed[0].question, "Which approach?");
+    }
+
+    #[test]
+    fn parse_yields_empty_question_when_question_absent_even_with_header() {
+        // Strict contract: `header` is NOT a substitute for `question`.
+        // Observed LLM slip (dev event 2026-05-31T04:57) — the model sets a
+        // per-question `header` and drops `question`. The parser leaves the
+        // text empty so `walk_question_batch` rejects the batch and the model
+        // re-asks, instead of the card showing a terse header.
+        let input = serde_json::json!({
+            "questions": [{
+                "header": "Esc-during-confirm",
+                "options": [{"label": "A"}, {"label": "B"}],
+            }],
+        });
+        let parsed = parse_ask_user_question_inputs(&input);
+        assert_eq!(parsed.len(), 1);
+        assert!(
+            parsed[0].question.is_empty(),
+            "header must not be salvaged into the question text"
+        );
+    }
+
+    #[test]
+    fn parse_treats_whitespace_only_question_as_empty() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "   ",
+                "header": "Next step",
+                "options": [{"label": "A"}, {"label": "B"}],
+            }],
+        });
+        let parsed = parse_ask_user_question_inputs(&input);
+        assert!(
+            parsed[0].question.is_empty(),
+            "whitespace-only question is treated as absent (not salvaged from header)"
+        );
+    }
+
+    #[test]
+    fn parse_yields_empty_question_when_question_absent() {
+        // Malformed — no `question`. The parser leaves the question empty;
+        // `walk_question_batch` rejects the batch up front so no blank card
+        // is ever emitted.
         let input = serde_json::json!({"questions": [{"options": []}]});
         let parsed = parse_ask_user_question_inputs(&input);
         assert_eq!(parsed, vec![placeholder()]);
+        assert!(parsed[0].question.is_empty());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
 name: Lucidos CLI (`lucidos`)
-description: Shell command available on PATH for any subprocess Lucidos spawns (Python, bash, Claude Code) — writes files under `data/`, emits and queries domain events, and calls external APIs through the engine proxy so credentials never appear in script source, args, env vars, or logs. Prefer this over hand-rolling HTTP calls back to the engine and over `curl -H "Authorization: Bearer $CRED_..."`.
+description: Shell command available on PATH for any subprocess Lucidos spawns (Python, bash, Claude Code) — writes files under `data/`, emits and queries domain events, lists thread summaries (`lucidos threads list/count`), spawns threads (`lucidos spawn-thread`, including app coding-agent threads via `--folder data/apps/<id>`), lists and applies pending changes (`lucidos changes list` / `lucidos changes apply <id>`), and calls external APIs through the engine proxy so credentials never appear in script source, args, env vars, or logs. Prefer this over hand-rolling HTTP calls back to the engine and over `curl -H "Authorization: Bearer $CRED_..."`.
 ---
 
 # `lucidos` CLI
@@ -9,7 +9,11 @@ A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos 
 
 - write files into the workspace's `data/` directory
 - emit or query domain events on the workspace's event store
+- list or count *thread summaries* in the workspace — useful for "is anything still running?" gates in triggers
+- spawn a new *thread* — a chat thread, or (`--cc`) a *coding-agent thread* on a repo or an app folder (`--folder data/apps/<id>`) — `lucidos spawn-thread`
+- list pending / applied *changes* (`lucidos changes list`) and apply a pending one (the CC-proposed branch waiting on the Apply button) — `lucidos changes apply <id>`
 - call an external API that's configured in `data/config/apis.json` (auth header injected by the engine — credential never appears in the script)
+- send a push notification to the user without going through an LLM thread
 
 The CLI is a thin Rust wrapper around the engine's HTTP API and filesystem conventions — for app UI usage see the JS [`lucidos.data.*`](./js-sdk.md) reference. Scripts should always prefer the CLI over hand-rolling HTTP calls back to the engine.
 
@@ -115,6 +119,209 @@ NEWEST_ID=$(lucidos events query --type SomeEvent --limit 1 | jq -r '.[0].id')
 lucidos events query --type SomeEvent --after-event-id "$NEWEST_ID"
 ```
 
+### `lucidos events count [--type T] [--since iso] [--until iso]`
+
+Count events by type/time without materialising payloads. Mirrors the `count_events` LLM tool. Two shapes:
+
+- **With `--type`:** `{"count": N, "byte_total": B}` for that single type.
+- **Without `--type`:** `{"by_type": [{"event_type": "...", "count": N, "byte_total": B}, ...], "total_count": N, "total_byte_total": B}` — per-type breakdown sorted by `count` desc.
+
+```bash
+# What's noisy in the last 7 days?
+$ lucidos events count --since 2026-05-18T00:00:00Z | jq '.by_type[:5]'
+[
+  {"event_type":"ContextCaptured","count":5783,"byte_total":119537664},
+  {"event_type":"ToolResult","count":4434,"byte_total":21856992},
+  ...
+]
+
+# How big is one type?
+$ lucidos events count --type ToolResult --since 2026-05-18T00:00:00Z
+{"count":4434,"byte_total":21856992}
+```
+
+`byte_total` is `SUM(octet_length(payload::text))` — the raw payload byte sum, a reliable proxy for the token cost of a corresponding `lucidos events query` call. Use this before `query` on busy workspaces to budget which types to drill into (the recurring `workspace-learning` recipe failure that motivated this CLI was a `query --type ToolResult --limit 300` call returning 2.3 MB and blowing the next-turn prompt cap).
+
+### `lucidos threads list [--active] [--source <list>] [--limit N]`
+
+List thread summaries from the parent workspace. Outputs the raw JSON array on stdout, newest-first by `last_activity`. Each row is a full `ThreadSummary` — the same shape returned by the `list_threads` LLM tool and by `lucidos.threads.list()` in the JS SDK, and the same shape the projection stores in `thread_summaries`.
+
+```bash
+$ lucidos threads list --active --limit 5 | jq '.[].title'
+"Plan dinner"
+"Refactor settings dialog"
+```
+
+- `--active` restricts to threads where the agentic loop is mid-flow — status `running` or `waiting_for_user_answer`. Status `waiting` is **not** active: it means the coding-agent thread has stopped and proposed changes the user must act on (the loop has paused). Status `failed` is also excluded — the response is over.
+- `--source` is a comma-separated list of `chat`, `trigger`, `claude_code`. Omit for all sources.
+- `--limit` clamps to `1..=1000` server-side, default 100.
+
+Use this from a script that needs to react to thread state — e.g. "is anything still running before I fire this trigger?" — without reconstructing it from raw `query_events`. The projection already tracks per-thread status; the list endpoint is just a read off it.
+
+### `lucidos threads count [--active] [--source <list>]`
+
+Count thread summaries matching the same filters as `list`. Outputs `{"count": N}` on stdout.
+
+```bash
+# How many active threads in the workspace?
+$ lucidos threads count --active
+{"count":3}
+
+# Is anything still running? (shell-friendly form)
+$ if [ "$(lucidos threads count --active | jq .count)" -eq 0 ]; then
+>   echo "Workspace is idle."
+> fi
+```
+
+Cheaper than materialising the full list just to read `.length` on big workspaces.
+
+### `lucidos spawn-thread --to <WS> --message <M> [--cc] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--cc-model <M>]`
+
+Start a new *thread* in another (or this same) workspace — a *chat thread* by default, or a *coding-agent thread* with `--cc`. `--to` names the target workspace (resolved under `$LUCIDOS_WORKSPACES_ROOT`, or an absolute path). Caller provenance (`caller_*` fields) defaults from `$LUCIDOS_WORKSPACE` / `$LUCIDOS_THREAD_ID` / `$LUCIDOS_EVENT_ID`, which the engine sets on every spawned subprocess. Prints a clickable `[title](thread:<ws>/<uuid>)` markdown link on stdout.
+
+`--relation top` (the default) starts an independent thread that does not report back; `--relation child` is a same-workspace parent-with-callback spawn (the calling thread auto-resumes when the child finishes).
+
+**Worktree targeting for `--cc` threads:**
+
+- `--repo <name|uuid>` — create the worktree from a registered *repository*. Defaults from `$LUCIDOS_REPO` (the engine sets it to the calling thread's repo) so a CC sidequest stays in its caller's repo. Pass `--repo ""` to force the target workspace's default repo.
+- `--folder <path>` — target an app folder instead, spawning an **app coding-agent thread**. A `data/apps/<id>` value (workspace-relative, resolved on the *target* workspace) creates a sparse-checkout worktree narrowed to that app folder whose *Apply* ff-merges into the workspace's `main` — no `/harden`, no engine restart. This is the same machinery the `run_claude` tool's `folder` argument produces. Only whole app folders are valid; the engine rejects other `data/` subtrees, app subpaths, and non-existent folders.
+
+`--folder` and `--repo` are mutually exclusive, and `--folder` requires `--cc` (the CLI errors before any HTTP round-trip on either). When `--folder` is set the `$LUCIDOS_REPO` default is suppressed — the engine rejects a request that carries both a repo and a folder.
+
+```bash
+# Spawn an app coding-agent thread to work on an app in this workspace.
+$ lucidos spawn-thread --to personal --cc --relation top \
+    --folder data/apps/momentum-autoresearch \
+    --title "Autoresearch session" \
+    --message "Run one research session per data/apps/momentum-autoresearch/knowhow."
+[Autoresearch session](thread:personal/2f1c…)
+```
+
+### `lucidos notify --title <T> --message <M> [--app-id <APP>] [--tap <T>] [--thread-id <UUID>] [--event-id <UUID>]`
+
+Send a push notification via the parent workspace. Persists to the inbox AND fans out as a web push to subscribed devices — identical to a `send_notification` LLM tool call, but callable directly from any subprocess (Python script, bash script, scheduled `script:`-typed trigger) without going through an LLM thread.
+
+```bash
+$ lucidos notify --title "Nettbank pappa" --message "Sjekk nettbanken til pappa (Alf Tiller)"
+{"success":true,"notification_id":"5b1e..."}
+```
+
+Both `--title` and `--message` are required and must be non-empty (the engine returns 400 on empty values).
+
+`--app-id <id>` is optional and stamps the notification's deep-link target. **Only set it when tapping the notification should open that app to act on it** — most reminders / nudges / summaries shouldn't deep-link, even when their trigger lives inside an app dir for organizational reasons. Same rule the `send_notification` LLM tool follows.
+
+#### Deep-linking back to the originating event
+
+For event-driven triggers ("Claude is asking", "credential needed", …) the right behaviour is for the push tap to scroll straight to the specific event card the user needs to act on. Three flags wire this up:
+
+- **`--tap <modal|none|navigate>`** — which kind of tap. `modal` (default) opens the inbox modal. `none` is the passive variant — no destination; the row marks itself read on in-app toast display or OS push tap (which just launches the PWA). Use for purely informational pushes that need no follow-up ("Backup complete", "Sync finished"). `navigate` deep-links to the target inferred from the other flags: `--thread-id` → navigate to that thread (scrolling and pulsing `--event-id` when set); `--app-id` → navigate to that app. When both `--thread-id` and `--app-id` are present, thread wins (the more common CTA shape — "answer this question").
+- **`--thread-id <UUID>`** — the originating thread. With `--tap navigate`, the tap deep-links straight to this thread instead of the inbox modal. Even without `--tap`, this stamps the notification so the modal's "Open thread" button resolves.
+- **`--event-id <UUID>`** — a specific event id inside `--thread-id` to scroll to and briefly pulse when the tap lands. Ignored when `--thread-id` is absent.
+
+```bash
+# Deep-link the push to the exact UserQuestionAsked card on tap.
+lucidos notify \
+  --title "Claude is asking" \
+  --message "Ship it?" \
+  --tap navigate \
+  --thread-id "$TRIGGER_EVENT_THREAD_ID" \
+  --event-id "$TRIGGER_EVENT_ID"
+```
+
+The `TRIGGER_EVENT_THREAD_ID` and `TRIGGER_EVENT_ID` env vars in the snippet are set by the engine on every script trigger fired by a thread-scoped event (see `building-a-trigger.md` § "Script trigger env vars"). For schedule-fired triggers neither is set, so `--tap modal` (the default) is the only meaningful choice.
+
+The CLI rejects `--tap navigate` without `--thread-id` and `--app-id` (the navigate kind needs a destination) with a clear error before the HTTP round-trip — the server returns the same 400 if the CLI's check is bypassed. For panel-shaped targets (`changes`, `triggers`, `files`, …) the CLI doesn't currently expose a flag — use the `send_notification` LLM tool or POST directly to `/api/v1/notifications` with the full structured `tap` object.
+
+#### Response and exit codes
+
+The CLI prints the engine's JSON response on stdout (`{"success": true, "notification_id": "<uuid>"}`). Non-zero exit on transport / HTTP error, with the engine's error body (or `lucidos: <transport error>`) on stderr.
+
+#### When to use which
+
+| Context | Use |
+|---|---|
+| Scheduled `script:`-typed trigger that needs to nudge the user | `lucidos notify` |
+| One-off bash / Python script run as part of an app or trigger | `lucidos notify` |
+| LLM agent in a chat / trigger thread | `send_notification` tool (LLM picks `app_id` based on context) |
+| Background engine code (Rust) | `LucidosEngine::create_notification` (the shared helper both surfaces call) |
+
+### `lucidos changes list`
+
+List pending and recently-applied *changes*. Wraps `GET /api/v1/changes` and echoes the engine's payload verbatim to stdout. This is the canonical way for a script to find a pending change's id before `apply` — read `.pending[].id`. Don't scan `ChangeProposed` events for the id when this one command gives it directly.
+
+```bash
+$ lucidos changes list
+{"pending":[{"id":"fbcc4a3a-...","branch_name":"claude-code/...","description":"fix: …","status":"pending",...}],"applied":[...],"total_pending":1,"restart_required":false,"restart_groups":[],"client_update_available":false,"has_more_applied":false}
+
+# Find the single pending change's id (e.g. in a build → apply pipeline):
+$ CID=$(lucidos changes list | jq -r '.pending[0].id')
+$ lucidos changes apply "$CID"
+```
+
+The response carries `pending` (array of pending changes, each with `id` / `branch_name` / `description` / `status` / `file_count` / `requires_restart` / `thread_id`), `applied` (recently applied), `total_pending`, and `restart_required`. Exit non-zero on transport / HTTP error.
+
+> **In-thread agent:** the chat Lucidos Agent has the equivalent `list_changes` LLM tool, which returns the same `{pending, applied, total_pending}` shape **in-process** (no HTTP round-trip). Use `list_changes` from a chat / trigger thread; use this CLI from a `script:`-typed trigger or a bash / Python subprocess.
+
+### `lucidos changes apply <change-id>`
+
+Apply a pending *change* (a CC-proposed branch that's waiting on the Apply button). Wraps `POST /api/v1/changes/<id>/apply` and echoes the engine's typed `ApplyChangeResult` JSON to stdout. Get the id from `lucidos changes list` (`.pending[].id`).
+
+```bash
+$ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
+{"status":"applied","change_id":"fbcc4a3a-...","thread_id":"1c1c34ef-...","message":"Change applied.","restart_required":false,"applied_commit":"9b1a...","previous_commit":"2a3b...","commits_applied":3,"files_changed":5}
+```
+
+> **In-thread agent:** the chat Lucidos Agent has the equivalent `apply_change` LLM tool. It calls the same engine apply pipeline **in-process** and stamps the apply as the agent (linked back to the applying thread), so the route popover never mislabels it as "You". Use `apply_change` from a chat / trigger thread; use this CLI from a `script:`-typed trigger or a bash / Python subprocess (which can't call the in-process tool and would otherwise have to forward the subprocess-origin headers by hand).
+
+The response carries:
+
+| Field | Meaning |
+|---|---|
+| `status` | `applied`, `noop`, `hardening`, or `conflict` (see `docs/apply-change-api.md` for the full table) |
+| `applied_commit` | 40-char SHA on `main` AFTER the merge (present on `applied` and idempotent `noop`) |
+| `previous_commit` | 40-char SHA on `main` BEFORE the merge |
+| `commits_applied` | Number of commits added to `main` (0 for `noop`) |
+| `restart_required` | `true` when the changed files trigger an engine restart on apply |
+| `conflict_thread_id` / `review_thread_id` | Thread to focus when `status` is `conflict` / `hardening` |
+
+The CLI prints the JSON verbatim on stdout. Exit non-zero on transport / 4xx with the engine's error body on stderr — match `--fail` semantics from `lucidos proxy`.
+
+#### Why use the CLI instead of hand-rolled urllib / curl
+
+The CLI auto-forwards two subprocess-origin headers (`x-lucidos-agent-origin-token`, `x-lucidos-source-thread-id`) that the engine reads to stamp the resulting `ChangeApplied` event as `Api { mode: Agent, source_thread_id }`. Without them, the engine falls through to `Api { mode: Human }` and the UI renders the apply card as **"You"** — wrongly attributing an agent action to the user. A `run_python` block that calls `urllib.request.urlopen("https://localhost:.../api/v1/changes/<id>/apply")` will hit this bug because urllib doesn't read the env vars on its own.
+
+```python
+# ❌ Wrong — the User-Agent on the request is "Python-urllib/X.Y" and the UI says "You"
+import ssl, urllib.request as r
+ctx = ssl._create_unverified_context()  # self-signed cert
+r.urlopen(r.Request(f"https://localhost:{port}/api/v1/changes/{cid}/apply", method="POST"), context=ctx)
+
+# ✅ Right — CLI forwards the headers; UI says "Lucidos Agent" with the source thread linked
+import subprocess
+subprocess.run(["lucidos", "changes", "apply", cid], check=True)
+```
+
+The same rule applies to bash:
+
+```bash
+# ❌ Wrong — bare curl from inside a run_bash tool
+curl -k -X POST "https://localhost:$LUCIDOS_API_PORT/api/v1/changes/$CID/apply"
+
+# ✅ Right — CLI handles the headers
+lucidos changes apply "$CID"
+```
+
+If a script genuinely needs to call the HTTP endpoint directly (test harness, external tool that can't shell out to the CLI), forward both headers explicitly:
+
+```bash
+curl -k -X POST \
+  -H "x-lucidos-agent-origin-token: $LUCIDOS_AGENT_ORIGIN_TOKEN" \
+  -H "x-lucidos-source-thread-id: $LUCIDOS_THREAD_ID" \
+  "https://localhost:$LUCIDOS_API_PORT/api/v1/changes/$CID/apply"
+```
+
+The engine listens on `https://` with a self-signed cert in dev (`-k` / `_create_unverified_context()` accepts it; the CLI already does). The token env var is process-local secret state set by the engine on every spawned subprocess; the thread id is set when the subprocess has a spawning thread. See `docs/apply-change-api.md` for the response shape and the full apply workflow.
+
 ### `lucidos proxy <name> [path] [-X METHOD] [-H "Hdr: val"] [-d body | --data-stdin] [-i] [--fail]`
 
 Call a backend configured in `data/config/apis.json` through the engine. The engine resolves the credential from the workspace's credential store, injects the configured auth header, and strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request. **The credential value never reaches the script** — neither in `argv`, env vars, the request line, nor any log.
@@ -184,6 +391,9 @@ Output is the response body on **stdout**. With `--include`, the status line and
 | One-off `curl` to a service the workspace will never reuse | Plain `curl` (no proxy entry needed) |
 | Emit/query domain events | `lucidos events …` |
 | Write a file under `data/` | `lucidos data write …` |
+| Push a notification to the user from a script | `lucidos notify --title … --message …` |
+| Find a pending change's id from a script | `lucidos changes list` (read `.pending[].id`; don't scan `ChangeProposed` events) |
+| Apply a CC-proposed change from a script | `lucidos changes apply <id>` (never hand-roll the HTTP call — actor stamps as "You") |
 
 If you find a script doing `curl -H "Authorization: Bearer $CRED_..."` against an API the workspace already owns a credential for, that's drift — add an `apis.json` entry and switch the script to `lucidos proxy`.
 

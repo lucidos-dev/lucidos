@@ -54,36 +54,30 @@ impl OAuthLookup for DbOAuthLookup {
         &self,
         providers: &[String],
     ) -> Result<Vec<oauth::OAuthAccount>, (StatusCode, String)> {
-        use crate::core::OAuthStore;
+        use crate::core::oauth::AccountLookupError;
         let mut out = Vec::with_capacity(providers.len());
         for provider in providers {
-            let mut account = OAuthStore::get_by_provider(&self.pool, provider)
+            let account = oauth::get_account_with_fresh_token(&self.pool, provider)
                 .await
-                .map_err(|e| {
-                    (
+                .map_err(|e| match e {
+                    AccountLookupError::NotConnected => (
+                        StatusCode::BAD_GATEWAY,
+                        oauth::provider_not_connected_msg(provider),
+                    ),
+                    AccountLookupError::DbError(err) => (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!(
                             "failed to load OAuth account for provider '{}': {}",
-                            provider, e
+                            provider, err
                         ),
-                    )
-                })?
-                .ok_or_else(|| {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        oauth::provider_not_connected_msg(provider),
-                    )
-                })?;
-            oauth::refresh_oauth_if_needed(&self.pool, &mut account)
-                .await
-                .map_err(|e| {
-                    (
+                    ),
+                    AccountLookupError::RefreshFailed(err) => (
                         StatusCode::BAD_GATEWAY,
                         format!(
                             "OAuth token refresh failed for provider '{}': {}",
-                            provider, e
+                            provider, err
                         ),
-                    )
+                    ),
                 })?;
             out.push(account);
         }
@@ -104,6 +98,9 @@ pub struct ScriptHandshakeLayer {
 }
 
 impl ScriptHandshakeLayer {
+    // Plain constructor that stores each parameter into the matching struct
+    // field — wrapping in a builder would only push the parameter list up one
+    // level without simplifying the layer-construction site.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         namespace: String,
@@ -449,7 +446,8 @@ print(json.dumps({
         let (pool, db_name) = setup_test_db().await;
 
         // (auth_type, auth_value, expected env-vars seen by script)
-        let cases: &[(AuthType, &str, &[(&str, &str)])] = &[
+        type AuthCase = (AuthType, &'static str, &'static [(&'static str, &'static str)]);
+        let cases: &[AuthCase] = &[
             (AuthType::ApiKey, "ak-123", &[("x-cred-bare", "ak-123")]),
             (AuthType::Bearer, "bear-456", &[("x-cred-bare", "bear-456")]),
             (

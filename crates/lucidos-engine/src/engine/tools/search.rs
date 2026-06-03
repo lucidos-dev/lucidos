@@ -54,7 +54,7 @@ pub struct GrepResult {
 /// matcher only sees `data/`-relative strings, accepting `..`-style patterns
 /// silently returns empty and trains the LLM to think files are missing.
 fn validate_pattern(label: &str, pattern: &str) -> Result<(), String> {
-    if pattern.contains("..") || pattern.starts_with('/') || pattern.starts_with('\\') {
+    if crate::core::is_path_traversal(pattern) {
         Err(format!(
             "{} must be relative under data/ — '..', leading '/' and leading '\\' are rejected",
             label

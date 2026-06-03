@@ -2,7 +2,7 @@ use crate::engine::AgentUserInput;
 
 /// Drain any follow-up messages that were queued in `msg_rx` but never consumed
 /// (e.g. because the CC process exited before reading them). Returns them so
-/// callers can re-process them with a fresh CC session instead of showing
+/// callers can re-process them with a fresh Claude Code session instead of showing
 /// a scary "interrupted" banner.
 pub(super) fn drain_lost_followups(
     msg_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentUserInput>,
@@ -48,12 +48,14 @@ mod tests {
             text: "follow-up 1".into(),
             images: None,
             origin_event_id: Some(eid),
+            kind: crate::engine::AgentInputKind::User,
         })
         .unwrap();
         tx.send(AgentUserInput {
             text: "internal".into(),
             images: None,
             origin_event_id: None,
+            kind: crate::engine::AgentInputKind::User,
         })
         .unwrap();
 

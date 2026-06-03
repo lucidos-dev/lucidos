@@ -10,17 +10,20 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-use crate::core::oauth::{self, OAuthStore};
+use crate::core::oauth;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Registry entry: (id, name, oauth_provider, required_scope, constructor).
+/// The constructor receives the pool AND the entry's `required_scope`, so a
+/// provider carries the scope it must verify in preflight without a second
+/// source of truth.
 type BackupProviderEntry = (
     &'static str,
     &'static str,
     &'static str,
     &'static str,
-    fn(PgPool) -> Box<dyn BackupProvider>,
+    fn(PgPool, &'static str) -> Box<dyn BackupProvider>,
 );
 
 /// Preference key for the backup cron schedule expression.
@@ -31,6 +34,11 @@ pub const PREF_BACKUP_PROVIDER: &str = "backup_provider";
 pub const PREF_BACKUP_RETENTION: &str = "backup_retention";
 /// Default number of backups to keep when no preference is set.
 pub const DEFAULT_BACKUP_RETENTION: usize = 5;
+/// Preference key for the persisted outcome of the last backup run (success or
+/// failure). Stored as a JSON `BackupLastRun` so the Settings → Backup page can
+/// show "did the last run succeed or fail, and when?" even after an engine
+/// restart — terminal outcome otherwise lives only in ephemeral SSE events.
+pub const PREF_BACKUP_LAST_RUN: &str = "backup_last_run";
 
 /// Check whether a backup schedule value represents an active (enabled) schedule.
 pub fn is_schedule_active(value: &str) -> bool {
@@ -50,10 +58,14 @@ pub async fn get_retention_count(pool: &PgPool) -> usize {
 
 /// Static registry of all backup providers: (id, name, oauth_provider, required_scope, constructor).
 const PROVIDERS: &[BackupProviderEntry] = &[
-    ("google_drive", "Google Drive", "google", "drive", |pool| {
-        Box::new(google_drive::GoogleDriveBackupProvider::new(pool))
-    }),
-    ("dropbox", "Dropbox", "dropbox", "", |pool| {
+    (
+        "google_drive",
+        "Google Drive",
+        "google",
+        "drive",
+        |pool, scope| Box::new(google_drive::GoogleDriveBackupProvider::new(pool, scope)),
+    ),
+    ("dropbox", "Dropbox", "dropbox", "", |pool, _scope| {
         Box::new(dropbox::DropboxBackupProvider::new(pool))
     }),
 ];
@@ -86,21 +98,25 @@ pub fn get_provider(provider_id: &str, pool: &PgPool) -> Result<Box<dyn BackupPr
     PROVIDERS
         .iter()
         .find(|(id, _, _, _, _)| *id == provider_id)
-        .map(|(_, _, _, _, ctor)| ctor(pool.clone()))
+        .map(|(_, _, _, scope, ctor)| ctor(pool.clone(), scope))
         .ok_or_else(|| format!("Unknown backup provider: {}", provider_id))
 }
 
 /// Get an OAuth token for a backup provider, refreshing if needed.
 pub async fn get_oauth_token(pool: &PgPool, provider: &str) -> Result<String, BoxError> {
-    let mut account = OAuthStore::get_by_provider(pool, provider)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "No {} account connected. Connect it in Settings first.",
-                provider
-            )
+    use crate::core::oauth::AccountLookupError;
+    let account = oauth::get_account_with_fresh_token(pool, provider)
+        .await
+        .map_err(|e| -> BoxError {
+            match e {
+                AccountLookupError::NotConnected => format!(
+                    "No {} account connected. Connect it in Settings first.",
+                    provider
+                )
+                .into(),
+                AccountLookupError::DbError(err) | AccountLookupError::RefreshFailed(err) => err,
+            }
         })?;
-    oauth::refresh_oauth_if_needed(pool, &mut account).await?;
     Ok(account.access_token)
 }
 
@@ -113,6 +129,83 @@ pub struct BackupEntry {
     pub created_at: DateTime<Utc>,
 }
 
+/// Terminal outcome of a backup run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupRunStatus {
+    Success,
+    Failure,
+}
+
+/// Persisted record of the most recent backup run's terminal outcome. Written
+/// by `run_backup` on both the success and failure paths and stored under
+/// `PREF_BACKUP_LAST_RUN`, so the page survives engine restarts (the
+/// `BackupCompleted` / `BackupFailed` SSE events are ephemeral).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupLastRun {
+    pub status: BackupRunStatus,
+    /// When the run reached its terminal state (RFC 3339).
+    pub at: DateTime<Utc>,
+    /// Filename of the produced backup (success only).
+    pub filename: Option<String>,
+    /// Size of the produced backup in bytes (success only).
+    pub size_bytes: Option<u64>,
+    /// Error message (failure only).
+    pub error: Option<String>,
+}
+
+impl BackupLastRun {
+    /// Build a success record from the produced backup entry.
+    pub fn success(entry: &BackupEntry) -> Self {
+        Self {
+            status: BackupRunStatus::Success,
+            at: Utc::now(),
+            filename: Some(entry.filename.clone()),
+            size_bytes: Some(entry.size_bytes),
+            error: None,
+        }
+    }
+
+    /// Build a failure record from the error message.
+    pub fn failure(error: &str) -> Self {
+        Self {
+            status: BackupRunStatus::Failure,
+            at: Utc::now(),
+            filename: None,
+            size_bytes: None,
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+/// Persist the last-run outcome under `PREF_BACKUP_LAST_RUN`. Failure to
+/// persist is returned to the caller so it can log it — the health card would
+/// otherwise silently lag behind the real outcome.
+pub async fn persist_last_run(pool: &PgPool, run: &BackupLastRun) -> Result<(), BoxError> {
+    use crate::core::PreferenceStore;
+    let value = serde_json::to_string(run)?;
+    PreferenceStore::set(pool, PREF_BACKUP_LAST_RUN, &value).await?;
+    Ok(())
+}
+
+/// Read the persisted last-run outcome. Returns `None` when never recorded; a
+/// malformed stored value is logged and treated as absent rather than failing
+/// the whole status response.
+pub async fn load_last_run(pool: &PgPool) -> Option<BackupLastRun> {
+    use crate::core::PreferenceStore;
+    let raw = PreferenceStore::get(pool, PREF_BACKUP_LAST_RUN)
+        .await
+        .ok()
+        .flatten()?;
+    match serde_json::from_str(&raw) {
+        Ok(run) => Some(run),
+        Err(e) => {
+            crate::log!("[Backup] Ignoring malformed {PREF_BACKUP_LAST_RUN}: {e}");
+            None
+        }
+    }
+}
+
 /// Trait for cloud storage backends that can store/retrieve encrypted backups.
 #[async_trait]
 pub trait BackupProvider: Send + Sync {
@@ -120,9 +213,13 @@ pub trait BackupProvider: Send + Sync {
     fn id(&self) -> &str;
     /// The OAuth provider name used for token lookup (e.g. "google", "dropbox").
     fn oauth_provider(&self) -> &str;
-    /// Verify the provider is accessible (valid token, correct permissions).
-    /// Called before expensive work like pg_dump/compress/encrypt.
-    async fn verify_access(&self) -> Result<(), BoxError>;
+    /// Fail-fast checks run BEFORE any expensive backup work (pg_dump, the
+    /// multi-GB tar, the multi-minute encrypt). `estimated_upload_bytes` is the
+    /// orchestrator's estimate of the encrypted archive size; the provider uses
+    /// it to reject the run up front when the upload can't succeed (e.g. over
+    /// quota), instead of wasting the whole pipeline only to fail at the final
+    /// upload. Also verifies the token is valid and the required scope exists.
+    async fn preflight(&self, estimated_upload_bytes: u64) -> Result<(), BoxError>;
     async fn upload(
         &self,
         file_path: &Path,
@@ -144,11 +241,86 @@ pub fn key_file_path(workspace: &Path) -> PathBuf {
     workspace.join(".lucidos").join("backup.key")
 }
 
+/// The workspace directory name used in backup archive filenames
+/// (`lucidos-backup-{name}-{timestamp}.enc`). Falls back to `"workspace"` when
+/// the path has no final component. The upload path and the prune matcher both
+/// derive the name from here, so they can never disagree on which archives are
+/// "this workspace's".
+pub fn workspace_archive_name(workspace: &Path) -> &str {
+    workspace
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+}
+
 /// Result of a successful backup restore — the new workspace's location.
 #[derive(Debug, Clone, Serialize)]
 pub struct RestoredWorkspace {
     pub workspace_path: String,
     pub workspace_name: String,
+}
+
+/// Authoritative restore-progress state, held by the engine for the duration of
+/// a restore and beyond (the terminal `Completed`/`Failed` is kept until the
+/// next restore starts). This is the SINGLE source of truth that BOTH the SSE
+/// `Restore*` events and the `GET /api/v1/backup/restore-status` endpoint
+/// serialize from — so a live stream and a page-reload refetch always render
+/// the identical state. A restore can run for many minutes; binding its state
+/// to the HTTP request lifetime (the old design) meant a tab reload or network
+/// blip cancelled the handler future, dropped the staging `TempDir`, and lost
+/// the whole download with nothing to reconnect to. See `restore_backup` in
+/// `api/backup.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RestoreState {
+    /// No restore has run since startup (or the field was never touched).
+    #[default]
+    Idle,
+    /// A restore is in flight. `phase`/`progress`/`total` mirror the
+    /// `restore_progress_sender` ticks (phase strings: downloading, decrypting,
+    /// decompressing, initializing, starting_db, restoring_db, done).
+    Running {
+        workspace_name: String,
+        phase: String,
+        progress: usize,
+        total: usize,
+    },
+    /// The restore finished; the new workspace is ready to start.
+    Completed {
+        workspace_name: String,
+        workspace_path: String,
+    },
+    /// The restore failed; `error` is the user-facing message.
+    Failed {
+        workspace_name: String,
+        error: String,
+    },
+}
+
+impl RestoreState {
+    /// True while a restore is actively running — used to reject a concurrent
+    /// restore (the engine runs one at a time).
+    pub fn is_running(&self) -> bool {
+        matches!(self, RestoreState::Running { .. })
+    }
+
+    /// Atomically claim the restore slot: if no restore is running, transition to
+    /// `Running { phase: "starting" }` and return `true`; if one is already
+    /// running, leave the state untouched and return `false`. The caller holds
+    /// the engine's `restore_state` write lock across this call, which makes the
+    /// check-and-set indivisible — two concurrent requests can't both win.
+    pub fn try_start(&mut self, workspace_name: &str) -> bool {
+        if self.is_running() {
+            return false;
+        }
+        *self = RestoreState::Running {
+            workspace_name: workspace_name.to_string(),
+            phase: "starting".to_string(),
+            progress: 0,
+            total: 100,
+        };
+        true
+    }
 }
 
 /// Validate a workspace name for use as a directory name.
@@ -207,8 +379,22 @@ pub async fn create_backup(
         provider.id()
     );
 
-    // Verify provider access before doing any expensive work
-    provider.verify_access().await?;
+    // Estimate the upload size up front — one workspace walk on the blocking
+    // pool — so the provider's preflight can fail fast BEFORE pg_dump, the
+    // multi-GB tar, and the multi-minute encrypt if it can't accept the upload
+    // (over quota, missing scope, bad token). This walk replaces the one
+    // estimate_weights used to do; the tar phase still walks once to stream files.
+    let ws_bytes = {
+        let workspace = workspace.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            workspace_backup_size(&workspace, &BackupIgnore::load(&workspace))
+        })
+        .await?
+    };
+
+    // PREFLIGHT — token, required scope, and free space. The only gate before
+    // expensive work; an actionable error here costs seconds, not ~25 minutes.
+    provider.preflight(estimate_archive_size(ws_bytes)).await?;
 
     let temp_dir = tempfile::tempdir()?;
     let progress = Arc::new(progress);
@@ -222,9 +408,14 @@ pub async fn create_backup(
         let temp_path = temp_dir.path().to_path_buf();
 
         tokio::task::spawn_blocking(move || -> Result<(PathBuf, usize), BoxError> {
-            // Estimate phase weights from workspace size
+            // Load data/.backupignore once for this run — shared by the tar walk
+            // (the workspace can have tens of thousands of entries; never
+            // re-parse per file).
+            let ignore = BackupIgnore::load(&workspace);
+
+            // Phase weights from the size already computed for preflight.
             progress("estimating", 0, 100);
-            let (dump_end, compress_end, encrypt_end) = estimate_weights(&workspace);
+            let (dump_end, compress_end, encrypt_end) = estimate_weights(ws_bytes);
 
             // Phase 1: pg_dump (0% → dump_end%)
             crate::log!("[Backup] Phase 1/4: pg_dump");
@@ -244,6 +435,7 @@ pub async fn create_backup(
                 &dump_path,
                 &compressed_path,
                 user_dir.as_deref(),
+                &ignore,
             )?;
 
             // Phase 3: encrypt with per-chunk progress (compress_end% → encrypt_end%)
@@ -281,10 +473,7 @@ pub async fn create_backup(
     // Phase 4: upload with progress (encrypt_end% → 100%)
     crate::log!("[Backup] Phase 4/4: upload");
     progress("uploading", encrypt_end, 100);
-    let workspace_name = workspace
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("workspace");
+    let workspace_name = workspace_archive_name(workspace);
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
     let filename = format!("lucidos-backup-{workspace_name}-{timestamp}.enc");
 
@@ -310,24 +499,80 @@ pub async fn create_backup(
     })
 }
 
-/// Delete old backups beyond the retention limit, keeping the newest `keep` entries.
+/// True when `s` is a backup-filename timestamp of the form `YYYYMMDD-HHMMSS`
+/// (8 digits, a hyphen, 6 digits) — the shape `create_backup` stamps via
+/// `Utc::now().format("%Y%m%d-%H%M%S")`. Validating it lets the archive matcher
+/// reject files whose name merely shares a workspace's prefix (e.g. workspace
+/// `personal` vs `personal-2`, where `lucidos-backup-personal-2-…` belongs to
+/// the latter).
+fn is_backup_timestamp(s: &str) -> bool {
+    match s.split_once('-') {
+        Some((date, time)) => {
+            date.len() == 8
+                && time.len() == 6
+                && date.bytes().all(|b| b.is_ascii_digit())
+                && time.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// True when `filename` is an encrypted backup archive produced by THIS
+/// workspace — it must match `lucidos-backup-{workspace_name}-{timestamp}.enc`
+/// exactly (timestamp shape validated). This is the guard that keeps pruning
+/// from ever touching another workspace's archives or any unrelated file the
+/// user placed in the shared cloud backup folder.
+fn is_own_backup_archive(filename: &str, workspace_name: &str) -> bool {
+    let prefix = format!("lucidos-backup-{workspace_name}-");
+    filename
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(".enc"))
+        .is_some_and(is_backup_timestamp)
+}
+
+/// From everything the provider lists in the shared backup folder, choose which
+/// archives to delete: narrow to THIS workspace's archives, keep the newest
+/// `keep`, and return the remainder OLDEST-FIRST for deletion. Pure so the
+/// selection rule is unit-testable without a live provider.
+fn select_prunable(
+    entries: Vec<BackupEntry>,
+    workspace_name: &str,
+    keep: usize,
+) -> Vec<BackupEntry> {
+    let mut own: Vec<BackupEntry> = entries
+        .into_iter()
+        .filter(|e| is_own_backup_archive(&e.filename, workspace_name))
+        .collect();
+    if own.len() <= keep {
+        return Vec::new();
+    }
+    // Newest first, then split off the newest `keep` to retain; the tail is
+    // what we delete. Reverse it so deletion proceeds oldest-first.
+    own.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let mut to_delete = own.split_off(keep);
+    to_delete.reverse();
+    to_delete
+}
+
+/// Delete this workspace's old backups beyond the retention limit, keeping the
+/// newest `keep`.
 ///
-/// Lists all backups from the provider, sorts by creation time (newest first),
-/// and deletes any beyond `keep`. Returns the number of backups deleted.
+/// Lists everything in the provider's shared backup folder, narrows to THIS
+/// workspace's `lucidos-backup-{workspace_name}-*.enc` archives (so another
+/// workspace's backups and any unrelated file in the folder are never touched —
+/// see [`select_prunable`]), then deletes oldest-first. Returns the number of
+/// backups deleted. A single delete failure is logged and skipped rather than
+/// propagated — one stuck archive must not abort cleanup of the rest.
 pub async fn prune_old_backups(
     provider: &dyn BackupProvider,
+    workspace_name: &str,
     keep: usize,
 ) -> Result<usize, BoxError> {
     if keep == 0 {
         return Ok(0);
     }
-    let mut entries = provider.list_backups().await?;
-    if entries.len() <= keep {
-        return Ok(0);
-    }
-    // Sort newest first
-    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    let to_delete = &entries[keep..];
+    let entries = provider.list_backups().await?;
+    let to_delete = select_prunable(entries, workspace_name, keep);
     let mut deleted = 0;
     for entry in to_delete {
         match provider.delete(&entry.id).await {
@@ -451,7 +696,21 @@ pub async fn restore_backup(
         tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
             std::fs::create_dir_all(&workspace_path)?;
             if let Err(e) = move_contents(&staging_dir, &workspace_path) {
-                let _ = std::fs::remove_dir_all(&workspace_path);
+                // `workspace_path` was just created in this function and
+                // `resolve_restore_workspace_path` guaranteed it did not exist
+                // beforehand, so this only ever removes a freshly-created,
+                // half-populated directory — never pre-existing user data. The
+                // cleanup is what lets the user retry the restore without hitting
+                // "workspace already exists". Log the failure (don't swallow it)
+                // so a botched cleanup that would block the retry is visible.
+                if let Err(rm) = std::fs::remove_dir_all(&workspace_path) {
+                    crate::log!(
+                        "[Backup] Restore failed and cleanup of partial workspace {} also failed: {} (original error: {})",
+                        workspace_path.display(),
+                        rm,
+                        e
+                    );
+                }
                 return Err(e);
             }
             Ok(())
@@ -516,7 +775,34 @@ fn init_workspace(workspace_name: &str) -> Result<String, BoxError> {
     Err("init-workspace.sh did not output DATABASE_URL".into())
 }
 
-/// Estimate progress weights for each backup phase based on workspace size.
+/// Sum the on-disk size of every file that WILL be included in the backup tar
+/// (i.e. after the hardcoded + `.backupignore` exclusions). This is the one
+/// workspace walk shared by preflight's free-space estimate and the phase-weight
+/// estimate; the tar phase walks once more to actually stream the files.
+fn workspace_backup_size(workspace: &Path, ignore: &BackupIgnore) -> u64 {
+    walkdir(workspace)
+        .unwrap_or_default()
+        .iter()
+        .filter(|p| {
+            p.strip_prefix(workspace)
+                .map(|rel| !is_excluded_workspace_path(rel, ignore))
+                .unwrap_or(true)
+        })
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum::<u64>()
+}
+
+/// Estimate the size of the *encrypted archive that will be uploaded* from the
+/// raw workspace size. The pipeline tar+zstd-compresses (~3:1) then AES-GCM
+/// encrypts (adds only ~16 bytes per chunk), so the upload is ≈ a third of the
+/// workspace. Used by preflight's free-space check; matches the 0.33 ratio
+/// `estimate_weights` uses for `compressed_mb` so the two stay consistent.
+fn estimate_archive_size(ws_bytes: u64) -> u64 {
+    ws_bytes / 3
+}
+
+/// Estimate progress weights for each backup phase from the (already-computed)
+/// workspace size in bytes.
 ///
 /// Returns `(dump_end, compress_end, encrypt_end)` as percentages (0-100).
 /// Upload fills the remainder to 100%.
@@ -526,18 +812,7 @@ fn init_workspace(workspace_name: &str) -> Result<String, BoxError> {
 ///   compress ~25 MB/s (tar + zstd level 3)
 ///   encrypt  ~5 MB/s  (AES-256-GCM, 1 MB chunks)
 ///   upload   ~10 MB/s (network dependent)
-fn estimate_weights(workspace: &Path) -> (usize, usize, usize) {
-    let ws_bytes = walkdir(workspace)
-        .unwrap_or_default()
-        .iter()
-        .filter(|p| {
-            p.strip_prefix(workspace)
-                .map(|rel| !is_excluded_workspace_path(rel))
-                .unwrap_or(true)
-        })
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .sum::<u64>();
-
+fn estimate_weights(ws_bytes: u64) -> (usize, usize, usize) {
     let ws_mb = ws_bytes as f64 / 1_048_576.0;
     let compressed_mb = ws_mb * 0.33; // zstd ~3:1 ratio estimate
 
@@ -652,14 +927,36 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Apply `pg_env_vars(database_url)` onto `cmd`. Returns `Err` when the URL
+/// doesn't match the expected shape so the caller fails loudly instead of
+/// spawning a subprocess that inherits zero `PG*` vars and gets a confusing
+/// connection error from libpq.
+fn apply_pg_env(cmd: &mut std::process::Command, database_url: &str) -> Result<(), BoxError> {
+    let vars = crate::core::pg_env_vars(database_url);
+    if vars.is_empty() {
+        return Err(
+            "database URL does not match expected postgres(ql)://user:pass@host[:port]/db shape"
+                .into(),
+        );
+    }
+    for (k, v) in vars {
+        cmd.env(k, v);
+    }
+    Ok(())
+}
+
 /// Run pg_dump to export the database in custom archive format.
 ///
 /// Custom format (`-Fc`) is a compressed binary format restored via `pg_restore`.
 /// It avoids PostgreSQL 18's `\restrict` / `\unrestrict` psql meta-commands
 /// (CVE-2025-8714) that break plain-text restores, and supports parallel restore.
+///
+/// Connection details flow through libpq `PG*` env vars so the password
+/// stays out of argv.
 fn pg_dump(database_url: &str, output_path: &Path) -> Result<(), BoxError> {
-    let output = std::process::Command::new("pg_dump")
-        .arg(database_url)
+    let mut cmd = std::process::Command::new("pg_dump");
+    apply_pg_env(&mut cmd, database_url)?;
+    let output = cmd
         .args([
             "--format=custom",
             "--no-owner",
@@ -682,26 +979,113 @@ fn pg_dump(database_url: &str, output_path: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// The target database name from a postgres URL, for `psql --dbname`.
+///
+/// We pull the name from the same `pg_env_vars` parse that seeds the `PG*` env,
+/// so host/port/user/password still flow via env (kept out of argv) and only
+/// the dbname lands on the command line.
+fn pg_dbname(database_url: &str) -> Result<String, BoxError> {
+    crate::core::pg_env_vars(database_url)
+        .into_iter()
+        .find_map(|(k, v)| (k == "PGDATABASE").then_some(v))
+        .ok_or_else(|| -> BoxError {
+            "database URL does not match expected postgres(ql)://user:pass@host[:port]/db shape"
+                .into()
+        })
+}
+
+/// Session-level SET parameters that exist in newer PostgreSQL versions but not
+/// older ones. When restoring a dump created by a newer pg_dump into an older
+/// server, these SET statements cause a fatal error. We strip them from the SQL
+/// before piping to psql.
+const CROSS_VERSION_SET_PARAMS: &[&str] = &[
+    "transaction_timeout",
+];
+
+/// Returns true if `line` is a `SET <param> = ...;` for a parameter in
+/// [`CROSS_VERSION_SET_PARAMS`]. Pure for testability.
+fn is_cross_version_set(line: &str) -> bool {
+    let trimmed = line.trim();
+    let upper = trimmed.to_uppercase();
+    if !upper.starts_with("SET ") {
+        return false;
+    }
+    for param in CROSS_VERSION_SET_PARAMS {
+        if upper.starts_with(&format!("SET {} ", param.to_uppercase()))
+            || upper.starts_with(&format!("SET {}=", param.to_uppercase()))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Restore a database from a custom-format dump file using pg_restore.
+///
+/// Pipes `pg_restore --file=-` (SQL to stdout) through a filter that strips
+/// session SET statements for parameters that don't exist in older PostgreSQL
+/// versions (e.g. `transaction_timeout` added in PG 17), then feeds the
+/// filtered SQL to `psql --single-transaction`. This makes cross-version
+/// restores (e.g. PG 17 dump → PG 16 server) work without losing atomicity.
 fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
-    let output = std::process::Command::new("pg_restore")
-        .arg("--dbname")
-        .arg(database_url)
+    use std::io::{BufRead, BufReader, Write};
+
+    let dbname = pg_dbname(database_url)?;
+
+    // Step 1: pg_restore outputs SQL to stdout
+    let mut restore_cmd = std::process::Command::new("pg_restore");
+    apply_pg_env(&mut restore_cmd, database_url)?;
+    let restore_output = restore_cmd
         .args([
             "--no-owner",
             "--no-acl",
             "--clean",
             "--if-exists",
-            "--single-transaction",
+            "--file=-",
         ])
         .arg(dump_path)
         .output()?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !restore_output.status.success() {
+        let stderr = String::from_utf8_lossy(&restore_output.stderr);
         return Err(format!(
-            "pg_restore failed with exit code: {}\n{}",
-            output.status, stderr
+            "pg_restore (to SQL) failed with exit code: {}\n{}",
+            restore_output.status, stderr
+        )
+        .into());
+    }
+
+    // Step 2: filter out cross-version SET statements
+    let reader = BufReader::new(&restore_output.stdout[..]);
+    let mut filtered = Vec::with_capacity(restore_output.stdout.len());
+    for line in reader.split(b'\n') {
+        let line = line?;
+        let text = String::from_utf8_lossy(&line);
+        if !is_cross_version_set(&text) {
+            filtered.extend_from_slice(&line);
+            filtered.push(b'\n');
+        }
+    }
+
+    // Step 3: pipe filtered SQL to psql inside a single transaction
+    let mut psql_cmd = std::process::Command::new("psql");
+    apply_pg_env(&mut psql_cmd, database_url)?;
+    let mut psql = psql_cmd
+        .args(["--single-transaction", "--dbname", &dbname])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let write_result = psql.stdin.take().unwrap().write_all(&filtered);
+    let psql_output = psql.wait_with_output()?;
+    write_result?;
+
+    if !psql_output.status.success() {
+        let stderr = String::from_utf8_lossy(&psql_output.stderr);
+        return Err(format!(
+            "Restore failed: psql exited with code: {}\n{}",
+            psql_output.status, stderr
         )
         .into());
     }
@@ -714,8 +1098,9 @@ fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
 /// statements. pg_restore --clean needs to DROP and recreate tables, which requires
 /// no other sessions holding locks. After termination, the pool auto-reconnects.
 fn terminate_other_connections(database_url: &str) -> Result<(), BoxError> {
-    let output = std::process::Command::new("psql")
-        .arg(database_url)
+    let mut cmd = std::process::Command::new("psql");
+    apply_pg_env(&mut cmd, database_url)?;
+    let output = cmd
         .arg("-c")
         .arg("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()")
         .output()?;
@@ -730,31 +1115,133 @@ fn terminate_other_connections(database_url: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// A single parsed `.backupignore` rule.
+enum IgnorePattern {
+    /// A plain path with no wildcards. Matches the path and everything under
+    /// it via component-prefix comparison — identical semantics to the
+    /// hardcoded `rel.starts_with(...)` checks.
+    Prefix(PathBuf),
+    /// A pattern containing glob wildcards (`*`, `?`, `[`). Matched against the
+    /// workspace-relative path *and each of its ancestors*, so a glob that
+    /// names a directory also excludes that directory's entire subtree. Note:
+    /// with `glob`'s default options `*` matches across `/`, so wildcard
+    /// patterns are greedy — `data/artifacts/*/klines` excludes `klines` at any
+    /// depth under `data/artifacts`, not just one level down.
+    Glob(glob::Pattern),
+}
+
+impl IgnorePattern {
+    fn matches(&self, rel: &Path) -> bool {
+        match self {
+            IgnorePattern::Prefix(prefix) => rel.starts_with(prefix),
+            IgnorePattern::Glob(pat) => rel.ancestors().any(|a| pat.matches_path(a)),
+        }
+    }
+}
+
+/// Parsed contents of a workspace's `data/.backupignore` — a gitignore-style
+/// list of workspace-relative paths to omit from the backup, *in addition* to
+/// the hardcoded exclusions. Loaded and parsed once per backup run and shared
+/// across the size estimate and the tar walk; an absent or empty file yields an
+/// empty set, preserving today's behavior.
+#[derive(Default)]
+struct BackupIgnore(Vec<IgnorePattern>);
+
+impl BackupIgnore {
+    /// Load `<workspace>/data/.backupignore`. A missing file is the common case
+    /// and yields no patterns silently; any other read error is logged and also
+    /// treated as no patterns — a broken ignore file never aborts the backup.
+    fn load(workspace: &Path) -> Self {
+        let path = workspace.join("data").join(".backupignore");
+        match std::fs::read_to_string(&path) {
+            Ok(content) => Self::parse(&content),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => {
+                crate::log!(
+                    "[Backup] Could not read {} ({}); ignoring it",
+                    path.display(),
+                    e
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// Parse the file body: one pattern per line, blank lines and `#` comments
+    /// skipped, a trailing `/` tolerated. Patterns with wildcard chars compile
+    /// to `glob::Pattern`; the rest are plain component-prefixes. A malformed
+    /// glob is logged and skipped rather than aborting the parse.
+    fn parse(content: &str) -> Self {
+        let mut patterns = Vec::new();
+        for raw in content.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // Tolerate a trailing slash: `foo/` behaves like `foo`.
+            let line = line.trim_end_matches('/');
+            if line.is_empty() {
+                continue;
+            }
+            if line.contains(['*', '?', '[']) {
+                match glob::Pattern::new(line) {
+                    Ok(pat) => patterns.push(IgnorePattern::Glob(pat)),
+                    Err(e) => crate::log!(
+                        "[Backup] Skipping malformed .backupignore pattern {:?}: {}",
+                        line,
+                        e
+                    ),
+                }
+            } else {
+                patterns.push(IgnorePattern::Prefix(PathBuf::from(line)));
+            }
+        }
+        Self(patterns)
+    }
+
+    /// True if any parsed pattern matches the workspace-relative path.
+    fn matches(&self, rel: &Path) -> bool {
+        self.0.iter().any(|p| p.matches(rel))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// True if a workspace-relative path must be omitted from the backup tar
 /// and from the size estimate.
 ///
-/// Excludes:
+/// Excludes (hardcoded, always — cheap checks first):
 /// - `.lucidos/` — ephemeral runtime/cache
 /// - `data/postgres/` — live PGDATA, captured via pg_dump
 /// - `data/postgres.*/` — archived PGDATA siblings (e.g.
 ///   `postgres.migrated-<ts>/` left by `scripts/lib/workspace.sh` after the
 ///   one-time bind-mount → Docker-volume migration). These can be many GB
 ///   and are redundant with pg_dump.
-fn is_excluded_workspace_path(rel: &Path) -> bool {
+///
+/// Then, in addition, any path matched by the workspace's `.backupignore`
+/// (`ignore`) — see [`BackupIgnore`].
+fn is_excluded_workspace_path(rel: &Path, ignore: &BackupIgnore) -> bool {
     if rel.starts_with(".lucidos") {
         return true;
     }
     let mut comps = rel.components();
-    let (Some(std::path::Component::Normal(d)), Some(std::path::Component::Normal(p))) =
+    if let (Some(std::path::Component::Normal(d)), Some(std::path::Component::Normal(p))) =
         (comps.next(), comps.next())
-    else {
-        return false;
-    };
-    if d != "data" {
-        return false;
+    {
+        let p = p.to_string_lossy();
+        if d == "data" && (p == "postgres" || p.starts_with("postgres.")) {
+            return true;
+        }
     }
-    let p = p.to_string_lossy();
-    p == "postgres" || p.starts_with("postgres.")
+    ignore.matches(rel)
 }
 
 /// Build a tar header for a file, copying size + mtime from filesystem metadata.
@@ -776,6 +1263,25 @@ fn header_for_file(metadata: &std::fs::Metadata) -> tar::Header {
     header
 }
 
+/// Classify an `io::Result` so the backup walk tolerates paths that vanish
+/// mid-walk: `Ok(Some(v))` = use it, `Ok(None)` = the path was removed
+/// (`NotFound`) so skip it, `Err(e)` = a real error to propagate.
+///
+/// The workspace's autoresearch loop constantly creates and tears down git
+/// worktrees under `.git/`, so a file (or directory) enumerated by the walk can
+/// disappear before tar reads it. A single vanished path must not abort the
+/// whole backup — but other error kinds (permissions, I/O) still must.
+fn skip_if_vanished<T>(path: &Path, result: std::io::Result<T>) -> Result<Option<T>, BoxError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::log!("[Backup] Skipping vanished path {}: {}", path.display(), e);
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Append a single file at `path` to the tar `builder` under archive path `archive_path`.
 fn append_file<W: std::io::Write>(
     builder: &mut tar::Builder<W>,
@@ -784,7 +1290,10 @@ fn append_file<W: std::io::Write>(
     metadata: &std::fs::Metadata,
 ) -> Result<(), BoxError> {
     let mut header = header_for_file(metadata);
-    let mut file = std::fs::File::open(path)?;
+    // The file may have vanished between the metadata check and now; skip it.
+    let Some(mut file) = skip_if_vanished(path, std::fs::File::open(path))? else {
+        return Ok(());
+    };
     builder.append_data(&mut header, archive_path, &mut file)?;
     Ok(())
 }
@@ -798,21 +1307,25 @@ fn tar_and_compress(
     sql_dump: &Path,
     output: &Path,
     user_dir: Option<&Path>,
+    ignore: &BackupIgnore,
 ) -> Result<(), BoxError> {
     let file = std::fs::File::create(output)?;
     let encoder = zstd::Encoder::new(file, 3)?;
     let mut builder = tar::Builder::new(encoder);
 
-    // Add workspace files, excluding .lucidos/, data/postgres/, and any
-    // data/postgres.*/ siblings (see is_excluded_workspace_path).
+    // Add workspace files, excluding .lucidos/, data/postgres/, any
+    // data/postgres.*/ siblings, and anything matched by data/.backupignore
+    // (see is_excluded_workspace_path).
     for path in walkdir(workspace)? {
         let rel = path.strip_prefix(workspace)?;
 
-        if is_excluded_workspace_path(rel) {
+        if is_excluded_workspace_path(rel, ignore) {
             continue;
         }
 
-        let metadata = std::fs::metadata(&path)?;
+        let Some(metadata) = skip_if_vanished(&path, std::fs::metadata(&path))? else {
+            continue;
+        };
         if metadata.is_file() {
             append_file(&mut builder, &path, rel, &metadata)?;
         }
@@ -836,7 +1349,9 @@ fn tar_and_compress(
                 if rel.starts_with(".git") {
                     continue;
                 }
-                let metadata = std::fs::metadata(&path)?;
+                let Some(metadata) = skip_if_vanished(&path, std::fs::metadata(&path))? else {
+                    continue;
+                };
                 if metadata.is_file() {
                     let archive_path = std::path::Path::new("user_dir").join(rel);
                     append_file(&mut builder, &path, &archive_path, &metadata)?;
@@ -862,8 +1377,14 @@ fn walkdir_inner(dir: &Path, results: &mut Vec<PathBuf>) -> Result<(), BoxError>
     if !dir.is_dir() {
         return Ok(());
     }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
+    // The directory may be removed mid-walk; treat a vanished dir as empty.
+    let Some(entries) = skip_if_vanished(dir, std::fs::read_dir(dir))? else {
+        return Ok(());
+    };
+    for entry in entries {
+        let Some(entry) = skip_if_vanished(dir, entry)? else {
+            continue;
+        };
         let path = entry.path();
         if path.is_dir() {
             walkdir_inner(&path, results)?;
@@ -875,435 +1396,5 @@ fn walkdir_inner(dir: &Path, results: &mut Vec<PathBuf>) -> Result<(), BoxError>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_validate_workspace_name() {
-        assert!(validate_workspace_name("personal").is_ok());
-        assert!(validate_workspace_name("my-workspace").is_ok());
-        assert!(validate_workspace_name("test_123").is_ok());
-
-        // Invalid
-        assert!(validate_workspace_name("").is_err());
-        assert!(validate_workspace_name("..").is_err());
-        assert!(validate_workspace_name("/etc/passwd").is_err());
-        assert!(validate_workspace_name("\\windows").is_err());
-        assert!(validate_workspace_name("has space").is_err());
-        assert!(validate_workspace_name(".hidden").is_err());
-    }
-
-    #[test]
-    fn test_key_file_path() {
-        let workspace = Path::new("/home/user/my-workspace");
-        assert_eq!(
-            key_file_path(workspace),
-            PathBuf::from("/home/user/my-workspace/.lucidos/backup.key")
-        );
-    }
-
-    #[test]
-    fn test_tar_and_compress_excludes_lucidos_and_postgres() {
-        let workspace = tempfile::tempdir().unwrap();
-        let ws = workspace.path();
-
-        // Create .lucidos/ — should be excluded
-        std::fs::create_dir_all(ws.join(".lucidos/cache")).unwrap();
-        std::fs::write(ws.join(".lucidos/cache/index.dat"), "cache data").unwrap();
-
-        // Create data/postgres/ — should be excluded (live DB, backed up via pg_dump)
-        std::fs::create_dir_all(ws.join("data/postgres/global")).unwrap();
-        std::fs::write(ws.join("data/postgres/global/pg_filenode.map"), "pgdata").unwrap();
-
-        // Create .git/ — should be included
-        std::fs::create_dir_all(ws.join(".git")).unwrap();
-        std::fs::write(ws.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
-
-        // Create data/artifacts/ — should be included
-        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
-        std::fs::write(ws.join("data/artifacts/user_profile.md"), "# Profile").unwrap();
-
-        // Create a SQL dump
-        let sql_dump = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
-
-        // Tar and compress
-        let output = tempfile::NamedTempFile::new().unwrap();
-        tar_and_compress(ws, sql_dump.path(), output.path(), None).unwrap();
-
-        // Decompress and verify contents (streaming from file)
-        let file = std::fs::File::open(output.path()).unwrap();
-        let decoder = zstd::Decoder::new(file).unwrap();
-        let mut archive = tar::Archive::new(decoder);
-
-        let mut found_paths: Vec<String> = Vec::new();
-        for entry in archive.entries().unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path().unwrap().to_string_lossy().to_string();
-            found_paths.push(path);
-        }
-
-        found_paths.sort();
-
-        // .lucidos/ should be excluded
-        assert!(
-            !found_paths.iter().any(|p| p.starts_with(".lucidos")),
-            "archive should not contain .lucidos/: {found_paths:?}"
-        );
-
-        // data/postgres/ should be excluded (live DB)
-        assert!(
-            !found_paths.iter().any(|p| p.starts_with("data/postgres")),
-            "archive should not contain data/postgres/: {found_paths:?}"
-        );
-
-        // .git/ and data/artifacts/ should be included
-        assert!(
-            found_paths.iter().any(|p| p.starts_with(".git")),
-            "archive should contain .git/: {found_paths:?}"
-        );
-        assert!(
-            found_paths.iter().any(|p| p.starts_with("data/")),
-            "archive should contain data/: {found_paths:?}"
-        );
-
-        // SQL dump should be at root
-        assert!(
-            found_paths.contains(&"lucidos_backup.dump".to_string()),
-            "archive should contain lucidos_backup.dump: {found_paths:?}"
-        );
-    }
-
-    /// `data/blobs/` holds content-addressed image bytes. Backups MUST
-    /// include them — they're the only copy of the bytes referenced by
-    /// every MessageReceived.user_image_hashes and ThreadComposeChanged.
-    /// A regression in the exclusion list would orphan every historical
-    /// image after restore, with no way to recover them.
-    #[test]
-    fn test_tar_and_compress_includes_data_blobs() {
-        let workspace = tempfile::tempdir().unwrap();
-        let ws = workspace.path();
-
-        // Realistic blob path — fan-out by leading two hex chars of the hash.
-        let hash = "ab".to_string() + &"c".repeat(62);
-        let blob_dir = ws.join("data/blobs").join(&hash[..2]);
-        std::fs::create_dir_all(&blob_dir).unwrap();
-        let blob_path = blob_dir.join(format!("{hash}.png"));
-        std::fs::write(&blob_path, b"\x89PNG fake bytes for test").unwrap();
-
-        let sql_dump = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
-
-        let output = tempfile::NamedTempFile::new().unwrap();
-        tar_and_compress(ws, sql_dump.path(), output.path(), None).unwrap();
-
-        let file = std::fs::File::open(output.path()).unwrap();
-        let decoder = zstd::Decoder::new(file).unwrap();
-        let mut archive = tar::Archive::new(decoder);
-        let found_paths: Vec<String> = archive
-            .entries()
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path().unwrap().to_string_lossy().to_string())
-            .collect();
-
-        let expected = format!("data/blobs/{}/{}.png", &hash[..2], hash);
-        assert!(
-            found_paths.contains(&expected),
-            "archive must contain {expected}, got: {found_paths:?}"
-        );
-    }
-
-    #[test]
-    fn test_tar_and_compress_excludes_postgres_migrated_archives() {
-        // `scripts/lib/workspace.sh` archives the old PGDATA as
-        // `data/postgres.migrated-<timestamp>/` when migrating from a host bind
-        // mount to a Docker named volume. These can be many GB and must NOT be
-        // included in the backup (the live DB is captured via pg_dump).
-        let workspace = tempfile::tempdir().unwrap();
-        let ws = workspace.path();
-
-        // Live pgdata (already excluded by the existing rule)
-        std::fs::create_dir_all(ws.join("data/postgres/global")).unwrap();
-        std::fs::write(ws.join("data/postgres/global/pg_filenode.map"), "live").unwrap();
-
-        // Archived pgdata sibling — the regression case
-        std::fs::create_dir_all(ws.join("data/postgres.migrated-20260503094805/global")).unwrap();
-        std::fs::write(
-            ws.join("data/postgres.migrated-20260503094805/global/pg_filenode.map"),
-            "stale",
-        )
-        .unwrap();
-
-        // Real workspace content that MUST still be included
-        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
-        std::fs::write(ws.join("data/artifacts/profile.md"), "# Profile").unwrap();
-
-        let sql_dump = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
-
-        let output = tempfile::NamedTempFile::new().unwrap();
-        tar_and_compress(ws, sql_dump.path(), output.path(), None).unwrap();
-
-        let file = std::fs::File::open(output.path()).unwrap();
-        let decoder = zstd::Decoder::new(file).unwrap();
-        let mut archive = tar::Archive::new(decoder);
-        let mut found_paths: Vec<String> = Vec::new();
-        for entry in archive.entries().unwrap() {
-            let entry = entry.unwrap();
-            found_paths.push(entry.path().unwrap().to_string_lossy().to_string());
-        }
-
-        assert!(
-            !found_paths
-                .iter()
-                .any(|p| p.starts_with("data/postgres.migrated-")),
-            "archive must not contain data/postgres.migrated-*: {found_paths:?}"
-        );
-        assert!(
-            !found_paths.iter().any(|p| p.starts_with("data/postgres/")),
-            "archive must not contain data/postgres/: {found_paths:?}"
-        );
-        assert!(
-            found_paths
-                .iter()
-                .any(|p| p == "data/artifacts/profile.md"),
-            "archive must contain data/artifacts/profile.md: {found_paths:?}"
-        );
-    }
-
-    #[test]
-    fn test_full_pipeline_encrypt_decrypt() {
-        let workspace = tempfile::tempdir().unwrap();
-        let ws = workspace.path();
-
-        // Create a file in the workspace
-        std::fs::create_dir_all(ws.join("data")).unwrap();
-        std::fs::write(ws.join("data/notes.txt"), "important notes").unwrap();
-
-        // Also create .lucidos/ which should be excluded
-        std::fs::create_dir_all(ws.join(".lucidos")).unwrap();
-        std::fs::write(ws.join(".lucidos/runtime.pid"), "12345").unwrap();
-
-        // Create a mock SQL dump
-        let sql_dump = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(sql_dump.path(), "INSERT INTO events VALUES (1);").unwrap();
-
-        // Tar + compress (streaming to file)
-        let compressed_path = tempfile::NamedTempFile::new().unwrap();
-        tar_and_compress(ws, sql_dump.path(), compressed_path.path(), None).unwrap();
-
-        // Encrypt (streaming file-to-file)
-        let key = crypto::generate_key();
-        let encrypted_path = tempfile::NamedTempFile::new().unwrap();
-        {
-            let input = std::fs::File::open(compressed_path.path()).unwrap();
-            let mut output = std::fs::File::create(encrypted_path.path()).unwrap();
-            crypto::encrypt(&key, input, &mut output).unwrap();
-        }
-
-        // Decrypt (streaming file-to-file)
-        let decrypted_path = tempfile::NamedTempFile::new().unwrap();
-        {
-            let input = std::fs::File::open(encrypted_path.path()).unwrap();
-            let mut output = std::fs::File::create(decrypted_path.path()).unwrap();
-            crypto::decrypt(&key, input, &mut output).unwrap();
-        }
-
-        // Decompress + untar (streaming from file)
-        let restore_dir = tempfile::tempdir().unwrap();
-        {
-            let file = std::fs::File::open(decrypted_path.path()).unwrap();
-            let decoder = zstd::Decoder::new(file).unwrap();
-            let mut archive = tar::Archive::new(decoder);
-            archive.unpack(restore_dir.path()).unwrap();
-        }
-
-        // Verify restored content matches original
-        let restored_notes =
-            std::fs::read_to_string(restore_dir.path().join("data/notes.txt")).unwrap();
-        assert_eq!(restored_notes, "important notes");
-
-        // Verify SQL dump is present
-        let restored_sql =
-            std::fs::read_to_string(restore_dir.path().join("lucidos_backup.dump")).unwrap();
-        assert_eq!(restored_sql, "INSERT INTO events VALUES (1);");
-
-        // Verify .lucidos/ was NOT included
-        assert!(
-            !restore_dir.path().join(".lucidos").exists(),
-            ".lucidos/ should not be in the restored backup"
-        );
-    }
-
-    #[test]
-    fn test_estimate_weights_small_workspace() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path();
-        // 1 MB workspace — dump dominates (fixed 2s overhead)
-        std::fs::write(ws.join("data.bin"), vec![0u8; 1_048_576]).unwrap();
-
-        let (dump_end, compress_end, encrypt_end) = estimate_weights(ws);
-
-        assert!(dump_end >= 2, "dump should get at least 2%: {dump_end}");
-        assert!(
-            compress_end > dump_end,
-            "compress_end should exceed dump_end"
-        );
-        assert!(
-            encrypt_end > compress_end,
-            "encrypt_end should exceed compress_end"
-        );
-        assert!(
-            encrypt_end <= 97,
-            "encrypt_end should leave room for upload: {encrypt_end}"
-        );
-    }
-
-    #[test]
-    fn test_estimate_weights_empty_workspace() {
-        let dir = tempfile::tempdir().unwrap();
-        let (dump_end, compress_end, encrypt_end) = estimate_weights(dir.path());
-
-        // Each phase gets at least its minimum, and they're strictly increasing
-        assert!(dump_end >= 2);
-        assert!(compress_end > dump_end);
-        assert!(encrypt_end > compress_end);
-        assert!(encrypt_end <= 97);
-    }
-
-    #[test]
-    fn test_estimate_restore_weights() {
-        // 10 MB encrypted file
-        let (decrypt_end, decompress_end) = estimate_restore_weights(10 * 1_048_576, 15);
-
-        assert!(decrypt_end > 15, "decrypt should start after download");
-        assert!(
-            decompress_end > decrypt_end,
-            "decompress should follow decrypt"
-        );
-        assert!(
-            decompress_end <= 97,
-            "should leave room for restore: {decompress_end}"
-        );
-    }
-
-    #[test]
-    fn test_estimate_restore_weights_tiny_file() {
-        // 100 KB file — restore dominates
-        let (decrypt_end, decompress_end) = estimate_restore_weights(100_000, 15);
-
-        assert!(decrypt_end >= 17, "each phase gets at least 2%");
-        assert!(decompress_end >= decrypt_end + 2);
-    }
-
-    #[test]
-    fn test_move_contents() {
-        let src = tempfile::tempdir().unwrap();
-        let dest = tempfile::tempdir().unwrap();
-
-        // Create structure in src
-        std::fs::create_dir_all(src.path().join("data/artifacts")).unwrap();
-        std::fs::write(src.path().join("data/artifacts/profile.md"), "# Profile").unwrap();
-        std::fs::write(src.path().join("top.txt"), "hello").unwrap();
-
-        // Put existing content in dest that shouldn't be affected
-        std::fs::create_dir_all(dest.path().join(".lucidos")).unwrap();
-        std::fs::write(dest.path().join(".lucidos/key"), "secret").unwrap();
-
-        move_contents(src.path(), dest.path()).unwrap();
-
-        // Source content should now be in dest
-        assert_eq!(
-            std::fs::read_to_string(dest.path().join("data/artifacts/profile.md")).unwrap(),
-            "# Profile"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dest.path().join("top.txt")).unwrap(),
-            "hello"
-        );
-        // Pre-existing dest content should still be there
-        assert_eq!(
-            std::fs::read_to_string(dest.path().join(".lucidos/key")).unwrap(),
-            "secret"
-        );
-    }
-
-    #[test]
-    fn test_tar_includes_user_dir() {
-        let workspace = tempfile::tempdir().unwrap();
-        let ws = workspace.path();
-        std::fs::create_dir_all(ws.join("data")).unwrap();
-        std::fs::write(ws.join("data/notes.txt"), "workspace content").unwrap();
-
-        // Create a mock user dir
-        let user_tmp = tempfile::tempdir().unwrap();
-        let user_dir = user_tmp.path();
-        std::fs::create_dir_all(user_dir.join("knowhow")).unwrap();
-        std::fs::write(
-            user_dir.join("knowhow/lucidos.md"),
-            "---\nname: Lucidos\n---\nLucidos knowhow.",
-        )
-        .unwrap();
-        // Create .git/ which should be excluded
-        std::fs::create_dir_all(user_dir.join(".git/objects")).unwrap();
-        std::fs::write(user_dir.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
-
-        let sql_dump = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
-
-        let output = tempfile::NamedTempFile::new().unwrap();
-        tar_and_compress(ws, sql_dump.path(), output.path(), Some(user_dir)).unwrap();
-
-        // Verify archive contents
-        let file = std::fs::File::open(output.path()).unwrap();
-        let decoder = zstd::Decoder::new(file).unwrap();
-        let mut archive = tar::Archive::new(decoder);
-        let mut found_paths: Vec<String> = Vec::new();
-        for entry in archive.entries().unwrap() {
-            let entry = entry.unwrap();
-            found_paths.push(entry.path().unwrap().to_string_lossy().to_string());
-        }
-
-        // Should include user_dir/knowhow/lucidos.md
-        assert!(
-            found_paths
-                .iter()
-                .any(|p| p == "user_dir/knowhow/lucidos.md"),
-            "archive should contain user_dir/knowhow/lucidos.md: {found_paths:?}"
-        );
-        // Should NOT include user_dir/.git/
-        assert!(
-            !found_paths.iter().any(|p| p.starts_with("user_dir/.git")),
-            "archive should not contain user_dir/.git/: {found_paths:?}"
-        );
-        // Should still include workspace content
-        assert!(
-            found_paths.iter().any(|p| p == "data/notes.txt"),
-            "archive should contain data/notes.txt: {found_paths:?}"
-        );
-    }
-
-    #[test]
-    fn test_walkdir_recursive() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        std::fs::create_dir_all(root.join("a/b")).unwrap();
-        std::fs::write(root.join("top.txt"), "top").unwrap();
-        std::fs::write(root.join("a/mid.txt"), "mid").unwrap();
-        std::fs::write(root.join("a/b/deep.txt"), "deep").unwrap();
-
-        let files = walkdir(root).unwrap();
-        assert_eq!(files.len(), 3);
-
-        let rel_paths: Vec<String> = files
-            .iter()
-            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().to_string())
-            .collect();
-
-        assert!(rel_paths.contains(&"top.txt".to_string()));
-        assert!(rel_paths.contains(&"a/mid.txt".to_string()));
-        assert!(rel_paths.contains(&"a/b/deep.txt".to_string()));
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

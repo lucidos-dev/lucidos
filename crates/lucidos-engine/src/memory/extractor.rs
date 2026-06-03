@@ -131,7 +131,16 @@ impl Default for QueryClassification {
     }
 }
 
-const EXTRACTION_MODEL: &str = "gemini-3-flash-preview";
+/// Default model the extractor falls back to when no per-call override is passed
+/// (and the `PREF_MODEL_MEMORY` preference is also empty). Override at process
+/// startup with `LUCIDOS_EXTRACTION_MODEL`. Mirrors the
+/// `LUCIDOS_MODEL` / `LUCIDOS_EMBEDDING_MODEL` env-var convention from CLAUDE.md.
+const EXTRACTION_MODEL_DEFAULT: &str = "gemini-3-flash-preview";
+
+fn default_extraction_model() -> String {
+    std::env::var("LUCIDOS_EXTRACTION_MODEL")
+        .unwrap_or_else(|_| EXTRACTION_MODEL_DEFAULT.to_string())
+}
 
 pub struct MemoryExtractor {
     provider: VertexProvider,
@@ -141,7 +150,10 @@ pub struct MemoryExtractor {
 }
 
 impl MemoryExtractor {
-    pub fn new(project_id: String, location: String) -> Self {
+    pub fn new(
+        project_id: String,
+        location: String,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let token_cache: TokenCache = std::sync::Arc::new(std::sync::Mutex::new(None));
         Self::with_location_handle(project_id, location_handle(location), token_cache)
     }
@@ -150,19 +162,19 @@ impl MemoryExtractor {
         project_id: String,
         location: LocationHandle,
         token_cache: TokenCache,
-    ) -> Self {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let provider = VertexProvider::with_location_handle(
             project_id.clone(),
             location.clone(),
-            EXTRACTION_MODEL.to_string(),
+            default_extraction_model(),
             token_cache.clone(),
-        );
-        Self {
+        )?;
+        Ok(Self {
             provider,
             project_id,
             location,
             token_cache,
-        }
+        })
     }
 
     /// Access the underlying Flash provider for lightweight LLM tasks.
@@ -171,10 +183,15 @@ impl MemoryExtractor {
     }
 
     /// Create a VertexProvider for a specific model, sharing the token cache
-    /// and live region handle.
-    pub fn provider_for_model(&self, model: &str) -> VertexProvider {
+    /// and live region handle. The reqwest builder can theoretically fail —
+    /// callers propagate via `?` so the panic doesn't land deep inside an
+    /// unrelated call stack.
+    pub fn provider_for_model(
+        &self,
+        model: &str,
+    ) -> Result<VertexProvider, Box<dyn std::error::Error + Send + Sync>> {
         if model.is_empty() || model == "default" {
-            self.provider.clone()
+            Ok(self.provider.clone())
         } else {
             VertexProvider::with_location_handle(
                 self.project_id.clone(),
@@ -228,7 +245,7 @@ impl MemoryExtractor {
             Some(ctx) => format!("{}{}\n\n{}", EXTRACTION_PROMPT, language_instruction, ctx),
             None => format!("{}{}", EXTRACTION_PROMPT, language_instruction),
         };
-        let provider = self.provider_for_model(model.unwrap_or_default());
+        let provider = self.provider_for_model(model.unwrap_or_default())?;
         let response = self
             .chat_with_provider(&provider, &system, content, Some("none"))
             .await?;
@@ -284,7 +301,7 @@ impl MemoryExtractor {
             ),
             _ => QUERY_CLASSIFICATION_PROMPT.to_string(),
         };
-        let provider = self.provider_for_model(model.unwrap_or_default());
+        let provider = self.provider_for_model(model.unwrap_or_default())?;
         let response = self
             .chat_with_provider(&provider, &system, query, Some("none"))
             .await?;
@@ -318,7 +335,7 @@ impl MemoryExtractor {
             CRITICAL: if a problem was reported and then fixed, say it \"was fixed\" — do NOT just describe the problem \
             without its resolution, as that causes the assistant to re-attempt already-completed fixes. \
             Write concise flowing prose, no bullet points.";
-        let provider = self.provider_for_model(model.unwrap_or_default());
+        let provider = self.provider_for_model(model.unwrap_or_default())?;
         let response = self
             .chat_with_provider(&provider, system, turns, Some("low"))
             .await?;
@@ -326,9 +343,17 @@ impl MemoryExtractor {
         Ok(summary)
     }
 
-    /// Create a single fallback fact when extraction fails.
-    /// Truncates content to 500 chars and assigns importance 0.5.
-    pub fn fallback_fact(content: &str, topic: &str) -> ExtractedFact {
+    /// Create a single fallback fact when structured extraction fails, or
+    /// `None` when the raw content isn't worth storing. The fallback bypasses
+    /// `extract_facts`' validation, so it must re-apply the same guard the
+    /// extractor uses: skip empty content and fabricated engine-internal
+    /// claims, which would otherwise smuggle past the filter that exists to
+    /// keep them out of memory. Truncates to 500 chars, importance 0.5.
+    pub fn fallback_fact(content: &str, topic: &str) -> Option<ExtractedFact> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() || is_fabricated_engine_internal_claim(trimmed) {
+            return None;
+        }
         let chars: String = content.chars().take(500).collect();
         let truncated = if chars.len() < content.len() {
             format!("{}...", chars)
@@ -336,12 +361,12 @@ impl MemoryExtractor {
             chars
         };
 
-        ExtractedFact {
+        Some(ExtractedFact {
             fact: truncated,
             importance: 0.5,
             topic: topic.to_string(),
             entities: vec![],
-        }
+        })
     }
 }
 
@@ -428,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_fallback_fact_short() {
-        let fact = MemoryExtractor::fallback_fact("Short content", "General");
+        let fact = MemoryExtractor::fallback_fact("Short content", "General").unwrap();
         assert_eq!(fact.fact, "Short content");
         assert_eq!(fact.importance, 0.5);
         assert_eq!(fact.topic, "General");
@@ -438,9 +463,28 @@ mod tests {
     #[test]
     fn test_fallback_fact_truncation() {
         let long_content = "a".repeat(600);
-        let fact = MemoryExtractor::fallback_fact(&long_content, "Test");
+        let fact = MemoryExtractor::fallback_fact(&long_content, "Test").unwrap();
         assert_eq!(fact.fact.len(), 503); // 500 chars + "..."
         assert!(fact.fact.ends_with("..."));
+    }
+
+    /// The fallback runs only after structured extraction fails, and it
+    /// bypasses `extract_facts`' filtering — so empty/whitespace content must
+    /// not be stored as a "fact".
+    #[test]
+    fn fallback_fact_rejects_empty_content() {
+        assert!(MemoryExtractor::fallback_fact("", "General").is_none());
+        assert!(MemoryExtractor::fallback_fact("   \n  ", "General").is_none());
+    }
+
+    /// The fallback must apply the same `is_fabricated_engine_internal_claim`
+    /// guard `extract_facts` does, or a fabricated engine-internal claim
+    /// slips into memory whenever structured extraction happens to fail.
+    #[test]
+    fn fallback_fact_rejects_fabricated_engine_internal_claim() {
+        let claim = "The agentic loop hit its max_iterations cap after 25 tool calls";
+        assert!(is_fabricated_engine_internal_claim(claim));
+        assert!(MemoryExtractor::fallback_fact(claim, "General").is_none());
     }
 
     #[test]
@@ -528,7 +572,9 @@ mod tests {
     #[test]
     fn test_filter_is_case_insensitive() {
         assert!(is_fabricated_engine_internal_claim("TOOL-CALL CAP hit"));
-        assert!(is_fabricated_engine_internal_claim("Per-Turn Limit reached"));
+        assert!(is_fabricated_engine_internal_claim(
+            "Per-Turn Limit reached"
+        ));
         assert!(is_fabricated_engine_internal_claim("see Agentic_Loop.RS"));
     }
 
@@ -553,7 +599,7 @@ mod tests {
         let location =
             std::env::var("VERTEX_REGION").unwrap_or_else(|_| "europe-west1".to_string());
 
-        let extractor = MemoryExtractor::new(project_id, location);
+        let extractor = MemoryExtractor::new(project_id, location).expect("extractor builds");
 
         let context = "Background:\n- The user is Jane Smith, born 01.01.1990, works at FakeCorp as a data scientist";
         let content = "Temperature control loop completed. Adjusted 3 heat pumps down by 1°C each. Outside temp 2°C.";

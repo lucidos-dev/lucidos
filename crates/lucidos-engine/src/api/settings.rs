@@ -2,6 +2,7 @@ use super::*;
 
 use crate::core::{AuthType, CredentialStore, OAuthStore, PinnedAppStore, PreferenceStore};
 use crate::engine::claude_code::{read_allowed_tools_file, write_allowed_tools_file};
+use crate::engine::event_bus::{BusEvent, SystemEvent};
 
 #[derive(Serialize)]
 pub(super) struct CcAllowedToolsResponse {
@@ -13,7 +14,7 @@ pub(super) struct CcAllowedToolsRequest {
     contents: String,
 }
 
-/// GET /api/cc-allowed-tools — return the raw contents of
+/// GET /api/v1/cc-allowed-tools — return the raw contents of
 /// `~/.lucidos/cc-allowed-tools` so the settings UI can display them. Missing
 /// file returns the seeded header (mirrors `cc_allowed_tools` semantics).
 pub(super) async fn get_cc_allowed_tools(
@@ -32,8 +33,8 @@ pub(super) async fn get_cc_allowed_tools(
     Ok(Json(CcAllowedToolsResponse { contents }))
 }
 
-/// PUT /api/cc-allowed-tools — overwrite the file with the provided contents
-/// (atomic). Newly spawned CC subprocesses pick this up immediately; in-flight
+/// PUT /api/v1/cc-allowed-tools — overwrite the file with the provided contents
+/// (atomic). Newly spawned Claude Code subprocesses pick this up immediately; in-flight
 /// subprocesses keep their frozen `--allowedTools` flag until they restart.
 pub(super) async fn put_cc_allowed_tools(
     State(state): State<AppState>,
@@ -70,6 +71,7 @@ pub(super) async fn list_credentials(
 /// Create or update a credential
 pub(super) async fn create_credential(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<CreateCredentialRequest>,
 ) -> Json<ApiResult> {
     let auth_type = AuthType::parse(&request.auth_type);
@@ -84,7 +86,11 @@ pub(super) async fn create_credential(
     .await
     {
         Ok(_) => {
-            // If this is an email password, also update the email account
+            // If this is an email password, also sync it into the email account
+            // row. IMAP/SMTP read the password from `email_accounts`, not the
+            // credentials table, so a failed sync must surface as an error (the
+            // edit path in `update_credential` does the same) rather than report
+            // a false success while email silently breaks.
             if auth_type == AuthType::EmailPassword {
                 if let Some(account_name) = request.service_name.strip_prefix("email:") {
                     use crate::core::EmailStore;
@@ -92,31 +98,130 @@ pub(super) async fn create_credential(
                         EmailStore::update_password(&state.pool, account_name, &request.auth_value)
                             .await
                     {
-                        log!(
-                            "[Email] Failed to update email password for '{}': {}",
-                            account_name,
-                            e
-                        );
+                        return ApiResult::err(format!("Failed to update email password: {}", e));
                     }
                 }
             }
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Settings] CredentialCreated", |actor| {
+                    SystemEvent::CredentialCreated {
+                        service_name: request.service_name.clone(),
+                        auth_type,
+                        actor,
+                    }
+                })
+                .await;
             ApiResult::ok()
         }
         Err(e) => ApiResult::err(format!("Failed to save credential: {}", e)),
     }
 }
 
-/// Update a credential's auth value
+/// Update an existing credential's editable fields. For `email_password`
+/// credentials the `email_accounts` row (server settings + password) is kept in
+/// sync, because IMAP/SMTP read from `email_accounts`, not the credentials
+/// table — the create path does the same, and the edit path must match it.
 pub(super) async fn update_credential(
     State(state): State<AppState>,
     Query(query): Query<ServiceQuery>,
+    headers: HeaderMap,
     Json(request): Json<UpdateCredentialRequest>,
 ) -> Json<ApiResult> {
+    use crate::core::EmailStore;
+
     let service = query.service;
-    match CredentialStore::update_value(&state.pool, &service, &request.auth_value).await {
-        Ok(true) => ApiResult::ok(),
+    let auth_type = AuthType::parse(&request.auth_type);
+
+    // Empty string means "keep the current secret" — same contract the
+    // frontend relies on when the user edits only non-secret fields.
+    let new_secret = request.auth_value.as_deref().filter(|s| !s.is_empty());
+
+    // For email credentials the canonical base_url mirrors the SMTP host
+    // (matches `configure_email`'s `smtp://<host>`), derived from the edited
+    // server settings when present.
+    let base_url = match (auth_type, &request.email) {
+        (AuthType::EmailPassword, Some(email)) => format!("smtp://{}", email.smtp_host),
+        _ => request.base_url.clone(),
+    };
+
+    match CredentialStore::update(
+        &state.pool,
+        &service,
+        &base_url,
+        auth_type,
+        request.auth_header.as_deref(),
+        new_secret,
+    )
+    .await
+    {
+        Ok(true) => {
+            if auth_type == AuthType::EmailPassword {
+                if let Some(account_name) = service.strip_prefix("email:") {
+                    if let Some(email) = &request.email {
+                        if let Err(e) = EmailStore::upsert(
+                            &state.pool,
+                            account_name,
+                            &email.email_address,
+                            &email.imap_host,
+                            email.imap_port,
+                            &email.smtp_host,
+                            email.smtp_port,
+                            &email.username,
+                            email.use_tls,
+                            email.require_send_confirmation,
+                        )
+                        .await
+                        {
+                            return ApiResult::err(format!("Failed to update email account: {}", e));
+                        }
+                    }
+                    if let Some(value) = new_secret {
+                        if let Err(e) =
+                            EmailStore::update_password(&state.pool, account_name, value).await
+                        {
+                            return ApiResult::err(format!(
+                                "Failed to update email password: {}",
+                                e
+                            ));
+                        }
+                    }
+                }
+            }
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Settings] CredentialUpdated", |actor| {
+                    SystemEvent::CredentialUpdated {
+                        service_name: service.clone(),
+                        actor,
+                    }
+                })
+                .await;
+            ApiResult::ok()
+        }
         Ok(false) => ApiResult::err(format!("Credential '{}' not found", service)),
         Err(e) => ApiResult::err(format!("Failed to update credential: {}", e)),
+    }
+}
+
+/// Get an email account's server settings (no password) so the settings UI can
+/// pre-fill the edit form for an `email_password` credential.
+pub(super) async fn get_email_account(
+    State(state): State<AppState>,
+    Query(query): Query<NameQuery>,
+) -> Result<Json<crate::core::EmailAccountInfo>, (StatusCode, String)> {
+    match crate::core::EmailStore::get_info(&state.pool, &query.name).await {
+        Ok(Some(info)) => Ok(Json(info)),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            format!("Email account '{}' not found", query.name),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get email account: {}", e),
+        )),
     }
 }
 
@@ -146,10 +251,23 @@ pub(super) async fn get_credential_value(
 pub(super) async fn delete_credential(
     State(state): State<AppState>,
     Query(query): Query<ServiceQuery>,
+    headers: HeaderMap,
 ) -> Json<ApiResult> {
     let service = query.service;
     match CredentialStore::delete(&state.pool, &service).await {
-        Ok(true) => ApiResult::ok(),
+        Ok(true) => {
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Settings] CredentialDeleted", |actor| {
+                    SystemEvent::CredentialDeleted {
+                        service_name: service.clone(),
+                        actor,
+                    }
+                })
+                .await;
+            ApiResult::ok()
+        }
         Ok(false) => ApiResult::err(format!("Credential '{}' not found", service)),
         Err(e) => ApiResult::err(format!("Failed to delete credential: {}", e)),
     }
@@ -174,6 +292,7 @@ pub(super) async fn list_oauth_accounts(
 pub(super) async fn delete_oauth_account(
     State(state): State<AppState>,
     Query(query): Query<OAuthAccountQuery>,
+    headers: HeaderMap,
 ) -> Json<ApiResult> {
     let id: Uuid = match query.id.parse() {
         Ok(id) => id,
@@ -181,7 +300,19 @@ pub(super) async fn delete_oauth_account(
     };
 
     match OAuthStore::delete(&state.pool, id).await {
-        Ok(true) => ApiResult::ok(),
+        Ok(true) => {
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Settings] OAuthAccountDeleted", |actor| {
+                    SystemEvent::OAuthAccountDeleted {
+                        account_id: id.to_string(),
+                        actor,
+                    }
+                })
+                .await;
+            ApiResult::ok()
+        }
         Ok(false) => ApiResult::err("OAuth account not found"),
         Err(e) => ApiResult::err(format!("Failed to delete OAuth account: {}", e)),
     }
@@ -320,20 +451,16 @@ pub(super) async fn delete_preference(
     let key = query.key;
     match PreferenceStore::delete(&state.pool, &key).await {
         Ok(true) => {
-            let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
             state
                 .engine
                 .event_bus
-                .emit_or_log(
-                    crate::engine::event_bus::BusEvent::System(
-                        crate::engine::event_bus::SystemEvent::PreferencesChanged {
-                            key: key.clone(),
-                            value: None,
-                            actor,
-                        },
-                    ),
-                    "[Settings] PreferencesChanged",
-                )
+                .emit_user_system(&headers, &state.pool, "[Settings] PreferencesChanged", |actor| {
+                    crate::engine::event_bus::SystemEvent::PreferencesChanged {
+                        key: key.clone(),
+                        value: None,
+                        actor,
+                    }
+                })
                 .await;
             ApiResult::ok()
         }
@@ -360,7 +487,7 @@ pub(super) struct PinAppRequest {
     device_id: String,
 }
 
-/// GET /api/pinned-apps?device_id=X — list pinned apps for a device
+/// GET /api/v1/pinned-apps?device_id=X — list pinned apps for a device
 pub(super) async fn get_pinned_apps(
     State(state): State<AppState>,
     Query(query): Query<PinnedAppsQuery>,
@@ -376,24 +503,65 @@ pub(super) async fn get_pinned_apps(
     Ok(Json(PinnedAppsResponse { entries }))
 }
 
-/// POST /api/pinned-apps — pin an app for a device
+/// POST /api/v1/pinned-apps — pin an app for a device. Idempotent in the DB;
+/// only emits `PinnedAppPinned` when the row was actually inserted (so
+/// re-clicks of an already-pinned tile don't append events).
 pub(super) async fn pin_app(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<PinAppRequest>,
 ) -> Json<ApiResult> {
     match PinnedAppStore::pin(&state.pool, &request.app_id, "main", &request.device_id).await {
-        Ok(()) => ApiResult::ok(),
+        Ok(true) => {
+            let actor =
+                super::actor::user_actor_resolved(&headers, &state.pool, Some(&request.device_id))
+                    .await;
+            state
+                .engine
+                .event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::PinnedAppPinned {
+                        app_id: request.app_id.clone(),
+                        device_id: request.device_id.clone(),
+                        actor,
+                    }),
+                    "[Settings] PinnedAppPinned",
+                )
+                .await;
+            ApiResult::ok()
+        }
+        Ok(false) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!("Failed to pin app: {}", e)),
     }
 }
 
-/// DELETE /api/pinned-apps — unpin an app for a device
+/// DELETE /api/v1/pinned-apps — unpin an app for a device. Idempotent in the
+/// DB; only emits `PinnedAppUnpinned` when a row was actually removed.
 pub(super) async fn unpin_app(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<PinAppRequest>,
 ) -> Json<ApiResult> {
     match PinnedAppStore::unpin(&state.pool, &request.app_id, "main", &request.device_id).await {
-        Ok(_) => ApiResult::ok(),
+        Ok(true) => {
+            let actor =
+                super::actor::user_actor_resolved(&headers, &state.pool, Some(&request.device_id))
+                    .await;
+            state
+                .engine
+                .event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::PinnedAppUnpinned {
+                        app_id: request.app_id.clone(),
+                        device_id: request.device_id.clone(),
+                        actor,
+                    }),
+                    "[Settings] PinnedAppUnpinned",
+                )
+                .await;
+            ApiResult::ok()
+        }
+        Ok(false) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!("Failed to unpin app: {}", e)),
     }
 }
@@ -402,6 +570,7 @@ pub(super) async fn unpin_app(
 
 pub(super) async fn register_device(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<DeviceRegisterRequest>,
 ) -> Json<serde_json::Value> {
     match crate::core::DeviceStore::register(
@@ -411,7 +580,33 @@ pub(super) async fn register_device(
     )
     .await
     {
-        Ok(device) => Json(serde_json::json!({ "success": true, "device": device })),
+        Ok((device, inserted)) => {
+            // Frontend calls this endpoint on every page load to refresh
+            // `last_seen_at`, so the upsert path is the steady state — only
+            // emit `DeviceRegistered` for genuine first-touch inserts.
+            // Otherwise the events table would grow by one row per refresh.
+            if inserted {
+                let actor = super::actor::user_actor_resolved(
+                    &headers,
+                    &state.pool,
+                    Some(&request.device_id),
+                )
+                .await;
+                state
+                    .engine
+                    .event_bus
+                    .emit_or_log(
+                        BusEvent::System(SystemEvent::DeviceRegistered {
+                            device_id: request.device_id.clone(),
+                            user_agent: request.user_agent.clone(),
+                            actor,
+                        }),
+                        "[Settings] DeviceRegistered",
+                    )
+                    .await;
+            }
+            Json(serde_json::json!({ "success": true, "device": device }))
+        }
         Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
     }
 }
@@ -434,10 +629,24 @@ pub(super) async fn list_devices(
 pub(super) async fn rename_device(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<DeviceRenameRequest>,
 ) -> Json<serde_json::Value> {
     match crate::core::DeviceStore::rename(&state.pool, &device_id, request.name.as_deref()).await {
-        Ok(true) => Json(serde_json::json!({ "success": true })),
+        Ok(true) => {
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Settings] DeviceRenamed", |actor| {
+                    SystemEvent::DeviceRenamed {
+                        device_id: device_id.clone(),
+                        name: request.name.clone(),
+                        actor,
+                    }
+                })
+                .await;
+            Json(serde_json::json!({ "success": true }))
+        }
         Ok(false) => Json(serde_json::json!({ "success": false, "error": "Device not found" })),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
     }
@@ -446,12 +655,26 @@ pub(super) async fn rename_device(
 pub(super) async fn set_device_push(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<DevicePushRequest>,
 ) -> Json<serde_json::Value> {
     match crate::core::DeviceStore::set_push_enabled(&state.pool, &device_id, request.push_enabled)
         .await
     {
-        Ok(true) => Json(serde_json::json!({ "success": true })),
+        Ok(true) => {
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Settings] DevicePushChanged", |actor| {
+                    SystemEvent::DevicePushChanged {
+                        device_id: device_id.clone(),
+                        push_enabled: request.push_enabled,
+                        actor,
+                    }
+                })
+                .await;
+            Json(serde_json::json!({ "success": true }))
+        }
         Ok(false) => Json(serde_json::json!({ "success": false, "error": "Device not found" })),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
     }
@@ -460,9 +683,22 @@ pub(super) async fn set_device_push(
 pub(super) async fn delete_device(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match crate::core::DeviceStore::delete(&state.pool, &device_id).await {
-        Ok(true) => Ok(Json(serde_json::json!({ "success": true }))),
+        Ok(true) => {
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Settings] DeviceDeleted", |actor| {
+                    SystemEvent::DeviceDeleted {
+                        device_id: device_id.clone(),
+                        actor,
+                    }
+                })
+                .await;
+            Ok(Json(serde_json::json!({ "success": true })))
+        }
         Ok(false) => Err((StatusCode::NOT_FOUND, "Device not found".to_string())),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -475,6 +711,7 @@ pub(super) async fn delete_device(
 
 pub(super) async fn send_email_confirmed(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     use crate::core::email::{EmailClient, EmailStore};
@@ -487,8 +724,25 @@ pub(super) async fn send_email_confirmed(
                 .collect()
         })
         .unwrap_or_default();
-    let subject = body["subject"].as_str().unwrap_or("");
-    let body_text = body["body"].as_str().unwrap_or("");
+    if to.is_empty() {
+        return Json(
+            serde_json::json!({ "success": false, "error": "`to` is required and must be a non-empty array" }),
+        );
+    }
+    let subject = match body["subject"].as_str() {
+        Some(s) => s,
+        None => {
+            return Json(
+                serde_json::json!({ "success": false, "error": "`subject` is required" }),
+            )
+        }
+    };
+    let body_text = match body["body"].as_str() {
+        Some(s) => s,
+        None => {
+            return Json(serde_json::json!({ "success": false, "error": "`body` is required" }))
+        }
+    };
     let cc: Vec<String> = body
         .get("cc")
         .and_then(|v| v.as_array())
@@ -508,7 +762,14 @@ pub(super) async fn send_email_confirmed(
         })
         .unwrap_or_default();
     let reply_to = body.get("reply_to_message_id").and_then(|v| v.as_str());
-    let account_name = body["account"].as_str().unwrap_or("");
+    let account_name = match body["account"].as_str() {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return Json(
+                serde_json::json!({ "success": false, "error": "`account` is required" }),
+            )
+        }
+    };
 
     let account = match EmailStore::get(&state.pool, account_name).await {
         Ok(Some(a)) => a,
@@ -584,10 +845,199 @@ pub(super) async fn send_email_confirmed(
     )
     .await
     {
-        Ok(_) => Json(serde_json::json!({ "success": true })),
+        Ok(_) => {
+            let attachment_count = attachments.len();
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Email] EmailSent", |actor| {
+                    crate::engine::event_bus::SystemEvent::EmailSent {
+                        account: account.name.clone(),
+                        to: to.clone(),
+                        cc: cc.clone(),
+                        bcc: bcc.clone(),
+                        subject: subject.to_string(),
+                        attachment_count,
+                        actor,
+                    }
+                })
+                .await;
+            Json(serde_json::json!({ "success": true }))
+        }
         Err(e) => {
             log!("[Email] Failed to send email to {}: {}", to.join(", "), e);
             Json(serde_json::json!({ "success": false, "error": format!("{}", e) }))
         }
+    }
+}
+
+// ===== OAuth Access Token Endpoint =====
+
+/// Response for `GET /api/v1/oauth/{provider}/access-token`. Carries the
+/// short-lived bearer token plus the upstream-reported expiry. The
+/// `refresh_token` is intentionally NOT included — keeping it engine-side
+/// is the whole point of this endpoint.
+#[derive(Serialize)]
+pub(super) struct OAuthAccessTokenResponse {
+    pub access_token: String,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Core lookup + auto-refresh for `GET /api/v1/oauth/{provider}/access-token`.
+/// Pulled out of the axum handler so it can be unit-tested without HTTP plumbing.
+pub(super) async fn fetch_oauth_access_token(
+    pool: &PgPool,
+    provider: &str,
+) -> Result<OAuthAccessTokenResponse, (StatusCode, String)> {
+    use crate::core::oauth::{get_account_with_fresh_token, AccountLookupError};
+    let account = get_account_with_fresh_token(pool, provider)
+        .await
+        .map_err(|e| match e {
+            AccountLookupError::NotConnected => (
+                StatusCode::NOT_FOUND,
+                format!("Provider '{}' not connected", provider),
+            ),
+            AccountLookupError::DbError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load OAuth account for '{}': {}", provider, err),
+            ),
+            AccountLookupError::RefreshFailed(err) => (
+                StatusCode::BAD_GATEWAY,
+                format!("OAuth token refresh failed for '{}': {}", provider, err),
+            ),
+        })?;
+    Ok(OAuthAccessTokenResponse {
+        access_token: account.access_token,
+        expires_at: account.token_expiry,
+    })
+}
+
+/// `GET /api/v1/oauth/{provider}/access-token` — returns a short-lived
+/// access token for an in-browser SDK (e.g. the Spotify Web Playback SDK)
+/// without exposing the refresh token. Auto-refreshes when the stored
+/// token is expired or expiring within 60s.
+pub(super) async fn get_oauth_access_token(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+) -> Result<Json<OAuthAccessTokenResponse>, (StatusCode, String)> {
+    fetch_oauth_access_token(&state.pool, &provider)
+        .await
+        .map(Json)
+}
+
+#[cfg(test)]
+mod oauth_access_token_tests {
+    use super::*;
+    use crate::core::OAuthStore;
+    use chrono::{Duration, Utc};
+
+    #[tokio::test]
+    async fn returns_404_when_provider_not_connected() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+        let result = fetch_oauth_access_token(&pool, "spotify").await;
+
+        match result {
+            Err((status, msg)) => {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert!(
+                    msg.contains("spotify"),
+                    "error should name the provider, got: {}",
+                    msg
+                );
+            }
+            Ok(_) => panic!("expected 404, got OK"),
+        }
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn returns_access_token_and_expires_at_when_connected() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let expiry = Utc::now() + Duration::seconds(3600);
+        OAuthStore::insert(
+            &pool,
+            "spotify",
+            Some("user@example.com"),
+            None,
+            "BQAlive-access-token",
+            Some("AQrefresh-token"),
+            Some(expiry),
+            "user-read-playback-state user-modify-playback-state",
+        )
+        .await
+        .unwrap();
+
+        let resp = fetch_oauth_access_token(&pool, "spotify")
+            .await
+            .expect("should return a token");
+
+        assert_eq!(resp.access_token, "BQAlive-access-token");
+        let returned_expiry = resp.expires_at.expect("expires_at must be set");
+        assert!(
+            (returned_expiry - expiry).num_seconds().abs() < 2,
+            "expires_at should match the stored expiry"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn response_serialization_omits_refresh_token() {
+        // Belt-and-braces: even if someone adds a refresh_token field later,
+        // the on-the-wire JSON shape must stay { access_token, expires_at }.
+        let resp = OAuthAccessTokenResponse {
+            access_token: "tok".into(),
+            expires_at: Some(Utc::now()),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("access_token").is_some());
+        assert!(json.get("expires_at").is_some());
+        assert!(
+            json.get("refresh_token").is_none(),
+            "refresh_token must never be serialized: {:?}",
+            json
+        );
+    }
+
+    #[tokio::test]
+    async fn attempts_refresh_when_stored_token_is_expired() {
+        // When the stored access token is already expired but no client
+        // credentials are configured, refresh_oauth_if_needed errors out
+        // and the handler maps that to BAD_GATEWAY. This proves the
+        // refresh code path runs (rather than returning the stale token).
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let past = Utc::now() - Duration::seconds(120);
+        OAuthStore::insert(
+            &pool,
+            "spotify",
+            Some("user@example.com"),
+            None,
+            "stale-token",
+            Some("AQrefresh-token"),
+            Some(past),
+            "user-read-playback-state",
+        )
+        .await
+        .unwrap();
+
+        let result = fetch_oauth_access_token(&pool, "spotify").await;
+
+        match result {
+            Err((status, _msg)) => {
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_GATEWAY,
+                    "expired token + missing client creds must surface as 502, not return the stale token"
+                );
+            }
+            Ok(resp) => panic!(
+                "expected refresh to be attempted, got stale token back: {:?}",
+                resp.access_token
+            ),
+        }
+
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 }

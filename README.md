@@ -34,12 +34,28 @@ The integrated environment makes for a smooth user experience, where researching
 
 This starts PostgreSQL in Docker, builds/runs the Rust engine natively, and launches a Vite dev server. Each workspace gets its own ports — multiple workspaces can run concurrently.
 
+### Ports
+
+The first workspace lands on `5173` (Vite / user-facing), `3000` (internal), `5432` (Postgres). Each additional workspace gets the next offset (`5174`, `5175`, …), stored in `~/.lucidos/port-registry` so the same workspace gets the same ports every run.
+
+If the target port is already taken by something else (e.g. another Vite app on `5173`), Lucidos walks forward to the next free offset and persists the new assignment — it does **not** kill the squatter. To pin a specific port:
+
+- `LUCIDOS_VITE_PORT=5273 ./scripts/web-dev.sh -w dev` — env var, one-shot.
+- `<workspace>/lucidos.toml` — per-workspace, persistent:
+  ```toml
+  [ports]
+  vite = 5273
+  ```
+
+Env var beats `lucidos.toml`. Both still collision-walk forward if the chosen base is taken. The chosen ports are logged to stderr when `web-dev.sh` starts.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LUCIDOS_WORKSPACE` | — | Workspace directory |
-| `LUCIDOS_MODEL` | `claude-opus-4-7` | LLM model name |
+| `LUCIDOS_VITE_PORT` | `5173` | Base Vite (user-facing) port — overrides per-workspace offset + `lucidos.toml`. API and Postgres ports shift by the same offset. |
+| `LUCIDOS_MODEL` | `claude-opus-4-8@default` | LLM model name |
 | `VERTEX_PROJECT_ID` | — | GCP project (for `claude-*`/`gemini-*`) |
 | `VERTEX_REGION` | `europe-west1` | Vertex AI region |
 | `OPENAI_API_KEY` | — | OpenAI key (for `gpt-*` models) |

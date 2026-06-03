@@ -1,6 +1,6 @@
 ---
 name: Building a Trigger
-description: Use when the user wants something to happen automatically — "every morning", "notify me when X happens", "watch for Y", recurring or event-driven background work. Covers cron vs on_event, the intent-vs-procedure rule, and notification discipline.
+description: Use when the user wants something to happen automatically — "every morning", "notify me when X happens", "watch for Y", recurring or event-driven background work. Covers cron vs event subscriptions, the intent-vs-procedure rule, and notification discipline.
 ---
 
 # Building a Trigger
@@ -12,7 +12,8 @@ How to guide a user from "I want this to happen automatically" to a working trig
 | User says | Right answer |
 |---|---|
 | "Every morning, send me…" | Trigger (cron) |
-| "Notify me when my package ships" | Trigger (on_event), with a separate event-emitting source |
+| "Notify me when my package ships" | Trigger (`on`), with a separate event-emitting source |
+| "When either X or Y happens, do Z" | One trigger with multiple entries in `on` — not two parallel triggers |
 | "Check this once and tell me" | Just do it now, no trigger |
 
 If the user only wants it to happen once, don't create a trigger.
@@ -25,17 +26,34 @@ A trigger's `run.intent` is **what the user would say** — one sentence in thei
 
 The trigger thread inherits the same knowhow surface a chat thread has: the system prompt's intent registry advertises what's available, and the LLM calls `load_knowhow` when it judges a recipe relevant. Writing the procedure inline to bypass that lookup turns the intent into a recipe and the next person who reads the trigger config can't tell what the user originally asked for. Keep the intent in the user's voice ("send me a daily summary of open PRs") and let the LLM pull the procedure on demand.
 
-## Cron vs. on_event vs. both
+## Cron vs. `on` vs. both
 
 - **Cron** — "every morning at 8" / "weekdays at noon". Time-driven.
-- **on_event** — "when X happens". Reactive. The event must already be emitted by something (an app, another trigger, an integration).
-- **Both** — rare; usually means cron with a payload-shaped condition that should be on_event instead. Re-examine before doing this.
+- **`on`** — "when X happens". Reactive. Each entry in the `on` array names an event type plus an optional payload filter. The event must already be emitted by something (an app, another trigger, an integration).
+- **Both** — rare; usually means cron with a payload-shaped condition that should be event-driven instead. Re-examine before doing this.
 
 If the user says "notify me when X" and X isn't an event yet, you have two work items: (1) make X emit an event, (2) trigger on it. Tell the user that explicitly.
 
+### One trigger, multiple events
+
+The `on` field is a list. Use multiple entries when *one workflow* should react to several event types — e.g. "summarize my day on `MessageReceived` from my partner OR on `EmailReceived` from my boss". Two parallel triggers with the same intent is a UX trap: editing one and forgetting the other silently drifts behaviour.
+
+Each entry carries its own `condition`, scoped to *that* event:
+
+```json
+{
+  "on": [
+    { "event_type": "OuraSleepImported", "condition": { "sleep_score": { "$lt": 70 } } },
+    { "event_type": "EmailReceived" }
+  ]
+}
+```
+
+The `sleep_score` filter does NOT apply to `EmailReceived` — its payload doesn't have that field at all. Per-entry conditions mean different event payload shapes never constrain each other.
+
 ## `condition` — when to filter
 
-Use `condition` when subscribing to a high-volume event but only caring about a slice. Example: subscribe to `EmailReceived` but only fire on emails from a specific sender. Without a condition, the trigger fires for every email and the LLM has to filter inside the run — wasteful and slow.
+Set `condition` on a subscription when the event is high-volume and you only care about a slice. Example: subscribe to `EmailReceived` but only fire on emails from a specific sender. Without a condition, the trigger fires for every email and the LLM has to filter inside the run — wasteful and slow.
 
 Don't use `condition` for logic that depends on external state (e.g. "only if this app's data file says X"). Conditions are pure payload filters. Stateful checks belong inside the run.
 
@@ -47,9 +65,9 @@ The scheduler auto-creates an error notification when a trigger fails. Don't dou
 
 ## Where the thread lands: `go_to_review`
 
-By default, trigger runs are unattended — their threads go straight to HISTORY when they finish, and only surface in REVIEW if the user follows up with a message. This is right for most cron triggers (silent imports, periodic syncs, idle nudges).
+By default, trigger runs are unattended — their threads go straight to ARCHIVE when they finish, and only surface in REVIEW if the user follows up with a message. This is right for most cron triggers (silent imports, periodic syncs, idle nudges).
 
-Set `go_to_review: true` when the trigger's *output is the point* — a daily summary the user is meant to read, an alert that needs acknowledgement, a scheduled report. The thread then surfaces in REVIEW on completion so it's not lost in HISTORY.
+Set `go_to_review: true` when the trigger's *output is the point* — a daily summary the user is meant to read, an alert that needs acknowledgement, a scheduled report. The thread then surfaces in REVIEW on completion so it's not lost in ARCHIVE.
 
 | User phrasing that answers it | Flag |
 |---|---|
@@ -61,12 +79,161 @@ A `send_notification` does **not** answer this question — notifications and re
 
 If the user's request doesn't clearly land in one of the rows above, **ask** — see Question 5 below. The flag is snapshotted onto each run when it fires; toggling it later only affects future runs.
 
-### Deep-link discipline (`app_id`)
+### Notification routing (`app_id`, `tap`, `event_id`)
 
-Set `app_id` on a notification only when the notification is a direct call to action inside that specific app — tapping opens the app to act on the thing. Most cron triggers (reminders, nudges, summaries, status pings) should omit `app_id`. The owning-app `app_id` on the trigger itself is unrelated; it doesn't license the notification to deep-link.
+Three independent fields control the notification:
 
-- **Good:** a habit-tracker check-in trigger fires at 8:00 with "Check in for today" → set `app_id` to the habit-tracker id so tapping opens the check-in form.
-- **Bad:** a 22:00 bedtime / wind-down nudge with body text only → leave `app_id` unset. It's a reminder, not a call to open an app.
+- **`app_id`** — *which* app the notification is about. Drives the inbox modal's "Open <app>" button. Set it whenever the notification relates to a specific app (so the user can navigate from the modal to the relevant app), even when the tap routing is `{ kind: 'modal' }`.
+- **`tap`** — *what happens on tap*. Discriminated union: `{ kind: 'modal' }` (default — opens the inbox modal showing the body), `{ kind: 'none' }` (passive — marks read with no navigation; for informational pushes that need no follow-up), or `{ kind: 'navigate', to: NavigateUi }` (delegates to the same router `navigate_ui` uses; `to` is its arg shape). Every kind marks the source notification read on tap.
+- **`event_id`** — *which specific event inside the linked thread* raised the notification. Optional UUID. Used by the §4 in-app matrix to silently mark-read when the user is already looking at the source event. Distinct from `tap.to.event_id` (which is the scroll-and-pulse target when the tap navigates to a thread — typically the same value).
+
+| Trigger says | `app_id` | `tap` | `event_id` |
+|---|---|---|---|
+| 8:00 habit-tracker "Check in for today" — direct CTA inside an app | habit-tracker | `{ kind: 'navigate', to: { target: 'app', app_id: 'habit-tracker' } }` | — |
+| Claude is asking the user a question — needs them back in the conversation, on that question | omit | `{ kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<event_id>' } }` | source event id |
+| CC asking for permission — same idea, different event | omit | `{ kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<event_id>' } }` | source event id |
+| "5 changes ready to apply" — multi-item panel destination | omit | `{ kind: 'navigate', to: { target: 'changes' } }` | — |
+| Daily summary "you completed 5 tasks today" — informational, no CTA | omit | `{ kind: 'modal' }` (default) | — |
+| 22:00 bedtime nudge — informational | omit | `{ kind: 'modal' }` (default) | — |
+| Habit-tracker weekly report — about an app, but the action is reading | habit-tracker | `{ kind: 'modal' }` (default) | — |
+| "Backup complete" / "Sync finished" — purely informational, no action needed | omit | `{ kind: 'none' }` | — |
+
+Tap defaults to `{ kind: 'modal' }` so the user reads the message and decides what to do — `navigate` is the explicit opt-in for direct CTAs and panel deep-links. `{ kind: 'none' }` is for passive informational pushes — the row marks itself read the moment the user could see it (toast on screen, OR push tapped), so it doesn't sit in the inbox waiting for acknowledgement. The notification always lands in the inbox regardless of `tap`, so the user can re-open the modal manually from the bell icon.
+
+See `system-knowhow/js-sdk.md` § `lucidos.notifications` for the full `NavigateUi` target list (panels, apps, threads, files, triggers, creation forms, URLs).
+
+#### Where the LLM finds `event_id`
+
+When a trigger fires from a `BusEvent::Thread` match, the engine appends a `## Triggering Event` block to the trigger's user message. Above the JSON payload, a line like:
+
+```
+Source event id: 7a9c2c5f-…
+```
+
+…carries the UUID of the event that fired the trigger. Pass that value to `send_notification`'s `event_id`. The push tap then deep-links to the exact event the trigger was about — the question card pulses on land, no scrolling needed.
+
+For schedule (cron) triggers there is no source event, so no `event_id`. For on-event triggers that notify about *a different* event (e.g. fire on `CodingAgentIdled` but notify about the last `UserQuestionAsked`), look the right event up yourself with `query_events` and use that id.
+
+#### Worked example — push when agent needs me
+
+```yaml
+on:
+  - event_type: UserQuestionAsked
+run:
+  intent: "Notify me when the agent has a question waiting for me. The push should deep-link straight to the question — tapping it takes me to the originating thread and pulses the question card on land."
+```
+
+The same shape works for `event_type: CodingAgentPermissionRequest` (swap the message to read from the `tool_name`/`summary` fields). Lucidos does not seed this trigger — workspaces opt in by creating it.
+
+## Script triggers: when an LLM call is overkill
+
+A trigger's `run` can be either `{ "type": "intent", "intent": "…" }` (the LLM path everything above describes) or `{ "type": "script", "path": "triggers/<slug>/scripts/run.py" }` (a script invoked directly with no LLM). Pick `script` when the work is mechanical — a fixed shape applied to whatever event(s) the `on:` list selects, a scripted API call, a deterministic emit — and an LLM judgement call isn't the feature.
+
+Good candidates for `script`:
+
+- "On any event in `on:`, notify with title + message read from the payload's common fields."
+- "Every morning at 7, hit `<API>` and write the response to `data/artifacts/<date>/x.json`."
+- "On `OrderPlaced`, emit `OrderQueuedForShipping` if `order.total > 100`."
+
+Bad candidates for `script` (keep these as `intent`):
+
+- Anything that needs to read the workspace's intent registry / knowhow library to pick a procedure.
+- Anything where the message wording should adapt to context (the LLM's judgement is the feature).
+- Multi-step workflows whose branches depend on prior results — the LLM-as-coordinator is what makes them work.
+
+### Script trigger env vars
+
+When the engine fires a script trigger that subscribes to a domain event, it sets the following env vars before exec'ing the script. Schedule fires emit none of them — the script has no source event to point at.
+
+| Env var | Set when | What it holds |
+|---|---|---|
+| `TRIGGER_EVENT_TYPE` | Always on event fires | The matched event name (e.g. `UserQuestionAsked`). Use as a fallback title or when the script genuinely needs to branch on type. |
+| `TRIGGER_EVENT_PAYLOAD` | Always on event fires | The source event's payload, serialized as JSON. Parse with `json.loads(os.environ["TRIGGER_EVENT_PAYLOAD"])`. |
+| `TRIGGER_EVENT_ID` | When the source event has a row id | The `events.id` (UUID) of the source row. Pass to `lucidos notify --event-id` so the push tap scroll-and-pulses the exact card. |
+| `TRIGGER_EVENT_THREAD_ID` | Only for *thread-scoped* source events | The thread the source event lives on. Pass to `lucidos notify --tap navigate --thread-id` so the push deep-links to the originating conversation instead of the trigger's own thread (which is `LUCIDOS_THREAD_ID`). |
+
+The trigger's own thread is `LUCIDOS_THREAD_ID` (same env var every spawned subprocess gets). `TRIGGER_EVENT_THREAD_ID` is the *source* event's thread — these are different threads. A script that mixes them up will deep-link the push into the trigger's own (uninteresting) thread instead of where the user actually needs to act.
+
+### Worked example — push when any subscribed event fires
+
+The script is *event-agnostic*: the trigger's `on:` list owns which events fire it; the script just consumes whatever arrives. Add or remove events from `on:` and the same script keeps working.
+
+`data/triggers/when-agent-needs-me/scripts/run.py`:
+
+```python
+#!/usr/bin/env python3
+"""Push a deep-linking notification for any event the trigger subscribes to.
+
+The trigger's `on:` list decides which events fire this — the script
+treats them uniformly. Title and message come from the payload's
+common fields (`title`, `message`, `summary`, `question`); the event
+type is only the fallback title. `--tap navigate` + the source
+event's thread id + event id make the push land on the exact card the user needs to act on.
+"""
+import json
+import os
+import subprocess
+
+event_type = os.environ["TRIGGER_EVENT_TYPE"]
+payload = json.loads(os.environ.get("TRIGGER_EVENT_PAYLOAD", "{}"))
+thread_id = os.environ.get("TRIGGER_EVENT_THREAD_ID")
+event_id = os.environ.get("TRIGGER_EVENT_ID")
+
+title = payload.get("title") or event_type
+message = (
+    payload.get("message")
+    or payload.get("question")
+    or payload.get("summary")
+    or f"{event_type} needs your attention"
+)
+
+args = ["lucidos", "notify", "--title", title, "--message", message]
+if thread_id:
+    args += ["--tap", "navigate", "--thread-id", thread_id]
+    if event_id:
+        args += ["--event-id", event_id]
+
+subprocess.run(args, check=True)
+```
+
+The trigger config picks the events:
+
+```json
+{
+  "name": "When agent needs me",
+  "on": [
+    { "event_type": "UserQuestionAsked" },
+    { "event_type": "CodingAgentPermissionRequest" },
+    { "event_type": "CredentialRequested" },
+    { "event_type": "McpConsentRequested" }
+  ],
+  "run": {
+    "type": "script",
+    "path": "triggers/when-agent-needs-me/scripts/run.py"
+  }
+}
+```
+
+Want to also notify on `EmailReceived` from your boss? Append another `on:` entry — the script doesn't need to change. The `run.path` is workspace-relative; the engine resolves it under `data/`. Swapping `intent` for `script` drops one LLM call per fire with no behaviour change visible to the user.
+
+If a payload doesn't carry the well-known fields, only the fallback title (the event type) and a generic message fire. That's the cost of the event-agnostic shape; the alternative — branching on `event_type` inside the script — is a maintenance trap (every new event the user subscribes to also needs a script edit). Prefer carrying `title` / `message` in the payload at the *event's* emit site so any subscriber can render it cleanly.
+
+## Grouping triggers
+
+A *trigger group* is a user-visible folder shown as a collapsible section in the triggers panel. Groups are pure labels — they have no schedule, run no code, and don't coordinate firing. Their only job is to collect related triggers under one header so the panel stays readable.
+
+Use a group when several triggers form an emergent workflow (one trigger emits an event via `emit_event`, another listens via `on_event`) and the user benefits from seeing them together. You don't need a group for a single trigger; the "Ungrouped" section at the bottom of the panel handles that case.
+
+| Tool | When to use |
+|---|---|
+| `list_trigger_groups` | Before assigning a trigger, check whether a fitting group already exists. |
+| `create_trigger_group(name, order?)` | Create a new section header. Names are unique within the workspace (case-insensitive). |
+| `create_trigger` / `update_trigger` with `group_id` | Assign a trigger to (or move it between / out of) a group. `update_trigger(group_id: null)` clears membership. |
+| `rename_trigger_group(group_id, name)` | Rename the section. |
+| `reorder_trigger_groups([{id, order}, ...])` | Batch-reorder panel sections. |
+| `delete_trigger_group(group_id)` | Refused if the group still has members — move or delete them first (the error response lists them). |
+
+Groups are orthogonal to `app_id`. An app-owned trigger can live in any group; the engine doesn't auto-couple the two. `app_id` drives notification deep-linking; `group_id` drives panel layout.
 
 ## Edit, don't recreate
 
@@ -78,11 +245,14 @@ This applies to every shape of change:
 |---|---|
 | "Change the cron to 9am" | `update_trigger(trigger_id, cron=...)` |
 | "Rename it to X" | `update_trigger(trigger_id, name="X")` |
-| "Switch it to fire on event Y instead" | `update_trigger(trigger_id, cron=null, on_event="Y")` |
+| "Switch it to fire on event Y instead" | `update_trigger(trigger_id, cron=null, on=[{event_type:"Y"}])` |
+| "Also fire when Z happens" | `update_trigger(trigger_id, on=[existing..., {event_type:"Z"}])` — append to the `on` array, don't make a sibling trigger |
+| "Stop firing on event Y" | `update_trigger(trigger_id, on=[existing... minus Y])` — `on` is a full replacement |
+| "Tighten the Y filter" | `update_trigger(trigger_id, on=[..., {event_type:"Y", condition:{...}}, ...])` — replace that entry inside the full list |
 | "Tweak the prompt" | `update_trigger(trigger_id, run={...})` |
 | "Pause it" | `pause_trigger(trigger_id)` (or `update_trigger(..., paused=true)`) |
 | "Make sure I see this one" / "Send to review" | `update_trigger(trigger_id, go_to_review=true)` |
-| "Stop bringing this up — keep it in history" | `update_trigger(trigger_id, go_to_review=false)` |
+| "Stop bringing this up — keep it in the archive" | `update_trigger(trigger_id, go_to_review=false)` |
 | "Add another time it should run" | `update_trigger(trigger_id, cron=[existing..., new_expr])` — append to the cron array, don't make a sibling trigger |
 | "Run it once more, like at 7pm tonight" | `update_trigger(trigger_id, cron=[existing..., one_shot_expr])`, then a follow-up `update_trigger` after it fires to remove the one-shot row. Don't create a duplicate trigger — even temporarily |
 
@@ -93,7 +263,7 @@ If you genuinely need a different trigger (different *workflow*, not a tweak of 
 Don't call `create_trigger` from the user's first message. Most "create a trigger for X" requests leave at least one of these unsettled — confirm before writing the trigger. Skip questions only when the user has already answered them in the same turn.
 
 1. **Recurring or one-shot?** "Notify me at 5pm today" is a one-shot — handle inline, don't create a trigger. Triggers are for things that should keep happening. If the user explicitly wants a one-shot trigger anyway (e.g. "create a test trigger that fires once in 2 min"), ask whether it should delete itself after firing — it won't on its own. See "One-shot triggers" below for the procedure.
-2. **Cron or on_event?** "Every morning at 8" is cron. "When my package ships" is on_event. If the event doesn't exist yet, name the work (emit the event from somewhere, then trigger on it) and confirm.
+2. **Cron or `on`?** "Every morning at 8" is cron. "When my package ships" is an event subscription. If the user names several events the same workflow should react to ("when X *or* Y happens"), they belong in one trigger with multiple `on` entries — not parallel triggers. If the event doesn't exist yet, name the work (emit the event from somewhere, then trigger on it) and confirm.
 3. **What's the run.intent in the user's voice?** One sentence the user would actually say. If you're tempted to write the procedure here, stop and put it in knowhow instead.
 4. **Should it notify, and on what?** Default is silent — `send_notification` only fires when there's something the user wants to hear about. Confirm whether a successful run should notify, and what the message should look like.
 5. **Surface to review or stay silent?** Always ask unless the user's phrasing clearly answers it (see the table in "Where the thread lands"). `go_to_review: true` for "I want to read this when it finishes" (daily summaries, scheduled reports, alerts that need acknowledgement); omit for silent housekeeping. A `send_notification` doesn't answer this — notifications and review-surface are independent.
@@ -116,7 +286,7 @@ Don't claim "I'll delete it after it runs" without doing one of the above — se
 
 1. **Set timezone first** if not already set. Cron is 6 fields (`second minute hour day-of-month month day-of-week`) in the user's local timezone, DST-aware via IANA tz. The `create_trigger` tool refuses without a timezone.
 2. **`list_triggers` first** to check whether an existing trigger should be updated instead of creating a new one.
-3. **Decide cron vs. on_event** before writing the trigger.
+3. **Decide cron vs. `on` (and whether `on` needs multiple entries)** before writing the trigger.
 4. **Write `run.intent` as the user would say it.**
 5. **If the trigger needs a procedure-laden recipe, write it to a knowhow file.** Trigger-scoped recipes belong at `data/triggers/<slug>/knowhow/<descriptive>.md` (where `<slug>` is the trigger's kebab-case slug field — set it explicitly via `create_trigger`/`update_trigger`; if you don't, the engine derives one from the name on read but never persists it, so renaming the trigger silently moves the per-trigger knowhow path). Broadly reusable recipes go in shared `data/knowhow/` (see `building-knowhow.md`). The trigger thread discovers knowhow the same way chat does — via `load_knowhow` calls the LLM makes itself — so there is no `run.knowhow` field to populate. Any legacy `run.knowhow:[...]` you might see in old `TriggerCreated` payloads is silently dropped by the deserializer; rewrite the intent to either name the relevant knowhow inline ("see `system-knowhow/X`") or be rich enough to nudge discovery from the system-prompt knowhow listing. Make the file's `name` and `description` frontmatter precise so semantic discovery finds it.
 
@@ -124,7 +294,8 @@ Don't claim "I'll delete it after it runs" without doing one of the above — se
 
 - **Recreating instead of editing.** See "Edit, don't recreate" above. The single biggest source of orphaned thread history.
 - **Recipe-in-text.** Putting procedure into `run.intent` instead of knowhow. See "The most important rule" above.
-- **Cron when on_event fits.** Polling burns runs and adds latency. If an event exists, prefer it.
+- **Cron when an event subscription fits.** Polling burns runs and adds latency. If an event exists, prefer it.
+- **Parallel triggers for one workflow that reacts to several events.** Use one trigger with multiple `on` entries; never duplicate the intent across siblings — editing one and forgetting the other silently drifts behaviour.
 - **No knowhow file for a procedure the trigger clearly needs.** Without a discoverable knowhow file, the LLM re-derives the procedure every run and gets it slightly different each time. Write the recipe down — semantic discovery will surface it on the next fire.
 - **Vague `name`/`description` frontmatter on a trigger-scoped knowhow.** Discovery is semantic, not by id, so a knowhow titled `notes.md` with `name: Notes` won't surface when the LLM is reasoning about an API call. Name the file by what it teaches (`openai-availability-check.md`), and write the `description` as the kind of question that should retrieve it.
 - **Knowhow that recommends raw `curl`/`fetch` for an API the workspace already proxies.** When the recipe instructs the LLM to shell out with `curl -H "Authorization: Bearer $CRED_..."` (or the `requests`/`fetch` equivalent), the credential leaks into argv and tool transcripts. The right path is the `proxy_request` LLM tool against an entry in `data/config/apis.json` — see `system-knowhow/building-knowhow.md` § "Calling external APIs from a recipe".

@@ -14,7 +14,7 @@ use super::{SpawnDispatcher, SpawnRequest, SpawnTrigger};
 
 fn cc_meta() -> EventMeta {
     EventMeta {
-        channel: Some(EventChannel::CodingAgent),
+        channel: Some(EventChannel::ClaudeCode),
         ..EventMeta::NONE
     }
 }
@@ -130,7 +130,7 @@ async fn classify_trigger_recognizes_cc_user_message() {
 }
 
 #[tokio::test]
-async fn classify_trigger_recognizes_continue_signal() {
+async fn classify_trigger_recognizes_continuation_requested() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
@@ -140,23 +140,23 @@ async fn classify_trigger_recognizes_continue_signal() {
     let event_id = Uuid::new_v4();
     let bus_event = BusEvent::Thread {
         thread_id,
-        event: ThreadEvent::ContinueSignal {
+        event: ThreadEvent::ContinuationRequested {
             reason: ENGINE_RESTART_INTERRUPT_REASON.to_string(),
         },
         meta: cc_meta(),
     };
     let trigger = dispatcher
         .classify_trigger(&bus_event, event_id)
-        .expect("ContinueSignal must classify as a trigger");
+        .expect("ContinuationRequested must classify as a trigger");
     match trigger {
-        SpawnTrigger::ContinueSignal {
+        SpawnTrigger::ContinuationRequested {
             thread_id: tid,
             event_id: eid,
         } => {
             assert_eq!(tid, thread_id);
             assert_eq!(eid, event_id);
         }
-        other => panic!("expected ContinueSignal, got {:?}", other),
+        other => panic!("expected ContinuationRequested, got {:?}", other),
     }
 
     pool.close().await;
@@ -248,11 +248,11 @@ async fn user_message_is_shadow_only_no_spawn_request_sent() {
     teardown_test_db(&db_name).await;
 }
 
-/// ContinueSignal is the actuated path — emitting one must produce a
+/// ContinuationRequested is the actuated path — emitting one must produce a
 /// `SpawnRequest::Continue` on the outbound channel for the engine-side
 /// receiver to consume.
 #[tokio::test]
-async fn continue_signal_produces_spawn_request() {
+async fn continuation_requested_produces_spawn_request() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
@@ -264,7 +264,7 @@ async fn continue_signal_produces_spawn_request() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // The thread needs a SessionStarted to satisfy the lifecycle contract
-    // (ContinueSignal is CC-only and the projection rejects CC events on a
+    // (ContinuationRequested is CC-only and the projection rejects CC events on a
     // chat thread).
     let thread_id = Uuid::new_v4();
     emit_cc_thread(
@@ -274,13 +274,16 @@ async fn continue_signal_produces_spawn_request() {
             session_id: "sid-cont".into(),
             branch: "claude-code/cont".into(),
             repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
         },
     )
     .await;
     let event_id = emit_cc_thread(
         &bus,
         thread_id,
-        ThreadEvent::ContinueSignal {
+        ThreadEvent::ContinuationRequested {
             reason: ENGINE_RESTART_INTERRUPT_REASON.to_string(),
         },
     )
@@ -296,7 +299,7 @@ async fn continue_signal_produces_spawn_request() {
             thread_id,
             event_id,
         },
-        "ContinueSignal must produce a matching SpawnRequest::Continue"
+        "ContinuationRequested must produce a matching SpawnRequest::Continue"
     );
 
     handle.abort();
@@ -361,6 +364,9 @@ async fn dispatcher_skips_trigger_already_followed_by_cc_event() {
             session_id: "sid-x".into(),
             branch: "claude-code/x".into(),
             repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
         },
     )
     .await;
@@ -398,10 +404,11 @@ async fn dispatcher_dispatches_pending_triggers_on_startup() {
             is_external_repo: false,
             requires_restart: false,
             cc_session_id: Some("handled-sid".into()),
-            agent: crate::runtime::AgentKind::ClaudeCode,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             reason: None,
             worktree_path: None,
             worktree_head_sha: None,
+            bg_bash_pending: false,
         },
     )
     .await;
@@ -513,6 +520,9 @@ async fn session_ended_does_not_trigger_dispatch() {
             session_id: "sid-end".into(),
             branch: "claude-code/end".into(),
             repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
         },
     )
     .await;

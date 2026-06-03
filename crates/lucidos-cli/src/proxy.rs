@@ -8,8 +8,9 @@
 //! - `-H` repeated for headers, `-X` for method, `-d` / stdin for body
 
 use std::io::{self, Read, Write};
+use std::time::Instant;
 
-use crate::http::client;
+use crate::http::{client, format_request_error};
 use crate::workspace::{BoxError, Workspace};
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,7 @@ pub(crate) fn run(ws: &Workspace, args: ProxyArgs) -> Result<u8, BoxError> {
     let headers = parse_headers(&args.headers)?;
 
     let client = client()?;
+    let method_str = method.as_str().to_string();
     let mut req = client.request(method, &url);
     for (name, value) in &headers {
         req = req.header(name, value);
@@ -45,9 +47,10 @@ pub(crate) fn run(ws: &Workspace, args: ProxyArgs) -> Result<u8, BoxError> {
         req = req.body(body);
     }
 
+    let start = Instant::now();
     let resp = req
         .send()
-        .map_err(|e| format!("Failed to send request to {}: {}", url, e))?;
+        .map_err(|e| format_request_error(&method_str, &url, &e, start.elapsed()))?;
     let status = resp.status();
     let resp_headers = resp.headers().clone();
     let body = resp

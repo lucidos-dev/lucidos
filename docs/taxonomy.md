@@ -1,14 +1,18 @@
 # Lucidos Workspace Taxonomy
 
-Source of truth for how workspace content is organized. Referenced by both the engine system prompt (for the Lucidos LLM) and CLAUDE.md (for CC development sessions).
+Source of truth for how workspace content is **organized**. Referenced by both the engine system prompt (for the Lucidos LLM) and CLAUDE.md (for CC development sessions).
+
+**Terms** (intent, knowhow, script, app, trigger, artifact, manifest, thread, sub-thread, top-thread, spawning thread, parent thread, event, domain event, workspace, plugin) are defined in [`system-knowhow/glossary.md`](../system-knowhow/glossary.md). This file uses those definitions and adds the structural / placement / ownership story on top.
 
 ## Three Content Types
 
-| Type | Purpose | Stability | Who maintains | Example |
-|------|---------|-----------|--------------|---------|
-| **Intent** | What the user wants, in their terms. Goals, conditions, desired outcomes. | Stable — changes when the user's needs change | User | "Find relevant jobs, store them, notify me of new ones and deadlines" |
-| **Knowhow** | How to achieve it, in technical terms. API details, data formats, quirks, workarounds. | Evolves — refined every time Lucidos learns something new | Lucidos | "Use `.product-card img` selector, vendor CDN requires base64 conversion" |
-| **Script** | Code invoked by intents or knowhow | Changes when tools or APIs change | Either | `download_images.py`, `validate_images.py` |
+| Type | Stability | Who maintains | Example |
+|------|-----------|---------------|---------|
+| **Intent** | Stable — changes when the user's needs change | User | "Find relevant jobs, store them, notify me of new ones and deadlines" |
+| **Knowhow** | Evolves — refined every time Lucidos learns something new | Lucidos | "Use `.product-card img` selector, vendor CDN requires base64 conversion" |
+| **Script** | Changes when tools or APIs change | Either | `download_images.py`, `validate_images.py` |
+
+See [`system-knowhow/glossary.md`](../system-knowhow/glossary.md) for the canonical definitions.
 
 ### Intent vs Knowhow
 
@@ -166,14 +170,4 @@ When creating a trigger that needs a recipe, write the knowhow file first (so it
 
 ## Thread Vocabulary
 
-Threads spawned by other threads come in two flavors. The `relation` argument on `run_thread` / `run_claude` (and the `--relation sub|top` flag on `lucidos spawn-thread`) chooses between them.
-
-| Term | Meaning |
-|------|---------|
-| **Spawning thread** | The thread that issues the spawn (verb-derived, neutral). |
-| **Spawned thread** | The new thread the spawn creates. |
-| **Sub-thread** | A spawned thread with a parent. When it reaches a terminal state, the engine fires a callback that resumes the parent with the sub-thread's result. `relation: "sub"` (default for `run_thread` / `run_claude`); `--relation sub` on the CLI. |
-| **Top-thread** | A spawned thread with no parent. Appears in the main thread list as an independent top-level thread. The spawning thread is NOT resumed when it finishes. `relation: "top"`; `--relation top` (CLI default). |
-| **Parent thread** | The spawning thread of a sub-thread (only meaningful when callback wiring is active). |
-
-Database columns (`parent_thread_id`, `child_thread_id`) keep their names — sub-threads still have parents. New prose should standardize on the terms above; "child thread" is an older spelling of "sub-thread" still in use in some files.
+Thread terms (*spawning thread*, *child thread*, *sub-thread*, *top-thread*, *parent thread*) are defined in [`system-knowhow/glossary.md`](../system-knowhow/glossary.md). Choose between *child thread* and *top-thread* via the `relation` argument on `run_thread` / `run_claude` (default `"child"`; `"sub"` is a back-compat alias) or the `--relation child|top` flag on `lucidos spawn-thread` (CLI default `top`; `sub` is a back-compat alias). Database columns (`parent_thread_id`, `child_thread_id`) keep their names — child threads still have parents.

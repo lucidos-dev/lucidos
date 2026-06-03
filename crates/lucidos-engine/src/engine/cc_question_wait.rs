@@ -1,12 +1,18 @@
-//! Rendezvous between the AskUserQuestion PreToolUse hook (waiting on POST
-//! /api/internal/ask-user-question) and the answer-submission API
-//! (POST /api/claude-code/answer-question). One broadcast channel per
-//! pending tool_use_id: the hook subscribes; the answer handler sends.
+//! Rendezvous between a blocked agent waiting for the user's answer and
+//! the answer-submission API (POST /api/v1/threads/{thread_id}/answer-question).
+//! One broadcast channel per pending tool_use_id: the waiter subscribes;
+//! the answer handler sends. Two waiters today: CC's PreToolUse hook
+//! (waiting on POST /api/v1/internal/ask-user-question) and the chat agent's
+//! in-process `ask_user_question` tool (waiting inside the agentic loop).
 //!
-//! In-memory only. On engine restart, blocked hooks die with their CC
-//! subprocesses; on resume, CC re-emits the AskUserQuestion tool_use, the
-//! hook fires again, and the endpoint's crash-recovery path (Task 3) reads
-//! a previously-persisted UserQuestionAnswered event from the DB instead.
+//! In-memory only. On engine restart, both kinds of waiters die — CC
+//! hooks with their subprocesses; chat tools with their LLM call. On
+//! resume, CC re-emits the AskUserQuestion tool_use, the hook fires
+//! again, and the endpoint's crash-recovery path reads a previously-
+//! persisted UserQuestionAnswered event from the DB instead. Chat
+//! tools have no resume — a restarted chat turn aborts via
+//! `ResponseAborted` and the persisted card is orphaned by
+//! `QUESTION_OVERTAKEN_EVENT_TYPES`; the user re-sends to ask again.
 
 use std::collections::HashMap;
 use std::sync::Arc;

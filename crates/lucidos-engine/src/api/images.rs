@@ -17,7 +17,7 @@ pub struct ThreadImageInfo {
     pub mime_type: String,
 }
 
-/// GET /api/threads/:thread_id/images — list all images in a thread
+/// GET /api/v1/threads/:thread_id/images — list all images in a thread
 pub(super) async fn list_thread_images(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
@@ -47,7 +47,7 @@ pub(super) async fn list_thread_images(
     Ok(Json(images))
 }
 
-/// GET /api/threads/:thread_id/images/:index — serve a single image as raw bytes
+/// GET /api/v1/threads/:thread_id/images/:index — serve a single image as raw bytes
 pub(super) async fn get_thread_image(
     State(state): State<AppState>,
     Path((thread_id, target_index)): Path<(Uuid, usize)>,

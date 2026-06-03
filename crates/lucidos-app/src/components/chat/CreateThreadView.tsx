@@ -9,6 +9,7 @@ import {
   focusedThreadId,
   threadMap,
   isThreadQuiescent,
+  cancelingThreadIds,
 } from '../../store/store';
 import { scrolledUp, awayFromBottom, notAtTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers } from './scrollState';
 import { ChatExchange } from './ChatExchange';
@@ -27,9 +28,19 @@ export function renderExchanges(
   // Compute once which abort exchange (if any) gets the Continue button —
   // the most recent ResponseAborted that has no later ContinuationStarted.
   const unresumedIdx = unresumedAbortIndex(exchanges);
+  // Lifted once for the whole list and passed as props to every ChatExchange:
+  // these reads subscribe the PARENT (this function, called from ThreadView)
+  // to threadMap + cancelingThreadIds instead of the 29+ child ChatExchanges.
+  // Combined with ChatExchange being `memo`d, a meta-shape change wakes only
+  // this one render pass and the memo skips per-exchange function bodies for
+  // every exchange whose prop fingerprint (userSeq + steps.length + last step
+  // seq + threadIsCC + threadIdle + threadCanceling + streamingBuffer + …) is
+  // unchanged. On a 29-exchange thread that's 28× fewer markdown re-parses
+  // per SSE event compared with each child subscribing independently.
   const threadMeta = threadMap.value.get(threadId)?.meta;
   const threadIsCC = threadMeta?.channel === 'claude_code';
   const threadIdle = isThreadQuiescent(threadMeta?.status);
+  const threadCanceling = cancelingThreadIds.value.has(threadId);
   return exchanges.reduce<{ nodes: VNode[]; imgOffset: number; lastModel?: string; lastEffort?: string }>((acc, ex, i) => {
     const isLast = i === exchanges.length - 1;
     // Pass isLast=false for the prior exchange (it's at i-1, never the last
@@ -48,6 +59,9 @@ export function renderExchanges(
         priorModel={acc.lastModel}
         priorEffort={acc.lastEffort}
         isUnresumedAbort={i === unresumedIdx}
+        threadIsCC={threadIsCC}
+        threadIdle={threadIdle}
+        threadCanceling={threadCanceling}
       />
     );
     acc.imgOffset += exchangeImageCount(ex);

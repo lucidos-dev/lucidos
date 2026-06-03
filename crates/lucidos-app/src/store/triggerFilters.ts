@@ -1,5 +1,5 @@
 import { computed } from '@preact/signals';
-import { triggers, historicalTriggers, threadMap, selectedTriggerIds, setSelectedTriggerIds, threadChannelFilter, THREAD_CHANNEL_FILTER_KEY } from './store';
+import { triggers, historicalTriggers, threadMap, selectedTriggerIds, setSelectedTriggerIds, threadChannelFilter, THREAD_CHANNEL_FILTER_KEY, filterFacets } from './store';
 import type { ThreadChannel } from './store';
 import { loadedOr } from './types';
 
@@ -60,6 +60,13 @@ export const triggerFilterOptions = computed<TriggerFilterOption[]>(() => {
     const id = entry.meta.triggerId;
     if (!id) continue;
     push(id, entry.meta.triggerName);
+  }
+  // Backend facets add any trigger that has a thread beyond the loaded window
+  // (completeness parity with repos/apps). Run last among the name-bearing
+  // sources so registry / historical / threadMap labels win — a facet-only
+  // trigger falls back to its id via push().
+  for (const facet of loadedOr(filterFacets.value, undefined)?.triggers ?? []) {
+    if (facet.id) push(facet.id);
   }
   for (const id of selectedTriggerIds.value) push(id);
 

@@ -1,10 +1,10 @@
 use super::*;
 
 use crate::core::PreferenceStore;
-use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::engine::event_bus::SystemEvent;
 use crate::triggers::{
     is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
-    TriggerConfig, TriggerRun,
+    EventSubscription, TriggerConfig, TriggerRun,
 };
 
 #[derive(Serialize)]
@@ -21,18 +21,23 @@ pub struct TriggerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_run: Option<String>,
     pub run: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub on: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub condition: Option<serde_json::Value>,
+    /// Event subscriptions. Empty for schedule-only triggers; each entry pairs
+    /// an event type with an optional per-entry payload filter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on: Vec<EventSubscription>,
     /// Owning app directory name (e.g. `"trigger-workflow"`), used to deep-link
     /// notifications back to the right app. None for standalone triggers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
     /// When true, threads spawned by this trigger surface in REVIEW on
-    /// completion instead of going straight to HISTORY.
+    /// completion instead of going straight to ARCHIVE.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub go_to_review: bool,
+    /// Owning *trigger group* id (UUID string) used by the panel to sort the
+    /// trigger under the right section. None places the trigger under the
+    /// "Ungrouped" section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
 }
 
 impl TriggerInfo {
@@ -56,11 +61,11 @@ impl TriggerInfo {
             next_run: config.next_run().map(|t| t.to_rfc3339()),
             run,
             on: config.on.clone(),
-            condition: config.condition.clone(),
             // Surface the resolved (explicit-or-derived) app id so the frontend
             // matches what the engine will stamp on notifications from this trigger.
             app_id: config.owning_app_id(),
             go_to_review: config.go_to_review,
+            group_id: config.group_id.clone(),
         }
     }
 }
@@ -97,19 +102,25 @@ pub struct CreateTriggerCronRequest {
     pub slug: Option<String>,
     #[serde(default)]
     pub cron_expressions: Vec<String>,
+    /// Event subscriptions. Empty for schedule-only triggers; each entry pairs
+    /// an event type with an optional per-entry payload filter (no `condition`
+    /// = fire on every matching event).
     #[serde(default)]
-    pub on_event: Option<String>,
-    #[serde(default)]
-    pub condition: Option<serde_json::Value>,
+    pub on: Vec<EventSubscription>,
     /// Owning app directory name (e.g. `"trigger-workflow"`). Stamped onto
     /// notifications emitted by this trigger so the popover can deep-link
     /// to the app. Optional; standalone triggers omit it.
     #[serde(default)]
     pub app_id: Option<String>,
     /// When true, threads spawned by this trigger surface in REVIEW on
-    /// completion instead of going straight to HISTORY. Default false.
+    /// completion instead of going straight to ARCHIVE. Default false.
     #[serde(default)]
     pub go_to_review: bool,
+    /// Optional *trigger group* id. Pure organizational label — the trigger
+    /// fires identically regardless of group. The handler validates the id
+    /// against the in-memory group registry and rejects unknown values.
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -122,18 +133,12 @@ pub struct UpdateTriggerCronRequest {
     pub cron_expressions: Option<Vec<String>>,
     #[serde(default)]
     pub paused: Option<bool>,
-    /// None = field absent (don't change), Some(None) = explicitly null (clear), Some(Some(v)) = set.
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_nullable::<String, _>"
-    )]
-    pub on_event: Option<Option<String>>,
-    /// None = field absent (don't change), Some(None) = explicitly null (clear), Some(Some(v)) = set.
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_nullable::<serde_json::Value, _>"
-    )]
-    pub condition: Option<Option<serde_json::Value>>,
+    /// Full replacement for the event subscription list. None = field absent
+    /// (don't change), Some(empty) = clear all subscriptions, Some(non-empty)
+    /// = replace with the new set. Partial edits aren't supported — send the
+    /// whole list.
+    #[serde(default)]
+    pub on: Option<Vec<EventSubscription>>,
     /// None = field absent (don't change), Some(None) = explicitly null (clear), Some(Some(v)) = set.
     #[serde(
         default,
@@ -146,6 +151,14 @@ pub struct UpdateTriggerCronRequest {
     /// [`is_valid_trigger_slug`] — invalid values reject the request with 400.
     #[serde(default)]
     pub slug: Option<String>,
+    /// None = field absent (don't change), Some(None) = explicitly null (clear),
+    /// Some(Some(v)) = set. The handler validates `v` against the in-memory
+    /// trigger-group registry.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_nullable::<String, _>"
+    )]
+    pub group_id: Option<Option<String>>,
 }
 
 /// Deserialize a field that can be absent, null, or a value.
@@ -256,17 +269,12 @@ pub(super) async fn create_trigger(
         }
     }
 
-    // Validate: at least one of cron or on_event must be provided
     let has_cron = !request.cron_expressions.is_empty();
-    let on_event = request
-        .on_event
-        .as_ref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let has_event = on_event.is_some();
+    let subscriptions = EventSubscription::normalize_list(request.on);
+    let has_event = !subscriptions.is_empty();
     if !has_cron && !has_event {
         return ApiResult::err(
-            "At least one cron expression or an event type (on_event) is required",
+            "At least one cron expression or an event subscription is required",
         );
     }
 
@@ -310,11 +318,9 @@ pub(super) async fn create_trigger(
         "timezone": timezone,
         "run": run_value,
     });
-    if let Some(ref ev) = on_event {
-        payload["on"] = serde_json::json!(ev);
-    }
-    if let Some(ref cond) = request.condition {
-        payload["condition"] = cond.clone();
+    if !subscriptions.is_empty() {
+        payload["on"] = serde_json::to_value(&subscriptions)
+            .expect("EventSubscription serialization is infallible");
     }
     if let Some(ref aid) = request.app_id {
         let trimmed = aid.trim();
@@ -325,20 +331,30 @@ pub(super) async fn create_trigger(
     if request.go_to_review {
         payload["go_to_review"] = serde_json::json!(true);
     }
+    // Validate trigger-group membership against the in-memory registry so a
+    // dangling group_id can't survive the round-trip. Unknown id → 400.
+    if let Some(ref gid) = request.group_id {
+        let trimmed = gid.trim();
+        if !trimmed.is_empty() {
+            let known = state.engine.trigger_groups.read().unwrap().contains_key(trimmed);
+            if !known {
+                return ApiResult::err(format!("Unknown group_id '{}'", trimmed));
+            }
+            payload["group_id"] = serde_json::json!(trimmed);
+        }
+    }
 
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    if let Err(e) = state
+    state
         .engine
         .event_bus
-        .emit(BusEvent::System(SystemEvent::TriggerCreated {
-            trigger_id: trigger_id_str.clone(),
-            payload,
-            actor,
-        }))
-        .await
-    {
-        log!("[Triggers] Failed to emit TriggerCreated event: {}", e);
-    }
+        .emit_user_system(&headers, &state.pool, "[Triggers] TriggerCreated", |actor| {
+            SystemEvent::TriggerCreated {
+                trigger_id: trigger_id_str.clone(),
+                payload,
+                actor,
+            }
+        })
+        .await;
 
     ApiResult::ok()
 }
@@ -407,19 +423,15 @@ pub(super) async fn update_trigger(
         update_payload["paused"] = serde_json::json!(paused);
     }
 
-    // Normalize on_event: trim whitespace, treat whitespace-only as null (clear).
-    let normalized_on: Option<Option<String>> = request.on_event.as_ref().map(|v| {
-        v.as_ref()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    });
+    let normalized_on: Option<Vec<EventSubscription>> =
+        request.on.map(EventSubscription::normalize_list);
 
-    // None = absent (keep existing), Some(None) = explicit null (clear), Some(Some(v)) = set
-    if let Some(v) = &normalized_on {
-        update_payload["on"] = serde_json::json!(v);
-    }
-    if let Some(v) = &request.condition {
-        update_payload["condition"] = serde_json::json!(v);
+    // None = absent (keep existing); Some(empty) = clear all; Some(non-empty) = replace.
+    // The new shape always serializes as an array — apply_update reads it back
+    // via parse_event_subscriptions and treats `[]` as clear.
+    if let Some(ref subs) = normalized_on {
+        update_payload["on"] = serde_json::to_value(subs)
+            .expect("EventSubscription serialization is infallible");
     }
     // Same null-vs-absent semantics for app_id: explicit null clears the link
     // (e.g. trigger moved out of an app), absent leaves it alone.
@@ -439,33 +451,46 @@ pub(super) async fn update_trigger(
             Err(e) => return ApiResult::err(e),
         }
     }
+    // group_id update: same null-vs-absent semantics as app_id. Setting a value
+    // validates against the in-memory registry; null clears membership; absent
+    // leaves the trigger in its current group.
+    if let Some(v) = &request.group_id {
+        let normalized = v
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(ref gid) = normalized {
+            let known = state.engine.trigger_groups.read().unwrap().contains_key(gid);
+            if !known {
+                return ApiResult::err(format!("Unknown group_id '{}'", gid));
+            }
+        }
+        update_payload["group_id"] = serde_json::json!(normalized);
+    }
 
     // Ensure trigger still has at least one firing mechanism after update
     let updated_crons = request
         .cron_expressions
         .as_ref()
         .unwrap_or(&existing.schedule);
-    let updated_on = match &normalized_on {
-        Some(v) => v.clone(),
-        None => existing.on.clone(),
-    };
-    if updated_crons.is_empty() && updated_on.is_none() {
-        return ApiResult::err("Trigger must have at least one cron expression or an event type");
+    let updated_on = normalized_on.as_ref().unwrap_or(&existing.on);
+    if updated_crons.is_empty() && updated_on.is_empty() {
+        return ApiResult::err(
+            "Trigger must have at least one cron expression or an event subscription",
+        );
     }
 
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    if let Err(e) = state
+    state
         .engine
         .event_bus
-        .emit(BusEvent::System(SystemEvent::TriggerUpdated {
-            trigger_id: trigger_id_str.clone(),
-            payload: update_payload,
-            actor,
-        }))
-        .await
-    {
-        log!("[Triggers] Failed to emit TriggerUpdated event: {}", e);
-    }
+        .emit_user_system(&headers, &state.pool, "[Triggers] TriggerUpdated", |actor| {
+            SystemEvent::TriggerUpdated {
+                trigger_id: trigger_id_str.clone(),
+                payload: update_payload,
+                actor,
+            }
+        })
+        .await;
 
     ApiResult::ok()
 }
@@ -489,19 +514,17 @@ pub(super) async fn delete_trigger(
         return ApiResult::err(format!("Trigger '{}' not found", task_id));
     }
 
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    if let Err(e) = state
+    state
         .engine
         .event_bus
-        .emit(BusEvent::System(SystemEvent::TriggerDeleted {
-            trigger_id: task_id.clone(),
-            payload: serde_json::json!({ "trigger_id": &task_id }),
-            actor,
-        }))
-        .await
-    {
-        log!("[Triggers] Failed to emit TriggerDeleted event: {}", e);
-    }
+        .emit_user_system(&headers, &state.pool, "[Triggers] TriggerDeleted", |actor| {
+            SystemEvent::TriggerDeleted {
+                trigger_id: task_id.clone(),
+                payload: serde_json::json!({ "trigger_id": &task_id }),
+                actor,
+            }
+        })
+        .await;
 
     ApiResult::ok()
 }

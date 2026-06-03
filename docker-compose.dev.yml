@@ -9,7 +9,7 @@
 # discover which workspace each container belongs to without a host path.
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg17
     container_name: lucidos-pg-${LUCIDOS_PG_NAME:-default}
     ports:
       - "${LUCIDOS_PG_PORT:-5432}:5432"

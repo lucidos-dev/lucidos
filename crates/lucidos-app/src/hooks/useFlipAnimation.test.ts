@@ -36,7 +36,7 @@ describe('FLIP transition detection', () => {
     it('detects no changes on first render', () => {
         const prev = new Map<string, string>();
         const { map: curr } = buildSectionMap([
-            { name: 'history', ids: ['__section_history', 'a', 'b', 'c'] },
+            { name: 'archive', ids: ['__section_archive', 'a', 'b', 'c'] },
         ]);
         const { transitioned, newItems } = detectChanges(prev, curr);
         expect(transitioned.size).toBe(0);
@@ -45,37 +45,37 @@ describe('FLIP transition detection', () => {
 
     it('detects no changes when sections stay the same', () => {
         const { map: prev } = buildSectionMap([
-            { name: 'history', ids: ['__section_history', 'a', 'b', 'c'] },
+            { name: 'archive', ids: ['__section_archive', 'a', 'b', 'c'] },
         ]);
         const { map: curr } = buildSectionMap([
-            { name: 'history', ids: ['__section_history', 'a', 'b', 'c'] },
+            { name: 'archive', ids: ['__section_archive', 'a', 'b', 'c'] },
         ]);
         const { transitioned, newItems } = detectChanges(prev, curr);
         expect(transitioned.size).toBe(0);
         expect(newItems.size).toBe(0);
     });
 
-    it('detects thread moving from history to pinned', () => {
+    it('detects thread moving from archive to saved', () => {
         const { map: prev } = buildSectionMap([
-            { name: 'history', ids: ['__section_history', 'a', 'b', 'c'] },
+            { name: 'archive', ids: ['__section_archive', 'a', 'b', 'c'] },
         ]);
         const { map: curr } = buildSectionMap([
-            { name: 'pinned', ids: ['__section_pinned', 'b'] },
-            { name: 'history', ids: ['__section_history', 'a', 'c'] },
+            { name: 'saved', ids: ['__section_saved', 'b'] },
+            { name: 'archive', ids: ['__section_archive', 'a', 'c'] },
         ]);
         const { transitioned, newItems } = detectChanges(prev, curr);
         expect(transitioned).toEqual(new Set(['b']));
         // New section header and sections that appeared
-        expect(newItems.has('__section_pinned')).toBe(true);
+        expect(newItems.has('__section_saved')).toBe(true);
     });
 
-    it('detects thread moving from pinned to history', () => {
+    it('detects thread moving from saved to archive', () => {
         const { map: prev } = buildSectionMap([
-            { name: 'pinned', ids: ['__section_pinned', 'b'] },
-            { name: 'history', ids: ['__section_history', 'a', 'c'] },
+            { name: 'saved', ids: ['__section_saved', 'b'] },
+            { name: 'archive', ids: ['__section_archive', 'a', 'c'] },
         ]);
         const { map: curr } = buildSectionMap([
-            { name: 'history', ids: ['__section_history', 'b', 'a', 'c'] },
+            { name: 'archive', ids: ['__section_archive', 'b', 'a', 'c'] },
         ]);
         const { transitioned } = detectChanges(prev, curr);
         expect(transitioned).toEqual(new Set(['b']));
@@ -83,37 +83,37 @@ describe('FLIP transition detection', () => {
 
     it('detects new thread appearing', () => {
         const { map: prev } = buildSectionMap([
-            { name: 'history', ids: ['__section_history', 'a', 'b'] },
+            { name: 'archive', ids: ['__section_archive', 'a', 'b'] },
         ]);
         const { map: curr } = buildSectionMap([
-            { name: 'history', ids: ['__section_history', 'new-thread', 'a', 'b'] },
+            { name: 'archive', ids: ['__section_archive', 'new-thread', 'a', 'b'] },
         ]);
         const { transitioned, newItems } = detectChanges(prev, curr);
         expect(transitioned.size).toBe(0);
         expect(newItems).toEqual(new Set(['new-thread']));
     });
 
-    it('detects thread moving from running to history', () => {
+    it('detects thread moving from active to archive', () => {
         const { map: prev } = buildSectionMap([
-            { name: 'running', ids: ['__section_running', 'a'] },
-            { name: 'history', ids: ['__section_history', 'b', 'c'] },
+            { name: 'active', ids: ['__section_active', 'a'] },
+            { name: 'archive', ids: ['__section_archive', 'b', 'c'] },
         ]);
         const { map: curr } = buildSectionMap([
-            { name: 'history', ids: ['__section_history', 'a', 'b', 'c'] },
+            { name: 'archive', ids: ['__section_archive', 'a', 'b', 'c'] },
         ]);
         const { transitioned, newItems } = detectChanges(prev, curr);
         expect(transitioned).toEqual(new Set(['a']));
-        // __section_history was already present, __section_running disappeared
+        // __section_archive was already present, __section_active disappeared
         expect(newItems.size).toBe(0);
     });
 
     it('detects multiple threads transitioning simultaneously', () => {
         const { map: prev } = buildSectionMap([
-            { name: 'running', ids: ['__section_running', 'a', 'b'] },
-            { name: 'history', ids: ['__section_history', 'c', 'd'] },
+            { name: 'active', ids: ['__section_active', 'a', 'b'] },
+            { name: 'archive', ids: ['__section_archive', 'c', 'd'] },
         ]);
         const { map: curr } = buildSectionMap([
-            { name: 'history', ids: ['__section_history', 'a', 'b', 'c', 'd'] },
+            { name: 'archive', ids: ['__section_archive', 'a', 'b', 'c', 'd'] },
         ]);
         const { transitioned, newItems } = detectChanges(prev, curr);
         expect(transitioned).toEqual(new Set(['a', 'b']));

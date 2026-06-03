@@ -1,4 +1,3 @@
-use super::super::document::safe_extract_pdf_text;
 use super::super::LucidosEngine;
 use super::credentials::credential_request_payload;
 use crate::api::is_path_traversal;
@@ -487,33 +486,6 @@ impl LucidosEngine {
                 let size_display = format_byte_size(data.len());
                 drop(data);
 
-                let pdf_text = if mime_type == "application/pdf" {
-                    let full_path = self
-                        .workspace_path
-                        .join("data/artifacts")
-                        .join(&dest_relative);
-                    match safe_extract_pdf_text(&full_path) {
-                        Ok(text) if !text.trim().is_empty() => {
-                            let text_path = format!("{}.txt", dest_relative);
-                            if let Err(e) = self
-                                .artifact_manager
-                                .write_and_commit(
-                                    &text_path,
-                                    &text,
-                                    &format!("Extract text from {}", safe_filename),
-                                )
-                                .await
-                            {
-                                log!("[Email] Failed to write extracted text: {}", e);
-                            }
-                            Some(text)
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
                 if let Err(e) = self
                     .event_bus
                     .emit(crate::engine::event_bus::BusEvent::System(
@@ -536,16 +508,11 @@ impl LucidosEngine {
                     dest_relative, safe_filename, size_display, short_sha
                 );
 
-                if let Some(text) = pdf_text {
-                    let total_chars = text.chars().count();
-                    let preview: String = text.chars().take(total_chars.min(2000)).collect();
-                    result.push_str(&format!(
-                        "\n\n--- Extracted PDF Text ({} chars total) ---\n{}",
-                        total_chars, preview
-                    ));
-                    if total_chars > 2000 {
-                        result.push_str("\n... (truncated, full text saved as sidecar .txt file)");
-                    }
+                if mime_type == "application/pdf" {
+                    result.push_str(
+                        "\n\nNote: PDF text extraction has been removed. The attachment is \
+                         saved as a binary artifact; its text content is not available to tools.",
+                    );
                 }
 
                 Ok(result)

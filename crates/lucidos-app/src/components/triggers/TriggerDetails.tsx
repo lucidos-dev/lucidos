@@ -1,16 +1,20 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { activeInlineForm, triggers, showToast } from '../../store/store';
+import { activeInlineForm, triggers, triggerGroups, showToast } from '../../store/store';
 import {
   closeTriggerForm,
   submitTrigger,
 } from '../../store/actions/triggers';
+import { createTriggerGroup } from '../../store/actions/triggerGroups';
 import { deriveTriggerType, toFailed } from '../../store/types';
-import type { TriggerInfo, TriggerRun, Loadable } from '../../store/types';
+import type { EventSubscription, TriggerInfo, TriggerRun, Loadable } from '../../store/types';
 import { describeCron, validateCron } from '../../utils/describeCron';
 import { Dropdown } from '../shared/Dropdown';
 import { fetchEventTypes } from '../../api/client';
 import { resizeTextarea, useFontMetricsResize } from '../chat/promptResize';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { LoadableError } from '../shared/LoadableError';
+
+const NEW_GROUP_SENTINEL = '__new_group__';
 
 type TriggerFormType = 'schedule' | 'event' | 'both';
 type RunType = 'intent' | 'script';
@@ -24,32 +28,46 @@ export function TriggerDetails() {
   const form = activeInlineForm.value;
   if (form?.type !== 'trigger') return null;
 
-  const editingId = form.taskId;
+  const editingId = form.triggerId;
 
   if (editingId) {
+    if (triggers.value.status === 'failed') {
+      return (
+        <div class="inline-form">
+          <LoadableError error={triggers.value.error} noun="triggers" />
+        </div>
+      );
+    }
     if (triggers.value.status !== 'loaded') {
       return <div class="inline-form"><div class="loading-spinner" /></div>;
     }
-    const task = triggers.value.data.find((t) => t.id === editingId);
-    if (!task) {
-      closeTriggerForm();
-      return null;
+    const trigger = triggers.value.data.find((t) => t.id === editingId);
+    if (!trigger) {
+      return <MissingTriggerCloser />;
     }
-    return <TriggerFormInner key={editingId} editingId={editingId} existingTask={task} />;
+    return <TriggerFormInner key={editingId} editingId={editingId} existingTrigger={trigger} />;
   }
 
-  return <TriggerFormInner key="new" existingTask={null} />;
+  return <TriggerFormInner key="new" existingTrigger={null} />;
 }
 
-function TriggerFormInner({ editingId, existingTask }: { editingId?: string; existingTask: TriggerInfo | null }) {
+/** Closes the trigger form when the target trigger no longer exists. Lives in
+ *  a child component so the signal write happens in useEffect (post-commit),
+ *  not inside the parent's render body — which preact lint flags. */
+function MissingTriggerCloser() {
+  useEffect(() => { closeTriggerForm(); }, []);
+  return null;
+}
 
-  const derived = existingTask ? deriveTriggerType(existingTask) : null;
+function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; existingTrigger: TriggerInfo | null }) {
+
+  const derived = existingTrigger ? deriveTriggerType(existingTrigger) : null;
   const initialFormType: TriggerFormType = derived === 'hybrid' ? 'both' : derived === 'event' ? 'event' : 'schedule';
 
   const [formType, setFormType] = useState<TriggerFormType>(initialFormType);
-  const [name, setName] = useState(existingTask?.name || '');
+  const [name, setName] = useState(existingTrigger?.name || '');
 
-  const existingRun = existingTask?.run;
+  const existingRun = existingTrigger?.run;
   const [runType, setRunType] = useState<RunType>(existingRun?.type === 'script' ? 'script' : 'intent');
   const [intentText, setIntentText] = useState(
     existingRun?.type === 'intent' ? existingRun.intent : ''
@@ -59,11 +77,23 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
   );
 
   const [cronExpressions, setCronExpressions] = useState<string[]>(
-    existingTask?.cron_expressions?.length ? [...existingTask.cron_expressions] : []
+    existingTrigger?.cron_expressions?.length ? [...existingTrigger.cron_expressions] : []
   );
   const [cronInput, setCronInput] = useState('');
   const [cronError, setCronError] = useState<string | null>(null);
-  const [eventType, setEventType] = useState(existingTask?.on || '');
+
+  // Parsed condition lives on `subs[i].condition` so submit can forward it
+  // directly. The raw JSON source the user is typing lives in `conditionDrafts`
+  // — parsing it back on every keystroke would lose the in-flight cursor /
+  // invalid intermediate state, so we hold the string until submit.
+  const initialSubs: EventSubscription[] = (existingTrigger?.on ?? []).map(s => ({ ...s }));
+  const initialDrafts: Record<number, string> = {};
+  (existingTrigger?.on ?? []).forEach((s, i) => {
+    if (s.condition) initialDrafts[i] = JSON.stringify(s.condition, null, 2);
+  });
+  const [subs, setSubs] = useState<EventSubscription[]>(initialSubs);
+  const [conditionDrafts, setConditionDrafts] = useState<Record<number, string>>(initialDrafts);
+  const [subErrors, setSubErrors] = useState<Record<number, string>>({});
   const [eventTypesLoadable, setEventTypesLoadable] = useState<Loadable<string[]>>(cachedEventTypes);
   const showEventTypesLoading = useDelayedLoading(eventTypesLoadable);
 
@@ -86,13 +116,23 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
       .finally(() => { inflightFetch = null; });
   }, []);
 
-  const knownEventTypes = eventTypesLoadable.status === 'loaded' ? eventTypesLoadable.data : [];
+  const eventTypeOptions: { value: string; label: string }[] = (() => {
+    if (eventTypesLoadable.status === 'loaded') {
+      return eventTypesLoadable.data.map(t => ({ value: t, label: t }));
+    }
+    if (eventTypesLoadable.status === 'failed') {
+      return [{ value: '', label: 'Failed to load event types' }];
+    }
+    if (eventTypesLoadable.status === 'loading' && showEventTypesLoading) {
+      return [{ value: '', label: 'Loading event types...' }];
+    }
+    return [];
+  })();
 
-  const [conditionJson, setConditionJson] = useState(
-    existingTask?.condition ? JSON.stringify(existingTask.condition, null, 2) : ''
-  );
-
-  const [goToReview, setGoToReview] = useState(existingTask?.go_to_review ?? false);
+  const [goToReview, setGoToReview] = useState(existingTrigger?.go_to_review ?? false);
+  const [groupId, setGroupId] = useState<string>(existingTrigger?.group_id ?? '');
+  // null = inline-create field hidden; string = visible with current draft.
+  const [newGroupDraft, setNewGroupDraft] = useState<string | null>(null);
 
   const intentRef = useRef<HTMLTextAreaElement>(null);
   const resizeIntent = () => { if (intentRef.current) resizeTextarea(intentRef.current); };
@@ -164,24 +204,102 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
       setCronError(null);
     }
 
-    // Parse condition JSON if provided
-    let condition: Record<string, unknown> | undefined;
-    if (showEvent && conditionJson.trim()) {
-      try {
-        condition = JSON.parse(conditionJson.trim());
-      } catch {
-        showToast('Invalid JSON in condition field', 'error');
+    let on: EventSubscription[] | undefined;
+    if (showEvent) {
+      const built: EventSubscription[] = [];
+      const errors: Record<number, string> = {};
+      subs.forEach((row, i) => {
+        const eventType = row.event_type.trim();
+        if (!eventType) return;
+        const draft = (conditionDrafts[i] ?? '').trim();
+        let condition: Record<string, unknown> | undefined;
+        if (draft) {
+          try {
+            condition = JSON.parse(draft);
+          } catch {
+            errors[i] = 'Invalid JSON';
+          }
+        }
+        built.push(condition ? { event_type: eventType, condition } : { event_type: eventType });
+      });
+      if (Object.keys(errors).length > 0) {
+        setSubErrors(errors);
+        showToast('Fix the highlighted condition JSON before saving', 'error');
         return;
       }
+      setSubErrors({});
+      on = built;
     }
 
-    const onEvent = showEvent && eventType.trim() ? eventType.trim() : undefined;
-
     await submitTrigger({
-      name, run, cronExpressions: finalCrons, taskId: editingId,
-      onEvent, condition, showEvent, goToReview,
+      name, run, cronExpressions: finalCrons, triggerId: editingId,
+      on, showEvent, goToReview,
+      groupId: groupId || null,
     });
   }
+
+  function clearSubError(index: number) {
+    if (!subErrors[index]) return;
+    const next = { ...subErrors };
+    delete next[index];
+    setSubErrors(next);
+  }
+
+  function addSubscription() {
+    setSubs([...subs, { event_type: '' }]);
+  }
+
+  function setEventType(index: number, eventType: string) {
+    setSubs(subs.map((s, i) => i === index ? { ...s, event_type: eventType } : s));
+    clearSubError(index);
+  }
+
+  function setConditionDraft(index: number, source: string) {
+    setConditionDrafts({ ...conditionDrafts, [index]: source });
+    clearSubError(index);
+  }
+
+  function removeSubscription(index: number) {
+    setSubs(subs.filter((_, i) => i !== index));
+    // Rekey both maps so trailing entries shift down with the array.
+    const reindex = <T,>(m: Record<number, T>) => Object.fromEntries(
+      Object.entries(m)
+        .map(([k, v]) => [Number(k), v] as const)
+        .filter(([k]) => k !== index)
+        .map(([k, v]) => [k > index ? k - 1 : k, v]),
+    );
+    setConditionDrafts(reindex(conditionDrafts));
+    setSubErrors(reindex(subErrors));
+  }
+
+  function handleGroupChange(value: string) {
+    if (value === NEW_GROUP_SENTINEL) {
+      setNewGroupDraft('');
+      return;
+    }
+    setNewGroupDraft(null);
+    setGroupId(value);
+  }
+
+  async function commitNewGroupDraft() {
+    const trimmed = (newGroupDraft ?? '').trim();
+    if (!trimmed) { setNewGroupDraft(null); return; }
+    const group = await createTriggerGroup(trimmed);
+    if (group) setGroupId(group.id);
+    setNewGroupDraft(null);
+  }
+
+  const groupsLoadable = triggerGroups.value;
+  const groupOptions: { value: string; label: string }[] = (() => {
+    const opts: { value: string; label: string }[] = [{ value: '', label: '(No group)' }];
+    if (groupsLoadable.status === 'loaded') {
+      for (const g of [...groupsLoadable.data].sort((a, b) => a.order - b.order)) {
+        opts.push({ value: g.id, label: g.name });
+      }
+    }
+    opts.push({ value: NEW_GROUP_SENTINEL, label: '+ New group…' });
+    return opts;
+  })();
 
   return (
     <div class="inline-form">
@@ -196,6 +314,33 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
               placeholder="e.g. Morning Brief"
               required
             />
+          </div>
+
+          <div class="form-group">
+            <label>Group</label>
+            <Dropdown
+              value={groupId}
+              onChange={handleGroupChange}
+              options={groupOptions}
+            />
+            {newGroupDraft !== null && (
+              <input
+                class="trigger-group-name-input"
+                type="text"
+                autoFocus
+                value={newGroupDraft}
+                placeholder="New group name"
+                onInput={e => setNewGroupDraft((e.target as HTMLInputElement).value)}
+                onBlur={commitNewGroupDraft}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') { e.preventDefault(); void commitNewGroupDraft(); }
+                  else if (e.key === 'Escape') setNewGroupDraft(null);
+                }}
+              />
+            )}
+            <div class="form-hint">
+              Optional folder shown in the triggers panel. Group related triggers (e.g. steps of a workflow connected by emit_event → on_event).
+            </div>
           </div>
 
           <div class="form-group">
@@ -281,36 +426,61 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
           )}
 
           {showEvent && (
-            <>
-              <div class="form-group">
-                <label>Event Type</label>
-                <Dropdown
-                  options={knownEventTypes.map(t => ({ value: t, label: t }))}
-                  value={eventType}
-                  onChange={setEventType}
-                  placeholder="e.g. OuraSleepImported"
-                  freeText
-                />
-                {eventTypesLoadable.status === 'failed' && (
-                  <div class="form-error">Failed to load event types: {eventTypesLoadable.error}</div>
-                )}
-                {eventTypesLoadable.status === 'loading' && showEventTypesLoading && (
-                  <div class="form-hint">Loading event types...</div>
-                )}
-              </div>
+            <div class="form-group">
+              <label>Event Subscriptions</label>
+              {eventTypesLoadable.status === 'failed' && (
+                <div class="form-error">Failed to load event types: {eventTypesLoadable.error}</div>
+              )}
+              {eventTypesLoadable.status === 'loading' && showEventTypesLoading && (
+                <div class="form-hint">Loading event types...</div>
+              )}
 
-              <div class="form-group">
-                <label>Condition (optional)</label>
-                <textarea
-                  value={conditionJson}
-                  onInput={(e) => setConditionJson((e.target as HTMLTextAreaElement).value)}
-                  placeholder={'e.g. {"sleep_score": {"$lt": 70}}'}
-                  class="code-textarea"
-                  rows={3}
-                />
-                <div class="form-hint">JSON payload filter. Leave empty to fire on every matching event.</div>
+              {subs.length === 0 && (
+                <div class="form-hint">No event subscriptions yet — add one below.</div>
+              )}
+
+              {subs.map((row, i) => (
+                <div key={i} class="trigger-subscription-row">
+                  <div class="removable-input-row">
+                    <Dropdown
+                      options={eventTypeOptions}
+                      value={row.event_type}
+                      onChange={(v) => setEventType(i, v)}
+                      placeholder="e.g. OuraSleepImported"
+                      freeText
+                    />
+                    <button
+                      type="button"
+                      class="action-btn action-btn-danger"
+                      onClick={() => removeSubscription(i)}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                  <textarea
+                    value={conditionDrafts[i] ?? ''}
+                    onInput={(e) => setConditionDraft(i, (e.target as HTMLTextAreaElement).value)}
+                    placeholder={'Condition (optional). e.g. {"sleep_score": {"$lt": 70}}'}
+                    class={`code-textarea${subErrors[i] ? ' input-error' : ''}`}
+                    rows={2}
+                  />
+                  {subErrors[i] && <div class="form-error">{subErrors[i]}</div>}
+                </div>
+              ))}
+
+              <div class="removable-input-row">
+                <button
+                  type="button"
+                  class="action-btn"
+                  onClick={addSubscription}
+                >
+                  Add event
+                </button>
               </div>
-            </>
+              <div class="form-hint">
+                Each subscription's condition only filters that event — different events can carry different payloads.
+              </div>
+            </div>
           )}
 
           <div class="form-group">
@@ -369,7 +539,7 @@ function TriggerFormInner({ editingId, existingTask }: { editingId?: string; exi
               <span>Send to Review on completion</span>
             </label>
             <div class="form-hint">
-              By default, runs land in History. Turn this on for triggers whose output you're meant to read — daily summaries, alerts, scheduled reports.
+              By default, runs land in Archive. Turn this on for triggers whose output you're meant to read — daily summaries, alerts, scheduled reports.
             </div>
           </div>
 

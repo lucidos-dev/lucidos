@@ -31,7 +31,7 @@ vi.mock('../store', () => ({
 }));
 
 // Side-effect imports thread-sync.ts pulls in — kept as no-ops.
-vi.mock('../../api/client', () => ({ API_BASE: '', postMcpConsent: vi.fn() }));
+vi.mock('../../api/client', () => ({ API_BASE: '', API: '/api/v1', postMcpConsent: vi.fn() }));
 vi.mock('../thread-events', () => ({
   handleEvent: vi.fn(),
   isChannelDefiningEvent: vi.fn(() => false),
@@ -50,6 +50,7 @@ vi.mock('./artifacts', () => ({
 }));
 vi.mock('./triggers', () => ({ navigateToTrigger: vi.fn() }));
 vi.mock('./apps', () => ({ refreshAppUI: vi.fn(), captureAppUI: vi.fn(), openAppById: vi.fn() }));
+vi.mock('./wipPreview', () => ({ clearWipIfMatches: vi.fn() }));
 vi.mock('./credentials', () => ({ openCredentialRequest: vi.fn() }));
 vi.mock('./menu', () => ({
   setActiveMenu: vi.fn(),

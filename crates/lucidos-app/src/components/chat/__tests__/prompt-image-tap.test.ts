@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
-const storeSource = readFileSync(resolve(here, '../../../store/store.ts'), 'utf-8');
+// openImagePopupFromGroup lives in its own module (re-exported from store.ts).
+const storeSource = readFileSync(resolve(here, '../../../store/imagePopup.ts'), 'utf-8');
 
 describe('image-preview-thumb tap opens popup with strip traversal', () => {
   const stripImgs = promptSource.match(/<img[\s\S]*?class="image-preview-thumb"[\s\S]*?\/>/g) ?? [];
@@ -35,7 +36,7 @@ describe('image-preview-thumb tap opens popup with strip traversal', () => {
 
   it('openImagePopupFromGroup walks up to the prompt strip as well as the thread', () => {
     const fnMatch = storeSource.match(/export function openImagePopupFromGroup[\s\S]*?\n\}/);
-    expect(fnMatch, 'openImagePopupFromGroup not exported from store.ts').not.toBeNull();
+    expect(fnMatch, 'openImagePopupFromGroup not exported from imagePopup.ts').not.toBeNull();
     const body = fnMatch![0];
     expect(body, 'closest() must include the prompt strip container').toMatch(/\.image-preview-strip/);
     expect(body, 'querySelectorAll must include the strip thumb class').toMatch(/\.image-preview-thumb/);

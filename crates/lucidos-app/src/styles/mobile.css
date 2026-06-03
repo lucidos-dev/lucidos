@@ -157,17 +157,6 @@
         font-size: var(--user-ui-scale, 112.5%); /* default 18px base on mobile, user-configurable */
     }
 
-    /* Container — full width, tighter padding on mobile */
-    .container {
-        max-width: 100%;
-        overflow-x: hidden;
-        padding: 0.75rem;
-        padding-top: calc(4.5rem + env(safe-area-inset-top, 0px));
-        padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
-        padding-right: max(0.75rem, env(safe-area-inset-right, 0px));
-        padding-bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
-    }
-
     .drawer-item {
         padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
     }
@@ -328,28 +317,6 @@
        visualViewport.height is the only reliable signal. */
     .app-shell {
         height: var(--app-height, 100dvh);
-    }
-
-    .split-layout {
-        flex-direction: column !important;
-    }
-
-    /* Collapse desktop content row on mobile — can't use display:none because
-       ThreadDrawer (position:fixed) inside it must remain in the rendering tree
-       for the mobile hamburger overlay. overflow:hidden clips non-fixed children
-       (SplitLayout, DrawerDivider) at zero height. */
-    .content-row {
-        flex: none;
-        height: 0;
-        min-height: 0;
-    }
-
-    /* SplitLayout is fully replaced by MobileSwipeContainer on mobile.
-       display:none prevents desktop elements (position:absolute .thread-content,
-       .thread-view-header) from leaking non-zero dimensions via getBoundingClientRect
-       into dual-layout-aware selectors. ThreadDrawer is a sibling, unaffected. */
-    .content-row > .split-layout {
-        display: none !important;
     }
 
     /* Thread toggle in pane body: hidden on mobile — mobile header has it */

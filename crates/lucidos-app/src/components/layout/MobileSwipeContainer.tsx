@@ -2,14 +2,65 @@ import { useRef, useCallback, useEffect, useLayoutEffect } from 'preact/hooks';
 import { mobileView, MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, appPseudoFullscreen } from '../../store/store';
 import { navigateToPane, resolveSwipePane } from '../../store/actions/pane';
 import { MOBILE_PANE_CONFIGS } from './MobileAppHeader';
-import { isTextInput } from '../../utils/dom';
+import { isTextInput, isInteractiveTarget, opensSoftwareKeyboard } from '../../utils/dom';
 import { SwipeTouch } from '../../utils/swipe';
-import { scrolledUp, scrollToBottom } from '../chat/scrollState';
+import { scrolledUp, pinToBottomNow } from '../chat/scrollState';
 
 export { SwipeTouch } from '../../utils/swipe';
 
 // Rubber band factor at edges (0 = no movement, 1 = full movement)
 const RUBBER_BAND = 0.3;
+
+/** Width of the screen-edge strip (px) where a touch is treated as a potential
+ *  iOS back/forward navigation swipe and suppressed. Narrow so vertical
+ *  scrolling and content taps (content carries its own horizontal padding)
+ *  outside the strip are unaffected. iOS's interactive pop gesture activates
+ *  from roughly the outermost ~20pt, so this comfortably covers it. */
+export const EDGE_NAV_GUARD_PX = 24;
+
+/** Pure decision: should a touchstart at `clientX` call preventDefault() to
+ *  suppress iOS's native back/forward navigation swipe?
+ *
+ *  A standalone iOS PWA exposes NO CSS/touch-action opt-out for this gesture,
+ *  and WebKit's edge recognizer commits before our in-app 8px horizontal lock
+ *  (SwipeTouch) — so preventing the default in onTouchMove runs too late. The
+ *  only reliable suppression is preventDefault on the touchstart itself. Scoped
+ *  to the screen-edge strip and to non-interactive, non-text-input targets so
+ *  taps on edge controls and vertical scrolling elsewhere survive. */
+export function shouldSuppressEdgeNavigation(args: {
+  clientX: number;
+  viewportWidth: number;
+  targetIsInteractive: boolean;
+  textInputFocused: boolean;
+}): boolean {
+  const { clientX, viewportWidth, targetIsInteractive, textInputFocused } = args;
+  if (targetIsInteractive || textInputFocused) return false;
+  return clientX <= EDGE_NAV_GUARD_PX || clientX >= viewportWidth - EDGE_NAV_GUARD_PX;
+}
+
+/** Pure decision: what value should `--app-height` be written to, given the
+ *  current visual viewport, layout viewport, and focus state? Extracted so
+ *  the wake/resize bug can be unit-tested without jsdom + fake visualViewport.
+ *
+ *  Keyboard up iff `vv.height` is meaningfully shrunk relative to
+ *  `window.innerHeight` (the layout viewport, which doesn't shrink for the
+ *  iOS keyboard) AND a text input that triggers the OS keyboard is focused.
+ *  When keyboard is up, render the app shell at `vv.height` (shrunk to fit
+ *  above the keyboard). Otherwise use `innerHeight` as the truth — this is
+ *  what fixes the iOS PWA wake bug, where a delayed `vv.resize` fires with
+ *  a stale shrunk `vv.height` even though the keyboard is actually dismissed.
+ *  The companion fix is in `onWake`, which blurs any iOS-preserved focus on
+ *  a text input so the `activeElementOpensKeyboard` signal correctly reports
+ *  false when the keyboard is actually down. */
+export function computeAppHeight(args: {
+  vvHeight: number;
+  innerHeight: number;
+  activeElementOpensKeyboard: boolean;
+}): number {
+  const { vvHeight, innerHeight, activeElementOpensKeyboard } = args;
+  const isKeyboard = vvHeight < innerHeight - 100 && activeElementOpensKeyboard;
+  return isKeyboard ? vvHeight : innerHeight;
+}
 
 /** Check if an element or any ancestor (up to pane boundary) scrolls horizontally. */
 function isHorizontallyScrollable(el: Element | null): boolean {
@@ -142,18 +193,35 @@ export function MobileSwipeContainer() {
   const touchTargetScrollable = useRef(false);
 
   const onTouchStart = useCallback((e: TouchEvent) => {
-    // Don't start pane swipes while a text input is focused — the user is
-    // typing and horizontal drags should not navigate away.
-    if (isTextInput(document.activeElement)) return;
-
+    const t = e.touches[0];
     const target = e.target as Element;
+
+    const textInputFocused = isTextInput(document.activeElement);
     // Don't hijack touches on horizontally-scrollable children (e.g., code blocks)
     // or range sliders (knob drag is horizontal and must not trigger pane swipe).
     touchTargetScrollable.current = isHorizontallyScrollable(target) ||
       !!target.closest('input[type="range"]');
+
+    // Suppress iOS's native back/forward navigation swipe at the screen edges.
+    // Must happen here on touchstart — the listener is registered { passive:
+    // false } for this — because WebKit's edge recognizer commits before our
+    // 8px horizontal lock, so onTouchMove's preventDefault is too late. Exempts
+    // scrollable children, interactive controls, and focused text inputs so
+    // their own gestures/taps survive (see shouldSuppressEdgeNavigation).
+    if (t && !touchTargetScrollable.current && shouldSuppressEdgeNavigation({
+      clientX: t.clientX,
+      viewportWidth: window.innerWidth,
+      targetIsInteractive: isInteractiveTarget(target),
+      textInputFocused,
+    })) {
+      e.preventDefault();
+    }
+
+    // Don't start pane swipes while a text input is focused — the user is
+    // typing and horizontal drags should not navigate away.
+    if (textInputFocused) return;
     if (touchTargetScrollable.current) return;
 
-    const t = e.touches[0];
     touch.current.start(t.clientX, t.clientY);
     const track = trackRef.current;
     if (track) track.style.transition = 'none';
@@ -212,7 +280,9 @@ export function MobileSwipeContainer() {
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    el.addEventListener('touchstart', onTouchStart, { passive: true });
+    // touchstart is non-passive: onTouchStart calls preventDefault() at the
+    // screen edges to suppress iOS's native back/forward navigation swipe.
+    el.addEventListener('touchstart', onTouchStart, { passive: false });
     el.addEventListener('touchmove', onTouchMove, { passive: false });
     el.addEventListener('touchend', onTouchEnd, { passive: true });
     el.addEventListener('touchcancel', onTouchEnd, { passive: true });
@@ -284,7 +354,6 @@ export function MobileSwipeContainer() {
   useEffect(() => {
     const vv = window.visualViewport;
     if (!vv) return;
-    let fullHeight = vv.height;
     // -1 sentinel ensures the initial setHeight() call writes the CSS variable
     // instead of being short-circuited by the equality guard inside setHeight.
     let lastSetHeight = -1;
@@ -298,32 +367,88 @@ export function MobileSwipeContainer() {
       document.documentElement.style.setProperty('--app-height', `${h}px`);
     };
 
+    // One computation site so onResize, onOrientationChange, the initial
+    // write, and the wake-time recompute all use the same keyboard-aware
+    // decision. Routing onOrientationChange / initial through this fixes the
+    // case where the user has the keyboard up at rotation or component mount
+    // — writing innerHeight blindly would stamp the full layout viewport
+    // over the keyboard-shrunk visual viewport, occluding the prompt area
+    // behind the keyboard until the next vv.resize repaired it.
+    const currentAppHeight = () => computeAppHeight({
+      vvHeight: vv.height,
+      innerHeight: window.innerHeight,
+      activeElementOpensKeyboard: opensSoftwareKeyboard(document.activeElement),
+    });
+
     const onResize = () => {
       // Capture before layout changes — once --app-height updates and
       // ResizeObserver fires, scrolledUp may flip to true.
       const wasAtBottom = !scrolledUp.value;
-      const isKeyboard = vv.height < fullHeight - 100 &&
-        isTextInput(document.activeElement);
-      if (!isKeyboard) {
-        fullHeight = vv.height;
-      }
-      setHeight(vv.height);
-      // scrollToBottom() sets ResizeObserver suppression to 'scroll',
+      setHeight(currentAppHeight());
+      // pinToBottomNow() sets ResizeObserver suppression to 'scroll',
       // so the observer scrolls to bottom instead of marking scrolledUp.
       if (wasAtBottom) {
-        scrollToBottom();
+        pinToBottomNow();
       }
     };
     const onOrientationChange = () => {
-      fullHeight = vv.height;
-      setHeight(fullHeight);
+      setHeight(currentAppHeight());
+    };
+    // iOS PWA suspend/resume often dismisses the on-screen keyboard without
+    // firing a visualViewport `resize` event. Without a wake-time recompute,
+    // --app-height stays at the keyboard-shrunk value and .app-shell renders
+    // at half the viewport (visible black band below the prompt) until reload.
+    //
+    // Two things both go wrong on iOS PWA wake and BOTH need fixing — the
+    // prior fix only covered (1):
+    //
+    //   1. window.visualViewport.height is often pinned at the stale shrunk
+    //      value at wake time, so going through onResize() (which used to
+    //      trust vv.height) would re-stamp the small value. window.innerHeight
+    //      is the layout viewport — doesn't shrink for the iOS keyboard and
+    //      is reliably restored on resume — so use it as the truth on wake.
+    //
+    //   2. iOS preserves focus on the textarea across suspend even when the
+    //      on-screen keyboard is dismissed. Ghost-focused state then fools
+    //      computeAppHeight's keyboard check (vv.height < innerHeight - 100
+    //      AND opensSoftwareKeyboard(activeElement) = both true) when a
+    //      delayed vv.resize finally fires — the helper returns vv.height
+    //      and onResize writes the stale shrunk value back into --app-height.
+    //      Explicit blur clears the ghost focus; the user re-taps to reopen
+    //      the keyboard naturally, matching the actual on-screen state.
+    //
+    // The blur is scoped to the case where vv.height appears shrunk relative
+    // to the layout viewport — that's the only scenario where keyboard-related
+    // ghost focus matters. Without the scope, a quick tab-switch return while
+    // a search modal or settings input is focused would dismiss its focus
+    // for no benefit (no keyboard-related state to clear).
+    //
+    // Reset lastSetHeight so the CSS write happens even when innerHeight
+    // matches the cached value.
+    const onWake = () => {
+      const wasAtBottom = !scrolledUp.value;
+      const vvLooksShrunk = vv.height < window.innerHeight - 100;
+      const active = document.activeElement;
+      if (vvLooksShrunk && active instanceof HTMLElement && opensSoftwareKeyboard(active)) {
+        active.blur();
+      }
+      lastSetHeight = -1;
+      setHeight(currentAppHeight());
+      if (wasAtBottom) pinToBottomNow();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') onWake();
     };
     vv.addEventListener('resize', onResize);
     window.addEventListener('orientationchange', onOrientationChange);
-    setHeight(fullHeight);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pageshow', onWake);
+    setHeight(currentAppHeight());
     return () => {
       vv.removeEventListener('resize', onResize);
       window.removeEventListener('orientationchange', onOrientationChange);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pageshow', onWake);
       document.documentElement.style.removeProperty('--app-height');
     };
   }, []);

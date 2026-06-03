@@ -312,7 +312,7 @@
     {
       "name": "chat_parent_ongoing_with_active_children",
       "thread_type": "chat",
-      "description": "Chat parent shows as Ongoing while any child is not in History",
+      "description": "Chat parent shows as Active while any child is not in Archive",
       "steps": [
         {"emit": "MessageReceived", "payload": {"text": "Hello", "channel": "chat"}},
         {"emit": "ResponseGenerated", "payload": {"text": "Hi!"}},
@@ -404,7 +404,7 @@
     {
       "name": "cc_apply_then_archive_full_flow",
       "thread_type": "claude_code",
-      "description": "CC thread: full flow — idle with changes → Apply → Archive button → Dismiss → HISTORY",
+      "description": "CC thread: full flow — idle with changes → Apply → Archive button → Dismiss → ARCHIVE",
       "steps": [
         {"emit": "MessageReceived"},
         {"emit": "SessionStarted"},
@@ -417,7 +417,7 @@
     {
       "name": "cc_discard_then_archive_full_flow",
       "thread_type": "claude_code",
-      "description": "CC thread: full flow — idle with changes → Discard → Archive button → Dismiss → HISTORY",
+      "description": "CC thread: full flow — idle with changes → Discard → Archive button → Dismiss → ARCHIVE",
       "steps": [
         {"emit": "MessageReceived"},
         {"emit": "SessionStarted"},

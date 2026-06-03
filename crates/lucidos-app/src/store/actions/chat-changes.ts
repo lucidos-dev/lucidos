@@ -1,12 +1,12 @@
-import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, updateAvailable, restartGroups, applyingChangeIds, toasts, engineRestarting, engineVersion, latestEngineVersion, threadMap } from '../store';
+import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, updateAvailable, restartGroups, applyingChangeIds, toasts, engineRestarting, engineVersion, latestEngineVersion } from '../store';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
 import type { RestartGroup } from '../store';
 import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, restartEngine, ApiError } from '../../api/client';
 import { isNewerVersion } from '../../utils/version';
 import { errorDetail } from '../../utils/errorDetail';
-import { PENDING_TITLE_PLACEHOLDER } from '../thread-events';
 import { focusThread } from './threads';
+import { formatThreadLabel } from './thread-label';
 import type { Change } from '../../api/client';
 import type { ToastAction } from '../types';
 
@@ -203,22 +203,23 @@ export function restoreRestartToast(): void {
 }
 
 /** Fetch changes from backend and update all related signals.
- *  On AbortError (10s client timeout) we retry once before bothering the user:
+ *  On TimeoutError (10s client timeout) we retry once before bothering the user:
  *  the iOS PWA fires this from `runResumeSync` after every visibilitychange,
  *  and the cellular/Wi-Fi radio just-waking case can hang the first request
- *  past the timeout even when the engine is responding fast. */
+ *  past the timeout even when the engine is responding fast. A manual
+ *  AbortError (no such caller today) intentionally does NOT retry. */
 export function refreshChangesState(): void {
   apiFetchChanges({ limit: 15 })
     .catch(e => {
-      if (e instanceof DOMException && e.name === 'AbortError') {
+      if (e instanceof DOMException && e.name === 'TimeoutError') {
         return apiFetchChanges({ limit: 15 });
       }
       throw e;
     })
     .then(state => {
       const applied = state.applied || [];
-      changes.value = state.pending;
-      appliedChanges.value = applied;
+      changes.value = { status: 'loaded', data: state.pending };
+      appliedChanges.value = { status: 'loaded', data: applied };
       changesHasMore.value = state.has_more_applied;
       restartRequired.value = state.restart_required || isEngineOutdated();
       // Backend is the source of truth across page reloads — the live
@@ -232,23 +233,18 @@ export function refreshChangesState(): void {
       if (hasClientUpdateSincePageLoad(applied)) updateAvailable.value = true;
       syncRestartToast();
     })
-    .catch(e => showToast(`Failed to fetch changes: ${errorDetail(e)}`, 'error'));
+    .catch(e => {
+      changes.value = toFailed<Change[]>(e);
+      appliedChanges.value = toFailed<Change[]>(e);
+      showToast(`Failed to fetch changes: ${errorDetail(e)}`, 'error');
+    });
 }
 
 /** Apply a single pending change by ID. */
 export async function applySingleChange(id: string): Promise<void> {
   try {
     const result = await apiApply(id);
-    if (result.status === 'conflict') {
-      // Backend spawned a CC session in conflict_thread_id to resolve;
-      // applyingChangeIds gets set via the MergeConflictDetected SSE event.
-      const conflictThreadId = result.conflict_thread_id;
-      const title = conflictThreadId ? threadMap.value.get(conflictThreadId)?.meta.title : undefined;
-      const threadLabel = title && title !== PENDING_TITLE_PLACEHOLDER ? `“${title}”` : 'thread';
-      showToast(`Merge conflict in ${threadLabel} — resolving automatically.`, 'warning', {
-        onClick: conflictThreadId ? () => focusThread(conflictThreadId) : undefined,
-      });
-    } else if (result.status === 'hardening') {
+    if (result.status === 'hardening') {
       // Hardening recovery: backend spawned a hardening session that will auto-apply.
       // Track the change as "applying" so ChangesPanel shows persistent state.
       applyingChangeIds.value = new Set([...applyingChangeIds.value, id]);
@@ -271,7 +267,21 @@ export async function discardSingleChange(id: string): Promise<void> {
 /** Apply all changes. */
 export async function applyAllChanges(): Promise<void> {
   try {
-    await apiApplyAll();
+    const result = await apiApplyAll();
+    const conflictThreadId = result.conflict_thread_id;
+    if (conflictThreadId) {
+      // Backend stopped at a conflict — surface the same toast as Apply Now.
+      // The SSE-driven toast (added in the MergeConflictDetected handler)
+      // covers the case where the user is not looking at the conflict
+      // thread; this one fires immediately on the batch's terminal HTTP
+      // response so Apply All has immediate feedback.
+      const label = formatThreadLabel(conflictThreadId);
+      showToast(
+        `Applied ${result.applied ?? 0} change(s) — merge conflict in ${label}, resolving automatically.`,
+        'warning',
+        { onClick: () => focusThread(conflictThreadId) },
+      );
+    }
   } catch (e) {
     showToast(errorDetail(e) || 'Failed to apply changes', 'error');
   }
@@ -321,11 +331,15 @@ export async function ensureChangeLoaded(id: string): Promise<void> {
   }
 }
 
-/** Load the next page of applied changes (infinite scroll). */
+/** Load the next page of applied changes (infinite scroll). Pagination
+ *  needs the last row's `resolved_at` as the cursor — only the `loaded`
+ *  state has it. */
 export async function loadMoreChanges(): Promise<void> {
   if (changesLoadingMore.value || !changesHasMore.value) return;
 
-  const current = appliedChanges.value;
+  const loadable = appliedChanges.value;
+  if (loadable.status !== 'loaded') return;
+  const current = loadable.data;
   if (current.length === 0) return;
 
   const lastItem = current[current.length - 1];
@@ -336,7 +350,7 @@ export async function loadMoreChanges(): Promise<void> {
   changesLoadingMore.value = true;
   try {
     const data = await apiFetchChanges({ limit: 15, before: beforeTs });
-    appliedChanges.value = [...current, ...(data.applied || [])];
+    appliedChanges.value = { status: 'loaded', data: [...current, ...(data.applied || [])] };
     changesHasMore.value = data.has_more_applied;
   } catch (e) {
     showToast(`Failed to load more changes: ${errorDetail(e)}`, 'error');

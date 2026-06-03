@@ -62,6 +62,7 @@ impl LlmProvider for MockProvider {
             cache_creation_tokens: None,
             cache_read_tokens: None,
             thinking_chars: None,
+            unknown_sse_dropped: 0,
         })
     }
 

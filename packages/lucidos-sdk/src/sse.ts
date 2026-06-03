@@ -1,4 +1,4 @@
-import { getBaseUrl } from './_fetch';
+import { apiUrl } from './_fetch';
 
 export interface SseThreadEvent {
   type: 'ThreadEvent';
@@ -61,7 +61,7 @@ export const sse = {
   connect(): void {
     if (eventSource) return;
 
-    eventSource = new EventSource(`${getBaseUrl()}/api/events`);
+    eventSource = new EventSource(apiUrl('/events'));
 
     eventSource.onmessage = (event) => {
       try {

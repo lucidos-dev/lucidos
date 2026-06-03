@@ -1,12 +1,12 @@
 use crate::support::{
-    base_url, db_url, http_client, poll_thread_summary_by_marker, poll_threads_until_history,
+    base_url, db_url, http_client, poll_thread_summary_by_marker, poll_threads_until_archive,
     unique_marker,
 };
 
 #[tokio::test]
 async fn threads_list_returns_expected_shape() {
     let client = http_client();
-    let url = format!("{}/api/threads", base_url());
+    let url = format!("{}/api/v1/threads", base_url());
 
     let resp = client
         .get(&url)
@@ -19,7 +19,7 @@ async fn threads_list_returns_expected_shape() {
 
     // Must have expected top-level fields
     assert!(body["saved"].is_array(), "saved should be array");
-    assert!(body["history"].is_array(), "history should be array");
+    assert!(body["archive"].is_array(), "archive should be array");
     assert!(body["active"].is_array(), "active should be array");
     assert!(
         body["active_threads"].is_array(),
@@ -33,7 +33,7 @@ async fn thread_appears_after_sending_message() {
     let marker = unique_marker("api-threads-list");
 
     // Send a message to create a thread
-    let chat_url = format!("{}/api/chat/stream", base_url());
+    let chat_url = format!("{}/api/v1/chat/stream", base_url());
     let chat_body = serde_json::json!({
         "message": format!("Say exactly: \"listed {marker}\""),
         "mode": "human",
@@ -45,13 +45,13 @@ async fn thread_appears_after_sending_message() {
         .await
         .expect("Chat request failed");
 
-    // Poll until the thread appears in history (requires has_response = TRUE,
+    // Poll until the thread appears in archive (requires has_response = TRUE,
     // i.e., the LLM has finished generating a response)
-    let body = poll_threads_until_history(&client, 30).await;
-    let history = body["history"].as_array().unwrap();
+    let body = poll_threads_until_archive(&client, 30).await;
+    let archive = body["archive"].as_array().unwrap();
 
     // Verify thread has expected fields
-    let thread = &history[0];
+    let thread = &archive[0];
     assert!(
         thread["thread_id"].is_string(),
         "thread_id should be string"
@@ -72,7 +72,7 @@ async fn thread_messages_endpoint_returns_events() {
     let marker = unique_marker("api-thread-msgs");
 
     // Create a thread
-    let chat_url = format!("{}/api/chat/stream", base_url());
+    let chat_url = format!("{}/api/v1/chat/stream", base_url());
     let chat_body = serde_json::json!({
         "message": format!("Say exactly: \"messages {marker}\""),
         "mode": "human",
@@ -84,7 +84,7 @@ async fn thread_messages_endpoint_returns_events() {
         .await
         .expect("Chat request failed");
 
-    // Find OUR thread by marker — history[0] races with parallel tests that
+    // Find OUR thread by marker — archive[0] races with parallel tests that
     // also create threads, and may resolve to a CC thread without any
     // SessionMessage-producing events.
     let thread_id = poll_thread_summary_by_marker(&pool, &marker, 30)
@@ -93,9 +93,9 @@ async fn thread_messages_endpoint_returns_events() {
         .to_string();
 
     // Poll messages until at least one appears — there can be a small window
-    // between the thread appearing in history (thread_summaries projection) and
+    // between the thread appearing in archive (thread_summaries projection) and
     // the events being queryable via the messages endpoint.
-    let messages_url = format!("{}/api/threads/{}/messages", base_url(), thread_id);
+    let messages_url = format!("{}/api/v1/threads/{}/messages", base_url(), thread_id);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let resp = client
@@ -122,7 +122,7 @@ async fn thread_messages_endpoint_returns_events() {
 #[tokio::test]
 async fn disk_usage_worktrees_returns_inventory_shape() {
     let client = http_client();
-    let url = format!("{}/api/disk-usage/worktrees", base_url());
+    let url = format!("{}/api/v1/disk-usage/worktrees", base_url());
 
     let resp = client
         .get(&url)
@@ -153,7 +153,7 @@ async fn thread_save_and_unsave() {
     let marker = unique_marker("api-save");
 
     // Create a thread
-    let chat_url = format!("{}/api/chat/stream", base_url());
+    let chat_url = format!("{}/api/v1/chat/stream", base_url());
     let chat_body = serde_json::json!({
         "message": format!("Say exactly: \"save-api {marker}\""),
         "mode": "human",
@@ -165,14 +165,14 @@ async fn thread_save_and_unsave() {
         .await
         .expect("Chat request failed");
 
-    // Poll until the thread appears in history
-    let threads = poll_threads_until_history(&client, 30).await;
-    let thread_id = threads["history"].as_array().unwrap()[0]["thread_id"]
+    // Poll until the thread appears in archive
+    let threads = poll_threads_until_archive(&client, 30).await;
+    let thread_id = threads["archive"].as_array().unwrap()[0]["thread_id"]
         .as_str()
         .unwrap();
 
     // Save the thread
-    let save_url = format!("{}/api/threads/save", base_url());
+    let save_url = format!("{}/api/v1/threads/save", base_url());
     let save_body = serde_json::json!({ "thread_id": thread_id });
     let save_resp = client
         .post(&save_url)
@@ -183,7 +183,7 @@ async fn thread_save_and_unsave() {
     assert_eq!(save_resp.status(), 200);
 
     // Verify it appears in saved
-    let threads_url = format!("{}/api/threads", base_url());
+    let threads_url = format!("{}/api/v1/threads", base_url());
     let threads2: serde_json::Value = client
         .get(&threads_url)
         .send()
@@ -201,7 +201,7 @@ async fn thread_save_and_unsave() {
     );
 
     // Unsave the thread
-    let unsave_url = format!("{}/api/threads/unsave", base_url());
+    let unsave_url = format!("{}/api/v1/threads/unsave", base_url());
     let unsave_body = serde_json::json!({ "thread_id": thread_id });
     let unsave_resp = client
         .post(&unsave_url)

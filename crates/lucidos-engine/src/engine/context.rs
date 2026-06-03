@@ -5,12 +5,53 @@ use crate::llm::{ContentBlock, Message, MessageContent};
 use crate::memory::{EmbeddingProvider, MemoryEntry, QueryClassification};
 use uuid::Uuid;
 
-/// Max character budget for messages sent to the LLM.
-/// ~143K tokens at 3.5 chars/token, leaves room for system prompt + tools + response.
-/// Character budget for the entire LLM request (system prompt + tools + messages).
-/// JSON-heavy tool calls average ~1.5 chars/token (not ~3.5 like prose), so this
-/// must be conservative. 300k chars ≈ 150–200k tokens depending on content mix.
-pub(super) const AGENT_CONTEXT_CHAR_BUDGET: usize = 300_000;
+/// Tokens reserved out of the model's context window when sizing the input
+/// char budget — a heuristic margin so a long reply doesn't push the request
+/// total past the window. The engine never enforces this on the output side
+/// (the model is free to keep generating); the reserve just shrinks how
+/// much input we'll pack in. 8k covers a long assistant turn plus tool
+/// calls; smaller reserves stop being safe past ~32k responses, which we
+/// don't ship today.
+pub(super) const RESPONSE_TOKEN_RESERVE: usize = 8_000;
+
+/// Per-request char budget for `(system_prompt + tools + messages)`, derived
+/// from the model's actual context window. JSON-heavy tool calls average
+/// ~1.5 chars/token (prose is ~3.5); the 3/2 multiplier picks the
+/// conservative end so the char total never under-counts the token total.
+/// The 1M-token Opus build (`[1m]`) gets ~1.49M chars; the default 200k
+/// Claude gets ~288k chars (close to the previous hardcoded 300k); GPT-5 at
+/// 400k gets ~588k chars. Callers subtract their own prompt overhead
+/// (system prompt + tool definitions) before handing the remainder to
+/// `trim_context_if_needed`.
+///
+/// Why this exists: the old `AGENT_CONTEXT_CHAR_BUDGET = 300_000` constant
+/// was calibrated for the 200k-token default Claude and ignored the 1M
+/// window on the Opus `[1m]` build entirely, so trim pass 2 would silently
+/// drop the original user message in long tool loops even though the model
+/// could easily have held the whole thread. Per-model derivation lets us
+/// actually use the headroom we paid for.
+pub(super) fn agent_context_char_budget(model: &str) -> usize {
+    let usable_tokens = context_window_for(model).saturating_sub(RESPONSE_TOKEN_RESERVE);
+    // 3/2 = 1.5 chars/token (integer math).
+    usable_tokens.saturating_mul(3) / 2
+}
+
+/// Inverse of the budget's chars/token assumption: turn a measured char
+/// count into a conservative token estimate. Uses the same 1.5 chars/token
+/// ratio as [`agent_context_char_budget`] so the displayed
+/// `ContextCaptured.estimated_total_tokens` (and the `Context: N tokens`
+/// thought-stream line) stays honest against the trim budget.
+///
+/// History: was previously `chars / 4` (the prose ratio), which silently
+/// undercounted JSON-heavy tool-result content by ~2.4×. A May 25
+/// `workspace-learning` trigger reported "Context: 649 K tokens" to the
+/// UI then sent 1.54 M tokens to the API — past the 1 M-cap Opus
+/// window — and the request 400'd. Matching the budget's ratio means an
+/// estimate near the window is a real warning, not an optimistic one.
+pub(crate) fn estimate_tokens_from_chars(chars: usize) -> usize {
+    // Inverse of `chars = tokens * 3 / 2` → `tokens = chars * 2 / 3`.
+    chars.saturating_mul(2) / 3
+}
 
 /// Number of tail messages to always preserve (2 assistant+user pairs).
 pub(super) const PRESERVE_RECENT_MESSAGES: usize = 4;
@@ -37,6 +78,16 @@ pub(super) const READ_FILE_MAX_BYTES: usize = 50_000;
 
 /// Minimum content size before considering truncation of a single value.
 pub(super) const TRUNCATION_THRESHOLD: usize = 500;
+
+/// Threshold for Pass 1.5 — truncates `ToolResult` blocks in the PRESERVED
+/// tail (the last [`PRESERVE_RECENT_MESSAGES`]) when Pass 1 alone can't get
+/// under budget. Higher than [`TRUNCATION_THRESHOLD`] because tail
+/// preservation exists so the LLM can see what just happened — only the
+/// outlier "tool result that dumped 100 KB of events" gets cut, normal
+/// small results survive verbatim. The truncated note still reaches the
+/// LLM ("[content truncated — was N chars]") so it knows to re-query if
+/// the data actually mattered.
+pub(super) const TAIL_TRUNCATION_THRESHOLD: usize = 20_000;
 
 /// Sanitize file content before returning it to the LLM:
 /// 1. Strip base64 data URIs (e.g. embedded images) — they burn tokens and the LLM can't use them.
@@ -116,9 +167,9 @@ pub(super) fn estimate_message_chars(message: &Message) -> usize {
                 .iter()
                 .map(|b| match b {
                     ContentBlock::Text { text } => text.len(),
-                    ContentBlock::ToolUse { id, name, input } => {
-                        id.len() + name.len() + input.to_string().len()
-                    }
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => id.len() + name.len() + input.to_string().len(),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         content,
@@ -152,32 +203,56 @@ pub fn context_window_for(model: &str) -> usize {
     200_000
 }
 
+/// Replace every `ContentBlock::Image` in `blocks` with a text placeholder
+/// produced by `placeholder()`. Returns total base64 bytes removed (used for
+/// logging by callers).
+pub(super) fn replace_image_blocks(
+    blocks: &mut [ContentBlock],
+    placeholder: impl Fn() -> String,
+) -> usize {
+    let mut stripped = 0usize;
+    for block in blocks.iter_mut() {
+        if let ContentBlock::Image { data, .. } = block {
+            stripped += data.len();
+            *block = ContentBlock::Text {
+                text: placeholder(),
+            };
+        }
+    }
+    stripped
+}
+
 /// Trim the agent loop message history to fit within a character budget.
 ///
-/// Two-pass approach:
-/// 1. Truncate large tool results/inputs in old messages (preserving recent ones).
+/// Three passes:
+/// 0. Strip image bytes from every message except the last (see inline note).
+/// 1. Truncate large tool results/inputs in old messages.
 /// 2. If still over budget, remove oldest message pairs from index 1 onward.
 ///
-/// Message[0] (the initial user message) and the last PRESERVE_RECENT_MESSAGES
-/// messages are never removed or truncated.
+/// `messages[0]` and the last `PRESERVE_RECENT_MESSAGES` messages are never
+/// removed or truncated in pass 2. If `protected_idx` is `Some(i)`, the message
+/// at that index is also pinned: pass 2 stops before removing it, even if that
+/// leaves the loop over budget. Callers use this to pin the current turn's
+/// user message — once tool iterations push it out of the last
+/// `PRESERVE_RECENT_MESSAGES` slots, the recent-tail rule alone no longer
+/// covers it and pass 2 would otherwise drop the original request (and any
+/// post-iter-1 image-description placeholder) from the prompt.
 ///
 /// Returns the number of messages removed in pass 2.
-pub(super) fn trim_context_if_needed(messages: &mut Vec<Message>, budget: usize) -> usize {
-    // Pass 0: strip base64 image data from all messages except message[0].
-    // Message[0] is the current user message — the agentic loop strips its images
-    // after iteration 1. But older messages with images (e.g. screenshots from
-    // previous turns) burn tokens without value since the LLM already processed them.
+pub(super) fn trim_context_if_needed(
+    messages: &mut Vec<Message>,
+    budget: usize,
+    protected_idx: Option<usize>,
+) -> usize {
+    // The current user message is the LAST entry — `chat::process` builds
+    // `messages = resume_tool_blocks; messages.push(current_user_message)`.
+    // Earlier messages' images were already seen by the LLM on prior turns.
     let mut image_bytes_stripped = 0usize;
-    for msg in messages.iter_mut().skip(1) {
+    let preserve = messages.len().saturating_sub(1);
+    for msg in messages.iter_mut().take(preserve) {
         if let MessageContent::Blocks(blocks) = &mut msg.content {
-            for block in blocks.iter_mut() {
-                if let ContentBlock::Image { data, .. } = block {
-                    image_bytes_stripped += data.len();
-                    *block = ContentBlock::Text {
-                        text: "[image from earlier in conversation]".to_string(),
-                    };
-                }
-            }
+            image_bytes_stripped +=
+                replace_image_blocks(blocks, || "[image from earlier in conversation]".to_string());
         }
     }
     if image_bytes_stripped > 0 {
@@ -213,11 +288,7 @@ pub(super) fn trim_context_if_needed(messages: &mut Vec<Message>, budget: usize)
                             *content = format!("[content truncated — was {} chars]", orig_len);
                         }
                     }
-                    ContentBlock::ToolUse {
-                        id: _,
-                        name: _,
-                        input,
-                    } => {
+                    ContentBlock::ToolUse { input, .. } => {
                         truncate_large_json_strings(input);
                     }
                     _ => {}
@@ -229,10 +300,46 @@ pub(super) fn trim_context_if_needed(messages: &mut Vec<Message>, budget: usize)
     let total_after_pass1: usize = messages.iter().map(estimate_message_chars).sum();
     if total_after_pass1 <= budget {
         log!("[Context] Context trimming: pass 1 reduced ~{}k -> ~{}k tokens ({} -> {} chars, {} msgs, budget ~{}k tokens)",
-            total / 3500, total_after_pass1 / 3500,
-            total, total_after_pass1, messages.len(), budget / 3500
+            estimate_tokens_from_chars(total) / 1000, estimate_tokens_from_chars(total_after_pass1) / 1000,
+            total, total_after_pass1, messages.len(), estimate_tokens_from_chars(budget) / 1000
         );
         return 0;
+    }
+
+    // Pass 1.5: if still over budget, truncate large ToolResult blocks in the
+    // preserved tail (except the very last message). Tail preservation exists
+    // so the LLM can see what just happened — but a tail full of huge
+    // `query_events` dumps will blow the budget no matter how aggressively
+    // pass 2 removes old pairs. The cut still leaves the "[content truncated
+    // — was N chars]" note so the LLM can re-query if the data mattered.
+    let mut total_after_truncation = total_after_pass1;
+    if len > PRESERVE_RECENT_MESSAGES + 1 {
+        let tail_start = len - PRESERVE_RECENT_MESSAGES;
+        let tail_end = len - 1; // skip the very last message
+        for message in &mut messages[tail_start..tail_end] {
+            if let MessageContent::Blocks(blocks) = &mut message.content {
+                for block in blocks.iter_mut() {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id: _,
+                        content,
+                    } = block
+                    {
+                        if content.len() > TAIL_TRUNCATION_THRESHOLD {
+                            let orig_len = content.len();
+                            *content = format!("[content truncated — was {} chars]", orig_len);
+                        }
+                    }
+                }
+            }
+        }
+        total_after_truncation = messages.iter().map(estimate_message_chars).sum();
+        if total_after_truncation <= budget {
+            log!("[Context] Context trimming: pass 1.5 (tail trim) reduced ~{}k -> ~{}k tokens ({} -> {} chars, budget ~{}k tokens)",
+                estimate_tokens_from_chars(total_after_pass1) / 1000, estimate_tokens_from_chars(total_after_truncation) / 1000,
+                total_after_pass1, total_after_truncation, estimate_tokens_from_chars(budget) / 1000
+            );
+            return 0;
+        }
     }
 
     // Pass 2: remove oldest messages (from index 1) until under budget.
@@ -240,10 +347,23 @@ pub(super) fn trim_context_if_needed(messages: &mut Vec<Message>, budget: usize)
     // also remove the following user message (which contains matching ToolResult
     // blocks). Never remove one without the other — orphaned ToolResult blocks
     // cause API validation errors.
+    //
+    // `current_total` starts from the post-truncation count (after both Pass 1
+    // and Pass 1.5) — using the pre-1.5 number would over-credit the budget
+    // and cause Pass 2 to evict more old pairs than necessary.
     let mut removed = 0;
-    let mut current_total = total_after_pass1;
+    let mut current_total = total_after_truncation;
+    // Track the protected message's position as removals shift it down. Once
+    // it reaches index 1 (or its tool_result pair-mate would be removed),
+    // stop — losing the pinned request is worse than going over budget.
+    let mut protected = protected_idx;
     while current_total > budget && messages.len() > PRESERVE_RECENT_MESSAGES + 1 {
         if messages.len() <= 1 {
+            break;
+        }
+
+        // Protected message currently at the only removable slot — stop.
+        if protected == Some(1) {
             break;
         }
 
@@ -254,10 +374,18 @@ pub(super) fn trim_context_if_needed(messages: &mut Vec<Message>, budget: usize)
             _ => false,
         };
 
+        // Pair removal would also drop messages[2]; if that's the protected
+        // message we'd corrupt it (lose the request line) rather than orphan
+        // a tool_use. Stop instead.
+        if has_tool_use && protected == Some(2) {
+            break;
+        }
+
         // Remove the message at index 1
         current_total -= estimate_message_chars(&messages[1]);
         messages.remove(1);
         removed += 1;
+        protected = protected.map(|p| p.saturating_sub(1));
 
         // If it had tool_use blocks, the next message (now at index 1) must contain
         // the matching tool_result blocks — remove it too to keep the pair intact.
@@ -265,149 +393,24 @@ pub(super) fn trim_context_if_needed(messages: &mut Vec<Message>, budget: usize)
             current_total -= estimate_message_chars(&messages[1]);
             messages.remove(1);
             removed += 1;
+            protected = protected.map(|p| p.saturating_sub(1));
         }
     }
 
     log!("[Context] Context trimming: ~{}k -> ~{}k tokens ({} -> {} chars), removed {} messages, {} remaining (budget ~{}k tokens)",
-        total / 3500, current_total / 3500,
-        total, current_total, removed, messages.len(), budget / 3500
+        estimate_tokens_from_chars(total) / 1000, estimate_tokens_from_chars(current_total) / 1000,
+        total, current_total, removed, messages.len(), estimate_tokens_from_chars(budget) / 1000
     );
     if current_total > budget {
         log!(
             "[Context] Warning: context still over budget after trimming (~{}k tokens, {} chars > {} budget)",
-            current_total / 3500,
+            estimate_tokens_from_chars(current_total) / 1000,
             current_total,
             budget
         );
     }
 
     removed
-}
-
-/// Validate that every assistant tool_use block has a matching tool_result in
-/// the immediately following user message. If any are missing, inject stub
-/// `tool_result` blocks so Anthropic doesn't 400 with "tool_use ids were
-/// found without tool_result blocks immediately after". Promotes the next
-/// user message from `Text` to `Blocks` first so the stubs land — Text
-/// content can't carry tool_results.
-///
-/// Returns the number of stub results injected (0 = valid). Called by the
-/// agentic loop each iteration AND by the LLM provider layer (defense in
-/// depth — covers callers that bypass the loop).
-pub(crate) fn validate_tool_use_pairing(messages: &mut Vec<Message>) -> usize {
-    let mut stubs_injected = 0;
-    let mut i = 0;
-    while i < messages.len() {
-        // Find assistant messages with tool_use blocks
-        let tool_use_ids: Vec<String> = match &messages[i].content {
-            MessageContent::Blocks(blocks) if messages[i].role == "assistant" => blocks
-                .iter()
-                .filter_map(|b| {
-                    if let ContentBlock::ToolUse { id, .. } = b {
-                        Some(id.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
-
-        if tool_use_ids.is_empty() {
-            i += 1;
-            continue;
-        }
-
-        // Check that the next message is a user message with matching tool_results
-        if i + 1 < messages.len() && messages[i + 1].role == "user" {
-            let existing_ids: std::collections::HashSet<String> = match &messages[i + 1].content {
-                MessageContent::Blocks(blocks) => blocks
-                    .iter()
-                    .filter_map(|b| {
-                        if let ContentBlock::ToolResult { tool_use_id, .. } = b {
-                            Some(tool_use_id.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
-                // Text content carries no tool_results — every tool_use_id is
-                // missing. Falls through to the injection path below, which
-                // promotes the Text content to Blocks so the stubs land.
-                _ => std::collections::HashSet::new(),
-            };
-
-            let missing: Vec<&String> = tool_use_ids
-                .iter()
-                .filter(|id| !existing_ids.contains(*id))
-                .collect();
-
-            if !missing.is_empty() {
-                log!(
-                    "[Context] WARNING: {} tool_use IDs missing tool_result in messages[{}]: {:?}",
-                    missing.len(),
-                    i + 1,
-                    missing
-                );
-
-                // Promote Text -> Blocks before injecting stubs: ToolResult
-                // blocks can only live inside `Blocks` content. Without this,
-                // an orphan tool_use followed by the user's plain-text prompt
-                // (the thread-b101c3d7 shape) silently sailed through to
-                // Anthropic and produced a 400.
-                if let MessageContent::Text(text) = &mut messages[i + 1].content {
-                    let promoted = if text.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![ContentBlock::Text {
-                            text: std::mem::take(text),
-                        }]
-                    };
-                    messages[i + 1].content = MessageContent::Blocks(promoted);
-                }
-
-                if let MessageContent::Blocks(blocks) = &mut messages[i + 1].content {
-                    for id in &missing {
-                        blocks.insert(
-                            0,
-                            ContentBlock::ToolResult {
-                                tool_use_id: (*id).clone(),
-                                content: crate::core::store::ORPHAN_TOOL_RESULT_STUB.to_string(),
-                            },
-                        );
-                        stubs_injected += 1;
-                    }
-                }
-            }
-        } else {
-            // No following user message at all — the assistant message with tool_use
-            // is the last message. This shouldn't happen but inject a user message.
-            log!("[Context] WARNING: assistant message at index {} has tool_use blocks but no following user message", i);
-            let result_blocks: Vec<ContentBlock> = tool_use_ids
-                .iter()
-                .map(|id| {
-                    stubs_injected += 1;
-                    ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: crate::core::store::ORPHAN_TOOL_RESULT_STUB.to_string(),
-                    }
-                })
-                .collect();
-            messages.insert(
-                i + 1,
-                Message {
-                    role: "user".to_string(),
-                    content: MessageContent::Blocks(result_blocks),
-                },
-            );
-        }
-
-        i += 2; // Skip the pair
-    }
-    stubs_injected
 }
 
 /// Recursively truncate large string values in a JSON Value.
@@ -463,12 +466,48 @@ pub(super) fn truncate_head_tail(content: &str, max_chars: usize) -> String {
 /// Format a single conversation history message with tiered truncation.
 /// Only assistant messages outside the verbatim tail get compacted.
 /// Everything else uses the safety-net limit (HISTORY_MSG_TRUNCATE).
-pub(super) fn format_history_content(content: &str, role: &str, is_verbatim: bool) -> String {
+///
+/// Before truncation, any verbatim occurrence of a loaded knowhow body is
+/// replaced with a one-line pointer back to the `[LOADED KNOWHOW]` section
+/// in this turn's prompt — the body lives there now and the LLM doesn't
+/// need to see it again inside `[CONVERSATION HISTORY]`. Match is by exact
+/// body substring (the loaded body is the same `[SYSTEM-KNOWHOW: <name>]`
+/// block produced by `core::knowhow::load_one_knowhow_section`); organic
+/// discussion of the marker that doesn't reproduce a real body survives
+/// unchanged.
+pub(super) fn format_history_content(
+    content: &str,
+    role: &str,
+    is_verbatim: bool,
+    loaded_knowhow_bodies: &[&str],
+) -> String {
+    let stripped = strip_loaded_knowhow_bodies(content, loaded_knowhow_bodies);
     if !is_verbatim && role == "assistant" {
-        truncate_head_tail(content, HISTORY_ASSISTANT_COMPACT)
+        truncate_head_tail(&stripped, HISTORY_ASSISTANT_COMPACT)
     } else {
-        truncate_head_tail(content, HISTORY_MSG_TRUNCATE)
+        truncate_head_tail(&stripped, HISTORY_MSG_TRUNCATE)
     }
+}
+
+const LOADED_KNOWHOW_POINTER: &str = "(body in [LOADED KNOWHOW] section above)";
+
+/// Replace each verbatim occurrence of a loaded knowhow body with a one-line
+/// pointer to the `[LOADED KNOWHOW]` section. Bodies are matched as exact
+/// substrings — the loaded body is the formatted block returned by
+/// `load_one_knowhow_section`, which is what the LLM saw on the original
+/// `load_knowhow` tool result. Bodies for unloaded docs (or stray markers
+/// the LLM typed in discussion) pass through unchanged.
+fn strip_loaded_knowhow_bodies(content: &str, loaded_bodies: &[&str]) -> String {
+    if loaded_bodies.is_empty() {
+        return content.to_string();
+    }
+    let mut out = content.to_string();
+    for body in loaded_bodies {
+        if !body.is_empty() && out.contains(body) {
+            out = out.replace(body, LOADED_KNOWHOW_POINTER);
+        }
+    }
+    out
 }
 
 /// Bounds runaway tool-loop turns; ~6 typical tool calls fit in well under this.
@@ -754,10 +793,6 @@ impl LucidosEngine {
 mod context_trim_tests;
 
 #[cfg(test)]
-#[path = "context_tests/validate.rs"]
-mod validate_tool_use_pairing_tests;
-
-#[cfg(test)]
 #[path = "context_tests/memory.rs"]
 mod memory_retrieval_tests;
 
@@ -771,7 +806,7 @@ mod sanitize_file_content_tests;
 
 #[cfg(test)]
 mod context_window_tests {
-    use super::context_window_for;
+    use super::{agent_context_char_budget, context_window_for};
 
     #[test]
     fn context_window_for_known_models() {
@@ -780,5 +815,41 @@ mod context_window_tests {
         assert_eq!(context_window_for("claude-sonnet-4-6"), 200_000);
         assert_eq!(context_window_for("gpt-5"), 400_000);
         assert_eq!(context_window_for("unknown-model"), 200_000);
+    }
+
+    /// The budget for the 1M-token Opus build must be substantially larger
+    /// than the budget for the 200k default — that's the entire point of
+    /// per-model derivation. The hardcoded 300k constant we replaced was
+    /// capping Opus at ~5× too small, so the new value must be at least
+    /// 4× the old default to be a real fix.
+    #[test]
+    fn opus_1m_budget_is_much_larger_than_default_claude() {
+        let opus_1m = agent_context_char_budget("claude-opus-4-7[1m]");
+        let default_claude = agent_context_char_budget("claude-opus-4-7");
+        assert!(
+            opus_1m >= default_claude * 4,
+            "1M Opus budget ({}) must be ≥ 4× default Claude budget ({})",
+            opus_1m,
+            default_claude
+        );
+        // And large enough to hold the 552 KB iPhone screenshot from the
+        // regression thread without trim pass 2 evicting anything.
+        assert!(opus_1m > 1_000_000, "Opus 1M budget too small: {}", opus_1m);
+    }
+
+    /// Pin the exact formula output for the default 200k Claude. The fuzzy
+    /// "close to 300k" range invited silent drift; the exact value
+    /// `(200_000 - 8_000) * 3 / 2 = 288_000` documents the math and trips
+    /// loudly if the multiplier or `RESPONSE_TOKEN_RESERVE` change without
+    /// a deliberate update here.
+    #[test]
+    fn default_claude_budget_matches_formula() {
+        assert_eq!(agent_context_char_budget("claude-opus-4-7"), 288_000);
+    }
+
+    /// And the same pin for the 1M Opus build — the regression scenario.
+    #[test]
+    fn opus_1m_budget_matches_formula() {
+        assert_eq!(agent_context_char_budget("claude-opus-4-7[1m]"), 1_488_000);
     }
 }

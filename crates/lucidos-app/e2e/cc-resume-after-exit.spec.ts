@@ -70,9 +70,12 @@ test.describe('CC resume after process exit', () => {
 
     await waitForCCToFinish(page, 120_000);
 
-    // Verify the follow-up message produced an actual response (not empty)
-    const responseCount = await countVisibleResponses(page);
-    expect(responseCount).toBeGreaterThanOrEqual(2);
+    // Verify the follow-up message produced an actual response (not empty).
+    // Poll: CC response text can still be rendering right after
+    // waitForCCToFinish (which gates on the status label, not content).
+    await expect
+      .poll(() => countVisibleResponses(page), { timeout: 30_000 })
+      .toBeGreaterThanOrEqual(2);
 
     // Verify the second response contains our marker
     const found = await page.evaluate((marker) => {

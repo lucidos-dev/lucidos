@@ -24,7 +24,7 @@ impl StopQuery {
     }
 }
 
-/// `POST /api/claude-code/stop` — stop a running CC session.
+/// `POST /api/v1/claude-code/stop` — stop a running Claude Code session.
 ///
 /// Three modes via query params:
 ///   - default: real Cancel/Stop click — emits `ResponseCanceled(UserStop)` if
@@ -32,7 +32,7 @@ impl StopQuery {
 ///   - `apply=true`: Apply Now — change auto-applies after CC terminates.
 ///   - `discard=true`: Discard — change is dropped.
 ///
-/// Archiving uses a different code path (`POST /api/threads/archive` →
+/// Archiving uses a different code path (`POST /api/v1/threads/archive` →
 /// `stop_agent(StopReason::Archive, ...)`) because it also emits `ThreadArchived`.
 pub(super) async fn claude_code_stop(
     State(state): State<AppState>,
@@ -109,6 +109,7 @@ pub(super) struct ControlRequestBody {
 
 pub(super) async fn claude_code_control(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<ControlRequestBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let thread_id = uuid::Uuid::parse_str(&body.thread_id).map_err(|_| {
@@ -117,9 +118,10 @@ pub(super) async fn claude_code_control(
             Json(serde_json::json!({ "error": "Invalid thread_id" })),
         )
     })?;
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     state
         .engine
-        .send_agent_control_request(thread_id, body.request)
+        .send_agent_control_request(thread_id, body.request, actor)
         .await
         .map(|_| Json(serde_json::json!({ "ok": true })))
         .map_err(|e| {
@@ -183,7 +185,7 @@ pub(super) struct ThreadIdBody {
     thread_id: String,
 }
 
-/// POST /api/claude-code/discard — discard CC changes without ending session
+/// POST /api/v1/claude-code/discard — discard CC changes without ending session
 pub(super) async fn claude_code_discard(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -216,42 +218,3 @@ pub(super) async fn claude_code_interrupt(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct AnswerQuestionBody {
-    thread_id: String,
-    tool_use_id: String,
-    answer: crate::engine::thread_events::AnswerKind,
-}
-
-/// POST /api/claude-code/answer-question — answer a pending CC AskUserQuestion.
-/// Emits `UserQuestionAnswered` and respawns CC with `--resume` and a matching
-/// `tool_result`. Returns 409 when the question is missing or already answered.
-pub(super) async fn claude_code_answer_question(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<AnswerQuestionBody>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let thread_id = uuid::Uuid::parse_str(&body.thread_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Invalid thread_id" })),
-        )
-    })?;
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    use crate::engine::agent_question::{answer_pending_question, AnswerResult};
-    match answer_pending_question(
-        &state.engine,
-        thread_id,
-        body.tool_use_id,
-        body.answer,
-        actor,
-    )
-    .await
-    {
-        AnswerResult::Resumed => Ok(Json(serde_json::json!({ "ok": true }))),
-        AnswerResult::Conflict(msg) => Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": msg })),
-        )),
-    }
-}

@@ -45,10 +45,10 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('lucidos');
   });
 
-  it('API-originated MessageReceived (human mode): chip is "You", summary "API message"', () => {
-    // The chip is mode-driven: a human typed `curl` from a script, so the
-    // initiator is still "You". The "API message" summary surfaces the
-    // origin; the popover carries the user-agent detail.
+  it('API-originated MessageReceived (human mode): chip is "API caller", summary "API message"', () => {
+    // "You" is reserved for `kind: device`. An anonymous HTTP caller never
+    // impersonates the user in the timeline — the chip renders "API caller"
+    // and the popover discloses the user-agent for forensics.
     const ex = exchangeWith({
       type: 'MessageReceived',
       text: 'curl request',
@@ -57,7 +57,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
       origin: { kind: 'api', user_agent: 'curl/8.7.1' },
     });
     const desc = describeInitiator(ex, '<p>curl request</p>', [], 'tid');
-    expect(desc.label).toBe('You');
+    expect(desc.label).toBe('API caller');
     expect(desc.summary).toBe('API message');
     expect(desc.variant).toBe('system');
   });
@@ -108,7 +108,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 
   it('ResponseAborted (device actor = restart pre-emit): chip is "You", summary "Restarted"', () => {
-    // /api/restart → abort_in_flight_for_restart pre-emits with the device
+    // /api/v1/restart → abort_in_flight_for_restart pre-emits with the device
     // actor that hit Restart. The chip + summary should read together as
     // "You — Restarted", not the generic "Response interrupted".
     const ex = exchangeWith({

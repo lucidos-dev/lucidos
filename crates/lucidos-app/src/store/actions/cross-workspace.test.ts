@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   fetchWorkspaces: vi.fn(),
@@ -6,18 +6,23 @@ const mocks = vi.hoisted(() => ({
   showToast: vi.fn(),
   isTauri: vi.fn(() => false),
   windowOpen: vi.fn(),
+  focusThreadOrBootstrap: vi.fn(),
 }));
 
 vi.mock('../../api/client', () => ({ fetchWorkspaces: mocks.fetchWorkspaces }));
 vi.mock('./artifacts', () => ({ openUrl: mocks.openUrl }));
 vi.mock('../../utils/platform', () => ({ isTauri: mocks.isTauri }));
+// Stub the heavy threads module — we only need the routing spy, not its chain.
+vi.mock('./threads', () => ({ focusThreadOrBootstrap: mocks.focusThreadOrBootstrap }));
 
 vi.mock('../store', async () => {
   const actual = await vi.importActual<typeof import('../store')>('../store');
   return { ...actual, showToast: mocks.showToast };
 });
 
-const { openThreadInWorkspace } = await import('./cross-workspace');
+const { openThreadInWorkspace, openThreadAcrossWorkspaces, ensureCrossWorkspaceThreadTitle, crossWorkspaceThreadTitle } =
+  await import('./cross-workspace');
+const { workspaceName } = await import('../store');
 
 const TID = '1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff';
 
@@ -106,5 +111,64 @@ describe('openThreadInWorkspace', () => {
       expect.stringContaining('Failed to open thread'),
       'error',
     );
+  });
+});
+
+describe('openThreadAcrossWorkspaces', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workspaceName.value = 'dev';
+  });
+  afterEach(() => {
+    workspaceName.value = '';
+  });
+
+  it('focuses in place for a same-workspace link', () => {
+    openThreadAcrossWorkspaces('dev', TID);
+    expect(mocks.focusThreadOrBootstrap).toHaveBeenCalledWith(TID);
+    expect(mocks.fetchWorkspaces).not.toHaveBeenCalled();
+  });
+
+  it('focuses in place for an untagged link (no workspace tag)', () => {
+    openThreadAcrossWorkspaces(undefined, TID);
+    expect(mocks.focusThreadOrBootstrap).toHaveBeenCalledWith(TID);
+    expect(mocks.fetchWorkspaces).not.toHaveBeenCalled();
+  });
+
+  it('hops to the source workspace for a cross-workspace link', () => {
+    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'work', port: 5175 })] });
+    openThreadAcrossWorkspaces('work', TID);
+    // openThreadInWorkspace invokes fetchWorkspaces synchronously before its
+    // first await, so we can assert the routing decision without flushing.
+    expect(mocks.focusThreadOrBootstrap).not.toHaveBeenCalled();
+    expect(mocks.fetchWorkspaces).toHaveBeenCalled();
+  });
+});
+
+describe('ensureCrossWorkspaceThreadTitle', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('fetches and caches the title from the source workspace engine', async () => {
+    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'dev', port: 5180 })] });
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ title: 'Resolved name' }) });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await ensureCrossWorkspaceThreadTitle('dev', TID);
+
+    expect(fetchMock).toHaveBeenCalledWith(`https://localhost:5180/api/v1/threads/${TID}`);
+    expect(crossWorkspaceThreadTitle('dev', TID)).toBe('Resolved name');
+  });
+
+  it('caches nothing (and never throws) when the source workspace is not running', async () => {
+    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'stopped', engine_running: false })] });
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await ensureCrossWorkspaceThreadTitle('stopped', TID);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(crossWorkspaceThreadTitle('stopped', TID)).toBeUndefined();
   });
 });

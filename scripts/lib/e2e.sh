@@ -10,6 +10,12 @@ _E2E_PROJECT_DIR="$(dirname "$_E2E_SCRIPTS_DIR")"
 # Use mock LLM provider by default for e2e tests (override with LUCIDOS_MODEL=... before calling)
 export LUCIDOS_MODEL="${LUCIDOS_MODEL:-mock}"
 
+# E2E builds opt into the `e2e-test-hooks` cargo feature so the engine
+# compiles in the push-log stub (replaces real web-push send with an
+# in-process write) and the `GET /api/v1/_test/push-log` endpoint that
+# Playwright tests assert against. See system-knowhow/notifications.md §5.4.
+export ENGINE_BUILD_FEATURES="${ENGINE_BUILD_FEATURES:-e2e-test-hooks}"
+
 # Source shared infrastructure — provides detect_tls, setup_postgres, start_engine,
 # start_vite, etc. Set the globals workspace.sh expects from its caller.
 SCRIPT_DIR="$_E2E_SCRIPTS_DIR"
@@ -38,7 +44,7 @@ ensure_workspace_running() {
     local vite_port="$API_PORT"
 
     # ── Engine ──
-    if curl -sk "${PROTO}://localhost:${engine_port}/api/health" >/dev/null 2>&1; then
+    if curl -sk "${PROTO}://localhost:${engine_port}/api/v1/health" >/dev/null 2>&1; then
         echo "Engine already running on port $engine_port"
         # Set up env vars that swap_ports normally provides
         swap_ports

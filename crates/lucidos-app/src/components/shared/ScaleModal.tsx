@@ -1,49 +1,18 @@
-import { signal } from '@preact/signals';
 import { useEffect } from 'preact/hooks';
-import { applyUiScale, setUiScale, currentUiScale, UI_SCALE_MIN, UI_SCALE_MAX, UI_SCALE_STEP, UI_SCALE_DEFAULT } from '../../store/actions/preferences';
+import {
+  UI_SCALE_MIN,
+  UI_SCALE_MAX,
+  UI_SCALE_STEP,
+} from '../../store/actions/preferences';
 import { ModalOverlay } from './ModalOverlay';
-
-export const scaleModalOpen = signal(false);
-const previewScale = signal(100);
-
-let saveTimeout: ReturnType<typeof setTimeout> | undefined;
-
-export function openScaleModal() {
-  previewScale.value = currentUiScale();
-  scaleModalOpen.value = true;
-}
-
-export function closeScaleModal() {
-  clearTimeout(saveTimeout);
-  scaleModalOpen.value = false;
-  const saved = currentUiScale();
-  if (previewScale.value !== saved) applyUiScale(saved);
-}
-
-export function dismissScaleModal() {
-  clearTimeout(saveTimeout);
-  setUiScale(previewScale.value);
-  scaleModalOpen.value = false;
-}
-
-function applyScaleChange(next: number) {
-  const current = scaleModalOpen.value ? previewScale.value : currentUiScale();
-  if (next === current) return;
-  previewScale.value = next;
-  applyUiScale(next);
-  if (!scaleModalOpen.value) scaleModalOpen.value = true;
-  clearTimeout(saveTimeout);
-  saveTimeout = setTimeout(() => setUiScale(next), 500);
-}
-
-export function resetUiScale() {
-  applyScaleChange(UI_SCALE_DEFAULT);
-}
-
-export function adjustUiScale(delta: number) {
-  const base = scaleModalOpen.value ? previewScale.value : currentUiScale();
-  applyScaleChange(Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, base + delta)));
-}
+import {
+  scaleModalOpen,
+  previewScale,
+  closeScaleModal,
+  adjustUiScale,
+  previewSliderValue,
+  commitSliderValue,
+} from './scaleModalState';
 
 export function ScaleModal() {
   const isOpen = scaleModalOpen.value;
@@ -62,18 +31,12 @@ export function ScaleModal() {
 
   function handleSliderInput(e: Event) {
     const val = parseInt((e.target as HTMLInputElement).value, 10);
-    if (!isNaN(val) && val !== previewScale.value) {
-      previewScale.value = val;
-      applyUiScale(val);
-    }
+    if (!isNaN(val)) previewSliderValue(val);
   }
 
   function handleSliderChange(e: Event) {
     const val = parseInt((e.target as HTMLInputElement).value, 10);
-    if (!isNaN(val)) {
-      setUiScale(val);
-      scaleModalOpen.value = false;
-    }
+    if (!isNaN(val)) commitSliderValue(val);
   }
 
   return (

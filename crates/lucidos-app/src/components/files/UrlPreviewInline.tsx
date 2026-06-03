@@ -78,13 +78,13 @@ export function UrlPreviewInline({ url, layout }: Props) {
           currentWebviewUrl.current = url;
         }).catch(() => {
           // Webview may have been closed — recreate
-          createWebview(url);
+          void createWebview(url);
         });
       } else {
-        createWebview(url);
+        void createWebview(url);
       }
     } else if (!webviewCreated.current) {
-      createWebview(url);
+      void createWebview(url);
     }
   }, [url, createWebview, isActiveLayout]);
 
@@ -94,6 +94,11 @@ export function UrlPreviewInline({ url, layout }: Props) {
 
     // Listen for URL changes from on_page_load (main-frame navigations only).
     // isMainFrameUrl filters as a safety net in case non-page URLs slip through.
+    // `cleaned` guards the race where the effect's cleanup runs before `listen()`
+    // resolves — without it the late `.then((fn) => { unlistenUrl = fn })` would
+    // assign an unlisten that nothing ever calls, leaking a global-signal-writing
+    // listener after the component is gone.
+    let cleaned = false;
     let unlistenUrl: (() => void) | null = null;
     listen<string>('panel-url-changed', (e) => {
       const newUrl = e.payload;
@@ -108,7 +113,10 @@ export function UrlPreviewInline({ url, layout }: Props) {
         currentWebviewUrl.current = newUrl;
         updatePanelUrl(newUrl);
       }
-    }).then((fn) => { unlistenUrl = fn; }).catch((err) => {
+    }).then((fn) => {
+      if (cleaned) { fn(); return; }
+      unlistenUrl = fn;
+    }).catch((err) => {
       showToast(`Failed to listen for URL changes: ${errorDetail(err)}`, 'error');
     });
 
@@ -119,7 +127,10 @@ export function UrlPreviewInline({ url, layout }: Props) {
       if (title !== panelTitle.value) {
         panelTitle.value = title || null;
       }
-    }).then((fn) => { unlistenTitle = fn; }).catch((err) => {
+    }).then((fn) => {
+      if (cleaned) { fn(); return; }
+      unlistenTitle = fn;
+    }).catch((err) => {
       showToast(`Failed to listen for title changes: ${errorDetail(err)}`, 'error');
     });
 
@@ -138,18 +149,22 @@ export function UrlPreviewInline({ url, layout }: Props) {
     window.addEventListener('resize', onResize);
 
     return () => {
+      cleaned = true;
       if (unlistenUrl) unlistenUrl();
       if (unlistenTitle) unlistenTitle();
       if (observer) observer.disconnect();
       window.removeEventListener('resize', onResize);
       if (resizeTimer) clearTimeout(resizeTimer);
+      // Best-effort cleanup during unmount: the webview may already be closed
+      // (race with another tab/layout flip) or the Tauri command may fail
+      // because the host window is tearing down. No user-facing recovery path
+      // exists — the next `createWebview` call recreates it on demand.
       invoke('close_panel_webview').catch(() => {});
       webviewCreated.current = false;
       currentWebviewUrl.current = '';
       panelTitle.value = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isActiveLayout]);
+  }, [isActiveLayout, updateBounds]);
 
   // Skip rendering in the inactive dual-rendered layout — otherwise both
   // SplitLayout and MobileSwipeContainer copies create a webview/iframe.

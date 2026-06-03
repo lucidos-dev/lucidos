@@ -68,7 +68,7 @@ pub(crate) fn run() -> Result<(), BoxError> {
         questions: questions_json,
     };
 
-    let endpoint = format!("{}/api/internal/ask-user-question", workspace.base_url());
+    let endpoint = format!("{}/api/v1/internal/ask-user-question", workspace.base_url());
     let resp: AskUserQuestionResponseBody = permission_prompt_client()?
         .post(&endpoint)
         .json(&body)

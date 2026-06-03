@@ -5,24 +5,42 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, pinnedApps, appsList, triggers } from '../store';
+import { panelOverlay, appsList, triggers, credentials, oauthAccounts, repositories, artifacts } from '../store';
 import { loadApps } from './apps';
 import { loadTriggers } from './triggers';
+import { loadTriggerGroups } from './triggerGroups';
 import { loadArtifacts } from './artifacts';
+import { removePinnedAppLocal, loadPinnedApps } from './pinnedApps';
+import { loadCredentials } from './credentials';
+import { loadOAuthAccounts } from './oauth';
+import { loadRepositories } from './repositoriesLoader';
+import { loadDevices, devices, getDeviceId } from './devices';
 
 export const RECENTS_KEY = 'lucidos-search-recents';
 export const NAV_KEY = 'lucidos-nav-history';
 
-/** Process a raw SSE message for entity reference updates. */
+/** Process a raw SSE message for entity reference updates.
+ *
+ *  Loaders below are fire-and-forget — each owns its own failure surface
+ *  (Loadable failed state via toFailed, plus showToast where applicable in
+ *  the loader). `void` is the explicit fire-and-forget marker so the loader's
+ *  failure path is the single source of truth and we don't double-toast from
+ *  here. */
 export function processSSEForReferences(type: string, data: Record<string, unknown>): void {
   switch (type) {
-    // Trigger events
+    // Trigger events — only Created / Updated / Deleted can change a trigger's
+    // group_id and thus the member_count badge on the section header. Enabled /
+    // Disabled / Executed touch unrelated fields, so skip the group refetch on
+    // those to keep the SSE pipeline cheap.
     case 'TriggerCreated':
     case 'TriggerUpdated':
+      void loadTriggers();
+      void loadTriggerGroups();
+      break;
     case 'TriggerEnabled':
     case 'TriggerDisabled':
     case 'TriggerExecuted':
-      loadTriggers();
+      void loadTriggers();
       break;
     case 'TriggerDeleted': {
       const triggerId = data.trigger_id as string;
@@ -31,18 +49,27 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
         pruneNavStack('trigger', triggerId);
         closeOverlayIfStale('trigger', triggerId);
       }
-      loadTriggers();
+      void loadTriggers();
+      void loadTriggerGroups();
       break;
     }
+    // Trigger group lifecycle — pure organizational events; refresh the
+    // group registry so the panel re-renders section headers.
+    case 'TriggerGroupCreated':
+    case 'TriggerGroupRenamed':
+    case 'TriggerGroupReordered':
+    case 'TriggerGroupDeleted':
+      void loadTriggerGroups();
+      break;
     // App events
     case 'AppCreated':
-      loadApps();
+      void loadApps();
       break;
     case 'AppUpdated': {
       const appId = data.app_id as string;
       const name = data.name as string | undefined;
       if (appId && name) patchRecentsMetadata(appId, 'apps', name);
-      loadApps();
+      void loadApps();
       break;
     }
     case 'AppDeleted': {
@@ -50,16 +77,52 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       if (appId) {
         pruneRecents(appId, 'apps');
         pruneNavStack('app', appId);
-        prunePinnedApp(appId);
+        removePinnedAppLocal(appId);
         closeOverlayIfStale('app', appId);
       }
-      loadApps();
+      void loadApps();
       break;
     }
-    // File events
+    // File events. `ArtifactImported` is the user-driven import flow;
+    // `ArtifactCreated`/`Updated`/`Deleted` fire from `emit_entity_events_for_change_apply`
+    // when a coding-agent change lands files in `data/artifacts/`. All four
+    // refresh the same `artifacts` list — gated on `loaded` for the latter
+    // three to match the PluginInstalled pattern (don't warm caches the user
+    // hasn't opened), unconditional for ArtifactImported because the import
+    // flow always has a settings panel open.
     case 'ArtifactImported':
-      loadArtifacts();
+      void loadArtifacts();
       break;
+    case 'ArtifactCreated':
+    case 'ArtifactUpdated':
+    case 'ArtifactDeleted':
+      if (artifacts.value.status === 'loaded') void loadArtifacts();
+      break;
+    // `RepositoryImported` is the `git_clone` tool landing a repo's files under
+    // `data/artifacts/imported/<name>/` — a BULK ARTIFACT import, not a change
+    // to the registered-repositories list (it carries url/destination/files,
+    // no repo_id). So it refreshes the `artifacts` cache, same gating as the
+    // Artifact* trio above. (Previously it wrongly reloaded the registered-repo
+    // list, which never contains the clone — so an agent-imported repo never
+    // appeared anywhere live.)
+    case 'RepositoryImported':
+      if (artifacts.value.status === 'loaded') void loadArtifacts();
+      break;
+    // Data-file mutations via the HTTP `/data/*` API (SDK `lucidos.data.*`,
+    // `lucidos` CLI). The engine emits these but NOT a paired Artifact* event,
+    // so a write/edit/delete under `data/artifacts/` would otherwise leave the
+    // artifacts list stale until reload. `path` is relative to `data/`
+    // (e.g. `artifacts/notes.md`); refresh the artifacts cache when it targets
+    // the artifacts subtree. Gated on `loaded` like the Artifact* trio.
+    case 'DataFileWritten':
+    case 'DataFileEdited':
+    case 'DataFileDeleted': {
+      const dataPath = data.path as string | undefined;
+      if (dataPath?.startsWith('artifacts/') && artifacts.value.status === 'loaded') {
+        void loadArtifacts();
+      }
+      break;
+    }
     // Plugin install/uninstall lands files under apps/, knowhow/, triggers/,
     // scripts/, auth-modules/. Only refresh lists the user has already
     // loaded — eagerly populating caches the user hasn't asked for is pure
@@ -67,8 +130,47 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     // don't surface.
     case 'PluginInstalled':
     case 'PluginUninstalled':
-      if (appsList.value.status === 'loaded') loadApps();
-      if (triggers.value.status === 'loaded') loadTriggers();
+      if (appsList.value.status === 'loaded') void loadApps();
+      if (triggers.value.status === 'loaded') void loadTriggers();
+      break;
+    // Settings-page caches — gated on `status === 'loaded'` (same as Plugin*
+    // above) so cross-device events don't warm caches the user hasn't asked
+    // for. When the user opens the matching settings panel the loader runs
+    // and fetches fresh data anyway.
+    case 'CredentialCreated':
+    case 'CredentialUpdated':
+    case 'CredentialDeleted':
+      if (credentials.value.status === 'loaded') void loadCredentials();
+      break;
+    case 'OAuthAccountDeleted':
+      if (oauthAccounts.value.status === 'loaded') void loadOAuthAccounts();
+      break;
+    // Registered-repositories list (Settings → Repositories). Only Add/Remove
+    // change it — they carry repo_id and are HTTP-driven (there is no agent
+    // tool that registers a repo). RepositoryImported is handled above with the
+    // artifact events, NOT here: it's a clone into artifacts, not a registered
+    // repo.
+    case 'RepositoryAdded':
+    case 'RepositoryRemoved':
+      if (repositories.value.status === 'loaded') void loadRepositories();
+      break;
+    case 'DeviceRegistered':
+    case 'DeviceRenamed':
+    case 'DevicePushChanged':
+    case 'DeviceDeleted':
+      if (devices.value.status === 'loaded') void loadDevices();
+      break;
+    // Pinned apps are device-scoped. Refresh only when the event targets THIS
+    // device — another tab on the same device (or an agent pin/unpin tool) must
+    // reflect the change; another device's pins are irrelevant here. The acting
+    // tab also receives its own event and reloads (idempotent confirm of the
+    // optimistic update). `pinnedApps` is hydrated from localStorage at init so
+    // it's effectively always `loaded`; no status gate needed.
+    case 'PinnedAppPinned':
+    case 'PinnedAppUnpinned':
+      if ((data.device_id as string | undefined) === getDeviceId()) {
+        void loadPinnedApps();
+      }
       break;
     // Thread title events
     case 'ThreadEvent':
@@ -160,20 +262,12 @@ function isNavEntryStale(entry: Record<string, unknown>, entity: string, id: str
     case 'trigger':
       if (overlay.type === 'form') {
         const form = overlay.form as Record<string, unknown> | undefined;
-        return form?.type === 'trigger' && form?.taskId === id;
+        return form?.type === 'trigger' && form?.triggerId === id;
       }
       return false;
     default:
       return false;
   }
-}
-
-function prunePinnedApp(appId: string): void {
-  const current = pinnedApps.value;
-  if (!current.some(e => e.app_id === appId)) return;
-  const filtered = current.filter(e => e.app_id !== appId);
-  pinnedApps.value = filtered;
-  localStorage.setItem('pinned_apps', JSON.stringify(filtered));
 }
 
 function closeOverlayIfStale(entity: string, id: string): void {
@@ -188,7 +282,7 @@ function closeOverlayIfStale(entity: string, id: string): void {
       }
       break;
     case 'trigger':
-      if (overlay.type === 'form' && overlay.form.type === 'trigger' && 'taskId' in overlay.form && overlay.form.taskId === id) {
+      if (overlay.type === 'form' && overlay.form.type === 'trigger' && 'triggerId' in overlay.form && overlay.form.triggerId === id) {
         panelOverlay.value = null;
       }
       break;

@@ -1,12 +1,10 @@
 import {
   activeMenuItem,
   panelOverlay,
-  mobileView,
   settingsSubview,
 } from '../store';
 import type { PanelOverlay } from '../store';
-import { navigateToPane } from './pane';
-import { isMobile } from '../../utils/viewport';
+import { revealContentPane } from './pane';
 import type { SettingsSubview } from '../store';
 import type { MenuItem } from '../types';
 import { loadCredentials } from './credentials';
@@ -21,9 +19,18 @@ import { pushNavState } from './navigation';
  *  preview, URL preview, etc.) so the menu's main content is shown. Pass an
  *  overlay to atomically land on a deep link (e.g. a trigger details panel)
  *  in the same render as the menu switch — avoids the empty-list flash that
- *  results from clear-then-set across an await. */
+ *  results from clear-then-set across an await.
+ *
+ *  Pure plumbing — does NOT manage panes. The user-intent callers
+ *  (`switchMenuItem`, `openSettingsSubview`, `landOnAccountsWithOverlay`,
+ *  the `thread-sync.ts` new-app / new-trigger branches) own the
+ *  `revealContentPane()` call themselves. Earlier this function carried its
+ *  own conditional `navigateToPane('content')` gated on `item !== prev &&
+ *  mobileView === 'thread'`; that gate silently dropped the swipe when the
+ *  user re-tapped the current item or wasn't on the chat pane. See
+ *  `.claude/rules/frontend.md` — "Navigation that lands content must call
+ *  revealContentPane()". */
 export function setActiveMenu(item: MenuItem, overlay: PanelOverlay = null) {
-  const prev = activeMenuItem.value;
   settingsSubview.value = 'main';
 
   panelOverlay.value = overlay;
@@ -32,33 +39,30 @@ export function setActiveMenu(item: MenuItem, overlay: PanelOverlay = null) {
 
   activeMenuItem.value = item;
   localStorage.setItem('lucidos-active-menu-item', item);
-
-  // Only on mobile — on desktop both layouts render simultaneously
-  // so mobileView must not be mutated by desktop interactions.
-  if (item !== prev && isMobile() && mobileView.value === 'thread') {
-    navigateToPane('content');
-  }
 }
 
 export function switchMenuItem(item: MenuItem) {
   setActiveMenu(item);
 
-  if (item === 'apps') loadApps();
-  if (item === 'triggers') loadTriggers();
-  if (item === 'settings') loadDevices();
-  if (item === 'notifications') loadNotifications();
+  // Each loader sets its own Loadable failed state on error.
+  if (item === 'apps') void loadApps();
+  if (item === 'triggers') void loadTriggers();
+  if (item === 'settings') void loadDevices();
+  if (item === 'notifications') void loadNotifications();
 
   pushNavState();
+  revealContentPane();
 }
 
 /** Navigate into a settings subview (from within the settings panel). */
 export function openSettingsSubview(key: Exclude<SettingsSubview, 'main'>) {
   settingsSubview.value = key;
-  if (key === 'accounts') loadCredentials();
+  if (key === 'accounts') void loadCredentials();
   panelOverlay.value = null;
   localStorage.removeItem('file-preview-open');
   localStorage.removeItem('app-window-open');
   pushNavState();
+  revealContentPane();
 }
 
 /** Land on Settings > Accounts with `overlay` in a single render — caller
@@ -67,5 +71,6 @@ export function openSettingsSubview(key: Exclude<SettingsSubview, 'main'>) {
 export function landOnAccountsWithOverlay(overlay: PanelOverlay): void {
   setActiveMenu('settings', overlay);
   settingsSubview.value = 'accounts';
-  loadCredentials();
+  void loadCredentials();
+  revealContentPane();
 }

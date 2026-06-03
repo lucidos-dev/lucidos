@@ -1,6 +1,6 @@
 import {
   repoFiles, repoDiff, repoViewMode, repoExpandedFolders,
-  repoPending, repoSelectedChangeId,
+  repoPending, repoSelectedChangeId, repoSource,
 } from '../../store/store';
 import type { DiffFile } from '../../store/store';
 import {
@@ -15,7 +15,7 @@ import { getEmojiForFile } from '../../utils/fileIcons';
 import { TreeNode } from './FolderTree';
 import { changeBadgeLabel } from './changeBadge';
 import { diffStats } from './diffStats';
-import { DiffStatsInline } from './DiffView';
+import { DiffStatsInline, DiffView } from './DiffView';
 
 export function RepoFilesView() {
   const loadable = repoFiles.value;
@@ -23,18 +23,25 @@ export function RepoFilesView() {
   const diffLoadable = repoDiff.value;
   const pending = repoPending.value;
   const mode = repoViewMode.value;
+  // Without a registered repo (app coding-agent threads use the workspace
+  // as their git root, which isn't a Repository row), the "All Files" tab
+  // would render an empty tree — hide the toggle and pin Changes view.
+  // The repo-file tree (repoFiles) isn't fetched for the app-CC path either,
+  // so don't gate the render on its load state.
+  const hasRepo = repoSource.value != null;
 
-  if (loadable.status === 'failed') {
-    return (
-      <div class="files-toolbar">
-        <span class="files-hint error-text">Failed to load: {loadable.error}</span>
-      </div>
-    );
-  }
-
-  if (loadable.status !== 'loaded') {
-    if (!showLoading) return null;
-    return <div class="loading-spinner" />;
+  if (hasRepo) {
+    if (loadable.status === 'failed') {
+      return (
+        <div class="files-toolbar">
+          <span class="files-hint error-text">Failed to load: {loadable.error}</span>
+        </div>
+      );
+    }
+    if (loadable.status !== 'loaded') {
+      if (!showLoading) return null;
+      return <div class="loading-spinner" />;
+    }
   }
 
   if (diffLoadable.status === 'failed') {
@@ -48,6 +55,20 @@ export function RepoFilesView() {
   const diffLoaded = diffLoadable.status === 'loaded';
   const changedFiles = diffLoaded ? diffLoadable.data.files : [];
   const changedMap = new Map(changedFiles.map(f => [f.path, f]));
+
+  // App-CC view: skip the toolbar entirely (no toggle / no expand-all
+  // controls apply) and render the inline diff. The empty bordered toolbar
+  // bar was a visual artifact.
+  if (!hasRepo) {
+    if (diffLoadable.status === 'loading') {
+      return showLoading ? <div class="loading-spinner" /> : null;
+    }
+    return (
+      <div class="artifacts-desktop">
+        <InlineDiffList files={changedFiles} />
+      </div>
+    );
+  }
 
   return (
     <>
@@ -122,6 +143,33 @@ export function ChangesFileList({ files, activePath }: { files: DiffFile[]; acti
       {files.length === 0 && (
         <div class="empty-state">No changes</div>
       )}
+    </div>
+  );
+}
+
+/** Diff renderer for app coding-agent threads (no registered repo to back the
+ *  file-preview panel). Stacks each file's hunks inline so the user gets the
+ *  full diff in one scroll, without depending on openRepoFilePreview (which
+ *  no-ops when repoSource is null). */
+function InlineDiffList({ files }: { files: DiffFile[] }) {
+  if (files.length === 0) {
+    return <div class="empty-state">No changes</div>;
+  }
+  let totalAdd = 0;
+  let totalDel = 0;
+  for (const f of files) {
+    const s = diffStats(f);
+    totalAdd += s.additions;
+    totalDel += s.deletions;
+  }
+  return (
+    <div class="folder-tree">
+      <div class="diff-stats-total">
+        <DiffStatsInline additions={totalAdd} deletions={totalDel} />
+      </div>
+      {files.map(f => (
+        <DiffView key={f.path} file={f} />
+      ))}
     </div>
   );
 }

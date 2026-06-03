@@ -43,7 +43,7 @@ describe('refreshRepoView reloads file tree after changes apply', () => {
   });
 
   it('defaults to "all" view when switching to a repo with pending changes', async () => {
-    // The Lucidos repo always has pending changes from CC sessions; switching
+    // The Lucidos repo always has pending changes from Claude Code sessions; switching
     // to it should still land on All Files, not auto-jump to the Changes tab.
     mockListRepoFiles.mockResolvedValueOnce(['foo.rs']);
     mockGetRepoChanges.mockResolvedValueOnce({ pending: [], applied: [], has_more: false });

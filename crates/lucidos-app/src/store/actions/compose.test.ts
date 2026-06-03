@@ -22,9 +22,9 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue([]),
 }));
 
-import { discardCompose, ensureFocusedComposeThread, pendingComposePuts, sendFollowup, updateCompose, applyRemoteCompose } from './compose';
+import { discardCompose, ensureFocusedComposeThread, pendingComposePuts, sendCompose, sendFollowup, updateCompose, applyRemoteCompose } from './compose';
 import { focusThread, unfocusThread } from './threads';
-import { connectionStatus, focusedThreadId, threadMap, FOCUSED_THREAD_KEY, toasts } from '../store';
+import { connectionStatus, focusedThreadId, inputMode, threadMap, FOCUSED_THREAD_KEY, toasts } from '../store';
 import {
   _resetThreadNavForTesting,
   _threadNavStateForTesting,
@@ -65,16 +65,19 @@ function makeThread(overrides: MakeThreadOpts = {}): ThreadState {
       createdAt: '',
       updatedAt: '',
       status: 'idle',
-      ccHasChanges: false,
-      ccRequiresRestart: false,
-      ccIsExternalRepo: false,
-      ccApplying: false,
+      codingAgentProposed: false,
+      codingAgentRequiresRestart: false,
+      codingAgentIsExternalRepo: false,
+      codingAgentApplying: false,
+      codingAgentHasDiff: false,
       lastRevivedAt: '',
       messageCount: 0,
       section: 'archived',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
+      blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
+      latestTodoList: null,
       ...metaOverrides,
     },
     events: new Map(),
@@ -228,6 +231,43 @@ describe('updateCompose discards empty composing drafts', () => {
     expect(threadMap.value.get('t-1')!.meta.state).toBe('discarded');
     expect(focusedThreadId.value).toBe('t-2');
   });
+
+  /** Regression: clicking the actor toggle (Lucidos/Claude) on an empty
+   *  focused composing thread used to trigger the auto-discard, which then
+   *  reset inputMode back to lucidos via discardCompose's session-stickiness
+   *  guard. Net effect: user clicks Claude, toggle snaps back to Lucidos,
+   *  user has to click 2-3 times before CC actually sticks. Mode-only patches
+   *  are a "I'm preparing to type, in this channel" signal — NOT a content
+   *  clear — so they must not trigger the ghost-row cleanup. */
+  it('does NOT auto-discard a mode-only patch on an empty composing draft (regression: actor-toggle-bounces-back-to-lucidos)', () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeThread({ state: 'composing', composeText: '', composeImages: [], composeMode: null }));
+    threadMap.value = map;
+    focusedThreadId.value = 't-1';
+    inputMode.value = { type: 'claude_code' };
+
+    updateCompose('t-1', { mode: 'claude_code' });
+
+    expect(threadMap.value.get('t-1')!.meta.state).toBe('composing');
+    expect(focusedThreadId.value).toBe('t-1');
+    expect(getDraft('t-1').mode).toBe('claude_code');
+    // The discardCompose path would have reset this to {type:'do'} as a
+    // session-stickiness guard — proving auto-discard fired.
+    expect(inputMode.value).toEqual({ type: 'claude_code' });
+  });
+
+  it('still auto-discards when text is cleared in the same patch that sets a mode', () => {
+    // User typed something, then in one combined update both cleared the text
+    // AND switched mode (unlikely from the UI but defensible at the API layer).
+    // The text clear is a real discard signal; the mode side ride-along loses.
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeThread({ state: 'composing', composeText: 'hello', composeMode: 'lucidos' }));
+    threadMap.value = map;
+
+    updateCompose('t-1', { text: '', mode: 'claude_code' });
+
+    expect(threadMap.value.get('t-1')!.meta.state).toBe('discarded');
+  });
 });
 
 describe('draft threads land in the navigation history', () => {
@@ -295,6 +335,7 @@ describe('draft threads land in the navigation history', () => {
     threadMap.value = new Map(threadMap.value).set(draftId, makeThread({
       id: draftId,
       state: 'composing',
+      latestTodoList: null,
     }));
 
     await discardCompose(draftId);
@@ -318,6 +359,7 @@ describe('draft threads land in the navigation history', () => {
     threadMap.value = new Map(threadMap.value).set(draftId, makeThread({
       id: draftId,
       state: 'composing',
+      latestTodoList: null,
     }));
 
     await discardCompose(draftId);
@@ -386,6 +428,7 @@ describe('draft threads land in the navigation history', () => {
     threadMap.value = new Map(threadMap.value).set(draftId, makeThread({
       id: draftId,
       state: 'composing',
+      latestTodoList: null,
     }));
 
     updateCompose(draftId, { text: '' });
@@ -677,5 +720,78 @@ describe('compose PUT waits for the thread-start POST to land (slow-network race
       'no compose PUT should fire against a discarded thread',
     ).toEqual([]);
     expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
+  });
+});
+
+/** The user-visible contract: picking Claude (or Lucidos) sticks. send /
+ *  discard MUST NOT reset inputMode — the next fresh compose has to start on
+ *  whichever channel the user last picked, both visually (toggle display) and
+ *  functionally (send routing). Cross-reload persistence is covered by
+ *  `store/inputMode-default.test.ts`. */
+describe('inputMode is sticky across compose sessions (toggle remembers last pick)', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockFetch = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    connectionStatus.value = 'connected';
+    focusedThreadId.value = 't-1';
+    inputMode.value = { type: 'claude_code' };
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    inputMode.value = { type: 'do' };
+    _resetComposeDraftsForTesting();
+    vi.restoreAllMocks();
+  });
+
+  it('sendCompose leaves inputMode alone so the next fresh compose stays on the user pick', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeThread({
+      state: 'composing',
+      channel: 'claude_code',
+      composeText: 'fix the bug',
+      composeMode: 'claude_code',
+    }));
+    threadMap.value = map;
+
+    await sendCompose('t-1', { useClaudeCode: true });
+
+    expect(inputMode.value).toEqual({ type: 'claude_code' });
+  });
+
+  it('discardCompose leaves inputMode alone so the next fresh compose stays on the user pick', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeThread({
+      state: 'composing',
+      channel: 'claude_code',
+      composeText: 'never mind',
+      composeMode: 'claude_code',
+    }));
+    threadMap.value = map;
+
+    await discardCompose('t-1');
+
+    expect(inputMode.value).toEqual({ type: 'claude_code' });
+  });
+
+  it('sendCompose started from lucidos leaves inputMode at lucidos', async () => {
+    inputMode.value = { type: 'do' };
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeThread({
+      state: 'composing',
+      channel: 'chat',
+      composeText: 'hello',
+      composeMode: 'lucidos',
+    }));
+    threadMap.value = map;
+
+    await sendCompose('t-1', { useClaudeCode: false });
+
+    expect(inputMode.value).toEqual({ type: 'do' });
   });
 });

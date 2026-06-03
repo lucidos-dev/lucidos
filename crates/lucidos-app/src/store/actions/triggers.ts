@@ -9,7 +9,7 @@ import {
   showConfirm,
 } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
-import type { TriggerRun } from '../types';
+import type { EventSubscription, TriggerRun } from '../types';
 import {
   listTriggers,
   listHistoricalTriggers,
@@ -19,8 +19,7 @@ import {
 } from '../../api/client';
 import { pushNavState } from './navigation';
 import { setActiveMenu } from './menu';
-import { navigateToPane } from './pane';
-import { isMobile } from '../../utils/viewport';
+import { revealContentPane } from './pane';
 import { errorDetail } from '../../utils/errorDetail';
 
 /** Drop selectedTriggerIds entries that aren't in either registry. No-ops
@@ -68,19 +67,20 @@ export function openAddTrigger(): void {
   pushNavState();
 }
 
-export function openEditTrigger(taskId: string): void {
-  panelOverlay.value = { type: 'form', form: { type: 'trigger', taskId } };
+export function openEditTrigger(triggerId: string): void {
+  panelOverlay.value = { type: 'form', form: { type: 'trigger', triggerId } };
   pushNavState();
 }
 
-export async function navigateToTrigger(taskId: string): Promise<void> {
+export async function navigateToTrigger(triggerId: string): Promise<void> {
   if (triggers.value.status !== 'loaded') await loadTriggers();
-  setActiveMenu('triggers', { type: 'form', form: { type: 'trigger', taskId } });
-  // Always go to the content pane on mobile — setActiveMenu's pane nav only
-  // fires when switching menus from the chat pane, but a deep link should
-  // surface the form regardless of where the user was.
-  if (isMobile()) navigateToPane('content');
+  setActiveMenu('triggers', { type: 'form', form: { type: 'trigger', triggerId } });
   pushNavState();
+  // Canonical helper: mobile swipe to content pane AND desktop expand of
+  // collapsed split. The earlier `if (isMobile()) navigateToPane('content')`
+  // only covered the mobile half — a trigger deep-link on a desktop with the
+  // split collapsed silently looked like nothing happened.
+  revealContentPane();
 }
 
 export function closeTriggerForm(): void {
@@ -91,44 +91,49 @@ interface SubmitTriggerParams {
   name: string;
   run: TriggerRun;
   cronExpressions: string[];
-  taskId?: string;
-  onEvent?: string;
-  condition?: Record<string, unknown>;
-  /** Whether the form is showing event fields — controls whether on_event/condition are sent on update. */
+  triggerId?: string;
+  /** Event subscriptions to send. Caller is responsible for normalization
+   *  (trimming, dropping blanks); the action sends the list as-is. Empty when
+   *  the form is schedule-only. */
+  on?: EventSubscription[];
+  /** Whether the form is showing event fields — controls whether subscriptions
+   *  are forwarded at all on update (false = explicitly clear). */
   showEvent?: boolean;
   /** When true, threads spawned by this trigger surface in REVIEW on completion. */
   goToReview: boolean;
+  /** Group membership: undefined = leave unchanged (update only), null = clear,
+   *  string = group id. Create requests treat undefined as "no group". */
+  groupId?: string | null;
 }
 
 export async function submitTrigger(params: SubmitTriggerParams): Promise<boolean> {
-  const { name, run, cronExpressions, taskId, onEvent, condition, showEvent, goToReview } = params;
+  const { name, run, cronExpressions, triggerId, on, showEvent, goToReview, groupId } = params;
   if (!name.trim()) {
     showToast('Trigger name is required', 'error');
     return false;
   }
   const trimmed = cronExpressions.map(s => s.trim()).filter(Boolean);
-  if (trimmed.length === 0 && !onEvent) {
-    showToast('At least one cron expression or an event type is required', 'error');
+  const hasOn = !!(on && on.length > 0);
+  if (trimmed.length === 0 && !hasOn) {
+    showToast('At least one cron expression or an event subscription is required', 'error');
     return false;
   }
 
   try {
-    if (taskId) {
+    if (triggerId) {
       const body: Parameters<typeof updateTrigger>[1] = {
         name: name.trim(),
         run,
         cron_expressions: trimmed,
         go_to_review: goToReview,
+        // showEvent=false means the user moved to schedule-only; the empty list
+        // clears any existing subscriptions on the backend.
+        on: showEvent ? (on ?? []) : [],
       };
-      if (showEvent) {
-        body.on_event = onEvent || null;
-        body.condition = condition || null;
-      } else {
-        // User switched to schedule-only — explicitly clear event fields
-        body.on_event = null;
-        body.condition = null;
-      }
-      const data = await updateTrigger(taskId, body);
+      // groupId: undefined = unchanged, null = clear, string = set. Same
+      // triple-state semantics as the engine's app_id field.
+      if (groupId !== undefined) body.group_id = groupId;
+      const data = await updateTrigger(triggerId, body);
       if (!data.success) {
         showToast(data.error || 'Failed to update trigger', 'error');
         return false;
@@ -138,9 +143,11 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         name: name.trim(),
         run,
         cron_expressions: trimmed,
-        on_event: onEvent,
-        condition,
+        on: on && on.length > 0 ? on : undefined,
         go_to_review: goToReview,
+        // groupId on create: null and undefined both mean "no group"; only a
+        // string sends a group_id to the engine.
+        group_id: typeof groupId === 'string' ? groupId : undefined,
       });
       if (!data.success) {
         showToast(data.error || 'Failed to create trigger', 'error');
@@ -158,11 +165,11 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
 }
 
 export async function toggleTrigger(
-  taskId: string,
+  triggerId: string,
   paused: boolean
 ): Promise<void> {
   try {
-    const data = await updateTrigger(taskId, { paused });
+    const data = await updateTrigger(triggerId, { paused });
     if (data.success) {
       await loadTriggers();
     } else {
@@ -174,15 +181,15 @@ export async function toggleTrigger(
 }
 
 export async function deleteTrigger(
-  taskId: string,
-  taskName: string
+  triggerId: string,
+  triggerName: string
 ): Promise<void> {
-  if (!(await showConfirm(`Delete trigger "${taskName}"?`))) {
+  if (!(await showConfirm(`Delete trigger "${triggerName}"?`))) {
     return;
   }
 
   try {
-    const data = await deleteTriggerApi(taskId);
+    const data = await deleteTriggerApi(triggerId);
     if (data.success) {
       await loadTriggers();
     } else {

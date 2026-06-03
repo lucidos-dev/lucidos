@@ -29,13 +29,19 @@ interface State {
 }
 
 /** Simulate loadCommands() — always updates model/effort from backend response.
- *  Clears pending when active session confirms. No cross-thread caching. */
+ *  Clears pending only when the live session has adopted that exact value, so
+ *  a stale in-flight fetch can't wipe a pending pick set after the fetch went
+ *  out. No cross-thread caching. */
 function handleLoadCommands(state: State, res: CCCommandsResponse): State {
   const next = { ...state };
   next.hasActiveSession = res.has_active_session;
   if (res.has_active_session) {
-    next.pendingEffort = null;
-    next.pendingModel = null;
+    if (res.current_reasoning_effort === next.pendingEffort) {
+      next.pendingEffort = null;
+    }
+    if (res.current_model === next.pendingModel) {
+      next.pendingModel = null;
+    }
   }
   next.currentEffort = (res.current_reasoning_effort as string) ?? null;
   next.currentModel = (res.current_model as string) ?? null;
@@ -88,7 +94,7 @@ describe('CC model/effort: per-thread, no cross-thread cache', () => {
       currentModel: 'opus[1m]',
       currentEffort: 'max',
     };
-    // Switch to thread B — backend returns null (no CC session, no events)
+    // Switch to thread B — backend returns null (no Claude Code session, no events)
     const res: CCCommandsResponse = {
       control_commands: [],
       builtin_commands: [],
@@ -149,6 +155,60 @@ describe('CC pending preferences survive until session confirms', () => {
     expect(state.pendingModel).toBeNull();
     expect(currentValueLabel(state, 'effort')).toBe('max');
     expect(currentValueLabel(state, 'model')).toBe('opus[1m]');
+  });
+
+  it('pending preserved when active-session response carries a different value (stale fetch race)', () => {
+    // Regression: cc-mid-session-settings.spec.ts on mobile-webkit. Reproduced
+    // in isolation against a fresh workspace.
+    // Sequence:
+    //   1. First CC turn ran with effort='high' (chat default), session
+    //      emitted CodingAgentSettingsChanged{high}; loadCommands fired and
+    //      cached current_reasoning_effort='high'.
+    //   2. The 1st-turn loadCommands fetch returned has_active_session=true
+    //      from when the session was still in the agent_sessions map (before
+    //      the idle-exit removed it). The response is in flight.
+    //   3. CC idled, session removed. The user clicks the CC menu, picks
+    //      Reasoning → Max, which sets pendingEffort='max'.
+    //   4. The stale in-flight fetch from step 2 lands. Old logic cleared
+    //      pendingEffort because has_active_session=true, even though the
+    //      response's current_reasoning_effort='high' didn't match.
+    //   5. sendMessage built the body with pendingEffort=null → fell back to
+    //      the default 'high' → backend spawned the follow-up with 'high'.
+    //   6. The test asserted current_reasoning_effort='max' → "Received: high".
+    // Fix: only clear pending when the response's value actually matches the
+    // pending pick, so a stale fetch can't wipe an intent set after it went
+    // out.
+    let state: State = { ...freshState, pendingEffort: 'max', pendingModel: 'haiku' };
+    const staleRes: CCCommandsResponse = {
+      control_commands: [],
+      builtin_commands: ['help'],
+      skill_commands: [],
+      current_model: 'opus[1m]',
+      current_reasoning_effort: 'high',
+      has_active_session: true,
+    };
+    state = handleLoadCommands(state, staleRes);
+    expect(state.pendingEffort).toBe('max');
+    expect(state.pendingModel).toBe('haiku');
+    expect(currentValueLabel(state, 'effort')).toBe('max');
+    expect(currentValueLabel(state, 'model')).toBe('haiku');
+  });
+
+  it('only the matching pending field clears when the response confirms one but not the other', () => {
+    // pendingEffort matches but pendingModel doesn't — half-adopted. Wiping
+    // both would lose the model pick the user still expects to take effect.
+    let state: State = { ...freshState, pendingEffort: 'max', pendingModel: 'haiku' };
+    const partialRes: CCCommandsResponse = {
+      control_commands: [],
+      builtin_commands: [],
+      skill_commands: [],
+      current_model: 'opus[1m]',
+      current_reasoning_effort: 'max',
+      has_active_session: true,
+    };
+    state = handleLoadCommands(state, partialRes);
+    expect(state.pendingEffort).toBeNull();
+    expect(state.pendingModel).toBe('haiku');
   });
 });
 

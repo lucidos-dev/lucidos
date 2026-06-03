@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.9.7 — 2026-06-03
+
+Three weeks of work since v0.9.6 (1111 non-merge commits). Headline themes: a full rebuild of notification/push delivery around a live presence protocol, app coding-agent threads, collapsible thread families + groups in the drawer, a customizable keyboard-shortcut system, structured notification taps, and several new chat-agent tools.
+
+### Added
+- **Live presence-based push delivery.** New `PresenceCheck` SSE protocol: engine pings devices and waits for a `POST /api/presence-pong` before deciding whether to push, replacing stale-heartbeat guesses. Fan-out rewritten around a pure `decide_push_allowed`; per-device dismiss-on-read; daily auto-disable of push on stale devices.
+- **Declarative Web Push for iOS** plus engine-scheduled wake-push and a periodic service-worker liveness probe to work around the macOS-Chrome SW wedge.
+- **Structured notification `Tap`** — `{kind, to?}` discriminated union replacing the old `'modal'|'open_app'|'open_thread'|'none'` strings, with `tap=none` passive auto-read notifications and event-anchored deep-links.
+- **App coding-agent threads** — spawn a Claude Code session scoped to a single `data/apps/<id>/` folder (sparse-checkout worktree, ff-merge on apply, no engine restart). Compose-view scope picker, WIP preview, app-branch chip, and a two-layer guard so a CC thread can't kill its host engine.
+- **Collapsible thread families in the drawer** — child threads render under their parent with a toggle row, saved-section attention badges, and `blocking_descendant_count` plumbed through the projection.
+- **Trigger groups** — `TriggerGroup` entity + events, HTTP API, LLM tools, collapsible group sections in the triggers panel, and a group picker in the trigger detail modal.
+- **Customizable keyboard shortcuts** — registry-driven keybindings with override persistence (synced as a workspace preference), an interactive recorder, a cheat-sheet searchable by combo, and a non-destructive Escape/close-cascade dispatcher (Cmd/Ctrl+W, Cmd/Ctrl+Shift+W).
+- **New chat-agent tools**: `todo_write` (live todo list + `TodoListWritten` event), `run_python_background` (long-running scientific-python), `count_events` (byte-budgeted event queries), `list_changes`/`apply_change`, and `lucidos changes list/apply <id>` + `--folder` app targeting on `spawn-thread`.
+- **Models**: Claude Opus 4.8 (now default, plus 1M-context variant in the CC picker), Gemini 3.5 Flash, Haiku 4.5.
+- **OAuth provider registry** — credential modal pre-fills auth/token/userinfo URLs from a built-in registry (`well_known_provider` renamed to `known_provider`) and auto-expands a custom-URL section for unknown providers; registry extended with Spotify. New `lucidos.oauth.getAccessToken(provider)` SDK method + `GET /api/v1/oauth/{provider}/access-token` for in-browser SDKs (e.g. Spotify Web Playback).
+- **Full credential editing** with email settings and masked secret reveal.
+- **`.backupignore` support**, persistent backup status on Settings → Backup, and auto-generated backup key with a store-this-key prompt.
+- **Per-thread loaded-knowhow tracking** — `[LOADED KNOWHOW]` injected each turn, recovered from events on restart, body stripped from history.
+- Actor-stamped events across 13 mutating endpoints; `ImageDescribed`, `EngineSupervisorRespawned`, `PreferencesChanged`, `EmailSent`, `ProxyModulesReloaded` events.
+- Cross-workspace `run_claude` (`workspace` param) and a watchdog that auto-resumes stuck/hung CC sessions.
+- Configurable, collision-aware Vite port selection pinned to `lucidos.toml`.
+
+### Changed
+- Raised the per-turn tool-call cap to 500 with a banner when reached.
+- Chat agent nudged to use `ask_user_question` for choice-shaped follow-ups; forbidden from parallel-calling it; AskUserQuestion card shows single- vs multi-select mode and renders option descriptions as markdown; wake-question single-option variant for unbounded waits.
+- Cascade-archive the whole thread family in a single transaction.
+- SPA overlay surfaces lazy-loaded (~40% smaller main bundle); context modal/sections lazy-fetched after snapshot strip.
+- Diff/Apply button driven by a single `ccBranchHasDiff` signal instead of a three-way union; `branch_has_diff` seeded on session bootstrap and refreshed by the startup recovery sweep.
+- Editable subject/body in the email confirm dialog; cross-workspace Origin popover shows thread name + link.
+
+### Fixed
+- Hundreds of fixes across chat, drawer, notifications, backup, archive, service worker, coding-agent, mobile/PWA, and e2e. Highlights: thread-title Escape cancels without saving; backup auto-key on scheduled runs; iOS edge-navigation gesture suppression; macOS-Chrome SW notification wedge mitigations; active-children count reconciliation; CC watchdog recovery from internet outages.
+
+### Removed
+- Page-side notification wedge-recovery Layers 3+4 (superseded by the engine PresenceCheck path).
+- Temporary iOS push-tap diagnostic breadcrumbs; broken chat model-fit guard (reverted); dead `SHORTCUT_IDS` export and assorted dead code; sync `run_python` write-guard.
 ## v0.9.6 — 2026-05-14
 
 ### Fixed

@@ -49,7 +49,10 @@ impl EventStore {
                     current_steps.clear();
                     current_images.clear();
                 }
-                "Thinking" => {
+                // "Thinking" is the legacy DB string; T7 renamed the variant to
+                // ThoughtStreamed. New rows store "ThoughtStreamed"; old rows
+                // are unchanged. Match both so legacy snapshots still render.
+                "Thinking" | "ThoughtStreamed" => {
                     // Legacy payload fields — kept for old DB rows. New
                     // emissions carry these on ContextCaptured.
                     let context_tokens = event
@@ -79,7 +82,11 @@ impl EventStore {
                         .get("results")
                         .and_then(|v| v.as_u64())
                         .is_some_and(|n| n > 0);
-                    let desc = if has_results { "Memory searched" } else { "Memory: no results" };
+                    let desc = if has_results {
+                        "Memory searched"
+                    } else {
+                        "Memory: no results"
+                    };
                     current_steps.push(Step {
                         description: desc.to_string(),
                         tool_name: None,
@@ -120,12 +127,8 @@ impl EventStore {
                         .unwrap_or("");
                     if tool_name == "browser_screenshot" && success {
                         if let Some(result) = event.payload.get("result").and_then(|v| v.as_str()) {
-                            if let Some(start) = result.find("screenshots/") {
-                                let path_part = &result[start..];
-                                let end =
-                                    path_part.find(['"', '\n', ' ']).unwrap_or(path_part.len());
-                                let path = &path_part[..end];
-                                current_images.push(path.to_string());
+                            if let Some(path) = super::extract_screenshot_path(result) {
+                                current_images.push(path);
                             }
                         }
                     }
@@ -207,11 +210,9 @@ impl EventStore {
 
         let artifact_manager = ArtifactManager::new(workspace_path.to_path_buf())?;
         let artifacts = if let Some(ref commit) = last_git_commit {
-            artifact_manager
-                .list_artifacts_at_commit(commit)
-                .unwrap_or_default()
+            artifact_manager.list_artifacts_at_commit(commit)?
         } else {
-            artifact_manager.list_artifacts().unwrap_or_default()
+            artifact_manager.list_artifacts()?
         };
 
         Ok(ConversationSnapshot {

@@ -12,12 +12,15 @@ test.describe('SSE live streaming', () => {
     const msg = uniqueMessage('stream-test');
     await sendMessage(page, `Write a paragraph about the number ${msg.slice(-6)}. Be verbose.`);
 
-    // Wait for any visible response-content to appear
+    // Wait for a visible response-content with non-empty text — waiting only
+    // for the element to exist races the first textContent snapshot below
+    // against the first streamed chunk, leaving firstSnapshot empty (flaky
+    // toBeTruthy, esp. on WebKit).
     await page.waitForFunction(() => {
       const els = document.querySelectorAll('.response-content');
       return Array.from(els).some(el => {
         const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
+        return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim().length > 0;
       });
     }, { timeout: 30_000 });
 

@@ -19,22 +19,24 @@ CC does NOT expose available models programmatically (see github.com/anthropics/
 
 ## Where the List Lives
 
-**File**: `crates/lucidos-engine/src/runtime/claude_code.rs`
-**Constant**: `CC_MODEL_OPTIONS`
+**File**: `crates/lucidos-engine/src/runtime/cc_menu_options.json`
+**Loaded by**: `cc_model_options()` / `cc_reasoning_effort_options()` in `claude_code.rs` (`include_str!` + `LazyLock`).
 
 Each entry has:
 - `value` — the alias CC accepts (e.g., `"sonnet"`, `"opus"`, `"haiku"`)
-- `label` — display name (e.g., `"Sonnet"`)
-- `description` — one-line description (e.g., `"Sonnet 4.6 · Best for everyday tasks"`)
+- `label` — display name (e.g., `"Sonnet 4.6"`)
+- `description` — one-line description (e.g., `"Best for everyday tasks"`)
+
+The JSON file also carries the `reasoning_efforts` list (`/effort` picker entries) under the same schema.
 
 ## Update Procedure
 
-1. **Check the current list**: search for `CC_MODEL_OPTIONS` in `claude_code.rs`
-2. **Compare with CC's picker**: run `claude` interactively and type `/model`, or check the model-config docs page
-3. **Update the constant**: add/remove/modify entries to match
-4. **Update tests**: the `command_definitions_include_model_options` test validates the list
-5. **Run tests**: `cargo test -p lucidos-engine -- cc_model`
-6. **Commit**: `fix: update CC model list to match current /model picker`
+1. **Open the JSON file** `crates/lucidos-engine/src/runtime/cc_menu_options.json`.
+2. **Compare with CC's picker**: run `claude` interactively and type `/model`, or check the model-config docs page.
+3. **Edit the JSON**: add/remove/modify entries to match. No Rust source touch required.
+4. **Mirror the change into the TS unions** in `crates/lucidos-app/src/api/client.ts` (`CCModelValue` and `CCReasoningEffort`). These are parallel hand-maintained mirrors — there's no codegen — so picker entries added/removed in the JSON must be reflected here in the same commit.
+5. **Run tests**: `cargo test -p lucidos-engine --lib -- cc_model` — `command_definitions_include_model_options` validates that the standard aliases stay present.
+6. **Commit**: `fix: update CC model list to match current /model picker`.
 
 ## Known Aliases
 

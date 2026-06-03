@@ -40,14 +40,14 @@ function makeChange(id: string, overrides: Partial<Change> = {}): Change {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  changes.value = [];
-  appliedChanges.value = [];
+  changes.value = { status: 'loaded', data: [] };
+  appliedChanges.value = { status: 'loaded', data: [] };
   lazyChanges.value = new Map();
 });
 
 describe('ensureChangeLoaded', () => {
   it('cache hit: skips fetch when change is already in appliedChanges', async () => {
-    appliedChanges.value = [makeChange('c-1')];
+    appliedChanges.value = { status: 'loaded', data: [makeChange('c-1')] };
 
     await ensureChangeLoaded('c-1');
 
@@ -56,7 +56,7 @@ describe('ensureChangeLoaded', () => {
   });
 
   it('cache hit: skips fetch when change is already in pending changes', async () => {
-    changes.value = [makeChange('c-1', { status: 'pending' })];
+    changes.value = { status: 'loaded', data: [makeChange('c-1', { status: 'pending' })] };
 
     await ensureChangeLoaded('c-1');
 

@@ -1,19 +1,21 @@
 import { useEffect, useCallback, useMemo } from 'preact/hooks';
-import type { DiffFile } from '../../store/store';
+import type { DiffFile, RepoDiff } from '../../store/store';
 import { selectedLines, repoDiff, repoPending, filePreviewSource, openImagePopup, repoSelectedChangeId } from '../../store/store';
+import type { Loadable } from '../../store/types';
 import { getRepoFileContent } from '../../api/client';
 import { loadChangeContextById } from '../../store/actions/repositories';
 import { highlightFileLines, CODE_EXTS } from '../../utils/syntaxHighlight';
 import { escapeHtml } from '../../utils/escapeHtml';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { renderCsvTable } from '../../utils/csv';
-import { RENDERABLE_EXTS } from './FilePreviewInline';
+import { RENDERABLE_EXTS } from './previewExts';
 import { isMobile, viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { DiffView } from './DiffView';
 import { RenderedDiff } from './RenderedDiff';
 import { ChangesFileList } from './RepoFilesView';
+import { LoadableError } from '../shared/LoadableError';
 
 interface Props {
   repoId: string;
@@ -29,9 +31,11 @@ interface Props {
 
 /** Decide whether to render a markdown diff via RenderedDiff (vs raw DiffView).
  *  RenderedDiff needs to fetch the post-change file body, which requires either
- *  a Lucidos `Change` row (changeId → /api/changes/:id/file) or a CC worktree
- *  branch on a registered repo (branchRef → /api/repositories/:id/file?ref=).
- *  External-repo CC sessions only ever have the branchRef path. */
+ *  a pending `Change` row (changeId → /api/v1/changes/:id/file — covers
+ *  Lucidos-internal AND app coding-agent threads, both of which produce a
+ *  Change) or a CC worktree branch on a registered repo (branchRef →
+ *  /api/v1/repositories/:id/file?ref=). External-repo Claude Code sessions
+ *  skip the Apply flow and only ever have the branchRef path. */
 export function shouldRenderMarkdownDiff(opts: {
   ext: string;
   fileStatus: DiffFile['status'];
@@ -45,6 +49,23 @@ export function shouldRenderMarkdownDiff(opts: {
   return !!opts.activeChangeId || !!opts.branchRef;
 }
 
+/** `hidden` covers both not-loaded and loaded-with-zero-files — the inner
+ *  pane renders alone. Loading and failed keep the sidebar mounted so the
+ *  in-flight fetch / server error is visible to the user. */
+export type SidebarState =
+  | { kind: 'hidden' }
+  | { kind: 'loading' }
+  | { kind: 'failed'; error: string }
+  | { kind: 'files'; files: DiffFile[] };
+
+export function sidebarStateFromDiff(diff: Loadable<RepoDiff>): SidebarState {
+  if (diff.status === 'loading') return { kind: 'loading' };
+  if (diff.status === 'failed') return { kind: 'failed', error: diff.error };
+  if (diff.status === 'not-loaded') return { kind: 'hidden' };
+  if (diff.data.files.length === 0) return { kind: 'hidden' };
+  return { kind: 'files', files: diff.data.files };
+}
+
 /** Renders RepoFilePreview with a sidebar listing the changed files in the
  *  current diff. The sidebar is hidden via container query when the content
  *  pane is too narrow (see `.repo-preview-split-sidebar` in panels.css), so
@@ -53,18 +74,28 @@ export function RepoFilePreviewWithSidebar(props: Props) {
   const isActiveLayout = props.layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
   if (!isActiveLayout) return null;
 
-  const diff = repoDiff.value;
-  const files = diff.status === 'loaded' ? diff.data.files : [];
-  const showSidebar = files.length > 0;
+  const sidebar = sidebarStateFromDiff(repoDiff.value);
 
-  if (!showSidebar) {
+  if (sidebar.kind === 'hidden') {
     return <RepoFilePreview {...props} />;
   }
 
   return (
     <div class="repo-preview-split">
       <aside class="repo-preview-split-sidebar">
-        <ChangesFileList files={files} activePath={props.path} />
+        {sidebar.kind === 'loading' && (
+          <div class="repo-preview-sidebar-state loading-skeleton" data-state="loading">
+            Loading changed files…
+          </div>
+        )}
+        {sidebar.kind === 'failed' && (
+          <div class="repo-preview-sidebar-state repo-preview-sidebar-error" data-state="failed">
+            Failed to load: {sidebar.error}
+          </div>
+        )}
+        {sidebar.kind === 'files' && (
+          <ChangesFileList files={sidebar.files} activePath={props.path} />
+        )}
       </aside>
       <div class="repo-preview-split-main">
         <RepoFilePreview {...props} />
@@ -73,7 +104,7 @@ export function RepoFilePreviewWithSidebar(props: Props) {
   );
 }
 
-export function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {
+function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
   const showDiffLoading = useDelayedLoading(repoDiff.value);
 
@@ -86,14 +117,14 @@ export function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props)
     if (!isActiveLayout) return;
     if (mode !== 'diff' || !changeId) return;
     if (repoSelectedChangeId.value === changeId && repoDiff.value.status === 'loaded') return;
-    loadChangeContextById(changeId);
+    void loadChangeContextById(changeId);
   }, [mode, changeId, isActiveLayout]);
 
   if (!isActiveLayout) return null;
 
   if (mode === 'diff') {
     const diff = repoDiff.value;
-    if (diff.status === 'failed') return <div class="empty-state error-text">Failed to load diff: {diff.error}</div>;
+    if (diff.status === 'failed') return <LoadableError noun="diff" error={diff.error} />;
     if (diff.status !== 'loaded') return showDiffLoading ? <div class="loading-spinner" /> : null;
     const file = diff.data.files.find(f => f.path === path);
     if (!file) return <div class="empty-state">File not found in diff</div>;
@@ -156,7 +187,7 @@ function RepoFileContent({ repoId, path }: { repoId: string; path: string }) {
     [content, ext, isCode],
   );
 
-  if (loadable.status === 'failed') return <div class="empty-state error-text">Failed to load: {loadable.error}</div>;
+  if (loadable.status === 'failed') return <LoadableError noun="file" error={loadable.error} />;
   if (content === null) return showLoading ? <div class="loading-spinner" /> : null;
 
   if (renderPreview) {

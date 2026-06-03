@@ -157,6 +157,7 @@ pub async fn pipeline_invalidate_for_retry(
 mod tests {
     use super::*;
     use crate::api::proxy_auth_layer::*;
+    use crate::api::proxy_hex::hex_lower;
     use axum::http::HeaderName;
     use bytes::Bytes;
     use std::sync::Arc;
@@ -427,13 +428,10 @@ mod tests {
         ) -> Result<AuthMutation, (axum::http::StatusCode, String)> {
             let snapshot = match input.body {
                 BodyView::Raw(b) => BodyViewSnapshot::Raw(b.len()),
-                BodyView::HashOnly { sha256, length } => {
-                    let mut hex = String::with_capacity(64);
-                    for b in sha256 {
-                        hex.push_str(&format!("{:02x}", b));
-                    }
-                    BodyViewSnapshot::HashOnly { sha256_hex: hex, length }
-                }
+                BodyView::HashOnly { sha256, length } => BodyViewSnapshot::HashOnly {
+                    sha256_hex: hex_lower(sha256),
+                    length,
+                },
             };
             *self.captured.lock().unwrap() = Some(snapshot);
             Ok(AuthMutation::default())
@@ -473,10 +471,7 @@ mod tests {
         let body_size = RAW_BODY_THRESHOLD_BYTES + 1;
         let body = bytes::Bytes::from(vec![0xABu8; body_size]);
         let expected_hash = body_hash(&body);
-        let mut expected_hex = String::with_capacity(64);
-        for b in expected_hash {
-            expected_hex.push_str(&format!("{:02x}", b));
-        }
+        let expected_hex = hex_lower(&expected_hash);
         run_pipeline(
             &layers,
             &axum::http::Method::POST,

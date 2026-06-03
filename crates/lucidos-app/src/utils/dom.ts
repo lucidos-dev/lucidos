@@ -6,6 +6,15 @@ export function isTextInput(el: EventTarget | Element | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
 }
 
+/** True if the element, or any ancestor, is an interactive control that owns its
+ *  own tap/drag (button, link, form field, [role="button"], contentEditable).
+ *  Used to exempt edge controls from the iOS navigation-swipe guard so their
+ *  taps still fire — preventDefault on a touchstart swallows the emulated click. */
+export function isInteractiveTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof Element)) return false;
+  return !!el.closest('button, a, input, textarea, select, label, [role="button"], [contenteditable]');
+}
+
 const KEYBOARD_INPUT_TYPES = new Set([
   'text', 'search', 'email', 'password', 'tel', 'url', 'number',
 ]);

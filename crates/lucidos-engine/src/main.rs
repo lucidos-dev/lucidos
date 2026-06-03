@@ -21,23 +21,58 @@ async fn shutdown_signal(
             .expect("failed to install Ctrl+C handler");
     };
 
+    // Legitimate stop signal. Use SIGUSR1 (not SIGTERM) so accidental `kill`
+    // commands from Claude Code subprocess tests can't take the engine down. A test
+    // that does `lsof -ti :5173 | xargs kill` will hit the engine's pid and
+    // send the default SIGTERM — we install a SIGTERM ignorer below so the
+    // engine survives. Legitimate stops (web-dev.sh kill_stale_processes,
+    // stop.sh, /api/v1/restart's spawned web-dev.sh) all send SIGUSR1.
     #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
+    let usr1 = async {
+        signal::unix::signal(signal::unix::SignalKind::user_defined1())
+            .expect("failed to install SIGUSR1 handler")
             .recv()
             .await;
     };
 
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let usr1 = std::future::pending::<()>();
+
+    // SIGTERM ignorer. Without an installed handler the kernel would deliver
+    // SIGTERM to the default action (terminate the process), so a CC test
+    // script that `xargs kill`s the engine's pid would still kill it. By
+    // installing a handler that logs + loops, we catch the signal and refuse
+    // to act on it. The handle is leaked deliberately — we want it to live
+    // for the rest of the process lifetime.
+    #[cfg(unix)]
+    let _sigterm_ignorer = tokio::spawn(async {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM ignorer");
+        loop {
+            sigterm.recv().await;
+            log!(
+                "[Shutdown] Received SIGTERM — ignored. Use SIGUSR1 to stop \
+                 (web-dev.sh kill_stale_processes / stop.sh / /api/v1/restart \
+                 all do this) or send SIGKILL to force-terminate."
+            );
+        }
+    });
 
     tokio::select! {
         _ = ctrl_c => {},
-        _ = terminate => {},
+        _ = usr1 => {},
     }
 
     log!("\n[Shutdown] Shutting down gracefully...");
+
+    // Stop the scheduler firing event-triggers before any cleanup event is
+    // emitted. `shutdown_agent_sessions`/`shutdown_active_threads` below emit
+    // terminator events (CodingAgentIdled, SessionEnded, ResponseAborted) that
+    // otherwise fan out to triggers; a trigger script's `lucidos ...` callback
+    // would then hit the HTTP API being torn down (line below) and die with a
+    // spurious "<trigger> failed" push. The scheduler's own shutdown flag is
+    // set much later (scheduler.shutdown()), too late to gate these events.
+    engine.mark_shutting_down();
 
     // Gracefully stop Claude Code sessions — interrupts active work,
     // waits for CodingAgentIdled events (which persist cc_session_id),
@@ -114,7 +149,12 @@ fn raise_fd_limit() {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Handle --version / -V before any heavy startup (DB, TLS, env loading).
     // Output prepends the umbrella Lucidos release to the per-crate engine version.
-    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+    // Uses bare `println!` (not `log!`) because this is user-facing CLI output that
+    // tooling parses — the timestamp/pid/label prefix from `log!` would break callers.
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
         println!(
             "Lucidos {} (lucidos-engine {})",
             lucidos_engine::LUCIDOS_RELEASE,
@@ -133,11 +173,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = dotenvy::dotenv();
 
     // Raise file descriptor limit — macOS defaults to 256 which is too low
-    // for an engine running multiple CC sessions, SSE streams, DB pool, and
+    // for an engine running multiple Claude Code sessions, SSE streams, DB pool, and
     // a Vite dev proxy simultaneously.
     raise_fd_limit();
 
     log!("[Startup] Lucidos Engine starting...");
+
+    // Log parent pid + process group + session id so a post-mortem can
+    // verify the supervisor chain from the log alone ("did the bash
+    // supervisor actually wrap this engine?"). The `log!` macro prepends
+    // `[pid:N]` to every line already, so the engine's own pid is not
+    // duplicated here.
+    #[cfg(unix)]
+    {
+        // SAFETY: getppid / getpgrp / getsid are async-signal-safe and
+        // take no pointer arguments — calling them in Rust is well-defined.
+        let ppid = unsafe { libc::getppid() };
+        let pgid = unsafe { libc::getpgrp() };
+        let sid = unsafe { libc::getsid(0) };
+        log!("[Startup] ppid={} pgid={} sid={}", ppid, pgid, sid);
+    }
 
     // Use local workspace for development, /workspace for Docker
     let workspace_path = std::env::var("LUCIDOS_WORKSPACE")
@@ -214,7 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 vertex_region.clone(),
                 model.clone(),
                 cache.clone(),
-            );
+            )?;
             (Some(provider), Some(cache))
         } else {
             log!("[Startup] Vertex AI not configured — Claude/Gemini models unavailable");
@@ -224,7 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let openai = match std::env::var("OPENAI_API_KEY") {
             Ok(api_key) => {
                 log!("[Startup] OpenAI API configured");
-                Some(OpenAiProvider::new(api_key, model.clone()))
+                Some(OpenAiProvider::new(api_key, model.clone())?)
             }
             Err(_) => None,
         };
@@ -262,6 +317,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let shared_engine: SharedEngine = Arc::new(engine);
     shared_engine.set_self_arc(&shared_engine);
     shared_engine.start_parent_callback_listener();
+    shared_engine.start_apply_all_driver();
+
+    // If the bash supervisor dropped a respawn sidecar (the previous engine
+    // pid died unexpectedly), emit one EngineSupervisorRespawned event so
+    // the respawn is recorded in the audit timeline. Emits before recovery
+    // so the timeline ordering is "supervisor respawn → recovery → ...".
+    // Best-effort: a missing sidecar (clean restart) is the common case.
+    lucidos_engine::engine::supervisor_respawn_sidecar::emit_if_present(
+        &workspace_path,
+        &shared_engine.event_bus,
+    )
+    .await;
 
     // Auto-resolve permission cards orphaned by the previous engine's death.
     // Must run before the orphan running/waiting resets: emitting Resolved
@@ -283,16 +350,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log!("[Startup] Failed to reset orphaned running threads: {}", e);
     }
 
-    // Reset CC threads stuck in 'waiting' with no pending changes.
-    // After restart, CC sessions are dead — threads with cc_has_changes=false
+    // Reset CC threads stuck in 'waiting' with no pending proposal.
+    // After restart, Claude Code sessions are dead — threads with no pending proposal
     // have nothing for the user to act on and should go idle. Chat threads can
     // no longer reach 'waiting' (ResponseAborted goes idle, ResponseFailed goes
     // to 'failed'), so the source='claude_code' scope is defensive.
     if let Err(e) = sqlx::query(
         "UPDATE thread_summaries SET status = 'idle', \
-         cc_has_changes = FALSE, cc_requires_restart = FALSE, \
-         cc_is_external_repo = FALSE, cc_applying = FALSE \
-         WHERE status = 'waiting' AND cc_has_changes = FALSE AND source = 'claude_code'",
+         coding_agent_proposed = FALSE, coding_agent_requires_restart = FALSE, \
+         coding_agent_is_external_repo = FALSE, coding_agent_applying = FALSE \
+         WHERE status = 'waiting' AND coding_agent_proposed = FALSE AND source = 'claude_code'",
     )
     .execute(shared_engine.pool())
     .await
@@ -300,14 +367,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log!("[Startup] Failed to reset orphaned waiting threads: {}", e);
     }
 
-    // Reconcile active_children_count — if all children are idle/waiting but
-    // the parent still has a non-zero count (e.g., a child CC session was
-    // canceled before emitting CodingAgentIdled), reset the count to match reality.
+    // Reconcile active_children_count in either drift direction. Over-count: a
+    // child Claude Code session canceled before emitting CodingAgentIdled leaves the
+    // parent with a stale non-zero count. Under-count: recovery's synthetic
+    // `CodingAgentIdled{reason=engine_restart_interrupt}` decrements as if the
+    // child were terminal, but the child is only parked — the user's Continue
+    // click re-increments via the `ContinueSignal` projection. If the user
+    // restarts again before clicking Continue, the now-zero count stays stuck
+    // without this sweep (the projection's +1 fires once per park/resume pair,
+    // not as a safety net for drifted rows). The `> 0` guard the prior version
+    // carried would skip exactly the rows that need repair.
     if let Err(e) = sqlx::query(
-        "UPDATE thread_summaries p SET active_children_count = \
-         COALESCE((SELECT COUNT(*) FROM thread_summaries c \
-           WHERE c.parent_thread_id = p.thread_id AND c.status = 'running'), 0) \
-         WHERE p.active_children_count > 0",
+        "WITH running_child_counts AS ( \
+             SELECT parent_thread_id, COUNT(*) AS cnt \
+             FROM thread_summaries \
+             WHERE parent_thread_id IS NOT NULL AND status = 'running' \
+             GROUP BY parent_thread_id \
+         ), \
+         parents AS ( \
+             SELECT DISTINCT parent_thread_id AS thread_id \
+             FROM thread_summaries WHERE parent_thread_id IS NOT NULL \
+         ) \
+         UPDATE thread_summaries p \
+         SET active_children_count = COALESCE(rc.cnt, 0)::int \
+         FROM parents pa LEFT JOIN running_child_counts rc \
+              ON rc.parent_thread_id = pa.thread_id \
+         WHERE p.thread_id = pa.thread_id \
+           AND p.active_children_count != COALESCE(rc.cnt, 0)::int",
     )
     .execute(shared_engine.pool())
     .await
@@ -333,6 +419,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log!("[Startup] Failed to reconcile total_children_count: {}", e);
     }
 
+    // Reconcile blocking_descendant_count. The orphan-running and
+    // orphan-waiting resets above flip child rows from blocking states
+    // (status='running'/'waiting'+coding_agent_proposed) to idle via direct
+    // UPDATEs that bypass the projection's sampling wrapper — so the parent's
+    // materialized count is not decremented. The subsequent recovery sweep
+    // emits ResponseAborted / CodingAgentIdled through EventBus, but by then
+    // `prev_sample` already shows status='idle' and the projection computes
+    // delta=0, leaving the count stuck at the pre-restart value. Without this
+    // reconciliation the parent's Archive button stays disabled forever (the
+    // `descendants_block_archive` predicate in `resolve_actions` keys off
+    // `blocking_descendant_count > 0`), and `archive_thread`'s cascade never
+    // runs even though every descendant is genuinely idle.
+    if let Err(e) =
+        lucidos_engine::engine::event_bus::EventBus::rebuild_blocking_descendant_count(
+            shared_engine.pool(),
+        )
+        .await
+    {
+        log!(
+            "[Startup] Failed to reconcile blocking_descendant_count: {}",
+            e
+        );
+    }
+
+    // Start todo garbage collector BEFORE the recovery sweep below. Recovery
+    // emits `ResponseAborted { cause: RecoveryAfterRestart }` for chat threads
+    // that were mid-response when the engine died — those terminators are
+    // broadcast on the bus and must reach the consumer so abandoned todos get
+    // flipped. tokio broadcast channels do NOT replay history for late
+    // subscribers, so a consumer spawned after recovery sees nothing.
+    lucidos_engine::engine::todo_consumer::spawn(shared_engine.clone());
+
     // Recover orphaned Claude Code worktrees (in-flight sessions that were
     // interrupted by engine crash). Idle sessions stay idle — they're shown
     // in the WAITING UI for the user to resume/apply/discard.
@@ -349,6 +467,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // for the ResponseAborted recovery above.
     shared_engine.recover_orphan_tool_calls().await;
 
+    // Reconcile `thread_summaries.coding_agent_has_diff` with on-disk git state for
+    // every active CC thread. Live updates flow through ChangeProposed /
+    // ChangeApplied / ChangeDiscarded / ThreadArchived projection handlers,
+    // driven by the aggregate end-of-turn emit. Mid-turn commits don't update
+    // the projection (the per-commit hook is gone), so this startup sweep is
+    // the authoritative reconciliation against on-disk git reality before the
+    // HTTP server starts serving frontend SSE — the WaitingBanner Diff button's
+    // signal must reflect git from the first connection.
+    lucidos_engine::engine::agent_recovery::refresh_coding_agent_has_diff_on_startup(
+        shared_engine.pool(),
+        shared_engine.workspace_path(),
+    )
+    .await;
+
+    // Propose changes that were never surfaced at idle: any idle coding-agent
+    // thread that has a committed branch diff but no pending change. This
+    // recovers threads wedged by the now-removed bg-bash propose-gate (whose
+    // only escape used to be a 5-minute nudge or a manual seed-change POST),
+    // and is a general safety net for any missed idle-proposal. Steady-state
+    // it's a no-op — `should_propose_change_at_idle` already fires for every
+    // clean idle — so it only does work on the restart that lands this change
+    // (and any future anomaly). See the function docstring for the per-thread
+    // eligibility checks.
+    lucidos_engine::engine::agent_recovery::propose_held_back_changes_on_startup(
+        shared_engine.pool(),
+        &shared_engine.event_bus,
+        shared_engine.workspace_path(),
+    )
+    .await;
+
     // Start memory indexer — subscribes to EventBus and indexes chat events
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());
 
@@ -363,7 +511,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Start the CC spawn dispatcher (Phase 5, Task 5.2).
     //
     // Subscribes to the EventBus and dispatches CC spawns based on trigger
-    // events. ContinueSignal triggers are production-active — they push a
+    // events. ContinuationRequested triggers are production-active — they push a
     // SpawnRequest::Continue onto the dispatcher's outbound channel, which
     // a receiver task on LucidosEngine consumes (start_spawn_request_consumer
     // below). MessageReceived triggers stay in SHADOW mode: the chat HTTP
@@ -377,6 +525,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             std::sync::Arc::new(shared_engine.event_bus.clone()),
         );
     shared_engine.start_spawn_request_consumer(spawn_request_rx);
+
+    // Start the external watchdog. Scans agent_sessions every 30 s from
+    // outside any per-thread `select!` — catches the May-2026 "stuck for
+    // 68 min" failure mode where the in-loop watchdog was starved by a
+    // wedged event handler. Emits ContinuationRequested (NOT ResponseAborted) so
+    // the dispatcher above auto-resumes without any user-visible "Aborted"
+    // terminal. See `engine::agent_session::external_watchdog`.
+    let _watchdog_handle = shared_engine.spawn_external_watchdog();
 
     // Use the engine's shared pool for scheduler
     let pool = shared_engine.pool().clone();

@@ -1,4 +1,5 @@
-import { artifacts, repositories, repoSource, workspaceName } from '../../store/store';
+import { useEffect } from 'preact/hooks';
+import { artifacts, repositories, repoSource, repoPending, workspaceName } from '../../store/store';
 import { expandAllFolders, collapseAllFolders, uploadFiles } from '../../store/actions/artifacts';
 import { loadRepositories } from '../../store/actions/chat';
 import { switchRepoSource } from '../../store/actions/repositories';
@@ -11,10 +12,19 @@ import { HiddenFileInput } from '../shared/HiddenFileInput';
 import { loadedOr } from '../../store/types';
 
 export function FilesView() {
-  if (repositories.value.status === 'not-loaded') loadRepositories();
+  useEffect(() => {
+    if (repositories.value.status === 'not-loaded') void loadRepositories();
+  }, []);
   const repos = loadedOr(repositories.value, []);
 
   const isRepo = repoSource.value !== null;
+  // App coding-agent threads have no registered repo (the workspace itself
+  // is the git root). viewThreadCcDiff sets repoPending + repoDiff in that
+  // case; RepoFilesView's no-registered-repo branch knows how to render the
+  // diff inline. Without this fallback the user lands on WorkspaceFilesView
+  // (the artifacts tree) and the diff they clicked is invisible.
+  const isAppCcDiff = !isRepo && repoPending.value != null;
+  const showRepoView = isRepo || isAppCcDiff;
 
   const sourceOptions = repos.length > 0 ? [
     { value: '', label: `Current Workspace (${workspaceName.value || 'unknown'})` },
@@ -25,15 +35,20 @@ export function FilesView() {
     <div class="content-view active">
       {sourceOptions.length > 0 && (
         <div class="files-source-switcher">
+          {/* Source switcher renders even in app-CC mode — selecting
+              "Current Workspace" routes back through the dropdown's
+              onChange, which clears repoPending and drops the user back
+              into WorkspaceFilesView. Without this, an app-CC diff has no
+              in-pane escape control. */}
           <Dropdown
             options={sourceOptions}
             value={repoSource.value ?? ''}
-            onChange={(v) => switchRepoSource(v || null)}
+            onChange={(v) => void switchRepoSource(v || null)}
           />
           {isRepo && <ChangeSelector />}
         </div>
       )}
-      {isRepo ? <RepoFilesView /> : <WorkspaceFilesView />}
+      {showRepoView ? <RepoFilesView /> : <WorkspaceFilesView />}
     </div>
   );
 }
@@ -45,7 +60,7 @@ function WorkspaceFilesView() {
   const handleFileSelected = (e: Event) => {
     const input = e.target as HTMLInputElement;
     if (input.files && input.files.length > 0) {
-      uploadFiles(input.files);
+      void uploadFiles(input.files);
       input.value = '';
     }
   };
