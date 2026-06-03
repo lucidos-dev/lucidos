@@ -19,7 +19,7 @@ This knowhow does **not** restate the rules. It points at them. Each check below
 
 | Reference | Owns |
 |---|---|
-| `system-knowhow/best-practices.md` | Workspace file conventions: artifacts/, apps/, knowhow/, intents/, scripts/, config/ layout, naming, "never nest artifacts", import-the-minimum |
+| `system-knowhow/best-practices.md` | Workspace file conventions: artifacts/, apps/, knowhow/, intents/, scripts/, config/ layout, `data/.env` per-workspace env overrides, naming, "never nest artifacts", import-the-minimum |
 | `system-knowhow/js-sdk.md` | Current app HTML boilerplate and the full `lucidos.*` API surface (anything not listed is either deprecated or invented) |
 | `system-knowhow/lucidos-cli.md` | What scripts and CC subprocesses use for `data.*` writes, `events.*` emits, `proxy` calls to external APIs (preferred over raw `curl -H "Authorization: ..."` with `$CRED_*`), and `spawn-thread` thread spawning (sub-threads + cross-workspace) |
 | `system-knowhow/intent-registry.md` | Which on-disk files become intents in the system prompt (trigger files double as intents — easy to miss) |

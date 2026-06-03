@@ -208,6 +208,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(&workspace_path)?;
     log!("[Startup] Using workspace: {}", workspace_path.display());
 
+    // Load this workspace's own `.env` (override semantics) on top of the global
+    // `.env` loaded above, so each workspace can carry its own environment — e.g.
+    // a workspace-specific GitHub auth account via GH_CONFIG_DIR / GIT_SSH_COMMAND
+    // that `gh` / `git push` from agent subprocesses pick up. Values land in the
+    // engine's process env, so every spawned subprocess inherits them.
+    match lucidos_engine::core::load_workspace_env(&workspace_path) {
+        Some(path) => log!("[Startup] Loaded per-workspace .env from {}", path.display()),
+        None => log!(
+            "[Startup] No per-workspace .env under {} — skipping",
+            workspace_path.join(lucidos_engine::core::DATA_DIR).display()
+        ),
+    }
+
     // Upgrade legacy `apis.json` (single `auth.type` per provider) to
     // the pipeline shape. Idempotent. Failure is fatal — better to
     // refuse to start than to silently lose proxy auth (operator can

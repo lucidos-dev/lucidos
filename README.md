@@ -60,6 +60,8 @@ Env var beats `lucidos.toml`. Both still collision-walk forward if the chosen ba
 | `VERTEX_REGION` | `europe-west1` | Vertex AI region |
 | `OPENAI_API_KEY` | — | OpenAI key (for `gpt-*` models) |
 
+**Per-workspace overrides:** on startup the engine loads a global `.env` from the process working directory, then — if present — `<workspace>/data/.env` with **override** semantics, so each workspace can carry its own environment (e.g. a workspace-specific GitHub auth account via `GH_CONFIG_DIR` / `GIT_SSH_COMMAND` that `gh` / `git push` from agent subprocesses pick up). These values land in the engine's process env and are inherited by every subprocess it spawns. `data/.env` is gitignored so its secrets never reach the workspace's artifacts repo.
+
 ---
 
 ## HTTPS for Local Development

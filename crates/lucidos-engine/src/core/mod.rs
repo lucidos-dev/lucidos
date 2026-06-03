@@ -248,8 +248,12 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
 /// engine writes there that should NOT be versioned has to be listed here.
 ///
 /// Order matters for diff stability: kept in the same order as historical
-/// values so existing files don't get rewritten on startup.
-const WORKSPACE_GITIGNORE_ENTRIES: &[&str] = &[".lucidos/", "data/postgres/", "data/blobs/"];
+/// values so existing files don't get rewritten on startup — new entries are
+/// appended at the end. `data/.env` is the per-workspace env file loaded by
+/// `load_workspace_env`; it typically carries secrets (auth tokens, SSH command
+/// overrides) and must never land in the workspace's git-tracked artifacts repo.
+const WORKSPACE_GITIGNORE_ENTRIES: &[&str] =
+    &[".lucidos/", "data/postgres/", "data/blobs/", "data/.env"];
 
 /// Ensure the workspace `.gitignore` exists and contains every
 /// engine-managed entry from `WORKSPACE_GITIGNORE_ENTRIES`. Idempotent:
@@ -282,6 +286,33 @@ pub fn ensure_workspace_gitignore_entries(workspace: &std::path::Path) -> std::i
     }
     std::fs::write(&path, next)?;
     Ok(true)
+}
+
+/// Load a per-workspace `.env` from `<workspace>/data/.env`, applying it with
+/// **override** semantics so per-workspace values win over both the global
+/// `.env` (loaded earlier via `dotenvy::dotenv()`) and the inherited process
+/// env. Returns the path that was loaded (`Some`) or `None` when no file exists.
+///
+/// The motivating use case is a per-workspace auth identity: a `data/.env` that
+/// sets `GH_CONFIG_DIR` / `GIT_SSH_COMMAND` so `gh` / `git push` run from agent
+/// subprocesses authenticate as that workspace's own GitHub account. The values
+/// land in the engine's own process env, so every subprocess the engine spawns
+/// (`run_bash`, `run_python`, Claude Code, scheduled scripts) inherits them —
+/// none of those spawn paths call `env_clear()`, they only layer extra vars on
+/// top (see `build_script_env_vars`).
+///
+/// `data/.env` is gitignored (see `WORKSPACE_GITIGNORE_ENTRIES`) so the secrets
+/// it typically carries never reach the workspace's artifacts repo.
+///
+/// Read/parse errors are swallowed — same tolerance as the global startup load;
+/// a malformed per-workspace `.env` must never stop the engine from booting.
+pub fn load_workspace_env(workspace: &std::path::Path) -> Option<std::path::PathBuf> {
+    let env_path = workspace.join(DATA_DIR).join(".env");
+    if !env_path.exists() {
+        return None;
+    }
+    let _ = dotenvy::from_path_override(&env_path);
+    Some(env_path)
 }
 
 pub use events::EventRow;

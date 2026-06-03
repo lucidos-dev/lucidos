@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.8 — 2026-06-03
+
+### Added
+- **Per-workspace environment overrides.** The engine now loads `<workspace>/data/.env` at startup via `dotenvy::from_path_override` (override semantics) and injects the result into every subprocess it spawns (`run_bash`, `run_python`, Claude Code, triggers). The motivating case is a per-workspace GitHub identity — point `GH_CONFIG_DIR` / `GIT_SSH_COMMAND` at the right account so `gh` / `git push` from agent subprocesses use the correct credentials. The file is gitignored (`data/.env` added to the workspace gitignore).
+
+### Changed
+- Documented the per-workspace `.env` behavior in `README.md` and corrected the "git-tracked under `data/`" rule in `docs/taxonomy.md` to list the real gitignored exceptions (`postgres/`, `blobs/`, `.env`).
+- Added agent-facing knowhow for `data/.env` setup in `system-knowhow/best-practices.md` (override semantics, subprocess inheritance, the GitHub-account recipe, and the ⚠️ restart-required-after-edit callout), with `system-knowhow/workspace-audit.md` kept aligned.
 ## v0.9.7 — 2026-06-03
 
 Three weeks of work since v0.9.6 (1111 non-merge commits). Headline themes: a full rebuild of notification/push delivery around a live presence protocol, app coding-agent threads, collapsible thread families + groups in the drawer, a customizable keyboard-shortcut system, structured notification taps, and several new chat-agent tools.
@@ -36,6 +44,7 @@ Three weeks of work since v0.9.6 (1111 non-merge commits). Headline themes: a fu
 ### Removed
 - Page-side notification wedge-recovery Layers 3+4 (superseded by the engine PresenceCheck path).
 - Temporary iOS push-tap diagnostic breadcrumbs; broken chat model-fit guard (reverted); dead `SHORTCUT_IDS` export and assorted dead code; sync `run_python` write-guard.
+
 ## v0.9.6 — 2026-05-14
 
 ### Fixed

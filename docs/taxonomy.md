@@ -95,7 +95,7 @@ data/
 ## Rules
 
 - **File naming:** Never use generic names like `skill.md`, `knowhow.md`, or `intent.md`. Always name files by what they describe (e.g., `calendar-data-layout.md`, `weather-forecast.md`, `comfort-cloud-api.md`).
-- **Everything under `data/` (except `postgres/`) is git-tracked** — files persist and have version history.
+- **Everything under `data/` is git-tracked** — files persist and have version history — **except** the engine-managed gitignored paths `postgres/` (event store), `blobs/` (binary cache), and `.env` (per-workspace env overrides; secret-bearing, loaded on startup).
 - **`.lucidos/`** is ephemeral (runtime cache, temp files). Can be rebuilt. Not under `data/`.
 - **Manifest vs knowhow:** `manifest.json` is for the user (UI display). Knowhow and intents are for the engine (LLM context). Don't put operational knowledge in manifests.
 - **Scripts belong with their consumer** — if only one trigger uses a script, it goes in that trigger's `scripts/`. If only one app uses it, it goes in that app's `scripts/`.

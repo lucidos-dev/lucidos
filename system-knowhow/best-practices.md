@@ -79,6 +79,30 @@ Engine-read JSON files. Currently:
 
 **This is the preferred way for scripts and apps to call external APIs.** Add an entry here once, then call the backend by name everywhere — the credential never appears in script source, args, env vars, log lines, or LLM tool transcripts. The pre-proxy pattern (`curl -H "Authorization: Bearer $CRED_..."` in scripts; `fetch` with the credential pasted into the iframe) is drift — see the workspace audit.
 
+## data/.env — Per-Workspace Environment Overrides
+
+Optional file at `data/.env` (gitignored — safe for secrets, never committed to the artifacts repo). On startup the engine loads it with **override** semantics *after* the global `.env`, so values here win over the global `.env` and the inherited process env. The loaded variables land in the engine's process env, so **every subprocess inherits them** — `run_bash`, `run_python`, scheduled scripts, and Claude Code sessions.
+
+> ⚠️ **The engine reads `data/.env` only once, at startup. After you create or edit it, the engine must be restarted for the new values to take effect** — there is no live reload.
+
+Use it for per-workspace environment that must differ from other workspaces on the same machine. The motivating case is a **per-workspace GitHub account**, so `gh` / `git push` run from agent subprocesses authenticate as the right identity:
+
+```dotenv
+# Point gh at a config dir already authenticated to THIS workspace's account
+GH_CONFIG_DIR=/Users/me/.config/gh-work
+# Force git's SSH to use a specific key for that account
+GIT_SSH_COMMAND="ssh -i /Users/me/.ssh/id_work -o IdentitiesOnly=yes"
+```
+
+Setup is **partly interactive** — you (the agent) can write `data/.env`, but the user must complete the auth handshake:
+
+1. Pick a dedicated gh config dir and authenticate it once (user-run, opens a browser): `GH_CONFIG_DIR=<dir> gh auth login`.
+2. For SSH push, make sure the key referenced by `GIT_SSH_COMMAND` is registered on that GitHub account.
+3. Write `data/.env` with the variables above.
+4. **Restart the engine** — `data/.env` is read once at startup, so new or edited values only take effect after a restart.
+
+Verify it loaded: the startup log shows `[Startup] Loaded per-workspace .env from <path>`.
+
 ## Key Rules
 
 1. **Never nest artifacts** — `artifacts/artifacts/` is always wrong
