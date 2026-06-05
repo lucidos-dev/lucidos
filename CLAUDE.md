@@ -2,6 +2,8 @@
 
 Top-level guidance for Claude Code. **Terms** (intent, knowhow, app, trigger, sub-thread, aggregate, EventBus, ThreadEvent, …) are defined in [`system-knowhow/glossary.md`](system-knowhow/glossary.md) (user-facing, base layer) and [`docs/glossary.md`](docs/glossary.md) (dev-only, extends the user-facing one). Use the canonical word — never a synonym. The glossary is a **living artifact**: grilling, brainstorming, and design dialogue actively use it (phrase questions in canonical terms, flag synonym reaches) and actively sharpen it (propose new entries / refinements in-conversation when a concept crystallizes). See `.claude/rules/glossary.md` § "Active use during design dialogue".
 
+**Decision log.** Non-obvious decisions — especially deliberate *no*s and approaches we backed out of after thinking them through — are recorded in [`docs/adr/`](docs/adr/README.md). Before re-opening a settled design question (or proposing something the codebase pointedly doesn't do), check there for the *why*; when a design dialogue lands on a decision worth not re-litigating, add an entry in the same change.
+
 Detailed conventions live in `.claude/rules/` files (each has glob frontmatter — Claude reads them when working on matching files).
 
 - `glossary.md` — canonical-terms rule + active-use-and-sharpen rule for design dialogue. Use the word from `system-knowhow/glossary.md` or `docs/glossary.md`, not a synonym; new concept → add an entry in the same change. Loads on any markdown / Rust / TS edit.

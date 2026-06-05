@@ -626,11 +626,13 @@ impl LucidosEngine {
         // in the gap between session start and the first new commit — a CC
         // thread resumed after engine restart would show no Diff button until
         // its next commit, even when commits already exist on the branch.
-        // Outside the projection tx by design: `git rev-list` inside a
+        // Outside the projection tx by design: `git diff` inside a
         // Postgres tx is the wrong shape. The helper logs and continues on
         // failure — bootstrap must not block on git or the projection write.
-        // On git error this writes TRUE optimistically; the recovery sweep /
-        // next commit hook will correct it.
+        // It writes the same git-truth the Diff button computes
+        // (`branch_changed_files`), so the button's visibility and its rendered
+        // diff stay in lockstep; the recovery sweep / next commit hook also
+        // reconcile it.
         //
         // Seeds for both initial-start (SessionStarted, via the chat HTTP
         // handler → `run_direct_agent`) and resume (ContinuationStarted, via
@@ -707,7 +709,20 @@ impl LucidosEngine {
         // question-cancel paths also cancel the token for non-hang reasons.
         let mut watchdog_fired = false;
 
+        // Bounded Esc fallback. A real Cancel (Stop) forwards CC's native
+        // interrupt (Esc) and waits for CC to wind down and emit a `Result`. If
+        // CC doesn't honor it within this window — a hung socket, or a control
+        // request ignored while a long tool runs (the watchdog skips while a
+        // tool is in flight, so it won't catch this) — escalate to the hard stop
+        // so Cancel is always responsive. Armed when the interrupt is forwarded;
+        // cleared once CC's terminal `Result` lands.
+        let mut interrupt_escalate_at: Option<tokio::time::Instant> = None;
+        const INTERRUPT_ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
+
         'event_loop: loop {
+            // Snapshot the (Copy) deadline so the escalation arm below polls a
+            // value, not a borrow of `interrupt_escalate_at` that other arms mutate.
+            let escalate_deadline = interrupt_escalate_at;
             tokio::select! {
                 event_opt = events_rx.recv() => {
                     let Some(ev) = event_opt else {
@@ -1178,6 +1193,9 @@ impl LucidosEngine {
                                             }
                                         }
                                         emitted_terminal_event = true;
+                                        // CC honored the interrupt (a Result landed) — disarm the
+                                        // bounded Esc fallback so it can't escalate to a hard stop.
+                                        interrupt_escalate_at = None;
                                         claude_text_buf.clear();
                                         last_text_persisted_len = 0;
                                         // Auto-commit any dirty files before checking for changes.
@@ -1188,11 +1206,13 @@ impl LucidosEngine {
                                             auto_commit_preserving_marker(&self.pool, wt, &repo_root, &branch_name, "Claude Code changes (auto-committed)").await;
                                         }
                                         // Check for worktree changes before entering waiting.
-                                        // Use three-dot merge-base diff (main...HEAD) so we only see
-                                        // changes introduced ON this branch, not changes main received
-                                        // after the branch was created. Without this, a branch whose
-                                        // changes were already merged appears to have changes because
-                                        // main moved ahead.
+                                        // `branch_changed_files` is a three-dot merge-base diff against
+                                        // `default_diff_base` (the SAME base the Diff button uses) so we
+                                        // only see changes introduced ON this branch, not changes the
+                                        // base received after the branch was created. Without this, a
+                                        // branch whose changes were already merged — or whose local
+                                        // default diverged — appears to have changes because the base
+                                        // moved ahead, lighting the Diff button on an empty diff.
                                         let (wt_has_changes, wt_requires_restart) = if conflict_change.is_some() {
                                             (true, false) // Conflict resolution always has work
                                         } else {
@@ -1476,6 +1496,10 @@ impl LucidosEngine {
                         {
                             log!("[ClaudeCode] Failed to forward interrupt: agent control channel closed");
                         }
+                        // Arm the bounded fallback: if CC doesn't emit a Result
+                        // within the window, the escalation arm hard-stops below.
+                        interrupt_escalate_at =
+                            Some(tokio::time::Instant::now() + INTERRUPT_ESCALATE_AFTER);
                     }
                     // Don't break — let the loop continue to read the Result event
                 }
@@ -1496,6 +1520,46 @@ impl LucidosEngine {
                         is_waiting,
                         is_shutdown,
                         suppress_user_terminal,
+                        &agent_cancel,
+                        &claude_text_buf,
+                        last_text_persisted_len,
+                        &meta,
+                        &external_terminal_emitted,
+                        &normalized_model,
+                        &cc_reasoning_effort,
+                    ).await;
+                    emitted_terminal_event = true;
+                    break;
+                }
+
+                // Bounded Esc fallback: CC did not emit a Result within the
+                // window after we forwarded the interrupt. Escalate to the hard
+                // stop so Cancel is always responsive. Stamp `Canceled(UserStop)`
+                // so `finalize` keeps the branch (KeepCanceledBranch) — the
+                // session is still best-effort resumable via the `cc_session_id`
+                // recorded on `CodingAgentSettingsChanged`. No-worse than the old
+                // immediate hard-kill, just delayed for the (rare) ignored-Esc case.
+                _ = async move {
+                    match escalate_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    log!(
+                        "[ClaudeCode] CC did not honor interrupt within {}s — escalating to hard stop for thread {}",
+                        INTERRUPT_ESCALATE_AFTER.as_secs(),
+                        thread_id
+                    );
+                    last_terminal_kind = Some(TerminalKind::Canceled(
+                        crate::engine::thread_events::CancelCause::UserStop,
+                    ));
+                    let is_shutdown = shutting_down.load(std::sync::atomic::Ordering::Relaxed);
+                    self.emit_stop_terminal(
+                        "interrupt_escalate",
+                        thread_id,
+                        is_waiting,
+                        is_shutdown,
+                        false, // a real UserStop — not Apply/Discard/Archive
                         &agent_cancel,
                         &claude_text_buf,
                         last_text_persisted_len,

@@ -4,6 +4,7 @@ import { useSignal } from '@preact/signals';
 import { changes, appliedChanges, changesHasMore, changesLoadingMore, busyChangeIds, showConfirm } from '../../store/store';
 import { applySingleChange, discardSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges } from '../../store/actions/chat-changes';
 import { viewChangeDiff } from '../../store/actions/repositories';
+import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
@@ -17,6 +18,17 @@ function ChangeDescription({ description }: { description: string }) {
         <Fragment key={i}>{line}{i < lines.length - 1 && <br />}</Fragment>
       ))}
     </span>
+  );
+}
+
+/** Open the thread that produced a change. Uses focusThreadOrBootstrap so a
+ *  thread outside the loaded window (old archived row, cross-workspace link)
+ *  still opens. Exported for the unit test. */
+export function ThreadLinkButton({ threadId }: { threadId: string }) {
+  return (
+    <button class="action-btn" onClick={(e) => { e.stopPropagation(); focusThreadOrBootstrap(threadId); }}>
+      Thread
+    </button>
   );
 }
 
@@ -102,6 +114,7 @@ export function ChangesView() {
                   </span>
                 </div>
                 <div class="list-row-actions">
+                  {change.thread_id && <ThreadLinkButton threadId={change.thread_id} />}
                   <button class="action-btn" onClick={(e) => { e.stopPropagation(); void viewChangeDiff(change); }}>Diff</button>
                   <button class="action-btn action-btn-danger" disabled={busy} onClick={() => guardedAction(change.id, discardSingleChange)}>Discard</button>
                   <button class="action-btn action-btn-confirm" disabled={busy} data-tooltip={change.requires_restart ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart' : undefined} onClick={() => guardedAction(change.id, applySingleChange)}>
@@ -126,6 +139,7 @@ export function ChangesView() {
                     </span>
                   </div>
                   <div class="list-row-actions">
+                    {change.thread_id && <ThreadLinkButton threadId={change.thread_id} />}
                     {change.pre_merge_sha && (
                       <button class="action-btn" onClick={(e) => { e.stopPropagation(); void viewChangeDiff(change); }}>Diff</button>
                     )}

@@ -311,10 +311,11 @@ export function setCaptureContext(enabled: boolean): Promise<void> {
 // --- Mobile header sticky ---
 
 /** When true, the mobile header stays fully visible — disables hide-on-scroll,
- *  hide-on-keyboard-open, and the app-UI-active pin. Defaults to false. */
+ *  hide-on-keyboard-open, and the app-UI-active pin. Defaults to true; only an
+ *  explicit `'false'` opts out of the pinned header. */
 export function currentMobileHeaderSticky(): boolean {
-  if (preferences.value.status !== 'loaded') return false;
-  return preferences.value.data['mobile_header_sticky'] === 'true';
+  if (preferences.value.status !== 'loaded') return true;
+  return preferences.value.data['mobile_header_sticky'] !== 'false';
 }
 
 export function setMobileHeaderSticky(enabled: boolean): Promise<void> {

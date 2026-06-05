@@ -306,6 +306,35 @@ fn resolve_claude_binary(home: Option<&Path>) -> std::ffi::OsString {
     std::ffi::OsString::from("claude")
 }
 
+/// Whether `sccache` is resolvable as an executable on `path_var`.
+///
+/// The engine sets `RUSTC_WRAPPER=sccache` on spawned coding-agent sessions so
+/// the heavy `lucidos-engine` crate rebuilds fast inside a coding-agent thread.
+/// But sccache is a dev-machine optimization installed by
+/// `scripts/lib/preflight.sh` — NOT a runtime dependency of the shipped engine
+/// binary. On any host where it's absent (a one-click-install target, CI, an
+/// external-repo session on a contributor's laptop) forcing the wrapper makes
+/// every `cargo build`/`cargo test` the session runs hard-fail with
+/// `process didn't exit successfully: sccache`. So `build_command` gates the
+/// env var on this probe: present → `RUSTC_WRAPPER=sccache` (fast cached
+/// builds); absent → `RUSTC_WRAPPER=""` (an empty value, NOT unset). The empty
+/// value matters: the Lucidos repo's tracked `.cargo/config.toml` sets
+/// `build.rustc-wrapper = "sccache"`, and cargo falls back to that config when
+/// the env var is merely unset — only an explicit empty `RUSTC_WRAPPER`
+/// overrides config to force a plain (uncached) build instead of a broken one.
+///
+/// `path_var` is injected to keep this pure and unit-testable; production passes
+/// `std::env::var_os("PATH")`. The child process inherits a superset of the
+/// engine's PATH (see `path_with_prefix`), so the engine's own PATH is the
+/// correct probe for what cargo will resolve at build time.
+fn sccache_on_path(path_var: Option<&std::ffi::OsStr>) -> bool {
+    let Some(path_var) = path_var else {
+        return false;
+    };
+    let exe = format!("sccache{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(path_var).any(|dir| dir.join(&exe).is_file())
+}
+
 /// Build the `claude` Command with all flags and env vars. Extracted so unit
 /// tests can inspect args/env without spawning. `cli_dir` is the directory
 /// containing the `lucidos` binary, prepended to PATH; pass `None` to skip.
@@ -339,8 +368,23 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .env_remove("CLAUDECODE")
-        .env("RUSTC_WRAPPER", "sccache");
+        .env_remove("CLAUDECODE");
+    // sccache speeds up the heavy lucidos-engine rebuilds a coding-agent thread
+    // triggers, but it's a dev-machine optimization (installed by
+    // scripts/lib/preflight.sh), not a runtime dependency of the shipped engine
+    // binary. Use the wrapper only when sccache is actually on PATH — otherwise
+    // a session on a host without it (one-click install, CI, an external repo on
+    // a contributor's laptop) would hard-fail every cargo build/test it runs
+    // with `process didn't exit successfully: sccache`. The absent branch sets
+    // an EMPTY value rather than leaving the var unset: the Lucidos repo's
+    // tracked .cargo/config.toml sets `build.rustc-wrapper = "sccache"`, which
+    // cargo falls back to when RUSTC_WRAPPER is unset — only an explicit empty
+    // value overrides it to a plain (uncached) build. See `sccache_on_path`.
+    if sccache_on_path(std::env::var_os("PATH").as_deref()) {
+        cmd.env("RUSTC_WRAPPER", "sccache");
+    } else {
+        cmd.env("RUSTC_WRAPPER", "");
+    }
     if args.resume_session_id.is_none() {
         cmd.arg("--include-partial-messages");
     }

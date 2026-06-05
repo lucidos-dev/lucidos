@@ -11,6 +11,18 @@ import { navigateToApp, waitForVisibleInput, assertHealthy } from './helpers';
  *  the selection, so the handler sees no selection and falls through (no
  *  substitution). Applying it atomically with the dispatch closes that window. */
 async function pasteText(input: Locator, text: string, selection?: [number, number]) {
+  // Let the app's async draft-settle finish before issuing the synthetic paste.
+  // Setting `el.value` + dispatching `input` promotes a compose thread; that
+  // schedules a textarea re-sync effect carrying the PRE-paste draft snapshot.
+  // If that effect runs AFTER the paste's setRangeText (cold start / load delays
+  // it past our next evaluate), it reverts the substitution back to the stale
+  // draft value. Waiting two animation frames guarantees the promotion effect
+  // has run, so the paste mutation is the last write to the textarea. A real
+  // user can't type-then-paste inside one frame, so this only closes a synthetic
+  // -input race, not a product behavior gap.
+  await input.evaluate(
+    () => new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r()))),
+  );
   await input.evaluate(
     (el: HTMLTextAreaElement, { payload, sel }: { payload: string; sel?: [number, number] }) => {
       el.focus();

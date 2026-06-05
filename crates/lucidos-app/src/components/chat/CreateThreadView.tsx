@@ -1,5 +1,5 @@
 import type { VNode } from 'preact';
-import { useRef, useEffect } from 'preact/hooks';
+import { useRef, useEffect, useLayoutEffect } from 'preact/hooks';
 import {
   activeExchanges,
   activeStreamingBuffer,
@@ -11,7 +11,7 @@ import {
   isThreadQuiescent,
   cancelingThreadIds,
 } from '../../store/store';
-import { scrolledUp, awayFromBottom, notAtTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers } from './scrollState';
+import { scrolledUp, awayFromBottom, notAtTop, scrollToBottom, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
@@ -214,7 +214,17 @@ export function useAutoScroll(ref: preact.RefObject<HTMLDivElement>, deps: unkno
     awayFromBottom.value = false;
   }, []);
 
-  useEffect(() => {
+  // Layout effect, not passive: it must snap to the bottom synchronously at
+  // commit — BEFORE the browser delivers the ResizeObserver callback for the
+  // same DOM growth. A passive effect runs after paint (and after onResize), so
+  // when a >80px chunk lands while the user is following (e.g. CC resuming after
+  // an Approve, once the 500ms suppression window has lapsed), onResize would
+  // see the user below the new bottom and escalate scrolledUp=true first,
+  // parking this snap and killing tailing on its own. Snapping first makes
+  // onResize see isAtBottom() and leave scrolledUp alone. Only fires on real
+  // content arrival (deps = events/streaming), never on local panel toggles, so
+  // the panel-expand "show the chevron" behaviour is untouched.
+  useLayoutEffect(() => {
     const el = ref.current;
     if (!el || scrolledUp.value) return;
     el.scrollTop = el.scrollHeight;
@@ -265,10 +275,7 @@ export function CreateThreadView() {
               showUp={isNotAtTop}
               showDown={isUp}
               onScrollUp={() => areaRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
-              onScrollDown={() => {
-                const el = areaRef.current;
-                if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-              }}
+              onScrollDown={scrollToBottom}
             />
           )}
         </>

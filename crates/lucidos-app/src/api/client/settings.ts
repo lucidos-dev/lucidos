@@ -249,8 +249,27 @@ export async function getBackupProviders(): Promise<BackupProviderInfo[]> {
   return json(`${API}/backup/providers`);
 }
 
+/** Reveal the EXISTING backup key. Read-only — throws `ApiError` 404 when no key
+ *  has been generated yet (call `generateBackupKey` for that). Never mints a key. */
 export async function getBackupKey(): Promise<BackupKeyResponse> {
   return json(`${API}/backup/key`);
+}
+
+/** Generate the backup key if none exists yet, then return it. Idempotent on the
+ *  engine: if a key already exists it's returned unchanged (`is_new: false`), so
+ *  this can never overwrite the key that protects existing backups. */
+export async function generateBackupKey(): Promise<BackupKeyResponse> {
+  return json(`${API}/backup/key`, { method: 'POST' });
+}
+
+export interface BackupKeyExists {
+  exists: boolean;
+}
+
+/** Whether a backup key already exists, without revealing it. Used on page load
+ *  to label the key button ("Show backup key" vs "Generate new backup key"). */
+export async function getBackupKeyExists(): Promise<BackupKeyExists> {
+  return json(`${API}/backup/key/exists`);
 }
 
 /** Returns when the backup is queued — completion arrives via SSE

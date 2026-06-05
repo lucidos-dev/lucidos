@@ -662,8 +662,122 @@ describe('iOS keyboard scroll preservation', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Continuous rAF loop: scrollToBottom must keep scrolling on every frame
-// during the suppression window, not just 2 frames. iOS keyboard animation
-// takes 300-400ms with many visualViewport.resize events — the old 2×rAF
-// approach missed most of the animation.
+// Scroll-to-bottom chevron must RE-ENGAGE tailing, not just nudge the position.
+//
+// Bug report: in a coding-agent thread the user clicked Approve on a permission
+// card, tailing stopped, and clicking the down chevron "still didn't auto
+// scroll". Root cause: the chevron handler did a bare
+// `el.scrollTo({ top: scrollHeight, behavior: 'smooth' })` — a one-shot nudge
+// that neither reset `scrolledUp` nor engaged the ResizeObserver suppression
+// window. So with tailing already broken (`scrolledUp === true`), the chevron
+// animated toward a stale bottom while content kept streaming below, and the
+// deps-effect (`if (scrolledUp.value) return`) stayed parked. The fix routes
+// the chevron through `scrollToBottom()`.
 // ---------------------------------------------------------------------------
+describe('scroll-to-bottom chevron re-engages tail', () => {
+  beforeEach(() => {
+    scrolledUp.value = false;
+    awayFromBottom.value = false;
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.advanceTimersByTime(600);
+    setActiveScrollElement(null);
+    vi.useRealTimers();
+  });
+
+  it('OLD bare smooth scrollTo leaves tail broken — content keeps growing below', () => {
+    // Tail already broken after Approve.
+    scrolledUp.value = true;
+    const el = mockScrollEl({ scrollTop: 1400, scrollHeight: 2000, clientHeight: 500 });
+    setActiveScrollElement(el);
+
+    // Old chevron handler: nudge to the current bottom, touch no signals.
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    expect(el.scrollTop).toBe(2000);
+    expect(scrolledUp.value).toBe(true); // never reset → tail still broken
+    expect(getResizeMode()).toBe('ignore'); // no suppression engaged
+
+    // CC streams a fresh chunk below the (stale) bottom.
+    el.scrollHeight = 2600;
+    // deps-effect is parked because scrolledUp is true …
+    if (!scrolledUp.value) el.scrollTop = el.scrollHeight;
+    // … and onResize in ignore mode only confirms the user is "scrolled up".
+    if (el.scrollTop + el.clientHeight < el.scrollHeight - 80) scrolledUp.value = true;
+
+    expect(scrolledUp.value).toBe(true);
+    expect(el.scrollTop).toBe(2000); // never followed the new content
+  });
+
+  it('NEW scrollToBottom re-engages tail — stays pinned as content streams', () => {
+    // Same broken starting point.
+    scrolledUp.value = true;
+    const el = mockScrollEl({ scrollTop: 1400, scrollHeight: 2000, clientHeight: 500 });
+    setActiveScrollElement(el);
+
+    // New chevron handler.
+    scrollToBottom();
+    expect(scrolledUp.value).toBe(false); // tailing restored
+    expect(getResizeMode()).toBe('scroll'); // suppression engaged
+    expect(el.scrollTop).toBe(2000);
+
+    // CC streams a fresh chunk → onResize in scroll mode pins to the new bottom.
+    el.scrollHeight = 2600;
+    if (getResizeMode() === 'scroll') {
+      el.scrollTop = el.scrollHeight;
+      extendSuppression();
+    }
+    expect(el.scrollTop).toBe(2600); // followed
+    expect(scrolledUp.value).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Resume race: new content arriving while the user is following must snap to
+// the bottom BEFORE onResize evaluates, otherwise a >80px chunk escalates
+// scrolledUp=true and kills tailing on its own.
+//
+// This is why Approve broke tailing without any user scroll: after the approve
+// gap the 500ms suppression window has expired, and CC resumes with a large
+// chunk (a whole tool-call card / buffered text > 80px). The deps snap ran in a
+// passive effect (after paint, after the ResizeObserver callback), so onResize
+// saw the user below the new bottom and escalated first. Moving the deps snap
+// into a layout effect makes it run synchronously at commit — before the
+// browser delivers the ResizeObserver callback — so onResize then sees the user
+// already at the bottom and leaves scrolledUp alone.
+// ---------------------------------------------------------------------------
+describe('resume race: snap-before-resize keeps tail alive for big chunks', () => {
+  beforeEach(() => { scrolledUp.value = false; awayFromBottom.value = false; });
+  afterEach(() => { setActiveScrollElement(null); });
+
+  // The user is following (scrolledUp=false), pinned at the bottom of 2000px,
+  // suppression has expired, then a 400px chunk lands in one render.
+  function bigChunkArrives() {
+    const el = mockScrollEl({ scrollTop: 1500, scrollHeight: 2000, clientHeight: 500 });
+    setActiveScrollElement(el);
+    el.scrollHeight = 2400; // big single-render growth at the bottom
+    return el;
+  }
+
+  function onResizeIgnoreMode(el: { scrollTop: number; clientHeight: number; scrollHeight: number }) {
+    if (el.scrollTop + el.clientHeight < el.scrollHeight - 80) scrolledUp.value = true;
+  }
+
+  it('BUG order (resize before snap) escalates scrolledUp and never follows', () => {
+    const el = bigChunkArrives();
+    // Passive deps-effect = runs after the ResizeObserver callback.
+    onResizeIgnoreMode(el);               // 2000 < 2320 → escalate
+    if (!scrolledUp.value) el.scrollTop = el.scrollHeight; // parked
+    expect(scrolledUp.value).toBe(true);
+    expect(el.scrollTop).toBe(1500);
+  });
+
+  it('FIX order (layout-effect snap before resize) stays pinned', () => {
+    const el = bigChunkArrives();
+    // Layout deps-effect = runs synchronously at commit, before onResize.
+    if (!scrolledUp.value) el.scrollTop = el.scrollHeight; // snap to 2400
+    onResizeIgnoreMode(el);               // 2400 >= 2320 → no escalate
+    expect(scrolledUp.value).toBe(false);
+    expect(el.scrollTop).toBe(2400);
+  });
+});

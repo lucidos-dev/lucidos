@@ -1007,7 +1007,11 @@ pub fn create_router(
             "/backup/restore-status",
             get(backup::get_restore_status).delete(backup::clear_restore_status),
         )
-        .route("/backup/key", get(backup::get_backup_key))
+        .route(
+            "/backup/key",
+            get(backup::get_backup_key).post(backup::generate_backup_key),
+        )
+        .route("/backup/key/exists", get(backup::backup_key_exists))
         .route("/backup/providers", get(backup::list_providers))
         .route(
             "/backup/schedule",

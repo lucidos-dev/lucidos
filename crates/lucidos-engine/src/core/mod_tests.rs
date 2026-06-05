@@ -140,6 +140,197 @@ fn redact_postgres_secrets_in_json_walks_nested_strings() {
 }
 
 #[test]
+fn test_describe_tool_ask_user_question_single_shows_question() {
+    let args = serde_json::json!({
+        "questions": [{ "question": "Should I proceed?", "options": [] }]
+    });
+    assert_eq!(
+        describe_tool("ask_user_question", &args),
+        "Asking: Should I proceed?"
+    );
+}
+
+#[test]
+fn test_describe_tool_ask_user_question_falls_back_to_header() {
+    // Empty question string falls back to the short header chip.
+    let args = serde_json::json!({
+        "questions": [{ "question": "", "header": "Approach", "options": [] }]
+    });
+    assert_eq!(
+        describe_tool("ask_user_question", &args),
+        "Asking: Approach"
+    );
+}
+
+#[test]
+fn test_describe_tool_ask_user_question_multiple() {
+    let args = serde_json::json!({
+        "questions": [
+            { "question": "A?", "options": [] },
+            { "question": "B?", "options": [] },
+            { "question": "C?", "options": [] }
+        ]
+    });
+    assert_eq!(
+        describe_tool("ask_user_question", &args),
+        "Asking 3 questions..."
+    );
+}
+
+#[test]
+fn test_describe_tool_ask_user_question_empty_falls_back() {
+    let args = serde_json::json!({ "questions": [] });
+    assert_eq!(
+        describe_tool("ask_user_question", &args),
+        "Asking a question..."
+    );
+}
+
+#[test]
+fn test_describe_tool_todo_write() {
+    let writing = serde_json::json!({
+        "todos": [{ "content": "Run tests", "active_form": "Running tests", "status": "pending" }]
+    });
+    assert_eq!(
+        describe_tool("todo_write", &writing),
+        "Updating todo list..."
+    );
+    let clearing = serde_json::json!({ "todos": [] });
+    assert_eq!(
+        describe_tool("todo_write", &clearing),
+        "Clearing todo list..."
+    );
+}
+
+#[test]
+fn test_describe_tool_background_exec() {
+    assert_eq!(
+        describe_tool(
+            "run_python_background",
+            &serde_json::json!({ "code": "x = 1" })
+        ),
+        "Running Python in background..."
+    );
+    assert_eq!(
+        describe_tool(
+            "run_bash_background",
+            &serde_json::json!({ "command": "sleep 99" })
+        ),
+        "Running in background: sleep 99..."
+    );
+    assert_eq!(
+        describe_tool("bash_output", &serde_json::json!({ "task_id": "abc" })),
+        "Checking background task output..."
+    );
+    assert_eq!(
+        describe_tool("bash_kill", &serde_json::json!({ "task_id": "abc" })),
+        "Stopping background task..."
+    );
+}
+
+#[test]
+fn test_describe_tool_trigger_groups_and_state() {
+    assert_eq!(
+        describe_tool("pause_trigger", &serde_json::json!({ "trigger_id": "t" })),
+        "Pausing trigger..."
+    );
+    assert_eq!(
+        describe_tool(
+            "create_trigger_group",
+            &serde_json::json!({ "name": "Morning" })
+        ),
+        "Creating trigger group 'Morning'..."
+    );
+    assert_eq!(
+        describe_tool(
+            "delete_trigger_group",
+            &serde_json::json!({ "group_id": "g" })
+        ),
+        "Deleting trigger group..."
+    );
+}
+
+#[test]
+fn test_describe_tool_count_events() {
+    assert_eq!(
+        describe_tool(
+            "count_events",
+            &serde_json::json!({ "event_type": "OuraSleepImported" })
+        ),
+        "Counting OuraSleepImported events..."
+    );
+    assert_eq!(
+        describe_tool("count_events", &serde_json::json!({})),
+        "Counting events..."
+    );
+}
+
+#[test]
+fn test_describe_tool_threads_and_changes() {
+    assert_eq!(
+        describe_tool("list_threads", &serde_json::json!({})),
+        "Listing threads..."
+    );
+    assert_eq!(
+        describe_tool("count_threads", &serde_json::json!({})),
+        "Counting threads..."
+    );
+    assert_eq!(
+        describe_tool("list_changes", &serde_json::json!({})),
+        "Listing changes..."
+    );
+    assert_eq!(
+        describe_tool("apply_change", &serde_json::json!({ "change_id": "c" })),
+        "Applying change..."
+    );
+    assert_eq!(
+        describe_tool(
+            "dismiss_from_context",
+            &serde_json::json!({ "event_id": "e" })
+        ),
+        "Dismissing from context..."
+    );
+    assert_eq!(
+        describe_tool(
+            "save_thread_image",
+            &serde_json::json!({ "image": "thread:1", "path": "photos/a.jpg" })
+        ),
+        "Saving image to photos/a.jpg..."
+    );
+}
+
+#[test]
+fn test_describe_tool_unknown_falls_back_to_generic() {
+    assert_eq!(
+        describe_tool("some_future_tool", &serde_json::json!({})),
+        "Executing some_future_tool..."
+    );
+}
+
+#[test]
+fn describe_tool_built_from_redacted_args_masks_postgres_password() {
+    // The live emit path (agentic_loop) redacts args BEFORE building the
+    // ToolCalled description, because the description renders in the steps UI
+    // just like the args. This pins that composition: a hardcoded postgres
+    // password must not survive into the bash-command preview.
+    for tool in ["run_bash", "run_bash_background"] {
+        let mut args = serde_json::json!({
+            "command": "psql postgres://lucidos:topsecret@localhost:5432/db -c 'select 1'"
+        });
+        redact_postgres_secrets_in_json(&mut args);
+        let desc = describe_tool(tool, &args);
+        assert!(
+            !desc.contains("topsecret"),
+            "{tool} leaked password: {desc}"
+        );
+        assert!(
+            desc.contains("***"),
+            "{tool} description not redacted: {desc}"
+        );
+    }
+}
+
+#[test]
 fn test_describe_tool_result_read_file() {
     let content = "hello world"; // 11 chars
     let result = describe_tool_result("read_file", content, true);
@@ -708,7 +899,11 @@ fn load_workspace_env_loads_and_overrides_when_present() {
     let key = "LUCIDOS_TEST_WS_ENV_OVERRIDE";
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("data")).unwrap();
-    std::fs::write(dir.path().join("data/.env"), format!("{key}=from-workspace\n")).unwrap();
+    std::fs::write(
+        dir.path().join("data/.env"),
+        format!("{key}=from-workspace\n"),
+    )
+    .unwrap();
 
     // SAFETY: process-wide env mutation gated by ENV_TEST_LOCK.
     unsafe {

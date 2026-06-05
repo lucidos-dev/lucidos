@@ -74,6 +74,12 @@ export const previewFile = computed(() => {
 /** When true, file preview shows raw source instead of rendered output (for md, html, csv, svg). */
 export const filePreviewSource = signal(localStorage.getItem('lucidos-file-preview-source') === 'true');
 
+/** When true, the data-file preview shows an editable textarea instead of the
+ *  rendered/source view. Reset to false whenever the previewed file changes
+ *  (see store/effects.ts) so a stale draft toggle never carries to a new file.
+ *  Not persisted — editing is always an explicit, in-session action. */
+export const filePreviewEditing = signal(false);
+
 /** CSS-based pseudo-fullscreen fallback for mobile (when native Fullscreen API is unavailable). */
 export const appPseudoFullscreen = signal(false);
 
@@ -996,4 +1002,14 @@ export const recoveryProgress = signal<{ completed: number; total: number } | nu
 
 // --- Update available ---
 export const updateAvailable = signal(false);
+
+// --- Service worker build id ---
+/** BUILD_ID of the active service worker (stamped into sw.js by the
+ *  `lucidos-sw-stamp` Vite plugin — see vite.config.ts), reported by the SW on
+ *  request and shown in the control panel. A debugging aid for "did the new
+ *  build's SW actually take over?": it's the same value whose byte-change fires
+ *  the update toast, so an unchanged id across an apply means the SW never
+ *  updated. `null` until the SW answers; the live dev server reports the
+ *  un-stamped `__LUCIDOS_BUILD_ID__` placeholder (shown as "dev"). */
+export const serviceWorkerBuildId = signal<string | null>(null);
 

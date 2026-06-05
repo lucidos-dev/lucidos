@@ -671,6 +671,13 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             let cmd = args["command"].as_str().unwrap_or("command");
             format!("Running: {}...", truncate(cmd, 60))
         }
+        "run_python_background" => "Running Python in background...".to_string(),
+        "run_bash_background" => {
+            let cmd = args["command"].as_str().unwrap_or("command");
+            format!("Running in background: {}...", truncate(cmd, 60))
+        }
+        "bash_output" => "Checking background task output...".to_string(),
+        "bash_kill" => "Stopping background task...".to_string(),
         "http_request" => {
             let url = args["url"].as_str().unwrap_or("URL");
             if let Some(path) = args["temp_path"].as_str() {
@@ -701,6 +708,19 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             "Deleting trigger {}...",
             args["trigger_id"].as_str().unwrap_or("trigger")
         ),
+        "pause_trigger" => "Pausing trigger...".to_string(),
+        "resume_trigger" => "Resuming trigger...".to_string(),
+        "list_trigger_groups" => "Listing trigger groups...".to_string(),
+        "create_trigger_group" => format!(
+            "Creating trigger group '{}'...",
+            args["name"].as_str().unwrap_or("group")
+        ),
+        "rename_trigger_group" => format!(
+            "Renaming trigger group to '{}'...",
+            args["name"].as_str().unwrap_or("group")
+        ),
+        "reorder_trigger_groups" => "Reordering trigger groups...".to_string(),
+        "delete_trigger_group" => "Deleting trigger group...".to_string(),
         "set_language" => format!(
             "Setting language to {}...",
             args["language"].as_str().unwrap_or("language")
@@ -849,6 +869,34 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             "Sending notification '{}'...",
             args["title"].as_str().unwrap_or("notification")
         ),
+        "ask_user_question" => match args["questions"].as_array() {
+            Some(questions) if questions.len() > 1 => {
+                format!("Asking {} questions...", questions.len())
+            }
+            Some(questions) if questions.len() == 1 => {
+                // Show the question itself (truncated) — far friendlier than the
+                // raw tool name. Fall back to the short `header` chip, then a
+                // generic label. No trailing "..." here: a short question ends
+                // in "?" naturally, and `truncate` appends "..." when it cuts.
+                let q = &questions[0];
+                let text = q
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| q.get("header").and_then(|v| v.as_str()))
+                    .unwrap_or("a question");
+                format!("Asking: {}", truncate(text, 60))
+            }
+            _ => "Asking a question...".to_string(),
+        },
+        "todo_write" => match args["todos"].as_array() {
+            Some(todos) if todos.is_empty() => "Clearing todo list...".to_string(),
+            _ => "Updating todo list...".to_string(),
+        },
+        "save_thread_image" => format!(
+            "Saving image to {}...",
+            args["path"].as_str().unwrap_or("artifacts")
+        ),
         "generate_image" => format!(
             "Generating image: {}...",
             truncate(args["prompt"].as_str().unwrap_or("image"), 50)
@@ -865,11 +913,20 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             "Running thread: {}...",
             truncate(args["prompt"].as_str().unwrap_or("task"), 50)
         ),
+        "list_threads" => "Listing threads...".to_string(),
+        "count_threads" => "Counting threads...".to_string(),
+        "list_changes" => "Listing changes...".to_string(),
+        "apply_change" => "Applying change...".to_string(),
         "correct_memory" => "Updating memory...".to_string(),
+        "dismiss_from_context" => "Dismissing from context...".to_string(),
         "query_events" => format!(
             "Querying {} events...",
             args["event_type"].as_str().unwrap_or("all")
         ),
+        "count_events" => match args["event_type"].as_str() {
+            Some(event_type) => format!("Counting {} events...", event_type),
+            None => "Counting events...".to_string(),
+        },
         "read_notifications" => "Reading notifications...".to_string(),
         "manage_repositories" => match args["action"].as_str() {
             Some("add") => format!(

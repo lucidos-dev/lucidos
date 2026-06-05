@@ -17,6 +17,11 @@ export function vnodeToText(node: ComponentChildren): string {
   const tag = typeof v.type === 'string' ? v.type : '';
   const cls = v.props?.class ? ` class="${v.props.class}"` : '';
   const dis = v.props?.disabled ? ' disabled' : '';
-  const inner = vnodeToText(v.props?.children);
+  // dangerouslySetInnerHTML replaces children — surface its HTML so assertions
+  // on markdown-rendered content (question text, option descriptions) still see
+  // the text. Children are ignored by preact when this prop is set.
+  const html = (v.props as { dangerouslySetInnerHTML?: { __html?: string } })
+    ?.dangerouslySetInnerHTML?.__html;
+  const inner = html != null ? html : vnodeToText(v.props?.children);
   return tag ? `<${tag}${cls}${dis}>${inner}</${tag}>` : inner;
 }

@@ -110,7 +110,7 @@ impl LucidosEngine {
         if let Some(tid) = thread_id {
             if let Some(session) = guard.get(&tid) {
                 if session.is_waiting {
-                    return Err("Session is already waiting".into());
+                    return Err(SESSION_ALREADY_WAITING.into());
                 }
                 session.interrupt.notify_one();
                 Ok(())

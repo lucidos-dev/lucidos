@@ -12,6 +12,7 @@ import {
   type NotificationToastRequestedPayload,
 } from './in-app-notification-toast';
 import { addRestartGroup, appliedToastRefreshAction } from './chat-changes';
+import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
 import { loadPreferences } from './preferences';
 import { loadArtifacts } from './artifacts';
 import { refreshAppUI, captureAppUI } from './apps';
@@ -519,6 +520,10 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     }
     if (clientUpdate) {
       updateAvailable.value = true;
+      // In --built mode the frontend rebuilds over the next few seconds; nudge
+      // the SW to pick up the new build so the Refresh toast fires promptly.
+      // No-op in the live dev server (sw.js never changes).
+      scheduleServiceWorkerUpdateChecks();
     }
   } else if (event.type === 'ChangeDiscarded') {
     const desc = event.change_id ? findChangeDescription(threadId, event.change_id) : undefined;

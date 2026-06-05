@@ -127,13 +127,13 @@ function validateTap(raw: unknown): Tap | null {
 }
 
 /** Translate the SW's `tapData` shape (`notification_id` / `thread_id` /
- *  `event_id` / `tap`) to a `DeepLinkTarget`. The service worker posts
- *  this shape as a `lucidos:deep-link` message when `client.navigate()` can't
- *  reach a same-origin tab (uncontrolled — common in dev after a hard reload
- *  or with DevTools "Update on reload" toggling controller mid-cycle). The
- *  message handler in `useStartup` is then the same on-arrival routing the
- *  hashchange path uses, so the SW's two delivery paths (navigate vs. message)
- *  converge on one dispatcher.
+ *  `event_id` / `tap`) to a `DeepLinkTarget`. The service worker posts this
+ *  shape as a `lucidos:deep-link` message to an already-open top-level tab on
+ *  notification tap (`routeToDeepLink` in `sw.js`) — the deterministic warm-tab
+ *  delivery that replaced a fragment-only `client.navigate('/#…')` (Chrome
+ *  doesn't fire `hashchange` for it; see system-knowhow/notifications.md §4.5).
+ *  The message handler in `useStartup` routes it through `dispatchDeepLink` —
+ *  the same dispatcher the cold-open URL path (`handleHashLocation`) uses.
  *
  *  `tap` arrives as a structured object (the engine puts it on the push
  *  payload, the SW forwards it on `event.notification.data`). `app_id` is

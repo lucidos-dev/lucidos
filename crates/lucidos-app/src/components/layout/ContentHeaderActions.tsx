@@ -3,11 +3,11 @@ import type { ComponentChild } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
 import { TimeTravelDropdown } from '../apps/TimeTravelDropdown';
-import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, appPseudoFullscreen, parseRepoPath } from '../../store/store';
+import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, filePreviewEditing, appPseudoFullscreen, parseRepoPath } from '../../store/store';
 import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
 import { getAppFrameSrc, getVisibleAppFrame, exitPseudoFullscreen, refreshAppUI } from '../../store/actions/apps';
-import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon } from '../shared/icons';
-import { RENDERABLE_EXTS } from '../files/previewExts';
+import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon } from '../shared/icons';
+import { RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
 import { isTauri, isIOSPwa } from '../../utils/platform';
 import { webviewReload } from '../../utils/tauri';
 import { openFileSearch } from '../files/fileSearchActions';
@@ -148,24 +148,47 @@ export function ContentHeaderActions() {
   } else if (overlay?.type === 'file-preview') {
     const ext = overlay.path.split('.').pop()?.toLowerCase() || '';
     const hasRendered = RENDERABLE_EXTS.includes(ext);
-    const isDiff = parseRepoPath(overlay.path)?.mode === 'diff';
-    addAction('refresh', reloadButton(
-      refreshFilePreview,
-      'Refresh',
-      isDiff ? 'Diff is fixed to this change' : undefined,
-    ));
-    if (hasRendered) {
-      const isSource = filePreviewSource.value;
-      addAction('source-toggle',
-        <button
-          class="icon-btn header-icon"
-          onClick={() => { filePreviewSource.value = !isSource; }}
-          aria-label={isSource ? 'Show rendered' : 'Show source'}
-          data-tooltip={isSource ? 'Show rendered' : 'Show source'}
-        >
-          {isSource ? <EyeIcon /> : <CodeIcon />}
-        </button>,
-      );
+    const repo = parseRepoPath(overlay.path);
+    const isDiff = repo?.mode === 'diff';
+    // Repo files are read at a git ref (not the live workspace), so they're not
+    // inline-editable; only data files under a mutable prefix are.
+    const editable = !repo && isEditableDataFile(overlay.path);
+    const editing = filePreviewEditing.value && editable;
+
+    // While editing, Save/Cancel live in the editor body (FilePreviewInline) and
+    // refresh/source-toggle would fight the draft — so the header drops them and
+    // keeps only the global actions.
+    if (!editing) {
+      addAction('refresh', reloadButton(
+        refreshFilePreview,
+        'Refresh',
+        isDiff ? 'Diff is fixed to this change' : undefined,
+      ));
+      if (hasRendered) {
+        const isSource = filePreviewSource.value;
+        addAction('source-toggle',
+          <button
+            class="icon-btn header-icon"
+            onClick={() => { filePreviewSource.value = !isSource; }}
+            aria-label={isSource ? 'Show rendered' : 'Show source'}
+            data-tooltip={isSource ? 'Show rendered' : 'Show source'}
+          >
+            {isSource ? <EyeIcon /> : <CodeIcon />}
+          </button>,
+        );
+      }
+      if (editable) {
+        addAction('edit',
+          <button
+            class="icon-btn header-icon file-edit-btn"
+            onClick={() => { filePreviewEditing.value = true; }}
+            aria-label="Edit file"
+            data-tooltip="Edit file"
+          >
+            <EditIcon />
+          </button>,
+        );
+      }
     }
   } else if (!overlay && activeMenuItem.value === 'files') {
     addAction('search',

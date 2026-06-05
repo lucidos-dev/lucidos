@@ -185,6 +185,22 @@ pub fn ensure_key(workspace: &std::path::Path) -> Result<(Vec<u8>, bool), BoxErr
     }
 }
 
+/// Whether a usable backup key is already persisted for this workspace.
+///
+/// Pure read: unlike [`ensure_key`], this NEVER generates or writes a key. It
+/// lets the Settings → Backup page choose its button label ("Show backup key"
+/// when a key exists vs "Generate new backup key" when none does) without the
+/// mere act of checking minting one — the exact footgun that surfaced a "New
+/// backup key generated" toast for a workspace that already had backups. A
+/// present-but-unreadable/corrupt file is treated as "no usable key" so the
+/// caller routes to generate rather than to a reveal that would error.
+pub fn key_exists(workspace: &std::path::Path) -> bool {
+    load_key_file(&super::key_file_path(workspace))
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +405,55 @@ mod tests {
         let (key2, is_new2) = ensure_key(workspace.path()).unwrap();
         assert!(!is_new2, "second ensure_key must reuse the existing key");
         assert_eq!(key, key2);
+    }
+
+    /// `key_exists` is the read-only counterpart to `ensure_key`: it reports
+    /// whether a key is on disk WITHOUT ever creating one. This is what lets the
+    /// Settings → Backup button label itself ("Show backup key" vs "Generate
+    /// new backup key") without the mere act of checking minting a key — the
+    /// exact behavior behind a "New backup key generated" toast appearing for a
+    /// workspace that already had backups.
+    #[test]
+    fn test_key_exists_is_read_only_and_reflects_presence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let key_path = crate::core::backup::key_file_path(workspace.path());
+
+        // Absent: reports false AND must not create the file as a side effect.
+        assert!(!key_exists(workspace.path()));
+        assert!(!key_path.exists(), "checking existence must not mint a key");
+        // Repeated checks stay read-only — no key materializes.
+        assert!(!key_exists(workspace.path()));
+        assert!(!key_path.exists());
+
+        // After a real generation, it reports true.
+        let (key, is_new) = ensure_key(workspace.path()).unwrap();
+        assert!(is_new);
+        assert!(key_exists(workspace.path()));
+
+        // Checking existence on a present key never alters the stored bytes.
+        assert!(key_exists(workspace.path()));
+        assert_eq!(load_key_file(&key_path).unwrap().unwrap(), key);
+    }
+
+    /// Revealing the key (the read path the GET endpoint uses) must never
+    /// overwrite or regenerate it: reading an existing key returns the same
+    /// bytes every time, and reading an ABSENT key returns `None` without
+    /// creating a file. Together with the `ensure_key` idempotency test this
+    /// pins the core guarantee the user asked about — "Show backup key" cannot
+    /// replace the key that protects existing backups.
+    #[test]
+    fn test_reveal_is_non_destructive() {
+        let workspace = tempfile::tempdir().unwrap();
+        let key_path = crate::core::backup::key_file_path(workspace.path());
+
+        // Reading an absent key never mints one.
+        assert!(load_key_file(&key_path).unwrap().is_none());
+        assert!(!key_path.exists());
+
+        // Generate once, then read repeatedly — the bytes are stable.
+        let (key, _) = ensure_key(workspace.path()).unwrap();
+        for _ in 0..3 {
+            assert_eq!(load_key_file(&key_path).unwrap().unwrap(), key);
+        }
     }
 }

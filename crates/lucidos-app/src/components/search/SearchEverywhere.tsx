@@ -138,7 +138,6 @@ function ResultRow({ item, index, selected, onSelect, onHover }: {
 }) {
   return (
     <button
-      key={`${item.category}:${item.id}`}
       data-role="search-result"
       class={`search-everywhere-result${selected ? ' selected' : ''}`}
       onMouseEnter={() => onHover(index)}

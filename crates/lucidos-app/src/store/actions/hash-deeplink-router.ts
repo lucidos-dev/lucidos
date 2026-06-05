@@ -65,8 +65,14 @@ export function setupHashDeeplinkRouting(): () => void {
     if (document.visibilityState === 'visible') handleHashLocation();
   }
 
-  // Defer cold-start so the stores have a tick to hydrate before navigation.
-  const coldStartTimer = window.setTimeout(handleHashLocation, 500);
+  // Cold-start: route the deep link as soon as the synchronous boot setup
+  // settles. A 0ms timer yields one macrotask (letting signal init + the first
+  // mount commit run) without the old fixed 500ms wait — on an iOS notification
+  // tap that whole delay sat on the critical path between the reload and the
+  // thread appearing. The dispatch is robust to not-yet-hydrated stores: a
+  // navigate-kind tap routes through focusThreadOrBootstrap, which fetches the
+  // thread when it isn't in the loaded window yet.
+  const coldStartTimer = window.setTimeout(handleHashLocation, 0);
   window.addEventListener('hashchange', handleHashLocation);
   document.addEventListener('visibilitychange', onResume);
   window.addEventListener('focus', onResume);

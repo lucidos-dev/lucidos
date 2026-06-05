@@ -51,7 +51,7 @@ async fn session_bootstrap_leaves_coding_agent_has_diff_false_when_branch_is_fre
     let branch = "claude-code/seed-fresh";
     let (_tmp, repo_root, _wt) = make_repo_and_worktree(branch).await;
 
-    // No additional commits on the branch — `git log main..branch` is empty.
+    // No additional commits on the branch — `branch_changed_files` is empty.
 
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
@@ -62,7 +62,7 @@ async fn session_bootstrap_leaves_coding_agent_has_diff_false_when_branch_is_fre
 
     assert!(
         !read_coding_agent_has_diff(&pool, thread_id).await,
-        "seed must leave coding_agent_has_diff=false when branch has no commits beyond main"
+        "seed must write coding_agent_has_diff=false when the branch has no net diff against its diff base"
     );
 
     pool.close().await;

@@ -29,6 +29,28 @@
     animation: modal-in var(--duration-normal) ease-out;
 }
 
+/* During a restart, nothing may float above the dim blocker except the toast
+   container (--z-toast). The elements that outrank the overlay in normal use
+   all sit at the tooltip layer (--z-tooltip = 10000, kept that high so a modal
+   never clips them): the JS tooltip, a pseudo-fullscreen app iframe, and the
+   landscape-rotate lock. RestartOverlay flags :root[data-restarting] so they
+   step aside while restarting. */
+
+/* Tooltip is transient — hide it outright (a ghost behind the 50% scrim would
+   look broken). inert already stops new tooltips firing (the hover targets are
+   inert), so this only clears one already on screen when the restart began. */
+:root[data-restarting] #tooltip {
+    display: none !important;
+}
+
+/* Full-screen opaque panels: drop below the overlay (don't hide) so the dim
+   "restarting" scrim covers them and the restart toast stays visible, then they
+   pop back to the top when the restart ends. */
+:root[data-restarting] .app-ui-inline.app-ui-fullscreen,
+:root[data-restarting] .landscape-lock {
+    z-index: calc(var(--z-modal) - 1) !important;
+}
+
 /* Reduced motion: disable non-essential transitions globally */
 @keyframes spin {
     to { transform: rotate(360deg); }

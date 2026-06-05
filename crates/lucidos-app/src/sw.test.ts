@@ -9,14 +9,35 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const swSource = readFileSync(resolve(__dirname, '../public/sw.js'), 'utf-8');
 
-type FakeClient = { frameType: string; visibilityState: string; postMessage?: (msg: unknown) => void };
+// In source (and in the live dev server) sw.js carries the literal
+// `__LUCIDOS_BUILD_ID__` placeholder; the `lucidos-sw-stamp` Vite plugin
+// replaces it with a per-build id at `vite build` time (vite.config.ts). These
+// tests run the unstamped source, so the shell cache name keeps the placeholder.
+const SHELL_CACHE = 'lucidos-shell-__LUCIDOS_BUILD_ID__';
+
+type FakeClient = {
+  frameType: string;
+  visibilityState: string;
+  url?: string;
+  postMessage?: (msg: unknown) => void;
+  focus?: () => Promise<unknown>;
+  navigate?: (url: string) => Promise<unknown>;
+};
 
 // Runs sw.js inside a sandbox where `self`, `fetch`, `clients`, and `caches`
 // are mocks. Returns the registered fetch handler so tests can drive it.
 // Top-level handlers (push, notificationclick) only register their listeners —
 // they don't fire at load time, so the mocks just need to satisfy the
 // addEventListener calls.
-function loadSw() {
+//
+// `opts.buildId` simulates the `lucidos-sw-stamp` plugin: it replaces the
+// `__LUCIDOS_BUILD_ID__` placeholder, flipping the SW's `IS_BUILT` gate true so
+// the navigation-shell cache (built mode only) is exercised. Omit it to test
+// the dev (un-stamped) behavior where the shell stays network-fresh.
+function loadSw(opts: { buildId?: string } = {}) {
+  const source = opts.buildId
+    ? swSource.replace(/__LUCIDOS_BUILD_ID__/g, opts.buildId)
+    : swSource;
   const handlers: Record<string, (event: any) => void> = {};
   const mockFetch = vi.fn();
   const cacheStore = new Map<string, Response>();
@@ -29,8 +50,13 @@ function loadSw() {
       return Promise.resolve();
     }),
   };
+  // Track which named caches exist so the activate handler's prune
+  // (caches.keys() → delete everything not in KEEP_CACHES) is observable.
+  const cacheNames = new Set<string>();
   const mockCaches = {
-    open: vi.fn(() => Promise.resolve(mockCache)),
+    open: vi.fn((name: string) => { cacheNames.add(name); return Promise.resolve(mockCache); }),
+    keys: vi.fn(() => Promise.resolve([...cacheNames])),
+    delete: vi.fn((name: string) => Promise.resolve(cacheNames.delete(name))),
   };
   const mockRegistration = {
     showNotification: vi.fn((_title: string, _opts: Record<string, unknown>) => Promise.resolve()),
@@ -44,26 +70,33 @@ function loadSw() {
     registration: mockRegistration,
   };
   // matchAll satisfies swDebugLog's best-effort broadcast (returns no clients
-  // by default); claim satisfies the activate handler. Push tests can override
-  // matchAll if they want to assert a particular client shape.
+  // by default); claim satisfies the activate handler. Push / notificationclick
+  // tests can override matchAll if they want to assert a particular client shape.
   const matchAll = vi.fn(() => Promise.resolve([] as FakeClient[]));
-  const mockClients = { matchAll, claim: () => Promise.resolve() };
+  const openWindow = vi.fn(() => Promise.resolve(null));
+  const mockClients = { matchAll, openWindow, claim: () => Promise.resolve() };
   // eslint-disable-next-line @typescript-eslint/no-implied-eval
-  new Function('self', 'fetch', 'clients', 'caches', swSource)(mockSelf, mockFetch, mockClients, mockCaches);
+  new Function('self', 'fetch', 'clients', 'caches', source)(mockSelf, mockFetch, mockClients, mockCaches);
   return {
     handlers,
     mockFetch,
     mockCache,
     mockCaches,
     cacheStore,
+    cacheNames,
     mockRegistration,
     matchAll,
+    openWindow,
+    skipWaiting: mockSelf.skipWaiting,
   };
 }
 
-function makeEvent(url: string, method: string = 'GET') {
+// `mode` populates request.mode so navigation-shell tests can mark a request as
+// a top-level navigation. Omit it for the asset/API/blob tests (those branch on
+// path + method, never mode).
+function makeEvent(url: string, method: string = 'GET', mode?: string) {
   return {
-    request: { url, method },
+    request: { url, method, ...(mode ? { mode } : {}) },
     respondWith: vi.fn(),
   };
 }
@@ -208,6 +241,215 @@ describe('Service Worker fetch handler', () => {
   });
 });
 
+// Content-hashed app bundles (Vite's build output, /assets/<name>-<hash>.<ext>)
+// are immutable for a given URL, so the SW serves them Cache-first — a reload
+// pulls the JS/CSS graph from disk instead of the network (the bulk of an iOS
+// PWA reload after a notification-tap navigation; see notifications.md §4.5).
+// The branch self-gates across run modes: the Vite dev server serves modules
+// from /src, /@vite, /@id, /node_modules/.vite — never /assets/* — so it never
+// fires in dev, where caching unhashed modules would pin stale code / break HMR.
+describe('Service Worker fetch handler — immutable /assets bundle caching', () => {
+  it('GET /assets/<hash>.js: serves from Cache API on hit (no network), via SHELL_CACHE', async () => {
+    const sw = loadSw();
+    const cached = new Response('cached-bundle');
+    sw.cacheStore.set('https://example.com/assets/index-abc123.js', cached);
+    const event = makeEvent('https://example.com/assets/index-abc123.js');
+    sw.handlers.fetch(event);
+    expect(event.respondWith).toHaveBeenCalledTimes(1);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(response).toBe(cached);
+    expect(sw.mockFetch).not.toHaveBeenCalled();
+    expect(sw.mockCaches.open).toHaveBeenCalledWith(SHELL_CACHE);
+  });
+
+  it('GET /assets/<hash>.css: caches a successful response on miss', async () => {
+    const sw = loadSw();
+    sw.mockFetch.mockResolvedValue(new Response('fresh', { status: 200 }));
+    const event = makeEvent('https://example.com/assets/index-def456.css');
+    sw.handlers.fetch(event);
+    await event.respondWith.mock.calls[0][0];
+    expect(sw.mockFetch).toHaveBeenCalledTimes(1);
+    expect(sw.mockCache.put).toHaveBeenCalledTimes(1);
+    const cachedReq = sw.mockCache.put.mock.calls[0][0] as { url: string };
+    expect(cachedReq.url).toBe('https://example.com/assets/index-def456.css');
+  });
+
+  it('GET /assets/<hash>.js: does NOT cache a failed response (404/5xx during a deploy swap)', async () => {
+    const sw = loadSw();
+    sw.mockFetch.mockResolvedValue(new Response('gone', { status: 404 }));
+    const event = makeEvent('https://example.com/assets/missing-000000.js');
+    sw.handlers.fetch(event);
+    await event.respondWith.mock.calls[0][0];
+    expect(sw.mockCache.put).not.toHaveBeenCalled();
+  });
+
+  it('GET /src/main.tsx (Vite dev module): does NOT call respondWith (no caching in dev)', () => {
+    const sw = loadSw();
+    const event = makeEvent('https://example.com/src/main.tsx');
+    sw.handlers.fetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+
+  it('GET /@vite/client (Vite dev runtime): does NOT call respondWith', () => {
+    const sw = loadSw();
+    const event = makeEvent('https://example.com/@vite/client');
+    sw.handlers.fetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+
+  it('cross-origin /assets/ GET (CDN): does NOT call respondWith', () => {
+    const sw = loadSw();
+    const event = makeEvent('https://cdn.other.com/assets/index-abc123.js');
+    sw.handlers.fetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+
+  it('non-GET /assets/ request: does NOT call respondWith', () => {
+    const sw = loadSw();
+    const event = makeEvent('https://example.com/assets/index-abc123.js', 'POST');
+    sw.handlers.fetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+});
+
+// Navigation-shell caching (eleventh iteration, notifications.md §4.5). Every
+// top-level navigation — the PWA start URL and every notification-tap reload
+// (`/?notification=…`, the cross-document load WebKit forces on iOS) — is served
+// the cached index.html so the reload's HTML fetch becomes a disk read. Built
+// mode only (the SW's IS_BUILT gate, flipped here by stamping a fake build id);
+// the live dev server must serve a network-fresh shell so HMR / index.html edits
+// aren't pinned. The entry is keyed by the normalized `/` URL so every query
+// variant collapses onto one shell; `path === '/'` excludes app-UI iframe
+// (`/app/<id>/`) navigations, which are their own server-rendered HTML.
+const STAMPED_BUILD = 'testbuild0001';
+const STAMPED_SHELL_CACHE = `lucidos-shell-${STAMPED_BUILD}`;
+
+describe('Service Worker fetch handler — navigation shell caching', () => {
+  it('dev (un-stamped): navigate to / falls through — shell stays network-fresh', () => {
+    const sw = loadSw(); // IS_BUILT false → navigation branch inert
+    const event = makeEvent('https://example.com/', 'GET', 'navigate');
+    sw.handlers.fetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+
+  it('built: navigate to /?notification=… serves the cached shell (no network), via SHELL_CACHE', async () => {
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    const cached = new Response('<!doctype html>shell');
+    // Cached under the normalized `/` key — the deep-link query must still hit it.
+    sw.cacheStore.set('https://example.com/', cached);
+    const event = makeEvent('https://example.com/?notification=nid-1&thread=tid-1', 'GET', 'navigate');
+    sw.handlers.fetch(event);
+    expect(event.respondWith).toHaveBeenCalledTimes(1);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(response).toBe(cached);
+    expect(sw.mockFetch).not.toHaveBeenCalled();
+    expect(sw.mockCaches.open).toHaveBeenCalledWith(STAMPED_SHELL_CACHE);
+  });
+
+  it('built: navigate cache miss fetches network and caches under the normalized / key (query stripped)', async () => {
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    sw.mockFetch.mockResolvedValue(new Response('fresh shell', { status: 200 }));
+    const event = makeEvent('https://example.com/?notification=nid-2', 'GET', 'navigate');
+    sw.handlers.fetch(event);
+    await event.respondWith.mock.calls[0][0];
+    expect(sw.mockFetch).toHaveBeenCalledTimes(1);
+    expect(sw.mockCache.put).toHaveBeenCalledTimes(1);
+    const cachedReq = sw.mockCache.put.mock.calls[0][0] as { url: string };
+    expect(cachedReq.url).toBe('https://example.com/');
+  });
+
+  it('built: navigate to an app-UI iframe (/app/<id>/) is NOT treated as the shell', () => {
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    const event = makeEvent('https://example.com/app/momentum/', 'GET', 'navigate');
+    sw.handlers.fetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+
+  it('built: a non-navigation GET to / falls through (only navigations hit the shell cache)', () => {
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    const event = makeEvent('https://example.com/', 'GET'); // no mode
+    sw.handlers.fetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+
+  it('built: navigate does NOT cache a failed shell response (502 during an engine restart)', async () => {
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    sw.mockFetch.mockResolvedValue(new Response('bad gateway', { status: 502 }));
+    const event = makeEvent('https://example.com/', 'GET', 'navigate');
+    sw.handlers.fetch(event);
+    await event.respondWith.mock.calls[0][0];
+    expect(sw.mockCache.put).not.toHaveBeenCalled();
+  });
+});
+
+// install precaches the shell (built mode) so even the FIRST controlled reload
+// is a disk read — the fetch-handler cache-first is the fallback if this misses.
+describe('Service Worker install handler — shell precache', () => {
+  function makeInstallEvent() {
+    const waiting: Array<Promise<unknown>> = [];
+    return { waitUntil: (p: Promise<unknown>) => { waiting.push(p); }, waiting };
+  }
+
+  it('built: precaches the shell with cache:reload, keyed by /, and still skipWaiting()s', async () => {
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    sw.mockFetch.mockResolvedValue(new Response('shell', { status: 200 }));
+    const event = makeInstallEvent();
+    sw.handlers.install(event);
+    await Promise.all(event.waiting);
+    expect(sw.skipWaiting).toHaveBeenCalledTimes(1);
+    expect(sw.mockFetch).toHaveBeenCalledWith(
+      'https://example.com/',
+      expect.objectContaining({ cache: 'reload' }),
+    );
+    expect(sw.mockCache.put).toHaveBeenCalledTimes(1);
+    expect((sw.mockCache.put.mock.calls[0][0] as { url: string }).url).toBe('https://example.com/');
+  });
+
+  it('built: a failed precache fetch does not throw or cache (best-effort)', async () => {
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    sw.mockFetch.mockRejectedValue(new TypeError('Load failed'));
+    const event = makeInstallEvent();
+    sw.handlers.install(event);
+    await expect(Promise.all(event.waiting)).resolves.toBeDefined();
+    expect(sw.mockCache.put).not.toHaveBeenCalled();
+  });
+
+  it('dev (un-stamped): install does NOT precache — shell stays network-fresh', async () => {
+    const sw = loadSw();
+    const event = makeInstallEvent();
+    sw.handlers.install(event);
+    await Promise.all(event.waiting);
+    expect(sw.skipWaiting).toHaveBeenCalledTimes(1);
+    expect(sw.mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+// activate() takes control of open pages, then prunes any cache it no longer
+// recognizes so a new build's shell cache name (lucidos-shell-<BUILD_ID>)
+// purges the prior generation instead of leaking it forever.
+describe('Service Worker activate handler — cache lifecycle', () => {
+  function makeActivateEvent() {
+    const waiting: Array<Promise<unknown>> = [];
+    return { waitUntil: (p: Promise<unknown>) => { waiting.push(p); }, waiting };
+  }
+
+  it('prunes caches outside the keep-list, retains blob + shell caches', async () => {
+    const sw = loadSw();
+    sw.cacheNames.add('lucidos-blob-v1');
+    sw.cacheNames.add(SHELL_CACHE);
+    sw.cacheNames.add('lucidos-shell-oldbuild'); // stale prior-build generation
+    sw.cacheNames.add('some-other-cache');
+    const event = makeActivateEvent();
+    sw.handlers.activate(event);
+    await Promise.all(event.waiting);
+    expect(sw.mockCaches.delete).toHaveBeenCalledWith('lucidos-shell-oldbuild');
+    expect(sw.mockCaches.delete).toHaveBeenCalledWith('some-other-cache');
+    expect(sw.mockCaches.delete).not.toHaveBeenCalledWith('lucidos-blob-v1');
+    expect(sw.mockCaches.delete).not.toHaveBeenCalledWith(SHELL_CACHE);
+    expect([...sw.cacheNames].sort()).toEqual(['lucidos-blob-v1', SHELL_CACHE].sort());
+  });
+});
+
 // Build a push event with a JSON payload. The SW handler calls `event.data.json()`
 // and `event.waitUntil(promise)` — collect waitUntil promises so tests can await
 // them before asserting.
@@ -266,6 +508,29 @@ describe('Service Worker message handler — liveness ping', () => {
     const source = { postMessage: vi.fn() };
     handlers.message({ data: { type: 'lucidos:ping' }, source });
     expect(source.postMessage).toHaveBeenCalledWith({ type: 'lucidos:pong' });
+  });
+
+  it('responds to lucidos:get-build-id with the placeholder BUILD_ID (un-stamped dev source)', () => {
+    const source = { postMessage: vi.fn() };
+    handlers.message({ data: { type: 'lucidos:get-build-id' }, source });
+    expect(source.postMessage).toHaveBeenCalledWith({
+      type: 'lucidos:build-id',
+      buildId: '__LUCIDOS_BUILD_ID__',
+    });
+  });
+
+  it('responds to lucidos:get-build-id with the stamped BUILD_ID (built source)', () => {
+    const sw = loadSw({ buildId: 'testbuild0001' });
+    const source = { postMessage: vi.fn() };
+    sw.handlers.message({ data: { type: 'lucidos:get-build-id' }, source });
+    expect(source.postMessage).toHaveBeenCalledWith({
+      type: 'lucidos:build-id',
+      buildId: 'testbuild0001',
+    });
+  });
+
+  it('does not respond to lucidos:get-build-id when event.source is null', () => {
+    expect(() => handlers.message({ data: { type: 'lucidos:get-build-id' }, source: null })).not.toThrow();
   });
 
   it('ignores unknown message types', () => {
@@ -543,6 +808,127 @@ describe('Service Worker push handler — wake variant (layer 3)', () => {
     const [, opts] = mockRegistration.showNotification.mock.calls[0];
     expect(opts.renotify).toBe(true);
     expect(opts.silent).toBe(false);
+  });
+});
+
+// notificationclick — the macOS-Chrome tap path (Safari handles the tap
+// declaratively and never runs this handler). routeToDeepLink delivers the
+// deep link to an already-open Lucidos tab via postMessage, NOT via a
+// fragment-only client.navigate(). The fragment-navigate path is unreliable:
+// Chrome doesn't fire `hashchange` for a fragment-only WindowClient.navigate(),
+// and the page-side focus/visibilitychange resume safety net doesn't fire when
+// the tab the user clicked back into was already the focused/visible tab (the
+// "came back to the computer in the morning" report — SW focused the right tab
+// and marked the notification read, but the page never dispatched the deep
+// link, so no modal opened / no thread navigation). See
+// system-knowhow/notifications.md §4.5.
+describe('Service Worker notificationclick handler — deep-link routing', () => {
+  function makeClickEvent(data: Record<string, unknown>) {
+    const waited: Array<Promise<unknown>> = [];
+    return {
+      notification: { data, close: vi.fn() },
+      waitUntil: (p: Promise<unknown>) => { waited.push(p); },
+      _waited: waited,
+    };
+  }
+
+  function topLevelClient(url = 'https://example.com/') {
+    return {
+      frameType: 'top-level',
+      visibilityState: 'visible',
+      url,
+      navigate: vi.fn(() => Promise.resolve({ focus: vi.fn(() => Promise.resolve()) })),
+      focus: vi.fn(() => Promise.resolve()),
+      postMessage: vi.fn(),
+    };
+  }
+
+  const threadData = {
+    notification_id: 'nid-thread',
+    thread_id: 'tid-1',
+    event_id: 'evt-7',
+    tap: { kind: 'navigate', to: { target: 'thread', id: 'tid-1', event_id: 'evt-7' } },
+    navigate: '/#notification=nid-thread&thread=tid-1&event=evt-7',
+  };
+
+  it('warm controlled tab: posts the deep link to the existing client (not a fragment navigate)', async () => {
+    const { handlers, matchAll, mockFetch, openWindow } = loadSw();
+    mockFetch.mockResolvedValue(new Response('ok'));
+    const client = topLevelClient();
+    matchAll.mockResolvedValue([client]);
+
+    const ev = makeClickEvent(threadData);
+    handlers.notificationclick(ev);
+    await Promise.all(ev._waited);
+
+    // Deterministic page-side delivery: the structured deep link reaches the
+    // page's navigator.serviceWorker 'message' listener regardless of whether
+    // a hashchange fires or the tab was already focused.
+    expect(client.postMessage).toHaveBeenCalledWith({ type: 'lucidos:deep-link', target: threadData });
+    // The tab is brought forward.
+    expect(client.focus).toHaveBeenCalledTimes(1);
+    // Regression lock: the warm path must NOT fragment-navigate the tab — that
+    // "succeeds" yet routes nothing (no hashchange, resume listener idle when
+    // the tab was already focused). This is the morning-tap bug.
+    expect(client.navigate).not.toHaveBeenCalled();
+    // No duplicate window is opened when a tab already exists.
+    expect(openWindow).not.toHaveBeenCalled();
+  });
+
+  it('marks the source notification read via fetch (modal-tap: read even when page-side dispatch is the modal)', async () => {
+    const { handlers, matchAll, mockFetch } = loadSw();
+    mockFetch.mockResolvedValue(new Response('ok'));
+    matchAll.mockResolvedValue([topLevelClient()]);
+
+    const modalData = { notification_id: 'nid-modal', tap: { kind: 'modal' }, navigate: '/#notification=nid-modal' };
+    const ev = makeClickEvent(modalData);
+    handlers.notificationclick(ev);
+    await Promise.all(ev._waited);
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://example.com/api/v1/notification/read?id=nid-modal',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
+  it('modal tap posts the deep link to the existing client so the page opens the inbox modal', async () => {
+    const { handlers, matchAll, mockFetch } = loadSw();
+    mockFetch.mockResolvedValue(new Response('ok'));
+    const client = topLevelClient();
+    matchAll.mockResolvedValue([client]);
+
+    const modalData = { notification_id: 'nid-modal', tap: { kind: 'modal' }, navigate: '/#notification=nid-modal' };
+    const ev = makeClickEvent(modalData);
+    handlers.notificationclick(ev);
+    await Promise.all(ev._waited);
+
+    expect(client.postMessage).toHaveBeenCalledWith({ type: 'lucidos:deep-link', target: modalData });
+  });
+
+  it('no existing tab (cold): opens a window at the engine-built deep-link URL', async () => {
+    const { handlers, matchAll, mockFetch, openWindow } = loadSw();
+    mockFetch.mockResolvedValue(new Response('ok'));
+    matchAll.mockResolvedValue([]);
+
+    const ev = makeClickEvent(threadData);
+    handlers.notificationclick(ev);
+    await Promise.all(ev._waited);
+
+    expect(openWindow).toHaveBeenCalledWith(
+      'https://example.com/#notification=nid-thread&thread=tid-1&event=evt-7',
+    );
+  });
+
+  it('closes the OS notification on tap', async () => {
+    const { handlers, matchAll, mockFetch } = loadSw();
+    mockFetch.mockResolvedValue(new Response('ok'));
+    matchAll.mockResolvedValue([topLevelClient()]);
+
+    const ev = makeClickEvent(threadData);
+    handlers.notificationclick(ev);
+    await Promise.all(ev._waited);
+
+    expect(ev.notification.close).toHaveBeenCalledTimes(1);
   });
 });
 

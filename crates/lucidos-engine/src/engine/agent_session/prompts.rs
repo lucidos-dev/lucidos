@@ -207,8 +207,18 @@ pub(super) fn external_repo_system_prompt(
     format!(
         "REPOSITORY CONTEXT: You are working in an isolated git worktree of the \"{repo_name}\" repository \
          on branch `{branch_name}` (based on {base_ref}).\n\n\
-         You have full git access. Create feature branches, push, and create PRs as needed. \
-         The user's git credentials and CLI tools (gh, etc.) are available.\n\n\
+         You have full git access — push and open PRs as needed; the user's git credentials and \
+         CLI tools (gh, etc.) are available.\n\n\
+         STAY ON THIS WORKTREE'S BRANCH: Do ALL of your committed work on `{branch_name}` — the \
+         branch this worktree is checked out on. Lucidos tracks THIS branch for the thread's Diff \
+         view and for resuming you, and the branch you push must be the same one. If the repo's \
+         workflow wants a differently-named branch (e.g. a ticket branch like `UA-1234-...`), \
+         RENAME this branch in place with `git branch -m {branch_name} <new-name>` and keep \
+         working on it — do NOT `git checkout -b` a separate sibling branch, commit there, and \
+         leave this worktree behind. Stranding later commits (e.g. a pre-PR cleanup pass) on a \
+         branch this worktree is not on makes the Diff show stale, pre-cleanup work that no longer \
+         matches your PR. Whatever branch you finish on MUST be the one this worktree is checked \
+         out on — run `git branch --show-current` before you finish to confirm.\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Commit or discard anything unintentional.\n\n\
          {ask_user_question}\n\n\
@@ -545,6 +555,25 @@ mod tests {
         assert!(
             prompt.contains("Acme"),
             "must still name the repo so CC knows where it is",
+        );
+    }
+
+    #[test]
+    fn external_repo_prompt_tells_cc_to_stay_on_the_worktree_branch() {
+        // Regression guard: the prompt used to say "Create feature branches",
+        // which let CC fork a sibling branch off the worktree's tracked branch,
+        // commit a pre-PR cleanup pass there, push it, and leave the worktree
+        // stranded on the pre-cleanup commit — so the Diff view (which follows
+        // the worktree's branch) showed stale work that didn't match the PR.
+        // The fix instructs CC to rename in place rather than fork.
+        let prompt = external_repo_system_prompt("Acme", "UA-1879-fix", "origin/main");
+        assert!(
+            prompt.contains("git branch -m UA-1879-fix"),
+            "external prompt must tell CC to RENAME its branch in place, not fork a sibling",
+        );
+        assert!(
+            !prompt.contains("Create feature branches"),
+            "external prompt must not invite CC to create sibling feature branches",
         );
     }
 

@@ -586,14 +586,20 @@
     padding: 0.5rem;
 }
 
-/* --- FLIP animation portal: flying thread clones render here --- */
+/* --- FLIP animation portal: flying thread clones render here ---
+   z-index sits just below the modal/restart/toast layer (--z-modal = 2300):
+   above all app chrome (header, panes, drawer) so a flying thread is never
+   clipped by normal UI, yet below the restart overlay and modals so a thread
+   whose status changes during an engine restart can't fly above the dim
+   blocker. Only the toast container (--z-toast) stays above the restart
+   overlay. */
 .flip-portal {
     position: fixed;
     top: 0;
     left: 0;
     width: 0;
     height: 0;
-    z-index: 9999;
+    z-index: calc(var(--z-modal) - 1);
     pointer-events: none;
     overflow: visible;
 }

@@ -8,6 +8,8 @@ import { Dropdown } from '../shared/Dropdown';
 import {
   getBackupProviders,
   getBackupKey,
+  generateBackupKey,
+  getBackupKeyExists,
   getBackupSchedule,
   setBackupSchedule,
   getBackupRetention,
@@ -200,12 +202,29 @@ export function shouldPollBackupStatus(status: Loadable<BackupStatus>, liveProgr
   return status.status === 'loaded' && status.data.running && !liveProgress;
 }
 
+/** Label for the single backup-key button. `keyExists` is the read-only probe
+ *  result (null = not probed yet); it decides "Show backup key" (a key exists)
+ *  vs "Generate new backup key" (none yet). Once a key is revealed the button
+ *  toggles to "Hide backup key". Defaulting the unknown state to "Show backup
+ *  key" is safe because the click handler falls back to generate if the reveal
+ *  404s. This is what stops a "show" action from silently minting a key — the
+ *  behavior that surfaced a "New backup key generated" toast for a workspace
+ *  that already had backups. */
+export function backupKeyButtonLabel(keyExists: boolean | null, showingKey: boolean): string {
+  if (showingKey) return 'Hide backup key';
+  if (keyExists === false) return 'Generate new backup key';
+  return 'Show backup key';
+}
+
 export function BackupSection() {
   const [providersLoadable, setProvidersLoadable] = useState<Loadable<BackupProviderInfo[]>>({ status: 'not-loaded' });
   const showProvidersLoading = useDelayedLoading(providersLoadable);
   const [selectedProvider, setSelectedProvider] = useState<string>('');
   const [keyInfo, setKeyInfo] = useState<BackupKeyResponse | null>(null);
   const [showKey, setShowKey] = useState(false);
+  // null until the on-mount existence probe answers. Drives the button label
+  // (Show vs Generate) without revealing or minting the key.
+  const [keyExists, setKeyExists] = useState<boolean | null>(null);
   const [backupsLoadable, setBackupsLoadable] = useState<Loadable<BackupEntry[]>>({ status: 'not-loaded' });
   const showBackupsLoading = useDelayedLoading(backupsLoadable);
   const [statusLoadable, setStatusLoadable] = useState<Loadable<BackupStatus>>({ status: 'not-loaded' });
@@ -258,6 +277,16 @@ export function BackupSection() {
     getRestoreStatus().then((s) => {
       restoreState.value = s;
     }).catch(() => { /* no banner until SSE or a successful later fetch */ });
+
+    // Probe whether a backup key already exists so the key button labels itself
+    // correctly ("Show backup key" vs "Generate new backup key") without
+    // revealing the secret or minting one. Best-effort startup probe: a failed
+    // probe leaves keyExists null, and the click handler still resolves
+    // correctly (reveal, falling back to generate on a 404) and surfaces any
+    // real error there — so no toast is owed here.
+    getBackupKeyExists()
+      .then((r) => setKeyExists(r.exists))
+      .catch(() => { /* label falls back to "Show"; the click handler resolves it */ });
   }, []);
 
   // Cancel any pending workspace-name validation debounce on unmount so a
@@ -364,20 +393,50 @@ export function BackupSection() {
     }
   }
 
-  async function handleShowKey() {
+  async function handleKeyButton() {
+    // Already revealed → just toggle visibility, no refetch.
     if (keyInfo) {
       setShowKey(!showKey);
       return;
     }
+    // No key yet → generate one (the only user-facing mint path).
+    if (keyExists === false) {
+      await generateAndShowKey();
+      return;
+    }
+    // A key exists (or existence is still unknown) → reveal it read-only.
     try {
       const resp = await getBackupKey();
       setKeyInfo(resp);
       setShowKey(true);
+      setKeyExists(true);
+    } catch (err) {
+      // 404 = key vanished since the probe (or never existed) → generate it.
+      // Any other error is a real failure the user must see.
+      if (err instanceof ApiError && err.httpCode === 404) {
+        await generateAndShowKey();
+      } else {
+        showToast(`Failed to show backup key: ${errorDetail(err)}`, 'error');
+      }
+    }
+  }
+
+  async function generateAndShowKey() {
+    try {
+      const resp = await generateBackupKey();
+      setKeyInfo(resp);
+      setShowKey(true);
+      setKeyExists(true);
+      // is_new is false if a key already existed (race) — only warn when we
+      // actually minted one, since that's the moment the user must save it.
       if (resp.is_new) {
-        showToast('New backup key generated. Save it -- you need it to restore. It cannot be recovered.', 'warning');
+        showToast(
+          'New backup key generated. Store it somewhere safe right now — you need it to restore, and it cannot be recovered.',
+          'warning',
+        );
       }
     } catch (err) {
-      showToast(`Failed to get backup key: ${errorDetail(err)}`, 'error');
+      showToast(`Failed to generate backup key: ${errorDetail(err)}`, 'error');
     }
   }
 
@@ -614,9 +673,9 @@ export function BackupSection() {
         <div style="display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.5rem;">
           <button
             class="action-btn"
-            onClick={handleShowKey}
+            onClick={handleKeyButton}
           >
-            {showKey ? 'Hide backup key' : 'Show backup key'}
+            {backupKeyButtonLabel(keyExists, showKey)}
           </button>
           {showKey && keyInfo && (
             <>
@@ -629,7 +688,7 @@ export function BackupSection() {
         </div>
         {showKey && keyInfo && (
           <div style="font-size: 0.6875rem; color: var(--accent-red); margin-top: 0.25rem;">
-            Store this key somewhere safe — you need it to restore, and it cannot be recovered.
+            Store this key somewhere safe right now — you need it to restore, and it cannot be recovered.
           </div>
         )}
       </div>

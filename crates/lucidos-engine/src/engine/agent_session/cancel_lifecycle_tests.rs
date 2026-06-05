@@ -234,6 +234,18 @@ async fn cancel_does_not_terminate_session() {
         "CodingAgentIdled must be emitted on cancel so the thread doesn't freeze in 'running'"
     );
 
+    // The cancel left a recoverable resume anchor: `lookup_latest_cc_session_id`
+    // must surface the session id so the follow-up `--resume`s the SAME
+    // conversation instead of spawning a fresh, amnesiac CC session. This is the
+    // crux of "Cancel = Esc": a cancel is a resumable turn boundary.
+    let recovered =
+        crate::engine::agent_session::lookup_latest_cc_session_id(&pool, thread_id).await;
+    assert_eq!(
+        recovered,
+        Some("sid-cancel-1".to_string()),
+        "cancel must leave a recoverable cc_session_id so the next message resumes the same session"
+    );
+
     // Bonus: a follow-up message after cancel is accepted by the bus — the
     // thread is still alive (no terminal SessionEnded blocked it). The actual
     // re-spawn is the dispatcher's job (covered by spawn_dispatcher_tests);

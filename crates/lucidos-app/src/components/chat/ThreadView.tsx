@@ -430,10 +430,7 @@ export function ThreadView() {
                     showUp={isNotAtTop}
                     showDown={isUp}
                     onScrollUp={() => areaRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
-                    onScrollDown={() => {
-                        const el = areaRef.current;
-                        if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-                    }}
+                    onScrollDown={scrollToBottom}
                 />
             </div>
         </div>

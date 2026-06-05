@@ -744,11 +744,15 @@ fn navigate_url_ios(params: &str) -> String {
 }
 
 /// Chrome service-worker navigate URL — a **hash** URL, read off
-/// `notification.data.navigate` by the `notificationclick` handler and passed
-/// to `client.navigate()`. A hash-only change keeps a warm Chrome tap
-/// reload-free (same-document navigation, routed by the page's `hashchange`
-/// listener). The wedge/declarative concerns that force iOS to use a query
-/// URL don't apply here — Chrome's SW drives the navigation itself.
+/// `notification.data.navigate` by the `notificationclick` handler. It feeds
+/// only the COLD `clients.openWindow()` path (no Lucidos tab open): the
+/// freshly-opened page's cold-start `handleHashLocation` reads the deep-link
+/// params off the hash. A warm, already-open tab is routed by `postMessage`
+/// instead of by this URL — Chrome doesn't fire `hashchange` for a fragment-
+/// only `client.navigate()`, so the SW posts the structured deep link straight
+/// to the page (see `routeToDeepLink` in `sw.js` and
+/// `system-knowhow/notifications.md` §4.5). The query-vs-hash split with
+/// [`navigate_url_ios`] is kept: iOS needs a cross-document (query) URL.
 fn navigate_url_sw(params: &str) -> String {
     if params.is_empty() {
         "/".to_string()
@@ -824,8 +828,10 @@ fn build_wake_payload(
 ///
 /// **Chrome / Firefox** don't recognize the magic, so the SW `push` handler
 /// fires as usual, reads `data.notification.*` to populate `showNotification`,
-/// and the existing `notificationclick` path runs on tap — routing off the
-/// hash `data.navigate` via `client.navigate()` (warm = no reload).
+/// and the `notificationclick` path runs on tap: an already-open tab is routed
+/// by `postMessage` (the structured deep link straight to the page), and the
+/// hash `data.navigate` URL feeds only the cold `clients.openWindow()` fallback
+/// (no tab open). See `system-knowhow/notifications.md` §4.5.
 ///
 /// `tap` is ALWAYS encoded as part of the `data` block — the page's tap
 /// dispatcher routes on `tap.kind` (`modal` opens the inbox, `none` is
@@ -876,8 +882,9 @@ fn build_push_payload(
         serde_json::to_value(tap).expect("Tap serializes infallibly"),
     );
     // HASH form inside `data` so the Chrome SW `notificationclick` handler can
-    // read the engine-built URL straight off `event.notification.data` (and
-    // `client.navigate()` it warm-no-reload) instead of rebuilding it.
+    // read the engine-built URL straight off `event.notification.data` for the
+    // cold `clients.openWindow()` path (no tab open) instead of rebuilding it.
+    // Warm taps route via postMessage, not this URL — see `navigate_url_sw`.
     data.insert(
         "navigate".into(),
         serde_json::Value::String(navigate_sw),

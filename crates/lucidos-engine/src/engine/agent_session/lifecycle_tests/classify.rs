@@ -60,16 +60,32 @@ fn shutdown_wins_over_cc_error() {
         );
     }
 
-    /// CC error beats user_hit_stop — the user clicking Stop and CC failing
-    /// in the same window is rare, but the underlying failure is more
-    /// actionable than a benign cancel label.
+    /// user_hit_stop beats cc_error — this is the interrupt-cancel case. The
+    /// `Stop` button (Cancel = Esc) routes through CC's native interrupt, and an
+    /// interrupted turn comes back as a `Result` with `is_error: true` (CC
+    /// reports the aborted turn, e.g. `stop_reason=tool_use` / an
+    /// `[ede_diagnostic]` line). That error is *caused by* the user's cancel, so
+    /// it must classify as `Canceled`, not `Failed` — otherwise the user sees a
+    /// red "Failed" dot for a turn they deliberately stopped and the
+    /// branch-preservation gate (keyed on `Canceled`) never fires. A real
+    /// failure on a turn the user did NOT stop still classifies as `Failed`
+    /// (user_hit_stop is false there — see `cc_error_wins_over_empty_text`).
     #[test]
-    fn cc_error_wins_over_user_hit_stop() {
-        let err = "upstream 503".to_string();
-    let (terminal, _) =
-        classify_result(false, true, false, Some(err.clone()), false);
-    assert_eq!(terminal, Some(TerminalKind::Failed { error: err }));
-}
+    fn user_hit_stop_wins_over_cc_error() {
+        use crate::engine::thread_events::CancelCause;
+        let err = "[ede_diagnostic] result_type=user stop_reason=tool_use".to_string();
+        let (terminal, emit_idle) =
+            classify_result(false, true, false, Some(err), false);
+        assert_eq!(
+            terminal,
+            Some(TerminalKind::Canceled(CancelCause::UserStop)),
+            "an interrupted turn (cc_error set by the cancel) must be Canceled, not Failed"
+        );
+        assert!(
+            emit_idle,
+            "cancel is a turn boundary — CodingAgentIdled must follow so the session stays resumable"
+        );
+    }
 
 /// Empty assistant text on an otherwise-clean turn classifies as `Failed`,
 /// not `Generated`. Without this branch, a Claude Code subprocess that bailed after
@@ -429,21 +445,26 @@ fn image_only_message_is_not_silent_resume() {
 ///     because the net diff happens to be zero would lose work.
 ///   - No commits on the branch always cleans up, regardless of the
 ///     other inputs (the diff signal is moot).
+///   - A user cancel (`user_canceled=true`) keeps the branch
+///     (`KeepCanceledBranch`) so the session stays resumable — even with no
+///     commits, where it would otherwise `CleanupBranches` → `git branch -D`.
+///     It never proposes (a cancelled turn is half-finished work), and it
+///     ranks below the external/crash keep-branch arms.
 #[test]
 fn classify_session_end_action_table() {
     use SessionEndAction::*;
     let cases = [
-        // (has_commits, files_empty, is_external, safety_net_fired) → action
+        // (has_commits, files_empty, is_external, safety_net_fired, user_canceled) → action
         //
-        // Healthy turn (safety_net_fired=false) — same as before this column existed:
-        ((true, false, false, false), Propose),
-        ((true, true, false, false), CleanupBranches), // phantom-Change regression
-        ((true, false, true, false), KeepExternalBranch),
-        ((true, true, true, false), KeepExternalBranch),
-        ((false, false, false, false), CleanupBranches),
-        ((false, true, false, false), CleanupBranches),
-        ((false, false, true, false), CleanupBranches),
-        ((false, true, true, false), CleanupBranches),
+        // Healthy turn (safety_net_fired=false, user_canceled=false) — same as before:
+        ((true, false, false, false, false), Propose),
+        ((true, true, false, false, false), CleanupBranches), // phantom-Change regression
+        ((true, false, true, false, false), KeepExternalBranch),
+        ((true, true, true, false, false), KeepExternalBranch),
+        ((false, false, false, false, false), CleanupBranches),
+        ((false, true, false, false, false), CleanupBranches),
+        ((false, false, true, false, false), CleanupBranches),
+        ((false, true, true, false, false), CleanupBranches),
         //
         // Safety-net fired — CC died mid-stream:
         //   - In our own repo with commits: CrashedKeepBranch (keep work,
@@ -452,25 +473,38 @@ fn classify_session_end_action_table() {
         //   - External repo with commits: still KeepExternalBranch — user
         //     owns the ref regardless of how the session ended.
         //   - No commits: CleanupBranches — nothing to keep.
-        ((true, false, false, true), CrashedKeepBranch),
-        ((true, true, false, true), CrashedKeepBranch),
-        ((true, false, true, true), KeepExternalBranch),
-        ((true, true, true, true), KeepExternalBranch),
-        ((false, false, false, true), CleanupBranches),
-        ((false, true, false, true), CleanupBranches),
-        ((false, false, true, true), CleanupBranches),
-        ((false, true, true, true), CleanupBranches),
+        ((true, false, false, true, false), CrashedKeepBranch),
+        ((true, true, false, true, false), CrashedKeepBranch),
+        ((true, false, true, true, false), KeepExternalBranch),
+        ((true, true, true, true, false), KeepExternalBranch),
+        ((false, false, false, true, false), CleanupBranches),
+        ((false, true, false, true, false), CleanupBranches),
+        ((false, false, true, true, false), CleanupBranches),
+        ((false, true, true, true, false), CleanupBranches),
+        //
+        // User cancel (Stop = Esc, user_canceled=true) — keep the branch so the
+        // session stays resumable; never propose. The grilling-cancel bug is the
+        // no-commits row: it MUST be KeepCanceledBranch, not CleanupBranches.
+        ((false, true, false, false, true), KeepCanceledBranch), // grilling cancel (the bug)
+        ((false, false, false, false, true), KeepCanceledBranch),
+        ((true, false, false, false, true), KeepCanceledBranch), // commits but cancelled → keep, don't propose
+        ((true, true, false, false, true), KeepCanceledBranch),
+        // External repo and crash arms still win over the cancel arm:
+        ((true, false, true, false, true), KeepExternalBranch),
+        ((true, false, false, true, true), CrashedKeepBranch), // defensive: can't really co-occur
     ];
-    for ((has_commits, files_empty, is_external, safety_net_fired), expected) in cases {
+    for ((has_commits, files_empty, is_external, safety_net_fired, user_canceled), expected) in cases
+    {
         assert_eq!(
             classify_session_end_action(
                 has_commits,
                 files_empty,
                 is_external,
                 safety_net_fired,
+                user_canceled,
             ),
             expected,
-            "(has_commits={has_commits}, files_empty={files_empty}, is_external={is_external}, safety_net_fired={safety_net_fired})",
+            "(has_commits={has_commits}, files_empty={files_empty}, is_external={is_external}, safety_net_fired={safety_net_fired}, user_canceled={user_canceled})",
         );
     }
 }

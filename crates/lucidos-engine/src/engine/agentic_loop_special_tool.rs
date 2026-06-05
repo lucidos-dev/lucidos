@@ -862,16 +862,20 @@ impl LucidosEngine {
             let mut result_blocks: Vec<ContentBlock> = Vec::new();
             for tc in &response.tool_calls {
                 // Emit ToolCalled via bus. Capture the event_id so spawn-style tools
-                // can record it as the spawning_event_id of the new thread.
+                // can record it as the spawning_event_id of the new thread. Redact
+                // first, then build BOTH the description and the args from the
+                // redacted copy — the description renders in the steps UI, so a
+                // postgres password in a bash command must not survive in it.
                 let mut redacted_args = tc.arguments.clone();
                 crate::core::redact_postgres_secrets_in_json(&mut redacted_args);
+                let description = self.describe_tool(&tc.name, &redacted_args);
                 let tool_called_event_id = self
                     .event_bus
                     .emit_for_id(BusEvent::Thread {
                         thread_id,
                         event: ThreadEvent::ToolCalled {
                             name: tc.name.clone(),
-                            description: self.describe_tool(&tc.name, &tc.arguments),
+                            description,
                             args: redacted_args,
                         },
                         meta: EventMeta::NONE,

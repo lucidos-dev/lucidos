@@ -264,10 +264,10 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
     }
   });
 
-  it('exposes Diff (enabled) for external repo with branch diff even when codingAgentProposed is false', () => {
+  it('shows Diff for external repo with branch diff even when codingAgentProposed is false', () => {
     // codingAgentProposed can drift to false while the branch is still ahead of main;
     // codingAgentHasDiff is the git-truth signal that survives that drift, so the
-    // Diff button stays enabled.
+    // Diff button stays shown.
     const thread = makeCCThread('t1', 'idle', 'inbox');
     thread.meta.codingAgentProposed = false;
     thread.meta.codingAgentIsExternalRepo = true;
@@ -279,16 +279,16 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
-      expect(state!.ccDiff).toBe('enabled');
+      expect(state!.showDiff).toBe(true);
     }
   });
 });
 
-describe('Diff button is always offered for CC threads, disabled when there is no diff', () => {
-  it('internal CC thread with codingAgentHasDiff=true shows Diff enabled even without a Change row', () => {
+describe('Diff button shows only when the CC thread has a diff', () => {
+  it('internal CC thread with codingAgentHasDiff=true shows Diff even without a Change row', () => {
     // CC made commits on the branch and the projection saw the branch is
     // ahead of main (codingAgentHasDiff=true), but the Change row hasn't
-    // materialized yet. Diff is still enabled — the git-truth signal carries
+    // materialized yet. Diff is still shown — the git-truth signal carries
     // the affordance independently of the Change row's appearance.
     const thread = makeCCThread('t1', 'waiting', 'inbox');
     thread.meta.codingAgentProposed = true;
@@ -301,14 +301,14 @@ describe('Diff button is always offered for CC threads, disabled when there is n
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
-      expect(state!.ccDiff).toBe('enabled');
+      expect(state!.showDiff).toBe(true);
     }
   });
 
-  it('internal CC thread with no changes shows Diff disabled', () => {
-    // Archive-only banner on a CC thread that did no work. The Diff button
-    // still renders so the user sees the affordance, but it's disabled
-    // (with a tooltip) since there's nothing to look at.
+  it('internal CC thread with no changes hides Diff entirely', () => {
+    // Archive-only banner on a CC thread that did no work. The Diff button is
+    // not rendered at all — there is nothing to look at, so the affordance
+    // would only mislead.
     const thread = makeCCThread('t1', 'idle', 'inbox');
     thread.meta.codingAgentProposed = false;
     thread.meta.codingAgentIsExternalRepo = false;
@@ -319,7 +319,7 @@ describe('Diff button is always offered for CC threads, disabled when there is n
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
-      expect(state!.ccDiff).toBe('disabled');
+      expect(state!.showDiff).toBe(false);
     }
   });
 
@@ -334,7 +334,7 @@ describe('Diff button is always offered for CC threads, disabled when there is n
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
       expect(state!.actions.map((a) => a.kind)).toContain('archive');
-      expect(state!.ccDiff).toBe('hidden');
+      expect(state!.showDiff).toBe(false);
     }
   });
 });

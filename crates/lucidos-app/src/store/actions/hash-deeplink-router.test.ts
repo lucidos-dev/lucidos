@@ -263,11 +263,11 @@ describe('hash-deeplink-router', () => {
     });
 
     it('s4_5_setup_routing_teardown_clears_cold_start_timer', () => {
-      // Fake timers so we can advance past the 500ms cold-start without
+      // Fake timers so we can advance past the cold-start dispatch without
       // a real wall-clock wait. Without this assertion, a regression that
       // drops `clearTimeout(coldStartTimer)` from teardown would still pass
-      // the listener-removal test above — the timer would fire ~500ms later
-      // (outside the synchronous test body) and silently dispatch.
+      // the listener-removal test above — the timer would fire on the next
+      // macrotask (outside the synchronous test body) and silently dispatch.
       vi.useFakeTimers();
       try {
         const teardown = setupHashDeeplinkRouting();

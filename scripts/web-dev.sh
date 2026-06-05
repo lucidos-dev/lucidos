@@ -2,7 +2,8 @@
 # Start Lucidos in browser-based development mode:
 #   - PostgreSQL with pgvector in Docker
 #   - Rust engine runs natively on macOS (fast iteration)
-#   - Frontend served via Vite dev server
+#   - Frontend served as a built bundle by default (vite build --watch + vite
+#     preview); pass --hmr for the live Vite dev server
 #   - Supports multiple workspaces running concurrently
 set -e
 

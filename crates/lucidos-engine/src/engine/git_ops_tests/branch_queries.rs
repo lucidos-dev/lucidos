@@ -227,6 +227,70 @@ async fn commit_plus_revert_branch_has_no_changed_files() {
     );
 }
 
+/// `branch_changed_files` must diff against the SAME base the Diff button uses
+/// (`default_diff_base`), so the `coding_agent_has_diff` gate it feeds can never
+/// disagree with the diff the button renders.
+///
+/// Regression for the `user-acquisition` migration report: a migration tool
+/// rewrote the user's local default branch so `origin/<default>` (the PR
+/// branch's true fork point) is no longer an ancestor of local `main`. Diffing
+/// against local `main` reported 53 changed files; the Diff button (diffing
+/// against `origin/main`) showed 0 — the button lit up on an empty diff. With
+/// the base aligned, `branch_changed_files` returns empty in this scenario,
+/// matching the button.
+#[tokio::test]
+async fn branch_changed_files_uses_origin_base_when_local_default_diverged() {
+    let origin_tmp = tempfile::tempdir().unwrap();
+    let origin = origin_tmp.path().to_path_buf();
+    let _ = git_cmd(&["init", "-q", "--bare", "-b", "main"], &origin).await;
+
+    let (_tmp, repo) = make_test_repo().await;
+    let c_root = String::from_utf8_lossy(
+        &git_cmd(&["rev-parse", "HEAD"], &repo).await.unwrap().stdout,
+    )
+    .trim()
+    .to_string();
+
+    // A commit on main that the PR branch forks from, then publish so
+    // `origin/main` holds that fork point.
+    tokio::fs::write(repo.join("fork-point.txt"), "shipped before the branch\n")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "feature on main (branch forks here)"], &repo).await;
+    let _ = git_cmd(&["remote", "add", "origin", origin.to_str().unwrap()], &repo).await;
+    let _ = git_cmd(&["push", "-q", "origin", "main"], &repo).await;
+    let _ = git_cmd(&["remote", "set-head", "origin", "main"], &repo).await;
+
+    // The CC branch forks from the fork point and adds nothing of its own —
+    // its commits are exactly what already lives on origin/main.
+    let _ = git_cmd(&["branch", "feature", "main"], &repo).await;
+
+    // A migration rewrites local `main`: reset to the root, commit a notice.
+    // `origin/main` is no longer an ancestor of local `main` — they diverge.
+    let _ = git_cmd(&["reset", "-q", "--hard", &c_root], &repo).await;
+    tokio::fs::write(repo.join("MIGRATION.md"), "moved to new-org\n")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "migration: secrets transfer (automated)"], &repo).await;
+
+    // Against local `main` the three-dot diff would surface `fork-point.txt`
+    // (and miss `MIGRATION.md`); against `origin/main` (the branch's true fork
+    // point) the branch has zero net diff.
+    let files = branch_changed_files(&repo, "feature").await;
+    assert!(
+        files.is_empty(),
+        "branch_changed_files must diff against origin/main when local main diverged, got: {:?}",
+        files
+    );
+    assert_eq!(
+        proposal_files_for_branch(&repo, "feature").await,
+        None,
+        "no net diff against the branch's true fork point must not warrant a Change proposal"
+    );
+}
+
 /// Recovery must NOT propose a Change when the branch has commits but zero net
 /// diff. Without this gate, `propose_branch_changes` creates a `changes` row
 /// with `file_count=0`, which renders Apply/Discard buttons that do nothing

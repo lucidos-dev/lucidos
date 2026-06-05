@@ -21,19 +21,26 @@
 #   SCRIPT_NAME  — basename of the calling script (for usage messages)
 
 # ── parse_dev_args ──────────────────────────────────────────────────────
-# Parse -w, -b, -r, -h flags. Sets WORKSPACE, BUILD, RELEASE.
+# Parse -w, -b, -r, -h flags. Sets WORKSPACE, BUILD, RELEASE, BUILT.
 parse_dev_args() {
     WORKSPACE="${LUCIDOS_WORKSPACE:-}"
     BUILD=""
     RELEASE=""
     ENGINE_ONLY=""
     FOLLOW_LOG=""
+    # Built frontend is the DEFAULT (vite build --watch + vite preview): the SW
+    # caches bundled /assets/* so an iOS PWA resumes instantly, and the client
+    # can't drift ahead of the engine. Pass --hmr to opt into the live Vite dev
+    # server instead (HMR, for active frontend iteration).
+    BUILT="1"
     while [[ $# -gt 0 ]]; do
         case $1 in
             -w|--workspace) WORKSPACE="$2"; shift 2 ;;
             -b|--build) BUILD="1"; shift ;;
             -r|--release) RELEASE="1"; shift ;;
             -f|--follow) FOLLOW_LOG="1"; shift ;;
+            --hmr|--dev) BUILT=""; shift ;;
+            --built) BUILT="1"; shift ;;   # explicit; built is already the default
             --engine-only) ENGINE_ONLY="1"; BUILD="1"; shift ;;
             -h|--help)
                 echo "Usage: $SCRIPT_NAME -w <workspace> [OPTIONS]"
@@ -43,14 +50,22 @@ parse_dev_args() {
                 echo "  -b, --build           Build engine before starting"
                 echo "  -r, --release         Build in release mode (slower build, faster runtime)"
                 echo "  -f, --follow          Tail the engine log after startup (default: exit after ready)"
+                echo "  --hmr                 Use the live Vite dev server (HMR) instead of the default"
+                echo "                        built frontend. Faster frontend iteration, but the iOS PWA"
+                echo "                        cold-loads slowly over a network link. (alias: --dev)"
+                echo "  --built               Serve a built frontend — the DEFAULT (vite build --watch +"
+                echo "                        vite preview): SW-cached /assets/* for instant PWA resume;"
+                echo "                        rebuilds on change with a 'New version available' toast."
+                echo "                        Listed for clarity; you get this without the flag."
                 echo "  --engine-only         Rebuild and restart only the engine (skip Vite, keep parent scripts)"
                 echo "  -h, --help            Show this help"
                 echo ""
                 echo "Examples:"
-                echo "  $SCRIPT_NAME -w dev               # ~/workspaces/dev"
-                echo "  $SCRIPT_NAME -w personal -b       # ~/workspaces/personal, build first"
+                echo "  $SCRIPT_NAME -w dev               # ~/workspaces/dev (built frontend, the default)"
+                echo "  $SCRIPT_NAME -w personal -b       # ~/workspaces/personal, build engine first"
                 echo "  $SCRIPT_NAME -w dev -f             # start and tail the engine log"
                 echo "  $SCRIPT_NAME -w /some/path -b -r  # absolute path, release build"
+                echo "  $SCRIPT_NAME -w dev -b --hmr       # live Vite dev server (HMR) for frontend iteration"
                 exit 0
                 ;;
             *) echo "Unknown option: $1"; exit 1 ;;
@@ -155,6 +170,9 @@ resolve_workspace() {
     # Workspace-scoped state files
     ENGINE_PIDFILE="$WORKSPACE/.lucidos/engine.pid"
     FRONTEND_PIDFILE="$WORKSPACE/.lucidos/frontend.pid"
+    # --built mode runs a second process (`vite build --watch`) alongside the
+    # `vite preview` server tracked by FRONTEND_PIDFILE. Empty file in dev mode.
+    BUILD_WATCH_PIDFILE="$WORKSPACE/.lucidos/build-watch.pid"
     ENGINE_LOG="$WORKSPACE/.lucidos/engine.log"
 
     # Compute a short name for the postgres container from workspace path
@@ -679,6 +697,21 @@ kill_stale_processes() {
         rm -f "$FRONTEND_PIDFILE"
     fi
 
+    # Stop any existing --built mode build-watch (skip in --engine-only mode).
+    # Symmetric with the frontend kill above: the parent-script `pkill -P` only
+    # reaps it if the prior dev script is still alive, so a crashed prior run
+    # would otherwise orphan the `vite build --watch` and leak its file watcher.
+    if [ -z "$ENGINE_ONLY" ] && [ -f "$BUILD_WATCH_PIDFILE" ]; then
+        local old_pid
+        old_pid="$(cat "$BUILD_WATCH_PIDFILE" 2>/dev/null || true)"
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            echo "Stopping existing frontend build-watch for this workspace (PID $old_pid)..."
+            kill "$old_pid" 2>/dev/null || true
+            killed=1
+        fi
+        rm -f "$BUILD_WATCH_PIDFILE"
+    fi
+
     # Wait for killed processes to release their ports before the caller
     # builds + launches the replacements. The engine needs an explicit wait:
     # its graceful-shutdown budget is 10s (main.rs) and draining an in-flight
@@ -1038,54 +1071,123 @@ build_sdk() {
     (cd "$PROJECT_DIR/packages/lucidos-sdk" && npm run build)
 }
 
+# ── wait_for_frontend ────────────────────────────────────────────────────
+# Poll a probe URL until it returns the expected content-type, or fail (60s).
+# Args: $1 = probe URL, $2 = kind (`js` for the dev /@vite/client probe,
+# `html` for the built preview SPA-index probe). On timeout, tears down the
+# frontend (and the build-watch process, if any) and exits 1.
+wait_for_frontend() {
+    local probe_url="$1" kind="$2"
+    echo -n "Waiting for frontend"
+    local content_type="" ok="" deadline=$((SECONDS + 60))
+    while (( SECONDS < deadline )); do
+        # `|| true` keeps curl's exit 7 (connect refused while it spins up) from
+        # tripping `set -e` through the assignment on macOS bash 3.2.
+        content_type=$(curl -sk --connect-timeout 1 --max-time 2 -o /dev/null -w "%{content_type}" "$probe_url" 2>/dev/null || true)
+        case "$kind:$content_type" in
+            js:text/javascript*|js:application/javascript*) ok="yes" ;;
+            html:text/html*) ok="yes" ;;
+        esac
+        if [ -n "$ok" ]; then
+            echo " ready!"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+
+    echo ""
+    echo "ERROR: frontend did not become ready within 60 seconds." >&2
+    echo "  $probe_url returned content-type: ${content_type:-<no response>}" >&2
+    kill "$FRONTEND_PID" 2>/dev/null || true
+    rm -f "$FRONTEND_PIDFILE"
+    if [ -n "${BUILD_WATCH_PID:-}" ]; then kill "$BUILD_WATCH_PID" 2>/dev/null || true; fi
+    rm -f "$BUILD_WATCH_PIDFILE" 2>/dev/null || true
+    exit 1
+}
+
 # ── start_vite ──────────────────────────────────────────────────────────
-# Install npm deps if needed, start Vite on internal port, wait for ready (60s).
-# Sets FRONTEND_PID.
+# Install npm deps if needed, start the frontend on the internal port, wait
+# for ready. Two modes: a built frontend (the default — vite build --watch +
+# vite preview, no HMR), or the live Vite dev server (`--hmr`). Sets
+# FRONTEND_PID (and, in built mode, BUILD_WATCH_PID).
 start_vite() {
     ensure_frontend_deps
-
-    echo "Starting Vite dev server..."
     export VITE_PORT="$INTERNAL_VITE_PORT"
     export API_PORT="$ENGINE_PORT"
+    detect_vite_tls
+
+    # Built frontend is the default: parse_dev_args sets BUILT=1 unless --hmr.
+    # The e2e harness drives start_vite without parse_dev_args and never sets
+    # BUILT, so `${BUILT:-}` is empty there → it stays on the live Vite dev
+    # server (unchanged by this default). ENGINE_ONLY restarts never reach here
+    # (web-dev.sh exits before start_vite), so a CC Apply restart leaves the
+    # already-running preview + build-watch untouched.
+    if [ -n "${BUILT:-}" ]; then
+        start_frontend_built
+    else
+        start_frontend_dev
+    fi
+}
+
+# Live Vite dev server with HMR.
+start_frontend_dev() {
+    echo "Starting Vite dev server..."
     (cd "$FRONTEND_DIR" && npx vite --host --port "$INTERNAL_VITE_PORT") > /dev/null 2>&1 &
     FRONTEND_PID=$!
     echo $FRONTEND_PID > "$FRONTEND_PIDFILE"
-
-    detect_vite_tls
 
     # Probe `/@vite/client` instead of `/`. A wedged Vite (e.g. node_modules
     # mutated under it) still returns 200 on `/` with the SPA index, so the
     # old probe passed for a server that would serve a blank page. The Vite
     # internal `/@vite/client` endpoint must return text/javascript — anything
     # else means Vite is broken even if it's listening.
-    local probe_url="$VITE_PROTO://localhost:$INTERNAL_VITE_PORT/@vite/client"
-    echo -n "Waiting for Vite"
-    local vite_ready="" content_type=""
-    # Wall-clock budget: per-curl `--max-time 2` means an iteration count would
-    # be misleading. SECONDS reflects real elapsed seconds.
-    local deadline=$((SECONDS + 60))
-    while (( SECONDS < deadline )); do
-        # `|| true` keeps curl's exit 7 (connect refused while Vite spins up) from
-        # tripping `set -e` through the assignment on macOS bash 3.2.
-        content_type=$(curl -sk --connect-timeout 1 --max-time 2 -o /dev/null -w "%{content_type}" "$probe_url" 2>/dev/null || true)
-        if [[ "$content_type" == text/javascript* || "$content_type" == application/javascript* ]]; then
-            echo " ready!"
-            vite_ready="yes"
-            break
+    wait_for_frontend "$VITE_PROTO://localhost:$INTERNAL_VITE_PORT/@vite/client" js
+}
+
+# Built frontend: `vite build --watch` produces a bundled, content-hashed
+# dist/ (rebuilding on source change), served statically by `vite preview`.
+# No HMR — the SW caches /assets/* so an iOS PWA resumes instantly, and the
+# "New version available" toast (driven by the per-build sw.js stamp) signals
+# when a rebuild is ready to reload. Note: like the dev server, this skips
+# `tsc --noEmit` — type errors surface at the explicit build / in CC harden.
+start_frontend_built() {
+    echo "Building frontend (vite build --watch)..."
+    # Clean slate so dist/index.html only (re)appears when THIS build finishes
+    # — avoids starting preview against a stale or half-written dist.
+    rm -rf "$FRONTEND_DIR/dist"
+    (cd "$FRONTEND_DIR" && npx vite build --watch) > /dev/null 2>&1 &
+    BUILD_WATCH_PID=$!
+    echo $BUILD_WATCH_PID > "$BUILD_WATCH_PIDFILE"
+
+    echo -n "Waiting for initial frontend build"
+    local build_deadline=$((SECONDS + 180))
+    while (( SECONDS < build_deadline )); do
+        if [ -f "$FRONTEND_DIR/dist/index.html" ]; then echo " done!"; break; fi
+        if ! kill -0 "$BUILD_WATCH_PID" 2>/dev/null; then
+            echo ""
+            echo "ERROR: vite build --watch exited before producing dist/index.html." >&2
+            rm -f "$BUILD_WATCH_PIDFILE"
+            exit 1
         fi
         echo -n "."
         sleep 1
     done
-
-    if [ -z "$vite_ready" ]; then
+    if [ ! -f "$FRONTEND_DIR/dist/index.html" ]; then
         echo ""
-        echo "ERROR: Vite did not become ready within 60 seconds." >&2
-        echo "  $probe_url returned content-type: ${content_type:-<no response>}" >&2
-        echo "  (expected text/javascript — Vite is wedged, killing it)" >&2
-        kill "$FRONTEND_PID" 2>/dev/null || true
-        rm -f "$FRONTEND_PIDFILE"
+        echo "ERROR: initial frontend build did not complete within 180s." >&2
+        kill "$BUILD_WATCH_PID" 2>/dev/null || true
+        rm -f "$BUILD_WATCH_PIDFILE"
         exit 1
     fi
+
+    echo "Starting vite preview..."
+    (cd "$FRONTEND_DIR" && npx vite preview --host --port "$INTERNAL_VITE_PORT") > /dev/null 2>&1 &
+    FRONTEND_PID=$!
+    echo $FRONTEND_PID > "$FRONTEND_PIDFILE"
+
+    # Preview serves the SPA index (text/html) — a built app has no /@vite/client.
+    wait_for_frontend "$VITE_PROTO://localhost:$INTERNAL_VITE_PORT/" html
 }
 
 # ── sleep_prevention_status ─────────────────────────────────────────────
@@ -1128,7 +1230,19 @@ show_banner() {
     if [ -n "$ts_hostname" ]; then
         echo "  Tailscale:   $PROTO://$ts_hostname:$ENGINE_PORT"
     fi
-    echo "  Vite HMR:    $PROTO://localhost:$INTERNAL_VITE_PORT"
+    # Frontend line is mode-aware: only the full web launch (`mode = web`) knows
+    # the chosen frontend mode via BUILT. tauri-dev always runs the live dev
+    # server (`npm run dev`) regardless of BUILT; an --engine-only restart never
+    # touched the frontend, so it can't claim a mode.
+    if [ "$mode" = "tauri" ]; then
+        echo "  Vite HMR:    $PROTO://localhost:$INTERNAL_VITE_PORT"
+    elif [ "$mode" = "engine-only" ]; then
+        echo "  Frontend:    $PROTO://localhost:$INTERNAL_VITE_PORT (unchanged)"
+    elif [ -n "${BUILT:-}" ]; then
+        echo "  Frontend:    built (vite preview) $PROTO://localhost:$INTERNAL_VITE_PORT"
+    else
+        echo "  Vite HMR:    $PROTO://localhost:$INTERNAL_VITE_PORT"
+    fi
     echo "  PostgreSQL:  localhost:$PG_PORT"
     echo "  Engine:      Native macOS"
     echo "  Sleep:       $(sleep_prevention_status)"
@@ -1145,6 +1259,11 @@ cleanup_processes() {
     if [ -f "$FRONTEND_PIDFILE" ]; then
         kill "$(cat "$FRONTEND_PIDFILE" 2>/dev/null)" 2>/dev/null || true
         rm -f "$FRONTEND_PIDFILE"
+    fi
+    # --built mode's `vite build --watch` companion (no-op file in dev mode).
+    if [ -f "$BUILD_WATCH_PIDFILE" ]; then
+        kill "$(cat "$BUILD_WATCH_PIDFILE" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$BUILD_WATCH_PIDFILE"
     fi
     echo "Engine still running for workspace: $WORKSPACE (port $ENGINE_PORT)"
     echo "Stop with: ./scripts/stop.sh -w $WORKSPACE"

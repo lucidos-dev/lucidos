@@ -290,6 +290,8 @@ The `description` is surfaced by `ThreadEvent::indexable_text()` and therefore *
 - `CancelCause`: `user_stop` (Stop button), `user_action` (Apply / Discard / Archive on running thread), `unknown` (legacy DB rows).
 - `AbortCause`: `engine_shutdown`, `safety_net`, `recovery_after_restart`, `process_killed`, `stale_settle`, `unknown` (legacy).
 
+On a *coding-agent thread*, `user_stop` is a **resumable turn boundary**, not a terminator: the `Stop` button routes through CC's native interrupt (Esc), so the turn is interrupted but the session stays alive — `CodingAgentIdled` (with the `cc_session_id`) follows, the branch is kept, and the next message `--resume`s the same conversation. This is distinct from `user_action` (Apply / Discard / Archive), which DO terminate via their own lifecycle event. See `system-knowhow/coding-agent-events.md` § `CodingAgentIdled` "Cancel = Esc".
+
 ### `BackgroundBashStarted` / `BackgroundBashCompleted`
 
 ```json

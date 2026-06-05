@@ -6,6 +6,7 @@ import {
   cancelStreamingResponse, countVisibleResponses, dismissCCSession,
   waitForStreamingToStart,
 } from './helpers';
+import { psql } from './db-helpers';
 
 // Benign bash sleep loop that keeps CC busy long enough for the test to click
 // stop. Avoids prompts that tip off CC as a test (e.g. wasteful file listings),
@@ -64,6 +65,62 @@ test.describe('Claude Code cancel and stop', () => {
         return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').includes(marker);
       });
     }, msg2, { timeout: 120_000 });
+  });
+
+  test('cancel resumes the same CC session, does not respawn a fresh one', async ({ page }) => {
+    await navigateToApp(page);
+    await newThread(page);
+    await switchToClaudeMode(page);
+
+    // Mark the boundary just before the spawn so we can find THIS test's thread
+    // by its `SessionStarted` (the events table isn't truncated between tests).
+    const since = psql(`SELECT now()`).trim();
+
+    await sendMessage(page, BUSY_BASH_PROMPT);
+    await waitForCCToStart(page, 60_000);
+    await waitForStreamingToStart(page, 1, 60_000);
+
+    // Cancel = Esc: interrupt the turn but keep the session resumable.
+    await cancelStreamingResponse(page);
+
+    // A follow-up must continue the SAME conversation.
+    const msg2 = uniqueMessage('cc-resume-after-cancel');
+    await sendFollowUp(page, `Say exactly: "recovered ${msg2}" and nothing else. Do not create any files.`);
+    await waitForExchangeCount(page, 2, 120_000);
+    await page.waitForFunction((marker) => {
+      const els = document.querySelectorAll('.response-content');
+      return Array.from(els).some(el => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').includes(marker);
+      });
+    }, msg2, { timeout: 120_000 });
+
+    // Backend continuity is the decisive signal — the THREAD HISTORY injection
+    // would feed a fresh session enough context to pass a content check, so it
+    // can't distinguish resume from respawn. The `cc_session_id` can: a real
+    // `--resume` keeps the same id; the old bug deleted the cancelled branch, so
+    // resume fell back to a brand-new session id. Identify this test's thread by
+    // its post-`since` SessionStarted, then assert exactly one distinct id.
+    const threadId = psql(
+      `SELECT aggregate_id FROM events WHERE event_type='SessionStarted' ` +
+      `AND created > '${since}'::timestamptz ORDER BY sequence DESC LIMIT 1`,
+    ).trim();
+    expect(threadId).toMatch(/^[0-9a-f-]{36}$/);
+
+    const distinctSids = psql(
+      `SELECT COUNT(DISTINCT payload->>'cc_session_id') FROM events ` +
+      `WHERE aggregate_id='${threadId}' ` +
+      `AND event_type IN ('CodingAgentSettingsChanged','CodingAgentIdled') ` +
+      `AND COALESCE(payload->>'cc_session_id','') <> ''`,
+    ).trim();
+    expect(distinctSids).toBe('1');
+
+    // And the cancel did not tear the session down (no SessionEnded, so the
+    // branch survived for the resume).
+    const sessionEnded = psql(
+      `SELECT COUNT(*) FROM events WHERE aggregate_id='${threadId}' AND event_type='SessionEnded'`,
+    ).trim();
+    expect(sessionEnded).toBe('0');
   });
 
   test('dismiss idle CC session with Archive button', async ({ page }) => {

@@ -502,6 +502,58 @@ async fn resolve_default_local_branch(repo_root: &Path) -> String {
     "main".to_string()
 }
 
+/// Resolve the base ref the Diff button should diff a coding-agent thread's
+/// branch against — the point its eventual PR/merge diverges from.
+///
+/// Defaults to the local default branch (e.g. `main`). That is the right base
+/// when the engine has applied work locally that hasn't been pushed yet: the
+/// local branch is then *linearly ahead* of `origin/<default>`, and diffing
+/// against it keeps already-merged commits out of the thread's diff (see
+/// `diff_base_is_local_main_when_origin_is_behind`).
+///
+/// But when the local default branch has *diverged* from the remote-tracking
+/// ref — its history was rewritten so `origin/<default>` is no longer an
+/// ancestor of it (a repo migration, a force-pull, or a rebase landed on the
+/// user's local `main`) — the merge-base with the thread branch collapses to an
+/// ancient commit and the diff balloons with unrelated churn. Then fall back to
+/// `origin/<default>`, which still holds the branch's true fork point, so the
+/// diff matches what the host (GitHub, …) computes for the PR.
+///
+/// Repos with no `origin` remote (test fixtures, fresh init) keep the local
+/// branch name.
+pub(crate) async fn default_diff_base(repo_root: &Path) -> String {
+    let local = default_local_branch(repo_root).await;
+    let remote_tracking = format!("origin/{local}");
+    if git_ref_exists(repo_root, &remote_tracking).await
+        && !is_ancestor(repo_root, &remote_tracking, &local).await
+    {
+        return remote_tracking;
+    }
+    local
+}
+
+/// `true` if `git_ref` resolves to a commit in `repo_root`.
+async fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
+    git_cmd(&["rev-parse", "--verify", "--quiet", git_ref], repo_root)
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// `true` if `ancestor` is an ancestor of `descendant` (i.e. `descendant`'s
+/// history contains `ancestor`). Mirrors `git merge-base --is-ancestor`, whose
+/// exit status is 0 for yes and 1 for no. A commit is its own ancestor, so
+/// equal refs return `true`.
+async fn is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> bool {
+    git_cmd(
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        repo_root,
+    )
+    .await
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}
+
 const DEFAULT_BRANCH_CACHE_TTL: Duration = Duration::from_secs(60);
 
 fn default_branch_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, String)>> {

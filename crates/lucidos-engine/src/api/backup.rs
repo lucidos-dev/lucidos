@@ -23,6 +23,11 @@ pub struct KeyResponse {
     pub is_new: bool,
 }
 
+#[derive(Serialize)]
+pub struct KeyExistsResponse {
+    pub exists: bool,
+}
+
 #[derive(Deserialize)]
 pub struct BackupRequest {
     pub provider: String,
@@ -150,19 +155,61 @@ pub async fn list_providers(
     Ok(Json(result))
 }
 
+/// GET /api/v1/backup/key — reveal the EXISTING key. Read-only: returns 404 when
+/// no key has been generated yet (the page then offers "Generate new backup
+/// key"). It must NEVER mint a key as a side effect — the old behavior silently
+/// generated one here, which orphaned prior backups (encrypted with the now-lost
+/// key) and surfaced as a misleading "New backup key generated" toast when a
+/// user only meant to view their key. Generation now lives behind the explicit
+/// POST below.
 pub async fn get_backup_key(
+    State(state): State<AppState>,
+) -> Result<Json<KeyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let key_path = backup::key_file_path(&state.workspace_path);
+    match crypto::load_key_file(&key_path) {
+        Ok(Some(key)) => Ok(Json(KeyResponse {
+            key: crypto::key_to_base64(&key),
+            is_new: false,
+        })),
+        Ok(None) => Err(json_error(
+            StatusCode::NOT_FOUND,
+            "No backup key exists yet. Generate one to enable encrypted backups.",
+        )),
+        Err(e) => Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read backup key: {e}"),
+        )),
+    }
+}
+
+/// POST /api/v1/backup/key — generate the key if absent, then return it. This is
+/// the only user-facing path that mints a key (the backup paths also mint via
+/// `ensure_key`). Idempotent: if a key already exists it's returned unchanged
+/// with `is_new: false`, so a double-click — or a race with a scheduled backup —
+/// can never overwrite the key that protects existing backups.
+pub async fn generate_backup_key(
     State(state): State<AppState>,
 ) -> Result<Json<KeyResponse>, (StatusCode, Json<ErrorResponse>)> {
     let (key, is_new) = crypto::ensure_key(&state.workspace_path).map_err(|e| {
         json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to get backup key: {e}"),
+            format!("Failed to generate backup key: {e}"),
         )
     })?;
     Ok(Json(KeyResponse {
         key: crypto::key_to_base64(&key),
         is_new,
     }))
+}
+
+/// GET /api/v1/backup/key/exists — whether a key is already on disk, WITHOUT
+/// revealing it. The page calls this on load to label its button correctly
+/// ("Show backup key" vs "Generate new backup key") without pulling the secret
+/// into the page or minting one.
+pub async fn backup_key_exists(State(state): State<AppState>) -> Json<KeyExistsResponse> {
+    Json(KeyExistsResponse {
+        exists: crypto::key_exists(&state.workspace_path),
+    })
 }
 
 /// Queues a backup and returns 202 immediately; terminal state arrives via

@@ -502,6 +502,13 @@ pub(crate) async fn emit_background_task_failure(
 /// to chase the enum into `types.rs`.
 pub use crate::engine::types::StopReason;
 
+/// Returned by [`LucidosEngine::interrupt_agent`] when the session is already
+/// idle/waiting — i.e. a Cancel (Stop) click that races a turn which already
+/// finished. Callers (the `/claude-code/stop` handler) treat it as a no-op
+/// (HTTP 200), not an error: there is nothing to interrupt. Lives here (not in
+/// the private `control` submodule) so the API handler can reference it.
+pub(crate) const SESSION_ALREADY_WAITING: &str = "Session is already waiting";
+
 /// Emit a terminal `ResponseAborted` event for a thread the projection still
 /// considers `running` but for which no live agent session or in-process loop
 /// remains. Both callers (`stop_agent`, `interrupt_agent`) are user buttons

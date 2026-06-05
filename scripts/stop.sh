@@ -45,6 +45,7 @@ stop_workspace() {
 
     local engine_pid_file="$ws/.lucidos/engine.pid"
     local frontend_pid_file="$ws/.lucidos/frontend.pid"
+    local build_watch_pid_file="$ws/.lucidos/build-watch.pid"
 
     # Stop engine via SIGUSR1, not SIGTERM — the engine ignores SIGTERM to
     # survive accidental `xargs kill` from CC subprocess test scripts (see
@@ -70,6 +71,18 @@ stop_workspace() {
             stopped="1"
         fi
         rm -f "$frontend_pid_file"
+    fi
+
+    # Stop the --built mode `vite build --watch` companion, if running.
+    if [ -f "$build_watch_pid_file" ]; then
+        local pid
+        pid="$(cat "$build_watch_pid_file")"
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Stopping frontend build-watch (PID $pid) for $ws"
+            kill "$pid" 2>/dev/null || true
+            stopped="1"
+        fi
+        rm -f "$build_watch_pid_file"
     fi
 
     # Stop PostgreSQL container if --force

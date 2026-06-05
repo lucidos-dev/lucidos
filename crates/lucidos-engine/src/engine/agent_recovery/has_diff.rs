@@ -113,17 +113,17 @@ pub(crate) fn lost_session_worktree_path(
 ///   `TRUE` here would render the WaitingBanner Diff button for a thread
 ///   that can't act on it.
 /// - Worktree dir exists → delegate to `session_seed::seed_coding_agent_has_diff`,
-///   which writes `TRUE` iff `git rev-list main..branch` is non-empty (and
-///   no-ops on a fresh branch, leaving the column at whatever it currently
-///   is — the precondition for active CC threads is that the column either
-///   was set to TRUE by a prior `ChangeProposed` or remains at the default
-///   FALSE from the projection upsert).
+///   which writes the explicit result of the Diff button's own computation
+///   (`branch_changed_files` = `git diff <default_diff_base>...branch`): TRUE
+///   when that net diff is non-empty, FALSE otherwise. Writing the explicit
+///   value (not no-op) is what corrects a stale `TRUE` left by a prior
+///   `ChangeProposed` whose work no longer produces a net diff against the
+///   branch's true fork point.
 ///
 /// Failures are logged but not propagated — the engine startup sweep must
-/// not block on git or DB hiccups. A failed git lookup defaults
-/// `has_branch_commits` to `true` (defensive — see its docstring), so a
-/// transient git error yields an optimistic TRUE. The next post-commit
-/// hook fire or the next engine restart reconciles.
+/// not block on git or DB hiccups. `branch_changed_files` swallows git errors
+/// to an empty list, so a transient git failure writes FALSE; the next
+/// post-commit hook fire or the next engine restart reconciles.
 pub(crate) async fn reconcile_thread_coding_agent_has_diff(
     pool: &sqlx::PgPool,
     thread_id: Uuid,

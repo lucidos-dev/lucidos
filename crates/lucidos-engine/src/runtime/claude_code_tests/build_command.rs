@@ -437,6 +437,68 @@ fn build_command_forwards_host_protection_env_vars() {
 }
 
 #[test]
+fn sccache_on_path_true_when_binary_present() {
+    // A `sccache` executable on the probed PATH → wrapper is safe to set.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let bin = tmp
+        .path()
+        .join(format!("sccache{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("write fake sccache");
+    let path_var = std::env::join_paths([tmp.path()]).expect("join_paths");
+    assert!(
+        sccache_on_path(Some(path_var.as_os_str())),
+        "sccache present on PATH must be detected"
+    );
+}
+
+#[test]
+fn sccache_on_path_false_when_absent() {
+    // PATH dir exists but has no sccache → must NOT claim it's present,
+    // otherwise build_command sets RUSTC_WRAPPER and cargo hard-fails.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path_var = std::env::join_paths([tmp.path()]).expect("join_paths");
+    assert!(
+        !sccache_on_path(Some(path_var.as_os_str())),
+        "missing sccache must not be reported as present"
+    );
+}
+
+#[test]
+fn sccache_on_path_false_when_path_unset() {
+    // No PATH at all → can't resolve anything → false (degrade to plain build).
+    assert!(!sccache_on_path(None), "absent PATH must yield false");
+}
+
+#[test]
+fn build_command_gates_rustc_wrapper_on_sccache_presence() {
+    // RUSTC_WRAPPER must ALWAYS be set — to "sccache" when it's on PATH, else to
+    // "" (empty). The empty value is load-bearing: the Lucidos repo's tracked
+    // .cargo/config.toml sets `build.rustc-wrapper = "sccache"`, and cargo falls
+    // back to that config when RUSTC_WRAPPER is merely unset; only an explicit
+    // empty value forces a plain build on a host without sccache. Leaving it
+    // unset (the original bug) would still hard-fail Lucidos-repo builds. Pin the
+    // wiring by comparing against the same predicate build_command consults, so
+    // the assertion is deterministic whether or not the test host has sccache.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let env = collect_envs(&cmd);
+    let wrapper = env
+        .get(std::ffi::OsStr::new("RUSTC_WRAPPER"))
+        .expect("RUSTC_WRAPPER must always be set (sccache, or empty to override .cargo/config.toml)");
+    let expected = if sccache_on_path(std::env::var_os("PATH").as_deref()) {
+        std::ffi::OsString::from("sccache")
+    } else {
+        std::ffi::OsString::from("")
+    };
+    assert_eq!(
+        wrapper.as_os_str(),
+        expected.as_os_str(),
+        "RUSTC_WRAPPER must be \"sccache\" when on PATH, else \"\" to disable the .cargo/config.toml fallback"
+    );
+}
+
+#[test]
 fn format_user_input_text_only() {
     let input = AgentInput {
         text: "hello".into(),

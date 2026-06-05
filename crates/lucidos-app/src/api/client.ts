@@ -6,6 +6,7 @@ export * from './client/_core';
 export * from './client/chat';
 export * from './client/changes';
 export * from './client/apps';
+export * from './client/data';
 export * from './client/triggers';
 export * from './client/threads';
 export * from './client/settings';

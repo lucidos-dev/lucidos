@@ -3,6 +3,7 @@ import { defineConfig, type Plugin } from 'vite';
 import preact from '@preact/preset-vite';
 import { resolve } from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 
 const VITE_PORT = parseInt(process.env.VITE_PORT || '5173');
 
@@ -105,8 +106,42 @@ function suppressMergeReload(): Plugin {
   };
 }
 
+/**
+ * Stamp each production build into dist/sw.js (the `--built` dev mode and the
+ * shipped app). The service worker carries a `__LUCIDOS_BUILD_ID__` placeholder
+ * folded into its cache name; replacing it with a per-build id makes every
+ * rebuild a byte-different sw.js, so the browser detects a service-worker update
+ * and fires the client's "New version available → Refresh" toast
+ * (hooks/useStartup.ts). Without this, a rebuild produces an identical sw.js and
+ * the toast never fires — which is the whole "how do I know it's ready to
+ * reload" signal in built mode.
+ *
+ * The id is derived from the emitted asset filenames (which embed content
+ * hashes), so it is DETERMINISTIC: a no-op rebuild (e.g. relaunching the dev
+ * harness with unchanged source) yields the same id and does not spuriously
+ * report an update. Vite copies public/ (including sw.js) into dist/ at
+ * BUNDLE_START — before this writeBundle hook — so dist/sw.js already exists
+ * here. `apply: 'build'` keeps it inert during `vite serve` (the live dev
+ * server), where the literal placeholder is a harmless static cache name.
+ */
+function stampServiceWorker(): Plugin {
+  return {
+    name: 'lucidos-sw-stamp',
+    apply: 'build',
+    writeBundle(options, bundle) {
+      const outDir = options.dir ?? resolve(__dirname, 'dist');
+      const swPath = resolve(outDir, 'sw.js');
+      if (!fs.existsSync(swPath)) return;
+      const assetNames = Object.keys(bundle).sort().join('\n');
+      const buildId = crypto.createHash('sha256').update(assetNames).digest('hex').slice(0, 12);
+      const src = fs.readFileSync(swPath, 'utf-8');
+      fs.writeFileSync(swPath, src.replace(/__LUCIDOS_BUILD_ID__/g, buildId));
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [engineVersionPlugin(), suppressMergeReload(), preact()],
+  plugins: [engineVersionPlugin(), suppressMergeReload(), stampServiceWorker(), preact()],
   build: {
     rollupOptions: {
       output: {
@@ -154,5 +189,19 @@ export default defineConfig({
     }),
     // No proxy needed — browser opens engine port directly, engine reverse-proxies
     // unmatched requests to Vite via LUCIDOS_DEV_PROXY in dev mode.
+  },
+  // `vite preview` (used by web-dev.sh --built to serve the built dist/) reads
+  // `preview.*`, NOT `server.*` — mirror host/port/strictPort and TLS here so the
+  // engine proxy and the iPhone reach it identically over Tailscale.
+  preview: {
+    host: true,
+    port: VITE_PORT,
+    strictPort: true,
+    ...(hasCerts && {
+      https: {
+        cert: fs.readFileSync(certFile!),
+        key: fs.readFileSync(keyFile!),
+      },
+    }),
   },
 });

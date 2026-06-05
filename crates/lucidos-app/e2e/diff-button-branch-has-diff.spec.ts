@@ -10,11 +10,12 @@ import type { Page } from '@playwright/test';
 
 /**
  * Verifies the WaitingBanner Diff button reacts to `coding_agent_has_diff` flips
- * driven by the projection:
+ * driven by the projection. The button SHOWS only when there is a diff — no
+ * diff means no button at all (not a greyed/disabled one):
  *
- *   - CC thread, no commits  → Diff disabled, "No changes on this branch" tooltip.
- *   - ChangeProposed lands   → projection flips coding_agent_has_diff=TRUE → SSE → Diff enables.
- *   - ChangeApplied lands    → projection flips coding_agent_has_diff=FALSE → SSE → Diff disables.
+ *   - CC thread, no diff     → Diff button hidden.
+ *   - ChangeProposed lands   → projection flips coding_agent_has_diff=TRUE → SSE → Diff appears.
+ *   - ChangeApplied lands    → projection flips coding_agent_has_diff=FALSE → SSE → Diff disappears.
  *
  * The seed step uses `POST /api/v1/internal/seed-change-for-test`, which emits
  * `ChangeProposed` through the live EventBus, so the projection write AND
@@ -24,8 +25,6 @@ import type { Page } from '@playwright/test';
  * Apply uses the real `POST /api/v1/changes/{id}/apply` endpoint, which fires
  * `ChangeApplied` through the EventBus on success.
  */
-
-const DIFF_DISABLED_TOOLTIP = 'No changes on this branch';
 
 function diffButton(page: Page) {
   return page.locator('.thread-action-buttons:visible button:has-text("Diff")').first();
@@ -94,7 +93,14 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
     psql("UPDATE thread_summaries SET status = 'idle', archive_state = 'archived' WHERE status = 'waiting' AND is_coding_agent = true");
   });
 
-  test('CC thread with no commits: Diff is disabled with "No changes" tooltip', async ({ page }) => {
+  /** Anchor the wait on the banner's Archive button — present for a waiting CC
+   *  thread with no diff — so we know the banner rendered before asserting the
+   *  Diff button is absent. */
+  function archiveButton(page: Page) {
+    return page.locator('.thread-action-buttons:visible button:has-text("Archive")').first();
+  }
+
+  test('CC thread with no diff: Diff button is hidden', async ({ page }) => {
     const suffix = `noop-${Date.now()}`;
     const { threadId } = seedWaitingThread(suffix);
 
@@ -104,16 +110,16 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
       }, threadId);
       await navigateToApp(page);
 
-      const diff = diffButton(page);
-      await expect(diff).toBeVisible({ timeout: 15_000 });
-      await expect(diff).toBeDisabled();
-      await expect(diff).toHaveAttribute('data-tooltip', DIFF_DISABLED_TOOLTIP);
+      // The banner renders (Archive is offered) but with no diff there is no
+      // Diff button at all — not a disabled one.
+      await expect(archiveButton(page)).toBeVisible({ timeout: 15_000 });
+      await expect(diffButton(page)).toBeHidden();
     } finally {
       cleanupCCThread(threadId);
     }
   });
 
-  test('After ChangeProposed lands, Diff enables and tooltip disappears', async ({ page }) => {
+  test('After ChangeProposed lands, the Diff button appears', async ({ page }) => {
     const suffix = `enable-${Date.now()}`;
     const { threadId } = seedWaitingThread(suffix);
     const { branch, file } = createBranch(suffix);
@@ -125,25 +131,24 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
       }, threadId);
       await navigateToApp(page);
 
-      const diff = diffButton(page);
-      await expect(diff).toBeVisible({ timeout: 15_000 });
-      await expect(diff).toBeDisabled();
+      // No diff yet → no Diff button.
+      await expect(archiveButton(page)).toBeVisible({ timeout: 15_000 });
+      await expect(diffButton(page)).toBeHidden();
 
       await seedChangeProposed(page, {
         changeId, threadId, branch, file,
         description: `E2E diff enable ${suffix}`,
       });
 
-      // SSE delivers the new aggregate; the button should enable within a
-      // tick or two. Generous timeout to cover slow CI without masking flakes.
-      await expect(diff).toBeEnabled({ timeout: 10_000 });
-      await expect(diff).not.toHaveAttribute('data-tooltip', DIFF_DISABLED_TOOLTIP);
+      // SSE delivers the new aggregate → coding_agent_has_diff=TRUE → the Diff
+      // button appears. Generous timeout to cover slow CI without masking flakes.
+      await expect(diffButton(page)).toBeVisible({ timeout: 10_000 });
     } finally {
       cleanupCCThread(threadId, changeId, branch, file);
     }
   });
 
-  test('After ChangeApplied lands, Diff disables again with tooltip restored', async ({ page }) => {
+  test('After ChangeApplied lands, the Diff button disappears', async ({ page }) => {
     const suffix = `disable-${Date.now()}`;
     const { threadId } = seedWaitingThread(suffix);
     const { branch, file } = createBranch(suffix);
@@ -156,22 +161,20 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
       }, threadId);
       await navigateToApp(page);
 
-      const diff = diffButton(page);
-      await expect(diff).toBeVisible({ timeout: 15_000 });
+      await expect(archiveButton(page)).toBeVisible({ timeout: 15_000 });
 
       await seedChangeProposed(page, {
         changeId, threadId, branch, file,
         description: `E2E diff disable ${suffix}`,
       });
-      await expect(diff).toBeEnabled({ timeout: 10_000 });
+      await expect(diffButton(page)).toBeVisible({ timeout: 10_000 });
 
       // Apply via the real API → ChangeApplied → projection clears coding_agent_has_diff.
       const applyResp = await page.request.post(`/api/v1/changes/${changeId}/apply`);
       expect(applyResp.ok(), `apply failed: ${applyResp.status()} ${await applyResp.text()}`).toBeTruthy();
       appliedToMain = true;
 
-      await expect(diff).toBeDisabled({ timeout: 10_000 });
-      await expect(diff).toHaveAttribute('data-tooltip', DIFF_DISABLED_TOOLTIP);
+      await expect(diffButton(page)).toBeHidden({ timeout: 10_000 });
     } finally {
       if (appliedToMain) cleanupFileFromMain(file, suffix);
       cleanupCCThread(threadId, changeId, branch, file);

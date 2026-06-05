@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, DIFF_DISABLED_TOOLTIP } from '../WaitingBanner';
+import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton } from '../WaitingBanner';
 import {
   threadMap,
   focusedThreadId,
@@ -108,7 +108,7 @@ describe('getBannerSlots', () => {
       actions: DISCARD_APPLY,
       threadId: 'tid',
       isArchiving: false,
-      ccDiff: 'enabled',
+      showDiff: true,
     });
 
     expect(buttonLabels(slots.liftable)).toEqual(['Diff']);
@@ -121,40 +121,38 @@ describe('getBannerSlots', () => {
       actions: ARCHIVE_ONLY,
       threadId: 'tid',
       isArchiving: false,
-      ccDiff: 'hidden',
+      showDiff: false,
     });
 
     expect(slots.liftable).toBeNull();
     expect(buttonLabels(slots.primary)).toEqual(['Archive']);
   });
 
-  it('CC thread with no pending change shows Diff disabled with tooltip', () => {
+  it('CC thread with no diff hides the Diff button entirely', () => {
     const slots = getBannerSlots({
       type: 'actions',
       actions: ARCHIVE_ONLY,
       threadId: 'tid',
       isArchiving: false,
-      ccDiff: 'disabled',
+      showDiff: false,
     });
 
-    expect(buttonLabels(slots.liftable)).toEqual(['Diff']);
-    const [diffBtn] = buttonNodes(slots.liftable);
-    expect(diffBtn.props.disabled).toBe(true);
-    expect((diffBtn.props as { 'data-tooltip'?: string })['data-tooltip']).toBe(DIFF_DISABLED_TOOLTIP);
+    expect(slots.liftable).toBeNull();
+    expect(buttonLabels(slots.primary)).toEqual(['Archive']);
   });
 
-  it('CC thread with ccDiff=enabled and no pending change uses the thread-level diff click', () => {
+  it('CC thread with showDiff uses the thread-level diff click', () => {
     const slots = getBannerSlots({
       type: 'actions',
       actions: DISCARD_APPLY,
       threadId: 'tid',
       isArchiving: false,
-      ccDiff: 'enabled',
+      showDiff: true,
     });
 
     expect(buttonLabels(slots.liftable)).toEqual(['Diff']);
     const [diffBtn] = buttonNodes(slots.liftable);
-    expect(diffBtn.props.disabled).toBe(false);
+    expect(diffBtn.props.disabled).toBeFalsy();
     expect(typeof (diffBtn.props as { onClick?: unknown }).onClick).toBe('function');
   });
 
@@ -164,7 +162,7 @@ describe('getBannerSlots', () => {
       actions: [],
       threadId: 'tid',
       isArchiving: true,
-      ccDiff: 'hidden',
+      showDiff: false,
     });
     expect(slots.liftable).toBeNull();
     expect(buttonLabels(slots.primary)).toEqual(['Archive...']);
@@ -185,8 +183,8 @@ describe('getBannerSlots', () => {
   });
 });
 
-describe('ccDiff is driven by codingAgentHasDiff alone', () => {
-  it('Diff is enabled when codingAgentHasDiff is true and no pending change exists', () => {
+describe('showDiff is driven by codingAgentHasDiff alone', () => {
+  it('Diff is shown when codingAgentHasDiff is true and no pending change exists', () => {
     // Single-signal rule: branch-has-diff is the sole driver. The previous
     // three-signal union (pendingChange OR codingAgentProposed OR codingAgentIsExternalRepo)
     // is gone — codingAgentHasDiff is the git-truth replacement.
@@ -204,14 +202,14 @@ describe('ccDiff is driven by codingAgentHasDiff alone', () => {
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
-      expect(state!.ccDiff).toBe('enabled');
+      expect(state!.showDiff).toBe(true);
     }
   });
 
-  it('Diff is disabled when codingAgentHasDiff is false even if coding_agent_proposed=true', () => {
+  it('Diff is hidden when codingAgentHasDiff is false even if coding_agent_proposed=true', () => {
     // Proves the new rule replaces the union: under the old union,
-    // codingAgentProposed=true alone would have enabled Diff. The new rule
-    // requires the branch to actually have a diff against main.
+    // codingAgentProposed=true alone would have shown Diff. The new rule
+    // requires the branch to actually have a diff against its diff base.
     const thread = makeCCThread('t1', {
       status: 'waiting',
       section: 'inbox',
@@ -226,7 +224,7 @@ describe('ccDiff is driven by codingAgentHasDiff alone', () => {
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
-      expect(state!.ccDiff).toBe('disabled');
+      expect(state!.showDiff).toBe(false);
     }
   });
 
@@ -241,7 +239,7 @@ describe('ccDiff is driven by codingAgentHasDiff alone', () => {
       actions: DISCARD_APPLY,
       threadId: 'tid',
       isArchiving: false,
-      ccDiff: 'enabled',
+      showDiff: true,
     });
 
     const [diffBtn] = buttonNodes(slots.liftable);

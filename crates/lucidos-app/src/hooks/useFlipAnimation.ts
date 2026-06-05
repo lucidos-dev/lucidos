@@ -16,9 +16,11 @@ const MOBILE_DURATION_SCALE = 0.6; // shorter animations on mobile
  * FLIP animation for thread list transitions.
  *
  * Uses a portal div for the flying thread — a cloned element rendered at
- * position:fixed with high z-index, completely outside the scroll container
- * and stacking context hierarchy. This guarantees the flying thread always
- * renders on top, regardless of CSS transforms or overflow clipping.
+ * position:fixed, completely outside the scroll container and stacking context
+ * hierarchy, so it renders above all app chrome regardless of CSS transforms or
+ * overflow clipping. The portal sits just below the modal/restart/toast layer
+ * (see .flip-portal in drawer.css), so a thread whose status changes during an
+ * engine restart can't fly above the restart overlay.
  *
  * Speed setting: slider 0 = normal (1x), +10 = 10x faster, -10 = 10x slower.
  */

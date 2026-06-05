@@ -13,6 +13,20 @@ inlineLinkStripRenderer.link = function({ tokens }: Tokens.Link): string {
   return this.parser.parseInline(tokens);
 };
 
+// Inline renderer for renderMarkdownInlineWithLinks — KEEPS http(s) links as
+// real <a> elements (covers both `[label](url)` and gfm-autolinked bare URLs),
+// forcing safe new-tab attributes. Any non-http(s) href (javascript:, data:,
+// mailto:, relative, app:, …) collapses to its label text, so an LLM-supplied
+// scheme can neither execute nor dead-end. Only valid in NON-interactive
+// containers — an <a> nested in a <button> is interactive-in-interactive, so
+// option buttons keep inlineLinkStripRenderer.
+const inlineLinkKeepRenderer = new marked.Renderer();
+inlineLinkKeepRenderer.link = function({ href, tokens }: Tokens.Link): string {
+  const text = this.parser.parseInline(tokens);
+  if (!/^https?:\/\//i.test(href)) return text;
+  return `<a href="${escapeHtmlAttr(href)}" target="_blank" rel="noopener">${text}</a>`;
+};
+
 // Unique marker prefix for copy block boundaries (survives marked processing)
 const COPY_MARKER = 'LUCIDOS_COPY_BLOCK';
 const COPY_MARKER_PATTERN = new RegExp(
@@ -135,5 +149,22 @@ export function renderMarkdownInline(md: string): string {
     async: false,
     breaks: true,
     renderer: inlineLinkStripRenderer,
+  }) as string).replace(DANGEROUS_TAG, (match) => escapeHtmlAttr(match));
+}
+
+/** Like renderMarkdownInline (phrasing content only — no block wrappers) but
+ *  KEEPS http(s) links as clickable `<a target="_blank" rel="noopener">`. Used
+ *  for the AskUserQuestion *question text*, where the LLM commonly pastes a bare
+ *  URL the user needs to open — `renderMarkdownInline` would flatten it to dead
+ *  text. Bare URLs are autolinked (gfm) and `[label](url)` links survive;
+ *  non-http(s) schemes collapse to label text — see `inlineLinkKeepRenderer`.
+ *  Safe ONLY in non-interactive containers: an `<a>` inside a `<button>` is
+ *  invalid, so option buttons must keep `renderMarkdownInline`. */
+export function renderMarkdownInlineWithLinks(md: string): string {
+  return (marked.parseInline(md, {
+    async: false,
+    breaks: true,
+    gfm: true,
+    renderer: inlineLinkKeepRenderer,
   }) as string).replace(DANGEROUS_TAG, (match) => escapeHtmlAttr(match));
 }

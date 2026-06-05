@@ -20,7 +20,7 @@ describe('shouldLiftSectionButtons', () => {
       ],
       threadId: 'tid',
       isArchiving: false,
-      ccDiff: 'hidden',
+      showDiff: false,
     };
   }
 

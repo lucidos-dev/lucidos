@@ -3,7 +3,7 @@ import { useEffect, useMemo } from 'preact/hooks';
 import { showToast } from '../../store/store';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
 import { createTapGate } from '../../utils/tapGesture';
-import { renderMarkdownInline } from '../../utils/renderMarkdown';
+import { renderMarkdownInline, renderMarkdownInlineWithLinks } from '../../utils/renderMarkdown';
 import { preserveAtBottom } from './scrollState';
 
 export type ResolvedAnswer =
@@ -148,6 +148,21 @@ function OptionContent({
   );
 }
 
+/** The question prompt itself. Rendered as inline markdown with live links so
+ *  a URL the LLM pastes into the question (e.g. a PR link) is clickable rather
+ *  than dead text. It sits in a plain `<div>`, not a `<button>`, so real `<a>`
+ *  elements are valid here — unlike the option label/desc inside OptionButton.
+ *  Shared across the live, answered, and terminated bodies so all three render
+ *  the question identically. */
+function QuestionText({ question }: { question: string }) {
+  return (
+    <div
+      class="cc-question-text"
+      dangerouslySetInnerHTML={{ __html: renderMarkdownInlineWithLinks(question) }}
+    />
+  );
+}
+
 /** Body of an `AskUserQuestion` divider exchange — rendered inside the
  *  initiator panel which provides the chrome (border, header, timestamp).
  *  Multi-select Submit lives in the prompt action row (PromptInput.tsx); the
@@ -179,7 +194,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
     return (
       <div class="cc-question-body" data-tool-use-id={toolUseId}>
         {options.length > 0 && <ModeBadge multiSelect={true} optionCount={options.length} />}
-        <div class="cc-question-text">{question}</div>
+        <QuestionText question={question} />
         {options.length > 0 && (
           <div class="cc-question-options">
             {options.map(opt => (
@@ -208,7 +223,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
   return (
     <div class="cc-question-body" data-tool-use-id={toolUseId}>
       {options.length > 0 && <ModeBadge multiSelect={false} optionCount={options.length} />}
-      <div class="cc-question-text">{question}</div>
+      <QuestionText question={question} />
       {options.length > 0 && (
         <div class="cc-question-options">
           {options.map(opt => (
@@ -287,7 +302,7 @@ export function AnsweredBody({
   return (
     <div class="cc-question-body cc-question-body-answered">
       {options.length > 0 && <ModeBadge multiSelect={multiSelect} optionCount={options.length} />}
-      <div class="cc-question-text">{question}</div>
+      <QuestionText question={question} />
       {options.length > 0 && (
         <div class="cc-question-options">
           {options.map(opt => (
@@ -335,7 +350,7 @@ export function TerminatedQuestionBody({
   return (
     <div class="cc-question-body cc-question-body-terminated">
       {options.length > 0 && <ModeBadge multiSelect={multiSelect} optionCount={options.length} />}
-      <div class="cc-question-text">{question}</div>
+      <QuestionText question={question} />
       {options.length > 0 && (
         <div class="cc-question-options">
           {options.map(opt => (

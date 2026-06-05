@@ -171,12 +171,22 @@ pub(super) const EMPTY_RESPONSE_ERROR: &str =
 /// keep the subprocess alive) is the run-loop's responsibility — see
 /// `AgentSession.pending_followups`.
 ///
-/// Precedence: silent_resume > shutdown > cc_error > user_hit_stop >
+/// Precedence: silent_resume > shutdown > user_hit_stop > cc_error >
 /// text_is_empty > generated. Shutdown wins because the engine is going down
 /// regardless of how CC ended the turn — the next process emits `Aborted` and
-/// the recovery path re-resumes from there. `text_is_empty` sits below
-/// user_hit_stop because a deliberate user cancel that happens to land on an
-/// empty Result is still a cancel, not a silent failure.
+/// the recovery path re-resumes from there.
+///
+/// `user_hit_stop` sits ABOVE `cc_error`: the `Stop` button (Cancel = Esc) now
+/// routes through CC's native interrupt, and an *interrupted* turn comes back as
+/// a `Result` with `is_error: true` (CC reports the aborted turn — e.g.
+/// `stop_reason=tool_use`, an `[ede_diagnostic]` line). That error is *caused by*
+/// the user's cancel, so it must classify as `Canceled`, not `Failed` — otherwise
+/// the user sees a red "Failed" dot for a turn they deliberately stopped, and the
+/// branch-preservation gate (which keys on `Canceled`) never fires, so the
+/// session loses its branch and can't resume. A real upstream failure on a turn
+/// the user *didn't* stop still classifies as `Failed` (user_hit_stop is false
+/// there). `text_is_empty` stays below user_hit_stop for the same reason — a
+/// cancel landing on an empty Result is still a cancel.
 pub(super) fn classify_result(
     is_silent_resume: bool,
     user_hit_stop: bool,
@@ -190,10 +200,10 @@ pub(super) fn classify_result(
     use crate::engine::thread_events::{AbortCause, CancelCause};
     let terminal = if is_shutdown {
         TerminalKind::Aborted(AbortCause::EngineShutdown)
-    } else if let Some(error) = cc_error {
-        TerminalKind::Failed { error }
     } else if user_hit_stop {
         TerminalKind::Canceled(CancelCause::UserStop)
+    } else if let Some(error) = cc_error {
+        TerminalKind::Failed { error }
     } else if text_is_empty {
         TerminalKind::Failed {
             error: EMPTY_RESPONSE_ERROR.to_string(),
@@ -291,6 +301,15 @@ pub(super) enum SessionEndAction {
     /// a ready-to-apply pending change misleads the user. The thread's
     /// terminal event is `ResponseAborted`, so the UI shows the crash state.
     CrashedKeepBranch,
+    /// The user cancelled the turn (Stop button = Esc). Cancel is a *resumable
+    /// turn boundary*, not a terminator — the next message `--resume`s the same
+    /// `cc_session_id` on this branch. Keep the branch (even with zero commits)
+    /// so `resolve_branch_for_resume` finds it; do NOT propose, because a
+    /// cancelled turn is half-finished work the user shouldn't be invited to
+    /// apply (mirrors `should_propose_change_at_idle`). Without this the
+    /// no-commits cancel path falls into `CleanupBranches` → `git branch -D`,
+    /// which is exactly what made a cancel spawn a fresh, amnesiac CC session.
+    KeepCanceledBranch,
     CleanupBranches,
 }
 
@@ -303,15 +322,26 @@ pub(super) enum SessionEndAction {
 /// branch reflect partial work — they stay on disk via `CrashedKeepBranch` but
 /// are never proposed as a change. External repos keep `KeepExternalBranch`
 /// regardless because the user owns push/PR for their own refs.
+///
+/// `user_canceled` is set when the last terminal was a user-driven
+/// `Canceled(UserStop)` (the Stop button, which now routes through CC's native
+/// interrupt/Esc). A cancel keeps the branch so the session stays resumable,
+/// and never proposes — it ranks above `Propose`/`CleanupBranches` but below the
+/// external/crash keep-branch arms (those already keep the branch and carry
+/// more specific semantics). It can't co-occur with `safety_net_fired`: a
+/// cancel emits a terminal event, so `safety_net_fired` (= no terminal) is
+/// false.
 pub(super) fn classify_session_end_action(
     has_commits: bool,
     proposal_files_empty: bool,
     is_external_repo: bool,
     safety_net_fired: bool,
+    user_canceled: bool,
 ) -> SessionEndAction {
     match (has_commits, is_external_repo, safety_net_fired) {
         (true, true, _) => SessionEndAction::KeepExternalBranch,
         (true, false, true) => SessionEndAction::CrashedKeepBranch,
+        _ if user_canceled => SessionEndAction::KeepCanceledBranch,
         (true, false, false) if !proposal_files_empty => SessionEndAction::Propose,
         _ => SessionEndAction::CleanupBranches,
     }

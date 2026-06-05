@@ -175,15 +175,21 @@ pub struct CcCommandsResult {
     pub current_reasoning_effort: Option<String>,
 }
 
-/// Why `stop_agent` fired the stop signal. Read by the run_session loop's
-/// stop arm to decide whether to emit `ResponseCanceled` (only `UserStop`
-/// does — the others have their own lifecycle terminator), and by the
-/// post-loop cleanup to drive Apply / Discard side effects.
+/// Why a stop signal fired. `Apply` / `Discard` / `Archive` flow through
+/// `stop_agent` (the run_session loop's stop arm reads this to drive their
+/// side effects; each has its own lifecycle terminator). `UserStop` does NOT
+/// flow here — a real Cancel routes through `interrupt_agent` (CC's native
+/// interrupt / Esc) so the session stays resumable (see `api::claude_code`).
+/// The variant is retained because `interrupt_agent`'s no-live-session
+/// fallback and the engine-shutdown sweep still surface a `UserStop`-shaped
+/// cancel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// User clicked the Cancel/Stop button on an in-flight CC turn. Emits
-    /// `ResponseCanceled(UserStop)` if CC was actively working; nothing if
-    /// CC had already gone idle (race window — previous turn already done).
+    /// User clicked the Cancel/Stop button on an in-flight CC turn — Cancel =
+    /// Esc. Routed through `interrupt_agent`, NOT `stop_agent`: the turn is
+    /// interrupted but the session stays resumable. The interrupted `Result`
+    /// classifies as `ResponseCanceled(UserStop)` + `CodingAgentIdled`; a
+    /// no-op if CC had already gone idle (race window — previous turn done).
     UserStop,
     /// User clicked Apply Now — the resulting change auto-applies after
     /// cleanup. Post-loop reads this to set `ProcessResult.auto_apply=true`.

@@ -889,7 +889,15 @@ impl LucidosEngine {
             }
 
             for tool_call in &response.tool_calls {
-                let tool_desc = self.describe_tool(&tool_call.name, &tool_call.arguments);
+                // Mask any postgres password the LLM hardcoded into a `bash`
+                // command (or other tool) BEFORE it reaches the log line, the
+                // persisted `description`, or the persisted `args` — the
+                // description renders in the steps UI just like the args, so
+                // both must be built from the redacted copy; see
+                // `core::redact_postgres_secrets_in_json`.
+                let mut redacted_args = tool_call.arguments.clone();
+                crate::core::redact_postgres_secrets_in_json(&mut redacted_args);
+                let tool_desc = self.describe_tool(&tool_call.name, &redacted_args);
                 log!(
                     "[AgentLoop] Step {}/{}: {}",
                     iterations,
@@ -900,18 +908,13 @@ impl LucidosEngine {
                 // Persist + broadcast ToolCalled. Capture the event_id so spawn-style
                 // tools (run_thread, run_claude) can record which tool call triggered
                 // the spawn — this becomes the new thread's `spawning_event_id`.
-                // Mask any postgres password the LLM hardcoded into a `bash`
-                // command (or other tool) before persisting; see
-                // `core::redact_postgres_secrets_in_json`.
-                let mut redacted_args = tool_call.arguments.clone();
-                crate::core::redact_postgres_secrets_in_json(&mut redacted_args);
                 let tool_called_event_id = self
                     .event_bus
                     .emit_for_id(crate::engine::event_bus::BusEvent::Thread {
                         thread_id,
                         event: crate::engine::thread_events::ThreadEvent::ToolCalled {
                             name: tool_call.name.clone(),
-                            description: self.describe_tool(&tool_call.name, &tool_call.arguments),
+                            description: tool_desc,
                             args: redacted_args,
                         },
                         meta: meta.clone(),

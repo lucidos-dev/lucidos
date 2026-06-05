@@ -27,10 +27,16 @@ impl StopQuery {
 /// `POST /api/v1/claude-code/stop` — stop a running Claude Code session.
 ///
 /// Three modes via query params:
-///   - default: real Cancel/Stop click — emits `ResponseCanceled(UserStop)` if
-///     CC was actively working, nothing if CC was already idle.
-///   - `apply=true`: Apply Now — change auto-applies after CC terminates.
-///   - `discard=true`: Discard — change is dropped.
+///   - default (`UserStop`): real Cancel/Stop click. Routed through CC's native
+///     **interrupt (Esc)** via `interrupt_agent` — the turn is interrupted but
+///     the session stays resumable (the next message `--resume`s the same
+///     `cc_session_id` on the same branch). Emits `ResponseCanceled(UserStop)` +
+///     `CodingAgentIdled` if CC was working; a no-op (HTTP 200) if CC was
+///     already idle. NOT a hard kill — that lost all conversation context.
+///   - `apply=true`: Apply Now — `stop_agent` hard-stops, then the change
+///     auto-applies (`ChangeApplied` is the terminator).
+///   - `discard=true`: Discard — `stop_agent` hard-stops, change dropped
+///     (`ChangeDiscarded` is the terminator).
 ///
 /// Archiving uses a different code path (`POST /api/v1/threads/archive` →
 /// `stop_agent(StopReason::Archive, ...)`) because it also emits `ThreadArchived`.
@@ -57,14 +63,24 @@ pub(super) async fn claude_code_stop(
         .await;
     }
 
-    match state
-        .engine
-        .stop_agent(query.reason(), thread_id, actor)
-        .await
-    {
+    // Cancel (Stop) = Esc: route a real `UserStop` through CC's native interrupt
+    // so the turn is interrupted but the session stays resumable — the next
+    // message `--resume`s the same `cc_session_id` on the same branch. Apply /
+    // Discard keep `stop_agent`: each carries its own terminator
+    // (`ChangeApplied` / `ChangeDiscarded`) and must hard-stop, not interrupt.
+    use crate::engine::claude_code::{StopReason, SESSION_ALREADY_WAITING};
+    let reason = query.reason();
+    let result = match reason {
+        StopReason::UserStop => state.engine.interrupt_agent(thread_id, actor).await,
+        other => state.engine.stop_agent(other, thread_id, actor).await,
+    };
+    match result {
         Ok(_) => Ok(StatusCode::OK),
+        // Cancel click racing an already-finished turn — nothing to interrupt.
+        // Matches the prior `stop_agent` no-op on an idle session.
+        Err(e) if e.to_string() == SESSION_ALREADY_WAITING => Ok(StatusCode::OK),
         Err(e) => {
-            crate::log!("[API] stop_agent failed: {}", e);
+            crate::log!("[API] claude_code_stop ({:?}) failed: {}", reason, e);
             Err(StatusCode::NOT_FOUND)
         }
     }

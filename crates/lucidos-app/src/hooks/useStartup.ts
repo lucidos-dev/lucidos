@@ -21,8 +21,8 @@ import { refreshChangesState, restoreRestartToast } from '../store/actions/chat-
 import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { openThreadAcrossWorkspaces } from '../store/actions/cross-workspace';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
-import { activeMenuItem, settingsSubview, updateAvailable, threadsLoaded, showToast, showConfirm, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
-import { shouldShowSwUpdateToast, markSwUpdateDismissed } from './sw-update';
+import { activeMenuItem, settingsSubview, updateAvailable, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
+import { shouldShowSwUpdateToast, markSwUpdateDismissed, requestServiceWorkerBuildId } from './sw-update';
 import {
   parseDeepLinkFromSwMessage,
   hasDeepLinkParams,
@@ -219,11 +219,17 @@ export function useStartup(): void {
         reg.addEventListener('updatefound', onUpdateFound);
       }).catch(() => { /* SW not ready in this environment — update toast is best-effort */ });
 
-      // Listens for two SW-originated messages: the deep-link fallback (used
-      // when client.navigate() rejects against an uncontrolled tab — common
-      // in dev after a hard reload or DevTools "Update on reload") and the
-      // liveness pong.
+      // Listens for two SW-originated messages: the deep-link delivery (how a
+      // notification tap routes an already-open tab — routeToDeepLink in sw.js
+      // posts the structured deep link rather than fragment-navigating; see
+      // system-knowhow/notifications.md §4.5) and the liveness pong.
       navigator.serviceWorker.addEventListener('message', onServiceWorkerMessage);
+
+      // Surface the active SW's BUILD_ID in the control panel (debugging aid for
+      // "did the new build's SW take over?"). Query now, and again whenever a new
+      // SW claims the page so the shown id tracks the live worker.
+      requestServiceWorkerBuildId();
+      navigator.serviceWorker.addEventListener('controllerchange', requestServiceWorkerBuildId);
     }
 
     // Closure-local so a hot-reload remount starts fresh.
@@ -240,7 +246,7 @@ export function useStartup(): void {
     const PROBE_TIMEOUT_MS = 5000;
 
     function onServiceWorkerMessage(event: MessageEvent) {
-      const data = event.data as { type?: unknown; target?: unknown } | null;
+      const data = event.data as { type?: unknown; target?: unknown; buildId?: unknown } | null;
       if (!data || typeof data !== 'object') return;
       if (data.type === 'lucidos:deep-link') {
         const target = parseDeepLinkFromSwMessage(data.target);
@@ -251,6 +257,10 @@ export function useStartup(): void {
       if (data.type === 'lucidos:pong') {
         lastPongAt = Date.now();
         pongResolver?.();
+        return;
+      }
+      if (data.type === 'lucidos:build-id') {
+        if (typeof data.buildId === 'string') serviceWorkerBuildId.value = data.buildId;
         return;
       }
     }
@@ -402,6 +412,7 @@ export function useStartup(): void {
       window.removeEventListener('message', onAppFrameMessage);
       stopHashRouting();
       navigator.serviceWorker?.removeEventListener('message', onServiceWorkerMessage);
+      navigator.serviceWorker?.removeEventListener('controllerchange', requestServiceWorkerBuildId);
       disconnectThreadEvents();
       stopDevicePresence();
       stopScrollVisibility();

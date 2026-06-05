@@ -152,11 +152,10 @@ describe('scroll-to-bottom button visibility', () => {
     expect(className).toBe('scroll-to-bottom visible');
   });
 
-  it('clicking button scrolls to bottom', () => {
-    const el = mockContainer({ scrollHeight: 2000 });
-    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-    expect(el.scrollTo).toHaveBeenCalledWith({ top: 2000, behavior: 'smooth' });
-  });
+  // Clicking the chevron routes through scrollToBottom() (resets scrolledUp +
+  // engages the suppression window) so tailing re-engages, not a one-shot
+  // smooth nudge. Behavioural coverage lives in scroll-suppression-preserve
+  // .test.ts § "scroll-to-bottom chevron re-engages tail".
 });
 
 // ---------------------------------------------------------------------------

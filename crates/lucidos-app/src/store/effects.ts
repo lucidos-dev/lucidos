@@ -1,5 +1,5 @@
 import { effect } from '@preact/signals';
-import { pageTitle, unreadCount, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, repoSelectedChangeId, inputMode, SELECTED_CHANGE_KEY, MOBILE_VIEW_KEY } from './store';
+import { pageTitle, unreadCount, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, filePreviewEditing, previewFile, repoSelectedChangeId, inputMode, SELECTED_CHANGE_KEY, MOBILE_VIEW_KEY } from './store';
 
 // Sync page title with unread count
 effect(() => {
@@ -75,6 +75,19 @@ effect(() => {
 // Persist source-vs-rendered preview toggle (md/html/csv/svg + diff view)
 effect(() => {
   localStorage.setItem('lucidos-file-preview-source', String(filePreviewSource.value));
+});
+
+// Drop inline edit mode whenever the previewed file changes (or the preview
+// closes). Restore-from-history (navigation.restoreState) sets panelOverlay
+// directly without going through openFilePreview, so resetting here — keyed on
+// the previewed path — covers every entry point, not just the click path.
+let lastPreviewFile: string | null = previewFile.value;
+effect(() => {
+  const path = previewFile.value;
+  if (path !== lastPreviewFile) {
+    lastPreviewFile = path;
+    filePreviewEditing.value = false;
+  }
 });
 
 // Persist selected change so the Diff view survives reload — without this,

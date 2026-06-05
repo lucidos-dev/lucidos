@@ -25,6 +25,12 @@ export function RestartOverlay() {
     // Drop focus so any in-flight typing or IME composition stops.
     (document.activeElement as HTMLElement | null)?.blur();
 
+    // Flag the restart globally so CSS can keep the one element that outranks
+    // this overlay — the JS tooltip (#tooltip at --z-tooltip = 10000, kept that
+    // high so a modal never clips it) — from floating above the dim blocker.
+    // Only the toast container is allowed above the restart overlay.
+    document.documentElement.setAttribute('data-restarting', '');
+
     // Mark every sibling of the overlay inert so panels, drawers, and modals
     // stop receiving clicks, focus, and input. The toast container stays
     // interactive so the user can dismiss the restart toast.
@@ -50,6 +56,7 @@ export function RestartOverlay() {
       document.removeEventListener('keydown', block, true);
       document.removeEventListener('keyup', block, true);
       inerted.forEach((el) => el.removeAttribute('inert'));
+      document.documentElement.removeAttribute('data-restarting');
       clearTimeout(timer);
     };
   }, [active]);

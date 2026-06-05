@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.9.9 — 2026-06-05
+
+### Added
+- Inline text-file editing in the file preview pane.
+- "Thread" button on changes-panel rows to jump to the originating thread.
+- `--built` frontend dev mode (now the default; `--hmr` opts back into the live Vite dev server) to kill the iOS PWA cold-load black screen.
+- Clickable links rendered inside AskUserQuestion question text.
+- Mobile: "Keep header visible" now defaults to on.
+- Active service-worker BUILD_ID surfaced in the control panel.
+
+### Changed
+- PWA caches the navigation shell so a notification-tap reload boots from disk; faster iOS notification-tap reload overall.
+- Restart-overlay z-ordering: only toasts sit above the overlay; fullscreen app, landscape lock, drawer threads, and tooltips drop below it during restart.
+
+### Fixed
+- CC: Cancel now acts like Esc (interrupt + resume) instead of kill + respawn.
+- CC: external-repo agents stay on the worktree branch so the Diff tracks their PR.
+- CC: only set `RUSTC_WRAPPER=sccache` when sccache is on PATH; set it to `""` (not unset) when absent.
+- Diff button gated on the same algorithm the viewer uses (hidden when empty); falls back to `origin/<default>` when the local default branch has diverged.
+- Steps: redact ToolCalled description from masked args; friendlier progress labels for generic-fallback tools.
+- Backup: "Show backup key" is read-only; key generation is explicit and never overwrites.
+- Notifications: route warm Chrome push taps via postMessage instead of fragment navigate.
+- File preview: freeze the editor fetch URL at mount so revision bumps don't tear out the textarea.
+- Scroll: chevron re-engages the tail; snap before resize so big chunks keep following.
+- dev script: mode-aware `show_banner`, kill stale `--built` build-watch, guard `${BUILT:-}`.
 ## v0.9.8 — 2026-06-03
 
 ### Added

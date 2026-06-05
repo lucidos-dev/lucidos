@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { signal } from '@preact/signals';
-import { connectionStatus, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, restartRequired, updateAvailable, restartGroups, showConfirm, showToast } from '../../store/store';
+import { connectionStatus, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, restartRequired, updateAvailable, serviceWorkerBuildId, restartGroups, showConfirm, showToast } from '../../store/store';
 import { isNewerVersion } from '../../utils/version';
+import { requestServiceWorkerBuildId } from '../../hooks/sw-update';
 import { initiateEngineRestart } from '../../store/actions/chat-changes';
 import { fetchWorkspaces } from '../../api/client';
 import type { WorkspaceInfo } from '../../api/client';
@@ -62,12 +63,25 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
   const clientVersion = tauriClientVersion ?? ENGINE_VERSION;
   const restart = restartRequired.value;
   const update = updateAvailable.value;
+  const swBuildId = serviceWorkerBuildId.value;
+  // Un-stamped sw.js (live dev server) reports the literal placeholder — show it
+  // as "dev" rather than the raw `__LUCIDOS_BUILD_ID__` token.
+  const buildLabel = swBuildId
+    ? (swBuildId.startsWith('__') ? 'dev' : swBuildId)
+    : null;
 
   // Anchor is the brand-label that opened the panel — re-clicking it routes
   // through its own onClick toggle. Escape comes free with the hook.
   useDismissOnOutside(effectiveOpen, ref, controlPanelAnchor.value, () => {
     controlPanelOpen.value = false;
   });
+
+  // Refresh the SW build id each time the panel opens so the shown value is the
+  // live worker's (it's also queried at startup and kept fresh on
+  // controllerchange — this just guarantees freshness when the user looks).
+  useEffect(() => {
+    if (effectiveOpen) requestServiceWorkerBuildId();
+  }, [effectiveOpen]);
 
   // Fetch other workspaces on open. Gated to the active layout so the dual-
   // mount doesn't double-fetch on every open.
@@ -191,6 +205,12 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
                   <span class="control-panel-update"> (latest: {latestClientVer})</span>
                 )}
               </span>
+            </div>
+          )}
+          {buildLabel && (
+            <div class="control-panel-info-row">
+              <span class="control-panel-label">Build</span>
+              <span class="control-panel-value">{buildLabel}</span>
             </div>
           )}
           {startedAt && (

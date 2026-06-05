@@ -3,11 +3,44 @@
 // Activate new SW immediately and take control of all pages.
 // This triggers Chrome's "site updated" toast when sw.js changes,
 // but only during development — in production SW updates are rare.
-self.addEventListener('install', () => {
+self.addEventListener('install', (event) => {
   self.skipWaiting();
+  // Warm the navigation shell so the FIRST controlled reload paints from disk
+  // instead of paying an HTML round trip. The iOS notification-tap is always a
+  // full cross-document reload (system-knowhow/notifications.md §4.5), so on a
+  // slow link that one uncached HTML fetch is visible blank time. Best-effort:
+  // if this misses (engine down at install), the fetch handler's cache-first
+  // populates the shell on the first navigation instead. Built mode only —
+  // `cache: 'reload'` bypasses the HTTP cache so we store the CURRENT build's
+  // shell, and SHELL_CACHE is build-id-keyed so activate() purges it on a bump.
+  if (IS_BUILT) {
+    event.waitUntil((async () => {
+      try {
+        const shellKey = new Request(self.location.origin + '/');
+        const resp = await fetch(self.location.origin + '/', { cache: 'reload' });
+        if (resp && resp.ok && !resp.redirected) {
+          const cache = await caches.open(SHELL_CACHE);
+          await cache.put(shellKey, resp.clone());
+        }
+      } catch {
+        /* offline / engine down at install — first navigation populates it */
+      }
+    })());
+  }
 });
 self.addEventListener('activate', (event) => {
-  event.waitUntil(clients.claim());
+  // Take control of open pages, then drop any cache we no longer recognize so
+  // a bumped cache name (e.g. lucidos-shell-v1 -> -v2) purges the prior
+  // generation instead of leaking it forever.
+  event.waitUntil(
+    (async () => {
+      const names = await caches.keys();
+      await Promise.all(
+        names.filter((name) => !KEEP_CACHES.includes(name)).map((name) => caches.delete(name)),
+      );
+      await clients.claim();
+    })(),
+  );
 });
 
 // Required for iOS PWA — without a fetch listener iOS won't treat this as a valid SW.
@@ -15,7 +48,8 @@ self.addEventListener('activate', (event) => {
 // We intercept same-origin GET /api/v1/* requests with explicit respondWith(fetch())
 // to work around an iOS Safari bug where the implicit "don't call respondWith"
 // fallback returns empty/corrupted responses after the SW is killed and restarted
-// under memory pressure (manifests as blank thread views).
+// under memory pressure (manifests as blank thread views). Built /assets/*
+// bundles are also served Cache-first (see SHELL_CACHE) to speed up reloads.
 //
 // We DO NOT intercept non-GET methods (POST/PUT/PATCH/DELETE). iOS WebKit's body
 // stream cloning is unreliable when respondWith re-issues a request with a body —
@@ -36,17 +70,87 @@ self.addEventListener('activate', (event) => {
 // background through it during the round-trip (the visible "black flash").
 const BLOB_CACHE = 'lucidos-blob-v1';
 
+// Per-build id, stamped into the built sw.js by the `lucidos-sw-stamp` Vite
+// plugin (vite.config.ts). It both keys the shell cache (so a new build's SW
+// purges the prior build's cache in activate()) AND makes each build's sw.js
+// byte-different — that byte difference is what the browser's SW update check
+// detects, which fires the "New version available → Refresh" toast in built
+// mode (the user's signal that a rebuild is ready to reload). In the live dev
+// server the plugin doesn't run, so this stays the literal placeholder — a
+// harmless static name (the dev server never serves /assets/*, so the shell
+// cache never populates anyway).
+const BUILD_ID = '__LUCIDOS_BUILD_ID__';
+
+// Immutable, content-hashed production bundles. Vite builds the app to
+// /assets/<name>-<hash>.<ext>; the hash changes whenever the bytes change, so a
+// cached entry for a URL is valid forever. Caching these lets a reload pull the
+// whole JS/CSS graph from disk instead of the network — the bulk of the cost of
+// an iOS PWA reload after a notification-tap navigation (which is always a full
+// cross-document load; see system-knowhow/notifications.md §4.5). Self-gating
+// across run modes: the Vite dev server serves source modules from /src,
+// /@vite, /@id, /node_modules/.vite — never /assets/* — so this never fires in
+// dev (where caching unhashed modules would pin stale code and break HMR) and
+// engages only for a built deployment.
+const SHELL_CACHE = 'lucidos-shell-' + BUILD_ID;
+
+// True only in a built deployment. The `lucidos-sw-stamp` plugin rewrites every
+// `__LUCIDOS_BUILD_ID__` token to a 12-char hex id at `vite build` time, so an
+// un-stamped sw.js (the live dev server, and the Vitest source-string tests)
+// still starts with `__`; a real build id never does. Gates the navigation
+// shell cache below to built mode only — in the Vite dev server the shell
+// (index.html → /src/main.tsx) and its module graph must stay network-fresh or
+// an edit to index.html / HMR would be pinned to a stale copy. The `/assets/*`
+// branch self-gates by path instead (dev never serves /assets/*), but a
+// navigation to `/` happens in BOTH modes, so it needs this explicit gate.
+const IS_BUILT = !BUILD_ID.startsWith('__');
+
+// Caches the SW owns and keeps; activate() deletes anything else so bumping a
+// cache name purges the prior generation.
+const KEEP_CACHES = [BLOB_CACHE, SHELL_CACHE];
+
 self.addEventListener('fetch', (event) => {
-  const url = event.request.url;
-  if (!url.startsWith(self.location.origin + '/api/v1/')) return;
   if (event.request.method !== 'GET') return;
+  const url = event.request.url;
+  // Only ever touch our own origin — cross-origin requests (CDNs, third-party
+  // iframes) are none of the SW's business.
+  if (!url.startsWith(self.location.origin)) return;
   const path = url.slice(self.location.origin.length).split('?')[0];
-  if (path === '/api/v1/events') return;
-  if (path.startsWith('/api/v1/blobs/')) {
-    event.respondWith(fetchBlobWithCache(event.request));
+
+  if (path.startsWith('/api/v1/')) {
+    // SSE: Chrome keeps the SW alive for the whole streaming connection, so
+    // intercepting it hangs the worker — let the browser handle it natively.
+    if (path === '/api/v1/events') return;
+    // Content-addressed blobs are immutable for the lifetime of the hash.
+    if (path.startsWith('/api/v1/blobs/')) {
+      event.respondWith(cacheFirst(event.request, BLOB_CACHE));
+      return;
+    }
+    // Other GETs get the iOS empty-response retry workaround (see top comment).
+    event.respondWith(fetchWithRetry(event.request));
     return;
   }
-  event.respondWith(fetchWithRetry(event.request));
+
+  // Content-hashed app bundles — no-op in dev (Vite never serves /assets/*).
+  if (path.startsWith('/assets/')) {
+    event.respondWith(cacheFirst(event.request, SHELL_CACHE));
+    return;
+  }
+
+  // Navigation shell (index.html). Every top-level navigation lands here: the
+  // PWA start URL and — the case that matters — every notification-tap reload,
+  // which arrives as a cross-document `/?notification=…&thread=…` load (the
+  // WebKit constraint in system-knowhow/notifications.md §4.5). Serving the
+  // cached shell turns that reload's HTML fetch into a disk read; combined with
+  // the cached /assets/* graph above, the app boots with zero network on the
+  // critical path and only the data GETs still round-trip. The `path === '/'`
+  // gate is load-bearing: app-UI iframes (`/app/<id>/`) and skill UIs are ALSO
+  // `mode: 'navigate'` requests but are NOT the SPA shell — they must reach
+  // their own server-rendered HTML, never index.html. Built mode only
+  // (IS_BUILT) so the dev server keeps serving a network-fresh shell.
+  if (IS_BUILT && event.request.mode === 'navigate' && path === '/') {
+    event.respondWith(cacheFirstShell(event.request));
+    return;
+  }
 });
 
 async function fetchWithRetry(request) {
@@ -57,14 +161,40 @@ async function fetchWithRetry(request) {
   }
 }
 
-async function fetchBlobWithCache(request) {
-  const cache = await caches.open(BLOB_CACHE);
+// Cache-first for immutable content (content-addressed blobs, content-hashed app
+// bundles): serve from the Cache API on a hit with no network, otherwise fetch
+// (with the iOS SW-restart retry) and populate the cache off the response path.
+// Only successful responses are cached, so a transient 404/5xx during a deploy
+// swap is never pinned.
+async function cacheFirst(request, cacheName) {
+  const cache = await caches.open(cacheName);
   const cached = await cache.match(request);
   if (cached) return cached;
   const response = await fetchWithRetry(request);
-  if (response.ok) {
+  if (response && response.ok) {
     // Clone off the response path so delivery isn't blocked on the cache write.
     cache.put(request, response.clone()).catch(() => {});
+  }
+  return response;
+}
+
+// Cache-first for the navigation shell (index.html). Unlike cacheFirst, the
+// entry is keyed by a NORMALIZED `/` request (no query string) so every
+// `/?notification=…` deep-link variant collapses onto one shell entry — read
+// and write both use `shellKey`, never the query-bearing `request`. Lives in
+// SHELL_CACHE so a new build's activate() purges it alongside the stale
+// /assets graph. A redirected or non-2xx response is never cached: a redirected
+// Response replayed for a navigation throws ("response served by service worker
+// has redirections"), and a transient error page during an engine restart must
+// not be pinned. On a miss the live network response is returned as-is.
+async function cacheFirstShell(request) {
+  const cache = await caches.open(SHELL_CACHE);
+  const shellKey = new Request(self.location.origin + '/');
+  const cached = await cache.match(shellKey);
+  if (cached) return cached;
+  const response = await fetchWithRetry(request);
+  if (response && response.ok && !response.redirected) {
+    cache.put(shellKey, response.clone()).catch(() => {});
   }
   return response;
 }
@@ -74,10 +204,10 @@ async function fetchBlobWithCache(request) {
 const DEFAULT_NOTIFICATION_TAG = 'lucidos-notification';
 
 // Resolve the engine-built relative navigate URL against the SW's origin so
-// `client.navigate()` and `clients.openWindow()` (both of which require
-// absolute URLs in Chrome) get a fully-qualified URL. Safari handles the
-// declarative `navigate` field directly without running this SW, so it
-// doesn't go through here.
+// `clients.openWindow()` (which requires an absolute URL in Chrome) gets a
+// fully-qualified URL. The push handler also resolves it for the
+// `showNotification` `navigate` option. Safari handles the declarative
+// `navigate` field directly without running this SW, so it doesn't go here.
 function resolveNavigate(relativeUrl) {
   if (typeof relativeUrl !== 'string' || relativeUrl.length === 0) {
     return self.location.origin + '/';
@@ -188,6 +318,15 @@ self.addEventListener('message', (event) => {
   // and the page recovers via unregister + re-register.
   if (event.data?.type === 'lucidos:ping' && event.source) {
     event.source.postMessage({ type: 'lucidos:pong' });
+    return;
+  }
+  // Build-id query (control panel debugging aid): report which build this SW
+  // is. BUILD_ID is the ground truth for "did the new build's SW take over?" —
+  // it's the same value whose byte-change makes sw.js differ and fires the
+  // "New version available → Refresh" toast. The page surfaces it in the
+  // connection status popover so a missed toast can be diagnosed by eye.
+  if (event.data?.type === 'lucidos:get-build-id' && event.source) {
+    event.source.postMessage({ type: 'lucidos:build-id', buildId: BUILD_ID });
   }
 });
 
@@ -198,16 +337,15 @@ self.addEventListener('notificationclick', (event) => {
   const notificationId = data.notification_id || null;
 
   // This handler runs on Chrome (and any browser that doesn't natively process
-  // the declarative envelope). It reads the HASH form of the deep link from
-  // `data.navigate`. iOS Safari handles the tap declaratively and navigates to
-  // `notification.navigate` (the QUERY form) WITHOUT running this handler — the
-  // two forms exist because iOS won't apply a same-document (hash-only)
-  // navigation to an already-open PWA window, so iOS needs a cross-document
-  // (query) URL. See crates/lucidos-engine/src/scheduler/push.rs::build_push_payload.
+  // the declarative envelope). iOS Safari handles the tap declaratively and
+  // navigates to `notification.navigate` (the QUERY form) WITHOUT running this
+  // handler. See crates/lucidos-engine/src/scheduler/push.rs::build_push_payload.
   //
-  // Hash here (not query) keeps a warm Chrome tap reload-free: navigating a
-  // controlled tab from `/` to `/#…` is a same-document change, so the page is
-  // NOT reloaded and its hashchange listener routes the deep link.
+  // A warm, already-open tab is routed by postMessage (see routeToDeepLink) —
+  // NOT by this URL — so `targetUrl` only drives the cold `clients.openWindow`
+  // path when no Lucidos tab is open. It uses the HASH form of the deep link
+  // from `data.navigate` so the freshly-opened page's `handleHashLocation`
+  // cold-start router reads the params off the hash.
   //
   // The legacy SW-side `buildDeepLinkUrl` was deleted with the declarative
   // migration — a missing `data.navigate` therefore means the push arrived in
@@ -234,10 +372,10 @@ async function routeToDeepLink(targetUrl, tapData) {
   const windowClients = await clients.matchAll({ type: 'window', includeUncontrolled: true });
   // frameType filter is the load-bearing line — same-origin app-UI iframes
   // (src=/app/<id>/) are ALSO Window clients per the SW spec. Without the
-  // 'top-level' gate, find() can return the iframe; navigate() then changes
-  // the iframe's URL and the PWA main window doesn't move, manifesting as
-  // "PWA opens to the wrong view". URL-substring filters stay as belt-and-
-  // braces for non-iframe edge cases (skill UIs in their own window).
+  // 'top-level' gate, find() can return the iframe; focusing/messaging it
+  // moves the wrong surface, manifesting as "PWA opens to the wrong view".
+  // URL-substring filters stay as belt-and-braces for non-iframe edge cases
+  // (skill UIs in their own window).
   const appClient = windowClients.find(c =>
     c.frameType === 'top-level' &&
     !c.url.includes('/sw.js') &&
@@ -245,27 +383,28 @@ async function routeToDeepLink(targetUrl, tapData) {
   );
 
   if (appClient) {
-    // 1. Try navigate first — works for both desktop Chrome when this SW
-    //    controls the tab AND iOS PWA cold-start (the inert WindowClient
-    //    accepts navigate even when focus/postMessage silently drop).
-    //    navigate() rejects with TypeError when the target tab is NOT
-    //    controlled by this SW (dev hard-reload, DevTools "Update on
-    //    reload" dropping the controller). matchAll({includeUncontrolled:true})
-    //    still returns the tab, so we fall through to focus() below.
-    const navigated = await appClient.navigate(targetUrl).catch(() => null);
-    if (navigated) {
-      await navigated.focus().catch(() => {});
-      return;
-    }
-    // 2. focus() works on uncontrolled clients; the page-side message
-    //    listener in useStartup dispatches the deep link through the same
-    //    router the hashchange path uses. Skip the openWindow fallback
-    //    when this succeeds so the user's existing tab is reused.
-    try {
-      await appClient.focus();
-      appClient.postMessage({ type: 'lucidos:deep-link', target: tapData });
-      return;
-    } catch { /* fall through to openWindow */ }
+    // Bring the tab forward (focus() also unfreezes a Chrome-frozen page so it
+    // can process the message below), then hand the page the structured deep
+    // link. postMessage → the page's navigator.serviceWorker 'message' listener
+    // (onServiceWorkerMessage in useStartup) → dispatchDeepLink, the SAME
+    // router the URL path uses.
+    //
+    // We deliberately do NOT use a fragment-only client.navigate('/#…') here.
+    // It "succeeds" against the warm, SW-controlled tab (so an earlier
+    // navigate-first design returned without ever messaging the page) yet
+    // routes nothing: Chrome does not fire `hashchange` for a fragment-only
+    // WindowClient.navigate(), and the page-side focus/visibilitychange resume
+    // safety net does NOT fire when the tab the user clicked back into was
+    // already the focused/visible tab — the "came back to the computer in the
+    // morning" case, where the SW focused the right tab and marked the
+    // notification read but the deep link silently no-op'd. postMessage is
+    // independent of both. See system-knowhow/notifications.md §4.5.
+    await appClient.focus().catch(() => {});
+    appClient.postMessage({ type: 'lucidos:deep-link', target: tapData });
+    return;
   }
+  // No existing top-level Lucidos window — open one at the engine-built
+  // deep-link URL so cold-start routing (handleHashLocation on load) picks up
+  // the params.
   await clients.openWindow(targetUrl);
 }

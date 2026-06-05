@@ -3,10 +3,6 @@ import { threadMap, focusedThreadId, applyingNowThreadIds, archivingThreadIds, d
 import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 
-export const DIFF_DISABLED_TOOLTIP = 'No changes on this branch';
-
-type CcDiff = 'hidden' | 'disabled' | 'enabled';
-
 /** The close-set kinds the banner renders. Discard-draft (rendered by
  *  PromptInput's "Discard draft" button) and the Save/Unsave toggle (rendered
  *  by PromptInput's section buttons) are excluded — they come from the same
@@ -17,7 +13,7 @@ type WaitingState =
   | { type: 'applying' }
   | { type: 'discarding' }
   | { type: 'canceling'; threadId: string; isCanceling: boolean }
-  | { type: 'actions'; actions: TaggedAction[]; threadId: string; isArchiving: boolean; ccDiff: CcDiff };
+  | { type: 'actions'; actions: TaggedAction[]; threadId: string; isArchiving: boolean; showDiff: boolean };
 
 /** Banner state passed to `getBannerSlots`. The 'canceling' variant is owned
  *  by PromptInput's morphable Send→Cancel button (so the swap can animate the
@@ -46,7 +42,7 @@ export function getWaitingState(): WaitingState | null {
   // no Archive action once the optimistic section flips to 'archived', so this
   // dedicated flag is what keeps the spinner on screen.)
   if (archivingThreadIds.value.has(focused)) {
-    return { type: 'actions', actions: [], threadId: focused, isArchiving: true, ccDiff: 'hidden' };
+    return { type: 'actions', actions: [], threadId: focused, isArchiving: true, showDiff: false };
   }
 
   const status = effectiveThreadStatus(thread);
@@ -76,21 +72,15 @@ export function getWaitingState(): WaitingState | null {
   const actions = resolveThreadActions(focused).filter((a) => BANNER_CLOSE_KINDS.has(a.kind));
   if (actions.length === 0) return null;
 
-  // Diff is enabled iff the CC branch actually has a diff against main on
+  // The Diff button is shown only when the CC branch actually has a diff on
   // disk (`codingAgentHasDiff` — single git-truth signal maintained by the
-  // backend projection + recovery sweep). The button stays visible (disabled)
-  // on CC threads with no diff so the affordance is always advertised, but
-  // it can never drop the user into an empty diff.
-  let ccDiff: CcDiff;
-  if (thread.meta.channel !== 'claude_code') {
-    ccDiff = 'hidden';
-  } else if (thread.meta.codingAgentHasDiff) {
-    ccDiff = 'enabled';
-  } else {
-    ccDiff = 'disabled';
-  }
+  // backend projection + recovery sweep, computed by the SAME algorithm the
+  // Diff viewer renders). No diff → no button, so it can never drop the user
+  // into an empty diff. This matches `getStandaloneCcDiffButton`, which also
+  // hides when there's nothing to show.
+  const showDiff = thread.meta.channel === 'claude_code' && thread.meta.codingAgentHasDiff;
 
-  return { type: 'actions', actions, threadId: focused, isArchiving: false, ccDiff };
+  return { type: 'actions', actions, threadId: focused, isArchiving: false, showDiff };
 }
 
 interface BannerSlots {
@@ -145,26 +135,22 @@ export function getBannerSlots(state: BannerState): BannerSlots {
   const actionButtons = state.actions.map((action) => renderActionButton(action));
 
   return {
-    liftable: state.ccDiff === 'hidden'
-      ? null
-      : renderDiffButton(state.threadId, state.ccDiff === 'enabled'),
+    liftable: state.showDiff ? renderDiffButton(state.threadId) : null,
     primary: <>{actionButtons}</>,
   };
 }
 
 /** Shared Diff-button JSX. Rendered in two places: inside the banner via
- *  `getBannerSlots` (where it can be disabled with a tooltip), and as a
- *  standalone slot via `getStandaloneCcDiffButton` (only the enabled form).
- *  Same key in both call sites so Preact treats it as one node across
- *  banner ↔ standalone transitions. */
-function renderDiffButton(threadId: string, enabled: boolean): ComponentChildren {
+ *  `getBannerSlots`, and as a standalone slot via `getStandaloneCcDiffButton`.
+ *  Both call sites only render it when the branch has a diff to show, so the
+ *  button is always clickable — no disabled form. Same key in both so Preact
+ *  treats it as one node across banner ↔ standalone transitions. */
+function renderDiffButton(threadId: string): ComponentChildren {
   return (
     <button
       key="diff"
       class="action-btn"
       data-row-item
-      disabled={!enabled}
-      data-tooltip={enabled ? undefined : DIFF_DISABLED_TOOLTIP}
       onClick={() => void viewThreadCcDiff(threadId)}
     >
       Diff
@@ -173,10 +159,11 @@ function renderDiffButton(threadId: string, enabled: boolean): ComponentChildren
 }
 
 /** Diff button decoupled from waitingState: appears whenever the focused
- *  CC thread's branch has commits, even mid-turn (when getWaitingState
+ *  CC thread's branch has a diff, even mid-turn (when getWaitingState
  *  returns 'canceling' and the banner is suppressed). PromptInput uses this
- *  in the slots-fallback path so the user-facing rule "branch has commits →
- *  Diff visible" holds regardless of CC's run-state. */
+ *  in the slots-fallback path so the user-facing rule "branch has a diff →
+ *  Diff visible" holds regardless of CC's run-state. Same `codingAgentHasDiff`
+ *  gate as the banner path, so both surfaces show/hide together. */
 export function getStandaloneCcDiffButton(): ComponentChildren | null {
   const focused = focusedThreadId.value;
   if (!focused) return null;
@@ -184,7 +171,7 @@ export function getStandaloneCcDiffButton(): ComponentChildren | null {
   if (!thread) return null;
   if (thread.meta.channel !== 'claude_code') return null;
   if (!thread.meta.codingAgentHasDiff) return null;
-  return renderDiffButton(focused, true);
+  return renderDiffButton(focused);
 }
 
 /** Render one close-set TaggedAction. Class + aria derive from the action kind;

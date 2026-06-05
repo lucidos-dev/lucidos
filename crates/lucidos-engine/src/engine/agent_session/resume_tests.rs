@@ -260,6 +260,53 @@ async fn applied_change_falls_through_to_fresh_start() {
     teardown_test_db(&db_name).await;
 }
 
+/// Regression for the "Cancel spawns a fresh, amnesiac CC session" bug.
+///
+/// A user Cancel (Stop = Esc) emits `ResponseCanceled` then `CodingAgentIdled`
+/// (carrying the `cc_session_id`) and — critically — does NOT delete the branch
+/// or emit `SessionEnded` (the branch survives via `KeepCanceledBranch` in
+/// `finalize`). So the most-recent turn closer is the idle, and the next message
+/// resolves to the SAME session id + branch (a `--resume`), not a fresh spawn.
+/// Before the fix, the cancel deleted the branch and dropped the sid, forcing a
+/// brand-new session that re-asked everything.
+#[tokio::test]
+async fn cancel_then_idle_resumes_same_session() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let branch = "claude-code/canceled-turn";
+    let session_id = "sess-canceled-resume";
+
+    seed_session_started(&bus, thread_id, session_id, branch).await;
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::ResponseCanceled {
+            text: "partial work before the user hit Stop".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+            cause: crate::engine::thread_events::CancelCause::UserStop,
+        },
+    )
+    .await;
+    emit_idled(&bus, thread_id, Some(session_id), None).await;
+
+    // Auto-detect path (no caller sid): the most-recent closer is the idle, so
+    // the resolver resumes the same session id on the SessionStarted branch.
+    let (sid, resume_branch) =
+        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None).await;
+    assert_eq!(
+        sid,
+        Some(session_id.to_string()),
+        "a cancel must resume the same cc_session_id, not spawn fresh"
+    );
+    assert_eq!(resume_branch, Some(branch.to_string()));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Reproduces the SessionEnded-after-CodingAgentIdled blind-spot.
 ///
 /// In a clean (no-changes) CC turn the engine emits CodingAgentIdled and

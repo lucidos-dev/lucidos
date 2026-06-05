@@ -648,7 +648,7 @@ async fn diff_via_worktree(
 ) -> Result<ThreadCcDiff, (StatusCode, String)> {
     let (branch_opt, base_ref, repo_root_res) = tokio::join!(
         crate::engine::git_ops::worktree_current_branch(worktree_path),
-        crate::engine::git_ops::default_local_branch(worktree_path),
+        crate::engine::git_ops::default_diff_base(worktree_path),
         resolve_worktree_repo_root(worktree_path),
     );
     let branch_name = branch_opt.ok_or((
@@ -708,7 +708,7 @@ async fn diff_via_branch_ref(
         ))?;
 
     let repo_root = std::path::PathBuf::from(&repo.path);
-    let base_ref = crate::engine::git_ops::default_local_branch(&repo_root).await;
+    let base_ref = crate::engine::git_ops::default_diff_base(&repo_root).await;
     let files = run_git_diff(
         &repo_root,
         &format!("{}...{}", base_ref, branch_name),

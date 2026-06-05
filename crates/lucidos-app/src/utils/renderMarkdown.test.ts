@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { renderMarkdown, renderMarkdownInline } from './renderMarkdown';
+import { renderMarkdown, renderMarkdownInline, renderMarkdownInlineWithLinks } from './renderMarkdown';
 
 describe('renderMarkdown', () => {
   it('converts basic markdown to HTML', () => {
@@ -374,6 +374,69 @@ Use this pattern for all prompts.`;
 
     it('handles empty input', () => {
       expect(renderMarkdownInline('')).toBe('');
+    });
+  });
+
+  describe('renderMarkdownInlineWithLinks (phrasing content + live links)', () => {
+    it('linkifies a bare URL into a new-tab anchor', () => {
+      const html = renderMarkdownInlineWithLinks(
+        'Draft PR #1488 is ready: https://github.com/m10s-green/user-acquisition/pull/1488 — mark it ready?',
+      );
+      expect(html).toContain(
+        '<a href="https://github.com/m10s-green/user-acquisition/pull/1488" target="_blank" rel="noopener">',
+      );
+      expect(html).toContain('https://github.com/m10s-green/user-acquisition/pull/1488</a>');
+    });
+
+    it('keeps [label](url) markdown links as anchors with the label text', () => {
+      const html = renderMarkdownInlineWithLinks('see [the PR](https://example.com/pr/1) please');
+      expect(html).toContain('<a href="https://example.com/pr/1" target="_blank" rel="noopener">');
+      expect(html).toContain('the PR</a>');
+    });
+
+    it('still renders inline markdown — bold, italic, code, breaks', () => {
+      const html = renderMarkdownInlineWithLinks('**bold** *it* `code` line\nbreak');
+      expect(html).toContain('<strong>bold</strong>');
+      expect(html).toContain('<em>it</em>');
+      expect(html).toContain('<code>code</code>');
+      expect(html).toContain('<br');
+    });
+
+    it('does NOT emit block elements — stays safe as phrasing content', () => {
+      const html = renderMarkdownInlineWithLinks('# heading\n- item one');
+      expect(html).not.toContain('<p>');
+      expect(html).not.toContain('<ul>');
+      expect(html).not.toContain('<h1');
+    });
+
+    it('drops javascript:-scheme links to label text (no anchor, no scheme)', () => {
+      const html = renderMarkdownInlineWithLinks('[click me](javascript:alert(1))');
+      expect(html).toContain('click me');
+      expect(html).not.toContain('<a ');
+      expect(html).not.toContain('javascript:');
+    });
+
+    it('does not anchor relative or non-http schemes', () => {
+      const html = renderMarkdownInlineWithLinks('[app](app:todo) and [file](data/artifacts/x.md)');
+      expect(html).not.toContain('<a ');
+      expect(html).toContain('app');
+      expect(html).toContain('file');
+    });
+
+    it('escapes quotes in the href so the attribute cannot break out', () => {
+      const html = renderMarkdownInlineWithLinks('[x](https://example.com/"onmouseover="alert(1))');
+      expect(html).not.toContain('"onmouseover="');
+      expect(html).toContain('&quot;');
+    });
+
+    it('still escapes dangerous tags from raw source', () => {
+      const html = renderMarkdownInlineWithLinks('try <script>x</script> here');
+      expect(html).not.toContain('<script>');
+      expect(html).toContain('&lt;script&gt;');
+    });
+
+    it('handles empty input', () => {
+      expect(renderMarkdownInlineWithLinks('')).toBe('');
     });
   });
 

@@ -566,6 +566,125 @@ async fn diff_base_is_local_main_when_origin_is_behind() {
     );
 }
 
+/// The mirror of the test above: when the local default branch has been
+/// *rewritten* so the remote-tracking ref no longer reaches it — a repo
+/// migration, a force-pull, or a rebase landing on the user's local `main` —
+/// the Diff button must fall back to `origin/<default>`, which still holds the
+/// branch's true fork point. Otherwise the three-dot merge-base collapses to an
+/// ancient common ancestor and the diff balloons with unrelated churn.
+///
+/// Regression for the `user-acquisition` migration report: the migration system
+/// committed to the user's local `main` ("secrets transfer", "migration notice"
+/// commits) and rewrote its history so the PR branch's fork point was no longer
+/// an ancestor of local `main`. Lucidos diffed against local `main` and showed
+/// 59 files; the GitHub PR (diffed against the untouched remote base) showed 12.
+#[tokio::test]
+async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
+    async fn run(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
+        tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .await
+            .unwrap()
+    }
+
+    let origin_dir = tempfile::tempdir().unwrap();
+    let origin_path = origin_dir.path();
+    run(
+        &["-c", "init.defaultBranch=main", "init", "-q", "--bare"],
+        origin_path,
+    )
+    .await;
+
+    let main_repo = tempfile::tempdir().unwrap();
+    let main_path = main_repo.path();
+    run(&["-c", "init.defaultBranch=main", "init", "-q"], main_path).await;
+    run(&["config", "user.email", "test@example.com"], main_path).await;
+    run(&["config", "user.name", "Test"], main_path).await;
+
+    // Root commit, then the fork point the PR branch builds on top of.
+    tokio::fs::write(main_path.join("README.md"), "init\n")
+        .await
+        .unwrap();
+    run(&["add", "."], main_path).await;
+    run(&["commit", "-q", "-m", "init"], main_path).await;
+    let c_root = String::from_utf8_lossy(&run(&["rev-parse", "HEAD"], main_path).await.stdout)
+        .trim()
+        .to_string();
+
+    tokio::fs::write(main_path.join("fork-point.txt"), "shipped before the PR\n")
+        .await
+        .unwrap();
+    run(&["add", "."], main_path).await;
+    run(&["commit", "-q", "-m", "feature on main (PR forks here)"], main_path).await;
+
+    // Publish to origin and record origin/HEAD → main. `origin/main` now holds
+    // the fork point.
+    run(
+        &["remote", "add", "origin", origin_path.to_str().unwrap()],
+        main_path,
+    )
+    .await;
+    run(&["push", "-q", "origin", "main"], main_path).await;
+    run(&["remote", "set-head", "origin", "main"], main_path).await;
+
+    // CC worktree forks from the fork point, adds its own file.
+    let wt_dir = tempfile::tempdir().unwrap();
+    let wt_path = wt_dir.path().join("wt");
+    run(
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "cc/feature",
+            wt_path.to_str().unwrap(),
+            "main",
+        ],
+        main_path,
+    )
+    .await;
+    tokio::fs::write(wt_path.join("cc-work.txt"), "from CC\n")
+        .await
+        .unwrap();
+    run(&["add", "."], &wt_path).await;
+    run(&["commit", "-q", "-m", "cc: add cc-work.txt"], &wt_path).await;
+
+    // A migration tool rewrites local `main`: reset back to the root and commit
+    // a migration notice. `origin/main` (the fork point) is no longer an
+    // ancestor of local `main` — they diverge at the root.
+    run(&["reset", "-q", "--hard", &c_root], main_path).await;
+    tokio::fs::write(main_path.join("MIGRATION.md"), "moved to new-org\n")
+        .await
+        .unwrap();
+    run(&["add", "."], main_path).await;
+    run(
+        &["commit", "-q", "-m", "migration: secrets transfer (automated)"],
+        main_path,
+    )
+    .await;
+
+    let diff = super::diff_via_worktree(&wt_path, None)
+        .await
+        .expect("diff_via_worktree should succeed");
+
+    assert_eq!(
+        diff.base_ref, "origin/main",
+        "local `main` diverged from the remote — base must fall back to \
+         `origin/main`, got `{}`",
+        diff.base_ref,
+    );
+
+    let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["cc-work.txt"],
+        "only the CC branch's own file belongs in the diff; the fork-point \
+         file leaked because the base used the rewritten local `main`: {:?}",
+        paths,
+    );
+}
+
 /// App coding-agent threads operate on `data/apps/<id>/` inside the
 /// workspace git. The cc-diff response must scope to that pathspec so
 /// the Diff button doesn't surface stray edits the agent made outside

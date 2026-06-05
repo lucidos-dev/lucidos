@@ -10,7 +10,7 @@ globs:
 ## Dev / runtime scripts
 
 ```bash
-./scripts/web-dev.sh -w <ws> [-b] [-r]    # Start (-b builds; -r release)
+./scripts/web-dev.sh -w <ws> [-b] [-r] [--hmr]  # Start (-b builds engine; -r release engine; --hmr = live Vite dev server)
 ./scripts/tauri-dev.sh -w <ws> [-b]       # Start engine + Tauri window
 ./scripts/stop.sh -w <ws>                 # Stop a specific workspace
 ./scripts/status.sh                       # Check running status
@@ -19,6 +19,51 @@ globs:
 ./scripts/dev-codesign-setup.sh           # One-time: stable macOS code-signing identity
 ./scripts/test-engine.sh [--full|--fresh] # Engine tests against a dedicated Docker PG
 ```
+
+### Frontend: built by default; `--hmr` for the live dev server
+
+`web-dev.sh` serves a **built frontend by default**: `start_vite` runs
+`npx vite build --watch` (initial build + rebuild on source change) and serves the
+bundled `dist/` via `npx vite preview`; the engine reverse-proxies the frontend to
+it (`LUCIDOS_DEV_PROXY`). The navigation shell (`index.html`) **and** content-hashed
+`/assets/*` are cached cache-first by the service worker → instant iOS PWA resume /
+notification-tap reload (no ~10s cold-load black screen over Tailscale; the reload
+boots with zero network on the critical path, only data GETs round-trip), and the
+client only changes when rebuilt, so it can't drift ahead of the engine binary. Trade-off: **no HMR** — after a change is applied, `vite build --watch`
+rebuilds (a few seconds), the SW detects the new build (each build stamps a fresh
+`BUILD_ID` into `sw.js` via the `lucidos-sw-stamp` plugin in
+`crates/lucidos-app/vite.config.ts`), and the existing **"New version available →
+Refresh"** toast tells you when to reload.
+
+**Debugging a missed toast:** the connection-status popover (control panel) shows
+the active SW's `BUILD_ID` as a **Build** row. The page asks the controlling SW for
+it via a `lucidos:get-build-id` message (SW replies `lucidos:build-id`), re-querying
+on `controllerchange` and each time the panel opens, so the shown id tracks the
+*live* worker. If the id is unchanged across workspaces / across an apply, the SW
+never picked up a new build (rebuild or stamp issue); if it changed but no toast
+fired, the toast logic is the suspect. The live dev server's un-stamped `sw.js`
+reports the literal placeholder, shown as `dev`.
+
+`--hmr` (alias `--dev`) opts into the **live Vite dev server** instead: Vite serves
+the app as hundreds of unbundled ESM modules with hot module replacement — best for
+active frontend iteration, but the SW caches nothing in dev (the shell-cache branch
+is gated to built mode via `IS_BUILT`, and `/assets/*` cache-first matches a path
+dev never emits) so an iOS PWA cold-loads slowly over the network. Like the build watch, the dev server skips `tsc --noEmit` — type errors
+surface at the explicit build / in CC harden.
+
+**Engine-restart interaction (the load-bearing part):** a CC Apply restarts the
+engine via `web-dev.sh --engine-only` (`crates/lucidos-engine/src/api/history.rs`),
+which sets `ENGINE_ONLY` and **exits before `start_vite`** — so the restart never
+touches the frontend. `kill_stale_processes` skips both the preview kill and the
+`vite build --watch` kill when `ENGINE_ONLY` is set, so the already-running built
+frontend survives the restart and the new engine just re-attaches its proxy; the
+build-watch picks up the merged source and rebuilds `dist/` on its own. The
+frontend mode is therefore chosen once, at the initial full launch.
+Implementation: `start_frontend_built` / `start_frontend_dev` in
+`scripts/lib/workspace.sh` (built-watch pid in `.lucidos/build-watch.pid`, torn
+down by `cleanup_processes` and `stop.sh`). The e2e harness (`scripts/lib/e2e.sh`)
+drives `start_vite` without `parse_dev_args`, so it never sets `BUILT` and stays on
+the live dev server.
 
 ## Engine tests need Postgres — use `test-engine.sh`
 

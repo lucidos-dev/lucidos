@@ -161,10 +161,20 @@ pub(crate) async fn has_branch_commits(repo_root: &Path, branch_name: &str) -> b
 }
 
 
-/// Get the list of changed files between main and a branch (three-dot merge-base diff).
+/// Get the list of changed files between the branch's diff base and the branch
+/// (three-dot merge-base diff). The base is `default_diff_base` — the SAME ref
+/// the Diff button diffs against (`origin/<default>` when the local default
+/// branch has diverged, otherwise the local default) — so the
+/// `coding_agent_has_diff` gate this feeds and the diff the button renders can
+/// never disagree. Using the local default directly here was the
+/// `user-acquisition` migration bug: a branch whose commits already live on
+/// `origin/main` but not on a force-rewritten local `main` showed 53 changed
+/// files against local `main` yet 0 against `origin/main`, lighting the Diff
+/// button on an empty diff.
+///
 /// Strips engine-injected paths — see `is_engine_injected_path` for rationale.
 pub(crate) async fn branch_changed_files(repo_root: &Path, branch_name: &str) -> Vec<String> {
-    let base = default_local_branch(repo_root).await;
+    let base = default_diff_base(repo_root).await;
     let range = format!("{}...{}", base, branch_name);
     git_cmd(&["diff", "--name-only", &range], repo_root)
         .await
