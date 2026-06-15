@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { cancelChat, checkHealth, fetchCCCommands, submitChat } from './client';
+import { cancelChat, checkHealth, fetchCodingAgentCommands, submitChat } from './client';
 
 // iOS Safari rejects with TypeError("Load failed") when the PWA's HTTP/2
 // connection is half-closed (typical after backgrounding). The service worker
@@ -71,7 +71,7 @@ describe('mutating fetch retry on TypeError', () => {
   });
 });
 
-describe('fetchCCCommands url construction', () => {
+describe('fetchCodingAgentCommands url construction', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -92,33 +92,51 @@ describe('fetchCCCommands url construction', () => {
   });
 
   it('passes repo_id="" explicitly when repoId is empty string (default Lucidos)', async () => {
-    await fetchCCCommands(undefined, '');
+    await fetchCodingAgentCommands(undefined, '');
     const [url] = mockFetch.mock.calls[0];
     expect(url).toBe('/api/v1/claude-code/commands?repo_id=');
   });
 
   it('passes repo_id when a specific repoId is given', async () => {
-    await fetchCCCommands(undefined, 'repo-uuid-123');
+    await fetchCodingAgentCommands(undefined, 'repo-uuid-123');
     const [url] = mockFetch.mock.calls[0];
     expect(url).toBe('/api/v1/claude-code/commands?repo_id=repo-uuid-123');
   });
 
   it('omits repo_id when repoId is undefined (no compose context)', async () => {
-    await fetchCCCommands('thread-abc');
+    await fetchCodingAgentCommands('thread-abc');
     const [url] = mockFetch.mock.calls[0];
     expect(url).toBe('/api/v1/claude-code/commands?thread_id=thread-abc');
   });
 
   it('passes both thread_id and repo_id when both are given', async () => {
-    await fetchCCCommands('thread-abc', 'repo-uuid-123');
+    await fetchCodingAgentCommands('thread-abc', 'repo-uuid-123');
     const [url] = mockFetch.mock.calls[0];
     expect(url).toBe('/api/v1/claude-code/commands?thread_id=thread-abc&repo_id=repo-uuid-123');
   });
 
   it('omits the query string entirely when neither argument is given', async () => {
-    await fetchCCCommands();
+    await fetchCodingAgentCommands();
     const [url] = mockFetch.mock.calls[0];
     expect(url).toBe('/api/v1/claude-code/commands');
+  });
+
+  it('passes coding_agent for compose-view codex selection', async () => {
+    await fetchCodingAgentCommands(undefined, '', 'codex');
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe('/api/v1/claude-code/commands?repo_id=&coding_agent=codex');
+  });
+
+  it('omits coding_agent for the claude-code default', async () => {
+    await fetchCodingAgentCommands(undefined, '', 'claude-code');
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe('/api/v1/claude-code/commands?repo_id=');
+  });
+
+  it('ignores coding_agent when a thread_id is given — backend resolves from the thread', async () => {
+    await fetchCodingAgentCommands('thread-abc', undefined, 'codex');
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe('/api/v1/claude-code/commands?thread_id=thread-abc');
   });
 });
 

@@ -11,6 +11,7 @@
 //! `crate::llm::openai::OpenAiProvider` (and re-exported from `crate::llm`).
 
 
+use crate::core::AuthType;
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, TokenCallback, ToolCall, ToolDefinition,
 };
@@ -22,6 +23,65 @@ mod responses;
 
 const CHUNK_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 16384;
+
+/// Where the OpenAI API key the engine builds [`OpenAiProvider`] from came
+/// from — surfaced in the startup log so an operator can tell whether the
+/// stored credential or the env fallback is in effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiKeySource {
+    /// A credential stored in Settings → Providers (service name `openai`).
+    Credential,
+    /// The `OPENAI_API_KEY` launch environment variable (the fallback).
+    Env,
+}
+
+impl std::fmt::Display for OpenAiKeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Credential => "stored credential (Settings → Providers)",
+            Self::Env => "OPENAI_API_KEY",
+        })
+    }
+}
+
+/// Resolve the OpenAI API key used to construct [`OpenAiProvider`].
+///
+/// A usable stored `openai` credential (Settings → Providers) takes precedence
+/// so the engine no longer needs `OPENAI_API_KEY` in its launch environment;
+/// the env var stays as a fallback to preserve existing deployments. Only
+/// `api_key` / `bearer` credentials carry a usable OpenAI key — any other
+/// `auth_type` (e.g. a `password` JSON blob) is ignored with a log line and the
+/// resolver falls through to the env var. Blank/whitespace values on either
+/// side are treated as absent. Returns `None` when neither is configured, in
+/// which case OpenAI models surface a clear error from `RoutingProvider`.
+pub fn resolve_openai_api_key(
+    credential: Option<(AuthType, String)>,
+    env_key: Option<String>,
+) -> Option<(String, OpenAiKeySource)> {
+    if let Some((auth_type, value)) = credential {
+        match auth_type {
+            AuthType::ApiKey | AuthType::Bearer => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Some((trimmed.to_string(), OpenAiKeySource::Credential));
+                }
+            }
+            other => {
+                log!(
+                    "[Startup] OpenAI credential auth_type {} unsupported (expected api_key or bearer) — ignoring it and falling back to OPENAI_API_KEY",
+                    other
+                );
+            }
+        }
+    }
+    if let Some(value) = env_key {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some((trimmed.to_string(), OpenAiKeySource::Env));
+        }
+    }
+    None
+}
 
 /// GPT-5+ and Codex models use the Responses API, all others use Chat Completions.
 fn uses_responses_api(model: &str) -> bool {
@@ -238,6 +298,10 @@ impl LlmProvider for OpenAiProvider {
             .await
         }
     }
+
+    fn default_model(&self) -> &str {
+        &self.model
+    }
 }
 
 #[cfg(test)]
@@ -256,5 +320,74 @@ mod tests {
         meta.absorb_chat_usage(&absurd);
         assert_eq!(meta.input_tokens, Some(u32::MAX));
         assert_eq!(meta.output_tokens, Some(u32::MAX));
+    }
+
+    /// A stored `openai` credential wins over the env var so users can configure
+    /// OpenAI entirely from Settings → Providers without OPENAI_API_KEY.
+    #[test]
+    fn stored_credential_takes_precedence_over_env() {
+        let resolved = resolve_openai_api_key(
+            Some((AuthType::ApiKey, "sk-stored".to_string())),
+            Some("sk-env".to_string()),
+        );
+        assert_eq!(
+            resolved,
+            Some(("sk-stored".to_string(), OpenAiKeySource::Credential))
+        );
+    }
+
+    /// With no credential the OPENAI_API_KEY env fallback is preserved.
+    #[test]
+    fn falls_back_to_env_when_no_credential() {
+        let resolved = resolve_openai_api_key(None, Some("sk-env".to_string()));
+        assert_eq!(resolved, Some(("sk-env".to_string(), OpenAiKeySource::Env)));
+    }
+
+    /// A `bearer` credential carries a usable OpenAI key just like `api_key`.
+    #[test]
+    fn bearer_credential_is_accepted() {
+        let resolved =
+            resolve_openai_api_key(Some((AuthType::Bearer, "sk-bearer".to_string())), None);
+        assert_eq!(
+            resolved,
+            Some(("sk-bearer".to_string(), OpenAiKeySource::Credential))
+        );
+    }
+
+    /// A non-key auth_type (e.g. a `password` JSON blob) is not a usable OpenAI
+    /// key — ignore it and fall back to the env var rather than feeding garbage
+    /// into the provider.
+    #[test]
+    fn unsupported_auth_type_falls_back_to_env() {
+        let resolved = resolve_openai_api_key(
+            Some((AuthType::Password, r#"{"username":"a","password":"b"}"#.to_string())),
+            Some("sk-env".to_string()),
+        );
+        assert_eq!(resolved, Some(("sk-env".to_string(), OpenAiKeySource::Env)));
+    }
+
+    /// A blank/whitespace credential value is treated as absent so a stray empty
+    /// row doesn't shadow a real env key.
+    #[test]
+    fn blank_credential_falls_back_to_env() {
+        let resolved = resolve_openai_api_key(
+            Some((AuthType::ApiKey, "   ".to_string())),
+            Some("sk-env".to_string()),
+        );
+        assert_eq!(resolved, Some(("sk-env".to_string(), OpenAiKeySource::Env)));
+    }
+
+    /// Neither configured (or both blank) → None, so OpenAI models surface a
+    /// clear "not configured" error instead of constructing a dead provider.
+    #[test]
+    fn none_configured_returns_none() {
+        assert_eq!(resolve_openai_api_key(None, None), None);
+        assert_eq!(
+            resolve_openai_api_key(
+                Some((AuthType::ApiKey, String::new())),
+                Some("  ".to_string())
+            ),
+            None
+        );
     }
 }

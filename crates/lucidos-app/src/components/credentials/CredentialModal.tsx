@@ -16,6 +16,7 @@ import { isMobile } from '../../utils/viewport';
 import { pickCredentialAutofocus } from './credentialAutofocus';
 import { parseSecret, buildSecret, emptyFields, type CredentialFields } from './credentialSecret';
 import { LoadableError } from '../shared/LoadableError';
+import { DelayedSpinner } from '../shared/DelayedSpinner';
 
 /** Strip the `email:` prefix the engine uses for email-account credentials. */
 function emailAccountName(service: string): string {
@@ -28,7 +29,9 @@ export function CredentialModal() {
 
   // Editing pre-loads the stored secret (+ email settings) so the uncontrolled
   // inputs initialise from real values; create/request needs no async load.
-  if (form.editing) return <CredentialEditLoader editing={form.editing} />;
+  // Keyed by the credential: switching edit targets remounts the loader, so a
+  // stale `data` from the previous credential can never seed the next form.
+  if (form.editing) return <CredentialEditLoader key={form.editing} editing={form.editing} />;
 
   return (
     <CredentialFormInner
@@ -105,7 +108,7 @@ function CredentialEditLoader({ editing }: { editing: string }) {
   if (credLoadable.status !== 'loaded' || data.status !== 'loaded' || !existingCred) {
     return (
       <div class="inline-form">
-        <div class="loading-spinner" />
+        <DelayedSpinner />
       </div>
     );
   }

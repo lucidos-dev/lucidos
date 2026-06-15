@@ -35,6 +35,15 @@ describe('renderQuestion', () => {
     expect(text).toContain('Allow?');
   });
 
+  it('attributes the request to "the coding agent", not a specific backend', () => {
+    // The same card is raised by CC's MCP permission prompt AND the Codex
+    // app-server approval bridge — naming Claude Code would misattribute a
+    // Codex escalation at the moment of a security decision.
+    const text = vnodeToText(renderQuestion('command_execution', 'command_execution sudo ls'));
+    expect(text).toContain('The coding agent wants');
+    expect(text).not.toContain('Claude Code');
+  });
+
   it('omits the "on <arg>" clause when the summary has no argument', () => {
     const text = vnodeToText(renderQuestion('ExitPlanMode', 'ExitPlanMode'));
     expect(text).toContain('the <strong>ExitPlanMode</strong> tool');
@@ -67,6 +76,10 @@ describe('sessionLabel', () => {
 
   it('returns "<first-token> …" for Bash so the user knows the scope is per-program, not per-command', () => {
     expect(sessionLabel('Bash', { command: 'git status --short' })).toBe('git …');
+  });
+
+  it('treats Codex command_execution like Bash (same per-program session scope)', () => {
+    expect(sessionLabel('command_execution', { command: 'git push origin main' })).toBe('git …');
   });
 
   it('returns the plugin slug for Skill', () => {
@@ -153,14 +166,14 @@ describe('permissionButtonState', () => {
       .toEqual({ disabled: false, stateClass: '' });
   });
 
-  it('marks the picked button with cc-permission-btn-picked when answered', () => {
+  it('marks the picked button with permission-btn-picked when answered', () => {
     expect(permissionButtonState({ answered: true, terminated: false, isPicked: true }))
-      .toEqual({ disabled: true, stateClass: ' cc-permission-btn-picked' });
+      .toEqual({ disabled: true, stateClass: ' permission-btn-picked' });
   });
 
-  it('marks the non-picked buttons with cc-permission-btn-rejected when answered', () => {
+  it('marks the non-picked buttons with permission-btn-rejected when answered', () => {
     expect(permissionButtonState({ answered: true, terminated: false, isPicked: false }))
-      .toEqual({ disabled: true, stateClass: ' cc-permission-btn-rejected' });
+      .toEqual({ disabled: true, stateClass: ' permission-btn-rejected' });
   });
 
   it('disables every button without picked/rejected styling when terminated but unanswered', () => {
@@ -174,9 +187,9 @@ describe('permissionButtonState', () => {
   // later abort lands.
   it('keeps picked/rejected styling when answered even if terminated also true', () => {
     expect(permissionButtonState({ answered: true, terminated: true, isPicked: true }))
-      .toEqual({ disabled: true, stateClass: ' cc-permission-btn-picked' });
+      .toEqual({ disabled: true, stateClass: ' permission-btn-picked' });
     expect(permissionButtonState({ answered: true, terminated: true, isPicked: false }))
-      .toEqual({ disabled: true, stateClass: ' cc-permission-btn-rejected' });
+      .toEqual({ disabled: true, stateClass: ' permission-btn-rejected' });
   });
 });
 

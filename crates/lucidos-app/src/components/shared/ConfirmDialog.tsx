@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'preact/hooks';
 import { confirmState } from '../../store/store';
 import { isTauri } from '../../utils/platform';
 import { hidePanelWebview, showPanelWebview } from '../../utils/tauri';
-import { ModalOverlay } from './ModalOverlay';
+import { Overlay } from './Overlay';
 
 function resolve(value: boolean) {
   const state = confirmState.peek();
@@ -60,8 +60,14 @@ export function ConfirmDialog() {
   const cancelLabel = state.cancelLabel || 'Cancel';
 
   return (
-    <ModalOverlay onClose={() => resolve(false)}>
-      <div ref={dialogRef} class="confirm-dialog" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+    <Overlay
+      open
+      onClose={() => resolve(false)}
+      panelClass="confirm-dialog"
+      panelRole="dialog"
+      ariaModal
+      panelRef={dialogRef}
+    >
         {state.title && <h2 class="confirm-title">{state.title}</h2>}
         <p class="confirm-message">{state.message}</p>
         {state.details && (
@@ -104,7 +110,6 @@ export function ConfirmDialog() {
             </button>
           </div>
         </div>
-      </div>
-    </ModalOverlay>
+    </Overlay>
   );
 }

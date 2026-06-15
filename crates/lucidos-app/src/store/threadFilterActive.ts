@@ -2,6 +2,7 @@ import { computed } from '@preact/signals';
 import {
   threadChannelFilter,
   ALL_CHANNELS,
+  CODING_AGENT_CHANNEL,
   selectedTriggerIds,
   selectedRepoIds,
   selectedAppIds,
@@ -22,14 +23,14 @@ export const threadFilterActive = computed<boolean>(() => {
     if (selected > 0 && (total === 0 || selected < total)) return true;
   }
 
-  if (threadChannelFilter.value.has('claude_code')) {
-    // CC has two cross-axis sub-selections (repos + apps). When either is
+  if (threadChannelFilter.value.has(CODING_AGENT_CHANNEL)) {
+    // Coding Agent has two cross-axis sub-selections (repos + apps). When either is
     // non-empty, the drawer is narrowing: even "select every app"
     // (selectedApps === totalApps) excludes Lucidos-source and external-repo
-    // CC threads, because threadPassesChannelFilter unions appOk || repoOk
+    // coding-agent threads, because threadPassesChannelFilter unions appOk || repoOk
     // and a non-app thread fails appOk. The per-axis "selected === total"
     // shortcut from triggers (where one axis = one universe) doesn't
-    // generalize here; report active whenever any CC sub-selection exists.
+    // generalize here; report active whenever any coding-agent sub-selection exists.
     if (selectedRepoIds.value.size > 0 || selectedAppIds.value.size > 0) return true;
   }
 

@@ -44,7 +44,7 @@ pub(crate) fn subprocess_chat_legitimate(
 /// onto the wrong MR). Iterating here keeps the chain bounded by the
 /// available orphans and serializes per-thread (`register_thread_queued`
 /// already serializes anyway, so a queue costs nothing extra).
-async fn process_orphan_chain(
+pub(crate) async fn process_orphan_chain(
     engine: SharedEngine,
     thread_id: Uuid,
     initial_orphans: Vec<InjectedPrompt>,
@@ -70,6 +70,7 @@ async fn process_orphan_chain(
                     None,
                     orphan.spawning_event_id,
                     orphan.mode,
+                    None,
                     None,
                     orphan.event_id,
                     None,
@@ -224,8 +225,10 @@ const CC_SOURCE: &str = "claude_code";
 pub(super) fn validate_thread_continuity(
     existing_source: Option<&str>,
     existing_repo_id: Option<&str>,
+    existing_coding_agent: Option<&str>,
     requested_use_cc: Option<bool>,
     requested_repo_id: Option<&str>,
+    requested_coding_agent: Option<crate::runtime::CodingAgent>,
 ) -> Result<(), (StatusCode, String)> {
     let Some(source) = existing_source else {
         return Ok(());
@@ -255,6 +258,24 @@ pub(super) fn validate_thread_continuity(
                     StatusCode::CONFLICT,
                     format!(
                         "Thread is locked to repo {existing_repo}; cannot switch to {req_repo}"
+                    ),
+                ));
+            }
+        }
+        // Backend lock: the new backend has no session to resume, so a flip
+        // would silently lose the whole conversation context. NULL stored
+        // value = legacy Claude Code thread (CodingAgent::parse semantics).
+        if let Some(req_agent) = requested_coding_agent {
+            let existing_agent = crate::runtime::CodingAgent::parse(
+                existing_coding_agent.unwrap_or("claude-code"),
+            );
+            if req_agent != existing_agent {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Thread is locked to the {} coding agent; cannot switch to {}",
+                        existing_agent.as_str(),
+                        req_agent.as_str()
                     ),
                 ));
             }
@@ -310,6 +331,7 @@ pub(super) async fn chat(
                 spawning_event_id,
                 mode,
                 request.cc_model.as_deref(),
+                None,
                 None,
                 request.title.as_deref(),
                 None,
@@ -458,10 +480,12 @@ pub(super) async fn chat_submit(
     );
     let url_ctx = request.url_context;
     // Resolve `image_hashes` to ChatImage by reading + base64-encoding the
-    // blobs once per send. Mutually exclusive with `images`; the latter
-    // (legacy base64 body) is still accepted and runs through the same
-    // compression pipeline. After Phase 4 ships, every frontend send takes
-    // the hash path and the legacy body becomes dead.
+    // blobs once per send. Mutually exclusive with `images` (legacy base64
+    // body; dead once every frontend send takes the hash path). Both carry the
+    // image at original resolution — the blob store and UI keep full-res, and
+    // the fit-to-model-size step happens at the LLM boundary
+    // (`engine::chat::images` / the image-description pass) via
+    // `ChatImage::fit_for_llm`, so compression lives in exactly one place.
     let chat_images = if let Some(hashes) = request.image_hashes.take() {
         let mut resolved = Vec::with_capacity(hashes.len());
         for hash in &hashes {
@@ -478,10 +502,17 @@ pub(super) async fn chat_submit(
         }
         Some(resolved)
     } else {
-        request.images.take().map(super::compress_images)
+        request.images.take()
     };
     let use_claude_code = request.use_claude_code;
     let cc_model = request.cc_model;
+    let coding_agent = request.coding_agent;
+    // `coding_agent` is a coding-agent-spawn payload — without CC requested it
+    // would silently vanish (the chat-agent path never reads it). Reject early.
+    if coding_agent.is_some() && use_claude_code != Some(true) {
+        log!("[Chat] chat_submit received `coding_agent` without `use_claude_code=true` — rejecting");
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let event_id = request.event_id;
     // Re-bind under the existing name so the rest of the handler reads
     // exactly as before (this is the same value parsed above for the
@@ -694,9 +725,10 @@ pub(super) async fn chat_submit(
     // races the debounced PUT; reading the lagged source as authoritative
     // here surfaces as a 409 ("Thread is locked to X mode") on Send. The
     // lock only applies once the thread has actually been sent.
+    let mut thread_exists = false;
     if let Some(tid) = thread_id {
-        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT state, source, cc_repo_id FROM thread_summaries WHERE thread_id = $1",
+        let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT state, source, cc_repo_id, coding_agent FROM thread_summaries WHERE thread_id = $1",
         )
         .bind(tid)
         .fetch_optional(state.engine.pool())
@@ -705,7 +737,8 @@ pub(super) async fn chat_submit(
             log!("[Chat] thread_summaries lookup failed for {}: {}", tid, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        if let Some((state_str, source, existing_repo)) = row {
+        thread_exists = row.is_some();
+        if let Some((state_str, source, existing_repo, existing_agent)) = row {
             let existing_state = ThreadState::from_db_str(&state_str).map_err(|e| {
                 log!("[Chat] thread_summaries.state for {} invalid: {}", tid, e);
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -714,14 +747,72 @@ pub(super) async fn chat_submit(
                 if let Err((sc, msg)) = validate_thread_continuity(
                     Some(&source),
                     existing_repo.as_deref(),
+                    existing_agent.as_deref(),
                     use_claude_code,
                     repo_id.as_deref(),
+                    coding_agent,
                 ) {
                     log!("[Chat] Reject follow-up on thread {}: {}", tid, msg);
                     return Err(sc);
                 }
             }
         }
+    }
+
+    // ---- Thread Queue gate ----
+    // Agent/Engine-mode POSTs that START a new thread are background spawns
+    // (cross-workspace task POSTs, `lucidos spawn-thread` CLI) — they route
+    // through the Thread Queue's admission control like every other
+    // background path. mode=Human (a person typing, from any workspace) and
+    // follow-ups on existing threads (child→parent callbacks, injections)
+    // always run immediately — user-initiated chat preempts.
+    if mode != ActorMode::Human && !thread_exists {
+        let queue_thread_id = thread_id.unwrap_or_else(Uuid::new_v4);
+        // Persist images as content-addressed blobs — queue requests never
+        // carry inline base64 (the request is persisted in the event payload).
+        let image_hashes = match request.image_hashes.take() {
+            Some(hashes) => hashes,
+            None => state
+                .engine
+                .queued_image_hashes(request.images.take().as_deref()),
+        };
+        let response_event_id = event_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let queue_request = crate::engine::thread_queue::ThreadQueueRequest::AgentChat {
+            message: request.message.clone(),
+            thread_id: queue_thread_id,
+            event_id: Some(response_event_id.clone()),
+            image_hashes,
+            device_id: device_id.clone(),
+            model: model.clone(),
+            reasoning_effort: reasoning_effort.clone(),
+            use_claude_code,
+            repo_id: repo_id.clone(),
+            cc_model: cc_model.clone(),
+            coding_agent,
+            title: request.title.clone(),
+            mode,
+            origin: origin.clone(),
+            parent_thread_id,
+            spawning_event_id,
+            app_id: app_id_to_stash.map(|(_, app_id)| app_id),
+        };
+        let outcome = state
+            .engine
+            .thread_queue
+            .submit(queue_request, origin, None)
+            .await;
+        if !outcome.admitted {
+            log!(
+                "[Chat] Agent-mode spawn queued at position {} (thread {})",
+                outcome.position,
+                queue_thread_id
+            );
+        }
+        return Ok(Json(ChatSubmitResponse {
+            event_id: response_event_id,
+        }));
     }
 
     // Stash the app spawn AFTER every early-return gate above (continuity
@@ -758,6 +849,19 @@ pub(super) async fn chat_submit(
     let thread_id_for_panic = thread_id;
     let actor_for_apply = origin.clone();
     let handle = tokio::spawn(async move {
+        // User-initiated work shares the one capacity pool (ADR 0008): take a
+        // prioritized slot, held across the whole response. Admits at once
+        // when the pool has room; at true pool-max this awaits a free slot
+        // (the person sees "requesting" until then). Released on task end —
+        // even on panic — by the guard's Drop.
+        let _user_slot = {
+            let summary =
+                crate::engine::thread_queue::truncate_summary(message.trim());
+            engine_clone
+                .thread_queue
+                .acquire_user_slot(thread_id, summary)
+                .await
+        };
         let result = engine_clone
             .process_message_with_steps(
                 &message,
@@ -777,6 +881,7 @@ pub(super) async fn chat_submit(
                 spawning_event_id,
                 mode,
                 cc_model.as_deref(),
+                coding_agent,
                 None,
                 title.as_deref(),
                 origin,
@@ -920,7 +1025,9 @@ pub(super) async fn chat_submit(
     // Monitor the spawned task — if it panics, emit ResponseFailed + SessionEnded
     // and clean up the Claude Code session so the thread doesn't get stuck in "running" state.
     if let Some(tid) = thread_id_for_panic {
-        LucidosEngine::monitor_cc_task(engine_for_panic, tid, handle);
+        // Fire-and-forget: the watcher cleans up on panic; nobody awaits it.
+        // Dropping the JoinHandle detaches the already-spawned watcher (it keeps running).
+        drop(LucidosEngine::monitor_cc_task(engine_for_panic, tid, handle));
     } else {
         tokio::spawn(async move {
             if let Err(join_err) = handle.await {
@@ -972,6 +1079,14 @@ pub(super) async fn cancel_chat(
         None => state.engine.cancel_all_threads(actor),
     }
     Ok(StatusCode::OK)
+}
+
+/// Routes for the `/chat*` surface.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/chat", post(chat))
+        .route("/chat/stream", post(chat_submit))
+        .route("/chat/cancel", post(cancel_chat))
 }
 
 #[cfg(test)]

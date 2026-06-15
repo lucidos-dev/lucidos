@@ -16,6 +16,17 @@ export interface EventSubscription {
   condition?: Record<string, unknown>;
 }
 
+/** An irreversible-side-effect category a trigger can be granted permission to
+ *  perform unattended. Only meaningful when the workspace's command guard is on
+ *  (Settings → Permissions → Command Safety). A trigger that hits an
+ *  irreversible command whose category isn't in its grant is failed. */
+export type SideEffectCategory =
+  | 'email'
+  | 'external_api'
+  | 'cloud_cli'
+  | 'out_of_workspace_destruction'
+  | 'other';
+
 export interface Trigger {
   id: string;
   name: string;
@@ -29,6 +40,9 @@ export interface Trigger {
    *  omits the field rather than emitting `[]`, so readers must tolerate
    *  absence. */
   on?: EventSubscription[];
+  /** Side-effect grant — irreversible categories this trigger may perform
+   *  unattended. Omitted when empty (= no grant). */
+  side_effect_grant?: SideEffectCategory[];
 }
 
 export interface CreateTrigger {
@@ -39,6 +53,9 @@ export interface CreateTrigger {
   /** Optional *trigger group* id (UUID string). Pure organizational label —
    *  the trigger fires identically regardless of group. Omit for ungrouped. */
   group_id?: string;
+  /** Side-effect grant — irreversible categories this trigger may perform
+   *  unattended. Omit / `[]` = none granted (the safe default). */
+  side_effect_grant?: SideEffectCategory[];
 }
 
 export interface UpdateTrigger {
@@ -52,6 +69,9 @@ export interface UpdateTrigger {
   /** Move the trigger into a *trigger group* (string id) or out of any group
    *  (null). Absent leaves membership unchanged. */
   group_id?: string | null;
+  /** Full replacement for the side-effect grant. Send the complete new set;
+   *  pass `[]` to clear all grants. */
+  side_effect_grant?: SideEffectCategory[];
 }
 
 export interface ApiResult {

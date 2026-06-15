@@ -52,6 +52,10 @@ impl LucidosEngine {
         // index and would walk every event in long-lived threads otherwise.
         terminator_emitted: &mut bool,
         capture_seed: ContextCaptureSeed<'_>,
+        // The firing trigger's declared side-effect grant (ADR 0002, Phase 5).
+        // Empty for chat turns. Consulted by the command guard only on the
+        // `Trigger` channel to gate `IrreversibleDanger` commands.
+        trigger_side_effect_grant: &[crate::engine::command_guard::SideEffectCategory],
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         // EventMeta for this request — all persisted events in this cycle share the same context
         let meta = crate::engine::thread_events::EventMeta {
@@ -64,6 +68,27 @@ impl LucidosEngine {
         let effective_model = (!model_str.is_empty()).then(|| model_str.to_string());
         let effective_effort = reasoning_effort.map(|s| s.to_string());
         let capture_window = super::super::context::context_window_for(capture_seed.model);
+
+        // Command guard (ADR 0002): off unless the workspace turned on the
+        // `command_guard` preference. Read once per response — the toggles can't
+        // change mid-response — and consulted before each bash/python dispatch
+        // below. The judge sub-toggle + model are only read when the guard is on
+        // (no DB cost on the common off path). `command_guard_ctx` carries the
+        // per-response judge-verdict cache so a re-emitted identical command
+        // doesn't re-pay the LLM call.
+        let command_guard_enabled = crate::core::PreferenceStore::command_guard(&self.pool).await?;
+        let (command_guard_judge_enabled, command_judge_model) = if command_guard_enabled {
+            (
+                crate::core::PreferenceStore::command_guard_judge(&self.pool).await?,
+                crate::core::PreferenceStore::command_judge_model(&self.pool).await,
+            )
+        } else {
+            (false, String::new())
+        };
+        let mut command_guard_judge_cache: std::collections::HashMap<
+            String,
+            crate::engine::command_guard::JudgedClassification,
+        > = std::collections::HashMap::new();
 
         let mut iterations = 0;
         // Capture before the loop pushes assistant/tool messages and shifts the index.
@@ -95,16 +120,13 @@ impl LucidosEngine {
                 )
                 .await;
                 *terminator_emitted = true;
-                return Ok(ProcessResult {
-                    response: String::new(),
-                    steps: vec![],
+                return Ok(terminal_result(
+                    String::new(),
                     images,
                     request_id,
                     thread_id,
-                    proposed_change: *proposed_change,
-                    auto_apply: false,
-                    orphaned_injections: vec![],
-                });
+                    *proposed_change,
+                ));
             }
 
             if iterations > MAX_ITERATIONS {
@@ -118,16 +140,13 @@ impl LucidosEngine {
                 )
                 .await;
                 *terminator_emitted = true;
-                return Ok(ProcessResult {
-                    response: msg,
-                    steps: vec![],
+                return Ok(terminal_result(
+                    msg,
                     images,
                     request_id,
                     thread_id,
-                    proposed_change: *proposed_change,
-                    auto_apply: false,
-                    orphaned_injections: vec![],
-                });
+                    *proposed_change,
+                ));
             }
 
             // Pin the current turn's user message so pass 2 cannot drop it.
@@ -326,16 +345,13 @@ impl LucidosEngine {
                     )
                     .await;
                     *terminator_emitted = true;
-                    return Ok(ProcessResult {
-                        response: partial,
-                        steps: vec![],
+                    return Ok(terminal_result(
+                        partial,
                         images,
                         request_id,
                         thread_id,
-                        proposed_change: *proposed_change,
-                        auto_apply: false,
-                        orphaned_injections: vec![],
-                    });
+                        *proposed_change,
+                    ));
                 }
             };
 
@@ -455,6 +471,14 @@ impl LucidosEngine {
                     synth_id,
                 );
             }
+            let suppressed_tool_turn_text = suppress_tool_turn_text(&mut response);
+            if suppressed_tool_turn_text {
+                crate::log!(
+                    "[AgenticLoop] thread={} suppressed assistant text attached to a tool-call turn",
+                    thread_id
+                );
+            }
+            let suppress_tool_turn_flush = !response.tool_calls.is_empty();
 
             // Final flush — send any remaining buffered text and persist
             // remainder. When inline repair fired, use the cleaned text
@@ -462,10 +486,14 @@ impl LucidosEngine {
             // TextStreamed events both reflect the repaired body.
             let (flush_text, remaining_to_persist) = {
                 let raw = raw_buffer.lock().unwrap();
-                let effective: &str = inline_repair
-                    .as_ref()
-                    .map(|d| d.cleaned_text.as_str())
-                    .unwrap_or(raw.as_str());
+                let effective: &str = if suppress_tool_turn_flush {
+                    ""
+                } else {
+                    inline_repair
+                        .as_ref()
+                        .map(|d| d.cleaned_text.as_str())
+                        .unwrap_or(raw.as_str())
+                };
                 let cloned = if effective.is_empty() {
                     None
                 } else {
@@ -555,24 +583,24 @@ impl LucidosEngine {
                         .await;
 
                     *terminator_emitted = true;
-                    return Ok(ProcessResult {
-                        response: clean_response,
-                        steps: vec![],
+                    return Ok(terminal_result(
+                        clean_response,
                         images,
                         request_id,
                         thread_id,
-                        proposed_change: *proposed_change,
-                        auto_apply: false,
-                        orphaned_injections: vec![],
-                    });
+                        *proposed_change,
+                    ));
                 }
 
-                // Empty completion (no content, no tool calls). Always a
-                // failure from the user's perspective — surface via
-                // ResponseFailed with full diagnostic in the error string.
-                // See `empty_completion_hint` for the branch logic
-                // distinguishing intentional silence, parser miss, and
-                // truncation.
+                // Empty completion (no content, no tool calls). Whether this is
+                // a failure depends on *why* it was empty, classified uniformly
+                // across providers and thread types — see
+                // `classify_empty_completion`. A genuine failure (truncation,
+                // safety block, dropped output, unrecognised stop) surfaces as
+                // ResponseFailed with a full diagnostic; a clean model-decided
+                // stop is benign intentional silence and completes the turn
+                // normally as an empty ResponseGenerated (the UI renders a
+                // neutral "empty response" note instead of a red error).
                 let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
                 let output_tokens_n = response.output_tokens.unwrap_or(0);
                 let thinking_chars_n = response.thinking_chars.unwrap_or(0);
@@ -585,7 +613,7 @@ impl LucidosEngine {
                     .thinking_chars
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "?".to_string());
-                let hint = empty_completion_hint(
+                let class = classify_empty_completion(
                     stop_reason,
                     output_tokens_n,
                     thinking_chars_n,
@@ -596,44 +624,78 @@ impl LucidosEngine {
                 } else {
                     String::new()
                 };
-                let error = format!(
-                    "Model returned no response (stop_reason: {}, output_tokens: {}, thinking_chars: {}{}, model: {}){}.",
+                let diagnostic = format!(
+                    "stop_reason: {}, output_tokens: {}, thinking_chars: {}{}, model: {}{}",
                     stop_reason,
                     output_tokens,
                     thinking_chars,
                     dropped_suffix,
                     effective_model.as_deref().unwrap_or("unknown"),
-                    hint,
+                    class.hint,
                 );
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
-                                error,
+
+                if class.is_error {
+                    let error = format!("Model returned no response ({}).", diagnostic);
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                                    error,
+                                },
+                                meta: meta.clone(),
                             },
-                            meta: meta.clone(),
-                        },
-                        "[AgenticLoop] ResponseFailed (empty completion)",
-                    )
-                    .await;
+                            "[AgenticLoop] ResponseFailed (empty completion)",
+                        )
+                        .await;
+                } else {
+                    // Benign: the model ended its turn cleanly and produced no
+                    // text. Complete normally (Idle, no red dot) via an empty
+                    // ResponseGenerated; log the diagnostic so an operator can
+                    // still see why the turn was empty.
+                    crate::log!(
+                        "[AgenticLoop] thread={} empty completion treated as benign ({})",
+                        thread_id,
+                        diagnostic
+                    );
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event:
+                                    crate::engine::thread_events::ThreadEvent::ResponseGenerated {
+                                        text: String::new(),
+                                        images: images.clone(),
+                                        model: effective_model.clone(),
+                                        reasoning_effort: effective_effort.clone(),
+                                    },
+                                meta: meta.clone(),
+                            },
+                            "[AgenticLoop] ResponseGenerated (empty completion)",
+                        )
+                        .await;
+                }
 
                 *terminator_emitted = true;
-                return Ok(ProcessResult {
-                    response: String::new(),
-                    steps: vec![],
+                return Ok(terminal_result(
+                    String::new(),
                     images,
                     request_id,
                     thread_id,
-                    proposed_change: *proposed_change,
-                    auto_apply: false,
-                    orphaned_injections: vec![],
-                });
+                    *proposed_change,
+                ));
             }
 
             // Execute each tool call
             let mut tool_outputs = Vec::new();
             let mut had_errors = false;
+            // Set when the command guard blocks a trigger's command because the
+            // side-effect isn't in the trigger's grant (ADR 0002, Phase 5). The
+            // blocked command is still recorded as a failed ToolResult (so the
+            // transcript is consistent); after this batch of tool calls the loop
+            // emits a terminal `ResponseFailed` and returns `Err` so the
+            // scheduler fails the trigger. Reset per outer-loop iteration.
+            let mut trigger_fail_reason: Option<String> = None;
 
             // Helper: push a circuit-breaker response into the messages array.
             // Must add the assistant's tool_use message AND matching tool_result blocks
@@ -720,16 +782,13 @@ impl LucidosEngine {
                                 "[AgenticLoop] ResponseGenerated (force-break)",
                             ).await;
                             *terminator_emitted = true;
-                            return Ok(ProcessResult {
-                                response: msg.to_string(),
-                                steps: vec![],
+                            return Ok(terminal_result(
+                                msg.to_string(),
                                 images,
                                 request_id,
                                 thread_id,
-                                proposed_change: *proposed_change,
-                                auto_apply: false,
-                                orphaned_injections: vec![],
-                            });
+                                *proposed_change,
+                            ));
                         }
                         let cached_result = format!(
                             "[list_files result - CACHED, DO NOT CALL AGAIN]\n{}\n\nSTOP: You have the file list. DO NOT call list_files again. Proceed with your task NOW.",
@@ -779,16 +838,13 @@ impl LucidosEngine {
                             )
                             .await;
                         *terminator_emitted = true;
-                        return Ok(ProcessResult {
-                            response: msg,
-                            steps: vec![],
+                        return Ok(terminal_result(
+                            msg,
                             images,
                             request_id,
                             thread_id,
-                            proposed_change: *proposed_change,
-                            auto_apply: false,
-                            orphaned_injections: vec![],
-                        });
+                            *proposed_change,
+                        ));
                     }
                     let stop_msg = format!("STOP: You've read '{}' with the same window multiple times. The content hasn't changed. Use the information you have and proceed with your task.", path_for_msg);
                     push_circuit_breaker(messages, &response, &stop_msg);
@@ -857,16 +913,13 @@ impl LucidosEngine {
                             )
                             .await;
                         *terminator_emitted = true;
-                        return Ok(ProcessResult {
-                            response: msg,
-                            steps: vec![],
+                        return Ok(terminal_result(
+                            msg,
                             images,
                             request_id,
                             thread_id,
-                            proposed_change: *proposed_change,
-                            auto_apply: false,
-                            orphaned_injections: vec![],
-                        });
+                            *proposed_change,
+                        ));
                     }
 
                     // Soft break at 3-4 — warn the LLM and let it continue
@@ -921,47 +974,88 @@ impl LucidosEngine {
                     })
                     .await;
 
-                let outcome: crate::engine::tools::ToolOutcome = if let Some(r) = self
-                    .handle_special_tool(
+                // Command guard (ADR 0002): classify bash/python commands before
+                // dispatch. `Catastrophic` is hard-blocked; `IrreversibleDanger`
+                // on a chat channel pauses and asks the user (this call blocks
+                // in-process until the user resolves the card, the turn is
+                // canceled, or a restart sweep resolves it). The refusal is
+                // paired with this tool_use as a failed ToolResult below — the
+                // same message-alternation guarantee the circuit breaker relies
+                // on — so the model sees why it was refused and routes around it;
+                // other tool calls in this response still run normally. No-op
+                // unless the `command_guard` preference is on.
+                let mut command_guard_ctx = crate::engine::command_permission::CommandGuardCtx {
+                    enabled: command_guard_enabled,
+                    judge_enabled: command_guard_judge_enabled,
+                    judge_model: &command_judge_model,
+                    judge_cache: &mut command_guard_judge_cache,
+                    trigger_grant: trigger_side_effect_grant,
+                };
+                let outcome: crate::engine::tools::ToolOutcome = match self
+                    .command_guard_decision(
+                        &mut command_guard_ctx,
                         &tool_call.name,
                         &tool_call.arguments,
                         thread_id,
-                        user_images,
-                        device_id,
-                        tool_called_event_id,
                         &tool_call.id,
-                    )
-                    .await
-                {
-                    // handle_special_tool still returns `String`; lift via
-                    // the legacy `Error:` prefix until its sites are
-                    // migrated to typed `Err`.
-                    crate::engine::tools::lift_legacy_string(r)
-                } else {
-                    // run_python / run_bash / http_request / mcp__* and friends
-                    // dispatch through here. These are the tools that can park
-                    // for minutes on a hung subprocess or a no-timeout reqwest
-                    // client, so the cancel-aware wrapper is mandatory: dropping
-                    // the inner future on cancel SIGKILLs the OS child (via
-                    // `kill_on_drop(true)` on the Command) and lets the outer
-                    // loop iterate to its pre-iter `is_cancelled()` check, which
-                    // emits ResponseCanceled. Without the wrapper, a
-                    // `urllib.request.urlopen()` with no timeout ignored cancel
-                    // forever and the thread stayed `running` until the engine
-                    // restarted.
-                    run_tool_with_cancel(
-                        self.execute_tool(
-                            &tool_call.name,
-                            &tool_call.arguments,
-                            extraction_ctx,
-                            request_id,
-                            device_id,
-                            cancel_token,
-                            thread_id,
-                        ),
+                        &meta,
                         cancel_token,
                     )
                     .await
+                {
+                    crate::engine::command_guard::GuardDecision::Refuse(refusal) => Err(refusal),
+                    // Trigger blocked by an ungranted side-effect: record the
+                    // block as a failed ToolResult (below), then break out and
+                    // fail the whole trigger run after this batch.
+                    crate::engine::command_guard::GuardDecision::FailTrigger(reason) => {
+                        trigger_fail_reason = Some(reason.clone());
+                        Err(reason)
+                    }
+                    crate::engine::command_guard::GuardDecision::Proceed => {
+                        if let Some(r) = self
+                            .handle_special_tool(
+                                &tool_call.name,
+                                &tool_call.arguments,
+                                thread_id,
+                                user_images,
+                                device_id,
+                                tool_called_event_id,
+                                &tool_call.id,
+                            )
+                            .await
+                        {
+                            // handle_special_tool still returns `String`; lift via
+                            // the legacy `Error:` prefix until its sites are
+                            // migrated to typed `Err`.
+                            crate::engine::tools::lift_legacy_string(r)
+                        } else {
+                            // run_python / run_bash / http_request / mcp__* and
+                            // friends dispatch through here. These are the tools
+                            // that can park for minutes on a hung subprocess or a
+                            // no-timeout reqwest client, so the cancel-aware
+                            // wrapper is mandatory: dropping the inner future on
+                            // cancel SIGKILLs the OS child (via `kill_on_drop(true)`
+                            // on the Command) and lets the outer loop iterate to
+                            // its pre-iter `is_cancelled()` check, which emits
+                            // ResponseCanceled. Without the wrapper, a
+                            // `urllib.request.urlopen()` with no timeout ignored
+                            // cancel forever and the thread stayed `running` until
+                            // the engine restarted.
+                            run_tool_with_cancel(
+                                self.execute_tool(
+                                    &tool_call.name,
+                                    &tool_call.arguments,
+                                    extraction_ctx,
+                                    request_id,
+                                    device_id,
+                                    cancel_token,
+                                    thread_id,
+                                ),
+                                cancel_token,
+                            )
+                            .await
+                        }
+                    }
                 };
                 let (result, is_error) = match outcome {
                     Ok(text) => (text, false),
@@ -1127,6 +1221,36 @@ impl LucidosEngine {
                 }
 
                 tool_outputs.push((tool_call.id.clone(), tool_result_text));
+
+                // A trigger hit an ungranted side-effect: its block is now
+                // recorded as a failed ToolResult — stop running the rest of
+                // this batch and fail the trigger below.
+                if trigger_fail_reason.is_some() {
+                    break;
+                }
+            }
+
+            // A trigger's command was blocked by an ungranted side-effect (ADR
+            // 0002, Phase 5). Emit a terminal `ResponseFailed` and return `Err`
+            // so the scheduler's failure-notification path surfaces it. The
+            // blocked command's failed ToolResult was already persisted above,
+            // so the transcript stays consistent; we don't append the assistant
+            // message or call the LLM again — the run ends here.
+            if let Some(reason) = trigger_fail_reason {
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                                error: reason.clone(),
+                            },
+                            meta: meta.clone(),
+                        },
+                        "[AgenticLoop] ResponseFailed (trigger side-effect not granted)",
+                    )
+                    .await;
+                *terminator_emitted = true;
+                return Err(reason.into());
             }
 
             // 1. Add the assistant's tool_use response as a message
@@ -1199,10 +1323,19 @@ impl LucidosEngine {
                         tool_use_id: tool_use_id.clone(),
                         content: dom_text.to_string(),
                     });
+                    // Fit the screenshot to the model size target (compress only
+                    // if over) so a large retina capture can't trip the provider's
+                    // per-image limit. fit_for_llm is the single gate for every
+                    // chat→model image.
+                    let fitted = crate::api::ChatImage {
+                        base64: screenshot_b64.to_string(),
+                        mime_type: sniff_image_media_type(screenshot_b64).to_string(),
+                    }
+                    .fit_for_llm();
                     trailing_blocks.push(ContentBlock::Image {
                         source_type: "base64".to_string(),
-                        media_type: sniff_image_media_type(screenshot_b64).to_string(),
-                        data: screenshot_b64.to_string(),
+                        media_type: fitted.mime_type,
+                        data: fitted.base64,
                     });
                     continue;
                 }
@@ -1213,6 +1346,9 @@ impl LucidosEngine {
                         tool_use_id: tool_use_id.clone(),
                         content: "[Image file displayed to you below]".to_string(),
                     });
+                    // No fit_for_llm here: read_file's encode_image_for_read already
+                    // fit the image before emitting the IMAGE_CONTENT marker, so this
+                    // payload is guaranteed within the model size target.
                     trailing_blocks.push(ContentBlock::Image {
                         source_type: "base64".to_string(),
                         media_type: media_type.to_string(),
@@ -1293,10 +1429,14 @@ impl LucidosEngine {
                         if !imgs.is_empty() {
                             let mut blocks = vec![ContentBlock::Text { text: framed }];
                             for img in imgs {
+                                // Fit each injected image to the model size target
+                                // (compress only if over) — same gate as the initial
+                                // send, so a large mid-flight upload can't 400.
+                                let fitted = img.clone().fit_for_llm();
                                 blocks.push(ContentBlock::Image {
                                     source_type: "base64".to_string(),
-                                    media_type: img.mime_type.clone(),
-                                    data: img.base64.clone(),
+                                    media_type: fitted.mime_type,
+                                    data: fitted.base64,
                                 });
                             }
                             MessageContent::Blocks(blocks)

@@ -45,10 +45,34 @@ What each piece does — include only what you need:
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
 | `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs an iframe-friendly link interceptor: `target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.navigate()` | App doesn't use `lucidos.*` |
-| `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | Skip (app keeps default dark palette) |
-| `lucidos.ui.watchPreferences()` | Re-applies preferences whenever the user changes them (SSE-driven) | Static apps that don't need live preference updates |
+| `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`** — without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
+| `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), and — under a `system` preference — when the OS light/dark appearance flips (a `prefers-color-scheme` listener, off iOS, matching the host shell) | Static apps that have opted out of Lucidos theming |
 
-**Theme integration is opt-in.** An app that omits both `<script src="/api/v1/sdk-prefs.js">` and `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` gets no `data-theme` attribute, no CSS variables, and no Lucidos default styling — the engine never auto-injects either tag. This is the right choice for apps that ship their own complete visual identity (charts, games, embedded third-party UIs).
+**Inherit the theme by default.** A normal app includes the theme assets, calls `applyPreferences()` + `watchPreferences()`, and styles with the theme variables (below) — so it follows the user's light/dark (OS) appearance just like the rest of Lucidos. Theme integration is *technically* opt-in: the engine never auto-injects these tags, so an app that omits both `<script src="/api/v1/sdk-prefs.js">` and `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` gets no `data-theme` attribute, no CSS variables, and no Lucidos default styling. Opt out only for an app that ships its own complete visual identity (charts, games, embedded third-party UIs) — otherwise inheriting is the default, and **hardcoding colors is a bug** (a light-mode workspace gets a dark-only app, or vice versa).
+
+### Theme variables
+
+`sdk-iframe.css` defines these CSS custom properties on `<html>` and flips their values between light and dark automatically — driven by the `data-theme` attribute, which `applyPreferences()` sets (resolving `system` to the OS setting) and `watchPreferences()` keeps in sync. Style your app with `var(--name)` and it tracks the user's appearance for free. The canonical values live in the engine's `sdk-iframe.css`; **the names are the contract**:
+
+| Group | Variables |
+|---|---|
+| Backgrounds | `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--bg-quaternary`, `--bg-hover`, `--bg-selected` |
+| Text | `--text-primary`, `--text-secondary`, `--text-muted`, `--text-on-accent` |
+| Border | `--border-color` |
+| Accents | `--accent`, `--accent-light`, `--accent-green`, `--accent-yellow`, `--accent-red` |
+| Shadows | `--shadow-sm`, `--shadow-md`, `--shadow-lg` |
+| Layout (theme-independent) | `--font-ui`, `--font-mono`, `--space-{xs,sm,md,lg,xl}`, `--radius-{sm,md,lg}`, `--transition`, `--user-ui-scale` |
+
+```css
+.card {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: var(--space-lg);
+}
+.card a { color: var(--accent); }
+```
 
 Apps using `lucidos._capture()` don't need to include `html2canvas` — the SDK loads it on demand from `/api/v1/static/html2canvas.min.js`.
 
@@ -340,6 +364,17 @@ interface EventSubscription {
   condition?: Record<string, unknown>;
 }
 
+// Irreversible-side-effect category a trigger can be granted. Only enforced
+// when the workspace's command guard is on (Settings → Permissions → Command
+// Safety). A trigger that hits an irreversible command whose category isn't in
+// its grant is failed (it can't be asked to approve — it runs unattended).
+type SideEffectCategory =
+  | 'email'
+  | 'external_api'
+  | 'cloud_cli'
+  | 'out_of_workspace_destruction'
+  | 'other';
+
 interface Trigger {
   id: string;
   name: string;
@@ -352,6 +387,9 @@ interface Trigger {
   // Event subscriptions. Empty for schedule-only triggers; the engine omits
   // the field rather than emitting `[]`, so readers must tolerate absence.
   on?: EventSubscription[];
+  // Side-effect grant — irreversible categories this trigger may perform
+  // unattended. Omitted when empty (= no grant).
+  side_effect_grant?: SideEffectCategory[];
 }
 
 interface CreateTrigger {
@@ -361,6 +399,9 @@ interface CreateTrigger {
   on?: EventSubscription[];
   /** Optional *trigger group* id; omit for ungrouped. */
   group_id?: string;
+  /** Side-effect grant — irreversible categories this trigger may perform
+   *  unattended. Omit / `[]` = none granted (the safe default). */
+  side_effect_grant?: SideEffectCategory[];
 }
 
 interface UpdateTrigger {
@@ -374,6 +415,8 @@ interface UpdateTrigger {
   /** Move into a group (string id), clear membership (null), or leave it
    *  unchanged (absent). */
   group_id?: string | null;
+  /** Full replacement for the side-effect grant; pass `[]` to clear all. */
+  side_effect_grant?: SideEffectCategory[];
 }
 
 interface ApiResult {
@@ -465,7 +508,7 @@ lucidos.notifications.markAllRead(): Promise<void>
 
 ```ts
 type NavigateTarget =
-  | 'files' | 'apps' | 'triggers' | 'changes' | 'notifications'
+  | 'files' | 'apps' | 'triggers' | 'thread-queue' | 'changes' | 'notifications'
   | 'settings' | 'app' | 'file' | 'trigger' | 'thread'
   | 'new-app' | 'new-trigger' | 'new-chat' | 'url';
 
@@ -601,10 +644,11 @@ Same canonical surface as the `lucidos threads list` / `lucidos threads count` C
 interface ThreadsListOptions {
   /** true → only threads where the agentic loop is mid-flow
    *  (status 'running' or 'waiting_for_user_answer'). false → invert.
-   *  Omit → no filter. Note: 'waiting' is NOT active — it means CC has
+   *  Omit → no filter. Note: 'waiting' is NOT active — it means the coding agent has
    *  stopped and proposed changes the user must act on. */
   active?: boolean;
-  /** Comma-separated source filter: 'chat', 'trigger', 'claude_code'. */
+  /** Comma-separated source filter: 'chat', 'trigger', 'coding-agent'.
+   *  Legacy 'claude_code' is also accepted. */
   source?: string;
   /** Server clamps to 1..=1000 (default 100). */
   limit?: number;
@@ -619,6 +663,13 @@ interface ThreadSummary {
   initiator: 'user' | 'system';
   created_at: string;
   last_activity: string;
+  /** When the user last drove the thread forward (message/answer/permission/
+   *  change apply-or-discard). The UI drawer sorts by this; agent churn does
+   *  not bump it. */
+  last_user_action: string;
+  /** When the agent (or trigger) last did something — streaming, a terminal
+   *  response, an idle, a trigger fire/complete, or asking the user. */
+  last_agent_action: string;
   message_count: number;
   /** 'inbox' | 'archived' — stored in thread_summaries.archive_state. */
   section: string;
@@ -661,6 +712,7 @@ interface ThreadSummary {
 
 ```ts
 lucidos.ui.applyPreferences(): Promise<void>
+lucidos.ui.watchPreferences(): void
 lucidos.ui.navigate(target: string, params?: Record<string, string>): Promise<void>
 lucidos.ui.startThread(opts?: { prompt?: string }): Promise<void>
 lucidos.ui.confirm(options: ConfirmOptions): Promise<boolean>
@@ -668,7 +720,9 @@ lucidos.ui.Select.create(opts: SelectCreateOptions): SelectInstance
 lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
 ```
 
-`applyPreferences()` fetches user preferences and applies theme, font, and scale as CSS variables. Call once on app load.
+`applyPreferences()` fetches user preferences and applies theme, font, and scale as CSS variables (resolving a `system` theme to the live OS light/dark). Call once on app load, and style your app with the theme variables (§ Theme variables, under Setup) so it follows the user's appearance — don't hardcode colors.
+
+`watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. Call it once alongside `applyPreferences()` so the app reacts when the user toggles light/dark — or when the OS appearance changes under a `system` preference — without a reload.
 
 `navigate()` sends a navigation request to the Lucidos frontend via SSE.
 

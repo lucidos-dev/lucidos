@@ -95,7 +95,6 @@
     font-size: 0.8125rem;
     color: var(--text-secondary);
     cursor: pointer;
-    border-bottom: 1px solid var(--border-color);
     min-height: 2.75rem;
     display: flex;
     align-items: center;
@@ -117,7 +116,8 @@
 
 .drawer-badge {
     margin-left: auto;
-    background: var(--accent-red);
+    /* Blue notification accent, matching the base .badge. */
+    background: var(--accent);
     color: var(--text-on-accent);
     font-size: 0.6875rem;
     font-weight: 600;
@@ -215,6 +215,12 @@
         justify-content: flex-end;
     }
 
+    /* Apps and triggers stack like every other mobile row (default column
+       layout above): the name, description, badges, and cron/event lists span
+       the full row width, with the action buttons on their own bottom-right
+       row. They were previously pinned beside the content to save vertical
+       space, but that squeezed long names/descriptions into a narrow column. */
+
     .thread-row {
         flex-direction: row;
         align-items: flex-start;
@@ -240,10 +246,11 @@
         height: auto;
     }
 
-    /* Break long words in conversation content and initiator panels */
+    /* Break long words in conversation content, turns, and the user bubble */
     .response-content,
     .initiator-panel,
-    .initiator-body {
+    .initiator-body,
+    .user-bubble {
         word-break: break-word;
         overflow-wrap: break-word;
     }
@@ -334,7 +341,6 @@
         z-index: 100;
         will-change: transform;
         background: var(--bg-primary);
-        border-bottom: 1px solid var(--border-color);
         padding-top: env(safe-area-inset-top, 0px);
         flex-direction: column;
         align-items: stretch;
@@ -408,6 +414,22 @@
         display: flex;
         align-items: center;
         flex-shrink: 0;
+        /* Same two-button + inner-gap footprint as .altview-slot (2 × 1.75rem +
+           0.25rem = 3.75rem) so the thread header's nav slot lines up with the
+           threads header's needs-attention/drafts slot — the two "secondary"
+           control clusters then reserve identical width. Without the gap the nav
+           slot is only 3.5rem and the "Threads" title sits 4px to the right. */
+        gap: 0.25rem;
+    }
+
+    /* The threads header leads with a filter button before its altview-slot; the
+       thread (brand) header has no equivalent primary action since swipe-only nav
+       dropped the thread-grid toggle. Reserve that leading slot (one 1.75rem
+       header icon + the 0.25rem row gap = 2rem) so the nav slot aligns with the
+       altview-slot and the "Lucidos" brand starts at the same x as "Threads".
+       Without it the brand sits 32px (2rem) to the left of the threads title. */
+    .mobile-thread-header .mobile-header-row {
+        padding-left: 2rem;
     }
 
     .mobile-nav-slot .content-back-btn,
@@ -415,6 +437,15 @@
     .mobile-nav-slot .thread-nav-btn {
         width: 1.375rem;
         height: 1.75rem;
+    }
+
+    /* Reserve the two 1.75rem header icons + their inner gap. Hidden toggles
+       collapse via the shared `.altview-hidden { display: none }` rule in
+       shell.css, so a single visible toggle packs to the first slot (right of
+       the filter) and this reserved width parks the freed space toward the
+       title, keeping it put regardless of how many toggles show. */
+    .mobile-threads-header .altview-slot {
+        width: 3.75rem;
     }
 
     .mobile-content-title {
@@ -478,13 +509,18 @@
         align-items: center;
         gap: 0.75rem;
         /* Right padding matches `.pane-header`'s `--header-padding-x` so the
-         * action icons land in the same slot as the mobile header above. */
+         * action icons land in the same slot as the mobile header above.
+         * Symmetric 0.5rem top/bottom — just the title's own padding, with no
+         * extra gap before the first message. */
         padding: 0.5rem 0.625rem 0.5rem 1rem;
-        background: color-mix(in srgb, var(--accent) 12%, var(--bg-primary));
+        /* Opaque page background (no accent tint, matches the desktop header) so
+         * content is cleanly covered behind the title text as it scrolls under
+         * the sticky bar. The fade that dissolves content just below the bar is
+         * the ::after overlay — kept out of the box so it adds no at-rest gap. */
+        background: var(--bg-primary);
         -webkit-user-select: none;
         user-select: none;
         -webkit-tap-highlight-color: transparent;
-        border-bottom: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border-color));
         flex-shrink: 0;
         position: sticky;
         /* Tracks the header's bottom edge via CSS vars from useHideOnScroll.
@@ -495,8 +531,34 @@
         /* Stretch to full width, cancelling .thread-content's horizontal padding */
         margin-left: -0.75rem;
         margin-right: -0.75rem;
-        /* Space below title bar (before first message) */
-        margin-bottom: 0.5rem;
+        /* No margin-bottom — the title's 0.5rem bottom padding is the only space
+         * before the first message. */
+    }
+
+    /* Fade transition below the sticky title: while the transcript is scrolled,
+       content passing up under the bar dissolves into the page background rather
+       than being cut off at the title's edge. It's an absolutely-positioned
+       overlay anchored to the bar's bottom (top: 100%), so it adds NO layout
+       space — the at-rest gap before the first message stays just the title's
+       0.5rem padding. Gated on `.scrolled` (driven by the notAtTop signal) so the
+       first message is crisp at the very top of the thread and the fade only eases
+       in once content is actually sliding under the title. pointer-events: none so
+       taps fall through to the content. */
+    .mobile-swipe-pane .mobile-thread-title-row::after {
+        content: '';
+        position: absolute;
+        top: 100%;
+        left: 0;
+        right: 0;
+        height: 1rem;
+        background: linear-gradient(to bottom, var(--bg-primary), transparent);
+        opacity: 0;
+        transition: opacity 0.2s ease;
+        pointer-events: none;
+    }
+
+    .mobile-swipe-pane .mobile-thread-title-row.scrolled::after {
+        opacity: 1;
     }
 
 }
@@ -812,10 +874,16 @@
 }
 
 /* ─── Pseudo-fullscreen on mobile ─── */
-/* .mobile-swipe-track's will-change:transform + inline transform create a
-   containing block that traps position:fixed descendants. When pseudo-fullscreen
-   is active, remove the containing block so the app iframe's position:fixed
-   covers the real viewport. Also hide the header and dot indicator. */
+/* The swipe machinery stacks THREE transformed ancestors between the app iframe
+   and the viewport — .mobile-swipe-container (translateZ(0) compositor layer),
+   .mobile-swipe-track (will-change:transform + inline transform), and
+   .mobile-swipe-pane (translateZ(0) compositor layer). Each one creates a
+   containing block that traps position:fixed descendants, so the app's
+   .app-ui-fullscreen overlay is clipped to the swipe viewport instead of
+   covering the screen — the thread drawer behind it shows through and the page
+   appears frozen. When pseudo-fullscreen is active, drop the transform on all
+   three so the overlay's position:fixed resolves against the real viewport.
+   Also hide the header and dot indicator. */
 @media (max-width: 768px) {
     :root[data-pseudo-fullscreen] .app-header {
         display: none !important;
@@ -831,9 +899,13 @@
         transition: none !important;
     }
 
-    /* .mobile-swipe-pane's translateZ(0) (added for iframe compositor clipping)
-       also creates a containing block. Drop it during pseudo-fullscreen so the
-       app iframe's position:fixed escapes to the real viewport. */
+    /* The container's and pane's translateZ(0) (both added for iframe compositor
+       clipping) each form a containing block too. Drop them during
+       pseudo-fullscreen so the app iframe's position:fixed escapes to the real
+       viewport — no swipe is in flight while fullscreen, and the opaque overlay
+       hides any momentary track mis-paint, so losing the compositor layer here
+       is harmless. */
+    :root[data-pseudo-fullscreen] .mobile-swipe-container,
     :root[data-pseudo-fullscreen] .mobile-swipe-pane {
         -webkit-transform: none !important;
         transform: none !important;

@@ -26,7 +26,8 @@
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    Json,
+    routing::{get, post},
+    Json, Router,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -190,4 +191,15 @@ pub(super) async fn summary(
         "soft_threshold_bytes": FREE_DISK_SOFT_BYTES,
         "hard_threshold_bytes": FREE_DISK_HARD_BYTES,
     })))
+}
+
+/// Routes for the `/disk-usage/*` surface.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/disk-usage/summary", get(summary))
+        .route("/disk-usage/worktrees", get(list_worktrees))
+        .route(
+            "/disk-usage/worktrees/:thread_id/cleanup",
+            post(cleanup_worktree),
+        )
 }

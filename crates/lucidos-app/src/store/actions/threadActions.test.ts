@@ -264,10 +264,9 @@ describe('discardDraft (confirm lives on the action)', () => {
     }
   });
 
-  it('the discard_draft button action routes through the same confirm as the cascade', async () => {
-    // Both the visible "Discard draft" button and the close-cascade shortcut
-    // drive this TaggedAction's invoke — so the confirm can never depend on
-    // which one the user used.
+  it('the discard_draft action routes through the same confirm as the cascade', async () => {
+    // The close-cascade shortcut drives this TaggedAction's invoke (the 'draft'
+    // close layer) — so the confirm lives on the action, not on any one caller.
     setThread(makeThreadState('t1', { meta: { section: 'inbox', status: 'idle', composeText: 'half a thought' } }));
     const action = resolveThreadActions('t1').find((a) => a.kind === 'discard_draft');
     void action?.invoke();

@@ -3,6 +3,10 @@
 import type { ActorMode } from '../store/thread-events';
 import type { AuthType, CredentialInfo } from '../store/types';
 
+/** Coding-agent backend discriminator — mirrors the Rust `CodingAgent` enum
+ *  (kebab-case wire values). */
+export type CodingAgent = 'claude-code' | 'codex';
+
 export interface ChatRequestBody {
   message: string;
   /**
@@ -44,6 +48,10 @@ export interface ChatRequestBody {
   images?: Array<{ base64: string; mime_type: string }>;
   use_claude_code?: boolean;
   cc_model?: string;
+  /** Which coding-agent backend a NEW coding-agent thread runs on. Requires
+   *  `use_claude_code: true`. Ignored on follow-ups — the thread's stored
+   *  backend wins (locked at first SessionStarted). */
+  coding_agent?: CodingAgent;
   event_id?: string;
   thread_id?: string;
   /** Required when `mode !== 'human'`: the thread that spawned this one. */
@@ -86,6 +94,24 @@ export interface NotificationsResponse {
 
 export interface CredentialsListResponse {
   credentials: CredentialInfo[];
+}
+
+/** A chat model in the DB-backed registry (Settings → Models). Mirrors the
+ *  engine `core::models::Model`. `provider` is the backend that serves it
+ *  ('vertex' | 'anthropic' | 'openai'); `source` is 'builtin' (disable-only) or
+ *  'user' (deletable). */
+export interface ModelInfo {
+  id: string;
+  label: string;
+  provider: string;
+  sort_order: number;
+  source: string;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface ModelsListResponse {
+  models: ModelInfo[];
 }
 
 /** Generic success/error response used by credential, preference, and trigger endpoints. */

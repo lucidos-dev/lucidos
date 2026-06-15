@@ -40,7 +40,7 @@ describe('image popup — clicking outside the image closes it', () => {
 
   it('closes the popup when the click landed on the slide background', () => {
     // Closing means clearing the popupImage signal — same as the close
-    // button and ModalOverlay backdrop click do.
+    // button and the <Overlay> backdrop dismiss do.
     expect(onClickBody).toMatch(/popupImage\.value\s*=\s*null/);
   });
 });

@@ -383,7 +383,7 @@ describe('Flow: CC follow-up stopped by user', () => {
     expect(exchangeStatus(exchanges[1], '', false)).toBe('canceled');
     expect(getLabel(exchanges[1], '', false)).toBe('Canceled');
 
-    // Third exchange: ResponseCanceled boundary panel — 'You — Canceled the response'
+    // Third exchange: ResponseCanceled boundary panel — 'Response canceled'
     expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
 
     // Thread: still "Waiting" because CC is alive (last event is CodingAgentIdled)

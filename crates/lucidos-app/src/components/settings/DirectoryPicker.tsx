@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { browseDirectories, type BrowseResult } from '../../api/client';
 import { toFailed, type Loadable } from '../../store/types';
-import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
+import { Overlay } from '../shared/Overlay';
 
 interface DirectoryPickerProps {
   onSelect: (path: string) => void;
@@ -87,8 +87,6 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
-  useDismissOnOutside(true, panelRef, null, onCancel);
-
   useEffect(() => {
     setData({ status: 'loading' });
     setSelectedIndex(-1);
@@ -128,7 +126,7 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
 
   return (
     <div class="confirm-overlay">
-      <div class="dir-picker" ref={panelRef}>
+      <Overlay open onClose={onCancel} backdrop={false} panelClass="dir-picker" panelRef={panelRef}>
         <div class="dir-picker-header">
           <span class="dir-picker-title">Select Directory</span>
           <button class="icon-btn header-icon" onClick={onCancel} aria-label="Close">
@@ -205,7 +203,7 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
             >Select</button>
           </div>
         </div>
-      </div>
+      </Overlay>
     </div>
   );
 }

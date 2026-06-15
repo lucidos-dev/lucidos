@@ -28,6 +28,7 @@ impl LucidosEngine {
         repo_id: Option<&str>,
         cc_model: Option<&str>,
         reasoning_effort: Option<&str>,
+        coding_agent: Option<crate::runtime::CodingAgent>,
         conflict_change_id: Option<Uuid>,
         origin_id: Uuid,
         spawning_event_id: Option<Uuid>,
@@ -156,6 +157,7 @@ impl LucidosEngine {
                 cc_model_str.clone(),
                 cc_effort_str.clone(),
                 None,
+                coding_agent,
             )
             .await;
         // Stale resume: CC process was expired and returned empty Result.
@@ -197,6 +199,7 @@ impl LucidosEngine {
                         cc_model_str,
                         cc_effort_str,
                         None,
+                        coding_agent,
                     )
                     .await;
             }

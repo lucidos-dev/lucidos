@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'preact/hooks';
-import { SHORTCUT_DEFS, shortcutDef, type ShortcutId, type ShortcutCategory } from '../../utils/shortcuts';
+import { SHORTCUT_DEFS, shortcutDef, type ShortcutId } from '../../utils/shortcuts';
 import { displayBinding, isCustomized, setBinding, resetBinding, recordChord } from '../../store/actions/keybindings';
 
-const CATEGORIES: ShortcutCategory[] = ['Navigation', 'View'];
+// Derived, not hand-maintained: a category added to the registry can't be
+// silently missing from the sheet. Order = first appearance in SHORTCUT_DEFS.
+const CATEGORIES = [...new Set(SHORTCUT_DEFS.map((d) => d.category))];
 
 /** Settings → Keyboard Shortcuts. Lists every registry shortcut with its
  *  current (possibly-customized) binding and a Record button to rebind it.

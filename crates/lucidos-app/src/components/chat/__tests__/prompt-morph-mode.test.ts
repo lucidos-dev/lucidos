@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { computeMorphMode, dispatchSend, submittingThreadIds } from '../PromptInput';
+import { clearQueuedUploadSend, computeMorphMode, dispatchSend, queueUploadSend, queuedUploadSends, submittingThreadIds, takeQueuedUploadSend } from '../PromptInput';
 
 const base = {
   hasContent: false,
@@ -83,5 +83,38 @@ describe('dispatchSend ordering', () => {
     dispatchSend(null, send);
 
     expect(stampedAtSendTime).toBe(false);
+  });
+});
+
+describe('queued upload sends', () => {
+  beforeEach(() => {
+    queuedUploadSends.value = new Map();
+    submittingThreadIds.value = new Set();
+  });
+
+  it('stores the latest send intent for a thread until upload settlement consumes it', () => {
+    queueUploadSend('t1', { useClaudeCode: false, context: { app_context: { app_id: 'a' } } });
+    queueUploadSend('t1', { useClaudeCode: true, context: null });
+
+    const intent = takeQueuedUploadSend('t1');
+
+    expect(intent).toEqual({ useClaudeCode: true, context: null });
+    expect(queuedUploadSends.value.has('t1')).toBe(false);
+  });
+
+  it('marks a queued upload send as submitting so the prompt can morph to Cancel', () => {
+    queueUploadSend('t1', { useClaudeCode: false, context: null });
+
+    expect(submittingThreadIds.value.has('t1')).toBe(true);
+    expect(computeMorphMode({ ...base, hasContent: false, cancelTargetId: 't1' })).toBe('cancel');
+  });
+
+  it('clearing a queued upload send also clears its optimistic submitting state', () => {
+    queueUploadSend('t1', { useClaudeCode: false, context: null });
+
+    clearQueuedUploadSend('t1');
+
+    expect(queuedUploadSends.value.has('t1')).toBe(false);
+    expect(submittingThreadIds.value.has('t1')).toBe(false);
   });
 });

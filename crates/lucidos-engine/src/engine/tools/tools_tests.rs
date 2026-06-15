@@ -6,12 +6,37 @@
 //! Postgres pool + `EventBus`. This mirrors how `event_bus_tests.rs`
 //! exercises bus paths.
 
-use super::{dismiss_from_context_impl, parse_apply_change_id};
+use super::{
+    dismiss_from_context_impl, merge_thread_queue_policy_patch, parse_apply_change_id,
+    parse_source_arg,
+};
 use crate::engine::event_bus::EventBus;
+use crate::engine::thread_queue::{CapacityPolicy, OverflowPolicy};
 use crate::test_support::{setup_test_db, teardown_test_db};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+#[test]
+fn parse_source_arg_normalizes_coding_agent_alias() {
+    let parsed = parse_source_arg(Some(&json!("chat, coding-agent, claude_code, trigger")))
+        .expect("source filter");
+    assert_eq!(
+        parsed,
+        vec!["chat", "claude_code", "claude_code", "trigger"]
+    );
+
+    let parsed =
+        parse_source_arg(Some(&json!(["coding-agent", "trigger", " "]))).expect("source filter");
+    assert_eq!(parsed, vec!["claude_code", "trigger"]);
+}
+
+#[test]
+fn parse_source_arg_collapses_blank_inputs() {
+    assert_eq!(parse_source_arg(Some(&json!(" , , "))), None);
+    assert_eq!(parse_source_arg(Some(&json!(["", "  "]))), None);
+    assert_eq!(parse_source_arg(Some(&json!(42))), None);
+}
 
 /// Insert a raw thread event directly into the events table, bypassing the
 /// EventBus. The dismiss handler queries by `(id, aggregate_id, event_type)`
@@ -422,11 +447,11 @@ mod build_query_events_response_tests {
     /// discipline if the schema lets it bypass.
     #[test]
     fn query_events_caps_match_workspace_learning_recipe() {
-        use crate::engine::tools::{query_events_byte_budget, query_events_limit};
-        assert_eq!(query_events_limit::DEFAULT, 50);
-        assert_eq!(query_events_limit::MAX, 200);
-        assert_eq!(query_events_byte_budget::DEFAULT, 128 * 1024);
-        assert_eq!(query_events_byte_budget::MAX, 512 * 1024);
+        use crate::engine::tools::{QUERY_EVENTS_BYTE_BUDGET, QUERY_EVENTS_LIMIT};
+        assert_eq!(QUERY_EVENTS_LIMIT.default, 50);
+        assert_eq!(QUERY_EVENTS_LIMIT.max, 200);
+        assert_eq!(QUERY_EVENTS_BYTE_BUDGET.default, 128 * 1024);
+        assert_eq!(QUERY_EVENTS_BYTE_BUDGET.max, 512 * 1024);
     }
 }
 
@@ -466,4 +491,76 @@ fn apply_change_accepts_valid_uuid_trimming_whitespace() {
     // pads string args.
     let out = parse_apply_change_id(&json!({"change_id": format!("  {id}  ")}));
     assert_eq!(out.expect("valid padded UUID must parse"), id);
+}
+
+#[test]
+fn thread_queue_policy_patch_merges_with_current_policy() {
+    let current = CapacityPolicy {
+        max_concurrent_total: 16,
+        max_concurrent_event_trigger: 6,
+        max_concurrent_cron: 6,
+        max_concurrent_sub_thread: 8,
+        max_concurrent_coding_agent: 12,
+        max_concurrent_per_trigger: 1,
+        max_queued_per_trigger: 25,
+        reserved_background: 4,
+        overflow: OverflowPolicy::DropOldest,
+    };
+
+    let out = merge_thread_queue_policy_patch(
+        current.clone(),
+        &json!({
+            "max_concurrent_coding_agent": 14,
+            "overflow": "pause-trigger"
+        }),
+    )
+    .expect("valid patch should merge");
+
+    assert_eq!(out.max_concurrent_total, current.max_concurrent_total);
+    assert_eq!(
+        out.max_concurrent_event_trigger,
+        current.max_concurrent_event_trigger
+    );
+    assert_eq!(out.max_concurrent_coding_agent, 14);
+    assert_eq!(out.overflow, OverflowPolicy::PauseTrigger);
+}
+
+#[test]
+fn thread_queue_policy_patch_rejects_empty_or_bad_fields() {
+    let current = CapacityPolicy::default();
+    let out = merge_thread_queue_policy_patch(current.clone(), &json!({}));
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("at least one")),
+        "empty patch should error, got: {out:?}"
+    );
+
+    let out =
+        merge_thread_queue_policy_patch(current.clone(), &json!({"max_concurrent_total": "12"}));
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("max_concurrent_total")),
+        "string cap should error, got: {out:?}"
+    );
+
+    let out =
+        merge_thread_queue_policy_patch(current.clone(), &json!({"max_queued_per_trigger": 0}));
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("at least 1")),
+        "zero queue cap should error, got: {out:?}"
+    );
+
+    let out = merge_thread_queue_policy_patch(current, &json!({"overflow": "delete-all"}));
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("overflow")),
+        "unknown overflow should error, got: {out:?}"
+    );
+}
+
+#[test]
+fn thread_queue_policy_patch_rejects_unknown_fields() {
+    let out =
+        merge_thread_queue_policy_patch(CapacityPolicy::default(), &json!({"max_total": 12}));
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("unknown Thread Queue policy field")),
+        "unknown field should error, got: {out:?}"
+    );
 }

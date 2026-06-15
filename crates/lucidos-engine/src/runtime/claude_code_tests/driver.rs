@@ -35,6 +35,7 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
             events_rx,
             input_tx,
             control_tx,
+            permission_rx: None,
         },
         cancel,
     )
@@ -81,7 +82,13 @@ async fn driver_task_parses_stdout_into_typed_events() {
         .await
         .expect("driver should emit Exited after EOF")
         .expect("events channel should be open");
-    assert!(matches!(exited, AgentEvent::Exited));
+    // Clean exit (printf then EOF) — not a signal kill.
+    assert!(matches!(
+        exited,
+        AgentEvent::Exited {
+            killed_by_signal: false
+        }
+    ));
 
     // Channel closes after Exited
     assert!(agent.events_rx.recv().await.is_none());
@@ -98,7 +105,71 @@ async fn driver_task_cancellation_terminates_process() {
         .await
         .expect("driver should emit Exited within 5s of cancellation")
         .expect("events channel should be open");
-    assert!(matches!(exited, AgentEvent::Exited));
+    // Engine-initiated cancel — the driver's own SIGKILL must NOT be reported
+    // as a stray signal kill (that would wrongly trigger auto-resume).
+    assert!(matches!(
+        exited,
+        AgentEvent::Exited {
+            killed_by_signal: false
+        }
+    ));
+}
+
+/// A stray external signal that kills CC mid-run (the `exit=143` bug) must be
+/// reported as `killed_by_signal: true` — distinct from the engine's own
+/// cancel-path SIGKILL — so the safety net can auto-resume instead of
+/// surfacing a red-dot abort. Sends SIGTERM directly to the child's pid, NOT
+/// through the driver's `cancel` token.
+#[cfg(unix)]
+#[tokio::test]
+async fn driver_task_flags_stray_signal_kill() {
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn test child");
+    let pid = child.id().expect("child pid");
+    let stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (_input_tx, input_rx) = mpsc::unbounded_channel();
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    tokio::spawn(driver_task(
+        child,
+        stdin,
+        BufReader::new(stdout),
+        BufReader::new(stderr),
+        events_tx,
+        input_rx,
+        control_rx,
+        cancel,
+        None,
+    ));
+
+    // External kill — the engine did NOT cancel. SAFETY: kill with a positive
+    // pid + integer signal number; no pointer args.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+
+    let exited = tokio::time::timeout(std::time::Duration::from_secs(5), events_rx.recv())
+        .await
+        .expect("driver should emit Exited within 5s of the kill")
+        .expect("events channel should be open");
+    assert!(
+        matches!(
+            exited,
+            AgentEvent::Exited {
+                killed_by_signal: true
+            }
+        ),
+        "a stray signal kill must set killed_by_signal=true, got {:?}",
+        exited,
+    );
 }
 
 // ── format_exit_status ───────────────────────────────────────────────────
@@ -172,6 +243,49 @@ fn format_exit_status_decodes_unknown_signal_number() {
     // dropping the number.
     let s = std::process::ExitStatus::from_raw(63);
     assert_eq!(format_exit_status(&Ok(s)), "signal=63");
+}
+
+// ── exit_indicates_signal_kill ───────────────────────────────────────────
+// The classifier the safety net keys off to auto-resume a stray-killed turn.
+
+#[cfg(unix)]
+#[test]
+fn exit_indicates_signal_kill_true_for_exit_143_and_137() {
+    use std::os::unix::process::ExitStatusExt;
+    // exit=143 (Node caught SIGTERM, re-raised) and exit=137 (128+SIGKILL).
+    assert!(exit_indicates_signal_kill(
+        &std::process::ExitStatus::from_raw(143 << 8)
+    ));
+    assert!(exit_indicates_signal_kill(
+        &std::process::ExitStatus::from_raw(137 << 8)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn exit_indicates_signal_kill_true_for_direct_signal() {
+    use std::os::unix::process::ExitStatusExt;
+    // Raw 15 = WIFSIGNALED with WTERMSIG=15 (kernel-delivered SIGTERM).
+    assert!(exit_indicates_signal_kill(
+        &std::process::ExitStatus::from_raw(15)
+    ));
+    // Raw 9 = WTERMSIG=9 (SIGKILL).
+    assert!(exit_indicates_signal_kill(
+        &std::process::ExitStatus::from_raw(9)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn exit_indicates_signal_kill_false_for_clean_and_plain_exit() {
+    use std::os::unix::process::ExitStatusExt;
+    // exit=0 (clean) and exit=1 (plain failure) are NOT signal kills.
+    assert!(!exit_indicates_signal_kill(
+        &std::process::ExitStatus::from_raw(0)
+    ));
+    assert!(!exit_indicates_signal_kill(
+        &std::process::ExitStatus::from_raw(1 << 8)
+    ));
 }
 
 #[test]
@@ -257,7 +371,7 @@ async fn driver_task_detects_subprocess_exit_when_grandchild_holds_stdout_busy()
         )
         .expect("events channel closed without Exited");
     assert!(
-        matches!(second, AgentEvent::Exited),
+        matches!(second, AgentEvent::Exited { .. }),
         "second event must be Exited (grandchild noise is unparseable and \
          produces no events), got {:?}",
         second,

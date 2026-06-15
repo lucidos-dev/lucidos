@@ -80,10 +80,15 @@ impl McpServerStore {
         let args_json = serde_json::to_value(args)?;
         let env_json = serde_json::to_value(env)?;
 
-        let row: (chrono::DateTime<chrono::Utc>,) = sqlx::query_as(
+        // RETURNING auto_approve (not a hardcoded `false`): on an ON CONFLICT
+        // update of an existing server, the UPDATE leaves auto_approve untouched,
+        // so a server that was previously auto-approved must keep reporting
+        // `true` in the returned struct — otherwise the caller connects with a
+        // stale flag that disagrees with the DB row.
+        let row: (chrono::DateTime<chrono::Utc>, bool) = sqlx::query_as(
             "INSERT INTO mcp_servers (id, name, command, args, env) VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, command = EXCLUDED.command, args = EXCLUDED.args, env = EXCLUDED.env \
-             RETURNING created_at"
+             RETURNING created_at, auto_approve"
         )
         .bind(id)
         .bind(name)
@@ -99,7 +104,7 @@ impl McpServerStore {
             command: command.to_string(),
             args: args.to_vec(),
             env: env.clone(),
-            auto_approve: false,
+            auto_approve: row.1,
             created_at: row.0,
         })
     }
@@ -126,5 +131,56 @@ impl McpServerStore {
             .execute(pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn reinsert_preserves_auto_approve() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+        let args = vec!["--flag".to_string()];
+        let env = HashMap::new();
+
+        // A brand-new server defaults to auto_approve = false.
+        let created = McpServerStore::insert(&pool, "srv", "Srv", "cmd", &args, &env)
+            .await
+            .unwrap();
+        assert!(
+            !created.auto_approve,
+            "new server should default to auto_approve = false"
+        );
+
+        // User opts the server into auto-approve.
+        assert!(McpServerStore::set_auto_approve(&pool, "srv", true)
+            .await
+            .unwrap());
+
+        // Re-registering the same id hits ON CONFLICT DO UPDATE, which does NOT
+        // touch auto_approve. The returned struct must reflect the real DB value
+        // (true), not a hardcoded false — this is the regression guard for the
+        // bug where a re-register silently disabled auto-approve in memory.
+        let reinserted =
+            McpServerStore::insert(&pool, "srv", "Srv Renamed", "cmd2", &args, &env)
+                .await
+                .unwrap();
+        assert!(
+            reinserted.auto_approve,
+            "re-registering an auto-approved server must keep auto_approve = true"
+        );
+        assert_eq!(
+            reinserted.name, "Srv Renamed",
+            "ON CONFLICT should update the mutable fields"
+        );
+
+        // The DB row agrees — no in-memory/DB divergence.
+        let fetched = McpServerStore::get(&pool, "srv").await.unwrap().unwrap();
+        assert!(fetched.auto_approve);
+
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 }

@@ -23,14 +23,26 @@ export function PluginInstallPanel() {
   const overwriteSet = new Set(req.overwrites);
   const newFiles = req.files.filter((f) => !overwriteSet.has(f));
 
+  // The action fns always closeInlineForm() in their own finally (unmounting
+  // this panel), so busy normally never resets visibly — but reset in a finally
+  // anyway so the buttons re-enable if a future action path returns without
+  // closing the form. setBusy after unmount is a harmless no-op in Preact.
   async function handleConfirm() {
     setBusy(true);
-    await confirmPluginInstallAction(req.install_id, req.plugin_name);
+    try {
+      await confirmPluginInstallAction(req.install_id, req.plugin_name);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function handleCancel() {
     setBusy(true);
-    await cancelPluginInstallAction(req.install_id);
+    try {
+      await cancelPluginInstallAction(req.install_id);
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (

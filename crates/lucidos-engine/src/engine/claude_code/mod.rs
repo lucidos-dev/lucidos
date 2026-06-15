@@ -76,6 +76,21 @@ const CC_PROTECTED_PATH_MARKERS: &[&str] = &[".claude/", ".git/"];
 // `PermissionCard.tsx`.
 const SESSION_PATH_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
+// Codex backend tool names, raised by the app-server approval bridge (see
+// `runtime/codex_app_server_parse.rs::parse_approval_request`). The
+// PERSISTED scopes (Broad / Narrow) are meaningless for them:
+// `cc-allowed-tools` only ever reaches Claude Code via `--allowedTools`; no
+// Codex driver reads the file, so persisting `command_execution` there would
+// claim a suppression nothing enforces while polluting CC's allowlist.
+// Session scope stays available where a meaningful sub-scope exists
+// (`command_execution(<first-token>:*)` — see `narrow_subscope`); `file_change`
+// gets NO session pattern at all (its approval input carries no stable
+// identifier, so the only derivable pattern would be the bare tool name —
+// one click would blanket-approve every future out-of-sandbox write in the
+// thread). Mirrors the TS-side `CODEX_BACKEND_TOOLS` /
+// `SESSION_ALLOW_INEFFECTIVE` constants in `PermissionCard.tsx`.
+const CODEX_BACKEND_TOOLS: &[&str] = &["command_execution", "file_change"];
+
 const CC_ALLOWED_TOOLS_FILE: &str = "cc-allowed-tools";
 const CC_ALLOWED_TOOLS_HEADER: &str =
     "# One pattern per line. Lines starting with '#' are ignored.\n";
@@ -85,7 +100,7 @@ const CC_ALLOWED_TOOLS_HEADER: &str =
 ///   * `Narrow` / `Broad` — persisted to `~/.lucidos/cc-allowed-tools` and
 ///     handed to CC via `--allowedTools` on every spawn. Survives engine
 ///     restart, but only takes effect for tools/paths CC actually respects.
-///   * `Session` — kept in memory on `CcPermissionState::session_allows`,
+///   * `Session` — kept in memory on `PermissionState::session_allows`,
 ///     scoped to one thread. Lost on engine restart. Works for *every* tool
 ///     and *every* path (including CC's own protected paths like `.claude/`
 ///     and `.git/`), because the engine intercepts before the prompt fires.
@@ -125,7 +140,7 @@ pub enum AllowScope {
 ///
 ///     All other tools return `None` for `Narrow` (the UI hides that button).
 ///
-///   * `Session` → stored on `CcPermissionState::session_allows` and matched
+///   * `Session` → stored on `PermissionState::session_allows` and matched
 ///     exact-string against patterns derived from future prompts in the same
 ///     thread. Always returns `Some(_)` so any prompt can be remembered for
 ///     the rest of the thread, including CC-protected paths the persisted
@@ -142,7 +157,9 @@ pub(crate) fn derive_allow_pattern(
 ) -> Option<String> {
     match scope {
         AllowScope::Broad => {
-            if BROAD_ALLOW_INEFFECTIVE.contains(&tool_name) {
+            if BROAD_ALLOW_INEFFECTIVE.contains(&tool_name)
+                || CODEX_BACKEND_TOOLS.contains(&tool_name)
+            {
                 return None;
             }
             if input_touches_protected_path(tool_name, input) {
@@ -151,6 +168,12 @@ pub(crate) fn derive_allow_pattern(
             Some(tool_name.to_string())
         }
         AllowScope::Narrow => {
+            // Codex backend tools: nothing reads a persisted pattern for
+            // them (see CODEX_BACKEND_TOOLS) — even though command_execution
+            // HAS a derivable sub-scope, persisting it would be a lie.
+            if CODEX_BACKEND_TOOLS.contains(&tool_name) {
+                return None;
+            }
             if input_touches_protected_path(tool_name, input) {
                 return None;
             }
@@ -168,6 +191,14 @@ pub(crate) fn derive_allow_pattern(
                     return None;
                 }
                 return Some(format!("{}({})", tool_name, path));
+            }
+            // file_change carries no stable identifier (its approval input
+            // is only reason/grant_root) — the bare-name fallback below
+            // would let one "Allow for this thread" click blanket-approve
+            // every future out-of-sandbox write. No session pattern: every
+            // file_change approval renders its own card.
+            if tool_name == "file_change" {
+                return None;
             }
             if let Some(narrow) = narrow_subscope(tool_name, input) {
                 return Some(narrow);
@@ -222,13 +253,18 @@ fn narrow_subscope(tool_name: &str, input: &serde_json::Value) -> Option<String>
             }
             Some(format!("Skill({}:*)", plugin))
         }
-        "Bash" => {
+        // Codex's command approvals carry a `command` field too — same
+        // first-token scoping as Bash, so a session grant on `git push`
+        // covers `git …` but NOT a later `rm -rf …`. Only the Session scope
+        // ever reaches this arm (Narrow returns None for Codex backend
+        // tools — nothing reads a persisted pattern for them).
+        "Bash" | "command_execution" => {
             let command = input.get("command").and_then(|v| v.as_str())?;
             let first = command.split_whitespace().next()?;
             if first.is_empty() {
                 return None;
             }
-            Some(format!("Bash({}:*)", first))
+            Some(format!("{}({}:*)", tool_name, first))
         }
         _ => None,
     }

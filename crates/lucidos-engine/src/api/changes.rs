@@ -44,6 +44,9 @@ pub(super) async fn broadcast_changes(state: &AppState) {
     if let Err(e) = r2 {
         crate::log!("[Changes] broadcast: enrich applied titles: {}", e);
     }
+    if let Err(e) = crate::core::changes::enrich_thread_active(pool, &mut pending).await {
+        crate::log!("[Changes] broadcast: enrich pending thread_active: {}", e);
+    }
 
     state
         .engine
@@ -66,7 +69,7 @@ pub(super) async fn broadcast_changes(state: &AppState) {
 pub(super) async fn list_changes(
     State(state): State<AppState>,
     Query(query): Query<ChangesListQuery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = query.limit.unwrap_or(15).clamp(1, 100);
     let before_ts = query.before.map(super::parse_unix_ts);
 
@@ -79,10 +82,10 @@ pub(super) async fn list_changes(
         proj.client_update_since(state.started_at),
         proj.restart_groups_since(state.started_at),
     );
-    let mut pending = pending_r.map_err(internal_err)?;
-    let mut applied = applied_r.map_err(internal_err)?;
-    let client_update = client_update_r.map_err(internal_err)?;
-    let mut restart_groups = restart_groups_r.map_err(internal_err)?;
+    let mut pending = pending_r.map_err(ApiError::db)?;
+    let mut applied = applied_r.map_err(ApiError::db)?;
+    let client_update = client_update_r.map_err(ApiError::db)?;
+    let mut restart_groups = restart_groups_r.map_err(ApiError::db)?;
     let has_more_applied = applied.len() as i64 > limit;
     if has_more_applied {
         applied.truncate(limit as usize);
@@ -93,9 +96,16 @@ pub(super) async fn list_changes(
         crate::core::changes::enrich_thread_titles(pool, &mut applied),
         crate::core::changes::enrich_restart_group_titles(pool, &mut restart_groups),
     );
-    r1.map_err(internal_err)?;
-    r2.map_err(internal_err)?;
-    r3.map_err(internal_err)?;
+    r1.map_err(ApiError::db)?;
+    r2.map_err(ApiError::db)?;
+    r3.map_err(ApiError::db)?;
+
+    // Flag pending changes whose thread is mid-turn so the UI disables Apply
+    // (and drops them from Apply All) — the same gate the per-change endpoint
+    // enforces server-side via guard_change_action.
+    crate::core::changes::enrich_thread_active(pool, &mut pending)
+        .await
+        .map_err(ApiError::db)?;
 
     Ok(Json(serde_json::json!({
         "pending": pending,
@@ -108,18 +118,11 @@ pub(super) async fn list_changes(
     })))
 }
 
-fn internal_err(e: sqlx::Error) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": format!("DB error: {e}") })),
-    )
-}
-
 /// GET /api/v1/changes/applied — list recently applied changes with pagination
 pub(super) async fn list_applied_changes(
     State(state): State<AppState>,
     Query(query): Query<ChangesListQuery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = query.limit.unwrap_or(15).clamp(1, 100);
     let before_ts = query.before.map(super::parse_unix_ts);
 
@@ -128,14 +131,14 @@ pub(super) async fn list_applied_changes(
         .changes()
         .list_recently_applied(limit + 1, before_ts)
         .await
-        .map_err(internal_err)?;
+        .map_err(ApiError::db)?;
     let has_more = applied.len() as i64 > limit;
     if has_more {
         applied.truncate(limit as usize);
     }
     crate::core::changes::enrich_thread_titles(state.engine.pool(), &mut applied)
         .await
-        .map_err(internal_err)?;
+        .map_err(ApiError::db)?;
     Ok(Json(
         serde_json::json!({ "applied": applied, "has_more": has_more }),
     ))
@@ -146,17 +149,14 @@ pub(super) async fn revert_change(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = user_actor_resolved(&headers, &state.pool, None).await;
     match state.engine.revert_change(id, actor).await {
         Ok(message) => {
             broadcast_changes(&state).await;
             Ok(Json(serde_json::json!({ "message": message })))
         }
-        Err(e) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )),
+        Err(e) => Err(ApiError::bad_request(e.to_string())),
     }
 }
 
@@ -179,13 +179,13 @@ async fn guard_change_action(
     change_id: Uuid,
     action: crate::engine::thread_lifecycle::Action,
     reject_msg: &str,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(), ApiError> {
     let row: Option<(Option<Uuid>, String)> =
         sqlx::query_as("SELECT thread_id, status FROM changes WHERE id = $1")
             .bind(change_id)
             .fetch_optional(&state.pool)
             .await
-            .map_err(internal_err)?;
+            .map_err(ApiError::db)?;
     // Unknown change id, change with no thread, or an already-resolved change:
     // defer to the engine (it returns "Change not found" or handles the
     // idempotent terminal-state retry).
@@ -197,12 +197,9 @@ async fn guard_change_action(
     }
     let actions = crate::api::threads::available_thread_actions_for(&state.pool, thread_id)
         .await
-        .map_err(internal_err)?;
+        .map_err(ApiError::db)?;
     if !actions.contains(&action) {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": reject_msg })),
-        ));
+        return Err(ApiError::new(StatusCode::CONFLICT, reject_msg));
     }
     Ok(())
 }
@@ -212,7 +209,7 @@ pub(super) async fn apply_change(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<Json<ApplyResult>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<ApplyResult>, ApiError> {
     let actor = user_actor_resolved(&headers, &state.pool, None).await;
     guard_change_action(
         &state,
@@ -226,10 +223,7 @@ pub(super) async fn apply_change(
             broadcast_changes(&state).await;
             Ok(Json(result))
         }
-        Err(e) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )),
+        Err(e) => Err(ApiError::bad_request(e.to_string())),
     }
 }
 
@@ -238,7 +232,7 @@ pub(super) async fn discard_change(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = user_actor_resolved(&headers, &state.pool, None).await;
     guard_change_action(
         &state,
@@ -252,10 +246,7 @@ pub(super) async fn discard_change(
             broadcast_changes(&state).await;
             Ok(Json(serde_json::json!({ "message": "Change discarded." })))
         }
-        Err(e) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )),
+        Err(e) => Err(ApiError::bad_request(e.to_string())),
     }
 }
 
@@ -270,18 +261,28 @@ pub(super) async fn discard_change(
 pub(super) async fn apply_all_changes(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = user_actor_resolved(&headers, &state.pool, None).await;
-    let pending = state
+    let all_pending = state
         .engine
         .changes()
         .list_pending()
         .await
-        .map_err(internal_err)?;
+        .map_err(ApiError::db)?;
+    if all_pending.is_empty() {
+        return Err(ApiError::bad_request("No pending changes"));
+    }
+    // Exclude changes whose thread is still mid-turn. Apply All calls
+    // `engine.apply_change` directly, bypassing the per-change
+    // `guard_change_action` gate, so without this it would merge a branch while
+    // the coding agent is still producing commits on it — racing the session's
+    // next proposal (real thread 76b4ee76).
+    let pending = crate::core::changes::drop_live_thread_changes(&state.pool, all_pending)
+        .await
+        .map_err(ApiError::db)?;
     if pending.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "No pending changes" })),
+        return Err(ApiError::bad_request(
+            "All pending changes belong to threads that are still working — wait for them to finish, then apply.",
         ));
     }
     let change_ids: Vec<Uuid> = pending.iter().map(|c| c.id).collect();
@@ -354,27 +355,44 @@ pub(super) async fn apply_all_changes(
     }
 }
 
+/// POST /api/v1/changes/apply-all/cancel — cancel the running Apply All batch.
+///
+/// Stops the driver from advancing to further members, interrupts the in-flight
+/// hardening/merge session, and emits `ApplyAllBatchCompleted`. Already-applied
+/// members stay applied; the in-flight apply aborts back to pending (best-effort
+/// for an in-progress merge); queued members stay pending. See
+/// `cancel_apply_all_batches` for the full semantics.
+pub(super) async fn cancel_apply_all_changes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = user_actor_resolved(&headers, &state.pool, None).await;
+    let canceled = state.engine.cancel_apply_all_batches(actor).await;
+    if canceled == 0 {
+        return Err(ApiError::bad_request("No Apply All batch is running"));
+    }
+    broadcast_changes(&state).await;
+    Ok(Json(serde_json::json!({ "canceled_batches": canceled })))
+}
+
 /// GET /api/v1/changes/:id — get a single change by ID
 pub(super) async fn get_change(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<crate::core::changes::Change>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<crate::core::changes::Change>, ApiError> {
     let mut change = state
         .engine
         .changes()
         .get_by_id(id)
         .await
-        .map_err(internal_err)?
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "Change not found" })),
-        ))?;
+        .map_err(ApiError::db)?
+        .ok_or_else(|| ApiError::not_found("Change not found"))?;
     crate::core::changes::enrich_thread_titles(
         state.engine.pool(),
         std::slice::from_mut(&mut change),
     )
     .await
-    .map_err(internal_err)?;
+    .map_err(ApiError::db)?;
     Ok(Json(change))
 }
 
@@ -417,18 +435,26 @@ pub(super) async fn list_changes_for_repo(
 pub(super) async fn discard_all_changes(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = user_actor_resolved(&headers, &state.pool, None).await;
-    let pending = state
+    let all_pending = state
         .engine
         .changes()
         .list_pending()
         .await
-        .map_err(internal_err)?;
+        .map_err(ApiError::db)?;
+    if all_pending.is_empty() {
+        return Err(ApiError::bad_request("No pending changes"));
+    }
+    // Skip changes whose thread is mid-turn — discarding would delete the
+    // branch/worktree out from under the live coding-agent session. Mirrors the
+    // Apply All filter and the per-change `guard_change_action` gate.
+    let pending = crate::core::changes::drop_live_thread_changes(&state.pool, all_pending)
+        .await
+        .map_err(ApiError::db)?;
     if pending.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "No pending changes" })),
+        return Err(ApiError::bad_request(
+            "All pending changes belong to threads that are still working — wait for them to finish, then discard.",
         ));
     }
     let mut discarded = 0;
@@ -456,6 +482,28 @@ pub(super) async fn discard_all_changes(
         "failed": failed,
         "errors": errors,
     })))
+}
+
+/// Routes for the `/changes*` URL surface. The diff/file routes register
+/// here even though their handlers live in `api::repositories` — grouped by
+/// path, not handler location.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/changes", get(list_changes))
+        .route("/changes/applied", get(list_applied_changes))
+        .route("/changes/apply-all", post(apply_all_changes))
+        .route("/changes/apply-all/cancel", post(cancel_apply_all_changes))
+        .route("/changes/discard-all", post(discard_all_changes))
+        .route(
+            "/changes/for-repo/:repo_id",
+            get(list_changes_for_repo),
+        )
+        .route("/changes/:id/apply", post(apply_change))
+        .route("/changes/:id/discard", post(discard_change))
+        .route("/changes/:id/revert", post(revert_change))
+        .route("/changes/:id/diff", get(super::repositories::get_change_diff))
+        .route("/changes/:id/file", get(super::repositories::get_change_file))
+        .route("/changes/:id", get(get_change))
 }
 
 #[cfg(test)]

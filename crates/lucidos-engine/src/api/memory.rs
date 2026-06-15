@@ -243,3 +243,15 @@ pub(super) async fn cancel_rebuild_memory(
         Json(serde_json::json!({ "status": "cancelling" })),
     )
 }
+
+/// Routes for the `/memory/*` surface.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/memory/stats", get(get_memory_stats))
+        .route("/memory/entries", get(get_memory_entries))
+        .route("/memory/source", get(get_memory_source))
+        .route(
+            "/memory/rebuild",
+            post(rebuild_memory).delete(cancel_rebuild_memory),
+        )
+}

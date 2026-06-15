@@ -1,10 +1,10 @@
 import { useSignal } from '@preact/signals';
-import { useRef, useState } from 'preact/hooks';
+import { useState } from 'preact/hooks';
 import type { Ref } from 'preact';
 import { focusedThreadId, threadMap } from '../../store/store';
 import type { TodoItem } from '../../store/thread-events';
 import { TodoCheckIcon, TodoInProgressIcon } from '../shared/icons';
-import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
+import { Overlay } from '../shared/Overlay';
 
 export function todoListIndicatorBody({
   items,
@@ -58,11 +58,9 @@ export function todoListIndicatorBody({
 export function todoListPanelBody({
   items,
   onClose,
-  panelRef,
 }: {
   items: TodoItem[];
   onClose: () => void;
-  panelRef?: Ref<HTMLDivElement>;
 }) {
   return (
     <div
@@ -70,7 +68,6 @@ export function todoListPanelBody({
       data-role="todo-panel"
       role="dialog"
       aria-label="Current todo list"
-      ref={panelRef}
     >
       <ul class="todo-panel-list">
         {items.map((item, idx) => (
@@ -111,21 +108,18 @@ export function todoListPanelBody({
   );
 }
 
-/** Symmetric to `CCControlMenu`: mounted in the prompt-bar actions row,
+/** Symmetric to `CodingAgentControlMenu`: mounted in the prompt-bar actions row,
  *  hidden when the chat agent hasn't written a list. Reads from
  *  `meta.latestTodoList` (projected in `handleEvent`) so the render path
  *  is O(1) — no walk of the events Map per threadMap flush. */
 export function TodoListIndicator() {
   const open = useSignal(false);
-  const panelRef = useRef<HTMLDivElement>(null);
   // useState (not useRef) so the dismiss hook re-runs once the button mounts
   // and we have a real anchor to exclude from the outside-click test.
   const [anchorEl, setAnchorEl] = useState<HTMLButtonElement | null>(null);
 
   const id = focusedThreadId.value;
   const items = id ? threadMap.value.get(id)?.meta.latestTodoList ?? null : null;
-
-  useDismissOnOutside(open.value, panelRef, anchorEl, () => (open.value = false));
 
   return (
     <>
@@ -134,11 +128,18 @@ export function TodoListIndicator() {
         onClick: () => (open.value = !open.value),
         buttonRef: setAnchorEl,
       })}
-      {open.value && items && items.length > 0 ? (
-        <div class="todo-panel-anchor">
-          {todoListPanelBody({ items, onClose: () => (open.value = false), panelRef })}
-        </div>
-      ) : null}
+      {/* Overlay panel is the `.todo-panel-anchor` positioning wrapper; the
+          inner `.todo-panel` (role/aria-label) is its child — same DOM as
+          before. Anchor is the indicator button. Contract lives in <Overlay>. */}
+      <Overlay
+        open={open.value && !!items && items.length > 0}
+        onClose={() => (open.value = false)}
+        anchor={anchorEl}
+        backdrop={false}
+        panelClass="todo-panel-anchor"
+      >
+        {items && items.length > 0 && todoListPanelBody({ items, onClose: () => (open.value = false) })}
+      </Overlay>
     </>
   );
 }

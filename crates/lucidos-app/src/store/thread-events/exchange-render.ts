@@ -112,7 +112,8 @@ function bindSnapshotToStep<T>(
   isThinking: (item: T) => boolean,
   assign: (item: T, snap: ContextCapture) => void,
 ): void {
-  const acceptable = data.producer === 'claude_code' ? isStep : isThinking;
+  // Coding-agent captures anchor to tool steps; main-LLM captures to thinking.
+  const acceptable = data.producer === 'main_llm' ? isThinking : isStep;
   for (let i = items.length - 1; i >= 0; i--) {
     if (acceptable(items[i])) {
       assign(items[i], data);
@@ -302,6 +303,10 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
   // Count images across the thread for thread:N numbering — starts after user images in this exchange
   let imageCounter = imageOffset + exchangeUserImageHashes(exchange).length;
   let isComplete = false;
+  // Set when the exchange completed via a text-less ResponseGenerated — a
+  // benign empty completion (the model ended its turn cleanly with no text).
+  // Drives the neutral "empty response" note pushed after the loop.
+  let emptyCompletion = false;
   // One ContextAssembled per exchange; attach to every step pushed after it.
   let currentContext: ContextAssembledData | undefined;
   let legacyAcc: LegacyContextEvents = {};
@@ -472,7 +477,40 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
       case 'CodingAgentUserMessageSent':
         // Legacy event — now an exchange boundary in groupIntoExchanges, never a step
         break;
-      case 'ResponseGenerated': case 'ResponseCanceled': case 'ResponseAborted': case 'ResponseFailed':
+      case 'CommandCheckpointed': {
+        // Command guard snapshot before a ReversibleDanger command (ADR 0002,
+        // Phase 4) — renders inline with a one-click Undo.
+        const e = event as { checkpoint_id: string; command: string; summary: string };
+        events.push({
+          type: 'checkpoint',
+          checkpoint_id: e.checkpoint_id,
+          command: e.command,
+          summary: e.summary,
+          reverted: false,
+        });
+        break;
+      }
+      case 'CommandCheckpointReverted': {
+        // The paired revert carries the checkpoint's request_event_id, so it
+        // groups into this exchange after its checkpoint — flip the card's state.
+        const id = (event as { checkpoint_id: string }).checkpoint_id;
+        for (const prior of events) {
+          if (prior.type === 'checkpoint' && prior.checkpoint_id === id) {
+            prior.reverted = true;
+            break;
+          }
+        }
+        break;
+      }
+      case 'ResponseGenerated':
+        isComplete = true;
+        // A text-less ResponseGenerated is a benign empty completion. The
+        // [ENGINE-LIMIT] cap path also emits a ResponseGenerated with no
+        // preceding TextStreamed, but with non-empty text — so checking the
+        // event's own text distinguishes the two.
+        emptyCompletion = !(event as { text?: string }).text?.trim();
+        break;
+      case 'ResponseCanceled': case 'ResponseAborted': case 'ResponseFailed':
       case 'CodingAgentIdled':
         isComplete = true;
         break;
@@ -507,6 +545,16 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
         break;
       }
     }
+    // Benign empty completion: the turn finished cleanly with no text and no
+    // images (tool steps may still be present — the model acted but didn't
+    // summarise). State that plainly instead of leaving a blank body.
+    if (
+      emptyCompletion
+      && !events.some(isMeaningfulText)
+      && !events.some(e => e.type === 'image')
+    ) {
+      events.push({ type: 'empty' });
+    }
   }
   return mergeAdjacentTextEvents(events);
 }
@@ -522,7 +570,7 @@ export function stepStatus(success: boolean | null): { label: string; className:
 
 /** Whether a non-last exchange's response panel should be hidden as visual
  *  noise. The next exchange's user message implies the chronological flow,
- *  so a panel that produced no real output isn't worth a "Continued below ↳"
+ *  so a panel that produced no real output isn't worth a "Done ↳"
  *  placeholder.
  *
  *  An exchange counts as empty if it has no response text and every event is
@@ -556,6 +604,34 @@ export function isCanceledQuestionDivider(exchange: Exchange): boolean {
   if (exchange.userEvent.type !== 'UserQuestionAsked') return false;
   return exchange.steps.some(({ event }) =>
     event.type === 'UserQuestionAnswered' && event.answer.kind === 'Canceled'
+  );
+}
+
+/** Change-lifecycle banner exchanges whose body may carry a post-boundary CC
+ *  continuation. Excludes `ChangeApplyFailed` — its initiator renders the error
+ *  and the change stays pending, so it has no "continued work" body. */
+const CHANGE_CONTINUATION_PANELS: ReadonlySet<string> = new Set([
+  'ChangeApplied',
+  'ChangeDiscarded',
+  'ChangeReverted',
+]);
+
+/** True for a change-lifecycle banner exchange (Applied/Discarded/Reverted)
+ *  that ALSO carries coding-agent work as steps — the session kept going after
+ *  the apply and produced more text/tool calls (usually a follow-up proposal)
+ *  with no new user message to anchor a fresh exchange, so those events folded
+ *  into the change exchange. The banner normally suppresses its response body
+ *  (`showResponsePanel` in ChatExchange); when this is true the body must
+ *  render, or the continued work is invisible between two "Change applied" rows
+ *  (real thread 76b4ee76). Idle/snapshot-only steps don't count — only genuine
+ *  CC output, matching what `exchangeResponseEvents` would actually render. */
+export function changePanelHasContinuation(exchange: Exchange): boolean {
+  if (!CHANGE_CONTINUATION_PANELS.has(exchange.userEvent.type)) return false;
+  return exchange.steps.some(({ event }) =>
+    event.type === 'CodingAgentTextStreamed'
+    || event.type === 'CodingAgentToolCalled'
+    || event.type === 'TextStreamed'
+    || event.type === 'ToolCalled',
   );
 }
 
@@ -656,9 +732,38 @@ function supersededAbortIndices(steps: SequencedEvent[]): Set<number> {
   return superseded;
 }
 
+/** A pending (optimistic, not-yet-ingested) chat follow-up exchange. These are
+ *  synthesized by `computeExchanges` from `thread.pendingUserMessages` with a
+ *  `_displayCreated` stamp and NO `created` (only the agent's real persisted
+ *  events carry `created`), and sorted to the very end of the timeline. CC
+ *  follow-ups instead carry a real `created` (delivered to stdin immediately,
+ *  never queued), so this predicate is chat-only by construction. */
+export function isPendingFollowup(exchange: Exchange): boolean {
+  const ev = exchange.userEvent;
+  return ev.type === 'MessageReceived' && !ev.created && !!ev._displayCreated;
+}
+
+/** Index of the exchange the agent is actively working on — i.e. the one that
+ *  owns the live stream and should read 'streaming'/'working', not the literal
+ *  last exchange.
+ *
+ *  When the thread is busy, follow-ups typed while it worked are queued and
+ *  appended AFTER the active turn (they sort last). So the active exchange is
+ *  the last NON-pending one; the trailing pending exchanges are queued behind
+ *  it. When the thread is idle, the literal last exchange is active (a
+ *  freshly-sent message is about to be picked up — it must read 'Requesting',
+ *  not 'Queued'). Returns `length - 1` for an empty/all-pending list. */
+export function activeExchangeIndex(exchanges: Exchange[], threadBusy: boolean): number {
+  if (!threadBusy) return exchanges.length - 1;
+  for (let j = exchanges.length - 1; j >= 0; j--) {
+    if (!isPendingFollowup(exchanges[j])) return j;
+  }
+  return exchanges.length - 1;
+}
+
 /** Derive ExchangeStatus for an exchange.
  *  @param isLast — true if this is the last (newest) exchange in the thread
- *  @param hasPriorActive — true if a prior exchange is still active (pending/streaming/cc-working),
+ *  @param hasPriorActive — true if a prior exchange is still active (pending/streaming/coding-agent-working),
  *         meaning this exchange is queued behind it
  *  @param threadIdle — true when CC is not producing output (see
  *         `isThreadQuiescent` in store.ts). When true and the exchange has no
@@ -680,7 +785,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // CC paused on AskUserQuestion. The QuestionCard owns the action surface;
   // the exchange itself reads as "done" so it doesn't show a "Working" spinner
   // while the user thinks. Resume (UserQuestionAnswered followed by CC text)
-  // clears this flag and the exchange falls back to cc-working.
+  // clears this flag and the exchange falls back to coding-agent-working.
   let isWaitingForAnswer = false;
   // Track whether the exchange reached a "completed" state BEFORE any
   // abort/shutdown event. When true, the abort is from a system-injected
@@ -698,7 +803,11 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // a step. Without seeding here, the steps loop sees only the resolution and
   // never the request, so isWaitingForAnswer stays false for pending dividers.
   const userEventType = exchange.userEvent.type;
-  if (userEventType === 'UserQuestionAsked' || userEventType === 'CodingAgentPermissionRequest') {
+  if (
+    userEventType === 'UserQuestionAsked'
+    || userEventType === 'CodingAgentPermissionRequest'
+    || userEventType === 'CommandPermissionRequested'
+  ) {
     isWaitingForAnswer = true;
   }
 
@@ -747,9 +856,11 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
         isCCWaiting = false; isComplete = false; isWaitingForAnswer = false; break;
       case 'UserQuestionAsked':
       case 'CodingAgentPermissionRequest':
+      case 'CommandPermissionRequested':
         isWaitingForAnswer = true; break;
       case 'UserQuestionAnswered':
       case 'CodingAgentPermissionResolved':
+      case 'CommandPermissionResolved':
         isWaitingForAnswer = false; break;
     }
   }
@@ -762,8 +873,8 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // Absorbed-UPI placeholder: the engine emitted a UPI carrying this
   // exchange's MR via injected_message_id, so the response actually lives in
   // the prior exchange (req_id-routed there). The placeholder reads as 'done'
-  // and is excluded from the 'interrupted' carve-out below ("Continued below"
-  // is wrong — the answer is above, not below).
+  // and is excluded from the 'interrupted' carve-out below (the "↳" continues-
+  // below arrow is wrong — the answer is above, not below).
   const onlyStep = exchange.steps.length === 1 ? exchange.steps[0].event : undefined;
   const isAbsorbedUpiPlaceholder = onlyStep?.type === 'UserPromptInjected' && !!onlyStep.injected_message_id;
 
@@ -786,7 +897,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // CC threads don't queue — messages go to CC's stdin, not engine queue.
   // Only the LAST queued exchange shows "Queued" — earlier ones were superseded
   // by a newer message and are handled by the empty-non-last rule below
-  // (→ 'done', renders as "Continued below ↳").
+  // (→ 'done', renders as "Done ✓").
   if (hasPriorActive && !hasSteps && !isCC && isLast) return 'queued';
   // CC idle → done. WaitingBanner handles the "can interact" state separately.
   if (isCCWaiting) return 'done';
@@ -795,7 +906,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   if (isCC && isSessionEndedNormally) return 'done';
   // CC paused on a user question or permission prompt — render as
   // 'awaiting-answer' so the surrounding spinner stops AND the header reads
-  // "Awaiting answer" (not the misleading "Done ✓"). The QuestionCard /
+  // "Needs your answer" (not the misleading "Done ✓"). The QuestionCard /
   // PermissionCard inside the exchange shows the action surface.
   if (isWaitingForAnswer) return 'awaiting-answer';
   // Non-last with steps but no terminator: the user moved past this exchange
@@ -819,8 +930,8 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // injection routes new events back to the parent's request_event_id, so a
   // non-last exchange the loop is still actively processing has steps).
   if (!hasSteps && !isCC && (!isLast || threadIdle)) return 'done';
-  // CC exchanges are 'cc-working' once they have steps, 'pending' before.
-  if (isCC) return hasSteps ? 'cc-working' : 'pending';
+  // CC exchanges are 'coding-agent-working' once they have steps, 'pending' before.
+  if (isCC) return hasSteps ? 'coding-agent-working' : 'pending';
   if (streamingBuffer) return 'streaming';
 
   // Absorbed-UPI placeholder: handled here for the isLast case (the

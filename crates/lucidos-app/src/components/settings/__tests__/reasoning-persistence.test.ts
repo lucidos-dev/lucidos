@@ -63,9 +63,13 @@ describe('Chat model and reasoning effort persist across restarts', () => {
     expect(reasoningEffort.value).toBe('high');
   });
 
-  it('loadPreferences ignores invalid model values', async () => {
+  it('loadPreferences honors any stored model value (registry is user-extensible)', async () => {
+    // The model set is now the DB-backed registry (users add their own), so the
+    // frontend no longer validates `chat_model` against a fixed allow-list — it
+    // honors the stored value and RoutingProvider resolves it (with a prefix
+    // fallback). An unknown reasoning effort still falls back to 'high'.
     getPreferencesMock.mockResolvedValueOnce({
-      preferences: { chat_model: 'made-up-model', chat_reasoning_effort: 'fake-effort' },
+      preferences: { chat_model: 'my-custom-model', chat_reasoning_effort: 'fake-effort' },
     });
     currentModel.value = DEFAULT_CHAT_MODEL;
     reasoningEffort.value = 'high';
@@ -73,7 +77,19 @@ describe('Chat model and reasoning effort persist across restarts', () => {
 
     await loadPreferences();
 
-    expect(currentModel.value).toBe(DEFAULT_CHAT_MODEL);
+    expect(currentModel.value).toBe('my-custom-model');
     expect(reasoningEffort.value).toBe('high');
+  });
+
+  it('loadPreferences falls back to the default model when none is stored', async () => {
+    getPreferencesMock.mockResolvedValueOnce({ preferences: { chat_reasoning_effort: 'medium' } });
+    currentModel.value = 'something-else';
+    reasoningEffort.value = 'high';
+    preferences.value = { status: 'not-loaded' };
+
+    await loadPreferences();
+
+    expect(currentModel.value).toBe(DEFAULT_CHAT_MODEL);
+    expect(reasoningEffort.value).toBe('medium');
   });
 });

@@ -8,6 +8,13 @@ export interface ThreadSummary {
   initiator: ThreadInitiator;
   created_at: string;
   last_activity: string;
+  /** When the user last drove this thread forward. The drawer sorts by this so
+   *  background agent churn no longer reshuffles the list. Always sent by the
+   *  engine; optional only so test mocks needn't supply it. */
+  last_user_action?: string;
+  /** When the agent (or trigger) last did something. Drives the thread-row
+   *  tooltip's "Agent ·" line, distinct from `last_user_action`. */
+  last_agent_action?: string;
   message_count: number;
   section: ThreadSection;
   active_children_count: number;
@@ -19,24 +26,24 @@ export interface ThreadSummary {
    *  "3 sub-threads still busy". */
   blocking_descendant_count: number;
   /** Count of descendants (transitive) currently in a state that needs user
-   *  attention (WaitingForUserAnswer, or an in-workspace CC thread with
+   *  attention (WaitingForUserAnswer, or an in-workspace coding-agent thread with
    *  pending changes). Strict subset of `blocking_descendant_count` — drops
    *  the Running case. Consumed by `displaySection` via `count > 0` to bubble
    *  the parent to REVIEW even when sibling descendants are still running. */
   attention_descendant_count: number;
   /** Thread status computed by the backend: 'idle', 'running', or 'waiting'. */
   status: string;
-  /** Whether the CC branch has any diff against main on disk — pure git
+  /** Whether the coding-agent branch has any diff against main on disk — pure git
    *  truth. Backs the WaitingBanner Diff button independently of the
    *  proposal lifecycle. */
   coding_agent_has_diff: boolean;
-  /** CC's formal "ready for review" — set by `ChangeProposed`. Backs the
+  /** Coding-agent thread's formal "ready for review" — set by `ChangeProposed`. Backs the
    *  Apply / Discard buttons. */
   coding_agent_proposed: boolean;
   /** Whether the proposed change requires an engine restart. Only meaningful
    *  when `coding_agent_proposed` is true. */
   coding_agent_requires_restart: boolean;
-  /** Whether the Claude Code session is working on an external repo. */
+  /** Whether the coding-agent thread is working on an external repo. */
   coding_agent_is_external_repo: boolean;
   /** Whether a merge conflict is being resolved. */
   coding_agent_applying: boolean;
@@ -50,19 +57,23 @@ export interface ThreadSummary {
   trigger_id?: string | null;
   /** Trigger name at fire-time (snapshot — falls back when the trigger is renamed/deleted). */
   trigger_name?: string | null;
-  /** Repository the Claude Code session bound to (only for `channel === 'claude_code'`). */
+  /** Repository the coding-agent thread bound to (only for `channel === 'claude_code'`). */
   cc_repo_id?: string | null;
   /** Current repo name from the registry — null when the repo was deleted. */
   cc_repo_name?: string | null;
   /** Coding-agent thread flavor: 'lucidos' | 'app' | 'external'. Drives
    *  app-specific affordances like the WIP preview button and the app-icon
-   *  branch chip. Null for non-CC threads and legacy CC rows (consumers
+   *  branch chip. Null for non-coding-agent threads and legacy coding-agent rows (consumers
    *  default null → 'lucidos'). */
   coding_agent_kind?: 'lucidos' | 'app' | 'external' | null;
   /** Canonical folder the coding agent operates on. For `coding_agent_kind ===
    *  'app'`, the last segment is the app id (`<ws>/data/apps/<id>/`). Null
-   *  for non-CC threads and legacy rows. */
+   *  for non-coding-agent threads and legacy rows. */
   coding_agent_folder?: string | null;
+  /** Which backend drives this thread: 'claude-code' | 'codex'. Null for
+   *  non-coding-agent threads and legacy coding-agent rows (consumers default null →
+   *  'claude-code'). */
+  coding_agent?: 'claude-code' | 'codex' | null;
   /** Compose state machine: 'composing' (draft) | 'active' | 'discarded'. The
    *  archive flag lives on the separate `archive_state` field — an archived
    *  thread carries `state='active'` plus `archive_state='archived'`. */
@@ -78,6 +89,12 @@ export interface ThreadSummary {
 export interface ThreadsResponse {
     saved: ThreadSummary[];
     archive: ThreadSummary[];
+    /** Total size of the archived pile (`archive_state='archived'`, unsaved) —
+     *  NOT just the loaded `archive` window. The collapsed Archive section's
+     *  count badge reads this so it shows the true total. Optional for graceful
+     *  degradation: an older engine (or a test mock) that omits it falls back
+     *  to the loaded count. */
+    archive_count?: number;
     active: string[];
     active_threads: ThreadSummary[];
     /** Threads in `composing` state — the Drafts surface. Newest-first. */
@@ -160,6 +177,8 @@ export interface OlderThreadsResponse {
 export async function fetchOlderThreads(
   before: string,
   limit = 15,
+  /** Preferred source names are `chat`, `trigger`, `coding-agent`; the backend
+   *  also accepts legacy `claude_code` for compatibility. */
   sources?: string[],
   triggerIds?: string[],
   repoIds?: string[],
@@ -173,12 +192,37 @@ export async function fetchOlderThreads(
     return json<OlderThreadsResponse>(`${API}/threads/older?${params}`);
 }
 
+/** True size of the archived pile (`archive_state='archived'`, unsaved) matching
+ *  the active drawer filter — drives the collapsed Archive badge so the number
+ *  reflects the filter and stays stable regardless of how many rows are loaded.
+ *  Mirrors `fetchOlderThreads`'s filter params (no cursor — it's a COUNT). Omit
+ *  all four to count the whole pile. */
+export async function fetchArchivedCount(
+  sources?: string[],
+  triggerIds?: string[],
+  repoIds?: string[],
+  appIds?: string[],
+): Promise<number> {
+  const params = new URLSearchParams();
+  if (sources && sources.length > 0) params.set('sources', sources.join(','));
+  if (triggerIds && triggerIds.length > 0) params.set('trigger_ids', triggerIds.join(','));
+  if (repoIds && repoIds.length > 0) params.set('repo_ids', repoIds.join(','));
+  if (appIds && appIds.length > 0) params.set('app_ids', appIds.join(','));
+  const qs = params.toString();
+  const data = await json<{ count: number }>(`${API}/threads/archived-count${qs ? `?${qs}` : ''}`);
+  return data.count;
+}
+
 /** One selectable drawer-filter facet (trigger / repo / app) returned by
  *  `/api/v1/threads/filter-facets`. `id` is the trigger id / repo UUID / app
  *  id; `last_activity` is the newest thread for that facet (ISO8601), used to
- *  order deleted entries. Labels are resolved client-side from the registries. */
+ *  order deleted entries. `name` is populated for the repos facet (resolved
+ *  server-side from the live registry → `repo_names` projection, so a removed
+ *  repo carries its historical name); NULL for trigger / app facets, whose
+ *  labels the client resolves from its own registries. */
 export interface FilterFacet {
   id: string | null;
+  name: string | null;
   last_activity: string | null;
 }
 

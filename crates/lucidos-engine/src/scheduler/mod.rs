@@ -56,8 +56,12 @@ pub(crate) fn trigger_id_to_uuid(trigger_id: &str) -> uuid::Uuid {
     uuid::Uuid::new_v5(&TRIGGER_UUID_NAMESPACE, trigger_id.as_bytes())
 }
 
-/// Tracks how many user tasks are executing concurrently
-static ACTIVE_TASK_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Tracks how many user tasks are executing concurrently. Incremented /
+/// decremented by the Thread Queue executor around each trigger run
+/// (`engine::thread_queue::executor`); the scheduler reads it for the
+/// shutdown drain wait. Informational — capacity enforcement lives in the
+/// Thread Queue's own accounting.
+pub(crate) static ACTIVE_TASK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Manages all triggers in Lucidos
 pub struct SchedulerManager {
@@ -153,18 +157,16 @@ impl SchedulerManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let tracked_tasks = self.tracked_tasks.clone();
         let engine_health = self.engine.clone();
-        let pool_health = self.pool.clone();
         let health_shutdown = self.shutdown_flag.clone();
         let trigger_configs = self.trigger_configs.clone();
 
         let health_job = Job::new_async("*/30 * * * * *", move |_uuid, _lock| {
             let tracked = tracked_tasks.clone();
             let engine = engine_health.clone();
-            let pool = pool_health.clone();
             let shutdown = health_shutdown.clone();
             let configs = trigger_configs.clone();
             Box::pin(async move {
-                check_task_health_and_restart(tracked, engine, pool, shutdown, configs).await;
+                check_task_health_and_restart(tracked, engine, shutdown, configs).await;
             })
         })?;
 
@@ -555,7 +557,6 @@ impl SchedulerManager {
             config.schedule.clone(),
             config.timezone.clone(),
             self.engine.clone(),
-            self.pool.clone(),
             self.shutdown_flag.clone(),
             self.trigger_configs.clone(),
         );
@@ -590,7 +591,6 @@ impl SchedulerManager {
         let trigger_groups = self.trigger_groups.clone();
         let tracked_tasks = self.tracked_tasks.clone();
         let engine = self.engine.clone();
-        let pool = self.pool.clone();
         let shutdown_flag = self.shutdown_flag.clone();
 
         tokio::spawn(async move {
@@ -636,7 +636,6 @@ impl SchedulerManager {
                                         &trigger_configs,
                                         &tracked_tasks,
                                         &engine,
-                                        &pool,
                                         &shutdown_flag,
                                     )
                                     .await;
@@ -674,7 +673,6 @@ impl SchedulerManager {
                                         Some(emitted.event_id),
                                         &trigger_configs,
                                         &engine,
-                                        &pool,
                                     )
                                     .await;
                                 }
@@ -705,7 +703,6 @@ impl SchedulerManager {
                                     Some(emitted.event_id),
                                     &trigger_configs,
                                     &engine,
-                                    &pool,
                                 )
                                 .await;
                             }
@@ -1005,8 +1002,16 @@ fn find_matching_script(data_dir: &std::path::Path, trigger_name: &str) -> Optio
                 if !path.join("scripts").join("run.py").exists() {
                     continue;
                 }
-                let dir_keywords: Vec<&str> = dir_name.split('-').collect();
-                if dir_keywords.iter().all(|kw| name_lower.contains(kw)) {
+                // Drop empty segments so a trailing/leading/double dash (e.g.
+                // "foo-" -> ["foo", ""]) doesn't contribute a "" keyword that
+                // `name_lower.contains("")` matches unconditionally. An
+                // all-dash dir name yields no keywords and must not match
+                // everything, so require at least one keyword.
+                let dir_keywords: Vec<&str> =
+                    dir_name.split('-').filter(|kw| !kw.is_empty()).collect();
+                if !dir_keywords.is_empty()
+                    && dir_keywords.iter().all(|kw| name_lower.contains(kw))
+                {
                     return Some(format!("{}/{}/scripts/run.py", prefix, dir_name));
                 }
             }
@@ -1059,5 +1064,31 @@ mod tests {
         assert_eq!(find_matching_script(&dir, "Oura Data Import"), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_matching_script_empty_segments_dont_match_all() {
+        // A trailing dash splits to an empty segment; it must not contribute a
+        // "" keyword that matches every trigger name. The real keyword still
+        // constrains, and a name without it does not match.
+        let dir = std::env::temp_dir().join("lucidos_test_find_script_trailing_dash");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("triggers/weather-/scripts")).unwrap();
+        std::fs::write(dir.join("triggers/weather-/scripts/run.py"), "# w").unwrap();
+        assert_eq!(
+            find_matching_script(&dir, "weather report"),
+            Some("triggers/weather-/scripts/run.py".to_string())
+        );
+        assert_eq!(find_matching_script(&dir, "unrelated task"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // An all-dash dir name yields no keywords and must match nothing
+        // (previously ["",""] -> contains("") -> matched everything).
+        let dir2 = std::env::temp_dir().join("lucidos_test_find_script_all_dash");
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(dir2.join("triggers/--/scripts")).unwrap();
+        std::fs::write(dir2.join("triggers/--/scripts/run.py"), "# x").unwrap();
+        assert_eq!(find_matching_script(&dir2, "literally anything"), None);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }

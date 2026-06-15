@@ -14,7 +14,8 @@ test.describe('Message route panel', () => {
     await sendMessage(page, `Say exactly: "ok ${msg}"`);
     await waitForResponse(page);
 
-    const badge = page.locator('.initiator-actor:visible').first();
+    // User messages are chromeless bubbles now — the timestamp is the origin trigger.
+    const badge = page.locator('.initiator-timestamp-button:visible').first();
     await expect(badge).toBeVisible();
     await badge.click();
 
@@ -41,7 +42,8 @@ test.describe('Message route panel', () => {
     await sendMessage(page, `Say exactly: "ack ${msg}"`);
     await waitForResponse(page);
 
-    const badge = page.locator('.initiator-actor:visible').first();
+    // User messages are chromeless bubbles now — the timestamp is the origin trigger.
+    const badge = page.locator('.initiator-timestamp-button:visible').first();
     await badge.click();
     const panel = page.locator('.message-route-panel');
     await expect(panel).toBeVisible();
@@ -56,7 +58,8 @@ test.describe('Message route panel', () => {
     await sendMessage(page, `Say exactly: "ok ${msg}"`);
     await waitForResponse(page);
 
-    const badge = page.locator('.initiator-actor:visible').first();
+    // User messages are chromeless bubbles now — the timestamp is the origin trigger.
+    const badge = page.locator('.initiator-timestamp-button:visible').first();
     await badge.click();
     const panel = page.locator('.message-route-panel');
     await expect(panel).toBeVisible();
@@ -74,7 +77,8 @@ test.describe('Message route panel', () => {
       await waitForResponse(page);
     }
 
-    const badge = page.locator('.initiator-actor:visible').first();
+    // User messages are chromeless bubbles now — the timestamp is the origin trigger.
+    const badge = page.locator('.initiator-timestamp-button:visible').first();
     await badge.click();
     const panel = page.locator('.message-route-panel');
     await expect(panel).toBeVisible();
@@ -100,13 +104,24 @@ test.describe('Message route panel', () => {
 
     await expect(panel).toBeVisible();
 
-    const after = await badge.boundingBox();
-    const panelAfter = await panel.boundingBox();
-    expect(after).not.toBeNull();
-    expect(panelAfter).not.toBeNull();
-    const anchorDelta = (after!.y) - (before!.y);
-    const panelDelta = (panelAfter!.y) - (panelBefore!.y);
-    expect(Math.abs(anchorDelta - panelDelta)).toBeLessThan(2);
+    // The panel re-anchors via requestAnimationFrame on the capture-phase scroll
+    // listener (useAnchoredPosition), so the reposition lands a frame or two after
+    // the scroll fires — not synchronously. Poll until the panel has caught up to
+    // the badge rather than reading boundingBox once, which raced the rAF on
+    // WebKit (panel still at its pre-scroll y → delta ≈ the full scroll distance).
+    await expect
+      .poll(
+        async () => {
+          const after = await badge.boundingBox();
+          const panelAfter = await panel.boundingBox();
+          if (!after || !panelAfter) return Number.POSITIVE_INFINITY;
+          const anchorDelta = after.y - before!.y;
+          const panelDelta = panelAfter.y - panelBefore!.y;
+          return Math.abs(anchorDelta - panelDelta);
+        },
+        { timeout: 5_000 },
+      )
+      .toBeLessThan(2);
   });
 
   test('engine-origin MessageReceived renders the engine explainer copy in popover', async ({ page }) => {
@@ -139,7 +154,8 @@ test.describe('Message route panel', () => {
       await navigateToApp(page);
       await assertHealthy(page);
 
-      // The actor button (origin badge) on the user message opens the popover.
+      // Engine-origin MessageReceived is variant 'system' → it keeps its actor
+      // chip (not a chromeless user bubble), so the origin badge is the chip.
       const badge = page.locator('.initiator-actor:visible').first();
       await expect(badge).toBeVisible();
       await badge.click();

@@ -51,6 +51,29 @@ export async function getWebviewContent(): Promise<{ title: string; content: str
   return invoke<{ title: string; content: string }>('webview_get_content');
 }
 
+/**
+ * Show a native macOS notification banner via the app's own
+ * `show_native_notification` command (lib.rs). We do NOT use
+ * tauri-plugin-notification: its desktop show() is fire-and-forget and never
+ * reports a click, so we drive `mac-notification-sys` in Rust and capture the
+ * tap there. `deepLink` is the SW-message shape (`notification_id` /
+ * `thread_id` / `event_id` / `tap`); on tap the command emits
+ * `native-notification-tapped` with it, which the page routes through the same
+ * dispatchDeepLink the web-push tap uses. Only call when isTauri() is true.
+ */
+export async function showNativeNotification(opts: {
+  title: string;
+  body: string;
+  deepLink: Record<string, unknown>;
+}): Promise<void> {
+  // `link` (single word) matches the Rust command param name verbatim.
+  await invoke('show_native_notification', {
+    title: opts.title,
+    body: opts.body,
+    link: opts.deepLink,
+  });
+}
+
 /** Listen for a Tauri event. Returns an unlisten function. Only call when isTauri() is true. */
 export function listen<T>(event: string, handler: (e: { payload: T }) => void): Promise<() => void> {
   const internals = window.__TAURI_INTERNALS__!;

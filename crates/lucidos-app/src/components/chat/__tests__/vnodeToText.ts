@@ -3,8 +3,8 @@ import type { ComponentChildren, VNode } from 'preact';
 /** Flatten a preact vnode tree to a tag-tagged string for structural
  *  assertions — no DOM, no preact-render-to-string. `class` and `disabled`
  *  are surfaced because the card tests assert on them. Function components
- *  are invoked with their props so nested helpers like ModeBadge /
- *  OptionContent render into the flat string. */
+ *  are invoked with their props so nested helpers like OptionContent /
+ *  OptionIndicator render into the flat string. */
 export function vnodeToText(node: ComponentChildren): string {
   if (node === null || node === undefined || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);

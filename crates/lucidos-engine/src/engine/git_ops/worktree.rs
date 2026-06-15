@@ -125,7 +125,6 @@ pub(crate) async fn resolve_main_worktree(path: &Path) -> PathBuf {
     }
 }
 
-
 /// Generate the app coding-agent thread branch name:
 /// `claude-code/app/<app_id>/<ts>-<uuid>`. Embeds the app id in the path so a
 /// `git branch -a` on the workspace git is greppable by app.
@@ -175,7 +174,15 @@ pub(crate) async fn create_sparse_app_worktree(
     let base = default_local_branch(workspace_root).await;
     let add = worktree_add_pruning_stale(
         workspace_root,
-        &["worktree", "add", "--no-checkout", wt_str, "-b", branch_name, &base],
+        &[
+            "worktree",
+            "add",
+            "--no-checkout",
+            wt_str,
+            "-b",
+            branch_name,
+            &base,
+        ],
     )
     .await?;
     if !add.status.success() {
@@ -304,7 +311,9 @@ async fn link_git_crypt_dir(wt_path: &Path) -> Result<(), String> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut lines = stdout.lines();
-    let git_dir = lines.next().ok_or("rev-parse: missing --absolute-git-dir")?;
+    let git_dir = lines
+        .next()
+        .ok_or("rev-parse: missing --absolute-git-dir")?;
     let common_raw = lines.next().ok_or("rev-parse: missing --git-common-dir")?;
 
     let git_dir = PathBuf::from(git_dir.trim());
@@ -347,7 +356,6 @@ async fn link_git_crypt_dir(wt_path: &Path) -> Result<(), String> {
     }
 }
 
-
 /// Get the current branch of a worktree (before it is removed).
 /// Returns `None` if detached HEAD or on error.
 pub(crate) async fn worktree_current_branch(worktree_path: &Path) -> Option<String> {
@@ -363,7 +371,6 @@ pub(crate) async fn worktree_current_branch(worktree_path: &Path) -> Option<Stri
         _ => None,
     }
 }
-
 
 /// Append each path to the git exclude file that `wt_path` actually reads,
 /// idempotently. Existing entries (custom or previously-added paths) are
@@ -423,8 +430,7 @@ pub(crate) async fn add_paths_to_worktree_exclude(wt_path: &Path, paths: &[&str]
     let existing = tokio::fs::read_to_string(&exclude_file)
         .await
         .unwrap_or_default();
-    let already: std::collections::HashSet<&str> =
-        existing.lines().map(|l| l.trim()).collect();
+    let already: std::collections::HashSet<&str> = existing.lines().map(|l| l.trim()).collect();
 
     let to_add: Vec<&str> = paths
         .iter()
@@ -452,18 +458,10 @@ pub(crate) async fn add_paths_to_worktree_exclude(wt_path: &Path, paths: &[&str]
     {
         Ok(mut f) => {
             if let Err(e) = f.write_all(payload.as_bytes()).await {
-                log!(
-                    "[Git] Failed to write {}: {}",
-                    exclude_file.display(),
-                    e
-                );
+                log!("[Git] Failed to write {}: {}", exclude_file.display(), e);
             }
         }
-        Err(e) => log!(
-            "[Git] Failed to open {}: {}",
-            exclude_file.display(),
-            e
-        ),
+        Err(e) => log!("[Git] Failed to open {}: {}", exclude_file.display(), e),
     }
 }
 
@@ -534,5 +532,100 @@ pub(crate) async fn hide_phantom_tracked_skill(cwd: &Path, rel_path: &str) {
             String::from_utf8_lossy(&o.stderr).trim()
         ),
         Err(e) => log!("[Git] {}", e),
+    }
+}
+
+/// Best-effort cleanup after a failed coding-agent spawn (`spawn_or_resume`
+/// errored after the worktree context was resolved). Deletes ONLY what the
+/// failed attempt itself created:
+///
+/// - the worktree, when `worktree_created` — a pre-existing worktree
+///   (resume, recovery, conflict mode) holds the thread's work and the next
+///   spawn attempt reuses it;
+/// - the branch, when `branch_created` AND the worktree slot is actually
+///   gone — a branch checked out in a surviving worktree can't be deleted
+///   by git anyway, and deleting it would strip the stranded-worktree
+///   sweeper's recovery anchor.
+///
+/// Every failure is logged. (The old inline shape — two unconditional
+/// `let _ =` git calls — force-removed resumed worktrees and force-deleted
+/// branches holding committed work, without a trace.)
+pub(crate) async fn cleanup_failed_spawn(
+    repo_root: &Path,
+    worktree_path: Option<&Path>,
+    branch_name: &str,
+    worktree_created: bool,
+    branch_created: bool,
+) {
+    // "No worktree in play" counts as gone — the branch (if ours) is free.
+    let mut worktree_gone = true;
+    if let Some(wt) = worktree_path {
+        if !worktree_created {
+            // Don't return early: fall through to the branch arm so a caller
+            // passing (worktree_created=false, branch_created=true) doesn't
+            // silently leak its created branch contractually. With the
+            // worktree kept, `worktree_gone=false` suppresses the delete in
+            // that combination anyway (the branch is checked out there).
+            log!(
+                "[ClaudeCode] Spawn failed — keeping pre-existing worktree {} (and branch {}) for resume",
+                wt.display(),
+                branch_name
+            );
+            worktree_gone = false;
+        } else {
+            match git_cmd(
+                &["worktree", "remove", "--force", &wt.to_string_lossy()],
+                repo_root,
+            )
+            .await
+            {
+                Ok(o) if o.status.success() => {
+                    log!(
+                        "[ClaudeCode] Removed worktree {} created by the failed spawn",
+                        wt.display()
+                    );
+                }
+                Ok(o) => {
+                    log!(
+                        "[ClaudeCode] Failed to remove worktree {} after failed spawn: {} — \
+                         keeping branch {}; the worktree cleanup worker will retry",
+                        wt.display(),
+                        String::from_utf8_lossy(&o.stderr).trim(),
+                        branch_name
+                    );
+                    worktree_gone = false;
+                }
+                Err(e) => {
+                    log!(
+                        "[ClaudeCode] git worktree remove errored for {} after failed spawn: {} — \
+                         keeping branch {}; the worktree cleanup worker will retry",
+                        wt.display(),
+                        e,
+                        branch_name
+                    );
+                    worktree_gone = false;
+                }
+            }
+        }
+    }
+    if branch_created && worktree_gone {
+        match git_cmd(&["branch", "-D", branch_name], repo_root).await {
+            Ok(o) if o.status.success() => {
+                log!(
+                    "[ClaudeCode] Deleted branch {} created by the failed spawn",
+                    branch_name
+                );
+            }
+            Ok(o) => log!(
+                "[ClaudeCode] Failed to delete branch {} after failed spawn: {}",
+                branch_name,
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => log!(
+                "[ClaudeCode] git branch -D errored for {} after failed spawn: {}",
+                branch_name,
+                e
+            ),
+        }
     }
 }

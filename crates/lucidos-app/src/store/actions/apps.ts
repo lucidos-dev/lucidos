@@ -27,7 +27,21 @@ import { pushNavState } from './navigation';
 import { isElementVisible } from '../../components/chat/scrollState';
 import { errorDetail } from '../../utils/errorDetail';
 
-export async function loadApps(): Promise<void> {
+// Shared in-flight load so concurrent callers await the SAME fetch instead of
+// racing duplicate GETs: the compose destination picker's render-path kick-off
+// and useStartup's eager load both fire on a cold start. An early `return`
+// would resolve immediately while the real fetch is still in flight, so an
+// `await loadApps()` caller (openAppById) would then read a still-'loading'
+// Loadable and falsely report failure — hence sharing the promise, not skipping.
+let appsLoadInFlight: Promise<void> | null = null;
+
+export function loadApps(): Promise<void> {
+  if (appsLoadInFlight) return appsLoadInFlight;
+  appsLoadInFlight = loadAppsInner().finally(() => { appsLoadInFlight = null; });
+  return appsLoadInFlight;
+}
+
+async function loadAppsInner(): Promise<void> {
   setLoadingIfFresh(appsList);
   try {
     const apps = await listAppsApi();

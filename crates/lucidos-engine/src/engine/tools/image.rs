@@ -12,9 +12,9 @@ use std::path::Path;
 /// ASCII-case-insensitive; only inspects the first ~32 bytes so ~4 KB
 /// generation prompts don't pay for a full lowercase allocation.
 fn looks_like_description_prompt(prompt: &str) -> bool {
-    /// Prefixes that signal a vision / analysis intent. Ordered with the
-    /// most-specific multi-word forms first so a longer match wins before
-    /// the bare word forms (`tell me about this image` vs `tell me what`).
+    /// Prefixes that signal a vision / analysis intent. Membership is a
+    /// boolean OR over the whole set (`.any()` below), so order has no effect
+    /// on the result — a prompt is blocked if it starts with ANY of these.
     const PREFIXES: &[&[u8]] = &[
         b"describe ",
         b"analyse ",

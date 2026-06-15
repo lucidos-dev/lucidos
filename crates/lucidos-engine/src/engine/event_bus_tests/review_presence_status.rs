@@ -348,6 +348,7 @@ async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sess-1".into(),
             branch: "claude-code/branch".into(),
             repo_id: None,
@@ -566,6 +567,97 @@ async fn emit_with_existing_event_id_fails_with_pkey_violation() {
         msg.contains("duplicate key") || msg.contains("events_pkey"),
         "error must mention the pkey violation: {}",
         msg
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression: a failed CC turn emits `ResponseFailed` (status='failed') then
+/// `CodingAgentIdled` in the same turn. The idle is CC-lifecycle bookkeeping and
+/// must NOT downgrade 'failed' → 'idle' — otherwise the red error dot in the
+/// thread list disappears (the originally-reported "this should have gotten an
+/// error dot" bug, e.g. CC `Not logged in · Please run /login`).
+#[tokio::test]
+async fn cc_idle_after_failed_turn_preserves_failed_status() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    start_cc_session(&bus, thread_id, "claude-code/login-error", None).await;
+
+    // CC turn ends in failure — terminal event sets status='failed'.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseFailed {
+            error: "Unknown error".into(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let after_fail: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(after_fail, "failed", "ResponseFailed must set status='failed'");
+
+    // The same turn's bookkeeping idle (no changes) follows.
+    emit_cc_idle(&bus, thread_id, false, Some("sid-fail")).await;
+
+    let after_idle: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        after_idle, "failed",
+        "CodingAgentIdled after a failed turn must preserve 'failed' (red error dot), \
+         not downgrade to 'idle'"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Complement: a *successful* CC turn (ResponseGenerated → CodingAgentIdled) must
+/// still settle to 'idle'. The failed-preservation CASE only fires on 'failed',
+/// so a normal turn is unaffected.
+#[tokio::test]
+async fn cc_idle_after_successful_turn_settles_idle() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    start_cc_session(&bus, thread_id, "claude-code/ok", None).await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    emit_cc_idle(&bus, thread_id, false, Some("sid-ok")).await;
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "idle",
+        "a successful CC turn's idle must settle to 'idle' (failed-preservation must not over-fire)"
     );
 
     pool.close().await;

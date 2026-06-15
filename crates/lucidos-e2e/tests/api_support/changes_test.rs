@@ -477,3 +477,29 @@ async fn archive_with_pending_change_is_rejected_409() {
 
     pool.close().await;
 }
+
+/// Canceling Apply All with no batch running is a clean 400 (nothing to cancel),
+/// not a 500 or a silent success — the endpoint reports there's nothing running.
+#[tokio::test]
+async fn cancel_apply_all_with_no_batch_returns_bad_request() {
+    let client = http_client();
+    let url = format!("{}/api/v1/changes/apply-all/cancel", base_url());
+    let resp = client
+        .post(&url)
+        .send()
+        .await
+        .expect("cancel apply-all request failed");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "cancel with no running batch must be 400"
+    );
+    let body: serde_json::Value = resp.json().await.expect("response body");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("No Apply All batch"),
+        "error must explain nothing is running: {body:?}"
+    );
+}

@@ -21,7 +21,7 @@ export type AppFilterOption = {
   lastActivity?: string;
 };
 
-/** Lists every app that has a Claude Code thread (session). Completeness comes
+/** Lists every app that has a coding-agent thread. Completeness comes
  *  from the backend `filterFacets` (all session-having apps, even those whose
  *  threads aren't in the loaded window); the loaded `threadMap` adds
  *  just-created threads immediately; `selectedAppIds` is always included so a

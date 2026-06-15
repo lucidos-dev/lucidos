@@ -5,9 +5,11 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, appsList, triggers, credentials, oauthAccounts, repositories, artifacts } from '../store';
+import { panelOverlay, appsList, triggers, credentials, chatModels, oauthAccounts, repositories, artifacts } from '../store';
 import { loadApps } from './apps';
+import { loadChatModels } from './models';
 import { loadTriggers } from './triggers';
+import { loadThreadQueue } from './threadQueue';
 import { loadTriggerGroups } from './triggerGroups';
 import { loadArtifacts } from './artifacts';
 import { removePinnedAppLocal, loadPinnedApps } from './pinnedApps';
@@ -41,6 +43,19 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'TriggerDisabled':
     case 'TriggerExecuted':
       void loadTriggers();
+      break;
+    // Thread Queue events — every transition (enqueue, admit, drop, complete)
+    // and policy change re-fetches the panel state. The list is small (live
+    // queue + active set only) so a full refetch per event stays cheap.
+    // ThreadQueueChanged is the transient signal for in-memory-only
+    // user-initiated slot moves (which carry no persisted ThreadQueue* event).
+    case 'ThreadQueued':
+    case 'ThreadQueueAdmitted':
+    case 'ThreadQueueDropped':
+    case 'ThreadQueueCompleted':
+    case 'ThreadQueueChanged':
+    case 'CapacityPolicyChanged':
+      void loadThreadQueue();
       break;
     case 'TriggerDeleted': {
       const triggerId = data.trigger_id as string;
@@ -141,6 +156,11 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'CredentialUpdated':
     case 'CredentialDeleted':
       if (credentials.value.status === 'loaded') void loadCredentials();
+      break;
+    case 'ModelCreated':
+    case 'ModelUpdated':
+    case 'ModelDeleted':
+      if (chatModels.value.status === 'loaded') void loadChatModels();
       break;
     case 'OAuthAccountDeleted':
       if (oauthAccounts.value.status === 'loaded') void loadOAuthAccounts();

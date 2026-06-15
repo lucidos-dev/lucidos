@@ -30,6 +30,7 @@ pub(crate) fn make_session(process_exited: bool) -> AgentSession {
         has_changes: false,
         requires_restart: false,
         pending_stop: None,
+        cancel_actor: None,
         stop: Arc::new(tokio::sync::Notify::new()),
         interrupt: Arc::new(tokio::sync::Notify::new()),
         idle_notify: Arc::new(tokio::sync::Notify::new()),
@@ -70,6 +71,7 @@ pub(crate) async fn seed_cc_thread(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-test".into(),
             branch: "claude-code/test".into(),
             repo_id: None,

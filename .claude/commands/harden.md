@@ -29,9 +29,12 @@ Do NOT extend this fast path to "string-only" or "comment-only" `.rs` edits. Str
 
 **Docs-only fast path:** if Phase 0.5 flagged this diff as docs-only, skip this phase entirely and proceed to Phase 2.
 
-Invoke the `code-review` skill at **medium** effort using the Skill tool (`Skill skill: "code-review" args: "medium"`). It reviews the branch diff for correctness bugs at the high-confidence end of the precision/recall slider — fewer findings, very low false-positive rate, complementary to Phase 2's broader bug-detection agent.
+Run the **repo-owned** `code-review` skill (`.claude/skills/code-review/SKILL.md`) at **medium** effort. It reviews the branch diff for correctness bugs at the high-confidence end of the precision/recall slider — fewer findings, very low false-positive rate, complementary to Phase 2's broader bug-detection agent.
 
-(Background: this phase used to invoke a built-in `/simplify` skill that also auto-fixed. Claude Code 2.1.147 renamed `/simplify` to `/code-review` and dropped auto-apply, so the apply step now lives here in the harden orchestrator instead of in the skill.)
+- **Claude Code:** invoke via the Skill tool — `Skill skill: "code-review" args: "medium"`. The project skill overrides Claude Code's built-in of the same name, so this resolves to the repo copy.
+- **Codex / any agent without a Skill tool:** the skill is NOT in your available-skills list (it lives only on disk). **Read `.claude/skills/code-review/SKILL.md` and follow its phases directly** against the branch diff at medium effort. Do not skip Phase 1 just because the Skill tool can't find it.
+
+(Background: this phase used to invoke Claude Code's built-in `code-review` skill — the renamed `/simplify`. Built-in and plugin skills are invisible to Codex, which only sees skills on disk under `.claude/skills/`, so a Codex `/harden` run couldn't find it. The procedure is now vendored into `.claude/skills/code-review/` so both backends run the same phases; the apply step lives here in the harden orchestrator, not in the skill.)
 
 When `code-review` returns its findings:
 
@@ -41,9 +44,25 @@ When `code-review` returns its findings:
 
 Do NOT pass `--comment` (that mode posts to GitHub PRs, which Lucidos does not use).
 
-## Phase 2: Launch Three Hardening Agents in Parallel
+**Report Phase 1 in prose — never reproduce the raw findings JSON.** The
+`code-review` skill's Output section tells you to emit its findings as a JSON
+array, and to `return []` when nothing survives. That array is the skill's
+*internal* contract for handing results back to this orchestrator — it is NOT
+for the reader. Translate it into one sentence of prose ("Phase 1: no findings"
+or "Phase 1 flagged N issues: …") and **do not paste the array — empty `[]`,
+`{}`, or populated — into your reply, fenced or inline.** A bare `[]` in the
+chat is meaningless noise to the user. (This is the source we own: the `[]` you
+see rendered in old threads is this array leaking through; suppressing it here
+is why the frontend no longer carries a strip-the-empty-array workaround.)
 
-Run `git diff main...HEAD` to get the current diff (including any Phase 1 fixes). Also run `git diff main...HEAD --name-only` to get the list of changed files. Launch three agents in parallel:
+## Phase 2: Run Three Hardening Agents
+
+Run `git diff main...HEAD` to get the current diff (including any Phase 1 fixes). Also run `git diff main...HEAD --name-only` to get the list of changed files. Run the three angles below:
+
+**Subagents are optional — the angles are not.** Mirrors the `code-review` skill's contract:
+
+- **Claude Code:** launch the three agents as parallel subagents via the Task tool (faster, independent perspectives).
+- **Codex / any agent without a Task tool:** you have NO subagent capability — do NOT try to spawn agents, and do NOT improvise a "simulated parallel" pass (that interleaves output and stalls the turn, which is exactly how a Codex `/harden` run dies right after Phase 1). Run all three angles **yourself, inline and sequentially** — Agent 1, then Agent 2, then Agent 3 — in this same session, collecting findings as you go. The analysis and output are identical; only the execution is serial. Then continue to Phase 3 in the same turn — do not stop or idle until Phase 5 has written the marker.
 
 ### Agent 1: Bug Detection
 
@@ -65,6 +84,12 @@ Focus on:
 - Code style or quality concerns (already covered by Phase 1 `code-review`)
 - Potential issues that depend on specific inputs or state
 - Subjective suggestions or improvements
+- Anything listed in `docs/code-review-priors.md` — the ledger of patterns
+  already flagged by past reviews and dismissed with evidence (guarded byte
+  slices, documented catch-silencers, deliberate `[]`-until-loaded filters,
+  …). Include the file in the agent's prompt. Re-flagging a prior requires
+  NEW evidence that the guard/contract changed, not re-derivation of the
+  original suspicion.
 
 ### Agent 2: CLAUDE.md Compliance
 
@@ -81,12 +106,19 @@ For each modified file, run `git log --oneline -10 <file>` to see recent history
 
 ## Phase 3: Validate Findings
 
-Wait for all three agents to complete. For each issue found, launch a parallel validation subagent that reads the actual code and verifies the issue is real. The validator should:
+Once all three angles are done (parallel subagents joined, or — for Codex / any agent without subagents — your own three inline passes complete), validate each issue found. **Per the same subagents-are-optional rule:** Claude Code launches a parallel validation subagent per finding; Codex / any agent without a Task tool validates each finding **inline and sequentially** in this same session. Either way the validator must:
 - Read the relevant source files (not just the diff)
 - Confirm the issue actually exists in the code
 - Discard findings that are false positives or depend on assumptions about runtime state
 
 Only issues confirmed by validation proceed to the report.
+
+When validation dismisses a finding about a **pattern likely to be re-flagged
+by future reviews** (a guarded construct that looks unguarded, a documented
+deliberate behavior that looks like a bug), add a pattern-based entry to
+`docs/code-review-priors.md` in the same change — that ledger is what keeps
+the next review round from re-litigating it. One-off misreadings of the diff
+don't need an entry; recurring-shaped ones do.
 
 ## Phase 4: Report and Fix
 
@@ -106,7 +138,7 @@ Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-s
 - CSS-only / docs-only → skip
 - Mixed → run both **in parallel**
 
-When the diff is mixed, kick the Rust and TS suites off concurrently — they're independent toolchains (cargo vs npm) with no shared state, so running them serially wastes wall-clock. Use the Bash tool's `run_in_background: true` for each, then `TaskOutput` to join. Pattern:
+When the diff is mixed, kick the Rust and TS suites off concurrently — they're independent toolchains (cargo vs npm) with no shared state, so running them serially wastes wall-clock. Use the Bash tool's `run_in_background: true` for each, then `TaskOutput` to join. (Codex / any agent without a background-Bash + `TaskOutput` tool: run the two suites **sequentially** instead — `cargo …` then `npm …`. Parallelism is only a wall-clock optimization; sequential gives identical correctness.) Pattern:
 
 ```
 # Launch both in parallel

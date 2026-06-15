@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatChannel } from './formatChannel';
+import { formatChannel, formatThreadChannelLabel } from './formatChannel';
 
 describe('formatChannel', () => {
   it('formats known channels', () => {
@@ -14,5 +14,26 @@ describe('formatChannel', () => {
 
   it('returns raw value for unrecognized channels', () => {
     expect(formatChannel('something_else')).toBe('something_else');
+  });
+});
+
+describe('formatThreadChannelLabel', () => {
+  it('reads "Codex" for a Codex-backed coding-agent thread', () => {
+    expect(formatThreadChannelLabel('claude_code', 'codex')).toBe('Codex');
+  });
+
+  it('reads "Claude Code" for a Claude Code coding-agent thread', () => {
+    expect(formatThreadChannelLabel('claude_code', 'claude-code')).toBe('Claude Code');
+  });
+
+  it('defaults a coding-agent thread with no backend to Claude Code', () => {
+    expect(formatThreadChannelLabel('claude_code')).toBe('Claude Code');
+    expect(formatThreadChannelLabel('claude_code', null)).toBe('Claude Code');
+  });
+
+  it('ignores codingAgent for non-coding channels', () => {
+    // A stray backend on a non-CC channel must never relabel it.
+    expect(formatThreadChannelLabel('chat', 'codex')).toBe('Lucidos');
+    expect(formatThreadChannelLabel('trigger', 'codex')).toBe('Trigger');
   });
 });

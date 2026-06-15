@@ -150,7 +150,7 @@ test.describe('Resume after restart — boundary panels', () => {
       await navigateToApp(page);
 
       // The abort boundary opens its own exchange whose initiator label is
-      // the engine label (⚙ Lucidos Engine). The Continue button sits in the
+      // the engine label (⬡ Lucidos Engine). The Continue button sits in the
       // initiator footer.
       const exchanges = page.locator('.chat-exchange:visible');
       await expect(exchanges).toHaveCount(2, { timeout: 10_000 });
@@ -166,7 +166,7 @@ test.describe('Resume after restart — boundary panels', () => {
     }
   });
 
-  test('chat thread aborted by /api/v1/restart: You chip + Continue button', async ({ page }) => {
+  test('chat thread aborted by /api/v1/restart: iconless action label + Continue button', async ({ page }) => {
     const threadId = randomUUID();
     const userMsgId = randomUUID();
     const abortedId = randomUUID();
@@ -196,7 +196,11 @@ test.describe('Resume after restart — boundary panels', () => {
       const exchanges = page.locator('.chat-exchange:visible');
       await expect(exchanges).toHaveCount(2, { timeout: 10_000 });
       const abortExchange = exchanges.nth(1);
-      await expect(abortExchange.locator('.initiator-label')).toContainText('You');
+      // Device-driven abort (you hit Restart) renders like the ResponseCanceled
+      // boundary: iconless, the action AS the label ("Restarted"), no "You" chip
+      // — who/what is in the timestamp popover.
+      await expect(abortExchange.locator('.initiator-icon')).toHaveCount(0);
+      await expect(abortExchange.locator('.initiator-label')).toContainText('Restarted');
       await expect(abortExchange.getByRole('button', { name: 'Continue' })).toBeVisible();
     } finally {
       psql([
@@ -252,8 +256,11 @@ test.describe('Resume after restart — boundary panels', () => {
       // The summary text must NOT say "engine restart" — this is a
       // user-clicked Continue, the engine was never restarted.
       const resumeExchange = exchanges.nth(2);
-      await expect(resumeExchange.locator('.initiator-label')).toContainText('You');
-      await expect(resumeExchange.getByText('Continued the response')).toBeVisible();
+      // The resume turn (you clicked Continue) renders like the cancel boundary:
+      // iconless, the action AS the label. It must read "Continued the response",
+      // NOT "...engine restart", and carry no "You" chip.
+      await expect(resumeExchange.locator('.initiator-icon')).toHaveCount(0);
+      await expect(resumeExchange.locator('.initiator-label')).toContainText('Continued the response');
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,

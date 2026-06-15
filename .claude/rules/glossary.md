@@ -20,8 +20,8 @@ Lucidos has two glossaries. Use the canonical term from them — never a synonym
   - *task* → **intent** (when the user means a goal) or **scheduled task** (when it's a cron job).
   - *recipe* → **knowhow**.
   - *attachment* → **artifact**.
-  - *cmd thread / CC subprocess / Claude session* → **coding-agent thread** (or **agent session** for the subprocess + worktree pairing generically; **Claude Code session** when CC specifically).
-  - *AgentKind* → **CodingAgent** (the enum was renamed; `CodingAgent::ClaudeCode` is the today-only variant).
+  - *cmd thread / CC subprocess / Claude session* → **coding-agent thread** (or **agent session** for the subprocess + worktree pairing generically; **Claude Code session** / **Codex session** when backend-specific).
+  - *AgentKind* → **CodingAgent** (the enum was renamed; variants: `ClaudeCode`, `Codex`).
   - *manifest* used unqualified → pick one: **app manifest** (`manifest.json`), **plugin manifest** (`manifest.toml`), or **signer manifest** (`<name>.manifest.json` sidecar).
   - *command* (for SSE-only events the engine broadcasts) → **transient event** (we use the events-only model; imperative-looking concepts are reframed as past-tense request events like `AppUiRefreshRequested`, never `RefreshAppUI`).
   - *event store* as a banned word → **kept**; the term is valid for the concept (events table + append semantics). What was deleted were the `EventStore` struct's `append` / `append_thread_event` **write** methods — that responsibility now lives inlined inside *EventBus*; the `EventStore` struct itself remains as a read-only query facade.

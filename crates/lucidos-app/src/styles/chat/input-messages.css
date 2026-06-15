@@ -13,14 +13,14 @@
     display: contents;
 }
 
-/* Wrapper for repo selector + input mode toggle */
+/* Wrapper for the compose destination picker (picker row + caption + hint) */
 .input-toggles-wrapper {
     display: flex;
-    flex-direction: row;
-    align-items: center;
-    gap: 0.125rem;
-    width: fit-content;
-    padding: 0.375rem 0 0.375rem 0.375rem;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.25rem;
+    width: 100%;
+    padding: 0.375rem 0 0.375rem 0.125rem;
     transition: opacity var(--duration-slow) ease;
 }
 
@@ -32,34 +32,55 @@
     pointer-events: none;
 }
 
-
-.cc-repo-submenu {
+.compose-destination-row {
     display: flex;
     align-items: center;
-    gap: 0.125rem;
-    color: var(--text-muted);
-    font-size: 0.75rem;
+    gap: 0.375rem;
+    max-width: 100%;
 }
 
-.cc-repo-submenu .cc-repo-selector {
+.compose-destination-row .compose-destination-picker {
     margin-bottom: 0;
     flex-shrink: 1;
     min-width: 0;
 }
 
-.cc-repo-submenu .cc-repo-selector .dropdown-trigger {
+.compose-destination-row .compose-destination-picker .dropdown-trigger {
     min-width: 0;
 }
 
-.cc-repo-submenu .cc-repo-selector .dropdown-sizer > *,
-.cc-repo-submenu .cc-repo-selector .dropdown-option {
+.compose-destination-row .compose-destination-picker .dropdown-sizer > * {
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-/* Input target tab toggle — uses .segmented-control / .segmented-btn */
-.input-target-tabs {
-    position: relative;
+/* Cap the menu so a long app/repo name clips (via the global
+ * .dropdown-option-label ellipsis) instead of growing the fixed-position
+ * menu past a mobile viewport. */
+.compose-destination-row .compose-destination-picker .dropdown-menu {
+    max-width: min(24rem, calc(100vw - 1rem));
+}
+
+.compose-coding-agent-chip {
+    flex-shrink: 0;
+}
+
+.compose-destination-caption {
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+}
+
+.compose-handoff-hint {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+    font-style: italic;
+}
+
+.compose-handoff-hint-dismiss {
+    flex-shrink: 0;
 }
 
 .prompt-input-container {
@@ -240,8 +261,8 @@
 }
 
 /* Stacked variant — useFitsInOneRow detected overflow, so the secondary
- * button (Diff for the banner, Discard draft for compose) lifts onto a
- * sub-row directly above the primary buttons. Stays inside this column so
+ * button (the Diff button, in the banner or standalone while composing) lifts
+ * onto a sub-row directly above the primary buttons. Stays inside this column so
  * the icons (siblings on the left of .prompt-actions-row) don't introduce a
  * tall flex-end gap above the primary sub-row. */
 .prompt-actions-right.is-stacked {
@@ -264,7 +285,6 @@
     display: flex;
     gap: 0.5rem;
     padding: 0.625rem 0.75rem;
-    border-bottom: 1px solid var(--border-color);
 }
 
 .change-description {
@@ -273,40 +293,40 @@
     font-weight: 400;
 }
 
-.cc-control-menu {
+.control-menu {
     position: relative;
     display: flex;
     align-items: center;
 }
 
-.cc-commands-btn {
+.commands-btn {
     flex-shrink: 0;
     transition: color 0.3s ease;
 }
 
-.cc-commands-btn svg {
+.commands-btn svg {
     width: var(--icon-size-md);
     height: var(--icon-size-md);
 }
 
-.cc-commands-btn-active {
-    color: var(--initiator-cc);
-    animation: cc-connect-pulse 0.6s ease-out;
+.commands-btn-active {
+    color: var(--initiator-coding-agent);
+    animation: control-connect-pulse 0.6s ease-out;
 }
 
-@keyframes cc-connect-pulse {
+@keyframes control-connect-pulse {
     0% { transform: scale(1); }
     40% { transform: scale(1.3); }
     100% { transform: scale(1); }
 }
 
 @media (hover: hover) {
-    .cc-commands-btn:hover:not(:disabled) {
+    .commands-btn:hover:not(:disabled) {
         color: var(--accent);
     }
 }
 
-.cc-control-dropdown {
+.control-dropdown {
     position: absolute;
     bottom: calc(100% + 0.375rem);
     left: 0;
@@ -320,23 +340,43 @@
     z-index: 100;
 }
 
-.cc-control-list {
+/* The Lucidos Agent picker (LucidosControlMenu) reuses the coding-agent
+   control-menu styles, but its root view holds only two rows — a fixed 20rem
+   height would leave a large empty panel. Size to content, capped so a long
+   model list still scrolls. */
+.control-dropdown-auto {
+    height: auto;
+    max-height: 20rem;
+}
+
+/* The Lucidos Agent control button renders the agent glyph (an emoji) rather
+   than an SVG, tinted to the agent's identity color like the CC button is. */
+.lucidos-commands-btn {
+    color: var(--initiator-agent);
+}
+
+.lucidos-agent-glyph {
+    font-size: var(--icon-size-md);
+    line-height: 1;
+}
+
+.control-list {
     display: flex;
     flex-direction: column;
     padding: 0.25rem;
 }
 
-.cc-control-filter {
+.control-filter {
     margin: 0.25rem;
 }
 
-.cc-control-empty {
+.control-empty {
     padding: 0.5rem 0.625rem;
     font-size: 0.8125rem;
     color: var(--text-secondary);
 }
 
-.cc-control-section-label {
+.control-section-label {
     padding: 0.25rem 0.625rem;
     font-size: 0.6875rem;
     font-weight: 600;
@@ -345,7 +385,7 @@
     letter-spacing: 0.03em;
 }
 
-.cc-control-item {
+.control-item {
     display: block;
     width: 100%;
     padding: 0.375rem 0.625rem;
@@ -358,52 +398,52 @@
     cursor: pointer;
 }
 
-.cc-control-item:hover,
-.cc-control-item-active {
+.control-item:hover,
+.control-item-active {
     background: var(--bg-hover);
 }
 
-.cc-control-option {
+.control-option {
     display: flex;
     flex-direction: column;
     gap: 0.125rem;
 }
 
-.cc-control-option-label {
+.control-option-label {
     font-weight: 500;
     display: flex;
     align-items: center;
     gap: 0.25rem;
 }
 
-.cc-control-checkmark {
+.control-checkmark {
     color: var(--accent);
     font-size: 0.75rem;
     font-weight: 700;
 }
 
-.cc-control-current-value {
+.control-current-value {
     color: var(--text-muted);
     font-weight: 400;
 }
 
-.cc-control-option-current {
+.control-option-current {
     background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
-.cc-control-option-desc {
+.control-option-desc {
     font-size: 0.6875rem;
     color: var(--text-secondary);
 }
 
-.cc-control-form {
+.control-form {
     display: flex;
     flex-direction: column;
     gap: 0.375rem;
     padding: 0.5rem;
 }
 
-.cc-control-form-title {
+.control-form-title {
     font-size: 0.75rem;
     font-weight: 600;
     color: var(--text-secondary);
@@ -411,7 +451,7 @@
     letter-spacing: 0.03em;
 }
 
-.cc-control-input {
+.control-input {
     padding: 0.375rem 0.5rem;
     border: 1px solid var(--border-color);
     border-radius: 0.25rem;
@@ -420,12 +460,12 @@
     font-size: 0.8125rem;
 }
 
-.cc-control-input:focus {
+.control-input:focus {
     outline: none;
     border-color: var(--accent);
 }
 
-.cc-control-form-actions {
+.control-form-actions {
     display: flex;
     gap: 0.375rem;
     justify-content: flex-end;
@@ -631,6 +671,15 @@
     .scroll-to-bottom {
         right: 1.8125rem;
     }
+
+    /* Fade the top of the transcript so messages dissolve as they scroll up
+     * under the transparent thread title header, instead of cutting off at a
+     * hard edge. Desktop only — on mobile this scroll container holds its own
+     * sticky title bar (.mobile-thread-title-row), which must not be masked. */
+    .thread-content {
+        -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 2.5rem);
+        mask-image: linear-gradient(to bottom, transparent 0, #000 2.5rem);
+    }
 }
 
 @media (hover: hover) {
@@ -752,7 +801,7 @@
 
 .progress-dot-waiting {
     background: var(--text-secondary);
-    animation: cc-pulse 2s ease-in-out infinite;
+    animation: progress-pulse 2s ease-in-out infinite;
 }
 
 .progress-dot-changes {
@@ -787,7 +836,7 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 
 .progress-dot-loading {
     background: var(--border-color);
-    animation: cc-pulse 2s ease-in-out infinite;
+    animation: progress-pulse 2s ease-in-out infinite;
     opacity: 0.5;
 }
 
@@ -797,111 +846,135 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 
 .progress-dot-red {
     background: var(--accent-red);
-    animation: cc-blink-red 0.6s ease-in-out infinite;
+    animation: progress-blink-red 0.6s ease-in-out infinite;
 }
 
-@keyframes cc-pulse {
+@keyframes progress-pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.3; }
 }
 
-@keyframes cc-blink-red {
+@keyframes progress-blink-red {
     0%, 100% { background: var(--accent-red); }
     50% { background: transparent; }
 }
 
-/* --- Initiator panel — bordered card describing who/what started an exchange.
-   Variants: user (accent left border), system (engine/auto-hardening/auto-merge),
-   trigger (scheduled/event-driven). Two-tone header/body matches response panel:
-   header sits on bg-secondary (with optional variant tint), body sits on bg-primary.
-   Header is clickable to collapse the body when there is content to hide. */
+/* --- Initiator turn — flat, card-less (Twitter-style feed). A human message
+   renders as a right-aligned gray bubble; every other initiator (agent/engine/
+   trigger/change/child/question/permission) is a flat transcript turn: icon +
+   plain (uncolored) name over a flush body. Turns are separated by a full-width
+   hairline. Attribution lives in the route popover, opened from the actor chip,
+   the timestamp, or (for change turns) the summary line. */
 .initiator-panel {
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    margin: 0.5rem 0;
-    background: var(--bg-primary);
-    overflow: hidden;
     font-size: 0.8125rem;
     line-height: 1.5;
 }
 
-.initiator-panel-user {
-    border-left: 0.1875rem solid var(--initiator-you);
-}
-
-.initiator-panel-lucidos {
-    border-left: 0.1875rem solid var(--initiator-agent);
-}
-
-/* Engine — shared accent for system + trigger + every change-lifecycle variant
-   (ChangeApplied/Failed/Discarded/Reverted always render with variant: 'system',
-   so .initiator-panel-system already covers them; no per-change border needed). */
-.initiator-panel-system,
-.initiator-panel-trigger {
-    border-left: 0.1875rem solid var(--initiator-engine);
+/* Feed-style padding on every turn — adjacent turns separate by this vertical
+   rhythm alone; there is no divider line between turns (borderless feed). */
+.initiator-panel,
+.response-panel {
+    padding: 0.85rem 0;
 }
 
 .initiator-header {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    padding: 0.5rem 0.75rem;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border-color);
+    margin-bottom: 0.7rem;
+    min-height: 1.2rem;
     font-size: 0.75rem;
     color: var(--text-secondary);
     flex-wrap: wrap;
 }
 
-.initiator-panel-system .initiator-header,
-.initiator-panel-trigger .initiator-header {
-    background: color-mix(in srgb, var(--initiator-engine) 4%, var(--bg-secondary));
-}
-
-.initiator-panel-lucidos .initiator-header {
-    background: color-mix(in srgb, var(--initiator-agent) 4%, var(--bg-secondary));
-}
-
-/* Shared with .response-header-clickable below — both are panel headers that
-   collapse the panel when clicked. Hover-out is delayed so brief cursor exits
-   caused by the collapse-driven layout shift don't flash the base color back
-   in before the cursor re-enters. */
+/* Shared with .response-header-clickable below — both collapse the turn's body
+   when clicked. Hover-out is delayed so brief cursor exits from the collapse-
+   driven layout shift don't flash the base back in before the cursor re-enters. */
 .initiator-header-clickable,
 .response-header-clickable {
     cursor: pointer;
     user-select: none;
+    border-radius: 0.25rem;
     transition: background var(--duration-normal) ease 80ms;
 }
 
 @media (hover: hover) {
     .initiator-header-clickable:hover,
     .response-header-clickable:hover {
-        background: color-mix(in srgb, var(--bg-secondary) 85%, var(--accent));
+        background: var(--bg-hover);
         transition-delay: 0s;
     }
-}
-
-.initiator-panel-collapsed .initiator-header {
-    border-bottom: none;
 }
 
 .initiator-icon {
     flex-shrink: 0;
     font-size: 0.875rem;
     line-height: 1;
+    display: inline-flex;
+    align-items: center;
+}
+/* Component icons (e.g. the Claude logo on a coding-agent question/permission
+   divider) — size + tint to match the response executor's icon. Emoji string
+   icons are unaffected. */
+.initiator-icon svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    color: var(--initiator-coding-agent);
 }
 
 .initiator-label {
-    font-weight: 500;
+    font-weight: 600;
     color: var(--text-primary);
     overflow-wrap: anywhere;
     min-width: 0;
 }
 
-.initiator-timestamp {
+/* Right-aligned header cluster: optional status chip (question/permission
+   resolution) + the timestamp. */
+.initiator-meta {
     margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+}
+.initiator-timestamp {
     font-size: 0.6875rem;
     color: var(--text-muted);
+}
+
+/* Chromeless turns (user bubble, change events) carry no actor chip — the
+   timestamp, and for change turns the "Change applied" summary, are the
+   route-popover triggers. */
+.initiator-timestamp-button {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+    padding: 0;
+}
+.initiator-summary-link {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+    font-family: inherit;
+    font-size: inherit;
+}
+@media (hover: hover) {
+    /* Timestamp dims to secondary; the summary keeps its reason color (green/
+       red/muted) and only gains an underline. */
+    .initiator-timestamp-button:hover {
+        color: var(--text-secondary);
+    }
+    .initiator-timestamp-button:hover,
+    .initiator-summary-link:hover {
+        text-decoration: underline;
+        text-underline-offset: 0.15rem;
+    }
 }
 
 .initiator-actor,
@@ -928,20 +1001,62 @@ button.initiator-actor,
 @media (hover: hover) {
     button.initiator-actor:hover,
     .response-executor:hover {
-        background: color-mix(in srgb, var(--bg-secondary) 80%, var(--accent));
+        background: var(--bg-hover);
     }
 }
 
 .initiator-body {
-    padding: 0.625rem 0.875rem;
     color: var(--text-primary);
     word-wrap: break-word;
     overflow-wrap: break-word;
+    /* Match the LLM response body's left inset so change cards, questions, and
+       every other initiator turn line up with the response text above them. */
+    padding-left: var(--turn-body-inset);
+}
+
+/* User message → right-aligned bubble with the accent tint (the same surface as
+   a picked question answer), no border. */
+.initiator-panel-bubble .initiator-body {
+    display: flex;
+    justify-content: flex-end;
+}
+.user-bubble {
+    background: var(--picked-surface);
+    border-radius: 0.9rem;
+    padding: 0.55rem 0.85rem;
+    max-width: 85%;
+    line-height: 1.55;
+}
+.user-bubble .markdown-content p:last-child {
+    margin-bottom: 0;
+}
+
+/* Collapsed turn indicator — shown on ANY collapsed panel (initiator or
+   response) so a folded turn isn't an empty row: a muted "⋯", rendered as a
+   small accent-tinted stub bubble on the right for a user message. */
+.turn-collapsed {
+    cursor: pointer;
+}
+.turn-collapsed-bubble {
+    display: flex;
+    justify-content: flex-end;
+}
+.turn-collapsed-dots {
+    color: var(--text-muted);
+    font-size: 1rem;
+    line-height: 1;
+}
+.turn-collapsed-bubble .turn-collapsed-dots {
+    background: var(--picked-surface);
+    border-radius: 0.9rem;
+    padding: 0.1rem 0.7rem;
 }
 
 .initiator-summary {
     font-weight: 500;
     color: var(--text-primary);
+    text-align: left;
+    display: block;
 }
 
 .initiator-summary + .change-body,

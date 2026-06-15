@@ -1,12 +1,14 @@
-import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, getReviewThreads, revealOnFocus, resetCCPendingPreferences, setFocusedThread, focusedThreadId } from '../store';
+import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds } from '../store';
 import { navigateToPane } from './pane';
 import { isMobile } from '../../utils/viewport';
-import { byReviewOrder } from '../thread-events';
-import type { ThreadSection } from '../thread-events';
+import type { ThreadSection, ThreadState } from '../thread-events';
+import { threadPassesChannelFilter } from '../threadFilter';
+import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview } from '../../components/drawer/family-graph';
+import type { FamilyGraph } from '../../components/drawer/family-graph';
 import { saveThread, unsaveThread, archiveThread } from '../../api/threads';
 import { ApiError } from '../../api/client';
 import { loadThreadEvents, ensureThreadByIdInMap, sectionMutatedAt } from './thread-loading';
-import { scrollToBottom, scrollToEventAndPulse } from '../../components/chat/scrollState';
+import { scrollToBottom, scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll } from '../../components/chat/scrollState';
 import { pushThreadNavState } from './thread-navigation';
 import { hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
 import { errorDetail } from '../../utils/errorDetail';
@@ -16,29 +18,40 @@ import { errorDetail } from '../../utils/errorDetail';
 // ---------------------------------------------------------------------------
 
 export interface FocusThreadOptions {
-  /** Skip mobile pane navigation. Used by history chevrons in the threads
-   *  list header so the user can preview prior threads without leaving the
-   *  list view. */
-  skipPaneNav?: boolean;
   /** When set, after the thread loads, scroll the matching event card into
    *  view and briefly pulse it. Used by notification deep-links so a push
    *  for a `UserQuestionAsked` lands on that exact question, not the bottom
    *  of the thread or the user's last saved scroll. Overrides the default
    *  scroll-to-bottom / restore-saved-scroll behavior. */
   targetEventId?: string | null;
+  /** When set, after the thread loads, scroll to the turn that produced this
+   *  change (stamped with `data-change-id` by `ChatExchange`) and pulse it.
+   *  Used by the Changes panel so a row lands on its own diff event rather than
+   *  the bottom of the thread — the change isn't necessarily the last turn.
+   *  Same scroll/suppression contract as `targetEventId`; ignored when
+   *  `targetEventId` is also set. */
+  targetChangeId?: string | null;
 }
 
 export function focusThread(threadId: string, options?: FocusThreadOptions): void {
   setFocusedThread(threadId);
-  resetCCPendingPreferences();
+  resetCodingAgentPendingPreferences();
   // Scroll to bottom and suppress ResizeObserver so content rendering
   // doesn't set scrolledUp=true before useAutoScroll can scroll down.
   // Skip when the target has a saved scroll — the 500ms pinning loop
   // would override useScrollMemory's restore.
-  // Skip too when a target event id is provided — scrollToEventAndPulse
-  // owns the scroll target in that case (notification deep-link).
+  // Skip too when a deep-link target (event or change) is provided — the
+  // matching scrollTo*AndPulse owns the scroll target in that case.
   const targetEventId = options?.targetEventId ?? null;
-  if (!targetEventId && !hasSavedScroll(threadScrollKey(threadId))) scrollToBottom();
+  // targetEventId wins when both are set (notification deep-link is more
+  // specific than a Changes-row landing on the originating turn).
+  const targetChangeId = targetEventId ? null : (options?.targetChangeId ?? null);
+  const hasTarget = !!targetEventId || !!targetChangeId;
+  // A plain focus (no deep-link target) cancels any in-flight deep-link scroll
+  // claim from a prior focus, so its suppression can't leak onto this thread's
+  // load. A deep-link focus re-claims below via scrollTo*AndPulse.
+  if (!hasTarget) clearPendingEventScroll();
+  if (!hasTarget && !hasSavedScroll(threadScrollKey(threadId))) scrollToBottom();
   // notAtTop is NOT reset here — syncNotAtTop() in the scroll listener owns
   // it exclusively. Manual resets cause the chevron to vanish when no scroll
   // event fires (e.g. re-focusing the same thread where scrollTop is unchanged).
@@ -51,12 +64,14 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // On mobile, navigate to the thread pane so the focused thread is visible.
   // Without this, callers like toast onClick and search would set the focused
   // thread but leave the user on whichever pane they were on.
-  if (isMobile() && !options?.skipPaneNav) {
+  if (isMobile()) {
     navigateToPane('thread');
   }
 
   if (targetEventId) {
     scrollToEventAndPulse(targetEventId);
+  } else if (targetChangeId) {
+    scrollToChangeAndPulse(targetChangeId);
   }
 
   // No auto-read — user must explicitly click Archive, Apply, or Discard.
@@ -81,7 +96,7 @@ export function focusThreadOrBootstrap(threadId: string, options?: FocusThreadOp
 export function unfocusThread(): void {
   setFocusedThread(null);
   revealOnFocus.value = false;
-  resetCCPendingPreferences();
+  resetCodingAgentPendingPreferences();
 }
 
 // ---------------------------------------------------------------------------
@@ -165,18 +180,47 @@ export async function handleUnsaveThread(threadId: string): Promise<void> {
 // Archive (move waiting thread to archive)
 // ---------------------------------------------------------------------------
 
-/** Ordered list of review-thread ids to consider as the next focus when the
- *  user archives `aroundId` — closest below first, then closest above.
- *  Snapshotted BEFORE the optimistic flip so the position anchor survives the
- *  cascade dropping `aroundId` (and its descendants) out of review. */
-function reviewCandidatesAround(aroundId: string): string[] {
-  const threads = getReviewThreads();
-  threads.sort(byReviewOrder);
-  const idx = threads.findIndex(t => t.meta.id === aroundId);
+/** Threads the user can actually see, given the active channel/trigger/repo/app
+ *  filter — the SAME family-scoped predicate the drawer uses (`ThreadDrawer`'s
+ *  ThreadList). The post-archive focus must land on a thread the user can click
+ *  on in the list, so a thread hidden by the active filter is never offered as
+ *  the next focus. Returns the filtered set plus the family graph (built over
+ *  the full thread map so parent walks resolve) for the caller to order. */
+function visibleThreadsAndGraph(): { visible: ThreadState[]; graph: FamilyGraph } {
+  const all = Array.from(threadMap.value.values());
+  const graph = computeFamilyGraph(all);
+  const filter = threadChannelFilter.value;
+  const triggerSelection = selectedTriggerIds.value;
+  const repoSelection = selectedRepoIds.value;
+  const appSelection = selectedAppIds.value;
+  // A trigger/repo/app sub-selection flips the gate to any-member matching,
+  // mirroring the drawer so a coding-agent thread in the selected repo/app surfaces with
+  // its family even when the root's channel is filtered out.
+  const subSelectionActive =
+    triggerSelection.size > 0 || repoSelection.size > 0 || appSelection.size > 0;
+  const visible = filterByTopThread(all, graph,
+    t => threadPassesChannelFilter(t, filter, triggerSelection, repoSelection, appSelection),
+    subSelectionActive,
+  );
+  return { visible, graph };
+}
+
+/** Ordered list of visible Current-section thread ids to consider as the next
+ *  focus when the user archives `aroundId` — closest below first, then closest
+ *  above. Walks the drawer's exact render order (`orderedCurrentForReview`:
+ *  family-review sorted, then nested by parent) so "next in queue" is the next
+ *  *visible row* — the next family's parent, not a sub-thread that merely sorts
+ *  high by its own per-thread review tier. Snapshotted BEFORE the optimistic
+ *  flip so the position anchor survives the cascade dropping `aroundId` (and its
+ *  descendants) out of Current. */
+function currentCandidatesAround(aroundId: string): string[] {
+  const { visible, graph } = visibleThreadsAndGraph();
+  const ordered = orderedCurrentForReview(visible, graph);
+  const idx = ordered.findIndex(t => t.meta.id === aroundId);
   if (idx < 0) return [];
   const result: string[] = [];
-  for (let i = idx + 1; i < threads.length; i++) result.push(threads[i].meta.id);
-  for (let i = idx - 1; i >= 0; i--) result.push(threads[i].meta.id);
+  for (let i = idx + 1; i < ordered.length; i++) result.push(ordered[i].meta.id);
+  for (let i = idx - 1; i >= 0; i--) result.push(ordered[i].meta.id);
   return result;
 }
 
@@ -231,13 +275,13 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
   }
 
   // Snapshot the position anchor BEFORE the optimistic flip — once the
-  // cascade leaves review, getReviewThreads() can't compute it.
-  const candidates = reviewCandidatesAround(threadId);
+  // cascade leaves Current, currentCandidatesAround() can't compute it.
+  const candidates = currentCandidatesAround(threadId);
 
   // Snapshot section + codingAgentProposed on every family member so we can
   // roll back if the API rejects (409 blocking, 500 mid-cascade). Both fields
-  // are required to leave review: `displaySection` keeps any thread with
-  // pending changes in review regardless of `section`.
+  // are required to leave Current: `displaySection` keeps any thread with
+  // pending changes in Current regardless of `section`.
   const cascade = collectArchiveCascade(threadId);
   type Snap = { section: ThreadSection; codingAgentProposed: boolean };
   const snapshot = new Map<string, Snap>();

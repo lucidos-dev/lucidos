@@ -109,6 +109,7 @@ pub async fn start_cc_session(
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: branch.into(),
             repo_id,

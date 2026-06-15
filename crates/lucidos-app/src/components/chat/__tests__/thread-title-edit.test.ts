@@ -9,19 +9,44 @@ import { normalizeRename } from '../ThreadTitleEditor';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(here, '../ThreadTitleEditor.tsx'), 'utf-8');
+// Comment-stripped copy for structural tag counts — prose mentioning
+// `<textarea>` / `<input>` in JSX comments must not be counted as markup.
+const code: string = source
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/\/\/[^\n]*/g, '');
 
-describe('ThreadTitleEditor — dual-element split', () => {
-  it('renders an <input type="text"> for editing', () => {
+describe('ThreadTitleEditor — display vs edit fields', () => {
+  it('edits via an <input type="text"> on desktop (single-line hug)', () => {
     expect(source).toMatch(/<input\b[\s\S]*?type=['"]text['"]/);
   });
 
-  it('renders a readOnly <textarea> for display', () => {
-    expect(source).toMatch(/<textarea\b[\s\S]*?readOnly/);
+  it('edits via a <textarea> on mobile (multi-line wrap), gated on viewportIsMobile', () => {
+    // A long title must wrap to multiple lines while editing on mobile; an
+    // <input> can only ever scroll on one line, so the mobile branch is a
+    // <textarea> sized to its content by autoResizeTextarea.
+    expect(source).toMatch(/isMobile\s*\?\s*\(\s*<textarea\b/);
+    expect(source).toMatch(/viewportIsMobile/);
+    expect(source).toMatch(/autoResizeTextarea/);
   });
 
-  it('keeps both elements in the DOM at all times (iOS sync-focus requirement)', () => {
+  it('renders a read-only <div> for display — the only <textarea> is the edit field', () => {
+    // The display is a <div>: in the desktop header CSS gives it
+    // white-space:nowrap + width:max-content so it hugs the title on one line.
+    // A <textarea> sizes to its cols attribute instead and wraps early — it's
+    // the mobile EDIT field, never the display.
+    expect(code).toMatch(/<div\b[\s\S]*?thread-title-display/);
+    const textareas = code.match(/<textarea\b[\s\S]*?>/g) ?? [];
+    expect(textareas.length, 'exactly one <textarea> (the mobile edit field)').toBe(1);
+    expect(textareas[0]).toContain('thread-title-edit-input');
+    expect(textareas[0], 'display must not be a textarea').not.toContain('thread-title-display');
+  });
+
+  it('keeps the edit field and the display in the DOM at all times (iOS sync-focus requirement)', () => {
+    // The edit field is split by viewport (isMobile ? textarea : input), never
+    // gated on `editing` — so a field always exists to focus() synchronously.
     expect(source).not.toMatch(/\{\s*editing\s*&&\s*<input\b/);
-    expect(source).not.toMatch(/\{\s*!\s*editing\s*&&\s*<textarea\b/);
+    expect(source).not.toMatch(/\{\s*editing\s*&&\s*<textarea\b/);
+    expect(source).not.toMatch(/\{\s*!\s*editing\s*&&\s*<div\b[\s\S]*?thread-title-display/);
   });
 
   it('uses keydown Enter to save', () => {
@@ -29,40 +54,12 @@ describe('ThreadTitleEditor — dual-element split', () => {
     expect(source).toMatch(/e\.preventDefault\(\)/);
   });
 
-  it('autoresize never depends on editValue (per-keystroke churn caused iOS cursor reset)', () => {
-    const autoResizeMatch = source.match(/autoResizeTextarea\([\s\S]*?\),\s*\[(.*?)\]/);
-    if (autoResizeMatch) {
-      expect(autoResizeMatch[1]).not.toContain('editValue');
-    }
+  it('sizes the desktop edit input to its value via the size attribute (hugs the title while editing)', () => {
+    expect(source).toMatch(/size=\{[^}]*editValue\.length[^}]*\}/);
   });
 
-  it('autoresize is gated on !editing (display:none scrollHeight=0 collapses height to ~2px)', () => {
-    // The display textarea has display:none while editing. Calling
-    // autoResizeTextarea on a display:none element pins style.height to the
-    // border-only height (~2px), and the next render reuses that value once
-    // the editor closes — title appears to disappear after a mobile rename.
-    // The race fires when SSE delivers ThreadTitleRenamed before the rename
-    // HTTP response resolves.
-    const effect = source.match(
-      /useEffect\(\(\)\s*=>\s*\{[\s\S]*?autoResizeTextarea\(displayRef\.current\)[\s\S]*?\},\s*\[([^\]]*)\]\)/,
-    );
-    expect(effect, 'autoResizeTextarea must run inside a guarded useEffect').not.toBeNull();
-    expect(effect![0]).toMatch(/if\s*\(\s*!\s*editing\s*\)/);
-    expect(effect![1]).toContain('editing');
-  });
-
-  it('uses .select() for the input', () => {
+  it('uses .select() for the edit field', () => {
     expect(source).toMatch(/inputRef\.current\??\.select\(\)/);
-  });
-
-  it('observes the display textarea size to re-fit on container width changes', () => {
-    // The display textarea wraps based on its parent's width. autoResizeTextarea
-    // running only on [title, editing] dep changes leaves style.height pinned
-    // to a wrapped-narrow measurement after the container widens (drawer
-    // toggle, divider drag, window resize) — the header balloons until rename
-    // or reload. A ResizeObserver re-runs the resize on width-only changes.
-    expect(source).toMatch(/new ResizeObserver\(/);
-    expect(source).toMatch(/observer\.observe\(el\)/);
   });
 });
 

@@ -270,7 +270,7 @@ async fn user_question_lifecycle_propagates_count() {
         read_attention_descendant_count(&pool, parent_id).await,
         1,
         "UserQuestionAsked → WaitingForUserAnswer also bumps the attention \
-         counter (WFUA needs user attention, drives REVIEW-bubble routing)"
+         counter (WFUA needs user attention, drives Current-bubble routing)"
     );
 
     // UserQuestionAnswered → status='running' → still blocking (no change),
@@ -328,7 +328,7 @@ async fn user_question_lifecycle_propagates_count() {
 }
 
 /// CC permission lifecycle mirrors UserQuestion: Asked bumps attention,
-/// Resolved drops it. Drives the parent's REVIEW-bubble routing through
+/// Resolved drops it. Drives the parent's Current-bubble routing through
 /// the CC-specific event pair, which has the same WFUA semantics as the
 /// chat-side UserQuestion pair (per the status-transition table in
 /// `thread_lifecycle.rs`).
@@ -357,7 +357,7 @@ async fn cc_permission_lifecycle_propagates_attention_count() {
         read_attention_descendant_count(&pool, parent_id).await,
         1,
         "CodingAgentPermissionRequest → WFUA must bump the parent's \
-         attention counter so REVIEW-bubble surfaces the parent"
+         attention counter so Current-bubble surfaces the parent"
     );
 
     bus.emit(BusEvent::Thread {
@@ -384,7 +384,7 @@ async fn cc_permission_lifecycle_propagates_attention_count() {
 }
 
 /// CC `ChangeProposed` puts the child into a state where the user must
-/// Apply or Discard. The parent must bubble to REVIEW. Mirror is
+/// Apply or Discard. The parent must bubble to Current. Mirror is
 /// `ChangeApplied` / `ChangeDiscarded` clearing the attention counter
 /// (already exercised indirectly via the existing blocking-count tests;
 /// this test pins the attention split explicitly).
@@ -431,8 +431,8 @@ async fn change_proposed_lifecycle_propagates_attention_count() {
 /// Mixed-siblings: when one CC child is paused on a permission and
 /// another is still running, the parent's `attention_descendant_count`
 /// reflects only the WFUA child (1), while `blocking_descendant_count`
-/// counts both (2). This is the case the REVIEW-bubble rule was
-/// designed for — the parent surfaces in Review even though sibling
+/// counts both (2). This is the case the Current-bubble rule was
+/// designed for — the parent surfaces in Current even though sibling
 /// work continues. Pinning it here so a future regression on the
 /// attention/blocking split shows up as a test failure rather than a
 /// drawer bug.
@@ -501,7 +501,7 @@ async fn mixed_siblings_attention_counts_only_wfua_not_running() {
         read_attention_descendant_count(&pool, parent_id).await,
         1,
         "Only the WFUA child counts as needing attention — Running sibling \
-         doesn't bubble. This is the case that drives the parent to REVIEW \
+         doesn't bubble. This is the case that drives the parent to Current \
          in display_section despite the live sibling work."
     );
 

@@ -5,7 +5,6 @@ import type { Token, Tokens } from 'marked';
 import '../../utils/markedConfig';
 import type { DiffFile } from '../../store/store';
 import { getChangeFileContent, getRepoFileContent } from '../../api/client';
-import { escapeHtml } from '../../utils/escapeHtml';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -259,7 +258,7 @@ export function RenderedDiff({ file, changeId, repoId, gitRef }: Props) {
       {deletions.length > 0 && (
         <details class="rendered-diff-deletions">
           <summary>−{deletions.length} removed line{deletions.length === 1 ? '' : 's'}</summary>
-          <pre>{deletions.map(escapeHtml).join('\n')}</pre>
+          <pre>{deletions.join('\n')}</pre>
         </details>
       )}
       <div class="diff-strip-layer" aria-hidden="true">

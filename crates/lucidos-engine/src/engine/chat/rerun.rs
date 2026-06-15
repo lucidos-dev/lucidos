@@ -234,6 +234,7 @@ impl LucidosEngine {
                     None,
                     ActorMode::Engine,
                     None,
+                    None,
                     Some(continuation_started_id),
                     None,
                     Some(MessageOrigin::engine(EngineReason::ContinuationStarted)),

@@ -1,5 +1,6 @@
 /**
- * Tests the input mode toggle (Lucidos/Edit/Claude) mount logic.
+ * Tests the compose destination picker's mount logic (the row that picks
+ * Lucidos Agent vs a coding target).
  *
  * Bug: togglesMounted was an independent useState synced via useEffect.
  * When focusedThreadId went from non-null to null, there was a render
@@ -62,8 +63,9 @@ describe('input mode toggle visibility', () => {
   it('stays mounted when focused thread is in composing state (regression)', () => {
     // Bug: a freshly-POSTed thread is focused (focusedThreadId is set) but
     // still in `composing` state — the user hasn't sent yet and must be able
-    // to switch between Lucidos and Claude. Hiding the toggle stranded them
-    // on whichever mode was last active in the global inputMode signal.
+    // to re-pick the compose destination (Lucidos Agent vs a coding target).
+    // Hiding the picker stranded them on whichever mode was last active in
+    // the global inputMode signal.
     const { togglesMounted, togglesFading } = computeToggleVisibility('thread-fresh', false, 'composing');
     expect(togglesMounted).toBe(true);
     expect(togglesFading).toBe(false);
@@ -120,11 +122,12 @@ describe('effectiveSendMode', () => {
   });
 
   it('routes via composeMode even when the draft was started in another channel (regression)', () => {
-    // A draft created in Lucidos mode (channel='chat', composeMode='lucidos')
-    // gets toggled to Claude. setMode updates composeMode to 'claude_code' but
-    // never touches channel — channel only locks at send time. The submit
-    // path used to read channel here, so the toggle UI showed Claude while
-    // the message routed via Lucidos. effectiveSendMode is the single source.
+    // A draft created on the Lucidos Agent (channel='chat',
+    // composeMode='lucidos') gets re-pointed at a coding target.
+    // applyDestination updates composeMode to 'claude_code' but never touches
+    // channel — channel only locks at send time. The submit path used to read
+    // channel here, so the picker showed a coding destination while the
+    // message routed via Lucidos. effectiveSendMode is the single source.
     expect(effectiveSendMode(makeComposingThread('claude_code', 'chat'))).toBe('claude_code');
   });
 

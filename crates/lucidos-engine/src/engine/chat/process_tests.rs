@@ -76,6 +76,7 @@ fn trigger_context_has_no_preload_fields() {
         slug: "name".to_string(),
         invocation: TriggerInvocation::Schedule,
         go_to_review: false,
+        side_effect_grant: vec![],
     };
 }
 
@@ -662,4 +663,59 @@ fn chat_prompt_nudges_use_of_ask_user_question() {
          — without it the rule only nudges *when* to ask, not *how*, and \
          Opus 4.7 keeps inventing `<ask_user_question>` wrappers",
     );
+}
+
+// --- FreeText answer eligibility (child-completion vs. human follow-up) ---
+
+use super::run::message_can_answer_pending_question;
+use crate::engine::thread_events::ActorMode;
+
+/// A genuine human follow-up typed on a thread with an open question is the
+/// one and only case that may be consumed as a FreeText answer.
+#[test]
+fn human_follow_up_can_answer_pending_question() {
+    assert!(message_can_answer_pending_question(
+        false,
+        "repo is private, not public",
+        ActorMode::Human,
+    ));
+}
+
+/// Regression: an agent-driven child-completion wake (the `[CHILD THREAD
+/// COMPLETED] …` block fed through `notify_parent_of_child_completion` with
+/// `ActorMode::Agent`) must NOT be eligible to answer the parent's open
+/// question. Before the `mode == Human` guard it was, producing a bogus
+/// `UserQuestionAnswered { FreeText }` stamped with a `thread_link`/`child`
+/// actor and silently consuming the user's question. It must instead fall
+/// through to the injection fast-path (queued as `WakeFromChild`).
+#[test]
+fn child_completion_wake_cannot_answer_pending_question() {
+    assert!(!message_can_answer_pending_question(
+        false,
+        "[CHILD THREAD COMPLETED] 59328631… success\nSession summary…",
+        ActorMode::Agent,
+    ));
+}
+
+/// Engine-driven re-entries (recovery notes, scheduler) are likewise never the
+/// user's answer.
+#[test]
+fn engine_driven_message_cannot_answer_pending_question() {
+    assert!(!message_can_answer_pending_question(
+        false,
+        "engine recovery note",
+        ActorMode::Engine,
+    ));
+}
+
+/// A new thread has no pending question to answer, and an empty message can't
+/// be an answer regardless of who authored it.
+#[test]
+fn new_thread_or_empty_message_cannot_answer_pending_question() {
+    assert!(!message_can_answer_pending_question(
+        true,
+        "first message on a brand-new thread",
+        ActorMode::Human,
+    ));
+    assert!(!message_can_answer_pending_question(false, "", ActorMode::Human));
 }

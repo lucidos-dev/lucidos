@@ -274,7 +274,7 @@ pub(in crate::api) async fn suggest_title(
             format!("Failed to build title provider: {}", e),
         )
     })?;
-    let title = crate::engine::generate_thread_title(&provider, &summary, None)
+    let title = crate::engine::generate_thread_title(provider.as_ref(), &summary, None)
         .await
         .map_err(|e| {
             log!("[API] Failed to generate title suggestion: {}", e);

@@ -702,6 +702,35 @@ pub(super) async fn emit_event(
     }
 }
 
+/// Routes for the engine-level surfaces this module's handlers own:
+/// `/health`, `/restart`, `/workspaces`, `/history`, `/messages`,
+/// `/session/messages`, and the `/events*` surface (global SSE stream +
+/// event-store queries). The two `/events/:event_id/*` routes are part of
+/// the events URL surface, so they register here even though their handlers
+/// live in `api::threads`.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/health", get(health))
+        .route("/restart", post(restart_engine))
+        .route("/workspaces", get(list_workspaces))
+        .route("/events", get(global_events))
+        .route("/history", get(get_history))
+        .route("/messages", get(get_recent_messages))
+        .route("/session/messages", get(get_session_messages))
+        .route("/events/query", get(query_events))
+        .route("/events/count", get(count_events))
+        .route("/events/types", get(event_types))
+        .route("/events/emit", post(emit_event))
+        .route(
+            "/events/:event_id/context",
+            get(super::threads::get_context_capture),
+        )
+        .route(
+            "/events/:event_id/tool-result",
+            get(super::threads::get_tool_result),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

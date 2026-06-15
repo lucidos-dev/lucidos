@@ -65,12 +65,19 @@ test.describe('Thread management', () => {
     // Navigate away
     await newThread(page);
 
-    // Open drawer and click on the most recent REAL thread (skip drafts)
-    await openThreadDrawer(page);
-    await page.locator(`${REAL_THREAD_ROW}:visible`).first().click();
-    await ensureOnThreadPane(page);
-
-    // Verify the thread content is still there
-    await expect(userMessageBody(page)).toContainText(msg, { timeout: 10_000 });
+    // Open the drawer and click the most recent REAL thread (skip drafts), then
+    // confirm its messages render. Under full-suite host contention the row
+    // click can be absorbed by a concurrent drawer re-render (compose/SSE
+    // fan-out): focus never changes and the thread pane keeps showing the empty
+    // compose draft. Retry the open→click→navigate until the thread's user
+    // message actually appears — the same absorbed-click guard ensureMobileView
+    // applies by re-clicking the pane dot in a loop. The assertion is unchanged,
+    // so a genuinely empty or wrong thread still fails.
+    await expect(async () => {
+      await openThreadDrawer(page);
+      await page.locator(`${REAL_THREAD_ROW}:visible`).first().click();
+      await ensureOnThreadPane(page);
+      await expect(userMessageBody(page)).toContainText(msg, { timeout: 5_000 });
+    }).toPass({ timeout: 30_000, intervals: [1_000, 2_000] });
   });
 });

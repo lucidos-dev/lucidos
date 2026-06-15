@@ -10,6 +10,32 @@ impl LucidosEngine {
         }
     }
 
+    /// Which backend drives this thread, from the `thread_summaries`
+    /// projection. NULL / missing row / DB error all default to `ClaudeCode`
+    /// — every thread persisted before the column existed was CC, and the
+    /// callers (event stamping on engine-internal flows) prefer a default
+    /// stamp over a hard failure.
+    pub(crate) async fn thread_coding_agent(&self, thread_id: Uuid) -> crate::runtime::CodingAgent {
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT coding_agent FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            crate::log!(
+                "[AgentSession] thread_coding_agent({}) DB error: {} — defaulting to ClaudeCode",
+                thread_id,
+                e
+            );
+            None
+        })
+        .flatten();
+        stored
+            .map(|s| crate::runtime::CodingAgent::parse(&s))
+            .unwrap_or(crate::runtime::CodingAgent::ClaudeCode)
+    }
+
     /// Signal the agent runtime to terminate, then flush any un-persisted text
     /// as a final stream event. The runtime task watches `cancel` and kills its
     /// child; we don't own the process here.
@@ -20,6 +46,7 @@ impl LucidosEngine {
         event_bus: &crate::engine::event_bus::EventBus,
         thread_id: Uuid,
         meta: &crate::engine::thread_events::EventMeta,
+        coding_agent: crate::runtime::CodingAgent,
     ) {
         cancel.cancel();
         if !claude_text_buf.is_empty() {
@@ -32,7 +59,7 @@ impl LucidosEngine {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed {
                                 text: delta.to_string(),
-                                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                                coding_agent,
                             },
                             meta: meta.clone(),
                         },
@@ -149,6 +176,7 @@ impl LucidosEngine {
         external_terminal_emitted: &std::sync::atomic::AtomicBool,
         normalized_model: &Option<String>,
         cc_reasoning_effort: &Option<String>,
+        coding_agent: crate::runtime::CodingAgent,
     ) {
         Self::kill_cc_and_flush(
             agent_cancel,
@@ -157,6 +185,7 @@ impl LucidosEngine {
             &self.event_bus,
             thread_id,
             meta,
+            coding_agent,
         )
         .await;
         let Some(kind) = stop_terminal_kind(is_shutdown, is_waiting, suppress_user_terminal)
@@ -216,13 +245,14 @@ impl LucidosEngine {
         prompt: &str,
         origin: Option<MessageOrigin>,
     ) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
+        let coding_agent = self.thread_coding_agent(thread_id).await;
         let result = self
             .event_bus
             .emit(crate::engine::event_bus::BusEvent::Thread {
                 thread_id,
                 event: crate::engine::thread_events::ThreadEvent::CodingAgentPromptSent {
                     text: prompt.to_string(),
-                    coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                    coding_agent,
                     origin,
                 },
                 meta: crate::engine::thread_events::EventMeta {
@@ -243,17 +273,23 @@ impl LucidosEngine {
         future: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
         let handle = tokio::spawn(future);
-        Self::monitor_cc_task(engine, thread_id, handle);
+        // Fire-and-forget: the watcher cleans up on panic; nobody awaits it.
+        // Dropping the JoinHandle detaches the already-spawned watcher (it keeps running).
+        drop(Self::monitor_cc_task(engine, thread_id, handle));
     }
 
     /// Monitor a spawned CC task's JoinHandle. If it panics, emit `ResponseFailed`
-    /// and `SessionEnded` and clean up the session entry. Shared by both
-    /// `spawn_cc_task_guarded` and `spawn_agent_thread`.
+    /// and `SessionEnded` and clean up the session entry. Shared by
+    /// `spawn_cc_task_guarded`, the chat HTTP handler, and the Thread Queue's
+    /// coding-agent execution path. Returns the watcher's own handle —
+    /// resolves once the monitored task AND any panic cleanup finish, so a
+    /// caller can await full completion (the queue executor does, to hold
+    /// the capacity slot for the session's duration).
     pub(crate) fn monitor_cc_task(
         engine: std::sync::Arc<LucidosEngine>,
         thread_id: Uuid,
         handle: tokio::task::JoinHandle<()>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             if let Err(join_err) = handle.await {
                 if join_err.is_panic() {
@@ -298,7 +334,7 @@ impl LucidosEngine {
                     engine.agent_sessions.lock().await.remove(&thread_id);
                 }
             }
-        });
+        })
     }
 }
 

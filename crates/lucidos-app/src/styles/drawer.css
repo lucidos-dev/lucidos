@@ -94,17 +94,42 @@
     flex: 1;
     overflow-y: auto;
     padding-bottom: 0.25rem;
+    /* No reserved scrollbar gutter. The app's global `::-webkit-scrollbar`
+     * (components.css) gives every scroller a 0.5rem *classic* bar that reserves
+     * layout width — which pushed the focused/highlighted/hover row background
+     * an extra 0.5rem short of the drawer's right edge (the gutter painted
+     * `--bg-primary`, reading as an inconsistent gap to the right of the
+     * selection). Hiding the bar drops that accidental gutter; the row's
+     * intentional `margin-right` then owns the right-side room. The list still
+     * scrolls via wheel / trackpad / touch. */
+    scrollbar-width: none;
+}
+
+.thread-drawer-list::-webkit-scrollbar {
+    display: none;
 }
 
 .thread-row {
     cursor: pointer;
     position: relative;
     /* `--thread-depth` inherits from the row wrapper for nested children (set
-     * via depthStyle() in ThreadDrawer.tsx); 0 keeps top-level rows aligned. */
-    padding-left: calc(1.25rem + var(--thread-depth, 0) * 1rem);
-    /* Right padding matches `.threads-header`'s `padding: 0 0.5rem` so action
-     * icons sit in the same horizontal slot as the filter/search above. */
+     * via depthStyle() in ThreadDrawer.tsx); 0 keeps top-level rows aligned.
+     * `--thread-row-pad-left` is the row's left padding — i.e. where the thread-
+     * name text starts. Shared so the bottom-edge divider `::after` below can
+     * begin at the same x (lines the divider's left up with the title text). */
+    --thread-row-pad-left: calc(1.25rem + var(--thread-depth, 0) * 1rem);
+    padding-left: var(--thread-row-pad-left);
+    /* Right padding gives the action icons breathing room inside the row. */
     padding-right: 0.5rem;
+    /* Inset the row 0.5rem from the drawer's right edge so the focused / hover /
+     * highlighted background (and the highlight outline, which rides the border
+     * box) reads as a card with room on the right rather than a strip flush to
+     * the edge. Margin (not clip-path) shrinks the actual box, so the background
+     * AND the outline inset together — a right clip-path would cut the outline's
+     * right side off. The bottom-edge divider `::after` (right: 0.5rem inside the
+     * row) shifts in with the box, preserving its gap from the selection edge.
+     * No left margin: nested sub-thread selections still reach the left edge. */
+    margin-right: 0.5rem;
     -webkit-touch-callout: none;
     -webkit-user-select: none;
     user-select: none;
@@ -127,115 +152,69 @@
     }
 }
 
-/* Drawer rows: the horizontal divider between rows lives on the *next*
- * wrapper's ::before (rule below), not on the row itself — kill the
- * inherited `.list-row` border-bottom so the wrapper's leading divider is
- * the only horizontal line between rows. Scoped to wrapped rows so
- * `SearchResultRow` (which renders a bare `.list-row.thread-row` without
- * a wrapper) keeps its standard `.list-row` divider. */
-.thread-row-wrap .thread-row {
-    border-bottom: 0;
+/* Each thread row carries a hairline divider on its own bottom edge (Apple
+ * Messages / Twitter style) — the row separator rides the row, not the gap
+ * below it. Drawn as a bottom-anchored `::after` (rather than `border-bottom`)
+ * so both ends inset toward the row's text column: `left` is the row's
+ * `padding-left` (`--thread-row-pad-left`) less a small 0.25rem nudge, so the
+ * line starts just left of the thread-name text, and `right: 0.5rem` matches
+ * `padding-right` so it stops at the row's content column — neither end runs
+ * flush to the drawer edge.
+ * `--border-color` matches every other divider in the app. Scoped to
+ * `.thread-drawer .thread-row` so it covers both wrapped rows (list / drafts)
+ * AND the bare `SearchResultRow`. Each row's line tracks its own indented text
+ * via `--thread-row-pad-left`. The hover override above keeps the hovered-row
+ * background clear of this color so the two don't merge into one thick band. */
+.thread-drawer .thread-row::after {
+    content: '';
+    position: absolute;
+    left: calc(var(--thread-row-pad-left) - 0.25rem);
+    right: 0.5rem;
+    bottom: 0;
+    border-bottom: 1px solid var(--border-color);
+    pointer-events: none;
 }
 
-/* Each row wrapper owns one horizontal divider ABOVE itself, spanning the
- * full drawer width. Drawing it on the *next* wrapper (rather than below the
- * previous row) keeps the line attached to the row whose content sits right
- * below it. Each wrapper draws exactly one divider, so dividers never stack. */
+/* `position: relative` anchors the row wrapper's absolutely-positioned
+ * children (status dot, disclosure chevron, the lifted-child accent bar). */
 .thread-row-wrap {
     position: relative;
 }
 
-.thread-row-wrap::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 1px;
-    background: var(--border-color);
-    pointer-events: none;
-    /* Paint above the row's background — the focused row's bg-selected and
-     * the family-toggle band's bg-secondary both reach the wrapper's top edge
-     * and would otherwise hide this 1px line. */
-    z-index: 1;
-}
-
-/* x-position of the family rail: one indent step to the left of this row's
- * own status-icon column, so the rail sits centered below the parent's
- * status dot. Shared by the rail (`.thread-row::before`) and the row's
- * clip-path; also reused as the family-toggle-wrap's margin-left so the
- * header band lines up with the children's visible left edge below.
- * `--thread-depth` is set inline by depthStyle() in ThreadDrawer.tsx and
- * inherits down to the row + its pseudo-elements. */
+/* x-position of the lifted-child accent bar: one indent step deeper per level,
+ * so each nesting level's accent bar starts a step further right than its
+ * parent. (The status dot no longer rides this column — it's pinned to a fixed
+ * left inset on the wrapper, see below.) `--thread-depth` is set inline by
+ * depthStyle() in ThreadDrawer.tsx and inherits down to the row + its
+ * pseudo-elements. */
 .thread-row-wrap.is-nested {
     --thread-indent: calc(0.8125rem + (var(--thread-depth, 0) - 1) * 1rem);
     --rail-x: var(--thread-indent);
 }
 
-/* Inset the top divider to the rail position so it respects the row's
- * indent instead of bleeding across the parent's rail/indent area. */
-.thread-row-wrap.is-nested::before {
-    left: var(--rail-x);
-}
-
-/* First row of a section: the section title already has its own
- * border-bottom — suppress the row's top divider so the two don't stack
- * into a doubled line at the top of the first row. */
-.list-section-title + .thread-row-wrap::before {
-    display: none;
-}
-
-/* Family-toggle's top divider extends leftward past the wrap's own
- * `margin-left: var(--thread-indent)` so it lines up with the parent row's
- * divider above. min(var(--thread-indent), 1rem) is the parent's indent step
- * from the wrap's perspective — depth 1 child pulls back the full base
- * (parent is at drawer edge), depth ≥2 pulls back one indent step. */
-.thread-row-wrap.is-nested.family-toggle-wrap::before {
-    left: calc(-1 * min(var(--thread-indent), 1rem));
-}
-
-/* Family rail: a 1px vertical guide line at each nested row's parent indent,
- * drawn per-row so segments butt into a continuous line under the parent.
- * Visually links a child back to its parent — the indent alone reads too
- * weakly. Only on nested rows (depth > 0); the wrapper carries the marker
- * class so the depth gate doesn't depend on style-attribute matching.
- *
- * The family-toggle header itself does NOT carry the rail — the spine starts
- * at the first child row below. */
+/* No vertical sub-thread rail: nested rows read as indented via their title
+ * offset alone, with no gray guide line. (The status dot sits in a fixed left
+ * column and no longer signals depth.) The `::before` is kept
+ * (transparent) purely so the lifted-child accent BAR below can light it —
+ * that's a state cue, not a divider. */
 .thread-row-wrap.is-nested .thread-row::before {
     content: '';
     position: absolute;
     left: var(--rail-x);
     top: 0;
     bottom: 0;
-    width: 1px;
-    background: var(--border-color);
+    width: 0.125rem;
+    background: transparent;
     pointer-events: none;
-    /* Match `.thread-row-wrap::before`'s z-index so the rail and divider
-     * paint in tree order at the 1px corner — without it, the divider would
-     * clip the top of the focused/lifted-child accent rail. */
     z-index: 1;
-}
-
-.thread-row-wrap.is-nested .thread-row::before {
-    transition: background var(--duration-fast) ease, width var(--duration-fast) ease;
-}
-
-/* Hover anywhere on the row brightens that row's rail segment. Adjacent
- * segments stay gray until hovered themselves — keeps the cue local without
- * needing JS to know the family extent. */
-@media (hover: hover) {
-    .thread-row-wrap.is-nested .thread-row:hover::before {
-        background: var(--accent);
-    }
+    transition: background var(--duration-fast) ease;
 }
 
 /* Lifted-family cue: a descendant whose own natural section matches the
- * routed section (i.e. it earned the lift). Promotes the rail to the section
- * accent at 2px so the eye lands on it while scanning the section, then
- * traces up to the lifted family. */
+ * routed section (i.e. it earned the lift). Lights the accent bar so the eye
+ * lands on it while scanning the section, then traces up to the lifted
+ * family. */
 .thread-row-wrap.is-nested .thread-row.thread-row-lifted-child::before {
-    width: 0.125rem;
     background: var(--accent);
 }
 
@@ -244,97 +223,121 @@
  * section in the drawer today — opacity is a strong-enough demotion cue
  * without needing per-section row treatments. */
 .thread-row.thread-row-lifted-parent .thread-row-title,
-.thread-row.thread-row-lifted-parent .thread-row-meta,
-.thread-row.thread-row-lifted-parent .thread-row-time,
+.thread-row.thread-row-lifted-parent .thread-row-context,
 .thread-row.thread-row-lifted-parent .message-channel-tag {
     opacity: 0.6;
 }
 
-/* Family toggle row: a sub-section header that renders under a parent
- * thread row when the family has any sub-threads. Tinted background frames
- * the children as one unit and signals the hidden family when collapsed.
+/* Sub-thread disclosure, horizontally centered on the parent row and aligned
+ * to the same line as the row's copy-icon action so it reads as the parent's
+ * (not the next thread's). The control swaps contents by state: while EXPANDED
+ * it shows the ▴ chevron — pointing UP because the control sits above the
+ * expanded sub-threads, so it reads as "pull these back up / collapse"; while
+ * COLLAPSED it shows the sub-thread count badge alone — no chevron — so the badge itself
+ * signals there are hidden sub-threads, and clicking it re-expands. The
+ * centered anchor holds across the swap.
  *
- * `margin-left` matches the CHILDREN's nesting offset (`--thread-indent`),
- * so the header starts at the same x as the children's visible (clip-path)
- * left edge below — the tinted band reads as the children's header, not
- * the parent's. The first child wrap's inherited `::before { left: var(
- * --rail-x); }` (rail-x === thread-indent for is-nested rows) puts the
- * divider directly underneath the header at the same x.
- *
- * Padding and font-size deliberately mirror `.list-section-title` in
- * global.css — this is the sub-section sibling of the top-level section
- * header. Lighter tint (bg-secondary vs bg-tertiary) and weight 500 (not
- * 600) keep the visual hierarchy: section header > family header > row. */
-.thread-row-wrap.is-nested.family-toggle-wrap {
-    background: var(--bg-secondary);
-    margin-left: var(--thread-indent);
-    /* Override the depth-relative inherited --rail-x to a constant so the
-     * glyph-padding-inside-wrap (which uses --rail-x below) stays at the
-     * base 0.8125rem regardless of depth. The header itself draws no rail. */
-    --rail-x: 0.8125rem;
-}
-
-.family-toggle {
+ * Absolutely positioned so it never disturbs the title / status dot / right-
+ * column flow. Vertically it rides the copy icon: that icon is the last child
+ * of the (taller) right column, so its bottom edge lands on the row's content-
+ * box bottom — i.e. `padding-bottom` from the row bottom. So `bottom` here =
+ * that padding + half the icon-vs-badge height difference, which centers the
+ * two on one line. Icon size and row padding both shift per breakpoint, so the
+ * value is tuned in the media blocks below; this base covers ≤768px, where the
+ * chevron/badge are bumped to 1.25rem (see the media block): row padding-bottom
+ * 0.5rem + (1.5rem icon − 1.25rem control)/2 = 0.625rem. */
+.family-disclosure {
+    position: absolute;
+    left: 50%;
+    bottom: 0.625rem;
+    transform: translateX(-50%);
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    width: 100%;
-    background: transparent;
+    gap: 0.3125rem;
+    max-width: calc(100% - 1.5rem);
+    padding: 0;
+    background: none;
     border: none;
-    color: var(--text-muted);
     cursor: pointer;
-    /* Left padding == --rail-x (overridden to 0.8125rem on the wrap above)
-     * keeps the ▾ glyph at the same internal inset at every depth. */
-    padding: 0.375rem 1rem 0.375rem var(--rail-x);
-    font-size: 0.6875rem;
-    font-weight: 500;
-    /* Stay on the pixel grid: fractional row heights put 1px dividers
-     * off-grid, where retina + zoom anti-alias them visibly fuzzy. */
-    line-height: 0.8125rem;
-    text-align: left;
-    transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
-}
-
-.family-toggle-glyph {
-    width: 0.625rem;
-    text-align: center;
     color: var(--text-secondary);
+    /* Above the family rail + row divider (both z-index 1) so the corner
+     * where they meet doesn't clip the control. */
+    z-index: 2;
     transition: color var(--duration-fast) ease;
 }
 
-.family-toggle-progress {
-    color: var(--text-secondary);
-    font-variant-numeric: tabular-nums;
+.family-disclosure-glyph {
+    font-size: 0.75rem;
+    line-height: 1;
+}
+
+/* Reserve vertical room below the title / "N exchanges" meta for the bottom-
+ * centered disclosure badge so a long (multi-line) title can't grow down into
+ * it. The badge is absolutely positioned (horizontally centered, inside the
+ * title column's width), so without this reserve the title's last line and the
+ * meta slide under it — the overlap a 3-line title produced.
+ *
+ * The padding rides the LEFT column, not the row, so short-title family rows
+ * stay compact: the badge tracks the (taller) right column's copy-icon line and
+ * the reserve is absorbed as slack; only once the title column outgrows the
+ * right column does the row get taller, pushing the badge clear of the title.
+ *
+ * Reserve = the badge's top edge above the row padding-box bottom, less the
+ * row's own padding-bottom. Mobile: bottom 0.625rem + badge height 1.25rem −
+ * padding-bottom 0.5rem = 1.375rem, rounded up to 1.5rem for clearance. */
+.thread-row.thread-row-has-family .thread-row-left {
+    padding-bottom: 1.5rem;
 }
 
 @media (hover: hover) {
-    .family-toggle:hover {
+    .family-disclosure:hover {
         color: var(--text-primary);
-        background: var(--bg-tertiary);
-    }
-    .family-toggle:hover .family-toggle-glyph {
-        color: var(--accent);
     }
 }
 
+/* Collapsed-only count badge — shared by collapsed section headers (number of
+ * threads in the section) and collapsed family parents (number of hidden
+ * sub-threads). Neutral pill so it reads as a quiet count, not a CTA. */
+.collapse-count-badge {
+    font-size: 0.625rem;
+    font-weight: 600;
+    line-height: 1rem;
+    min-width: 1rem;
+    padding: 0 0.3125rem;
+    text-align: center;
+    border-radius: 0.625rem;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    font-variant-numeric: tabular-nums;
+}
+
+/* The collapsed sub-thread count badge (inside .family-disclosure) takes a
+ * subtle accent-blue fill instead of the neutral --bg-tertiary above. On a
+ * focused parent row the row bg is --bg-selected (#1e2430 dark), nearly
+ * identical to --bg-tertiary — so the gray badge lost its fill and read as a
+ * bare number on the selected row. The blue tint stays distinct against both
+ * the normal and the focused row bg. Section-header count badges (also
+ * .collapse-count-badge) keep the neutral fill — this is scoped to the family
+ * disclosure only. */
+.family-disclosure .collapse-count-badge {
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+/* Dark mode: lift the accent share so the fill reads a touch bluer against the
+ * darker row backgrounds (the 15% tint above looks washed out on dark). Light
+ * mode keeps the base 15% — it stays distinct there already. */
+html[data-theme="dark"] .family-disclosure .collapse-count-badge {
+    background: color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+/* Focus is shown by the `bg-selected` fill alone — no leading accent bar.
+ * The fill spans the full row width at every depth — nested rows are NOT
+ * clipped to the indent rail — so a focused/highlighted sub-thread's
+ * background runs all the way to the drawer's left edge, like a top-level
+ * row. The title still reads as indented via its `padding-left`. */
 .thread-row.thread-row-focused,
 .thread-row.thread-row-focused:hover {
     background: var(--bg-selected);
-    border-left: 0.125rem solid var(--accent);
-}
-
-/* Nested focus marker: drop the border instead of making it transparent —
- * the rail ::before below is positioned from the padding edge, so a 2px
- * transparent border would shift it past var(--rail-x) (the clip-path edge)
- * and leak a bg-selected gap before the accent starts. */
-.thread-row-wrap.is-nested .thread-row.thread-row-focused,
-.thread-row-wrap.is-nested .thread-row.thread-row-focused:hover {
-    border-left: 0;
-}
-
-.thread-row-wrap.is-nested .thread-row.thread-row-focused::before {
-    background: var(--accent);
-    width: 0.125rem;
 }
 
 .thread-row.thread-row-highlighted {
@@ -347,24 +350,15 @@
     background: var(--bg-selected);
 }
 
-/* Nested rows: the whole row's painted output (background, focused
- * selection tint, highlighted outline) is clipped to start at the rail
- * position. The row's box still spans the full width — layout and
- * positions stay identical to top-level rows — but visually the row looks
- * indented as a single unit instead of having content pushed right inside
- * a full-width strip. The horizontal divider lives on the wrapper's
- * ::before (above) which sits outside the row's clip, so the inset divider
- * lands at rail-x regardless. */
-.thread-row-wrap.is-nested .thread-row {
-    clip-path: inset(0 0 0 var(--rail-x));
-}
-
 .thread-row-left {
     flex: 1;
     min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 0.125rem;
+    /* Give wrapped titles descent room without making every row taller: this
+     * only affects row height when the title column is the tallest column. */
+    padding-bottom: 0.25rem;
 }
 
 .thread-row-title-row {
@@ -374,7 +368,7 @@
 
 .thread-row-title {
     font-size: 0.8125rem;
-    font-weight: 500;
+    font-weight: 400;
     overflow-wrap: break-word;
     word-break: break-word;
 }
@@ -392,15 +386,6 @@
     margin-left: 0.375rem;
 }
 
-.thread-row-meta {
-    font-size: 0.6875rem;
-    color: var(--text-secondary);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    padding-left: 0.25rem;
-}
-
 .thread-row-right {
     display: flex;
     flex-direction: column;
@@ -410,13 +395,17 @@
     align-self: stretch;
 }
 
-.thread-row-time {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-    font-size: 0.6875rem;
-    color: var(--text-muted);
+/* The repo / app / trigger NAME chip, shown under the channel/type tag. Muted
+ * so the type tag stays the primary label; truncates long repo names rather than
+ * forcing the row wider. The detail times live in the row's long-press/hover
+ * tooltip (see threadRowInfo.ts), so this column is type + name only. */
+.thread-row-context {
+    max-width: 9rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
 }
 
 .thread-row-actions {
@@ -459,17 +448,25 @@
     height: var(--icon-size-md);
 }
 
-.thread-row > .thread-status {
+/* The dot hangs off the row WRAPPER, not the `.thread-row` itself, so it keeps a
+ * fixed left column at every depth — it stays in the same place whether the row
+ * is a thread, sub-thread, or sub-sub-thread, instead of tracking the title's
+ * per-depth indent. The wrapper and row share the same top edge, so the `top`
+ * values below still center the dot on the title line. */
+.thread-row-wrap > .thread-status {
     position: absolute;
-    /* Stays a fixed 0.875rem inset from the padded edge — at depth 0 this is
-     * 0.375rem, at depth 1 it's 1.375rem, etc. — so the dot tracks the title
-     * indent instead of sitting in dead space at the row's left edge. */
-    left: calc(0.375rem + var(--thread-depth, 0) * 1rem);
+    left: 0.375rem;
     top: 1.0625rem;
     transform: translateY(-50%);
+    /* Paint above the row. The dot is the wrapper's FIRST child and `.thread-row`
+     * (its sibling) is `position: relative`, so both are positioned siblings with
+     * `z-index: auto` and paint in DOM order — without this the row paints AFTER
+     * the dot and a focused/highlighted row's opaque background (`--bg-selected`)
+     * covers it, making the status dot vanish the moment a row is selected. */
+    z-index: 1;
 }
 
-.thread-row > .thread-status .mini-spinner {
+.thread-row-wrap > .thread-status .mini-spinner {
     width: 0.5rem;
     height: 0.5rem;
     box-sizing: border-box;
@@ -501,19 +498,55 @@
         padding-bottom: 0.125rem;
     }
 
-    .thread-row > .thread-status {
-        top: 1.125rem;
+    /* Track the copy icon's line: row padding-bottom 0.125rem +
+     * (1.25rem icon − 1rem badge)/2 = 0.25rem. */
+    .family-disclosure {
+        bottom: 0.25rem;
+    }
+
+    /* Desktop badge is smaller and the row padding-bottom tighter, so the
+     * title-column reserve shrinks to match: bottom 0.25rem + badge height
+     * 1rem − padding-bottom 0.125rem = 1.125rem, rounded up to 1.25rem. */
+    .thread-row.thread-row-has-family .thread-row-left {
+        padding-bottom: 1.25rem;
+    }
+
+    /* Centers the dot on the title's first line. 1.125rem read a hair high
+     * (it sat above the line's optical center); 1.25rem drops it back onto the
+     * text — the long-standing value before a May icon-shrink bundled in a 2px
+     * up-nudge. */
+    .thread-row-wrap > .thread-status {
+        top: 1.25rem;
     }
 }
 
 @media (max-width: 768px) {
-    .thread-row > .thread-status {
+    .thread-row-wrap > .thread-status {
         top: 1.3125rem;
     }
 
     .thread-row-actions .icon-btn.header-icon {
         width: 1.75rem;
         height: 1.5rem;
+    }
+
+    /* Bigger sub-thread disclosure on touch — both the ▴ chevron (expanded) and
+     * the collapsed count badge are fiddly tap targets / hard to read at the base
+     * size; bump both so the affordance is easy to hit. The control is bottom-
+     * anchored, so it grows upward; the base `bottom` is tuned (0.625rem) to keep
+     * the now-taller 1.25rem chevron/badge centered on the copy-icon line. */
+    .family-disclosure-glyph {
+        font-size: 1.25rem;
+    }
+
+    /* Scoped to .family-disclosure so collapsed section-header count badges keep
+     * their compact size. */
+    .family-disclosure .collapse-count-badge {
+        font-size: 0.8125rem;
+        line-height: 1.25rem;
+        min-width: 1.25rem;
+        padding: 0 0.4375rem;
+        border-radius: 0.75rem;
     }
 }
 
@@ -611,6 +644,40 @@
     padding: 0;
 }
 
+/* Room between sections — the gap after a section's last thread, before the
+   next section's header. Adjacent-sibling so it never lands above the FIRST
+   section: the top header stays tight to the search/filter bar above it, while
+   every later header gets breathing room from the section that precedes it.
+   (Empty sections render `null`, so the first rendered `.drawer-section` is
+   genuinely the topmost one.) Restores the inter-section separation that shrank
+   when the header's top padding was trimmed, without re-bloating the top
+   header. */
+.drawer-section + .drawer-section {
+    margin-top: 0.75rem;
+}
+
+/* Flat section headers: drop the gray band that `.list-section-title` carries
+   in base.css (the divider lines are already gone globally). The uppercase,
+   letter-spaced label reads as a section marker on its own; the top padding
+   gives the header its own breathing room (the gap BETWEEN sections rides on
+   the `.drawer-section + .drawer-section` margin above, not on this padding).
+   To carry the section weight without a band, the label is the primary
+   (near-black) text color, bolder (700), and a touch larger (0.8125rem vs the
+   base 0.6875rem) than the base `.list-section-title`. `--text-primary`
+   (not literal black) keeps dark mode inverting correctly. Covers the
+   collapsible lifecycle headers plus the Drafts / Results headers, which all
+   render inside `.thread-drawer`. Left padding matches `.thread-row`'s
+   `padding-left` (1.25rem at depth 0) so the header label starts where the
+   thread-name text starts, clearing the absolutely-positioned status-dot
+   column to its left. */
+.thread-drawer .list-section-title {
+    background: none;
+    padding: 0.5rem 1rem 0.375rem 1.25rem;
+    color: var(--text-primary);
+    font-weight: 700;
+    font-size: 0.8125rem;
+}
+
 .list-section-title-collapsible {
     cursor: pointer;
     -webkit-user-select: none;
@@ -620,25 +687,10 @@
     gap: 0.25rem;
 }
 
-.section-attention-badge {
-    margin-left: auto;
-    font-size: 0.6875rem;
-    font-weight: 600;
-    color: var(--text-on-accent);
-    background: var(--accent);
-    padding: 0 0.375rem;
-    border-radius: 0.625rem;
-    /* Integer pixels — the badge sizes the section title's flex row, so a
-     * fractional line-height here knocks every drawer row off-grid. */
-    line-height: 1rem;
-    min-width: 1rem;
-    text-align: center;
-}
-
 @media (hover: hover) {
+    /* Flat headers carry no fill, so hover is a color-only cue — no band. */
     .list-section-title-collapsible:hover {
         color: var(--text-primary);
-        background: color-mix(in srgb, var(--bg-tertiary) 85%, var(--text-muted));
     }
 }
 
@@ -659,11 +711,21 @@
     /* Right padding matches `.pane-header`'s `--header-padding-x` so the action
      * icons land in the same horizontal slot as the AppHeader icons above. */
     padding: 0.25rem 0.625rem 0.25rem 1rem;
-    background: color-mix(in srgb, var(--accent) 12%, var(--bg-primary));
+    /* Transparent background — the header blends into the content below. */
+    background: transparent;
     -webkit-user-select: none;
     user-select: none;
-    border-bottom: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border-color));
     flex-shrink: 0;
+}
+
+/* While editing, the suggestion is rendered below the input but pulled out of
+ * flow (absolute, rule further down) so .thread-title-edit stays exactly
+ * input-height and the status icon + action icons remain centered on the input
+ * field — not dropped to the middle of input+suggestion. Reserve room beneath
+ * the row so the out-of-flow suggestion doesn't overlap the transcript. The
+ * reserve tracks the suggestion's own min-height (1.25rem) plus the row's gap. */
+.thread-view-header:has(.thread-title-edit.is-editing) {
+    padding-bottom: 1.5rem;
 }
 
 /* Desktop title-bar icons run smaller than the AppHeader slot — keep the
@@ -684,26 +746,31 @@
     gap: 0.25rem;
 }
 
-/* (hover: none) branch is for desktops with touch — mobile hides this
- * whole header in favor of the app header. */
-.thread-view-header-actions .icon-btn {
+/* Hidden by default, revealed on row hover/focus; they sit on the right of the
+ * title, right beside its text (the field hugs the title — rule below).
+ * (hover: none) keeps them visible on touch. Scoped to .thread-view-header
+ * (desktop only) — the same actions span is
+ * reused by the mobile app header (.mobile-thread-title-row), which must stay
+ * always-visible; leaving the hide rule unscoped would strand its icons
+ * invisible on a narrow (≤768px) desktop window with a mouse, where neither
+ * reveal path matches. */
+.thread-view-header .thread-view-header-actions .icon-btn {
     opacity: 0;
     transition: opacity var(--duration-fast) ease-in-out;
 }
 
 @media (hover: hover) {
     .thread-view-header:hover .thread-view-header-actions .icon-btn,
-    .thread-view-header-actions .icon-btn:focus-visible {
+    .thread-view-header .thread-view-header-actions .icon-btn:focus-visible {
         opacity: 1;
     }
 }
 
 @media (hover: none) {
-    .thread-view-header-actions .icon-btn {
+    .thread-view-header .thread-view-header-actions .icon-btn {
         opacity: 1;
     }
 }
-
 
 /* position:relative so the edit <input> can absolutely-position over the display textarea. */
 .thread-title-edit {
@@ -730,13 +797,73 @@
     min-width: 0;
 }
 
+/* Desktop thread-view-header only (the mobile app header reuses these classes
+ * full-width and hides .thread-view-header on mobile, so this scoping leaves it
+ * alone). The field hugs its text so the action icons sit right beside the title,
+ * and the wrapper hugs that field (flex:0 1 auto). max-width:100% caps both to
+ * the row; align-items:flex-start keeps them at text width, not stretched. */
+.thread-view-header .thread-title-edit {
+    flex: 0 1 auto;
+    min-width: 0;
+    /* Cap + clip the title to the row. max-width:100% here resolves against the
+     * header (a stable width), so it doesn't feed back into the field's size the
+     * way a cap on the field itself would. */
+    max-width: 100%;
+    overflow: hidden;
+    align-items: flex-start;
+}
+
+.thread-view-header .thread-title-input {
+    min-width: 4ch;
+}
+
+/* The read-only display hugs its title on ONE line: white-space:nowrap +
+ * width:max-content sizes it to the true one-line text width, auto-updating when
+ * a web font loads (a JS measurement can't time that reliably). It deliberately
+ * has NO max-width — capping the field itself is circular with its content-based
+ * flex basis and collapses it ~1 char short; the wrapper above caps and clips
+ * (overflow:hidden) instead, so a title too long for the row is clipped at the
+ * row's right edge. */
+.thread-view-header .thread-title-input.thread-title-display {
+    width: max-content;
+    white-space: nowrap;
+}
+
+/* While editing, the <input> hugs its value via its size attribute (set in JS);
+ * width:auto lets that drive the width, capped to the row by max-width. */
+.thread-view-header .thread-title-input.thread-title-edit-input {
+    width: auto;
+    max-width: 100%;
+}
+
+/* While editing, drop the clip so the out-of-flow suggestion below is visible.
+ * Safe: the edit <input> is capped at max-width:100% so there's nothing to clip
+ * horizontally mid-edit. Using `visible` (not `clip`) also dodges the Chrome bug
+ * where overflow-x:clip on a positioned ancestor eats pointer events on its
+ * y-overflowing absolute children — here the suggestion button must stay
+ * clickable. (Non-editing keeps overflow:hidden to clip an over-long title.) */
+.thread-view-header .thread-title-edit.is-editing {
+    overflow: visible;
+}
+
+/* Anchor the suggestion just below the input, taken out of flow so it doesn't
+ * stretch .thread-title-edit (which would re-center the action icons). left:0
+ * lines it up under the title because .thread-title-edit hugs the title text;
+ * right:0 gives it a definite width (so the loading shimmer's width:60% has
+ * something to resolve against instead of collapsing to shrink-to-fit). */
+.thread-view-header .thread-title-edit .thread-title-suggestion {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+}
+
 .thread-title-input.thread-title-display {
     background: transparent;
     border-color: transparent;
     cursor: pointer;
     margin: -0.125rem -0.25rem;
     transition: background var(--duration-fast) ease;
-    resize: none;
     overflow: hidden;
     word-break: break-word;
     overflow-wrap: anywhere;
@@ -770,6 +897,18 @@
     position: static;
     opacity: 1;
     cursor: text;
+}
+
+/* Mobile edit field is a <textarea> so a long title wraps to multiple lines
+ * instead of scrolling on one line. No manual resize handle; its height is
+ * driven to fit the content by autoResizeTextarea (overflow hidden so no
+ * scrollbar flickers mid-grow). overflow-wrap:anywhere matches the read-only
+ * display so an unbreakable string still wraps. Desktop stays a single-line
+ * <input> and never matches this rule. */
+textarea.thread-title-edit-input {
+    resize: none;
+    overflow: hidden;
+    overflow-wrap: anywhere;
 }
 
 /* Suggestion area below the input */

@@ -1,6 +1,6 @@
 ---
 name: Lucidos CLI (`lucidos`)
-description: Shell command available on PATH for any subprocess Lucidos spawns (Python, bash, Claude Code) — writes files under `data/`, emits and queries domain events, lists thread summaries (`lucidos threads list/count`), spawns threads (`lucidos spawn-thread`, including app coding-agent threads via `--folder data/apps/<id>`), lists and applies pending changes (`lucidos changes list` / `lucidos changes apply <id>`), and calls external APIs through the engine proxy so credentials never appear in script source, args, env vars, or logs. Prefer this over hand-rolling HTTP calls back to the engine and over `curl -H "Authorization: Bearer $CRED_..."`.
+description: Shell command available on PATH for any subprocess Lucidos spawns (Python, bash, Claude Code) — writes files under `data/`, emits and queries domain events, lists thread summaries (`lucidos threads list/count`), spawns threads (`lucidos spawn-thread`, including app coding-agent threads via `--folder data/apps/<id>`), lists and applies pending changes (`lucidos changes list` / `lucidos changes apply <id>`), reads system-knowhow on demand (`lucidos knowhow list` / `lucidos knowhow read <id>` — how an app coding-agent thread fetches app-building guides), and calls external APIs through the engine proxy so credentials never appear in script source, args, env vars, or logs. Prefer this over hand-rolling HTTP calls back to the engine and over `curl -H "Authorization: Bearer $CRED_..."`.
 ---
 
 # `lucidos` CLI
@@ -11,7 +11,8 @@ A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos 
 - emit or query domain events on the workspace's event store
 - list or count *thread summaries* in the workspace — useful for "is anything still running?" gates in triggers
 - spawn a new *thread* — a chat thread, or (`--cc`) a *coding-agent thread* on a repo or an app folder (`--folder data/apps/<id>`) — `lucidos spawn-thread`
-- list pending / applied *changes* (`lucidos changes list`) and apply a pending one (the CC-proposed branch waiting on the Apply button) — `lucidos changes apply <id>`
+- list pending / applied *changes* (`lucidos changes list`) and apply a pending one (the coding-agent-proposed branch waiting on the Apply button) — `lucidos changes apply <id>`
+- read engine-shipped system-knowhow (and user knowhow) — `lucidos knowhow list` / `lucidos knowhow read <id>` — the way an *app coding-agent thread* (whose worktree can't see `system-knowhow/`) pulls app-building guides on demand
 - call an external API that's configured in `data/config/apis.json` (auth header injected by the engine — credential never appears in the script)
 - send a push notification to the user without going through an LLM thread
 
@@ -59,7 +60,18 @@ $ lucidos data write artifacts/ua-analysis/2026-04-20/report.html --from /tmp/re
 $ echo '{"hello": "world"}' | lucidos data write artifacts/foo.json
 ```
 
-The resolved absolute path is printed on **stderr** so it can be captured separately from any future structured stdout.
+Two outputs:
+
+- **stderr** — the resolved absolute filesystem path, so it can be captured separately (`… 2>/tmp/path`).
+- **stdout** — a ready-to-paste clickable Lucidos chat link, mirroring `lucidos spawn-thread`:
+
+```bash
+$ echo '# notes' | lucidos data write artifacts/ost-jira-workflow/node-types-and-attributes.md
+[node-types-and-attributes.md](artifacts/ost-jira-workflow/node-types-and-attributes.md)   # stdout
+/Users/.../workspaces/work/data/artifacts/ost-jira-workflow/node-types-and-attributes.md   # stderr
+```
+
+**Linking an artifact in chat — use the bare store path, never a scheme.** The clickable form is the `data/`-rooted path with no URL scheme (e.g. `artifacts/ost-jira-workflow/node-types-and-attributes.md`, or with the leading `data/`); the frontend's path linkifier rewrites it into a file-preview link. There is **no `artifact:` or `file:` scheme** — inventing one (by analogy to `thread:`/`app:`) produces a dead link the browser can't resolve. Paste the stdout link verbatim, or keep its target and swap the label for something friendlier: `[OST node types & attributes](artifacts/ost-jira-workflow/node-types-and-attributes.md)`.
 
 ### `lucidos events emit <EventType> --payload <json> [--summary <str>]`
 
@@ -153,7 +165,7 @@ $ lucidos threads list --active --limit 5 | jq '.[].title'
 ```
 
 - `--active` restricts to threads where the agentic loop is mid-flow — status `running` or `waiting_for_user_answer`. Status `waiting` is **not** active: it means the coding-agent thread has stopped and proposed changes the user must act on (the loop has paused). Status `failed` is also excluded — the response is over.
-- `--source` is a comma-separated list of `chat`, `trigger`, `claude_code`. Omit for all sources.
+- `--source` is a comma-separated list of `chat`, `trigger`, `coding-agent`. Legacy `claude_code` is also accepted. Omit for all sources.
 - `--limit` clamps to `1..=1000` server-side, default 100.
 
 Use this from a script that needs to react to thread state — e.g. "is anything still running before I fire this trigger?" — without reconstructing it from raw `query_events`. The projection already tracks per-thread status; the list endpoint is just a read off it.
@@ -183,7 +195,7 @@ Start a new *thread* in another (or this same) workspace — a *chat thread* by 
 
 **Worktree targeting for `--cc` threads:**
 
-- `--repo <name|uuid>` — create the worktree from a registered *repository*. Defaults from `$LUCIDOS_REPO` (the engine sets it to the calling thread's repo) so a CC sidequest stays in its caller's repo. Pass `--repo ""` to force the target workspace's default repo.
+- `--repo <name|uuid>` — create the worktree from a registered *repository*. Defaults from `$LUCIDOS_REPO` (the engine sets it to the calling thread's repo) so a coding-agent sidequest stays in its caller's repo. Pass `--repo ""` to force the target workspace's default repo.
 - `--folder <path>` — target an app folder instead, spawning an **app coding-agent thread**. A `data/apps/<id>` value (workspace-relative, resolved on the *target* workspace) creates a sparse-checkout worktree narrowed to that app folder whose *Apply* ff-merges into the workspace's `main` — no `/harden`, no engine restart. This is the same machinery the `run_claude` tool's `folder` argument produces. Only whole app folders are valid; the engine rejects other `data/` subtrees, app subpaths, and non-existent folders.
 
 `--folder` and `--repo` are mutually exclusive, and `--folder` requires `--cc` (the CLI errors before any HTTP round-trip on either). When `--folder` is set the `$LUCIDOS_REPO` default is suppressed — the engine rejects a request that carries both a repo and a folder.
@@ -264,7 +276,7 @@ The response carries `pending` (array of pending changes, each with `id` / `bran
 
 ### `lucidos changes apply <change-id>`
 
-Apply a pending *change* (a CC-proposed branch that's waiting on the Apply button). Wraps `POST /api/v1/changes/<id>/apply` and echoes the engine's typed `ApplyChangeResult` JSON to stdout. Get the id from `lucidos changes list` (`.pending[].id`).
+Apply a pending *change* (a coding-agent-proposed branch that's waiting on the Apply button). Wraps `POST /api/v1/changes/<id>/apply` and echoes the engine's typed `ApplyChangeResult` JSON to stdout. Get the id from `lucidos changes list` (`.pending[].id`).
 
 ```bash
 $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
@@ -321,6 +333,31 @@ curl -k -X POST \
 ```
 
 The engine listens on `https://` with a self-signed cert in dev (`-k` / `_create_unverified_context()` accepts it; the CLI already does). The token env var is process-local secret state set by the engine on every spawned subprocess; the thread id is set when the subprocess has a spawning thread. See `docs/apply-change-api.md` for the response shape and the full apply workflow.
+
+### `lucidos knowhow list`
+
+List the merged user + system-knowhow catalog. Wraps `GET /api/v1/knowhow` and echoes the engine's payload verbatim: `{ "knowhow": [{ "id", "name", "description" }] }`. Engine-shipped reference docs carry the `system-knowhow/` id prefix; user-curated knowhow uses its path under `data/knowhow/` without `.md`. Read `.knowhow[].id` to find the id to pass to `read`.
+
+```bash
+$ lucidos knowhow list
+{"knowhow":[{"id":"audit-checklist","name":"Audit checklist","description":"..."},{"id":"system-knowhow/building-an-app","name":"Building an App","description":"Use when the user wants to build..."},...]}
+```
+
+### `lucidos knowhow read <id>`
+
+Read one knowhow doc's full content by id. Wraps `GET /api/v1/knowhow/read?id=<id>` and prints the same `[KNOW-HOW: …]` / `[SYSTEM-KNOWHOW: …]` block the chat agent's `load_knowhow` tool returns. Exit non-zero (with the engine's not-found sentinel on stderr) when the id resolves to nothing.
+
+```bash
+$ lucidos knowhow read system-knowhow/building-an-app
+[SYSTEM-KNOWHOW: Building an App]
+# Building an App
+…
+[END SYSTEM-KNOWHOW]
+```
+
+**Why this exists.** The chat Lucidos Agent loads `system-knowhow/*.md` via its in-process `load_knowhow` tool — but an *app coding-agent thread* runs in a sparse-checkout *worktree* narrowed to a single `data/apps/<id>/` folder, so the engine's `system-knowhow/` is neither on disk nor reachable via that tool. This subcommand is how such a session (Claude Code or Codex) pulls the same app-building guidance — `system-knowhow/building-an-app` (when an app is the right answer, scaffolding defaults, common mistakes), `system-knowhow/js-sdk` (the `lucidos.*` SDK surface), `system-knowhow/best-practices` (file layout, where app data lives) — on demand. Load the relevant knowhow before writing app code rather than guessing at the SDK surface or data paths.
+
+> **In-thread agent:** the chat Lucidos Agent uses the `load_knowhow` LLM tool with the same id (`system-knowhow/<id>`), in-process. Use `load_knowhow` from a chat / trigger thread; use this CLI from a coding-agent thread or a bash / Python subprocess that has no in-process tool access.
 
 ### `lucidos proxy <name> [path] [-X METHOD] [-H "Hdr: val"] [-d body | --data-stdin] [-i] [--fail]`
 
@@ -393,7 +430,7 @@ Output is the response body on **stdout**. With `--include`, the status line and
 | Write a file under `data/` | `lucidos data write …` |
 | Push a notification to the user from a script | `lucidos notify --title … --message …` |
 | Find a pending change's id from a script | `lucidos changes list` (read `.pending[].id`; don't scan `ChangeProposed` events) |
-| Apply a CC-proposed change from a script | `lucidos changes apply <id>` (never hand-roll the HTTP call — actor stamps as "You") |
+| Apply a coding-agent-proposed change from a script | `lucidos changes apply <id>` (never hand-roll the HTTP call — actor stamps as "You") |
 
 If you find a script doing `curl -H "Authorization: Bearer $CRED_..."` against an API the workspace already owns a credential for, that's drift — add an `apis.json` entry and switch the script to `lucidos proxy`.
 

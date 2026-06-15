@@ -25,6 +25,28 @@ pub enum CodingAgent {
     Codex,
 }
 
+impl CodingAgent {
+    /// Wire/DB string for this backend — same kebab-case values serde uses
+    /// (`claude-code`, `codex`), so the `thread_summaries.coding_agent`
+    /// column, event payloads, and HTTP request bodies all share one root.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Parse a stored backend string. Unknown / legacy NULL-ish values fall
+    /// back to `ClaudeCode` — every thread persisted before the column
+    /// existed was a Claude Code thread.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "codex" => Self::Codex,
+            _ => Self::ClaudeCode,
+        }
+    }
+}
+
 /// Canonical event emitted by a coding agent. Implementors translate their
 /// CLI's output format into this enum before sending it over `events_rx`.
 #[derive(Debug, Clone)]
@@ -80,7 +102,15 @@ pub enum AgentEvent {
     },
     /// Process exited. Always the last event before `events_rx` closes.
     /// Stderr is logged inside the runtime — consumers don't need to handle it.
-    Exited,
+    ///
+    /// `killed_by_signal` is `true` when the agent process died from a signal
+    /// the engine did NOT initiate — a stray `SIGTERM`/`SIGKILL` (e.g. the
+    /// `exit=143` Node-caught-SIGTERM case) observed as the process's *natural*
+    /// exit status, before any engine-side teardown kill. The safety net reads
+    /// it to auto-resume an unexpectedly-killed mid-stream turn (via
+    /// `ContinuationRequested`) instead of surfacing a red-dot abort. A clean
+    /// exit, an EOF close, or an engine-initiated cancel all report `false`.
+    Exited { killed_by_signal: bool },
 }
 
 /// User input sent to a running agent.
@@ -143,6 +173,44 @@ pub struct SpawnArgs<'a> {
     /// AskUserQuestion redirect (which would hang an unattended session
     /// waiting for an answer that's not coming).
     pub interactive: bool,
+    /// True when the engine resumes a mid-turn-interrupted session with NO
+    /// new user input (the `ContinuationRequested` recovery path) and expects
+    /// the agent to pick up where it left off on its own.
+    ///
+    /// Claude Code ignores this: `claude --print --resume` auto-injects
+    /// "Continue from where you left off." before reading stdin. Runtimes
+    /// whose CLI only acts on an explicit prompt (Codex) use it to start the
+    /// first turn with an equivalent continuation prompt instead of waiting
+    /// for an input that will never arrive.
+    pub continuation: bool,
+}
+
+/// An in-band permission request raised by the agent's own protocol — the
+/// Codex app-server's `item/commandExecution/requestApproval` /
+/// `item/fileChange/requestApproval` JSON-RPC requests. The engine's run
+/// loop consumes these from `RunningAgent::permission_rx`, drives the same
+/// `CodingAgentPermissionRequest` → PermissionCard → broadcast machinery the
+/// CC MCP HTTP path uses, and answers via `respond` (`true` = accept,
+/// `false` = decline); the driver then replies to the JSON-RPC request.
+///
+/// Claude Code does NOT use this channel — its permission prompts arrive
+/// out-of-band over HTTP (`lucidos mcp-permission-server` →
+/// `/api/v1/internal/permission-prompt`), so its `RunningAgent` carries
+/// `permission_rx: None`.
+#[derive(Debug)]
+pub struct AgentPermissionRequest {
+    /// The agent's identifier for the tool call being approved (the Codex
+    /// item id). Becomes `CodingAgentPermissionRequest.tool_use_id`.
+    pub id: String,
+    /// Backend-shaped tool name (`command_execution` / `file_change`) —
+    /// same vocabulary the backend's `CodingAgentToolCalled` events use.
+    pub tool_name: String,
+    /// Tool input for the card's summary line + dedup key (e.g.
+    /// `{"command": "...", "cwd": "..."}`).
+    pub input: serde_json::Value,
+    /// One-shot answer channel. Dropping the receiver (driver death) tells
+    /// the engine-side waiter to abandon the prompt.
+    pub respond: tokio::sync::oneshot::Sender<bool>,
 }
 
 /// A spawned agent. The runtime owns the child process and an internal driver
@@ -157,6 +225,10 @@ pub struct RunningAgent {
     pub events_rx: mpsc::UnboundedReceiver<AgentEvent>,
     pub input_tx: mpsc::UnboundedSender<AgentInput>,
     pub control_tx: mpsc::UnboundedSender<ControlRequest>,
+    /// In-band permission requests (see [`AgentPermissionRequest`]). `None`
+    /// for backends whose permissions flow out-of-band (Claude Code's MCP
+    /// HTTP path, the Codex exec driver's sandbox-only model).
+    pub permission_rx: Option<mpsc::UnboundedReceiver<AgentPermissionRequest>>,
 }
 
 #[async_trait]
@@ -168,4 +240,27 @@ pub trait AgentRuntime: Send + Sync {
         args: SpawnArgs<'_>,
         cancel: CancellationToken,
     ) -> Result<RunningAgent, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CodingAgent;
+
+    #[test]
+    fn coding_agent_as_str_matches_serde_wire_values() {
+        // The DB column, event payloads, and HTTP bodies must share one root —
+        // as_str() and serde's kebab-case rename are the same contract.
+        for agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
+            let wire = serde_json::to_value(agent).unwrap();
+            assert_eq!(wire, serde_json::Value::String(agent.as_str().to_string()));
+            assert_eq!(CodingAgent::parse(agent.as_str()), agent);
+        }
+    }
+
+    #[test]
+    fn coding_agent_parse_defaults_unknown_to_claude_code() {
+        // Legacy NULL/garbage rows predate the column — all were Claude Code.
+        assert_eq!(CodingAgent::parse(""), CodingAgent::ClaudeCode);
+        assert_eq!(CodingAgent::parse("forgecode"), CodingAgent::ClaudeCode);
+    }
 }

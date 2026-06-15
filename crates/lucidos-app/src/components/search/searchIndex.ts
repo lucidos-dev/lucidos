@@ -36,6 +36,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'repositories', label: 'Repositories', subview: 'repositories', path: 'Settings' },
   { id: 'backup', label: 'Backup', subview: 'backup', path: 'Settings' },
   { id: 'memory', label: 'Memory', subview: 'memory', path: 'Settings' },
+  { id: 'permissions', label: 'Permissions', subview: 'permissions', path: 'Settings', keywords: 'permissions security command guard safety allowlist claude code lucidos agent bash python tools' },
   { id: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', subview: 'keyboard-shortcuts', path: 'Settings', keywords: 'keybindings hotkeys shortcut' },
 
   // Models subview
@@ -43,6 +44,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:image-generation', label: 'Image Generation', subview: 'models', path: 'Settings → Models', anchor: 'models:image-generation' },
   { id: 'models:background-tasks', label: 'Background Tasks', subview: 'models', path: 'Settings → Models', anchor: 'models:background-tasks' },
   { id: 'models:vertex-ai', label: 'Vertex AI', subview: 'models', path: 'Settings → Models', anchor: 'models:vertex-ai' },
+  { id: 'models:providers', label: 'Providers', subview: 'models', path: 'Settings → Models', anchor: 'models:providers', keywords: 'providers anthropic openai api key direct credential gpt claude' },
   { id: 'models:reasoning', label: 'Reasoning', subview: 'models', path: 'Settings → Models → Chat', anchor: 'models:reasoning' },
   { id: 'models:title-generation', label: 'Title generation', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:title-generation' },
   { id: 'models:image-description', label: 'Image description', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:image-description' },
@@ -68,6 +70,14 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Accounts subview
   { id: 'accounts:credentials', label: 'Credentials', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:credentials' },
   { id: 'accounts:oauth', label: 'OAuth', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:oauth' },
+
+  // Permissions subview (Command Safety + the two allowlist editors)
+  { id: 'command-safety', label: 'Command Safety', subview: 'permissions', path: 'Settings → Permissions', anchor: 'command-safety', keywords: 'command guard safety bash python shell judge' },
+  { id: 'command-safety:guard', label: 'Command guard', subview: 'permissions', path: 'Settings → Permissions → Command Safety', anchor: 'command-safety:guard', keywords: 'command guard safety bash python shell' },
+  { id: 'command-safety:judge', label: 'LLM judge', subview: 'permissions', path: 'Settings → Permissions → Command Safety', anchor: 'command-safety:judge', keywords: 'command guard llm judge' },
+  { id: 'command-safety:judge-model', label: 'Judge model', subview: 'permissions', path: 'Settings → Permissions → Command Safety', anchor: 'command-safety:judge-model', keywords: 'command guard judge model haiku' },
+  { id: 'permissions:lucidos', label: 'Lucidos Agent permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:lucidos', keywords: 'lucidos agent command allowlist bash python always allow auto allow' },
+  { id: 'permissions:claude-code', label: 'Claude Code permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:claude-code', keywords: 'claude code coding agent tool permissions allowed tools allowlist' },
 ];
 
 /** Per-shortcut search entries, synthesized from the registry so they reflect

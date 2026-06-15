@@ -89,6 +89,11 @@ describe('handleNavigationRequest', () => {
     expect(switchMenuItem).toHaveBeenCalledWith('files');
   });
 
+  it('switches to thread-queue tab (Thread Queue notification tap)', () => {
+    handleNavigationRequest({ target: 'thread-queue' });
+    expect(switchMenuItem).toHaveBeenCalledWith('thread-queue');
+  });
+
   it('opens app by id', () => {
     handleNavigationRequest({ target: 'app', app_id: 'my-app' });
     expect(openAppById).toHaveBeenCalledWith('my-app');

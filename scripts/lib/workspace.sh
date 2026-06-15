@@ -170,9 +170,12 @@ resolve_workspace() {
     # Workspace-scoped state files
     ENGINE_PIDFILE="$WORKSPACE/.lucidos/engine.pid"
     FRONTEND_PIDFILE="$WORKSPACE/.lucidos/frontend.pid"
-    # --built mode runs a second process (`vite build --watch`) alongside the
-    # `vite preview` server tracked by FRONTEND_PIDFILE. Empty file in dev mode.
-    BUILD_WATCH_PIDFILE="$WORKSPACE/.lucidos/build-watch.pid"
+    # NOTE: --built mode's `vite build --watch` is NOT workspace-scoped — it
+    # produces the SHARED crates/lucidos-app/dist/ that every workspace of this
+    # checkout serves through its own `vite preview`, so it's a checkout-level
+    # singleton tracked by build_watch_pidfile (below), not a per-workspace pid.
+    # A legacy per-workspace build-watch.pid from pre-singleton runs is cleaned
+    # up by kill_stale_processes / stop.sh.
     ENGINE_LOG="$WORKSPACE/.lucidos/engine.log"
 
     # Compute a short name for the postgres container from workspace path
@@ -697,19 +700,21 @@ kill_stale_processes() {
         rm -f "$FRONTEND_PIDFILE"
     fi
 
-    # Stop any existing --built mode build-watch (skip in --engine-only mode).
-    # Symmetric with the frontend kill above: the parent-script `pkill -P` only
-    # reaps it if the prior dev script is still alive, so a crashed prior run
-    # would otherwise orphan the `vite build --watch` and leak its file watcher.
-    if [ -z "$ENGINE_ONLY" ] && [ -f "$BUILD_WATCH_PIDFILE" ]; then
-        local old_pid
-        old_pid="$(cat "$BUILD_WATCH_PIDFILE" 2>/dev/null || true)"
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            echo "Stopping existing frontend build-watch for this workspace (PID $old_pid)..."
-            kill "$old_pid" 2>/dev/null || true
+    # The --built mode `vite build --watch` is now a checkout-level singleton
+    # shared across workspaces (build_watch_pidfile), so a per-workspace restart
+    # must NOT tear it down — start_frontend_built reuses it when healthy and
+    # rebuilds only when it's dead, dist/ is broken, or this is a SOLO `-b`.
+    # Clean up a legacy per-workspace build-watch from pre-singleton runs so it
+    # can't linger as an orphan duplicating the shared one.
+    if [ -z "$ENGINE_ONLY" ] && [ -f "$WORKSPACE/.lucidos/build-watch.pid" ]; then
+        local legacy_bw
+        legacy_bw="$(cat "$WORKSPACE/.lucidos/build-watch.pid" 2>/dev/null || true)"
+        if [ -n "$legacy_bw" ] && kill -0 "$legacy_bw" 2>/dev/null; then
+            echo "Stopping legacy per-workspace build-watch (PID $legacy_bw)..."
+            kill "$legacy_bw" 2>/dev/null || true
             killed=1
         fi
-        rm -f "$BUILD_WATCH_PIDFILE"
+        rm -f "$WORKSPACE/.lucidos/build-watch.pid"
     fi
 
     # Wait for killed processes to release their ports before the caller
@@ -976,6 +981,36 @@ running_frontend_workspaces_in_project() (
     done
 )
 
+# ── shared build-watch (checkout-level singleton) ───────────────────────
+# --built mode's `vite build --watch` produces the SHARED crates/lucidos-app/dist/
+# that every workspace of this checkout serves via its own `vite preview`. It is
+# therefore a checkout-level singleton, NOT per workspace: the first --built
+# workspace to start it owns it; later workspaces reuse it (start_frontend_built).
+# Rebuilding it per workspace would republish a byte-fresh sw.js into the shared
+# dist/ and spuriously fire the "New version available" toast on every OTHER
+# workspace's open tab (the determinism guard means identical source never changes
+# the BUILD_ID — so the toast only fires when a republish drags those tabs forward).
+build_watch_pidfile() { echo "$PROJECT_DIR/crates/lucidos-app/.build-watch/pid"; }
+build_watch_log()     { echo "$PROJECT_DIR/crates/lucidos-app/.build-watch/log"; }
+
+# Tear down the shared build-watch only when NO workspace of this checkout is
+# still serving the frontend. Call AFTER this workspace's frontend.pid has been
+# removed, so running_frontend_workspaces_in_project no longer counts us. No-op
+# when no shared build-watch is recorded (e.g. --hmr mode).
+teardown_shared_build_watch_if_idle() {
+    local pidfile; pidfile="$(build_watch_pidfile)"
+    [ -f "$pidfile" ] || return 0
+    if [ -n "$(running_frontend_workspaces_in_project "$PROJECT_DIR")" ]; then
+        return 0   # another workspace still serves this checkout — keep it alive
+    fi
+    local pid; pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "Stopping shared frontend build-watch (PID $pid) — no workspaces left serving this checkout"
+        kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+}
+
 # ── _resolve_npm_install_root ─────────────────────────────────────────
 # For npm-workspace members, deps are hoisted to the workspace root —
 # the per-package node_modules dir often only holds Vite's cache (or
@@ -998,15 +1033,37 @@ _resolve_npm_install_root() {
     echo "$dir"
 }
 
+# ── _deps_fingerprint ──────────────────────────────────────────────────
+# Content fingerprint of the inputs that decide an npm install at this root:
+# every package.json in the tree (heavy/irrelevant dirs pruned) plus the
+# root lockfile. Content-only by design — unlike an mtime comparison, a
+# no-op rewrite (a git checkout, `git worktree add`, or a CC change apply
+# rewrites package.json and bumps its mtime without changing a byte) yields
+# an identical fingerprint, so it can't trigger a spurious reinstall that
+# would deadlock an engine-only restart while a frontend is running.
+# cksum is portable (macOS + Linux) and sufficient for change detection.
+_deps_fingerprint() {
+    local root="$1"
+    {
+        find "$root" \
+            \( -name node_modules -o -name .git -o -name target \
+               -o -name .lucidos -o -name dist \) -prune \
+            -o -name package.json -print 2>/dev/null \
+            | LC_ALL=C sort | while IFS= read -r f; do cat "$f"; done
+        [ -f "$root/package-lock.json" ] && cat "$root/package-lock.json"
+    } | cksum
+}
+
 # ── ensure_npm_deps ───────────────────────────────────────────────────
-# Run npm install if node_modules is missing or package.json has changed.
-# Refuses if any other workspace has a running frontend dev server inside
-# THIS project ($PROJECT_DIR) — npm workspaces hoists deps to one shared
-# node_modules tree, so mutating it under a running Vite silently corrupts
-# its in-memory module graph (stale inodes) and turns it into a wedged
-# "200 with wrong body" server — manifesting as a blank page in the browser.
-# Vites running from a different physical checkout (e.g. a CC worktree)
-# don't share node_modules with this project and aren't blocked.
+# Run npm install if node_modules is missing or the dependency fingerprint
+# changed (see _deps_fingerprint — content, not mtime). Refuses if any other
+# workspace has a running frontend dev server inside THIS project
+# ($PROJECT_DIR) — npm workspaces hoists deps to one shared node_modules
+# tree, so mutating it under a running Vite silently corrupts its in-memory
+# module graph (stale inodes) and turns it into a wedged "200 with wrong
+# body" server — manifesting as a blank page in the browser. Vites running
+# from a different physical checkout (e.g. a CC worktree) don't share
+# node_modules with this project and aren't blocked.
 # Usage: ensure_npm_deps "path/to/package" "label"
 ensure_npm_deps() {
     local dir="$1"
@@ -1021,23 +1078,49 @@ ensure_npm_deps() {
     local install_root
     install_root="$(_resolve_npm_install_root "$dir")"
 
+    local stamp="$install_root/node_modules/.lucidos-deps-stamp"
+
     if [ ! -d "$install_root/node_modules" ]; then
         needs_install="node_modules missing"
-    elif [ "$dir/package.json" -nt "$install_root/node_modules" ]; then
-        # node_modules dir mtime is updated by every `npm install` (it always
-        # rewrites .package-lock.json). The local .package-lock.json file isn't
-        # reliable in npm-workspace setups — installs at the root don't touch
-        # the per-package lockfile, so it's permanently "stale" and would
-        # trigger spurious reinstalls every startup.
-        needs_install="package.json changed"
-    elif [ "$install_root" != "$dir" ] && [ "$install_root/package.json" -nt "$install_root/node_modules" ]; then
-        needs_install="root package.json changed"
+    elif [ ! -f "$stamp" ]; then
+        # node_modules exists but predates this fingerprint scheme (installed by
+        # an older script, or `npm install` run directly). Trust it as current
+        # and stamp it now rather than forcing a reinstall — forcing one here
+        # would deadlock an engine-only restart whenever a frontend is running.
+        # Genuine content changes are detected normally once the stamp exists.
+        _deps_fingerprint "$install_root" > "$stamp" 2>/dev/null || true
+    elif [ "$(_deps_fingerprint "$install_root")" != "$(cat "$stamp" 2>/dev/null)" ]; then
+        needs_install="dependencies changed"
     fi
 
     if [ -n "$needs_install" ]; then
         local active
         active="$(running_frontend_workspaces_in_project "$PROJECT_DIR")"
         if [ -n "$active" ]; then
+            # An engine-only restart (CC Apply) deliberately keeps the running
+            # frontend alive — kill_stale_processes skips the Vite + build-watch
+            # teardown when ENGINE_ONLY is set, so this restart never killed it.
+            # Installing now would corrupt that frontend's shared node_modules,
+            # but aborting (exit 1) would leave the workspace with NO engine at
+            # all — build_sdk runs before the ENGINE_ONLY early-exit in
+            # web-dev.sh, so a hard-fail here kills the whole restart. So in
+            # ENGINE_ONLY mode we skip the install, keep the existing (working)
+            # node_modules, and let the engine come up; the deferred deps land on
+            # the next full frontend restart (the stamp is intentionally left
+            # un-updated so that restart re-detects the change). Outside
+            # ENGINE_ONLY this is a genuine conflict — a second workspace launch
+            # against shared deps — so hard-fail and tell the user to stop it.
+            if [ -n "${ENGINE_ONLY:-}" ]; then
+                echo "" >&2
+                echo "WARNING: $label changed ($needs_install) but a frontend in this checkout is running for:" >&2
+                while IFS= read -r ws; do
+                    [ -n "$ws" ] && echo "  - $ws" >&2
+                done <<< "$active"
+                echo "Skipping install to keep that frontend alive; the engine will still restart." >&2
+                echo "Run a full restart (./scripts/stop.sh -w <name> then ./scripts/web-dev.sh -w <name>) to pick up the new dependencies." >&2
+                echo "" >&2
+                return 0
+            fi
             echo "" >&2
             echo "ERROR: $label install needed ($needs_install), but a frontend in this checkout is running for:" >&2
             while IFS= read -r ws; do
@@ -1051,6 +1134,8 @@ ensure_npm_deps() {
         fi
         echo "Installing $label ($needs_install)..."
         (cd "$dir" && npm install)
+        # Record what we just installed so the next check compares content.
+        _deps_fingerprint "$install_root" > "$stamp" 2>/dev/null || true
     fi
 }
 
@@ -1101,8 +1186,12 @@ wait_for_frontend() {
     echo "  $probe_url returned content-type: ${content_type:-<no response>}" >&2
     kill "$FRONTEND_PID" 2>/dev/null || true
     rm -f "$FRONTEND_PIDFILE"
-    if [ -n "${BUILD_WATCH_PID:-}" ]; then kill "$BUILD_WATCH_PID" 2>/dev/null || true; fi
-    rm -f "$BUILD_WATCH_PIDFILE" 2>/dev/null || true
+    # Only tear down the shared build-watch if THIS launch started it (owns it);
+    # a reused one belongs to a sibling workspace still serving the checkout.
+    if [ -n "${BUILD_WATCH_OWNED:-}" ] && [ -n "${BUILD_WATCH_PID:-}" ]; then
+        kill "$BUILD_WATCH_PID" 2>/dev/null || true
+        rm -f "$(build_watch_pidfile)" 2>/dev/null || true
+    fi
     exit 1
 }
 
@@ -1151,38 +1240,84 @@ start_frontend_dev() {
 # "New version available" toast (driven by the per-build sw.js stamp) signals
 # when a rebuild is ready to reload. Note: like the dev server, this skips
 # `tsc --noEmit` — type errors surface at the explicit build / in CC harden.
+#
+# The `vite build --watch` + dist/ are a CHECKOUT-LEVEL singleton shared by every
+# workspace of this checkout (build_watch_pidfile). This launch REUSES a healthy
+# shared build-watch instead of rebuilding when another workspace is already
+# serving the checkout — a rebuild would republish a byte-fresh sw.js into the
+# shared dist/ and spuriously fire "New version available" on those workspaces'
+# open tabs. A SOLO `-b` restart still rebuilds from scratch (clears a wedged
+# build-watch — the stale-CSS remedy — and matches the pre-singleton behavior).
 start_frontend_built() {
-    echo "Building frontend (vite build --watch)..."
-    # Clean slate so dist/index.html only (re)appears when THIS build finishes
-    # — avoids starting preview against a stale or half-written dist.
-    rm -rf "$FRONTEND_DIR/dist"
-    (cd "$FRONTEND_DIR" && npx vite build --watch) > /dev/null 2>&1 &
-    BUILD_WATCH_PID=$!
-    echo $BUILD_WATCH_PID > "$BUILD_WATCH_PIDFILE"
+    local bw_pidfile bw_log
+    bw_pidfile="$(build_watch_pidfile)"
+    bw_log="$(build_watch_log)"
+    mkdir -p "${bw_pidfile%/*}"
 
-    echo -n "Waiting for initial frontend build"
-    local build_deadline=$((SECONDS + 180))
-    while (( SECONDS < build_deadline )); do
-        if [ -f "$FRONTEND_DIR/dist/index.html" ]; then echo " done!"; break; fi
-        if ! kill -0 "$BUILD_WATCH_PID" 2>/dev/null; then
+    local existing_pid="" healthy=""
+    if [ -f "$bw_pidfile" ]; then existing_pid="$(cat "$bw_pidfile" 2>/dev/null || true)"; fi
+    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null && [ -f "$FRONTEND_DIR/dist/index.html" ]; then
+        healthy=1
+    fi
+
+    # Is another workspace of THIS checkout currently serving the shared dist/?
+    # (This workspace's own frontend.pid was removed by kill_stale_processes, so
+    # it is not counted here.)
+    local others_serving
+    others_serving="$(running_frontend_workspaces_in_project "$PROJECT_DIR")"
+
+    # Reuse the healthy shared build-watch when another workspace is serving the
+    # checkout (don't disturb their tabs) OR this isn't an explicit `-b` rebuild
+    # (the watch already keeps dist/ current). Otherwise (re)build and take
+    # ownership — covers a dead/broken watch and the solo `-b` rebuild.
+    if [ -n "$healthy" ] && { [ -n "$others_serving" ] || [ -z "${BUILD:-}" ]; }; then
+        echo "Reusing shared frontend build-watch (PID $existing_pid) serving $FRONTEND_DIR/dist."
+        BUILD_WATCH_OWNED=""
+    else
+        if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+            echo "Replacing existing frontend build-watch (PID $existing_pid)..."
+            kill "$existing_pid" 2>/dev/null || true
+        fi
+        echo "Building frontend (vite build --watch)..."
+        # Clean slate. dist/ is the LIVE dir preview serves; dist.staging/dist.prev
+        # are the atomic-publish scratch dirs (LUCIDOS_ATOMIC_DIST in vite.config.ts):
+        # the watch builds into dist.staging and renames it onto dist/ only after a
+        # complete build, so a failed/interrupted rebuild can't leave preview serving
+        # a shell-less dist/ (the "404 on every page" failure mode).
+        rm -rf "$FRONTEND_DIR/dist" "$FRONTEND_DIR/dist.staging" "$FRONTEND_DIR/dist.prev"
+        # Build output goes to a log (not /dev/null) so a build failure is one
+        # `tail` away instead of an unexplained 404.
+        (cd "$FRONTEND_DIR" && LUCIDOS_ATOMIC_DIST=1 npx vite build --watch) > "$bw_log" 2>&1 &
+        BUILD_WATCH_PID=$!
+        BUILD_WATCH_OWNED=1
+        echo "$BUILD_WATCH_PID" > "$bw_pidfile"
+
+        echo -n "Waiting for initial frontend build (log: $bw_log)"
+        local build_deadline=$((SECONDS + 180))
+        while (( SECONDS < build_deadline )); do
+            if [ -f "$FRONTEND_DIR/dist/index.html" ]; then echo " done!"; break; fi
+            if ! kill -0 "$BUILD_WATCH_PID" 2>/dev/null; then
+                echo ""
+                echo "ERROR: vite build --watch exited before producing dist/index.html. See $bw_log" >&2
+                rm -f "$bw_pidfile"
+                exit 1
+            fi
+            echo -n "."
+            sleep 1
+        done
+        if [ ! -f "$FRONTEND_DIR/dist/index.html" ]; then
             echo ""
-            echo "ERROR: vite build --watch exited before producing dist/index.html." >&2
-            rm -f "$BUILD_WATCH_PIDFILE"
+            echo "ERROR: initial frontend build did not complete within 180s. See $bw_log" >&2
+            kill "$BUILD_WATCH_PID" 2>/dev/null || true
+            rm -f "$bw_pidfile"
             exit 1
         fi
-        echo -n "."
-        sleep 1
-    done
-    if [ ! -f "$FRONTEND_DIR/dist/index.html" ]; then
-        echo ""
-        echo "ERROR: initial frontend build did not complete within 180s." >&2
-        kill "$BUILD_WATCH_PID" 2>/dev/null || true
-        rm -f "$BUILD_WATCH_PIDFILE"
-        exit 1
     fi
 
     echo "Starting vite preview..."
-    (cd "$FRONTEND_DIR" && npx vite preview --host --port "$INTERNAL_VITE_PORT") > /dev/null 2>&1 &
+    # Serve the published LIVE dir explicitly — the build redirects build.outDir to
+    # dist.staging under LUCIDOS_ATOMIC_DIST, but preview must always serve dist/.
+    (cd "$FRONTEND_DIR" && npx vite preview --host --port "$INTERNAL_VITE_PORT" --outDir dist) > /dev/null 2>&1 &
     FRONTEND_PID=$!
     echo $FRONTEND_PID > "$FRONTEND_PIDFILE"
 
@@ -1260,11 +1395,11 @@ cleanup_processes() {
         kill "$(cat "$FRONTEND_PIDFILE" 2>/dev/null)" 2>/dev/null || true
         rm -f "$FRONTEND_PIDFILE"
     fi
-    # --built mode's `vite build --watch` companion (no-op file in dev mode).
-    if [ -f "$BUILD_WATCH_PIDFILE" ]; then
-        kill "$(cat "$BUILD_WATCH_PIDFILE" 2>/dev/null)" 2>/dev/null || true
-        rm -f "$BUILD_WATCH_PIDFILE"
-    fi
+    # The --built mode `vite build --watch` is a checkout-level singleton shared
+    # across workspaces; tear it down only when no workspace is still serving
+    # this checkout's frontend (this workspace's frontend.pid was removed just
+    # above, so it no longer counts). No-op in --hmr mode.
+    teardown_shared_build_watch_if_idle
     echo "Engine still running for workspace: $WORKSPACE (port $ENGINE_PORT)"
     echo "Stop with: ./scripts/stop.sh -w $WORKSPACE"
     echo "PostgreSQL still running (container lucidos-pg-$PG_NAME). Stop with:"

@@ -22,6 +22,7 @@
 //! - `events` — emit/query/count
 //! - `threads` — run_thread, run_claude, list/count threads
 //! - `changes` — list_changes, apply_change
+//! - `thread_queue` — list_thread_queue, update_thread_queue_policy
 //! - `web` — web_search, fetch_news
 //! - `proxy` — reload_proxy_modules, proxy_request, http_request
 //! - `images` — save_thread_image, generate_image
@@ -46,6 +47,7 @@ mod misc;
 mod notifications;
 mod plugins;
 mod proxy;
+mod thread_queue;
 mod threads;
 mod triggers;
 mod web;
@@ -98,6 +100,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
     tools.extend(events::event_tools()); // emit_event, query_events, count_events
     tools.extend(threads::list_tools()); // list_threads, count_threads
     tools.extend(changes::changes_tools()); // list_changes, apply_change
+    tools.extend(thread_queue::thread_queue_tools()); // list_thread_queue, update_thread_queue_policy
     tools.extend(plugins::plugin_tools()); // install/check/update/uninstall plugin
     tools.extend(misc::ask_user_question_tools()); // ask_user_question
     tools.extend(memory::dismiss_from_context_tools()); // dismiss_from_context

@@ -28,6 +28,10 @@ acquire_e2e_lock e2e || exit 1
 kill_orphan_simulator
 ensure_workspace_running
 teardown_e2e() {
+    # Belt-and-suspenders: e2e-browser.sh stops its own reaper on exit, but if it
+    # died on an untrapped signal the loop is orphaned — reap it here via the
+    # pidfile. No-op when nothing is running.
+    stop_webkit_reaper
     cleanup_e2e_worktrees
     stop_e2e_workspace
     release_e2e_lock

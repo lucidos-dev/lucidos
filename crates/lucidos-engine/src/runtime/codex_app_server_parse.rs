@@ -1,0 +1,520 @@
+//! Codex `app-server` JSON-RPC protocol mapper.
+//!
+//! `codex app-server` speaks line-delimited JSON-RPC 2.0 over stdio (verified
+//! against codex-cli 0.139.0 — `codex app-server generate-json-schema` is the
+//! schema source). Three inbound frame shapes: responses to our requests
+//! (`{"id", "result"|"error"}`), server notifications (`{"method", "params"}`,
+//! no id), and server→client REQUESTS (`{"id", "method", "params"}` — the
+//! approval prompts we must answer).
+//!
+//! Mirrors the two-pure-layer split of `codex_parse.rs`:
+//! [`parse_app_server_line`] decodes one line into an [`AppServerLine`];
+//! [`AppServerTracker`] folds notifications into the canonical
+//! [`AgentEvent`]s. The driver in `codex_app_server.rs` owns the process,
+//! the handshake state machine, and the approval round-trips.
+
+use super::agent_runtime::AgentEvent;
+
+/// One decoded line of `codex app-server` stdout.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum AppServerLine {
+    /// Response to a request WE sent. `error` carries the JSON-RPC error's
+    /// `message` when the request failed.
+    Response {
+        id: u64,
+        result: serde_json::Value,
+        error: Option<String>,
+    },
+    /// Server notification (no id) — the streaming surface.
+    Notification {
+        method: String,
+        params: serde_json::Value,
+    },
+    /// Server→client request (id + method) — approvals. Must be answered or
+    /// codex blocks the item forever.
+    ServerRequest {
+        id: serde_json::Value,
+        method: String,
+        params: serde_json::Value,
+    },
+    /// Unrecognized or non-JSON line — logged by the caller, otherwise ignored.
+    Other,
+}
+
+/// Decode one stdout line. Never fails — undecodable input maps to
+/// [`AppServerLine::Other`] so a protocol surprise can't kill the read loop.
+pub(super) fn parse_app_server_line(line: &str) -> AppServerLine {
+    let line = line.trim();
+    if line.is_empty() {
+        return AppServerLine::Other;
+    }
+    let val: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return AppServerLine::Other,
+    };
+    let id = val.get("id");
+    let method = val.get("method").and_then(|m| m.as_str());
+    match (id, method) {
+        (Some(id), Some(method)) => AppServerLine::ServerRequest {
+            id: id.clone(),
+            method: method.to_string(),
+            params: val.get("params").cloned().unwrap_or(serde_json::Value::Null),
+        },
+        (None, Some(method)) => AppServerLine::Notification {
+            method: method.to_string(),
+            params: val.get("params").cloned().unwrap_or(serde_json::Value::Null),
+        },
+        (Some(id), None) => {
+            // Responses to our requests — we only ever send integer ids.
+            let Some(id) = id.as_u64() else {
+                return AppServerLine::Other;
+            };
+            let error = val
+                .get("error")
+                .map(|e| {
+                    e.get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown JSON-RPC error")
+                        .to_string()
+                });
+            AppServerLine::Response {
+                id,
+                result: val.get("result").cloned().unwrap_or(serde_json::Value::Null),
+                error,
+            }
+        }
+        (None, None) => AppServerLine::Other,
+    }
+}
+
+/// An approval request decoded from a server→client request. The driver
+/// forwards these to the engine's permission bridge
+/// (`RunningAgent::permission_rx`) and replies with the user's decision.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ApprovalRequest {
+    /// The Codex item id — becomes `CodingAgentPermissionRequest.tool_use_id`
+    /// and pairs the card with the item's `CodingAgentToolCalled`.
+    pub item_id: String,
+    /// Backend-shaped tool name (`command_execution` / `file_change`) —
+    /// same vocabulary the Codex `CodingAgentToolCalled` events use.
+    pub tool_name: String,
+    /// Card input — feeds the dedup key and the summary line.
+    pub input: serde_json::Value,
+}
+
+/// Decode the two approval methods. Returns `None` for any other server
+/// request (the driver replies with a JSON-RPC error so codex doesn't hang).
+pub(super) fn parse_approval_request(
+    method: &str,
+    params: &serde_json::Value,
+) -> Option<ApprovalRequest> {
+    let item_id = params
+        .get("itemId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    match method {
+        "item/commandExecution/requestApproval" => {
+            let mut input = serde_json::Map::new();
+            if let Some(cmd) = params.get("command").and_then(|v| v.as_str()) {
+                input.insert("command".to_string(), cmd.into());
+            }
+            if let Some(cwd) = params.get("cwd").and_then(|v| v.as_str()) {
+                input.insert("cwd".to_string(), cwd.into());
+            }
+            if let Some(reason) = params.get("reason").and_then(|v| v.as_str()) {
+                input.insert("reason".to_string(), reason.into());
+            }
+            Some(ApprovalRequest {
+                item_id,
+                tool_name: "command_execution".to_string(),
+                input: serde_json::Value::Object(input),
+            })
+        }
+        "item/fileChange/requestApproval" => {
+            let mut input = serde_json::Map::new();
+            if let Some(reason) = params.get("reason").and_then(|v| v.as_str()) {
+                input.insert("reason".to_string(), reason.into());
+            }
+            if let Some(root) = params.get("grantRoot").and_then(|v| v.as_str()) {
+                input.insert("grant_root".to_string(), root.into());
+            }
+            // The item id keeps the engine's dedup key unique per approval:
+            // two concurrent file-change requests without reason/grantRoot
+            // would otherwise collapse onto one card, and a single click
+            // would approve a change the user never saw described.
+            input.insert("item_id".to_string(), item_id.clone().into());
+            Some(ApprovalRequest {
+                item_id,
+                tool_name: "file_change".to_string(),
+                input: serde_json::Value::Object(input),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Map an app-server item status (`inProgress` / `completed` / `failed` /
+/// `declined`) to the `AgentEvent::ToolResult.status` convention
+/// (`success` / `error`). `declined` = the user denied the approval — the
+/// item never ran, which is an error from the tool's perspective.
+fn tool_status(status: &str) -> &'static str {
+    match status {
+        "failed" | "declined" => "error",
+        _ => "success",
+    }
+}
+
+fn str_field(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Folds app-server notifications into canonical [`AgentEvent`]s across one
+/// session. Same contract as the exec driver's `TurnTracker`: `Init` once,
+/// one `Result` per turn terminal, abandoned tool calls closed at every turn
+/// boundary so the engine's paired-tool watchdog counter re-arms.
+#[derive(Debug, Default)]
+pub(super) struct AppServerTracker {
+    /// Codex thread id — the engine's resume handle.
+    pub session_id: Option<String>,
+    init_emitted: bool,
+    /// Turn id of the in-flight turn — the `turn/interrupt` target.
+    pub current_turn_id: Option<String>,
+    /// Assistant text accumulated this turn — becomes `Result.text`.
+    agent_texts: Vec<String>,
+    /// Per-item text already emitted via `item/agentMessage/delta`, so the
+    /// final `item/completed` only emits the (normally empty) remainder
+    /// instead of duplicating the whole message.
+    streamed: std::collections::HashMap<String, String>,
+    /// Last error notification — promoted to a failed `Result` only when the
+    /// process dies without a turn terminal.
+    pub last_error: Option<String>,
+    /// True once the current turn saw its `turn/completed`.
+    pub turn_terminal_seen: bool,
+    /// Tool-use ids emitted without a matching result yet.
+    open_tool_ids: Vec<String>,
+}
+
+impl AppServerTracker {
+    pub fn new(session_id: Option<String>) -> Self {
+        Self {
+            session_id,
+            ..Self::default()
+        }
+    }
+
+    /// Reset per-turn accumulation. Session-level state survives.
+    pub fn begin_turn(&mut self) {
+        self.agent_texts.clear();
+        self.streamed.clear();
+        self.last_error = None;
+        self.turn_terminal_seen = false;
+        self.current_turn_id = None;
+        self.open_tool_ids.clear();
+    }
+
+    pub fn turn_text(&self) -> String {
+        self.agent_texts.join("\n\n")
+    }
+
+    /// Record the thread id and emit `Init` exactly once. Fed from the
+    /// `thread/start` / `thread/resume` response (primary) and the
+    /// `thread/started` notification (defensive duplicate).
+    pub fn note_thread_started(
+        &mut self,
+        thread_id: String,
+        model: Option<String>,
+    ) -> Vec<AgentEvent> {
+        self.session_id = Some(thread_id.clone());
+        if self.init_emitted {
+            return Vec::new();
+        }
+        self.init_emitted = true;
+        vec![AgentEvent::Init {
+            session_id: thread_id,
+            model,
+            slash_commands: Vec::new(),
+            skills: Vec::new(),
+        }]
+    }
+
+    /// Close every tool call still in flight with an error `ToolResult` —
+    /// same watchdog-re-arm contract as the exec tracker.
+    pub fn close_open_tools(&mut self) -> Vec<AgentEvent> {
+        std::mem::take(&mut self.open_tool_ids)
+            .into_iter()
+            .map(|id| AgentEvent::ToolResult {
+                output: "(abandoned — turn ended before the tool finished)".to_string(),
+                status: "error".to_string(),
+                id,
+            })
+            .collect()
+    }
+
+    /// Fold one notification into zero or more canonical events.
+    /// `turn_duration_ms` is driver-measured elapsed time for the turn.
+    pub fn map_notification(
+        &mut self,
+        method: &str,
+        params: &serde_json::Value,
+        turn_duration_ms: u64,
+    ) -> Vec<AgentEvent> {
+        match method {
+            "thread/started" => {
+                let thread_id = params
+                    .get("thread")
+                    .map(|t| str_field(t, "id"))
+                    .unwrap_or_default();
+                if thread_id.is_empty() {
+                    return Vec::new();
+                }
+                self.note_thread_started(thread_id, None)
+            }
+            "turn/started" => {
+                if let Some(turn) = params.get("turn") {
+                    let id = str_field(turn, "id");
+                    if !id.is_empty() {
+                        self.current_turn_id = Some(id);
+                    }
+                }
+                Vec::new()
+            }
+            "turn/completed" => {
+                self.turn_terminal_seen = true;
+                self.current_turn_id = None;
+                let turn = params.get("turn").cloned().unwrap_or_default();
+                let status = str_field(&turn, "status");
+                let mut events = self.close_open_tools();
+                let error = match status.as_str() {
+                    "failed" => Some(
+                        turn.get("error")
+                            .map(|e| str_field(e, "message"))
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or_else(|| "turn failed".to_string()),
+                    ),
+                    // `interrupted` is an error-free terminal: the engine's
+                    // user_hit_stop latch classifies it as Canceled.
+                    _ => None,
+                };
+                events.push(AgentEvent::Result {
+                    text: self.turn_text(),
+                    duration_ms: turn_duration_ms,
+                    error,
+                });
+                events
+            }
+            "thread/tokenUsage/updated" => {
+                let last = params
+                    .get("tokenUsage")
+                    .and_then(|u| u.get("last"))
+                    .cloned()
+                    .unwrap_or_default();
+                let u64_field =
+                    |key: &str| last.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+                let clamp = |v: u64| crate::llm::clamp_provider_token_count(v, "Codex");
+                // Same convention as the exec tracker: codex reports TOTAL
+                // input with the cached share inside it; `Usage.input_tokens`
+                // carries the uncached portion (Anthropic convention the
+                // consumer re-totals).
+                let total_input = clamp(u64_field("inputTokens"));
+                let cached = clamp(u64_field("cachedInputTokens")).min(total_input);
+                let output = clamp(u64_field("outputTokens"));
+                if total_input == 0 && output == 0 {
+                    return Vec::new();
+                }
+                vec![AgentEvent::Usage {
+                    model: None,
+                    input_tokens: total_input - cached,
+                    output_tokens: output,
+                    cache_read_tokens: cached,
+                    cache_creation_tokens: 0,
+                }]
+            }
+            "error" => {
+                let message = params
+                    .get("error")
+                    .map(|e| str_field(e, "message"))
+                    .unwrap_or_default();
+                if !message.is_empty() {
+                    self.last_error = Some(message);
+                }
+                Vec::new()
+            }
+            "item/agentMessage/delta" => {
+                let delta = str_field(params, "delta");
+                if delta.is_empty() {
+                    return Vec::new();
+                }
+                let item_id = str_field(params, "itemId");
+                self.streamed.entry(item_id).or_default().push_str(&delta);
+                vec![AgentEvent::Message {
+                    role: "assistant".to_string(),
+                    text: delta,
+                }]
+            }
+            "item/started" | "item/completed" => {
+                let completed = method == "item/completed";
+                let Some(item) = params.get("item") else {
+                    return Vec::new();
+                };
+                self.map_item(item, completed)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn map_item(&mut self, item: &serde_json::Value, completed: bool) -> Vec<AgentEvent> {
+        let id = str_field(item, "id");
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match item_type {
+            "agentMessage" => {
+                if !completed {
+                    return Vec::new();
+                }
+                let text = str_field(item, "text");
+                if text.is_empty() {
+                    return Vec::new();
+                }
+                self.agent_texts.push(text.clone());
+                // Deltas already streamed most (usually all) of this item —
+                // emit only the remainder so the engine's text buffer doesn't
+                // duplicate the message.
+                let streamed = self.streamed.remove(&id).unwrap_or_default();
+                let remainder = match text.strip_prefix(streamed.as_str()) {
+                    Some(rest) => rest.to_string(),
+                    // Deltas diverged from the final text (shouldn't happen;
+                    // defensive) — prefer the streamed version already shown,
+                    // emit nothing extra.
+                    None if !streamed.is_empty() => String::new(),
+                    None => text,
+                };
+                if remainder.is_empty() {
+                    return Vec::new();
+                }
+                vec![AgentEvent::Message {
+                    role: "assistant".to_string(),
+                    text: remainder,
+                }]
+            }
+            "commandExecution" => {
+                if completed {
+                    self.open_tool_ids.retain(|open| open != &id);
+                    let aggregated = str_field(item, "aggregatedOutput");
+                    let output = if aggregated.is_empty() {
+                        format!(
+                            "exit_code: {}",
+                            item.get("exitCode").and_then(|v| v.as_i64()).unwrap_or_default()
+                        )
+                    } else {
+                        aggregated
+                    };
+                    vec![AgentEvent::ToolResult {
+                        output,
+                        status: tool_status(&str_field(item, "status")).to_string(),
+                        id,
+                    }]
+                } else {
+                    self.open_tool_ids.push(id.clone());
+                    vec![AgentEvent::ToolUse {
+                        name: "command_execution".to_string(),
+                        input: serde_json::json!({ "command": str_field(item, "command") }),
+                        id,
+                    }]
+                }
+            }
+            "fileChange" => {
+                // Keep path + kind, drop the inline diffs — a multi-file
+                // patch would balloon the persisted event.
+                let changes: Vec<serde_json::Value> = item
+                    .get("changes")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|ch| {
+                                serde_json::json!({
+                                    "path": str_field(ch, "path"),
+                                    "kind": ch.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if completed {
+                    self.open_tool_ids.retain(|open| open != &id);
+                    let status = str_field(item, "status");
+                    vec![AgentEvent::ToolResult {
+                        output: status.clone(),
+                        status: tool_status(&status).to_string(),
+                        id,
+                    }]
+                } else {
+                    self.open_tool_ids.push(id.clone());
+                    vec![AgentEvent::ToolUse {
+                        name: "file_change".to_string(),
+                        input: serde_json::json!({ "changes": changes }),
+                        id,
+                    }]
+                }
+            }
+            "mcpToolCall" => {
+                // Same mcp__<server>__<tool> naming the exec driver and CC use.
+                let name = format!(
+                    "mcp__{}__{}",
+                    str_field(item, "server"),
+                    str_field(item, "tool")
+                );
+                if completed {
+                    self.open_tool_ids.retain(|open| open != &id);
+                    let error = item
+                        .get("error")
+                        .filter(|e| !e.is_null())
+                        .map(|e| str_field(e, "message"))
+                        .filter(|m| !m.is_empty());
+                    let output = error.unwrap_or_else(|| {
+                        item.get("result")
+                            .filter(|r| !r.is_null())
+                            .map(|r| r.to_string())
+                            .unwrap_or_default()
+                    });
+                    vec![AgentEvent::ToolResult {
+                        output,
+                        status: tool_status(&str_field(item, "status")).to_string(),
+                        id,
+                    }]
+                } else {
+                    self.open_tool_ids.push(id.clone());
+                    vec![AgentEvent::ToolUse {
+                        name,
+                        input: item.get("arguments").cloned().unwrap_or(serde_json::Value::Null),
+                        id,
+                    }]
+                }
+            }
+            "webSearch" => {
+                // Completed-only synthesized pair, mirroring the exec tracker.
+                if !completed {
+                    return Vec::new();
+                }
+                vec![
+                    AgentEvent::ToolUse {
+                        name: "web_search".to_string(),
+                        input: serde_json::json!({ "query": str_field(item, "query") }),
+                        id: id.clone(),
+                    },
+                    AgentEvent::ToolResult {
+                        output: String::new(),
+                        status: "success".to_string(),
+                        id,
+                    },
+                ]
+            }
+            // userMessage echoes our own input; reasoning summaries and plan
+            // items have no slot in the coding-agent timeline (same call the
+            // exec tracker makes for `reasoning`).
+            _ => Vec::new(),
+        }
+    }
+}

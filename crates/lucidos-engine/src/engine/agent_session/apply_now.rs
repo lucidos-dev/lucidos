@@ -699,6 +699,7 @@ impl LucidosEngine {
                 .and_then(|s| s.cc_session_id.clone())
         };
 
+        let coding_agent = self.thread_coding_agent(thread_id).await;
         self.event_bus
             .emit_or_log(
                 BusEvent::Thread {
@@ -708,7 +709,7 @@ impl LucidosEngine {
                         requires_restart: false,
                         is_external_repo: false,
                         cc_session_id: cc_sid,
-                        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                        coding_agent,
                         reason: None,
                         worktree_path: Some(worktree_path.to_string_lossy().into_owned()),
                         // Apply-now exits the loop with the worktree at the

@@ -13,7 +13,7 @@ vi.mock('../store', () => ({
   applyingChangeIds: signal(new Set()),
   applyingNowThreadIds: signal(new Map()),
   generatedTitleIds: new Set(),
-  ccSessionVersion: signal(0),
+  codingAgentSessionVersion: signal(0),
   memoryRebuildProgress: signal(null),
   backupProgress: signal(null),
   backupListVersion: signal(0),

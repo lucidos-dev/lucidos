@@ -9,9 +9,10 @@ use super::agent_runtime::{
     AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent, SpawnArgs,
 };
 use super::lucidos_cli::{
-    ensure_workspace_bin_symlink, install_lucidos_cli_skill, lucidos_cli_dir, path_with_prefix,
+    ensure_workspace_bin_symlink, install_lucidos_cli_skill, lucidos_cli_dir,
     LUCIDOS_CLI_SKILL_REL_PATH,
 };
+use super::spawn_env::{apply_lucidos_env, drain_stderr};
 
 /// Single source of truth for CC's `/model` and `/effort` picker entries.
 /// The data lives in `cc_menu_options.json` next to this file — see that
@@ -280,6 +281,9 @@ impl AgentRuntime for ClaudeCodeRuntime {
             events_rx,
             input_tx,
             control_tx,
+            // CC permissions flow out-of-band: its MCP permission-prompt
+            // subprocess POSTs /api/v1/internal/permission-prompt directly.
+            permission_rx: None,
         })
     }
 }
@@ -304,35 +308,6 @@ fn resolve_claude_binary(home: Option<&Path>) -> std::ffi::OsString {
         }
     }
     std::ffi::OsString::from("claude")
-}
-
-/// Whether `sccache` is resolvable as an executable on `path_var`.
-///
-/// The engine sets `RUSTC_WRAPPER=sccache` on spawned coding-agent sessions so
-/// the heavy `lucidos-engine` crate rebuilds fast inside a coding-agent thread.
-/// But sccache is a dev-machine optimization installed by
-/// `scripts/lib/preflight.sh` — NOT a runtime dependency of the shipped engine
-/// binary. On any host where it's absent (a one-click-install target, CI, an
-/// external-repo session on a contributor's laptop) forcing the wrapper makes
-/// every `cargo build`/`cargo test` the session runs hard-fail with
-/// `process didn't exit successfully: sccache`. So `build_command` gates the
-/// env var on this probe: present → `RUSTC_WRAPPER=sccache` (fast cached
-/// builds); absent → `RUSTC_WRAPPER=""` (an empty value, NOT unset). The empty
-/// value matters: the Lucidos repo's tracked `.cargo/config.toml` sets
-/// `build.rustc-wrapper = "sccache"`, and cargo falls back to that config when
-/// the env var is merely unset — only an explicit empty `RUSTC_WRAPPER`
-/// overrides config to force a plain (uncached) build instead of a broken one.
-///
-/// `path_var` is injected to keep this pure and unit-testable; production passes
-/// `std::env::var_os("PATH")`. The child process inherits a superset of the
-/// engine's PATH (see `path_with_prefix`), so the engine's own PATH is the
-/// correct probe for what cargo will resolve at build time.
-fn sccache_on_path(path_var: Option<&std::ffi::OsStr>) -> bool {
-    let Some(path_var) = path_var else {
-        return false;
-    };
-    let exe = format!("sccache{}", std::env::consts::EXE_SUFFIX);
-    std::env::split_paths(path_var).any(|dir| dir.join(&exe).is_file())
 }
 
 /// Build the `claude` Command with all flags and env vars. Extracted so unit
@@ -369,22 +344,6 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .env_remove("CLAUDECODE");
-    // sccache speeds up the heavy lucidos-engine rebuilds a coding-agent thread
-    // triggers, but it's a dev-machine optimization (installed by
-    // scripts/lib/preflight.sh), not a runtime dependency of the shipped engine
-    // binary. Use the wrapper only when sccache is actually on PATH — otherwise
-    // a session on a host without it (one-click install, CI, an external repo on
-    // a contributor's laptop) would hard-fail every cargo build/test it runs
-    // with `process didn't exit successfully: sccache`. The absent branch sets
-    // an EMPTY value rather than leaving the var unset: the Lucidos repo's
-    // tracked .cargo/config.toml sets `build.rustc-wrapper = "sccache"`, which
-    // cargo falls back to when RUSTC_WRAPPER is unset — only an explicit empty
-    // value overrides it to a plain (uncached) build. See `sccache_on_path`.
-    if sccache_on_path(std::env::var_os("PATH").as_deref()) {
-        cmd.env("RUSTC_WRAPPER", "sccache");
-    } else {
-        cmd.env("RUSTC_WRAPPER", "");
-    }
     if args.resume_session_id.is_none() {
         cmd.arg("--include-partial-messages");
     }
@@ -401,50 +360,15 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     if let Some(prompt) = args.system_prompt {
         cmd.arg("--append-system-prompt").arg(prompt);
     }
-    cmd.env("LUCIDOS_WORKSPACE", args.workspace_path);
-    // Host-process protection env (LUCIDOS_HOST_PID + optional FRONTEND_PID +
-    // optional API_PORT). Shares a builder with
-    // `engine_impl::build_script_env_vars` so a future subprocess surface
-    // (MCP child, signer host, …) cannot ship without it. See the helper's
-    // doc for why this exists.
-    for (key, value) in crate::api::actor::host_protection_env_vars(args.workspace_path) {
-        cmd.env(key, value);
-    }
-    // PG* env so CC can run `psql -c '…'` bare without putting the
-    // password in argv (which gets persisted into CodingAgentToolCalled
-    // and rendered in the steps UI). See `core::pg_env_vars` doc.
-    for (key, value) in crate::core::pg_env_vars_cached() {
-        cmd.env(key, value);
-    }
-    // Subprocess-origin env (LUCIDOS_AGENT_ORIGIN_TOKEN + LUCIDOS_THREAD_ID).
-    // Shares a builder with `engine_impl::build_script_env_vars` so the two
-    // subprocess surfaces (CC + Lucidos LLM tool shells) cannot drift.
-    // `args.thread_id` is the Claude Code session's owning thread; the engine
-    // recognises callbacks bearing this pair and attributes them honestly.
-    for (key, value) in crate::api::actor::subprocess_origin_env_vars(Some(args.thread_id)) {
-        cmd.env(key, value);
-    }
-    // Read by `lucidos spawn-thread` CLI to default `--caller-event-id` so
-    // cross-workspace POSTs from a Claude Code subprocess carry the originating event.
-    if let Some(event_id) = args.spawning_event_id {
-        cmd.env("LUCIDOS_EVENT_ID", event_id.to_string());
-    }
-    // Read by `lucidos spawn-thread` CLI to default `--repo` so a CC sidequest
-    // is created in the same repo as its caller (otherwise the engine would
-    // fall back to the workspace's default repo, breaking sidequests for
-    // workspaces hosting multiple repos).
-    if let Some(repo_name) = args.repo_name {
-        cmd.env("LUCIDOS_REPO", repo_name);
-    }
-    // Read by `cc-stop-reminder` to gate the AskUserQuestion redirect.
-    // Unattended sessions (conflict-resolution) don't set this — they would
-    // hang on the redirect waiting for an answer that's not coming.
-    // Wire contract: name + value duplicated as `SESSION_KIND_ENV` /
-    // `SESSION_KIND_INTERACTIVE` consts in
-    // `crates/lucidos-cli/src/cc_stop_reminder.rs`. Keep both in sync.
-    if args.interactive {
-        cmd.env("LUCIDOS_SESSION_KIND", "interactive");
-    }
+    // Agent-independent Lucidos env contract (workspace, host protection,
+    // PG*, subprocess origin, spawn metadata, RUSTC_WRAPPER, PATH) — shared
+    // with every other AgentRuntime via `spawn_env::apply_lucidos_env`.
+    apply_lucidos_env(&mut cmd, args, cli_dir, "ClaudeCode");
+    // Root-cause fix for the stray-SIGTERM truncation bug: give CC its OWN
+    // process group so a group-wide signal to the engine never reaches it.
+    // The engine ignores SIGTERM but CC's Node runtime does not (exit=143).
+    // See `spawn_env::isolate_in_process_group`.
+    crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
     // The engine permission handler now waits indefinitely for the user
     // (matching `AskUserQuestion`'s "stay idle" behavior). CC has TWO
     // separate MCP timeouts that both have to be lifted, otherwise whichever
@@ -459,16 +383,6 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     // session.
     cmd.env("MCP_TOOL_TIMEOUT", (86_400u64 * 1000).to_string());
     cmd.env("MCP_TIMEOUT", (86_400u64 * 1000).to_string());
-    if let Some(cli_dir) = cli_dir {
-        match path_with_prefix(cli_dir) {
-            Ok(p) => {
-                cmd.env("PATH", p);
-            }
-            Err(e) => {
-                crate::log!("[ClaudeCode] failed to join PATH for lucidos CLI: {}", e);
-            }
-        }
-    }
     // NOTE: we deliberately do NOT attempt a post-fork macOS TCC "responsibility
     // disclaim" here (a prior version called
     // `responsibility_set_caller_responsible_for_self()` from a `pre_exec` hook).
@@ -574,6 +488,26 @@ fn signal_name(sig: i32) -> Option<&'static str> {
     }
 }
 
+/// True when an exit status indicates the process was killed by a signal —
+/// either delivered directly by the kernel (`status.signal()` is set) or via
+/// the Node.js `128 + signum` convention (a handler caught the signal, ran
+/// cleanup, and re-exited `exit=143`/`exit=137`). Used to distinguish a stray
+/// external kill (auto-resumable) from a clean exit. Mirrors the case analysis
+/// in `format_exit_status`; lives next to it so the two stay in lockstep.
+#[cfg(unix)]
+pub(crate) fn exit_indicates_signal_kill(status: &std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    if status.signal().is_some() {
+        return true;
+    }
+    matches!(status.code(), Some(code) if (129..=159).contains(&code))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn exit_indicates_signal_kill(_status: &std::process::ExitStatus) -> bool {
+    false
+}
+
 pub(crate) fn format_exit_status(
     wait_result: &std::io::Result<std::process::ExitStatus>,
 ) -> String {
@@ -610,38 +544,6 @@ pub(crate) fn format_exit_status(
     }
 }
 
-/// Drain remaining stderr from the CC child (up to 4 KB).
-///
-/// Per-line timeout — 100 ms of stderr silence means we're done. The
-/// previous wall-clock 2 s timeout blocked the post-loop cleanup for
-/// the full 2 s whenever a grandchild (e.g., rustc) inherited stderr
-/// and kept the fd open after CC's death: read_line on an inherited-
-/// but-silent fd is Pending forever, and the wall-clock timeout was
-/// our only escape. Per-line bounding returns the moment CC's own
-/// stderr is drained, even if grandchildren hold the fd.
-async fn drain_stderr(stderr_reader: &mut BufReader<ChildStderr>) -> String {
-    let mut output = String::with_capacity(4096);
-    let mut line = String::new();
-    loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            stderr_reader.read_line(&mut line),
-        )
-        .await
-        {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(_)) => {
-                output.push_str(&line);
-                line.clear();
-                if output.len() > 4096 {
-                    break;
-                }
-            }
-        }
-    }
-    output
-}
-
 /// Drive the CC process: forward stdout → events_tx, input/control → stdin,
 /// and react to cancellation. Always emits `AgentEvent::Exited` (best-effort)
 /// before returning so consumers can distinguish a clean close from a panic.
@@ -663,6 +565,18 @@ async fn driver_task(
     // need it (for correlating the engine's "CC process exited" line with
     // macOS unified-log entries / ps output during incident analysis).
     let child_pid = child.id();
+    // The process's NATURAL exit status — captured only when the OS reports
+    // the child gone on its own (the `child.wait()` arm, or a post-loop
+    // `try_wait`), BEFORE any engine-side teardown kill. Drives
+    // `killed_by_signal` so a stray external SIGTERM (exit=143) is told apart
+    // from a clean exit or an engine-initiated cancel (whose SIGKILL would
+    // otherwise masquerade as a stray signal). `None` = the engine tore the
+    // child down (cancel/EOF) — not auto-resumable.
+    let mut natural_exit_status: Option<std::process::ExitStatus> = None;
+    // True once the child has been reaped (`wait()` resolved). Gates the
+    // group-kill below: after reaping, the pid (hence the group id) may be
+    // recycled, so signalling the group would risk unrelated processes.
+    let mut child_reaped = false;
     let mut line_buf = String::new();
     loop {
         tokio::select! {
@@ -745,6 +659,10 @@ async fn driver_task(
                     child_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
                     format_exit_status(&wait_result),
                 );
+                // The child died on its own — record its true status before any
+                // teardown so the safety net can auto-resume a stray-kill turn.
+                natural_exit_status = wait_result.ok();
+                child_reaped = true;
                 // tokio's `read_line` is not cancel-safe: when the stdout
                 // arm's read_line resolves Ready in the same poll cycle as
                 // wait_result, select! drops the read_line value but
@@ -784,6 +702,28 @@ async fn driver_task(
         }
     }
 
+    // If the child already died on its own but a different select! arm won the
+    // race (stdout EOF / error / a pre-captured line), reap it here BEFORE any
+    // teardown kill so its true exit status still classifies the death. A
+    // still-running child (genuine cancel) yields `None` and stays unreaped.
+    if !child_reaped {
+        if let Ok(Some(status)) = child.try_wait() {
+            natural_exit_status = Some(status);
+            child_reaped = true;
+        }
+    }
+
+    // Deliberate teardown: tear down the whole process group (CC + every
+    // descendant it spawned — Bash tools, cargo/rustc) so nothing is left
+    // orphaned holding the stdout pipe. Only while the child is unreaped — see
+    // `signal_child_process_group`'s pid-recycle caveat.
+    #[cfg(unix)]
+    if !child_reaped {
+        if let Some(pid) = child_pid {
+            crate::runtime::spawn_env::signal_child_process_group(pid, libc::SIGKILL);
+        }
+    }
+
     // Make sure the child is gone before draining stderr — otherwise stderr
     // could keep producing output and we'd block.
     let _ = child.start_kill();
@@ -803,7 +743,11 @@ async fn driver_task(
     } else {
         log!("[ClaudeCode] Claude Code stderr: {}", stderr_tail.trim());
     }
-    let _ = events_tx.send(AgentEvent::Exited);
+    let killed_by_signal = natural_exit_status
+        .as_ref()
+        .map(exit_indicates_signal_kill)
+        .unwrap_or(false);
+    let _ = events_tx.send(AgentEvent::Exited { killed_by_signal });
     // events_tx drops here — channel closes, consumer sees None.
 }
 

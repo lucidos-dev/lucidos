@@ -46,6 +46,7 @@ async fn seed_session_started(bus: &EventBus, thread_id: Uuid, session_id: &str,
         bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: session_id.into(),
             branch: branch.into(),
             repo_id: None,
@@ -136,6 +137,7 @@ async fn pending_change_branch_with_idled_session_recovers_sid() {
         &bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "wrong-session".into(),
             branch: wrong_branch.into(),
             repo_id: None,

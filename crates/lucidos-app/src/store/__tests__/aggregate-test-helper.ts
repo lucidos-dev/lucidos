@@ -83,7 +83,7 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
     'UserPromptInjected', 'CodingAgentPromptSent', 'ContinuationRequested',
     'TextStreamed', 'ThoughtStreamed', 'ToolCalled', 'ToolResult',
     'CodingAgentTextStreamed', 'CodingAgentToolCalled', 'CodingAgentToolResult',
-    'UserQuestionAnswered', 'CodingAgentPermissionResolved',
+    'UserQuestionAnswered', 'CodingAgentPermissionResolved', 'CommandPermissionResolved',
   ]);
   const setIdle: ReadonlySet<string> = new Set([
     'TriggerCompleted', 'ChangeApplied', 'ChangeDiscarded', 'ThreadArchived',
@@ -114,7 +114,7 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
   else if (setIdle.has(t)) out.status = 'idle';
   else if (t === 'ResponseFailed') out.status = 'failed';
   else if (t === 'ResponseAborted') out.status = out.codingAgentProposed ? 'waiting' : 'failed';
-  else if (t === 'UserQuestionAsked' || t === 'CodingAgentPermissionRequest') out.status = 'waiting_for_user_answer' as ThreadStatus;
+  else if (t === 'UserQuestionAsked' || t === 'CodingAgentPermissionRequest' || t === 'CommandPermissionRequested') out.status = 'waiting_for_user_answer' as ThreadStatus;
   else if (conditionalWaitingIdle.has(t)) out.status = out.codingAgentProposed ? 'waiting' : 'idle';
 
   return out;

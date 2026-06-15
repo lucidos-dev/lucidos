@@ -243,6 +243,8 @@ export interface BackupProviderInfo {
   connected: boolean;
   ready: boolean;
   required_scope: string;
+  /** Web URL to this provider's backups folder ("View backups folder" link), or null. */
+  folder_url: string | null;
 }
 
 export async function getBackupProviders(): Promise<BackupProviderInfo[]> {
@@ -313,11 +315,6 @@ export interface BackupStatus {
 
 export async function getBackupStatus(provider: string): Promise<BackupStatus> {
   return json(`${API}/backup/status?provider=${encodeURIComponent(provider)}`);
-}
-
-export interface RestoredWorkspace {
-  workspace_path: string;
-  workspace_name: string;
 }
 
 /** Authoritative restore state — mirrors the Rust `RestoreState` enum. The SAME

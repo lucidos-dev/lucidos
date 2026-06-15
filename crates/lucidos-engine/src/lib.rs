@@ -168,17 +168,100 @@ pub(crate) mod test_util {
     use crate::memory::EmbeddingProvider;
     use async_trait::async_trait;
 
-    /// Shared FastEmbedProvider across all test modules.
-    /// Loads ~465 MB of model + tokenizer files from huggingface on first call,
-    /// so it's gated behind the `real-embedder-tests` Cargo feature; default
-    /// `cargo test` runs offline. Avoids lock file contention when multiple
-    /// real-embedder tests initialize the model concurrently.
+    /// Cached outcome of initializing the shared real embedder. Stored in a
+    /// `OnceLock` so a cold-cache HuggingFace fetch failure costs a single
+    /// timeout, not one per gated test.
     #[cfg(feature = "real-embedder-tests")]
-    pub fn shared_embedder() -> &'static crate::memory::FastEmbedProvider {
+    enum SharedEmbedder {
+        Ready(crate::memory::FastEmbedProvider),
+        /// The model/tokenizer files couldn't be fetched from huggingface.co
+        /// (host unreachable, request timed out). The real-embedder tests skip
+        /// on this rather than fail — a third-party network blip must never red
+        /// the e2e suite. Carries the error string for the skip log.
+        FetchUnavailable(String),
+    }
+
+    /// True when a `FastEmbedProvider::new()` error is a model-download /
+    /// network failure (HF unreachable, request timed out, too many retries)
+    /// rather than a logic / data bug. Only this class of failure is allowed to
+    /// skip a real-embedder test.
+    ///
+    /// The match walks the **entire error source chain**, not just the top
+    /// message: `fastembed` wraps the underlying transport error with anyhow
+    /// context like `Failed to retrieve onnx/model.onnx` (preserved as a
+    /// `.source()`), so the network signal lives one level down. The raw HF
+    /// errors look like `request error: <url>: <ureq error>` / `Too many
+    /// retries: …`, and the HF host appears in every fetch URL. `failed to
+    /// retrieve` is fastembed's own *fetch*-path wrapper — distinct from the
+    /// `could not read … file` messages it emits when an already-downloaded file
+    /// is corrupt, which we deliberately do NOT match so real corruption still
+    /// fails loudly.
+    #[cfg(feature = "real-embedder-tests")]
+    fn is_model_fetch_failure(err: &(dyn std::error::Error + Send + Sync)) -> bool {
+        const MARKERS: &[&str] = &[
+            "huggingface",
+            "request error",
+            "network error",
+            "timed out",
+            "timeout",
+            "too many retries",
+            "connection",
+            "failed to lookup",
+            "dns error",
+            "no such host",
+            "failed to retrieve", // fastembed's fetch-path context wrapper
+        ];
+        let mut level: Option<&dyn std::error::Error> = Some(err);
+        while let Some(e) = level {
+            let msg = e.to_string().to_lowercase();
+            if MARKERS.iter().any(|needle| msg.contains(needle)) {
+                return true;
+            }
+            level = e.source();
+        }
+        false
+    }
+
+    /// Shared FastEmbedProvider across all real-embedder test modules.
+    ///
+    /// Returns `Some(provider)` when the model is available — either freshly
+    /// downloaded or served from the warm `.fastembed_cache` (a cache hit makes
+    /// `hf-hub`'s `ApiRepo::get` short-circuit before any network call, so a
+    /// seeded cache runs fully offline). Every caller's real assertions then run
+    /// unchanged.
+    ///
+    /// Returns `None` (and logs a `SKIP`) only when the model files can't be
+    /// fetched from huggingface.co. This is the resilience guarantee: a
+    /// transient HF outage degrades these tests to *skipped*, never *failed*.
+    /// A non-fetch init failure (corrupt model, bad config) still panics — that
+    /// is a real bug, not a network blip.
+    ///
+    /// Loads ~465 MB of model + tokenizer files on a cold cache, so it's gated
+    /// behind the `real-embedder-tests` Cargo feature; default `cargo test`
+    /// never touches it. The `OnceLock` also avoids lock-file contention when
+    /// multiple gated tests initialize the model concurrently.
+    #[cfg(feature = "real-embedder-tests")]
+    pub fn shared_embedder() -> Option<&'static crate::memory::FastEmbedProvider> {
         use crate::memory::FastEmbedProvider;
         use std::sync::OnceLock;
-        static PROVIDER: OnceLock<FastEmbedProvider> = OnceLock::new();
-        PROVIDER.get_or_init(|| FastEmbedProvider::new().unwrap())
+        static PROVIDER: OnceLock<SharedEmbedder> = OnceLock::new();
+        let outcome = PROVIDER.get_or_init(|| match FastEmbedProvider::new() {
+            Ok(provider) => SharedEmbedder::Ready(provider),
+            Err(e) if is_model_fetch_failure(e.as_ref()) => {
+                SharedEmbedder::FetchUnavailable(e.to_string())
+            }
+            Err(e) => panic!("FastEmbedProvider init failed (not a model-fetch error): {e}"),
+        });
+        match outcome {
+            SharedEmbedder::Ready(provider) => Some(provider),
+            SharedEmbedder::FetchUnavailable(msg) => {
+                eprintln!(
+                    "[real-embedder-tests] SKIP: MultilingualE5Small model unavailable \
+                     (huggingface.co fetch failed): {msg}"
+                );
+                None
+            }
+        }
     }
 
     /// Deterministic test embedder. Returns an L2-normalized one-hot-style

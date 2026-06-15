@@ -2,7 +2,7 @@
 //! driver. Re-exported from `agentic_loop`'s mod.rs so existing
 //! `agentic_loop::X` and `super::X` paths keep resolving.
 
-use crate::llm::provider::ToolDefinition;
+use crate::llm::provider::{LlmResponse, ToolDefinition};
 use crate::llm::tool_names as tn;
 use crate::llm::{get_default_tools, get_notification_tool, get_read_notifications_tool};
 use crate::llm::{ContentBlock, Message, MessageContent};
@@ -69,64 +69,157 @@ where
     }
 }
 
-/// Hint suffix for the empty-completion `ResponseFailed` error message. The
-/// LLM call returned with no text and no tool calls — the user always sees a
-/// failure, but the *reason* needs to be honest:
+/// Cross-provider classification of a completion's finish reason. Providers
+/// report the raw reason verbatim and use *different vocabularies* — Anthropic
+/// lowercases (`end_turn`, `max_tokens`, `refusal`), Gemini uppercases (`STOP`,
+/// `MAX_TOKENS`, `SAFETY`, `RECITATION`), OpenAI mixes (`completed`, `stop`,
+/// `length`, `max_output_tokens`, `content_filter`). Classifying on a single
+/// provider's strings would silently mis-file every other provider's
+/// truncation / safety stop as a clean stop — the exact trap that made an empty
+/// Gemini `STOP` look the same as a Gemini `MAX_TOKENS` cutoff. Normalize once,
+/// here, so the empty-completion decision is provider-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinishClass {
+    /// The model finished its turn on its own terms (`end_turn` / `STOP` /
+    /// `stop` / `completed`). An empty turn here is intentional silence, not a
+    /// failure.
+    Clean,
+    /// Output was cut off by a length / token budget (`max_tokens` /
+    /// `MAX_TOKENS` / `length` / `max_output_tokens`). Content was lost.
+    Truncated,
+    /// A provider safety / policy classifier withheld the content
+    /// (`refusal` / `SAFETY` / `RECITATION` / `content_filter` / …).
+    Blocked,
+    /// Anything unrecognised — `null`/absent, `stop_sequence`, `other`,
+    /// `malformed_function_call`, a future reason we haven't mapped. Treated as
+    /// a failure (fail-safe): we don't know why the turn was empty, so surface
+    /// it rather than silently pass.
+    Unknown,
+}
+
+/// Map a raw provider finish reason onto [`FinishClass`]. Case-insensitive so
+/// Gemini's uppercase enum collapses onto the same buckets as Anthropic's
+/// lowercase one.
+pub(crate) fn normalize_finish_reason(stop_reason: &str) -> FinishClass {
+    match stop_reason.to_ascii_lowercase().as_str() {
+        // Model-decided end of turn across providers.
+        "end_turn" | "stop" | "completed" | "end_of_turn" | "eos" => FinishClass::Clean,
+        // Length / token-budget cutoff across providers.
+        "max_tokens" | "max_output_tokens" | "length" | "model_length" => FinishClass::Truncated,
+        // Safety / policy block or explicit refusal across providers.
+        "refusal" | "safety" | "recitation" | "content_filter" | "blocklist"
+        | "prohibited_content" | "spii" | "image_safety" => FinishClass::Blocked,
+        // null/absent ("unknown" sentinel), stop_sequence, other, etc.
+        _ => FinishClass::Unknown,
+    }
+}
+
+/// Verdict for a completion that returned no text and no tool calls.
+pub(crate) struct EmptyCompletionClass {
+    /// `true` → emit `ResponseFailed` (genuine failure: truncation, safety
+    /// block, dropped output, or an unrecognised stop). `false` → benign: the
+    /// model finished cleanly and just produced no text, so the thread
+    /// completes normally and the UI renders a neutral "empty response" note.
+    pub is_error: bool,
+    /// Human-readable suffix. For the error case it's appended to the
+    /// `ResponseFailed` diagnostic; for the benign case it's logged so an
+    /// operator can still see *why* the turn was empty.
+    pub hint: &'static str,
+}
+
+/// Decide whether an empty completion (no text, no tool calls) is a genuine
+/// failure or benign intentional silence — uniformly across providers and
+/// thread types. The classification keys off the *cause* of the emptiness, not
+/// what launched the thread:
 ///
-/// - `refusal`: the provider's streaming safety classifier stopped the turn
-///   and withheld the content the model had begun generating, so
-///   `output_tokens` can be non-zero while nothing reaches the engine. This
-///   is a definitive provider signal, not a parser miss — checked before the
-///   `output_tokens` heuristic below so a refusal isn't misattributed to a
-///   stream-shape change (the misleading message the 2026-06-02 report saw).
-/// - `output_tokens > 16` with `thinking_chars == 0`: the provider billed
-///   real output but nothing reached the engine. Either a known content
-///   block carried an unrecognised payload shape or an unknown block / delta
-///   type slipped past the parser (the latter increments
-///   `unknown_sse_dropped` in `vertex::process_sse_data`). Surfacing this
-///   prevents the misleading "model decided no action was needed" message
-///   that masked the real Vertex SSE drift seen on 2026-05-18.
-/// - `thinking_chars > 0`: the model thought (we got thinking blocks) but
-///   chose not to emit text or call a tool. Distinct from a parser miss.
-/// - `max_tokens`: the model hit the token budget before producing any
-///   visible block.
-/// - `end_turn` with no other signal: genuinely intentional silence.
+/// - **Truncated / Blocked** (normalized finish reason): content was lost or
+///   withheld → error.
+/// - **Dropped output** — `output_tokens > 16` with `thinking_chars == 0`, or
+///   `unknown_sse_dropped > 0`: the provider billed real output but nothing
+///   reached the engine (a known block carried an unrecognised shape, or an
+///   unknown SSE block slipped past the parser). Anthropic-only signal —
+///   Gemini / OpenAI hardcode these to `None`/`0`, so it never fires there →
+///   error.
+/// - **Unknown** finish reason with nothing salvageable (`null`,
+///   `stop_sequence`, a future reason): fail-safe → error.
+/// - **Clean** stop with nothing dropped: the model ended its turn and chose to
+///   emit no text → benign.
 ///
 /// Threshold `16` is well above any realistic structural-overhead floor for
-/// `usage.output_tokens` on a no-op `end_turn` — keeps true silence out of
-/// the parser-miss branch.
-pub(crate) fn empty_completion_hint(
+/// `usage.output_tokens` on a no-op clean stop — keeps true silence out of the
+/// parser-miss branch.
+pub(crate) fn classify_empty_completion(
     stop_reason: &str,
     output_tokens: u32,
     thinking_chars: usize,
     unknown_sse_dropped: u32,
-) -> &'static str {
-    // Truncation wins regardless of what was captured — the user needs to
-    // know the budget was hit before they wonder about parser drift.
-    if stop_reason == "max_tokens" {
-        return " — output truncated by token budget";
+) -> EmptyCompletionClass {
+    let error = |hint: &'static str| EmptyCompletionClass {
+        is_error: true,
+        hint,
+    };
+    let class = normalize_finish_reason(stop_reason);
+    match class {
+        // Truncation wins regardless of what was captured — the user needs to
+        // know the budget was hit before they wonder about parser drift.
+        FinishClass::Truncated => return error(" — output truncated by token budget"),
+        // A safety / policy block withheld already-generated content, so
+        // output_tokens can be non-zero while nothing reaches the engine.
+        FinishClass::Blocked => {
+            return error(" — the model declined to respond (provider safety classifier withheld the output). Rephrase the request or start a new thread; retrying the same prompt will be refused again")
+        }
+        FinishClass::Clean | FinishClass::Unknown => {}
     }
-    // Refusal is a definitive provider signal, not a parser miss: the safety
-    // classifier stopped the turn and withheld already-generated content, so
-    // output_tokens can be non-zero while nothing reaches the engine. Check it
-    // before the output_tokens heuristic, which would otherwise blame the
-    // parser / a stream-shape change.
-    if stop_reason == "refusal" {
-        return " — the model declined to respond (provider safety classifier withheld the output). Rephrase the request or start a new thread; retrying the same prompt will be refused again";
-    }
+    // Dropped output: tokens billed but nothing surfaced. Either a known block
+    // carried an unexpected payload shape (couldn't classify) or an unknown
+    // SSE block was dropped (`unknown_sse_dropped`, incremented in
+    // `vertex::process_sse_data`). Surfacing this prevents the misleading
+    // "model decided no action was needed" that masked real Vertex SSE drift.
     if output_tokens > 16 && thinking_chars == 0 {
         if unknown_sse_dropped > 0 {
-            return " — engine dropped unknown SSE shapes; provider stream may have changed (see [Vertex] WARNING logs for the exact types)";
+            return error(" — engine dropped unknown SSE shapes; provider stream may have changed (see [Vertex] WARNING logs for the exact types)");
         }
-        return " — model generated output the engine couldn't classify (likely a stream-shape change in the provider)";
+        return error(" — model generated output the engine couldn't classify (likely a stream-shape change in the provider)");
     }
-    if thinking_chars > 0 {
-        return " — model thought but produced no text or tool call";
+    if unknown_sse_dropped > 0 {
+        return error(" — engine dropped unknown SSE shapes; provider stream may have changed (see [Vertex] WARNING logs for the exact types)");
     }
-    match stop_reason {
-        "end_turn" => " — model decided no action was needed",
-        _ => "",
+    // Unrecognised stop with nothing salvageable — we can't vouch that the
+    // turn ended cleanly, so surface it rather than silently passing.
+    if class == FinishClass::Unknown {
+        return error("");
     }
+    // Clean stop, nothing dropped: intentional silence. Not an error.
+    let hint = if thinking_chars > 0 {
+        " — model thought but produced no text or tool call"
+    } else {
+        " — model ended its turn without producing text"
+    };
+    EmptyCompletionClass {
+        is_error: false,
+        hint,
+    }
+}
+
+/// Remove assistant prose attached to a tool-call response.
+///
+/// A response with structured tool calls is not the assistant's final answer;
+/// the visible progress is carried by `ToolCalled` / `ToolResult` events and
+/// the next model iteration decides what to do with the results. Keeping the
+/// text block made provider/tool-turn preambles part of both the user's chat
+/// transcript and the next prompt. Gemini Flash exposed the failure mode by
+/// echoing a system instruction ("Just act") before several function calls,
+/// which then fed itself back into subsequent iterations.
+pub(crate) fn suppress_tool_turn_text(response: &mut LlmResponse) -> bool {
+    if response.tool_calls.is_empty() {
+        return false;
+    }
+    let had_text = response
+        .content
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty());
+    response.content = None;
+    had_text
 }
 
 /// Build the tool list for intent sub-loops.
@@ -421,6 +514,37 @@ pub(crate) fn is_bad_image_description(desc: &str) -> bool {
 /// cap" claim without this prefix is a hallucination. The chat system
 /// prompt tells the model the same.
 pub(crate) const MAX_ITERATIONS: usize = 500;
+
+/// Build the `ProcessResult` every terminal path in `run_agentic_loop`
+/// returns. All eight return sites — pre-iter cancel, iteration cap, mid-LLM
+/// cancel, success, empty completion, and the three circuit-breaker
+/// force-breaks — construct the same shape: only `response` and `images`
+/// vary, while `steps`, `auto_apply`, and `orphaned_injections` are always
+/// empty/`false` on a terminal turn. Centralising the construction keeps
+/// those constant fields from drifting across the return sites.
+///
+/// This is a pure value constructor with no side effects: each caller still
+/// sets `*terminator_emitted = true` and emits its own distinct event before
+/// returning, so the circuit-breaker branches keep their individual
+/// thresholds and messages — nothing is unified beyond the result literal.
+pub(crate) fn terminal_result(
+    response: String,
+    images: Vec<String>,
+    request_id: Uuid,
+    thread_id: Uuid,
+    proposed_change: bool,
+) -> super::super::types::ProcessResult {
+    super::super::types::ProcessResult {
+        response,
+        steps: vec![],
+        images,
+        request_id,
+        thread_id,
+        proposed_change,
+        auto_apply: false,
+        orphaned_injections: vec![],
+    }
+}
 
 /// Without this emit the frontend would never see a terminator and the
 /// thread would show "running" forever after hitting the cap.

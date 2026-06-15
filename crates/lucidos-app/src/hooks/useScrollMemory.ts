@@ -75,6 +75,16 @@ export interface ScrollMemoryOptions {
    *  For chat: pass `() => scrolledUp.value` so only meaningful "scrolled up"
    *  positions are remembered (at-bottom defers to auto-scroll on reload). */
   shouldSave?: () => boolean;
+  /** Predicate called once at restore time (effect setup). Return false to
+   *  SKIP restoring the saved offset for this mount/key-change while still
+   *  attaching the save listener. Defaults to always-restore. For chat: pass
+   *  `() => !hasPendingEventScroll()` so a notification deep-link resolving a
+   *  scroll to a specific event isn't overridden by the saved-scroll restore.
+   *  Without this, focusing an UNfocused thread re-runs this hook, and its
+   *  restore observer (created after `scrollToEventAndPulse`'s) fires last and
+   *  snaps back to the saved offset — the "toast deep-link lands on the saved
+   *  position, not the event, unless the thread was already focused" bug. */
+  shouldRestore?: () => boolean;
   /** When true, force `scrollTop=0` for the no-save case (gates only the
    *  `saved === null` branch — `saved === 0` is a real restore and always
    *  writes scrollTop). Use for shared scroll containers where the previous
@@ -95,11 +105,13 @@ export function useScrollMemory(
   key: string | null,
   options: ScrollMemoryOptions = {},
 ) {
-  const { onRestored, paused = false, shouldSave, resetOnEmpty = false } = options;
+  const { onRestored, paused = false, shouldSave, shouldRestore, resetOnEmpty = false } = options;
   const onRestoredRef = useRef(onRestored);
   const shouldSaveRef = useRef(shouldSave);
+  const shouldRestoreRef = useRef(shouldRestore);
   onRestoredRef.current = onRestored;
   shouldSaveRef.current = shouldSave;
+  shouldRestoreRef.current = shouldRestore;
 
   useEffect(() => {
     if (!key || paused) return;
@@ -192,10 +204,20 @@ export function useScrollMemory(
       saveTimer = setTimeout(writeNow, SAVE_DEBOUNCE_MS);
     };
 
+    // A higher-priority scroll may own this load — e.g. a notification
+    // deep-link resolving a scroll to a specific event. Skip the restore so it
+    // can't override that scroll, but still attach the save listener below so
+    // the user's post-landing position is remembered. Evaluated once here: the
+    // deep-link claim is set (in focusThread) BEFORE this effect runs, and held
+    // until scrollToEventAndPulse's deadline, so a setup-time check is enough.
+    const allowRestore = shouldRestoreRef.current ? shouldRestoreRef.current() : true;
+
     if (saved === null) {
       // Browsers preserve scrollTop across children-shrink, so a shared
       // container needs an explicit reset; non-shared containers opt out.
       if (resetOnEmpty) el.scrollTop = 0;
+      restoring = false;
+    } else if (!allowRestore) {
       restoring = false;
     } else if (saved === 0) {
       // Restore explicitly — same shared-container reason as the null branch.

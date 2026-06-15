@@ -23,6 +23,9 @@ mod threads_list_test;
 #[path = "api_support/filter_facets_test.rs"]
 mod filter_facets_test;
 
+#[path = "api_support/archived_count_test.rs"]
+mod archived_count_test;
+
 #[path = "api_support/sse_test.rs"]
 mod sse_test;
 
@@ -74,6 +77,9 @@ mod image_migration_test;
 #[path = "api_support/load_knowhow_dedup_test.rs"]
 mod load_knowhow_dedup_test;
 
+#[path = "api_support/knowhow_read_test.rs"]
+mod knowhow_read_test;
+
 #[path = "api_support/context_capture_lazy_test.rs"]
 mod context_capture_lazy_test;
 
@@ -82,6 +88,9 @@ mod tool_result_lazy_test;
 
 #[path = "api_support/trigger_groups_test.rs"]
 mod trigger_groups_test;
+
+#[path = "api_support/command_safety_test.rs"]
+mod command_safety_test;
 
 #[path = "api_support/cascade_archive_test.rs"]
 mod cascade_archive_test;

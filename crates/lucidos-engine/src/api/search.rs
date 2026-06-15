@@ -384,6 +384,11 @@ async fn search_changes_internal(
     Ok(matched)
 }
 
+/// Route for the global `/search` surface.
+pub(super) fn router() -> Router<AppState> {
+    Router::new().route("/search", get(search))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

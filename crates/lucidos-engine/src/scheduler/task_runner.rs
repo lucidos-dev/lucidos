@@ -5,7 +5,6 @@
 
 use crate::api::SharedEngine;
 use crate::triggers::TriggerConfig;
-use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,7 +12,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{trigger_id_to_uuid, user_tasks, ACTIVE_TASK_COUNT, MISSED_TASK_GRACE_MINUTES};
+use super::{trigger_id_to_uuid, MISSED_TASK_GRACE_MINUTES};
 
 /// Information about a tracked task.
 ///
@@ -41,7 +40,6 @@ pub(super) fn spawn_task_runner(
     cron_expressions: Vec<String>,
     timezone: String,
     engine: SharedEngine,
-    pool: PgPool,
     shutdown_flag: Arc<AtomicBool>,
     trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
 ) -> (JoinHandle<()>, CancellationToken) {
@@ -55,7 +53,6 @@ pub(super) fn spawn_task_runner(
             cron_expressions,
             timezone,
             engine,
-            pool,
             shutdown_flag,
             trigger_configs,
             task_cancel,
@@ -82,7 +79,6 @@ async fn run_task_loop(
     cron_expressions: Vec<String>,
     timezone: String,
     engine: SharedEngine,
-    pool: PgPool,
     shutdown_flag: Arc<AtomicBool>,
     trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
     cancel_token: CancellationToken,
@@ -122,7 +118,6 @@ async fn run_task_loop(
         &trigger_id,
         &task_name,
         &engine,
-        &pool,
         &trigger_configs,
     )
     .await?;
@@ -182,16 +177,17 @@ async fn run_task_loop(
             }
         }
 
-        // Read fresh config from in-memory state (event-sourced)
-        let config = {
+        // Read fresh state (event-sourced) — exit the loop on pause/delete.
+        // The Thread Queue executor re-reads the full config at run time.
+        let paused = {
             let configs = trigger_configs.read().unwrap();
-            configs.get(&trigger_id).cloned()
+            configs.get(&trigger_id).map(|c| c.paused)
         };
-        let config = match config {
-            Some(c) if !c.paused => c,
-            Some(_) => return Ok("trigger paused".to_string()),
+        match paused {
+            Some(false) => {}
+            Some(true) => return Ok("trigger paused".to_string()),
             None => return Ok("trigger deleted".to_string()),
-        };
+        }
 
         // Validate we're not too late (past grace window)
         let actual_now = chrono::Utc::now();
@@ -216,34 +212,50 @@ async fn run_task_loop(
             );
         }
 
-        // Execute the task with the fresh data
-        let active = ACTIVE_TASK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if active > 1 {
+        // Execute through the Thread Queue: admission control may hold the
+        // fire until capacity frees. Awaiting completion preserves the
+        // loop's semantics (next occurrence computed after the run ends) —
+        // saturation back-pressures this trigger's schedule instead of
+        // stacking unbounded concurrent runs. Execution bookkeeping
+        // (ACTIVE_TASK_COUNT, record_trigger_executed, failure logging)
+        // lives in the queue executor.
+        let outcome = engine
+            .thread_queue
+            .submit(
+                crate::engine::thread_queue::ThreadQueueRequest::Cron {
+                    trigger_id: trigger_id.clone(),
+                },
+                None,
+                Some(cancel_token.clone()),
+            )
+            .await;
+        if !outcome.admitted {
             log!(
-                "[Scheduler] Concurrent execution: {} tasks now active (starting '{}')",
-                active,
-                task_name
+                "[Scheduler] Task '{}' queued at position {} (system at capacity)",
+                task_name,
+                outcome.position
             );
         }
-
-        let result = user_tasks::execute_user_task(
-            engine.clone(),
-            &pool,
-            &config,
-            crate::engine::thread_events::TriggerInvocation::Schedule,
-            None,
-            Some(cancel_token.clone()),
-        )
-        .await;
-
-        ACTIVE_TASK_COUNT.fetch_sub(1, Ordering::Relaxed);
-
-        // Record after execution so crash mid-task → catch-up re-executes.
-        engine.record_trigger_executed(&trigger_id).await;
-
-        if let Err(e) = result {
-            log!("[Scheduler] Task '{}' execution failed: {}", task_name, e);
-            // Continue to next occurrence rather than crashing
+        tokio::select! {
+            _ = outcome.completion => {}
+            _ = cancel_token.cancelled() => {
+                // Trigger updated/deleted mid-wait. A still-queued entry is
+                // dropped here; an admitted run observes the token itself
+                // (execute_user_task carries it), so a drop failure just
+                // means the run is already in flight.
+                if let Err(e) = engine
+                    .thread_queue
+                    .drop_entry(outcome.entry_id, "trigger cancelled", None)
+                    .await
+                {
+                    log!(
+                        "[Scheduler] Task '{}' cancelled while running: {}",
+                        task_name,
+                        e
+                    );
+                }
+                return Ok("cancelled".to_string());
+            }
         }
     }
 }
@@ -255,7 +267,6 @@ async fn check_and_execute_missed(
     trigger_id: &str,
     task_name: &str,
     engine: &SharedEngine,
-    pool: &PgPool,
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now_in_tz = chrono::Utc::now().with_timezone(&tz);
@@ -310,23 +321,25 @@ async fn check_and_execute_missed(
             delay.num_seconds()
         );
 
-        if let Err(e) = user_tasks::execute_user_task(
-            engine.clone(),
-            pool,
-            &config,
-            crate::engine::thread_events::TriggerInvocation::Schedule,
-            None,
-            None,
-        )
-        .await
-        {
+        // Same Thread Queue routing as the on-time path; the executor owns
+        // record_trigger_executed and failure logging. No cancel token —
+        // matches the pre-queue missed-grace call.
+        let outcome = engine
+            .thread_queue
+            .submit(
+                crate::engine::thread_queue::ThreadQueueRequest::Cron {
+                    trigger_id: trigger_id.to_string(),
+                },
+                None,
+                None,
+            )
+            .await;
+        if outcome.completion.await.is_err() {
             log!(
-                "[Scheduler] Task '{}' grace period execution failed: {}",
-                task_name,
-                e
+                "[Scheduler] Task '{}' grace-period completion channel dropped",
+                task_name
             );
         }
-        engine.record_trigger_executed(trigger_id).await;
     }
 
     Ok(())
@@ -341,7 +354,6 @@ pub(super) async fn handle_trigger_event(
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
     tracked_tasks: &Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
     engine: &SharedEngine,
-    pool: &PgPool,
     shutdown_flag: &Arc<AtomicBool>,
 ) {
     let task_uuid = trigger_id_to_uuid(trigger_id);
@@ -359,7 +371,6 @@ pub(super) async fn handle_trigger_event(
                         &config,
                         tracked_tasks,
                         engine,
-                        pool,
                         shutdown_flag,
                         trigger_configs,
                     )
@@ -390,13 +401,15 @@ pub(super) async fn handle_trigger_event(
                         &config,
                         tracked_tasks,
                         engine,
-                        pool,
                         shutdown_flag,
                         trigger_configs,
                     )
                     .await;
                 }
                 crate::log!("[Scheduler] Updated trigger: {}", trigger_id);
+                // An update can unpause — queued fires for this trigger may
+                // be eligible again.
+                engine.thread_queue.drain().await;
             }
         }
         "TriggerDeleted" => {
@@ -436,13 +449,15 @@ pub(super) async fn handle_trigger_event(
                         &config,
                         tracked_tasks,
                         engine,
-                        pool,
                         shutdown_flag,
                         trigger_configs,
                     )
                     .await;
                 }
                 crate::log!("[Scheduler] Resumed trigger: {}", trigger_id);
+                // Resume unblocks the trigger's queued fires — drain so they
+                // admit without waiting for the periodic sweep.
+                engine.thread_queue.drain().await;
             }
         }
         "TriggerDisabled" => {
@@ -464,7 +479,6 @@ async fn register_and_track(
     config: &TriggerConfig,
     tracked_tasks: &Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
     engine: &SharedEngine,
-    pool: &PgPool,
     shutdown_flag: &Arc<AtomicBool>,
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
 ) {
@@ -475,7 +489,6 @@ async fn register_and_track(
         config.schedule.clone(),
         config.timezone.clone(),
         engine.clone(),
-        pool.clone(),
         shutdown_flag.clone(),
         trigger_configs.clone(),
     );
@@ -541,7 +554,6 @@ pub(super) async fn handle_domain_event(
     source_event_id: Option<uuid::Uuid>,
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
     engine: &SharedEngine,
-    pool: &PgPool,
 ) {
     match event_trigger_skip_reason(engine.is_shutting_down(), depth) {
         Some(EventTriggerSkip::ShuttingDown) => {
@@ -577,49 +589,35 @@ pub(super) async fn handle_domain_event(
         matching.len()
     );
 
+    // Route every fire through the Thread Queue: over capacity the fire is
+    // enqueued (FIFO per trigger) instead of spawning unbounded concurrent
+    // executions. Execution itself — task-local scoping, ACTIVE_TASK_COUNT,
+    // record_trigger_executed, failure logging — lives in the queue
+    // executor (`engine::thread_queue::executor`).
     let next_depth = depth + 1;
     for config in matching {
-        let engine = engine.clone();
-        let pool = pool.clone();
-        let event_type = event_type.to_string();
-        let event_payload = payload.clone();
-
-        ACTIVE_TASK_COUNT.fetch_add(1, Ordering::Relaxed);
-        tokio::spawn(async move {
+        let outcome = engine
+            .thread_queue
+            .submit(
+                crate::engine::thread_queue::ThreadQueueRequest::EventTrigger {
+                    trigger_id: config.id.clone(),
+                    event_type: event_type.to_string(),
+                    event_payload: payload.clone(),
+                    depth: next_depth,
+                    origin_thread_id,
+                    source_event_id,
+                },
+                None,
+                None,
+            )
+            .await;
+        if !outcome.admitted {
             crate::log!(
-                "[Scheduler] Firing event trigger '{}' for event '{}'",
+                "[Scheduler] Event trigger '{}' queued at position {} (system at capacity)",
                 config.name,
-                event_type
+                outcome.position
             );
-
-            let invocation = crate::engine::thread_events::TriggerInvocation::Event {
-                event_type: event_type.clone(),
-                event_id: source_event_id,
-                thread_id: origin_thread_id,
-            };
-            let inner = user_tasks::EVENT_TRIGGER_DEPTH.scope(
-                next_depth,
-                user_tasks::execute_user_task(
-                    engine.clone(),
-                    &pool,
-                    &config,
-                    invocation,
-                    Some(&event_payload),
-                    None,
-                ),
-            );
-            let result = match origin_thread_id {
-                Some(tid) => user_tasks::ORIGIN_THREAD_ID.scope(tid, inner).await,
-                None => inner.await,
-            };
-
-            engine.record_trigger_executed(&config.id).await;
-            ACTIVE_TASK_COUNT.fetch_sub(1, Ordering::Relaxed);
-
-            if let Err(e) = result {
-                crate::log!("[Scheduler] Event trigger '{}' failed: {}", config.name, e);
-            }
-        });
+        }
     }
 }
 
@@ -655,7 +653,6 @@ async fn detach_tracked_task(
 pub(super) async fn check_task_health_and_restart(
     tracked: Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
     engine: SharedEngine,
-    pool: PgPool,
     shutdown_flag: Arc<AtomicBool>,
     trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
 ) {
@@ -709,7 +706,6 @@ pub(super) async fn check_task_health_and_restart(
             schedule,
             timezone,
             engine.clone(),
-            pool.clone(),
             shutdown_flag.clone(),
             trigger_configs.clone(),
         );

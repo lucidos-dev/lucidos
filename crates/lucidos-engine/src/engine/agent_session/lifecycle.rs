@@ -148,6 +148,19 @@ pub(super) fn is_silent_resume(user_text_empty: bool, has_images: bool) -> bool 
     user_text_empty && !has_images
 }
 
+/// Tool names whose `AgentEvent::ToolUse` must NOT emit a
+/// `CodingAgentToolCalled`: the question flow renders its own card from the
+/// `UserQuestionAsked` event the internal endpoint emits, so a tool-call step
+/// on top would surface the same question twice. Two names, one per backend:
+/// CC's native `AskUserQuestion` (intercepted by its PreToolUse hook) and
+/// Codex's MCP-routed `mcp__lucidos__ask_user_question` (served by `lucidos
+/// mcp-permission-server`). The ToolUse still increments `tools_in_flight`
+/// at the call site — the watchdog must stay disarmed while the user takes
+/// their time answering.
+pub(super) fn is_user_question_tool(name: &str) -> bool {
+    name == "AskUserQuestion" || name == crate::runtime::CODEX_ASK_USER_QUESTION_TOOL
+}
+
 /// User-facing error message for the empty-response branch of `classify_result`.
 /// Surfaces an OOM-killed bash (exit 137), a SIGTERM'd subprocess (exit 143), or
 /// any other path where CC produces a Result with no real assistant text. Without
@@ -213,6 +226,31 @@ pub(super) fn classify_result(
     };
     let emit_idle = !is_shutdown;
     (Some(terminal), emit_idle)
+}
+
+/// After a `Result` is classified and its terminal emitted, decide whether the
+/// run loop should clear the `user_hit_stop` latch. A `Result` is always a turn
+/// boundary, so the latch — which records "the user interrupted the turn that
+/// just ended" — must clear once that turn's cancel/abort terminal has fired.
+///
+/// The load-bearing case is an interrupt superseded by inflight follow-ups:
+/// when the Stop button fires but follow-ups are already queued, the run loop
+/// keeps the subprocess alive to drain them (`TerminateDecision::
+/// KeepAliveForFollowup`). Those follow-ups complete with real, successful
+/// output and emit a SECOND `Result`. Without clearing the latch here, that
+/// Result re-classifies as `Canceled(UserStop)` — mislabeling finished,
+/// committed work as "Canceled" and emitting a phantom second `ResponseCanceled`
+/// carrying the completed text. Clearing makes the next Result classify on its
+/// own merits (`Generated`).
+///
+/// `Generated` / `Failed` can't co-occur with a set latch (`user_hit_stop`
+/// ranks above both in `classify_result`), so only the cancel/abort terminals
+/// need to clear it.
+pub(super) fn terminal_clears_user_hit_stop(terminal: &TerminalKind) -> bool {
+    matches!(
+        terminal,
+        TerminalKind::Canceled(_) | TerminalKind::Aborted(_)
+    )
 }
 
 /// Auto-commit the worktree on session cleanup ONLY when the last turn
@@ -354,18 +392,27 @@ pub(super) fn classify_session_end_action(
 /// `last_terminal_kind` is per-turn for the same reason: the cleanup gate
 /// (`should_auto_commit_on_cleanup`) must reflect THIS turn's outcome,
 /// not whatever the previous turn happened to leave behind.
+///
+/// `cancel_actor` is reset in lockstep with `user_hit_stop`: the interrupt
+/// arm sets both together (cancelling device → `meta.actor`), so a new turn
+/// must clear both. Without this, a follow-up arriving on `msg_rx` during the
+/// cancel+follow-up race clears the latch but leaves the prior turn's device
+/// on `meta`, leaking it onto the follow-up's `CodingAgentPromptSent` and
+/// `ResponseGenerated`.
 pub(super) fn reset_per_turn_flags(
     is_waiting: &mut bool,
     last_emitted_idle: &mut bool,
     emitted_terminal_event: &mut bool,
     user_hit_stop: &mut bool,
     last_terminal_kind: &mut Option<TerminalKind>,
+    cancel_actor: &mut Option<crate::engine::thread_events::MessageOrigin>,
 ) {
     *is_waiting = false;
     *last_emitted_idle = false;
     *emitted_terminal_event = false;
     *user_hit_stop = false;
     *last_terminal_kind = None;
+    *cancel_actor = None;
 }
 
 /// 10 minutes of CC silence in the narrow "awaiting Anthropic response"
@@ -435,12 +482,22 @@ impl WatchdogGate {
 /// indefinitely.
 ///
 /// Precedence: external terminal already emitted > watchdog fired (auto-
-/// recovery) > plain safety net (abort). External terminal wins because the
-/// caller already landed a terminal (engine restart, race), and a second
-/// terminal would relabel a finished turn. Watchdog wins over plain abort
-/// because the watchdog's whole job is to bypass the user-visible abort
-/// when the network died mid-call — auto-resume picks up cleanly via
-/// `--resume` once the kernel notices the dead socket.
+/// recovery) > stray signal-kill (auto-recovery) > plain safety net (abort).
+/// External terminal wins because the caller already landed a terminal (engine
+/// restart, race), and a second terminal would relabel a finished turn.
+/// Watchdog wins over plain abort because the watchdog's whole job is to bypass
+/// the user-visible abort when the network died mid-call — auto-resume picks up
+/// cleanly via `--resume` once the kernel notices the dead socket.
+///
+/// A stray signal-kill (`killed_by_signal`) the engine did NOT initiate
+/// (`!engine_cancelled`) is the `exit=143` truncation bug: a SIGTERM reached
+/// the CC child without a deliberate cancel. It is recoverable the same way —
+/// auto-resume via `--resume` rather than a red-dot abort the user must clear.
+/// Gated on `!engine_cancelled` so a deliberate teardown's own SIGKILL (user
+/// Stop, shutdown, restart, eviction, stale-resume) never masquerades as a
+/// stray kill. The process-group isolation fix should prevent the stray
+/// SIGTERM in the first place; this is the defense-in-depth recovery for any
+/// residual mid-stream signal death.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SafetyNetAction {
     /// Loop ended with a natural terminator (Generated, Failed, Canceled,
@@ -468,6 +525,8 @@ pub(super) fn safety_net_action(
     safety_net_fired: bool,
     watchdog_fired: bool,
     external_terminal_already_emitted: bool,
+    killed_by_signal: bool,
+    engine_cancelled: bool,
 ) -> SafetyNetAction {
     if !safety_net_fired {
         return SafetyNetAction::Nothing;
@@ -476,10 +535,14 @@ pub(super) fn safety_net_action(
         return SafetyNetAction::Skip;
     }
     if watchdog_fired {
-        SafetyNetAction::EmitContinuationRequested
-    } else {
-        SafetyNetAction::EmitAbortedSafetyNet
+        return SafetyNetAction::EmitContinuationRequested;
     }
+    // Stray external signal-kill (exit=143) with no deliberate engine cancel —
+    // recover like the watchdog rather than surfacing an abort.
+    if killed_by_signal && !engine_cancelled {
+        return SafetyNetAction::EmitContinuationRequested;
+    }
+    SafetyNetAction::EmitAbortedSafetyNet
 }
 
 /// Pure tick outcome. Fires only when CC is mid-turn (`!is_waiting`), no

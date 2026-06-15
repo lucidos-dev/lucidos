@@ -98,8 +98,33 @@ names and passes them as substring filters so it runs ~8 tests instead of
 ~1933. When you add a new `#[cfg(feature = "real-embedder-tests")]` test, add
 its name to `GATED_TESTS` at the top of the script.
 
-For unit/wiring tests of code that *uses* the embedder (e.g. `discover_knowhow`,
-`stamp_knowhow`), use the `KeywordEmbedder` mock from `crate::test_util` —
+**Network resilience (warm cache + graceful skip).** These tests must never red
+the suite on a transient huggingface.co outage (a real failure mode — a
+`tokenizer.json` fetch once timed out and failed the nightly e2e). Two layers:
+
+- **Warm cache (fast/deterministic path).** `e2e-embedder.sh` pins
+  `FASTEMBED_CACHE_DIR` to a stable, machine-persistent dir
+  (`${XDG_CACHE_HOME:-$HOME/.cache}/lucidos/fastembed`) so the ~465 MB seed
+  survives `cargo clean` / worktree churn and is shared across worktrees + the
+  nightly checkout. On a cache hit, `hf-hub`'s `ApiRepo::get` short-circuits
+  before any network call — seeded runs are fully offline. (The model is far too
+  large to commit, so `.fastembed_cache/` stays gitignored; the cache is *seeded*
+  once, not checked in.)
+- **Graceful skip (resilience guarantee).** When the cache is cold *and*
+  huggingface.co is unreachable, `test_util::shared_embedder()` returns `None`
+  (logging a `SKIP` line) instead of panicking on the model-fetch `.unwrap()`.
+  Each gated test does `let Some(provider) = shared_embedder() else { return };`,
+  so an HF outage degrades to *skipped*, never *failed*. Only a model-fetch /
+  network error skips (matched by `is_model_fetch_failure`) — assertion failures
+  and non-network init errors (corrupt model, bad config) still fail loudly.
+
+To prove the offline path locally: seed once (`./scripts/e2e-embedder.sh`), then
+re-run with `HF_ENDPOINT=http://127.0.0.1:1` — the tests pass from the warm cache
+with zero network. To prove the skip: point `FASTEMBED_CACHE_DIR` at an empty dir
+with the same unreachable endpoint — the tests skip rather than fail.
+
+For unit/wiring tests of code that *uses* the embedder (e.g. memory rebuild,
+`recall_memory`), use the `KeywordEmbedder` mock from `crate::test_util` —
 deterministic, network-free, cosine reflects keyword overlap. Default
 `cargo test` stays offline; only add `#[cfg(feature = "real-embedder-tests")]`
 when the test genuinely depends on the model's semantic behavior.

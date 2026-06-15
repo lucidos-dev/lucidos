@@ -9,7 +9,7 @@ import {
   showConfirm,
 } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
-import type { EventSubscription, TriggerRun } from '../types';
+import type { EventSubscription, SideEffectCategory, TriggerRun } from '../types';
 import {
   listTriggers,
   listHistoricalTriggers,
@@ -70,6 +70,10 @@ export function openAddTrigger(): void {
 export function openEditTrigger(triggerId: string): void {
   panelOverlay.value = { type: 'form', form: { type: 'trigger', triggerId } };
   pushNavState();
+  // Lands the edit form in the content pane: mobile swipe + desktop split
+  // expand. Now the whole trigger row's click handler, so it must reveal the
+  // pane like openApp does for the apps panel.
+  revealContentPane();
 }
 
 export async function navigateToTrigger(triggerId: string): Promise<void> {
@@ -104,10 +108,14 @@ interface SubmitTriggerParams {
   /** Group membership: undefined = leave unchanged (update only), null = clear,
    *  string = group id. Create requests treat undefined as "no group". */
   groupId?: string | null;
+  /** Side-effect grant (ADR 0002, Phase 5) — the full set this trigger is
+   *  authorized to perform unattended. Always sent as a complete list (the
+   *  engine replaces wholesale); `[]` clears all grants. */
+  sideEffectGrant: SideEffectCategory[];
 }
 
 export async function submitTrigger(params: SubmitTriggerParams): Promise<boolean> {
-  const { name, run, cronExpressions, triggerId, on, showEvent, goToReview, groupId } = params;
+  const { name, run, cronExpressions, triggerId, on, showEvent, goToReview, groupId, sideEffectGrant } = params;
   if (!name.trim()) {
     showToast('Trigger name is required', 'error');
     return false;
@@ -129,6 +137,9 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         // showEvent=false means the user moved to schedule-only; the empty list
         // clears any existing subscriptions on the backend.
         on: showEvent ? (on ?? []) : [],
+        // Full replacement every save (the form always reflects the complete
+        // grant); `[]` clears all grants.
+        side_effect_grant: sideEffectGrant,
       };
       // groupId: undefined = unchanged, null = clear, string = set. Same
       // triple-state semantics as the engine's app_id field.
@@ -148,6 +159,9 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         // groupId on create: null and undefined both mean "no group"; only a
         // string sends a group_id to the engine.
         group_id: typeof groupId === 'string' ? groupId : undefined,
+        // Only send a grant when non-empty (keeps the create payload clean for
+        // the common no-grant trigger).
+        side_effect_grant: sideEffectGrant.length > 0 ? sideEffectGrant : undefined,
       });
       if (!data.success) {
         showToast(data.error || 'Failed to create trigger', 'error');

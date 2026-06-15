@@ -25,14 +25,12 @@ const notesApp: App = {
   id: 'notes-app',
   name: 'Notes App',
   description: 'Daily notes',
-  knowhow: [],
 };
 
 const tripPlanner: App = {
   id: 'trip-planner-2026',
   name: 'Trip Planner 2026',
   description: 'Vacation planner',
-  knowhow: [],
 };
 
 describe('captureAppUI', () => {

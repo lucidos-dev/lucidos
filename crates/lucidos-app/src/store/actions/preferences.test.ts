@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences } from './preferences';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions } from './preferences';
 import * as apiClient from '../../api/client';
 
 const platformMocks = vi.hoisted(() => ({ isIOS: false }));
@@ -304,5 +304,53 @@ describe("applyTheme('system') — matchMedia change listener gating", () => {
     platformMocks.isIOS = true;
     applyTheme('system');
     expect(listeners).toHaveLength(0);
+  });
+});
+
+describe('welcomeSuggestionsDismissed — new-workspace welcome gate', () => {
+  beforeEach(() => {
+    preferences.value = { status: 'not-loaded' };
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('fails closed while preferences are not loaded (no flash for returning users)', () => {
+    expect(welcomeSuggestionsDismissed()).toBe(true);
+  });
+
+  it('fails closed when preferences failed to load', () => {
+    preferences.value = { status: 'failed', error: 'network error' };
+    expect(welcomeSuggestionsDismissed()).toBe(true);
+  });
+
+  it('is NOT dismissed on a loaded workspace with the preference unset (new workspace shows welcome)', () => {
+    preferences.value = { status: 'loaded', data: {} };
+    expect(welcomeSuggestionsDismissed()).toBe(false);
+  });
+
+  it('is dismissed once the preference is set to true', () => {
+    preferences.value = { status: 'loaded', data: { welcome_suggestions_dismissed: 'true' } };
+    expect(welcomeSuggestionsDismissed()).toBe(true);
+  });
+
+  it('dismissWelcomeSuggestions writes the preference when not yet dismissed', async () => {
+    preferences.value = { status: 'loaded', data: {} };
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+
+    await dismissWelcomeSuggestions();
+
+    expect(spy).toHaveBeenCalledWith('welcome_suggestions_dismissed', 'true', undefined);
+    expect((preferences.value as { data: Record<string, string> }).data.welcome_suggestions_dismissed).toBe('true');
+  });
+
+  it('dismissWelcomeSuggestions is idempotent — skips the write when already dismissed', async () => {
+    preferences.value = { status: 'loaded', data: { welcome_suggestions_dismissed: 'true' } };
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+
+    await dismissWelcomeSuggestions();
+
+    expect(spy).not.toHaveBeenCalled();
   });
 });

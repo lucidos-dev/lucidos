@@ -126,6 +126,16 @@ impl BatchProgress {
         })
     }
 
+    /// Every still-unresolved member, in order. Used by the batch-cancel path:
+    /// the in-flight member (currently hardening/merging) plus the queued ones
+    /// that never started. Order-preserving like `next_pending`.
+    pub(crate) fn pending_members(&self) -> Vec<Uuid> {
+        self.members
+            .iter()
+            .filter_map(|(id, status)| matches!(status, MemberStatus::Pending).then_some(*id))
+            .collect()
+    }
+
     /// True when every member has resolved. The driver emits
     /// `ApplyAllBatchCompleted` and removes the batch from the registry.
     pub(crate) fn is_complete(&self) -> bool {
@@ -168,6 +178,12 @@ impl ApplyAllRegistry {
 
     pub(crate) fn remove(&mut self, batch_id: Uuid) -> Option<BatchProgress> {
         self.inner.remove(&batch_id)
+    }
+
+    /// IDs of every live batch. The cancel-all path snapshots these so it can
+    /// drain + remove each batch under one lock.
+    pub(crate) fn batch_ids(&self) -> Vec<Uuid> {
+        self.inner.keys().copied().collect()
     }
 
     /// Find the batch that contains `change_id`, if any. Returns the batch
@@ -399,6 +415,46 @@ mod tests {
         assert_eq!(final_state.applied_ids(), vec![ids[0]]);
         assert_eq!(final_state.failures(), vec![failure(ids[1], "boom")]);
         assert!(reg.remove(batch_id).is_none(), "second remove returns None");
+    }
+
+    /// `pending_members` returns every unresolved member in order — the cancel
+    /// path interrupts the in-flight one and marks all of them canceled.
+    #[test]
+    fn pending_members_returns_unresolved_in_order() {
+        let ids = uuids(4);
+        let mut batch = BatchProgress::new(Uuid::new_v4(), ids.clone(), None);
+        assert_eq!(batch.pending_members(), ids);
+
+        batch.record_applied(ids[0]);
+        batch.record_failed(ids[2], "boom".into());
+        // ids[1] (in-flight) and ids[3] (queued) remain pending, in order.
+        assert_eq!(batch.pending_members(), vec![ids[1], ids[3]]);
+
+        batch.record_failed(ids[1], "Apply All canceled".into());
+        batch.record_failed(ids[3], "Apply All canceled".into());
+        assert!(batch.pending_members().is_empty());
+        assert!(batch.is_complete(), "canceling all pending completes the batch");
+    }
+
+    /// `batch_ids` lists every live batch so cancel-all can drain them.
+    #[test]
+    fn registry_batch_ids_lists_all_live_batches() {
+        let batch_a = BatchProgress::new(Uuid::new_v4(), uuids(1), None);
+        let batch_b = BatchProgress::new(Uuid::new_v4(), uuids(1), None);
+        let a_id = batch_a.batch_id();
+        let b_id = batch_b.batch_id();
+        let mut reg = ApplyAllRegistry::default();
+        reg.insert(batch_a);
+        reg.insert(batch_b);
+
+        let mut ids = reg.batch_ids();
+        ids.sort();
+        let mut want = vec![a_id, b_id];
+        want.sort();
+        assert_eq!(ids, want);
+
+        reg.remove(a_id);
+        assert_eq!(reg.batch_ids(), vec![b_id]);
     }
 
     /// Empty batch is trivially complete — guards against a no-op

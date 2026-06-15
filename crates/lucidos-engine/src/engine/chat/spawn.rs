@@ -17,6 +17,10 @@ impl LucidosEngine {
     /// caller already emitted it and incremented active_children_count).
     /// `model` / `reasoning_effort` — chat-mode prefs to inherit; `None` falls
     /// through to the engine's `LUCIDOS_MODEL` env default.
+    ///
+    /// Returns the child thread id plus the processing task's `JoinHandle` —
+    /// the Thread Queue executor awaits it so the spawn's capacity slot is
+    /// held until the sub-thread finishes its turn.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_thread(
         &self,
@@ -28,7 +32,8 @@ impl LucidosEngine {
         caller_title: Option<&str>,
         model: Option<String>,
         reasoning_effort: Option<String>,
-    ) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Uuid, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>>
+    {
         let explicit_title = caller_title
             .map(str::trim)
             .filter(|t| !t.is_empty())
@@ -73,7 +78,7 @@ impl LucidosEngine {
                             // Spawned child threads carry no images on their first prompt.
                             emit_generated_title(
                                 &bus,
-                                &provider,
+                                provider.as_ref(),
                                 child_thread_id,
                                 &msg,
                                 None,
@@ -92,7 +97,7 @@ impl LucidosEngine {
 
         let engine = self.clone_arc();
         let prompt_owned = prompt.to_string();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = engine
                 .process_message_with_steps(
                     &prompt_owned,
@@ -112,6 +117,7 @@ impl LucidosEngine {
                     spawning_event_id,
                     ActorMode::Agent,
                     None,
+                    None,
                     pre_emitted_origin,
                     None,
                     None,
@@ -122,6 +128,6 @@ impl LucidosEngine {
             }
         });
 
-        Ok(child_thread_id)
+        Ok((child_thread_id, handle))
     }
 }

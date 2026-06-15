@@ -1,6 +1,6 @@
 use crate::engine::agent_session::node_modules_setup::has_install_marker;
 use crate::engine::agent_session::prompts::{
-    app_worktree_recovery_system_prompt, app_worktree_system_prompt,
+    app_worktree_recovery_system_prompt, app_worktree_system_prompt, append_backend_rules,
     conflict_resolution_system_prompt, external_repo_recovery_system_prompt,
     external_repo_system_prompt, recovery_system_prompt, worktree_system_prompt,
 };
@@ -27,6 +27,15 @@ pub(super) struct SpawnWorktreeContext {
     pub(super) interactive_session: bool,
     pub(super) adoption_note: Option<String>,
     pub(super) resume_session_id: Option<String>,
+    /// True when THIS call created the worktree directory (vs. reusing a
+    /// recovery / conflict / resume worktree). The spawn-failure cleanup
+    /// (`git_ops::cleanup_failed_spawn`) only removes what this attempt
+    /// created — a pre-existing worktree holds the thread's work.
+    pub(super) worktree_created: bool,
+    /// True when THIS call created `branch_name` (fresh spawn, `-b`). Same
+    /// cleanup contract: a reused branch may hold committed work and must
+    /// survive a failed spawn.
+    pub(super) branch_created: bool,
 }
 
 impl LucidosEngine {
@@ -49,13 +58,21 @@ impl LucidosEngine {
         mut resume_session_id: Option<String>,
         thread_id: Uuid,
         cc_start: std::time::Instant,
+        // Backend already resolved by `run_direct_agent` (stored value beats
+        // the request) — threaded through so `append_backend_rules` can pick
+        // the Codex teaching section without re-querying thread_summaries.
+        coding_agent: crate::runtime::CodingAgent,
     ) -> Result<SpawnWorktreeContext, Box<dyn std::error::Error + Send + Sync>> {
         let mut adoption_note: Option<String> = None;
-        let (cwd, system_prompt, branch_name, worktree_path, interactive_session) = if let Some(
-            (wt_path, branch),
-        ) =
-            recovery_worktree
-        {
+        let (
+            cwd,
+            system_prompt,
+            branch_name,
+            worktree_path,
+            interactive_session,
+            worktree_created,
+            branch_created,
+        ) = if let Some((wt_path, branch)) = recovery_worktree {
             // Recovery mode: reuse an orphaned worktree from a previous session
             log!(
                 "[ClaudeCode] Starting recovery session on orphaned worktree: {} (branch {})",
@@ -71,7 +88,17 @@ impl LucidosEngine {
             } else {
                 recovery_system_prompt(&branch, workspace_name)
             };
-            (wt_path.clone(), system_prompt, branch, Some(wt_path), true)
+            // Reused worktree + branch — nothing here is ours to delete on
+            // a failed spawn.
+            (
+                wt_path.clone(),
+                system_prompt,
+                branch,
+                Some(wt_path),
+                true,
+                false,
+                false,
+            )
         } else if let Some(ref change) = conflict_change {
             // Conflict mode: run in the merge worktree where the merge is in progress
             let wt_path_str = change
@@ -84,11 +111,15 @@ impl LucidosEngine {
                 .ok_or("Conflict change has no merge temp branch")?;
             let cwd = PathBuf::from(wt_path_str);
             let system_prompt = conflict_resolution_system_prompt().to_string();
+            // The merge worktree + temp branch belong to the in-progress
+            // merge, not to this spawn — keep them on failure.
             (
                 cwd.clone(),
                 system_prompt,
                 temp_branch.clone(),
                 Some(cwd),
+                false,
+                false,
                 false,
             )
         } else {
@@ -377,10 +408,23 @@ impl LucidosEngine {
             {
                 if let Err(e) = catchup_with_main(&wt_path).await {
                     log!(
-                        "[ClaudeCode] catchup_with_main failed for {} ({}) -- worktree may be running stale scripts",
+                        "[ClaudeCode] catchup_with_main failed for {} ({}) -- worktree is behind main; surfacing to the session instead of running stale",
                         wt_path.display(),
                         e
                     );
+                    // Don't SILENTLY run a stale worktree. `catchup_with_main`
+                    // aborted the merge (it can't auto-resolve conflicts), so
+                    // the branch is now behind main with conflicting changes —
+                    // the resumed session would otherwise build on pre-merge
+                    // scripts/config with no signal. Surface it via the
+                    // adoption note, which is injected into the session's next
+                    // prompt AND recorded in the timeline, so CC resolves the
+                    // merge with main before relying on shared tooling.
+                    let note = build_catchup_conflict_note(&e.to_string());
+                    adoption_note = Some(match adoption_note.take() {
+                        Some(existing) => format!("{existing}\n{note}"),
+                        None => note,
+                    });
                 }
             }
 
@@ -529,8 +573,28 @@ impl LucidosEngine {
             } else {
                 worktree_system_prompt(&branch_name, workspace_name)
             };
-            (cwd, system_prompt, branch_name, Some(wt_path), true)
+            // What did THIS call create? `existing_worktree.is_none()` means
+            // the create path ran (worktree_add / sparse app worktree);
+            // `!reusing_branch` on top means the branch was born here too
+            // (`-b`). A reused branch (resume) or reused worktree must
+            // survive a failed spawn — see `cleanup_failed_spawn`.
+            let worktree_created = existing_worktree.is_none();
+            let branch_created = worktree_created && !reusing_branch;
+            (
+                cwd,
+                system_prompt,
+                branch_name,
+                Some(wt_path),
+                true,
+                worktree_created,
+                branch_created,
+            )
         };
+        // Backend-specific teaching rides every prompt flavor (normal,
+        // recovery, conflict, override) — a recovered or conflict-resolving
+        // Codex session needs the CLI + question teaching just as much as a
+        // fresh one.
+        let system_prompt = append_backend_rules(system_prompt, coding_agent);
         Ok(SpawnWorktreeContext {
             cwd,
             system_prompt,
@@ -539,6 +603,47 @@ impl LucidosEngine {
             interactive_session,
             adoption_note,
             resume_session_id,
+            worktree_created,
+            branch_created,
         })
+    }
+}
+
+/// Engine-injected resume note for when `catchup_with_main` aborted on a
+/// resumed/reused worktree because `main` advanced and the auto-merge hit
+/// conflicts. Prepended to the session's next prompt (and recorded in the
+/// timeline) so the worktree is never *silently* run stale — CC resolves the
+/// merge with `main` before relying on shared scripts/config. `err` is the
+/// underlying `catchup_with_main` error for context.
+fn build_catchup_conflict_note(err: &str) -> String {
+    format!(
+        "[Note from engine: `main` advanced while this thread was idle, and \
+         auto-merging it into your worktree's branch hit conflicts ({err}). \
+         Your worktree is now BEHIND main — its scripts/, configs, and source \
+         may be stale. Before relying on shared tooling, run `git merge main`, \
+         resolve the conflicts, and commit. Don't assume the worktree is \
+         up to date.]"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_catchup_conflict_note;
+
+    #[test]
+    fn catchup_conflict_note_surfaces_staleness_and_error() {
+        let note = build_catchup_conflict_note("New conflicts from concurrent main changes: x");
+        // Must name the situation so CC (and the user, via the timeline) acts.
+        assert!(note.contains("main"), "note must mention main");
+        assert!(
+            note.to_lowercase().contains("conflict"),
+            "note must mention the conflict"
+        );
+        assert!(
+            note.contains("git merge main"),
+            "note must tell CC how to recover"
+        );
+        // The underlying error is carried through for context.
+        assert!(note.contains("concurrent main changes"));
     }
 }

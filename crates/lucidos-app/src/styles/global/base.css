@@ -25,9 +25,9 @@ html {
     /* Modal overlays must sit above the floating header chrome (2200) so the
        dim backdrop actually covers it — otherwise header buttons punch
        through, show tooltips on hover, and outside-click never lands on the
-       overlay. Same level as .restart-overlay (--z-control-panel + 100). */
+       overlay. Same level as .ui-blocking-overlay (--z-control-panel + 100). */
     --z-modal: 2300;
-    /* Toasts sit above --z-modal and .restart-overlay (both at 2300) so they
+    /* Toasts sit above --z-modal and .ui-blocking-overlay (both at 2300) so they
        remain visible over any open modal. */
     --z-toast: 2400;
     --z-tooltip: 10000;
@@ -43,6 +43,10 @@ html {
     /* Layout */
     --divider-width: 0.1875rem;
     --content-max-width: 50rem;
+    /* Left inset shared by a turn's body content — LLM response body and every
+       initiator body (change card, question, permission, child completion) line
+       up against the same edge. */
+    --turn-body-inset: 0.4rem;
 
     /* Icon sizes (used by .icon-btn variants) */
     --icon-size-sm: 0.875rem;
@@ -64,6 +68,10 @@ html, html[data-theme="dark"] {
     --border-color: #30363d;
     --bg-hover: #1a1f2a;
     --bg-selected: #1e2430;
+    /* Accent-tinted "picked" surface: user message bubble, selected/answered
+       question option, freetext resolution, collapsed-turn stub. One recipe so
+       the whole picked family stays in lockstep (overridden per theme below). */
+    --picked-surface: color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary));
     --text-primary: #e6edf3;
     --text-secondary: #8b949e;
     --text-muted: #6e7681;
@@ -77,7 +85,7 @@ html, html[data-theme="dark"] {
     --initiator-you: #3b82f6;
     --initiator-agent: #fbbf24;
     --initiator-engine: #14b8a6;
-    --initiator-cc: #fb923c;
+    --initiator-coding-agent: #fb923c;
     /* Reason hues — only ever paint the summary line of an engine panel. */
     --reason-trigger: #f59e0b;
     --reason-applied: #10b981;
@@ -108,6 +116,9 @@ html[data-theme="light"] {
     --border-color: #d0d7de;
     --bg-hover: #eaeef2;
     --bg-selected: #eff2f5;
+    /* Lighter in light mode — a softer tint over the near-white secondary surface
+       instead of the heavier grey tertiary, so the bubble reads gentler. */
+    --picked-surface: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
     --text-primary: #1f2328;
     --text-secondary: #656d76;
     --text-muted: #8b949e;
@@ -122,7 +133,7 @@ html[data-theme="light"] {
     --initiator-you: #2563eb;
     --initiator-agent: #ca8a04;
     --initiator-engine: #0d9488;
-    --initiator-cc: #ea7c2a;
+    --initiator-coding-agent: #ea7c2a;
     --reason-trigger: #b45309;
     --reason-applied: #047857;
     --reason-failed: #b91c1c;
@@ -354,7 +365,8 @@ h4, h5, h6 { font-size: 0.8125rem; }
 }
 
 .icon-btn.filter-active,
-.icon-btn.drafts-active {
+.icon-btn.drafts-active,
+.icon-btn.attention-active {
     color: var(--accent);
     background: var(--bg-tertiary);
     border-radius: 0.375rem;
@@ -367,7 +379,8 @@ h4, h5, h6 { font-size: 0.8125rem; }
     }
 
     .icon-btn.filter-active:hover,
-    .icon-btn.drafts-active:hover {
+    .icon-btn.drafts-active:hover,
+    .icon-btn.attention-active:hover {
         background: var(--bg-quaternary);
         color: var(--accent);
     }
@@ -594,11 +607,15 @@ h4, h5, h6 { font-size: 0.8125rem; }
     cursor: default;
 }
 
+/* Option label sits at the primary text color so the muted second-line
+ * description and the section headers (both --text-secondary) read as
+ * de-emphasized beneath it — without this contrast every row is one flat
+ * --text-secondary and the hierarchy disappears. */
 .dropdown-option {
     padding: 0.25rem 0.5rem;
     font-family: var(--font-ui);
     font-size: 0.6875rem;
-    color: var(--text-secondary);
+    color: var(--text-primary);
     cursor: pointer;
     white-space: nowrap;
     transition: background-color 0.1s;
@@ -621,7 +638,7 @@ h4, h5, h6 { font-size: 0.8125rem; }
 }
 
 .dropdown-option.dropdown-option-header {
-    color: var(--text-muted);
+    color: var(--text-secondary);
     font-size: 0.625rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -633,13 +650,50 @@ h4, h5, h6 { font-size: 0.8125rem; }
 @media (hover: hover) {
     .dropdown-option.dropdown-option-header:hover {
         background: transparent;
-        color: var(--text-muted);
+        color: var(--text-secondary);
     }
 }
 
 .dropdown-option.dropdown-option-header.focused {
     background: transparent;
-    color: var(--text-muted);
+    color: var(--text-secondary);
+}
+
+/* Every option's label is wrapped (one DOM shape — see Dropdown.tsx); clip
+ * with ellipsis when a caller constrains the menu width. */
+.dropdown-option-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Optional second line under an option's label (DropdownOption.description).
+ * var(--text-secondary) matches the established option-description treatment
+ * (.control-option-desc, .question-option-desc, .change-option-desc). */
+.dropdown-option-description {
+    font-size: 0.625rem;
+    color: var(--text-secondary);
+    white-space: normal;
+    max-width: 16rem;
+}
+
+/* Error row (DropdownOption.danger) — a failed load must look different from
+ * an empty group. Danger rows skip the header class entirely (Dropdown.tsx),
+ * so no uppercase resets are needed here. */
+.dropdown-option.dropdown-option-danger {
+    color: var(--accent-red);
+    cursor: default;
+}
+
+@media (hover: hover) {
+    .dropdown-option.dropdown-option-danger:hover {
+        background: transparent;
+        color: var(--accent-red);
+    }
+}
+
+.dropdown-option.dropdown-option-danger.focused {
+    background: transparent;
+    color: var(--accent-red);
 }
 
 .dropdown-input-wrap {
@@ -694,7 +748,6 @@ h4, h5, h6 { font-size: 0.8125rem; }
     align-items: center;
     gap: 0.75rem;
     padding: 0.5rem 1rem;
-    border-bottom: 1px solid var(--border-color);
     cursor: pointer;
     transition: background var(--duration-fast);
 }
@@ -725,7 +778,6 @@ h4, h5, h6 { font-size: 0.8125rem; }
     flex-wrap: wrap;
     gap: 0.75rem;
     padding: 0.5rem 1rem;
-    border-bottom: 1px solid var(--border-color);
     transition: background var(--duration-fast);
 }
 
@@ -748,8 +800,6 @@ h4, h5, h6 { font-size: 0.8125rem; }
     letter-spacing: 0.05em;
     color: var(--text-secondary);
     background: var(--bg-tertiary);
-    border-top: 1px solid var(--border-color);
-    border-bottom: 1px solid var(--border-color);
 }
 
 .list-row-info {

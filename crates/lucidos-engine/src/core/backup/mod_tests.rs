@@ -909,6 +909,9 @@ impl BackupProvider for MockProvider {
     fn oauth_provider(&self) -> &str {
         "mock"
     }
+    async fn folder_url(&self) -> Option<String> {
+        None
+    }
     async fn preflight(&self, _estimated_upload_bytes: u64) -> Result<(), BoxError> {
         Ok(())
     }

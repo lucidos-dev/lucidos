@@ -1,5 +1,8 @@
+pub mod anthropic;
+pub mod anthropic_wire;
 pub mod image;
 pub mod mock;
+pub mod model_registry;
 pub mod openai;
 pub mod provider;
 pub mod routing;
@@ -8,8 +11,10 @@ pub mod tools;
 pub mod validate;
 pub mod vertex;
 
+pub use anthropic::{AnthropicAuth, AnthropicProvider};
 pub use image::{ImageProvider, ImageSize};
-pub use openai::OpenAiProvider;
+pub use model_registry::{ModelRegistry, ProviderKind};
+pub use openai::{resolve_openai_api_key, OpenAiKeySource, OpenAiProvider};
 pub use provider::{ContentBlock, LlmProvider, Message, MessageContent, TokenCallback, ToolCall};
 pub use routing::RoutingProvider;
 pub use tools::{
@@ -23,6 +28,23 @@ use std::time::Duration;
 
 /// Max retry attempts for LLM API calls (shared across providers).
 pub const MAX_RETRIES: u32 = 3;
+
+/// Map a unified `reasoning_effort` string to the thinking-budget token count
+/// shared by the Claude `budget_tokens` field (Vertex + direct Anthropic) and
+/// the Gemini-3 `thinkingConfig.thinkingBudget`. Unknown values fall back to
+/// the "high" budget — the default each call site picked independently before
+/// this was DRYed up. Provider-neutral, so it lives here rather than in any one
+/// provider module.
+pub(crate) fn thinking_budget_for_effort(effort: &str) -> u32 {
+    match effort {
+        "low" => 4096,
+        "medium" => 8192,
+        "high" => 16384,
+        "xhigh" => 24576,
+        "max" => 32768,
+        _ => 16384,
+    }
+}
 
 /// Whether an HTTP status code is retryable (429 rate limit, 529 overload, 5xx server error).
 pub fn is_retryable_status(status_code: u16) -> bool {

@@ -154,3 +154,55 @@ fn notification_toast_requested_is_transient_on_notification_aggregate() {
     assert_eq!(e.event_type(), "NotificationToastRequested");
     assert_eq!(e.aggregate_id(), Uuid::nil().to_string());
 }
+
+#[test]
+fn native_push_requested_serializes_with_type_tag() {
+    // §4 native desktop surface trigger — emitted on the push-ALLOWED branch
+    // so a connected Tauri app shows a native macOS banner. Same wire shape as
+    // NotificationToastRequested (the SDK reuses the decode), consumed by the
+    // native-push handler. `sent_at_ms` drives the page-side freshness gate.
+    let nid = Uuid::nil();
+    let tid = Uuid::nil();
+    let e = SystemEvent::NativePushRequested {
+        notification_id: nid,
+        title: "Claude is asking".to_string(),
+        body: "Pick one".to_string(),
+        thread_id: Some(tid),
+        event_id: None,
+        app_id: None,
+        tap: Tap::Modal,
+        sent_at_ms: 1_700_000_000_000,
+    };
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(json["type"], "NativePushRequested");
+    assert_eq!(json["data"]["notification_id"], nid.to_string());
+    assert_eq!(json["data"]["title"], "Claude is asking");
+    assert_eq!(json["data"]["body"], "Pick one");
+    assert_eq!(json["data"]["thread_id"], tid.to_string());
+    assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
+    assert_eq!(json["data"]["tap"], serde_json::json!({"kind": "modal"}));
+    assert!(json["data"].get("event_id").is_none());
+    assert!(json["data"].get("app_id").is_none());
+}
+
+#[test]
+fn native_push_requested_is_transient_on_notification_aggregate() {
+    // Transient UI signal — broadcast to SSE, never written to events. Lives on
+    // the `notification` aggregate alongside NotificationToastRequested (its
+    // mutually-exclusive complement: toast on push-suppressed, native on
+    // push-allowed).
+    let e = SystemEvent::NativePushRequested {
+        notification_id: Uuid::nil(),
+        title: String::new(),
+        body: String::new(),
+        thread_id: None,
+        event_id: None,
+        app_id: None,
+        tap: Tap::Modal,
+        sent_at_ms: 0,
+    };
+    assert!(!e.is_persisted());
+    assert_eq!(e.aggregate(), "notification");
+    assert_eq!(e.event_type(), "NativePushRequested");
+    assert_eq!(e.aggregate_id(), Uuid::nil().to_string());
+}

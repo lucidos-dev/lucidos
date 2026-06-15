@@ -33,10 +33,12 @@ pub(super) async fn insert_trigger_thread(
     minutes_ago: i64,
 ) -> Uuid {
     let id = Uuid::new_v4();
+    // The drawer sorts by last_user_action, so stagger it (not just
+    // last_activity) to control the order these helpers' callers assert on.
     sqlx::query(
             "INSERT INTO thread_summaries \
-             (thread_id, title, source, message_count, last_activity, has_response, is_saved, trigger_id, trigger_name) \
-             VALUES ($1, 'T', 'trigger', 1, NOW() - ($2 || ' minutes')::interval, TRUE, FALSE, $3, $4)",
+             (thread_id, title, source, message_count, last_activity, last_user_action, last_agent_action, has_response, is_saved, trigger_id, trigger_name) \
+             VALUES ($1, 'T', 'trigger', 1, NOW() - ($2 || ' minutes')::interval, NOW() - ($2 || ' minutes')::interval, NOW() - ($2 || ' minutes')::interval, TRUE, FALSE, $3, $4)",
         )
         .bind(id)
         .bind(minutes_ago.to_string())
@@ -54,8 +56,8 @@ pub(super) async fn insert_cc_repo_thread(pool: &PgPool, repo_id: &str, minutes_
     let id = Uuid::new_v4();
     sqlx::query(
             "INSERT INTO thread_summaries \
-             (thread_id, title, source, message_count, last_activity, has_response, is_saved, cc_repo_id) \
-             VALUES ($1, 'CC', 'claude_code', 1, NOW() - ($2 || ' minutes')::interval, TRUE, FALSE, $3)",
+             (thread_id, title, source, message_count, last_activity, last_user_action, last_agent_action, has_response, is_saved, cc_repo_id) \
+             VALUES ($1, 'CC', 'claude_code', 1, NOW() - ($2 || ' minutes')::interval, NOW() - ($2 || ' minutes')::interval, NOW() - ($2 || ' minutes')::interval, TRUE, FALSE, $3)",
         )
         .bind(id)
         .bind(minutes_ago.to_string())
@@ -77,6 +79,45 @@ pub(super) async fn insert_repository(pool: &PgPool, repo_id: Uuid, name: &str, 
         .expect("insert repository");
 }
 
+/// Seed the durable `repo_names` projection (what the EventBus
+/// `RepositoryAdded` arm writes). Lets a test simulate "this repo's name was
+/// recorded, then the repo was removed from the live registry".
+pub(super) async fn insert_repo_name(pool: &PgPool, repo_id: Uuid, name: &str) {
+    sqlx::query("INSERT INTO repo_names (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name")
+        .bind(repo_id)
+        .bind(name)
+        .execute(pool)
+        .await
+        .expect("insert repo_name");
+}
+
+/// Remove a repo from the live `repositories` registry — mirrors
+/// `RepositoryStore::remove`. The `repo_names` projection is left untouched.
+pub(super) async fn delete_repository(pool: &PgPool, repo_id: Uuid) {
+    sqlx::query("DELETE FROM repositories WHERE id = $1")
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("delete repository");
+}
+
+/// Insert a `changes` row binding a thread to a `repo_root` path. Powers the
+/// repo-name scavenge backfill: a pre-`RepositoryAdded` repo's name is
+/// recoverable from this path's basename even when no event recorded it.
+pub(super) async fn insert_change(pool: &PgPool, thread_id: Uuid, repo_root: &str) {
+    // `branch_name` is unique per pending change (`idx_changes_unique_pending_branch`),
+    // so derive a fresh one per row.
+    let request_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO changes (request_id, branch_name, repo_root, thread_id) VALUES ($1, $2, $3, $4)")
+        .bind(request_id)
+        .bind(format!("branch-{request_id}"))
+        .bind(repo_root)
+        .bind(thread_id)
+        .execute(pool)
+        .await
+        .expect("insert change");
+}
+
 /// Insert an app coding-agent thread operating on `data/apps/<app_id>` with the
 /// given last_activity offset and archive state. Returns the new thread id.
 pub(super) async fn insert_app_thread(
@@ -90,9 +131,9 @@ pub(super) async fn insert_app_thread(
     let archive_state = if archived { "archived" } else { "inbox" };
     sqlx::query(
             "INSERT INTO thread_summaries \
-             (thread_id, title, source, message_count, last_activity, has_response, is_saved, \
+             (thread_id, title, source, message_count, last_activity, last_user_action, last_agent_action, has_response, is_saved, \
               archive_state, coding_agent_kind, coding_agent_folder) \
-             VALUES ($1, 'App', 'claude_code', 1, NOW() - ($2 || ' minutes')::interval, TRUE, FALSE, \
+             VALUES ($1, 'App', 'claude_code', 1, NOW() - ($2 || ' minutes')::interval, NOW() - ($2 || ' minutes')::interval, NOW() - ($2 || ' minutes')::interval, TRUE, FALSE, \
                      $3, 'app', $4)",
         )
         .bind(id)
@@ -114,8 +155,8 @@ pub(super) async fn insert_null_trigger_thread(pool: &PgPool, minutes_ago: i64) 
     let id = Uuid::new_v4();
     sqlx::query(
             "INSERT INTO thread_summaries \
-             (thread_id, title, source, message_count, last_activity, has_response, is_saved, trigger_id, trigger_name) \
-             VALUES ($1, 'T', 'trigger', 1, NOW() - ($2 || ' minutes')::interval, TRUE, FALSE, NULL, NULL)",
+             (thread_id, title, source, message_count, last_activity, last_user_action, last_agent_action, has_response, is_saved, trigger_id, trigger_name) \
+             VALUES ($1, 'T', 'trigger', 1, NOW() - ($2 || ' minutes')::interval, NOW() - ($2 || ' minutes')::interval, NOW() - ($2 || ' minutes')::interval, TRUE, FALSE, NULL, NULL)",
         )
         .bind(id)
         .bind(minutes_ago.to_string())

@@ -500,19 +500,18 @@ describe('Apply Now — SessionEnded must not clear applying state', () => {
 
 });
 
-describe('codingAgentApplying suppresses Cancel button during merge-via-CC apply', () => {
-  it('returns applying (not canceling) when status=running and codingAgentApplying=true', () => {
+describe('merge-via-CC apply is cancelable (best-effort) from the thread', () => {
+  it('returns canceling when status=running and codingAgentApplying=true', () => {
     // Scenario: user clicked Apply on the Changes panel for a thread with a
     // live Claude Code session. Tier 1 slow-path emits MergeConflictDetected (sets
     // codingAgentApplying=true), then sends a merge prompt to CC. CC processes the
     // prompt → CodingAgentPromptSent flips status to 'running'.
     //
-    // Without this guard, the WaitingBanner would show the Cancel button.
-    // Clicking Cancel only interrupts the Claude Code subprocess — the apply task in
-    // apply_change keeps running, sees CC went idle, checks if main is now
-    // an ancestor of the branch, and emits ChangeApplied anyway. The user
-    // thinks they cancelled but the merge lands. Hide Cancel during apply
-    // so the user can't trigger a no-op cancel.
+    // The user must be able to stop a long-running merge: Cancel interrupts the
+    // CC merge session. It's best-effort — if the merge already landed before the
+    // interrupt processes, the engine still emits ChangeApplied; otherwise the
+    // change returns to pending. (This used to be suppressed to a disabled
+    // "Apply...", leaving no way out of a stuck merge.)
     const thread = makeCCThread('t1', 'running', 'inbox');
     thread.meta.codingAgentApplying = true;
     threadMap.value = new Map([['t1', thread]]);
@@ -520,12 +519,11 @@ describe('codingAgentApplying suppresses Cancel button during merge-via-CC apply
 
     const state = getWaitingState();
     expect(state).not.toBeNull();
-    expect(state!.type).toBe('applying');
+    expect(state!.type).toBe('canceling');
   });
 
-  it('returns applying when status=waiting_for_user_answer and codingAgentApplying=true', () => {
-    // Symmetric: even if CC pauses on a question mid-merge, suppress Cancel.
-    // The apply task is still in flight in the engine.
+  it('returns canceling when status=waiting_for_user_answer and codingAgentApplying=true', () => {
+    // Symmetric: a merge paused on a CC question is still mid-turn and cancelable.
     const thread = makeCCThread('t1', 'waiting_for_user_answer', 'inbox');
     thread.meta.codingAgentApplying = true;
     threadMap.value = new Map([['t1', thread]]);
@@ -533,12 +531,11 @@ describe('codingAgentApplying suppresses Cancel button during merge-via-CC apply
 
     const state = getWaitingState();
     expect(state).not.toBeNull();
-    expect(state!.type).toBe('applying');
+    expect(state!.type).toBe('canceling');
   });
 
   it('still shows Cancel for normal CC running with codingAgentApplying=false', () => {
-    // Regression guard: don't suppress Cancel for ordinary CC turns where no
-    // apply is in flight. codingAgentApplying must be the sole gate.
+    // Regression guard: ordinary CC turns are cancelable too.
     const thread = makeCCThread('t1', 'running', 'inbox');
     thread.meta.codingAgentApplying = false;
     threadMap.value = new Map([['t1', thread]]);

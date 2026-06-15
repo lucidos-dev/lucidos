@@ -1,8 +1,10 @@
-//! Question-lifecycle primitives shared by both `AskUserQuestion` channels:
+//! Question-lifecycle primitives shared by every `AskUserQuestion` channel:
 //! CC's PreToolUse hook (`lucidos-cli ask-user-question-hook`, served by
-//! `api::internal::ask_user_question`) and the chat agent's `ask_user_question`
-//! tool (`engine::agentic_loop_special_tool::handle_chat_ask_user_question`).
-//! Both flow through `walk_question_batch` here; both resolve via
+//! `api::internal::ask_user_question`), Codex's `ask_user_question` MCP tool
+//! (`lucidos mcp-permission-server`, same endpoint), and the chat agent's
+//! `ask_user_question` tool
+//! (`engine::agentic_loop_special_tool::handle_chat_ask_user_question`).
+//! All flow through `walk_question_batch` here; all resolve via
 //! `answer_pending_question` here. The HTTP / tool layers stay thin — they
 //! only translate the outcome into their respective wire shapes.
 
@@ -202,9 +204,11 @@ impl LucidosEngine {
     ///
     /// `channel` is stamped onto every emitted `UserQuestionAsked` and on
     /// the trailing Canceled padding answers so `answer_pending_question`
-    /// can branch on the originating channel — CC threads get the resume
-    /// marker + `ContinuationRequested` spawn; chat threads skip both because
-    /// the chat tool returns the answer directly as a tool result.
+    /// can branch on the originating channel — coding-agent threads (CC and
+    /// Codex both ride `EventChannel::ClaudeCode`, the coding-agent channel)
+    /// get the resume marker + `ContinuationRequested` spawn; chat threads
+    /// skip both because the chat tool returns the answer directly as a
+    /// tool result.
     pub(crate) async fn walk_question_batch(
         &self,
         thread_id: Uuid,
@@ -781,34 +785,20 @@ pub async fn answer_pending_question(
     // `QuestionWaitRegistry`, gets woken below, and returns the answer as
     // a tool_result on the same turn. Skip both for chat-channel answers.
     if !should_emit_cc_resume_side_effects(original_channel) {
-        engine
-            .question_wait_registry
-            .notify(
-                &tool_use_id,
-                crate::engine::cc_question_wait::AnswerPayload {
-                    answers: serde_json::to_value(&answer).unwrap_or(serde_json::Value::Null),
-                },
-            )
-            .await;
+        notify_and_release_waiter(engine, &tool_use_id, &answer).await;
         return AnswerResult::Resumed;
     }
 
-    emit_resume_marker_for_cc_answer(&engine.event_bus, thread_id, &answer, actor.clone()).await;
+    let coding_agent = engine.thread_coding_agent(thread_id).await;
+    emit_resume_marker_for_cc_answer(&engine.event_bus, thread_id, &answer, actor.clone(), coding_agent)
+        .await;
 
     // Wake the blocked hook (if any). No-op if nothing is registered:
     // - Engine restart killed the hook; on resume the endpoint's crash-recovery
     //   path reads the just-persisted UserQuestionAnswered from the DB instead.
     // - User answered before the hook re-registered after a transient error;
     //   same crash-recovery path covers it.
-    engine
-        .question_wait_registry
-        .notify(
-            &tool_use_id,
-            crate::engine::cc_question_wait::AnswerPayload {
-                answers: serde_json::to_value(&answer).unwrap_or(serde_json::Value::Null),
-            },
-        )
-        .await;
+    notify_and_release_waiter(engine, &tool_use_id, &answer).await;
 
     ensure_resume_after_answer(
         &engine.event_bus,
@@ -820,6 +810,32 @@ pub async fn answer_pending_question(
     .await;
 
     AnswerResult::Resumed
+}
+
+/// Wake every waiter blocked on `tool_use_id`, then drop the registry
+/// entry. The broadcast buffers the payload, so a waiter that registered
+/// before the send still receives it after the forget; a waiter that
+/// registers later hits the persisted `UserQuestionAnswered` via the
+/// crash-recovery DB lookup instead. The forget is the registry's only
+/// cleanup for waiters that died mid-question (agent killed while the card
+/// was on screen — the dropped handler never reaches its own `forget`;
+/// without this, every cancel-stamped question leaked one entry until
+/// engine restart).
+async fn notify_and_release_waiter(
+    engine: &Arc<LucidosEngine>,
+    tool_use_id: &str,
+    answer: &AnswerKind,
+) {
+    engine
+        .question_wait_registry
+        .notify(
+            tool_use_id,
+            crate::engine::cc_question_wait::AnswerPayload {
+                answers: serde_json::to_value(answer).unwrap_or(serde_json::Value::Null),
+            },
+        )
+        .await;
+    engine.question_wait_registry.forget(tool_use_id).await;
 }
 
 /// Emit the empty `CodingAgentPromptSent` "resume marker" that projects to a
@@ -841,6 +857,11 @@ pub(crate) async fn emit_resume_marker_for_cc_answer(
     thread_id: Uuid,
     answer: &AnswerKind,
     actor: Option<MessageOrigin>,
+    // Which backend is processing the answer — CC via its PreToolUse hook,
+    // Codex via the `mcp__lucidos__ask_user_question` MCP tool. The marker
+    // must stamp the real backend or a Codex thread's Thinking placeholder
+    // would attribute the next turn to Claude Code.
+    coding_agent: crate::runtime::CodingAgent,
 ) -> bool {
     if matches!(answer, AnswerKind::Canceled) {
         return false;
@@ -850,7 +871,7 @@ pub(crate) async fn emit_resume_marker_for_cc_answer(
             thread_id,
             event: ThreadEvent::CodingAgentPromptSent {
                 text: String::new(),
-                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                coding_agent,
                 origin: actor.clone(),
             },
             meta: EventMeta {

@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { navigateToApp } from './helpers';
+import { navigateToApp, gotoWithRetry } from './helpers';
 
 // Regression: ResizeObserver alone doesn't fire when only the scroll
 // container's INNER content (not its own box) grows — which is the typical
@@ -19,7 +19,7 @@ test.describe('scroll position restore', () => {
     if (currentSize) {
       await page.setViewportSize({ width: currentSize.width, height: 400 });
     }
-    await page.goto('/');
+    await gotoWithRetry(page, '/');
     // Seed Settings as the active panel with a saved scroll offset before the
     // app boots. We use a modest value — the bug isn't about exact pixel
     // position but about whether ANY restore occurs once Loadable<T> data

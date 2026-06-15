@@ -31,8 +31,8 @@ describe('appFilterOptions — only apps with CC sessions', () => {
     appsList.value = {
       status: 'loaded',
       data: [
-        { id: 'momentum', name: 'Momentum', description: '', knowhow: [] },
-        { id: 'habit', name: 'Habit', description: '', knowhow: [] },
+        { id: 'momentum', name: 'Momentum', description: '' },
+        { id: 'habit', name: 'Habit', description: '' },
       ],
     };
     // Only momentum has a thread.
@@ -43,7 +43,7 @@ describe('appFilterOptions — only apps with CC sessions', () => {
   it('labels a session app from the live appsList (not deleted)', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'momentum', name: 'Momentum', description: '', knowhow: [] }],
+      data: [{ id: 'momentum', name: 'Momentum', description: '' }],
     };
     threadMap.value = new Map([['t1', appThread('/ws/data/apps/momentum')]]);
     expect(appFilterOptions.value).toEqual([{ id: 'momentum', label: 'Momentum', deleted: false }]);
@@ -60,7 +60,7 @@ describe('appFilterOptions — only apps with CC sessions', () => {
   it('keeps a selected app even with no session so it stays clearable', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'momentum', name: 'Momentum', description: '', knowhow: [] }],
+      data: [{ id: 'momentum', name: 'Momentum', description: '' }],
     };
     threadMap.value = new Map();
     selectedAppIds.value = new Set(['momentum']);
@@ -70,7 +70,7 @@ describe('appFilterOptions — only apps with CC sessions', () => {
   it('ignores non-app coding-agent threads', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'momentum', name: 'Momentum', description: '', knowhow: [] }],
+      data: [{ id: 'momentum', name: 'Momentum', description: '' }],
     };
     threadMap.value = new Map([
       ['t1', { meta: { codingAgentKind: 'lucidos', codingAgentFolder: '/ws/data/apps/momentum' } } as unknown as ThreadState],
@@ -81,12 +81,12 @@ describe('appFilterOptions — only apps with CC sessions', () => {
   it('lists an app from filterFacets even with no loaded thread (complete option list)', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'momentum', name: 'Momentum', description: '', knowhow: [] }],
+      data: [{ id: 'momentum', name: 'Momentum', description: '' }],
     };
     threadMap.value = new Map();
     filterFacets.value = {
       status: 'loaded',
-      data: { triggers: [], repos: [], apps: [{ id: 'momentum', last_activity: '2026-04-01T00:00:00Z' }] },
+      data: { triggers: [], repos: [], apps: [{ id: 'momentum', name: null, last_activity: '2026-04-01T00:00:00Z' }] },
     };
     expect(appFilterOptions.value).toEqual([{ id: 'momentum', label: 'Momentum', deleted: false }]);
   });
@@ -95,7 +95,7 @@ describe('appFilterOptions — only apps with CC sessions', () => {
     appsList.value = { status: 'loaded', data: [] };
     filterFacets.value = {
       status: 'loaded',
-      data: { triggers: [], repos: [], apps: [{ id: 'gone', last_activity: '2026-04-01T00:00:00Z' }] },
+      data: { triggers: [], repos: [], apps: [{ id: 'gone', name: null, last_activity: '2026-04-01T00:00:00Z' }] },
     };
     const opt = appFilterOptions.value;
     expect(opt).toHaveLength(1);

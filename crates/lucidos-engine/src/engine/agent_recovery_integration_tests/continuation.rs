@@ -34,6 +34,7 @@ async fn continuation_requested_emission_classifies_as_spawn_trigger() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-cont".into(),
             branch: "claude-code/cont".into(),
             repo_id: None,
@@ -105,6 +106,7 @@ async fn synthetic_idled_with_engine_restart_interrupt_does_not_dispatch() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-int".into(),
             branch: "claude-code/int".into(),
             repo_id: None,

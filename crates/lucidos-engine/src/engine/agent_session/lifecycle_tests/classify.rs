@@ -1,12 +1,35 @@
 use super::*;
 
+/// Both backends' question tools must suppress the `CodingAgentToolCalled`
+/// emit — the `UserQuestionAsked` event renders the card; a tool-call step
+/// on top double-surfaces the question. Every other tool (including OTHER
+/// lucidos MCP tools like the permission `approve`) must keep emitting, or
+/// its step silently vanishes from the timeline.
+#[test]
+fn question_tools_are_suppressed_other_tools_are_not() {
+    assert!(is_user_question_tool("AskUserQuestion"));
+    assert!(is_user_question_tool("mcp__lucidos__ask_user_question"));
+    for name in [
+        "Bash",
+        "Edit",
+        "command_execution",
+        "file_change",
+        "mcp__lucidos__approve",
+        "mcp__other__ask_user_question",
+    ] {
+        assert!(
+            !is_user_question_tool(name),
+            "{name} must emit CodingAgentToolCalled"
+        );
+    }
+}
 
 /// CC merges back-to-back stdin inputs into a single Result, so the
 /// engine's `pending_followups` counter cannot be relied on to predict
 /// whether more Results are coming. A normal `Generated` Result must
 /// always emit `CodingAgentIdled` regardless of inflight inputs —
 /// otherwise the thread sits in stored=Archived → DisplaySection::Archive
-/// instead of Review. Inflight-followup race protection lives in the
+/// instead of Current. Inflight-followup race protection lives in the
 /// run-loop's subprocess-termination decision, not here.
 #[test]
 fn generated_result_always_emits_idle() {
@@ -15,7 +38,7 @@ fn generated_result_always_emits_idle() {
     assert!(
         emit_idle,
         "Generated Result must emit CodingAgentIdled so the thread reaches \
-         Review — not Archive — after CC produces a Result"
+         Current — not Archive — after CC produces a Result"
     );
 }
 
@@ -244,7 +267,7 @@ fn silent_resume_drops_cc_error_too() {
 /// The invariants this guards:
 ///   - `Generated` → `emit_idle = true`. Skipping idle here is the bug —
 ///     CC really finished, so the thread row must flip to `waiting`/`idle`
-///     and the section must move to Review.
+///     and the section must move to Current.
 ///   - `Aborted` → `emit_idle = false`. Emitting idle on shutdown makes
 ///     `recover_orphaned_worktrees` think the session is "truly idle" and
 ///     skip recovery on restart.
@@ -507,4 +530,82 @@ fn classify_session_end_action_table() {
             "(has_commits={has_commits}, files_empty={files_empty}, is_external={is_external}, safety_net_fired={safety_net_fired}, user_canceled={user_canceled})",
         );
     }
+}
+
+/// The `user_hit_stop` latch must clear after the cancel/abort terminal it
+/// produced is emitted — a `Result` is a turn boundary. `Generated` / `Failed`
+/// can't co-occur with a set latch (it ranks above both in `classify_result`),
+/// so only the cancel/abort terminals need to clear it.
+#[test]
+fn terminal_clears_user_hit_stop_for_cancel_and_abort_only() {
+    use crate::engine::thread_events::{AbortCause, CancelCause};
+    assert!(terminal_clears_user_hit_stop(&TerminalKind::Canceled(
+        CancelCause::UserStop
+    )));
+    assert!(terminal_clears_user_hit_stop(&TerminalKind::Canceled(
+        CancelCause::UserAction
+    )));
+    assert!(terminal_clears_user_hit_stop(&TerminalKind::Aborted(
+        AbortCause::EngineShutdown
+    )));
+    assert!(!terminal_clears_user_hit_stop(&TerminalKind::Generated));
+    assert!(!terminal_clears_user_hit_stop(&TerminalKind::Failed {
+        error: "x".to_string()
+    }));
+}
+
+/// Regression for the "successful turn mislabeled Canceled (twice)" bug.
+///
+/// When the Stop button interrupts an in-flight turn but follow-ups are already
+/// queued, the run loop keeps the subprocess alive to drain them
+/// (`TerminateDecision::KeepAliveForFollowup`). CC reports the interrupted turn
+/// as a `Result` with `is_error` (`stop_reason=tool_use`) → the first
+/// `Canceled`. The drained follow-ups then complete with real, successful output
+/// and emit a SECOND `Result`. Without clearing the `user_hit_stop` latch after
+/// the first cancel, that second `Result` re-classifies as `Canceled` —
+/// stamping finished, committed work as "Canceled" and emitting a phantom
+/// second `ResponseCanceled` carrying the completed text (exactly what the user
+/// saw). Clearing the latch makes the completion classify as `Generated`.
+#[test]
+fn inflight_followup_completion_after_cancel_is_generated_not_double_cancel() {
+    use crate::engine::thread_events::CancelCause;
+
+    // 1) The Stop interrupts the in-flight turn; CC's Result carries the
+    //    interrupt diagnostic (is_error) and the latch is set.
+    let mut user_hit_stop = true;
+    let (first, _) = classify_result(
+        false,
+        user_hit_stop,
+        false,
+        Some("[ede_diagnostic] result_type=user stop_reason=tool_use".to_string()),
+        true,
+    );
+    assert_eq!(
+        first,
+        Some(TerminalKind::Canceled(CancelCause::UserStop)),
+        "the interrupt must classify as the first Canceled"
+    );
+
+    // 2) The run loop clears the latch once that cancel terminal is emitted,
+    //    because the subprocess is kept alive to drain inflight follow-ups.
+    if let Some(kind) = &first {
+        if terminal_clears_user_hit_stop(kind) {
+            user_hit_stop = false;
+        }
+    }
+    assert!(
+        !user_hit_stop,
+        "the user-stop latch must clear after the Canceled terminal so the \
+         next Result classifies fresh"
+    );
+
+    // 3) The drained follow-ups complete successfully with full text. With the
+    //    latch cleared this is a clean completion, NOT a second cancel.
+    let (second, _) = classify_result(false, user_hit_stop, false, None, false);
+    assert_eq!(
+        second,
+        Some(TerminalKind::Generated),
+        "a successful completion after an interrupt superseded by inflight \
+         follow-ups must be ResponseGenerated, not a second ResponseCanceled"
+    );
 }

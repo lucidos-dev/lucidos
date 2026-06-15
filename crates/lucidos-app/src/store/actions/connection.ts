@@ -1,10 +1,12 @@
-import { connectionStatus, dismissToast, showToast, isProcessing, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, TOAST_AUTO_DISMISS_MS } from '../store';
+import { connectionStatus, dismissToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, TOAST_AUTO_DISMISS_MS } from '../store';
 import { checkHealth, API_BASE } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
 import { refreshChangesState, RESTART_LS_KEY } from './chat-changes';
-import { refreshUnreadCount } from './notifications';
+import { loadUnreadNotifications } from './notifications';
 import { isNewerVersion } from '../../utils/version';
+import { refreshClient } from '../../hooks/sw-update';
+import { syncClientUpdateFromBuild } from './client-update';
 
 /** User-facing copy when `submitChat` couldn't reach the engine — laptop
  *  woke up to a stale connection, the engine is genuinely down, etc.
@@ -20,9 +22,15 @@ export function getUnreachableEngineMsg(): string {
 /** True once we've been connected at least once (distinguishes initial connect from reconnect). */
 let hasEverConnected = false;
 
-/** Consecutive health check failures while processing is active.
- *  After 3 failures (15s at 5s polling) we force disconnect regardless of processing state —
- *  the engine is genuinely down, not just slow. */
+/** Consecutive `/health` failures tolerated before flipping the dot to
+ *  disconnected. The engine is local and almost never down, and the dot is
+ *  driven SOLELY by this 5s poll (it does not reflect SSE liveness) — so a lone
+ *  failed GET is far more likely a transient blip (iOS radio nap, Tailscale
+ *  latency spike, HTTP/2 coalescing hiccup after the PWA backgrounds) than a
+ *  real outage. We require MAX_SUPPRESSED_FAILURES+1 consecutive failures
+ *  (~20s at 5s polling) before showing red, mirroring the MIN_RECONNECT_SUCCESSES
+ *  hysteresis on the way back to green. This is what stops the dot blinking red
+ *  on iOS PWA when nothing is actually disconnected. */
 let consecutiveFailures = 0;
 const MAX_SUPPRESSED_FAILURES = 3;
 
@@ -54,7 +62,7 @@ function runResumeSync(): void {
   // timer in ThreadView can never retry a thread that had a transient failure.
   clearForcedRetries();
 
-  void refreshUnreadCount();
+  void loadUnreadNotifications();
   disconnectThreadEvents();
   connectThreadEvents();
   refreshChangesState();
@@ -120,22 +128,55 @@ export async function handleResume(): Promise<void> {
   }
 }
 
+/** The restart safety timeout fired (UiBlockingOverlay). Before declaring a
+ *  timeout, confirm the engine is actually still unreachable.
+ *
+ *  On iOS the restart timer is frozen while the PWA is suspended and fires on
+ *  resume — even though the engine restarted fine while we were backgrounded.
+ *  A blind "Engine restart timed out" toast there is a false error, and worse:
+ *  clearing engineRestarting also drops the central toast suppression, letting
+ *  the post-restart resync's transient failures leak as a pile of toasts. So
+ *  probe health first, but always unblock (the timer's contract). Reachable →
+ *  run the normal reconnect path for the real "Engine restarted" toast +
+ *  resync. Genuinely unreachable after the full window → tell the user. Both
+ *  branches unblock; only the real-timeout branch toasts. */
+export async function handleRestartTimeout(): Promise<void> {
+  // The safety timeout's contract is to ALWAYS unblock the UI once it fires —
+  // clear the overlay flag up front, regardless of the outcome below, so the
+  // overlay can never hang on a reachable-but-not-restart-detected edge.
+  const health = await checkHealth();
+  engineRestarting.value = false;
+  if (health.status === 'loaded') {
+    // Engine is reachable — the restart completed while we were suspended /
+    // foregrounded and we just hadn't noticed. Run the normal reconnect path
+    // for the real "Engine restarted" toast + resync; no false timeout error.
+    await checkConnection();
+    return;
+  }
+  // Genuinely unreachable after the full window — tell the user.
+  showToast('Engine restart timed out', 'error');
+}
+
 export async function checkConnection(): Promise<boolean> {
   const wasConnected = connectionStatus.value === 'connected';
   const healthResult = await checkHealth();
   const health = healthResult.status === 'loaded' ? healthResult.data : null;
   let connected = health !== null;
 
-  // During active processing, tolerate a few health check timeouts before transitioning to
-  // disconnected. The engine can be slow under heavy load, but if it fails
-  // MAX_SUPPRESSED_FAILURES times in a row, it's genuinely down.
+  // Debounce transient health-check failures before declaring disconnect — see
+  // MAX_SUPPRESSED_FAILURES above. This runs whenever we were connected,
+  // independent of processing state: the old code gated this on isProcessing,
+  // so the idle case (PWA in a pocket — exactly when iOS naps the radio) had
+  // ZERO tolerance and a single blip flipped the dot red. Only after
+  // MAX_SUPPRESSED_FAILURES consecutive failures do we let `connected` stay
+  // false and paint red.
   // Track the *real* health result separately from the displayed `connected`
   // value so a suppressed failure doesn't reset the counter on the next line —
   // without this guard the suppression accumulator would zero out after every
   // suppressed failure and the cap would never fire (the engine could stay
   // "down" for hours and we'd still display connected).
   const healthOk = connected;
-  if (!connected && isProcessing.value && wasConnected) {
+  if (!connected && wasConnected) {
     consecutiveFailures++;
     if (consecutiveFailures <= MAX_SUPPRESSED_FAILURES) {
       connected = true;
@@ -183,10 +224,19 @@ export async function checkConnection(): Promise<boolean> {
         restartRequired.value = true;
       }
     }
+    // Tauri app: the shell updates as a versioned unit, so the app-version
+    // comparison is the right "client behind" signal. `__LUCIDOS_APP_VERSION__`
+    // is injected only by the Tauri shell (lib.rs), so its presence IS the Tauri
+    // signal. The WEB client is NOT compared against the engine version here —
+    // the frontend bundle and the engine version independently in dev (a
+    // Rust-only change bumps the engine but not the bundle), so that comparison
+    // flagged a phantom update with nothing to refresh to. Web freshness is the
+    // service-worker BUILD_ID check (syncClientUpdateFromBuild), run on load /
+    // resume / panel open and after a restart below.
     if (health.latest_tauri_app_version) {
       latestTauriAppVersion.value = health.latest_tauri_app_version;
-      const currentAppVersion = window.__LUCIDOS_APP_VERSION__;
-      if (currentAppVersion && isNewerVersion(health.latest_tauri_app_version, currentAppVersion)) {
+      const appVersion = window.__LUCIDOS_APP_VERSION__;
+      if (appVersion && isNewerVersion(health.latest_tauri_app_version, appVersion)) {
         updateAvailable.value = true;
       }
     }
@@ -238,13 +288,21 @@ export async function checkConnection(): Promise<boolean> {
       engineRestarting.value = false;
       localStorage.removeItem(RESTART_LS_KEY);
       dismissToast('restart-required');
-      // Frontend code may have changed — Vite HMR is dead after restart,
-      // so the client needs a reload to pick up new assets.
+      // Frontend code MAY have changed — Vite HMR is dead after restart, so the
+      // client needs a reload to pick up new assets. refreshClient() (not a bare
+      // reload) so the new sw.js is picked up and the cache-first /assets/* graph
+      // doesn't serve a stale bundle back after the reload.
       showToast('Engine restarted', 'success', {
-        action: { label: 'Refresh', onClick: () => window.location.reload() },
+        action: { label: 'Refresh', onClick: () => refreshClient() },
         autoDismissMs: TOAST_AUTO_DISMISS_MS,
       });
-      updateAvailable.value = true;
+      // Light the update badge only if the frontend bundle ACTUALLY rebuilt
+      // (BUILD_ID changed), not for every restart — an engine-only (Rust) change
+      // bumps the engine but leaves the bundle untouched, so a blind set here
+      // nagged for a refresh that does nothing. The build-watch rebuild lands a
+      // few seconds after the restart, so re-check on the scheduled SW nudges
+      // too; this catches a rebuild that already completed.
+      void syncClientUpdateFromBuild();
     }
     runResumeSync();
   } else if (connected && resumePending) {

@@ -103,6 +103,10 @@ pub const COUNT_THREADS: &str = "count_threads";
 pub const LIST_CHANGES: &str = "list_changes";
 pub const APPLY_CHANGE: &str = "apply_change";
 
+// Thread Queue (background admission-control policy + live queue)
+pub const LIST_THREAD_QUEUE: &str = "list_thread_queue";
+pub const UPDATE_THREAD_QUEUE_POLICY: &str = "update_thread_queue_policy";
+
 // Context management
 pub const DISMISS_FROM_CONTEXT: &str = "dismiss_from_context";
 

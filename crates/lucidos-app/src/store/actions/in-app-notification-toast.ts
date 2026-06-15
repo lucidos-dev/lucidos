@@ -82,16 +82,17 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
 
   if (row === 'row4_hidden') {
     // Bell badge updates via the parent SSE dispatch's handleNotificationSSE
-    // (refreshUnreadCount). Suppress the toast — by the time the user
+    // (loadUnreadNotifications). Suppress the toast — by the time the user
     // resumes the PWA it's stale and sits on top of a deep-link landing
     // (see work-tracker `pwa-stale-sticky-notification-toast-on-resume`).
     return;
   }
 
   if (row === 'row1_auto_read') {
-    // User is literally looking at the source event. Mark read (server
-    // broadcast will collapse the +1 bump from handleNotificationSSE) and
-    // skip the toast entirely.
+    // User is literally looking at the source event. Mark read — which drops it
+    // from the unread set so the badge never bumps — and skip the toast. The
+    // optimistic removal invalidates the in-flight set reload handleNotificationSSE
+    // kicked off, so the created notification can't briefly surface on the badge.
     if (target.notification) markReadOptimistic(target.notification);
     return;
   }

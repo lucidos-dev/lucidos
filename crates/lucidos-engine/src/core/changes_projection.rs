@@ -25,6 +25,18 @@ pub struct ChangesProjection {
     pool: PgPool,
 }
 
+/// Outcome of the in-tx single-fire check for a `ChangeApplied` emit
+/// ([`ChangesProjection::change_apply_dedup`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangeApplyDedup {
+    /// First (or only) apply for this change_id — persist the event.
+    Proceed,
+    /// A `ChangeApplied` was already recorded for this change_id (the row is
+    /// already `applied`); a concurrent or later duplicate apply lost the race.
+    /// The caller must skip persisting a second event.
+    Suppress,
+}
+
 /// Parse change_id silently. Real emit paths always pass a valid UUID; tests
 /// frequently pass throwaway strings ("c1") whose target row doesn't exist —
 /// the matching SQL helper then no-ops. Diagnostics for "id parsed but no
@@ -149,6 +161,42 @@ impl ChangesProjection {
             crate::log!("[ChangesProjection] write_applied: no row for {} — missing aggregate ChangeProposed?", id);
         }
         Ok(())
+    }
+
+    /// Single-fire guard for `ChangeApplied`. Locks the change row `FOR UPDATE`
+    /// and decides whether the surrounding emit should persist the event.
+    ///
+    /// The change row's `status` is the claim token: [`write_applied`] (run in
+    /// the same emit transaction, Phase Project) flips it `pending`→`applied`,
+    /// and the `FOR UPDATE` lock taken here is held until that transaction
+    /// commits. A concurrent or later `ChangeApplied` for the same change_id
+    /// therefore blocks on the lock, then reads `applied` and gets
+    /// [`ChangeApplyDedup::Suppress`] — so one logical apply can never persist
+    /// two `ChangeApplied` events (the two-"Change applied"-entries bug).
+    ///
+    /// A missing or unparseable change_id yields [`ChangeApplyDedup::Proceed`]:
+    /// there's nothing to dedup against (throwaway test ids, the external-repo
+    /// archive carve-out, or the Tier-3 slow path whose `ChangeProposed` row was
+    /// never created), so existing single-emit behavior is preserved.
+    ///
+    /// [`write_applied`]: Self::write_applied
+    pub(crate) async fn change_apply_dedup(
+        tx: &mut Transaction<'_, Postgres>,
+        change_id: &str,
+    ) -> sqlx::Result<ChangeApplyDedup> {
+        let Some(id) = parse_change_id(change_id) else {
+            return Ok(ChangeApplyDedup::Proceed);
+        };
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM changes WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        Ok(if status.as_deref() == Some("applied") {
+            ChangeApplyDedup::Suppress
+        } else {
+            ChangeApplyDedup::Proceed
+        })
     }
 
     pub(crate) async fn write_status(

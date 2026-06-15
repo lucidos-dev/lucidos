@@ -21,6 +21,7 @@ pub(crate) mod todo;
 mod web;
 
 use super::LucidosEngine;
+use crate::engine::thread_queue::{CapacityPolicy, OverflowPolicy};
 use crate::llm::tool_names as tn;
 
 /// Result of a tool dispatch: `Ok(text)` = success, `Err(text)` = failure.
@@ -158,6 +159,11 @@ impl LucidosEngine {
             tn::COUNT_THREADS => self.execute_count_threads(args).await,
             tn::LIST_CHANGES => self.execute_list_changes().await,
             tn::APPLY_CHANGE => self.execute_apply_change(args, thread_id).await,
+            tn::LIST_THREAD_QUEUE => self.execute_list_thread_queue().await,
+            tn::UPDATE_THREAD_QUEUE_POLICY => {
+                self.execute_update_thread_queue_policy(args, thread_id)
+                    .await
+            }
             tn::DISMISS_FROM_CONTEXT => self.execute_dismiss_from_context(args, thread_id).await,
             tn::TODO_WRITE => self.execute_todo_write(args, thread_id).await,
             tn::MANAGE_REPOSITORIES => self.execute_manage_repositories(args).await,
@@ -605,16 +611,9 @@ impl LucidosEngine {
             .and_then(|v| v.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc));
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(query_events_limit::DEFAULT)
-            .clamp(query_events_limit::MIN, query_events_limit::MAX);
-        let byte_limit = args
-            .get("byte_limit")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(query_events_byte_budget::DEFAULT)
-            .clamp(query_events_byte_budget::MIN, query_events_byte_budget::MAX);
+        let limit = QUERY_EVENTS_LIMIT.apply(args.get("limit").and_then(|v| v.as_i64()));
+        let byte_limit =
+            QUERY_EVENTS_BYTE_BUDGET.apply(args.get("byte_limit").and_then(|v| v.as_i64()));
 
         match self
             .event_store
@@ -797,6 +796,153 @@ impl LucidosEngine {
             Err(e) => Err(format!("Error: failed to apply change: {}", e)),
         }
     }
+
+    /// LLM tool: list the Thread Queue plus the active capacity policy. Shares
+    /// `ThreadQueue::snapshot` with `GET /api/v1/thread-queue`, so the tool and
+    /// the panel return identical entries — including the in-memory
+    /// user-initiated occupants (`kind: "user-chat"`) the tool previously
+    /// omitted, which is why it reported an empty pool while the panel showed
+    /// running user-chat rows.
+    async fn execute_list_thread_queue(&self) -> ToolOutcome {
+        let snapshot = self
+            .thread_queue
+            .snapshot()
+            .await
+            .map_err(|e| format!("Error: failed to list Thread Queue: {}", e))?;
+        serde_json::to_string(&snapshot)
+            .map_err(|e| format!("Error: failed to serialise Thread Queue: {}", e))
+    }
+
+    /// LLM tool: partially update the Thread Queue capacity policy. Unlike
+    /// the HTTP panel endpoint, omitted fields are merged with the live policy
+    /// rather than with code defaults, which is the safe shape for natural
+    /// requests such as "double capacity".
+    async fn execute_update_thread_queue_policy(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let previous = self.thread_queue.policy().await;
+        let policy = merge_thread_queue_policy_patch(previous.clone(), args)?;
+        let actor = crate::engine::thread_events::MessageOrigin::ThreadLink {
+            thread_id,
+            title: None,
+            spawning_event_id: None,
+            mode: crate::engine::thread_events::ActorMode::Agent,
+            direction: crate::engine::thread_events::ThreadDirection::Parent,
+        };
+        let engine = self.clone_arc();
+        engine
+            .thread_queue
+            .set_policy(policy.clone(), Some(actor))
+            .await
+            .map_err(|e| format!("Error: failed to update Thread Queue policy: {}", e))?;
+        serde_json::to_string(&serde_json::json!({
+            "previous_policy": previous,
+            "policy": policy,
+        }))
+        .map_err(|e| format!("Error: failed to serialise Thread Queue policy: {}", e))
+    }
+}
+
+/// Apply a partial Thread Queue policy patch to a starting policy. Missing
+/// fields keep their existing value; present fields must have the same JSON
+/// type as the wire policy. Pure so validation is testable without an engine.
+pub(crate) fn merge_thread_queue_policy_patch(
+    mut policy: CapacityPolicy,
+    args: &serde_json::Value,
+) -> Result<CapacityPolicy, String> {
+    let obj = args
+        .as_object()
+        .ok_or_else(|| "Error: update_thread_queue_policy expects an object".to_string())?;
+    if obj.is_empty() {
+        return Err("Error: at least one Thread Queue policy field is required".to_string());
+    }
+    for field in obj.keys() {
+        if !is_thread_queue_policy_field(field) {
+            return Err(format!(
+                "Error: unknown Thread Queue policy field `{}`",
+                field
+            ));
+        }
+    }
+
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_total",
+        &mut policy.max_concurrent_total,
+    )?;
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_event_trigger",
+        &mut policy.max_concurrent_event_trigger,
+    )?;
+    apply_usize_policy_field(args, "max_concurrent_cron", &mut policy.max_concurrent_cron)?;
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_sub_thread",
+        &mut policy.max_concurrent_sub_thread,
+    )?;
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_coding_agent",
+        &mut policy.max_concurrent_coding_agent,
+    )?;
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_per_trigger",
+        &mut policy.max_concurrent_per_trigger,
+    )?;
+    apply_usize_policy_field(
+        args,
+        "max_queued_per_trigger",
+        &mut policy.max_queued_per_trigger,
+    )?;
+    apply_usize_policy_field(
+        args,
+        "reserved_background",
+        &mut policy.reserved_background,
+    )?;
+
+    if let Some(value) = args.get("overflow") {
+        policy.overflow =
+            serde_json::from_value::<OverflowPolicy>(value.clone()).map_err(|_| {
+                "Error: overflow must be one of `drop-oldest` or `pause-trigger`".to_string()
+            })?;
+    }
+
+    if policy.max_queued_per_trigger == 0 {
+        return Err("Error: max_queued_per_trigger must be at least 1".to_string());
+    }
+    Ok(policy)
+}
+
+fn apply_usize_policy_field(
+    args: &serde_json::Value,
+    field: &str,
+    target: &mut usize,
+) -> Result<(), String> {
+    let Some(value) = args.get(field) else {
+        return Ok(());
+    };
+    *target = serde_json::from_value::<usize>(value.clone())
+        .map_err(|_| format!("Error: {field} must be an unsigned integer"))?;
+    Ok(())
+}
+
+fn is_thread_queue_policy_field(field: &str) -> bool {
+    matches!(
+        field,
+        "max_concurrent_total"
+            | "max_concurrent_event_trigger"
+            | "max_concurrent_cron"
+            | "max_concurrent_sub_thread"
+            | "max_concurrent_coding_agent"
+            | "max_concurrent_per_trigger"
+            | "max_queued_per_trigger"
+            | "reserved_background"
+            | "overflow"
+    )
 }
 
 /// Parse the required `change_id` UUID arg for the `apply_change` tool. Pure
@@ -811,6 +957,23 @@ pub(crate) fn parse_apply_change_id(args: &serde_json::Value) -> Result<uuid::Uu
     };
     uuid::Uuid::parse_str(raw)
         .map_err(|_| format!("Error: change_id is not a valid UUID: {}", raw))
+}
+
+/// Default + inclusive `[min, max]` bounds for an optional numeric tool
+/// argument. `apply(None)` yields the default; `apply(Some(v))` clamps `v` into
+/// range. Unifies the `query_events` limit/byte-budget pair (and is reusable by
+/// any other tool that wants the same "default-when-absent, then clamp" shape).
+#[derive(Clone, Copy)]
+pub(crate) struct ClampBounds<T> {
+    pub default: T,
+    pub min: T,
+    pub max: T,
+}
+
+impl<T: Ord + Copy> ClampBounds<T> {
+    pub(crate) fn apply(&self, value: Option<T>) -> T {
+        value.unwrap_or(self.default).clamp(self.min, self.max)
+    }
 }
 
 /// Byte-budget bounds for the `query_events` LLM tool. The default cap
@@ -828,11 +991,11 @@ pub(crate) fn parse_apply_change_id(args: &serde_json::Value) -> Result<uuid::Uu
 /// and crashed with `prompt is too long`. Eight `query_events` calls at
 /// the old 256K default totalled ~2MB of tool results in the LLM
 /// context, and `chars/4` estimation undercounted by ~2.4×.
-pub(crate) mod query_events_byte_budget {
-    pub const DEFAULT: i64 = 128 * 1024;
-    pub const MIN: i64 = 1024;
-    pub const MAX: i64 = 512 * 1024;
-}
+pub(crate) const QUERY_EVENTS_BYTE_BUDGET: ClampBounds<i64> = ClampBounds {
+    default: 128 * 1024,
+    min: 1024,
+    max: 512 * 1024,
+};
 
 /// Row-count bounds for the `query_events` LLM tool. The default of 50
 /// matches the `workspace-learning` recipe's "sampling, not enumeration"
@@ -840,11 +1003,11 @@ pub(crate) mod query_events_byte_budget {
 /// on a small event type (e.g. `EngineSupervisorRespawned` over a year)
 /// without enabling the abuse pattern that crashed the May 25 trigger
 /// (single calls at `limit: 300/500` for high-byte-per-row types).
-pub(crate) mod query_events_limit {
-    pub const DEFAULT: i64 = 50;
-    pub const MIN: i64 = 1;
-    pub const MAX: i64 = 200;
-}
+pub(crate) const QUERY_EVENTS_LIMIT: ClampBounds<i64> = ClampBounds {
+    default: 50,
+    min: 1,
+    max: 200,
+};
 
 /// Serialise events to compact JSON, stopping when the next event would
 /// push the cumulative size over `byte_limit`. Always returns a wrapper
@@ -908,7 +1071,9 @@ pub(crate) fn build_query_events_response(
 /// Parse the `source` arg accepted by `list_threads` / `count_threads`.
 /// The LLM may emit a comma-separated string (`"chat,trigger"`) or a JSON
 /// array of strings (`["chat", "trigger"]`). Empty results collapse to
-/// `None` so the store helper's "no filter" branch fires.
+/// `None` so the store helper's "no filter" branch fires. `coding-agent` is
+/// the public filter name; rows are still persisted with the legacy
+/// `claude_code` source.
 fn parse_source_arg(raw: Option<&serde_json::Value>) -> Option<Vec<String>> {
     let v = raw?;
     let out: Vec<String> = if let Some(s) = v.as_str() {
@@ -922,10 +1087,18 @@ fn parse_source_arg(raw: Option<&serde_json::Value>) -> Option<Vec<String>> {
     } else {
         return None;
     };
+    let out: Vec<String> = out.into_iter().map(canonical_source_filter_value).collect();
     if out.is_empty() {
         None
     } else {
         Some(out)
+    }
+}
+
+fn canonical_source_filter_value(value: String) -> String {
+    match value.as_str() {
+        "coding-agent" => "claude_code".to_string(),
+        _ => value,
     }
 }
 

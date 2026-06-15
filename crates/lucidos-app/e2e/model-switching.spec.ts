@@ -1,6 +1,6 @@
 import { test, expect, Page } from '@playwright/test';
 import {
-  navigateToApp, assertHealthy, newThread, switchToClaudeMode,
+  navigateToApp, assertHealthy, newThread, pickComposeDestination,
   sendMessage, waitForActionPanel,
 } from './helpers';
 
@@ -9,7 +9,7 @@ import {
 async function setupIdleCCThread(page: Page) {
   await navigateToApp(page);
   await newThread(page);
-  await switchToClaudeMode(page);
+  await pickComposeDestination(page);
 
   await sendMessage(page, 'Say exactly: "setup". Do not create any files.');
   await waitForActionPanel(page, 'Archive', 120_000);
@@ -51,20 +51,20 @@ async function mockActiveSession(page: Page) {
 /** Open the CC dropdown and navigate to the Model submenu. */
 async function openModelPicker(page: Page) {
   // Wait for the button to have commands loaded (active class) before clicking.
-  const cmdBtn = page.locator('.cc-commands-btn-active:visible').first();
+  const cmdBtn = page.locator('.commands-btn-active:visible').first();
   await expect(cmdBtn).toBeVisible({ timeout: 30_000 });
   await cmdBtn.click();
 
-  const dropdown = page.locator('.cc-control-dropdown:visible').first();
+  const dropdown = page.locator('.control-dropdown:visible').first();
   await expect(dropdown).toBeVisible({ timeout: 5_000 });
 
   // Use strict regex to avoid matching skill commands like "vertex-models"
-  const modelOption = dropdown.locator('.cc-control-item:visible').filter({ hasText: /^Model/ }).first();
+  const modelOption = dropdown.locator('.control-item:visible').filter({ hasText: /^Model/ }).first();
   await expect(modelOption).toBeVisible({ timeout: 10_000 });
   await modelOption.click();
 
   // Wait for model list to render
-  await expect(page.locator('.cc-control-option:visible').first()).toBeVisible({ timeout: 5_000 });
+  await expect(page.locator('.control-option:visible').first()).toBeVisible({ timeout: 5_000 });
 
   return { cmdBtn, dropdown };
 }
@@ -78,16 +78,16 @@ test.describe('Model switching', () => {
     // This test only needs the dropdown visible — idle session is fine
     await setupIdleCCThread(page);
 
-    const cmdBtn = page.locator('.cc-commands-btn:visible').first();
+    const cmdBtn = page.locator('.commands-btn:visible').first();
     await expect(cmdBtn).toBeVisible({ timeout: 10_000 });
 
     await cmdBtn.click();
 
-    const dropdown = page.locator('.cc-control-dropdown:visible').first();
+    const dropdown = page.locator('.control-dropdown:visible').first();
     await expect(dropdown).toBeVisible({ timeout: 5_000 });
 
-    // Top-level items use .cc-control-item class
-    const optionCount = await page.locator('.cc-control-item:visible').count();
+    // Top-level items use .control-item class
+    const optionCount = await page.locator('.control-item:visible').count();
     expect(optionCount).toBeGreaterThan(0);
   });
 
@@ -98,7 +98,7 @@ test.describe('Model switching', () => {
 
     const { dropdown } = await openModelPicker(page);
 
-    const currentModel = dropdown.locator('.cc-control-option-current:visible').first();
+    const currentModel = dropdown.locator('.control-option-current:visible').first();
     if (await currentModel.isVisible({ timeout: 3_000 }).catch(() => false)) {
       const text = await currentModel.textContent();
       expect(text).toBeTruthy();
@@ -115,7 +115,7 @@ test.describe('Model switching', () => {
     const { cmdBtn, dropdown } = await openModelPicker(page);
 
     // Pick a non-default, non-current option to switch to
-    const allOptions = page.locator('.cc-control-option:visible');
+    const allOptions = page.locator('.control-option:visible');
     const count = await allOptions.count();
     expect(count).toBeGreaterThanOrEqual(2);
 
@@ -123,7 +123,7 @@ test.describe('Model switching', () => {
     let targetIdx = -1;
     for (let i = 0; i < count; i++) {
       const text = await allOptions.nth(i).textContent();
-      const isCurrent = await allOptions.nth(i).evaluate(el => el.classList.contains('cc-control-option-current'));
+      const isCurrent = await allOptions.nth(i).evaluate(el => el.classList.contains('control-option-current'));
       if (!isCurrent && !(text ?? '').startsWith('Default')) {
         targetIdx = i;
         break;
@@ -131,7 +131,7 @@ test.describe('Model switching', () => {
     }
     expect(targetIdx).toBeGreaterThanOrEqual(0);
 
-    const targetLabelRaw = await allOptions.nth(targetIdx).locator('.cc-control-option-label').textContent();
+    const targetLabelRaw = await allOptions.nth(targetIdx).locator('.control-option-label').textContent();
     const targetLabel = (targetLabelRaw ?? '').replace(/✓/g, '').trim();
     await allOptions.nth(targetIdx).click();
 
@@ -140,13 +140,13 @@ test.describe('Model switching', () => {
     await cmdBtn.click();
     await expect(dropdown).toBeVisible({ timeout: 5_000 });
 
-    const modelOption2 = dropdown.locator('.cc-control-item:visible').filter({ hasText: /^Model/ }).first();
+    const modelOption2 = dropdown.locator('.control-item:visible').filter({ hasText: /^Model/ }).first();
     await expect(modelOption2).toBeVisible({ timeout: 10_000 });
     await modelOption2.click();
-    await expect(page.locator('.cc-control-option:visible').first()).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator('.control-option:visible').first()).toBeVisible({ timeout: 5_000 });
 
     // The selected model should now show as current
-    const currentAfter = page.locator('.cc-control-option-current:visible .cc-control-option-label');
+    const currentAfter = page.locator('.control-option-current:visible .control-option-label');
     await expect(currentAfter.first()).toBeVisible({ timeout: 5_000 });
     const afterTextRaw = await currentAfter.first().textContent();
     const afterText = (afterTextRaw ?? '').replace(/✓/g, '').trim();

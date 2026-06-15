@@ -172,132 +172,143 @@ mod should_flush_tests {
     }
 }
 
-mod empty_completion_hint_tests {
-    use super::super::empty_completion_hint;
+mod classify_empty_completion_tests {
+    use super::super::{classify_empty_completion, normalize_finish_reason, FinishClass};
 
-    // Background: when the LLM call returns end_turn with no text and no
-    // tool calls, the engine emits ResponseFailed with a hint. The original
-    // hint hard-coded "model decided no action was needed" for end_turn,
-    // which is a lie when output_tokens > 0 — the model DID generate, the
-    // parser just didn't recognize the SSE shape. These tests pin down the
-    // four diagnostic branches so the next provider-stream change shows up
-    // as a precise message instead of a misleading one.
+    // Background: when the LLM call returns no text and no tool calls, the
+    // engine classifies *why* it was empty — uniformly across providers and
+    // thread types. A clean model-decided stop is benign intentional silence
+    // (emit an empty ResponseGenerated, render a neutral note); truncation,
+    // safety blocks, dropped output, and unrecognised stops are genuine
+    // failures (ResponseFailed). These tests pin the benign/error split and the
+    // cross-provider stop-reason vocabulary — the trap that made an empty
+    // Gemini `STOP` indistinguishable from a `MAX_TOKENS` cutoff.
 
     #[test]
-    fn truly_silent_end_turn_says_no_action_needed() {
-        // output_tokens <= 16 = pure structural overhead, nothing generated.
-        let hint = empty_completion_hint("end_turn", 5, 0, 0);
+    fn clean_stop_is_benign_across_providers() {
+        // Anthropic end_turn, Gemini STOP, OpenAI stop/completed — all clean.
+        for reason in ["end_turn", "STOP", "stop", "completed"] {
+            let class = classify_empty_completion(reason, 5, 0, 0);
+            assert!(
+                !class.is_error,
+                "{reason} with no dropped output must be benign, hint: {}",
+                class.hint
+            );
+            assert!(
+                class.hint.contains("without producing text"),
+                "{reason} benign hint should describe intentional silence, got: {}",
+                class.hint
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_is_error_across_providers() {
+        // Anthropic max_tokens, Gemini MAX_TOKENS, OpenAI length /
+        // max_output_tokens — all truncation, regardless of case.
+        for reason in ["max_tokens", "MAX_TOKENS", "length", "max_output_tokens"] {
+            let class = classify_empty_completion(reason, 8192, 0, 0);
+            assert!(class.is_error, "{reason} must be an error");
+            assert!(
+                class.hint.contains("truncated"),
+                "{reason} must say truncated, got: {}",
+                class.hint
+            );
+        }
+    }
+
+    #[test]
+    fn safety_block_is_error_across_providers() {
+        // Anthropic refusal, Gemini SAFETY/RECITATION, OpenAI content_filter.
+        for reason in ["refusal", "SAFETY", "RECITATION", "content_filter"] {
+            let class = classify_empty_completion(reason, 207, 0, 0);
+            assert!(class.is_error, "{reason} must be an error");
+            assert!(
+                class.hint.contains("declined"),
+                "{reason} must say the model declined, got: {}",
+                class.hint
+            );
+            // Must NOT misattribute a safety block to a parser / stream-shape
+            // change — the misleading message the 2026-06-02 report saw.
+            assert!(
+                !class.hint.contains("couldn't classify"),
+                "{reason} must NOT blame the parser, got: {}",
+                class.hint
+            );
+        }
+    }
+
+    #[test]
+    fn safety_block_wins_even_with_zero_output_tokens() {
+        // A block that withholds everything before any tokens are billed must
+        // still be reported as declined, not as intentional silence.
+        let class = classify_empty_completion("refusal", 0, 0, 0);
+        assert!(class.is_error);
+        assert!(class.hint.contains("declined"), "got: {}", class.hint);
+    }
+
+    #[test]
+    fn dropped_output_with_unknown_shapes_is_error() {
+        // 2222 output tokens, nothing captured, SSE accumulator flagged unknown
+        // shapes — error, and the hint must call them out (Anthropic-only
+        // signal; clean stop_reason does NOT make it benign).
+        let class = classify_empty_completion("end_turn", 2222, 0, 3);
+        assert!(class.is_error, "dropped output must be an error");
         assert!(
-            hint.contains("no action was needed"),
-            "intentional silence must say 'no action was needed', got: {}",
-            hint
+            class.hint.contains("dropped unknown SSE shapes"),
+            "must call out dropped shapes, got: {}",
+            class.hint
         );
     }
 
     #[test]
-    fn large_output_with_unknown_drops_blames_parser() {
-        // The failure mode this fix targets: 2222 output tokens, nothing
-        // captured, and the SSE accumulator flagged unknown shapes — the
-        // hint must say so instead of claiming the model intended silence.
-        let hint = empty_completion_hint("end_turn", 2222, 0, 3);
+    fn dropped_output_without_unknown_shapes_is_error() {
+        // Tokens billed but nothing captured and no unknowns flagged — a known
+        // block carried an unexpected payload shape. Still an error.
+        let class = classify_empty_completion("end_turn", 2222, 0, 0);
+        assert!(class.is_error, "dropped output must be an error");
         assert!(
-            hint.contains("dropped unknown SSE shapes"),
-            "parser miss with dropped shapes must call them out, got: {}",
-            hint
-        );
-        assert!(
-            !hint.contains("no action was needed"),
-            "must NOT claim intentional silence, got: {}",
-            hint
+            class.hint.contains("couldn't classify"),
+            "must call out the parser gap, got: {}",
+            class.hint
         );
     }
 
     #[test]
-    fn large_output_without_unknown_drops_still_blames_parser() {
-        // Tokens generated but nothing captured AND no unknowns flagged means
-        // a known block type carried unexpected payload shape. Still a parser
-        // miss, not intentional silence.
-        let hint = empty_completion_hint("end_turn", 2222, 0, 0);
+    fn thinking_only_clean_stop_is_benign() {
+        // Model thought (visibly) but produced no text on a clean stop — benign
+        // intentional silence, with a hint that distinguishes it.
+        let class = classify_empty_completion("end_turn", 100, 4096, 0);
+        assert!(!class.is_error, "thinking-then-silence on a clean stop is benign");
         assert!(
-            hint.contains("couldn't classify"),
-            "parser miss without dropped shapes must still call out the gap, got: {}",
-            hint
-        );
-        assert!(
-            !hint.contains("no action was needed"),
-            "must NOT claim intentional silence, got: {}",
-            hint
-        );
-    }
-
-    #[test]
-    fn thinking_only_says_thought_but_no_output() {
-        // Model thought (visibly, via thinking blocks) but produced no text
-        // or tool call. Different failure than "silently dropped" — useful to
-        // distinguish for debugging "is the model giving up?".
-        let hint = empty_completion_hint("end_turn", 100, 4096, 0);
-        assert!(
-            hint.contains("thought but produced no text"),
+            class.hint.contains("thought but produced no text"),
             "thinking-only must mention the thought, got: {}",
-            hint
+            class.hint
         );
     }
 
     #[test]
-    fn max_tokens_says_truncated() {
-        let hint = empty_completion_hint("max_tokens", 8192, 0, 0);
-        assert!(
-            hint.contains("truncated"),
-            "max_tokens must say truncated, got: {}",
-            hint
-        );
+    fn unknown_stop_reason_is_error_failsafe() {
+        // A reason we don't recognise (future provider value, stop_sequence,
+        // the "unknown" sentinel for a null stop_reason) is failed-safe to an
+        // error so a genuinely broken turn still surfaces.
+        for reason in ["some_future_reason", "stop_sequence", "unknown", "other"] {
+            let class = classify_empty_completion(reason, 0, 0, 0);
+            assert!(class.is_error, "{reason} must fail-safe to an error");
+            assert!(
+                class.hint.is_empty(),
+                "{reason} carries no specific hint, got: {}",
+                class.hint
+            );
+        }
     }
 
     #[test]
-    fn other_stop_reasons_have_no_hint() {
-        let hint = empty_completion_hint("some_future_reason", 0, 0, 0);
-        assert!(
-            hint.is_empty(),
-            "unknown stop_reason with no other signals must have no hint, got: {}",
-            hint
-        );
-    }
-
-    #[test]
-    fn refusal_says_model_declined() {
-        // Real-world payload from the "stop_reason: refusal" report: the
-        // provider's streaming safety classifier stopped the turn and withheld
-        // the content the model had begun generating, so output_tokens is
-        // non-zero (207) while nothing reached the engine.
-        let hint = empty_completion_hint("refusal", 207, 0, 0);
-        assert!(
-            hint.contains("declined"),
-            "refusal must say the model declined, got: {}",
-            hint
-        );
-        // Must NOT misattribute the empty content to a parser / provider
-        // stream-shape change — that was the misleading message users saw.
-        assert!(
-            !hint.contains("couldn't classify"),
-            "refusal must NOT blame the parser, got: {}",
-            hint
-        );
-        assert!(
-            !hint.contains("stream-shape"),
-            "refusal must NOT blame a stream-shape change, got: {}",
-            hint
-        );
-    }
-
-    #[test]
-    fn refusal_wins_even_with_zero_output_tokens() {
-        // A refusal that withholds everything before any tokens are billed
-        // must still be reported as a refusal, not as intentional silence.
-        let hint = empty_completion_hint("refusal", 0, 0, 0);
-        assert!(
-            hint.contains("declined"),
-            "refusal must say the model declined regardless of output_tokens, got: {}",
-            hint
-        );
+    fn normalize_is_case_insensitive() {
+        assert_eq!(normalize_finish_reason("STOP"), FinishClass::Clean);
+        assert_eq!(normalize_finish_reason("end_turn"), FinishClass::Clean);
+        assert_eq!(normalize_finish_reason("MAX_TOKENS"), FinishClass::Truncated);
+        assert_eq!(normalize_finish_reason("safety"), FinishClass::Blocked);
+        assert_eq!(normalize_finish_reason("stop_sequence"), FinishClass::Unknown);
     }
 }

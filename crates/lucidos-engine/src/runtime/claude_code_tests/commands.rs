@@ -159,6 +159,29 @@ fn normalize_cc_model_id_preserves_unknown() {
 }
 
 #[test]
+fn fable_5_round_trips_through_cc_model_helpers() {
+    // Fable 5 is a full model id present in cc_menu_options.json, so it passes
+    // through normalize unchanged, and the 1M variant reconciles like the others.
+    assert_eq!(normalize_cc_model_id("claude-fable-5"), "claude-fable-5");
+    assert_eq!(
+        normalize_cc_model_id("claude-fable-5[1m]"),
+        "claude-fable-5[1m]"
+    );
+    assert_eq!(
+        reconcile_cc_model(Some("claude-fable-5[1m]"), "claude-fable-5"),
+        "claude-fable-5[1m]"
+    );
+    // The /model picker offers Fable 5 (and its 1M variant).
+    let defs = cc_command_definitions();
+    assert_command_options(
+        &defs,
+        "set_model",
+        "model",
+        &["claude-fable-5", "claude-fable-5[1m]"],
+    );
+}
+
+#[test]
 fn reconcile_cc_model_preserves_1m_suffix_when_cc_strips_it() {
     // CC strips the [1m] suffix when echoing the model in stream-json
     // (both Init and per-message Usage frames). The engine pinned the

@@ -438,6 +438,60 @@ async fn restore_cc_allowed_tools(client: &reqwest::Client, contents: &str) {
     );
 }
 
+/// GET/PUT round-trip of `~/.lucidos/agent-allowed-commands` via the settings
+/// endpoints that back the Settings → Permissions → Lucidos Agent permissions
+/// list editor. Mirrors the `cc-allowed-tools` settings API.
+#[tokio::test]
+async fn agent_allowed_commands_settings_roundtrip() {
+    let client = http_client();
+    // Snapshot, write a known body with a unique sentinel, read it back, restore.
+    let snapshot = read_agent_allowed_commands(&client).await;
+    let sentinel = format!("Bash(e2e-{}:*)", Uuid::new_v4().simple());
+    let body = format!(
+        "# Lucidos Agent command allowlist — one pattern per line.\n{sentinel}\nPython\n"
+    );
+
+    let put = client
+        .put(format!("{}/api/v1/agent-allowed-commands", base_url()))
+        .json(&json!({ "contents": body }))
+        .send()
+        .await
+        .expect("PUT agent-allowed-commands failed");
+    assert!(put.status().is_success(), "PUT must succeed");
+
+    let after = read_agent_allowed_commands(&client).await;
+    assert_eq!(after, body, "GET must return exactly what was PUT");
+    assert!(
+        line_present(&after, &sentinel),
+        "round-tripped file must contain the sentinel pattern; got:\n{after}"
+    );
+
+    // Restore so the e2e workspace's allowlist is left as we found it.
+    let restore = client
+        .put(format!("{}/api/v1/agent-allowed-commands", base_url()))
+        .json(&json!({ "contents": snapshot }))
+        .send()
+        .await
+        .expect("PUT agent-allowed-commands (restore) failed");
+    assert!(restore.status().is_success(), "restore PUT must succeed");
+}
+
+/// Read the current ~/.lucidos/agent-allowed-commands via the settings endpoint.
+async fn read_agent_allowed_commands(client: &reqwest::Client) -> String {
+    let resp = client
+        .get(format!("{}/api/v1/agent-allowed-commands", base_url()))
+        .send()
+        .await
+        .expect("GET agent-allowed-commands failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "GET agent-allowed-commands must 200"
+    );
+    let body: serde_json::Value = resp.json().await.expect("invalid JSON");
+    body["contents"].as_str().unwrap_or("").to_string()
+}
+
 fn line_present(contents: &str, pattern: &str) -> bool {
     count_line(contents, pattern) > 0
 }

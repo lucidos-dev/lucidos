@@ -217,6 +217,7 @@ impl LucidosEngine {
                                     None,
                                     None,
                                     None,
+                                    None,
                                 )
                                 .await;
                             if let Err(e) = result {
@@ -242,6 +243,7 @@ impl LucidosEngine {
         vertex_project_id: String,
         vertex_location: crate::llm::vertex::LocationHandle,
         vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
+        model_registry: crate::llm::model_registry::ModelRegistry,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Install the subprocess-origin token before anything spawns a
         // subprocess. See `api::actor` module docs.
@@ -398,6 +400,18 @@ impl LucidosEngine {
                 backfilled
             );
         }
+
+        // One-shot, idempotent: repos added before the `RepositoryAdded` event
+        // existed have no name in `repositories` (once removed) or the event
+        // log, so the filter showed their UUID. Recover the name from the path
+        // basename preserved in `changes.repo_root`.
+        let repo_names = event_store.backfill_repo_names_from_changes().await?;
+        if repo_names > 0 {
+            log!(
+                "[Engine] Backfilled {} repo_names rows from changes.repo_root (pre-RepositoryAdded repos)",
+                repo_names
+            );
+        }
         let python_runtime = PythonRuntime::new(workspace_path.clone())?;
         let app_manager = Arc::new(AppManager::new(&workspace_path)?);
 
@@ -416,7 +430,23 @@ impl LucidosEngine {
         HeadlessBlocklist::init_schema(&pool).await?;
         BrowserLogins::init_schema(&pool).await?;
 
-        let openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+        // Resolve the OpenAI key once: a stored `openai` credential (Settings →
+        // Providers) is preferred, with the OPENAI_API_KEY launch env var as the
+        // fallback. Used for the image provider and for routing `gpt-*`
+        // background-task models through the MemoryExtractor.
+        let openai_credential = match CredentialStore::get(&pool, "openai").await {
+            Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
+            Ok(None) => None,
+            Err(e) => {
+                log!("[Startup] Failed to read OpenAI credential: {}", e);
+                None
+            }
+        };
+        let openai_api_key = crate::llm::resolve_openai_api_key(
+            openai_credential,
+            std::env::var("OPENAI_API_KEY").ok(),
+        )
+        .map(|(key, _source)| key);
 
         let extractor = if vertex_project_id.is_empty() {
             log!("[Memory] No Vertex project configured — memory extraction disabled");
@@ -425,11 +455,14 @@ impl LucidosEngine {
             let cache = vertex_token_cache
                 .clone()
                 .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None)));
-            Some(MemoryExtractor::with_location_handle(
-                vertex_project_id.clone(),
-                vertex_location.clone(),
-                cache,
-            )?)
+            Some(
+                MemoryExtractor::with_location_handle(
+                    vertex_project_id.clone(),
+                    vertex_location.clone(),
+                    cache,
+                )?
+                .with_openai_key(openai_api_key.clone()),
+            )
         };
 
         // Memory index uses PostgreSQL + pgvector for vector search
@@ -623,6 +656,7 @@ impl LucidosEngine {
         }
 
         spawn_vertex_region_subscriber(event_bus.subscribe(), vertex_location.clone());
+        spawn_models_registry_subscriber(event_bus.subscribe(), model_registry, pool.clone());
 
         // Build the wasmtime engine ONCE — both `proxy_modules` (compiled
         // here at startup) and `WasmSignerLayer::apply` (instantiated
@@ -634,6 +668,21 @@ impl LucidosEngine {
             crate::api::proxy_wasm_signer::build_wasmtime_engine()
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?,
         );
+
+        // Shared with SchedulerManager AND the Thread Queue (drain consults
+        // trigger pause/deletion state), so all three see one registry.
+        let trigger_configs: Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>> =
+            Arc::new(std::sync::RwLock::new(HashMap::new()));
+
+        // Thread Queue admission control. Policy is event-sourced — the
+        // latest CapacityPolicyChanged event is the configuration.
+        let capacity_policy = thread_queue::ThreadQueue::load_policy(&pool).await;
+        let thread_queue_manager = Arc::new(thread_queue::ThreadQueue::new(
+            pool.clone(),
+            event_bus.clone(),
+            trigger_configs.clone(),
+            capacity_policy,
+        ));
 
         Ok(Self {
             artifact_manager,
@@ -718,6 +767,7 @@ impl LucidosEngine {
             agent_runtimes: {
                 let mut m: HashMap<CodingAgent, Arc<dyn AgentRuntime>> = HashMap::new();
                 m.insert(CodingAgent::ClaudeCode, Arc::new(ClaudeCodeRuntime));
+                m.insert(CodingAgent::Codex, Arc::new(CodexRuntime));
                 m
             },
             last_cc_spawn: std::sync::Mutex::new(HashMap::new()),
@@ -728,7 +778,10 @@ impl LucidosEngine {
             mcp_manager,
             pending_mcp_consent: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_cc_permission: Arc::new(std::sync::Mutex::new(
-                cc_permission::CcPermissionState::default(),
+                cc_permission::PermissionState::default(),
+            )),
+            pending_command_permission: Arc::new(std::sync::Mutex::new(
+                cc_permission::PermissionState::default(),
             )),
             question_wait_registry: cc_question_wait::QuestionWaitRegistry::new(),
             pending_apply_actors: pending_apply_actors::PendingApplyActors::default(),
@@ -741,10 +794,11 @@ impl LucidosEngine {
                 tx
             },
             self_arc: std::sync::OnceLock::new(),
-            trigger_configs: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            trigger_configs,
             trigger_groups: Arc::new(std::sync::RwLock::new(HashMap::new())),
             trigger_group_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             bash_background: crate::engine::tools::bash_background::BackgroundBashRegistry::new(),
+            thread_queue: thread_queue_manager,
         })
     }
 

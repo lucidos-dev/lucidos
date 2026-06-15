@@ -12,6 +12,7 @@ import { MENU_ITEMS } from '../types';
 import { normalizeUrl } from './artifacts';
 import { NAV_KEY } from './entityReferences';
 import { isTauri } from '../../utils/platform';
+import { revealContentPane } from './pane';
 
 /** A snapshot of panel navigation state. */
 export interface NavEntry {
@@ -250,6 +251,13 @@ export function navBack(): void {
   if (!canGoBack.value) return;
   navCursor.value--;
   restoreState(navStack.value[navCursor.value]);
+  // Back/Forward are user-intent content navigation (the buttons live in the
+  // content-pane header / app header), so make the restored content visible —
+  // same contract as switchMenuItem/openApp. Mobile: no-op when already on the
+  // content pane; desktop: re-expands a collapsed split. NOT called from
+  // restoreState itself, since that also runs on page-load init where a forced
+  // reveal would override the reloaded pane state.
+  revealContentPane();
   saveNavState();
 }
 
@@ -258,5 +266,6 @@ export function navForward(): void {
   if (!canGoForward.value) return;
   navCursor.value++;
   restoreState(navStack.value[navCursor.value]);
+  revealContentPane();
   saveNavState();
 }

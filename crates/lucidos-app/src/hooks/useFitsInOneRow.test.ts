@@ -1,9 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { computeFitsInOneRow } from './useFitsInOneRow';
 
-// Pinning the actual width math the prompt uses to decide whether to lift
-// Diff / Discard draft to a row above. Each scenario walks a real-ish set of
-// button widths the bottom row of PromptInput would carry on a phone screen.
+// Pinning the actual width math the prompt uses to decide whether to lift the
+// secondary button (the Diff button — in the banner or standalone while
+// composing) to a row above. Each scenario walks a real-ish set of button
+// widths the bottom row of PromptInput would carry on a phone screen.
 describe('computeFitsInOneRow', () => {
   // 0.5rem at the default 16px root = 8px between items.
   const gap = 8;
@@ -33,14 +34,15 @@ describe('computeFitsInOneRow', () => {
     expect(computeFitsInOneRow([36, 36, 70, 56, 84, 64], 800, gap)).toBe(true);
   });
 
-  // [icons 36+36] [Discard draft 110] [Save 70] [Send 60] = 312px content
-  // + 4 gaps of 8px = 344px. Still over 330px on a phone — must lift Discard.
-  it('the compose row with Discard draft + Save + Send overflows a phone', () => {
+  // [icons 36+36] [secondary 110] [Save 70] [Send 60] = 312px content
+  // + 4 gaps of 8px = 344px. Still over 330px on a phone — must lift the
+  // secondary button.
+  it('a dense bottom row (icons + a wide secondary + Save + Send) overflows a phone', () => {
     expect(computeFitsInOneRow([36, 36, 110, 70, 60], 330, gap)).toBe(false);
   });
 
-  // After lifting Discard draft, the bottom row is just icons + Save + Send.
-  // The hook still measures every [data-row-item] (the lifted button is a
+  // After lifting the secondary button, the bottom row is just icons + Save +
+  // Send. The hook still measures every [data-row-item] (the lifted button is a
   // data-row-item too, just in a sibling row), so the sum is unchanged —
   // stays "does not fit" and stays stacked. Loop avoided.
   it('still reports "does not fit" with the same item set after lifting (stable across re-render)', () => {

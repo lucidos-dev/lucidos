@@ -283,6 +283,25 @@ describe('Service Worker fetch handler — immutable /assets bundle caching', ()
     expect(sw.mockCache.put).not.toHaveBeenCalled();
   });
 
+  // A bundle deleted by a later `vite build --watch` rebuild resolves through the
+  // dev server's SPA fallback to index.html (200 text/html), NOT a 404. Caching
+  // that under the bundle URL would poison the entry forever (the page loads HTML
+  // as a module script → no JS → black #app). The asset branch must treat an HTML
+  // body as a miss: serve it through but never store it.
+  it('GET /assets/<hash>.js: does NOT cache an HTML SPA-fallback body (deleted bundle)', async () => {
+    const sw = loadSw();
+    const html = new Response('<!doctype html><html></html>', {
+      status: 200,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+    sw.mockFetch.mockResolvedValue(html);
+    const event = makeEvent('https://example.com/assets/index-OLDHASH.js');
+    sw.handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(response).toBe(html); // passed through, not swallowed
+    expect(sw.mockCache.put).not.toHaveBeenCalled();
+  });
+
   it('GET /src/main.tsx (Vite dev module): does NOT call respondWith (no caching in dev)', () => {
     const sw = loadSw();
     const event = makeEvent('https://example.com/src/main.tsx');
@@ -312,19 +331,24 @@ describe('Service Worker fetch handler — immutable /assets bundle caching', ()
   });
 });
 
-// Navigation-shell caching (eleventh iteration, notifications.md §4.5). Every
-// top-level navigation — the PWA start URL and every notification-tap reload
-// (`/?notification=…`, the cross-document load WebKit forces on iOS) — is served
-// the cached index.html so the reload's HTML fetch becomes a disk read. Built
-// mode only (the SW's IS_BUILT gate, flipped here by stamping a fake build id);
-// the live dev server must serve a network-fresh shell so HMR / index.html edits
-// aren't pinned. The entry is keyed by the normalized `/` URL so every query
+// Navigation-shell serving (twelfth iteration, notifications.md §4.5). The shell
+// is served NETWORK-FIRST: every top-level navigation — the PWA start URL and
+// every notification-tap reload (`/?notification=…`, the cross-document load
+// WebKit forces on iOS) — fetches a fresh index.html so the shell always matches
+// the content-hashed /assets/* bundles the server currently has. A shell pinned
+// cache-first from an earlier build referenced bundles a later `vite build
+// --watch` had already deleted; the server's SPA fallback answered those with
+// index.html (200 text/html), the page loaded HTML as its entry module script,
+// and the PWA went black. The cache is the OFFLINE fallback only. Built mode only
+// (the SW's IS_BUILT gate, flipped here by stamping a fake build id); the live
+// dev server must serve a network-fresh shell so HMR / index.html edits aren't
+// pinned. The cache entry is keyed by the normalized `/` URL so every query
 // variant collapses onto one shell; `path === '/'` excludes app-UI iframe
 // (`/app/<id>/`) navigations, which are their own server-rendered HTML.
 const STAMPED_BUILD = 'testbuild0001';
 const STAMPED_SHELL_CACHE = `lucidos-shell-${STAMPED_BUILD}`;
 
-describe('Service Worker fetch handler — navigation shell caching', () => {
+describe('Service Worker fetch handler — navigation shell (network-first)', () => {
   it('dev (un-stamped): navigate to / falls through — shell stays network-fresh', () => {
     const sw = loadSw(); // IS_BUILT false → navigation branch inert
     const event = makeEvent('https://example.com/', 'GET', 'navigate');
@@ -332,21 +356,25 @@ describe('Service Worker fetch handler — navigation shell caching', () => {
     expect(event.respondWith).not.toHaveBeenCalled();
   });
 
-  it('built: navigate to /?notification=… serves the cached shell (no network), via SHELL_CACHE', async () => {
+  it('built: navigate to /?notification=… fetches a FRESH shell (network-first), even when one is cached', async () => {
     const sw = loadSw({ buildId: STAMPED_BUILD });
-    const cached = new Response('<!doctype html>shell');
-    // Cached under the normalized `/` key — the deep-link query must still hit it.
-    sw.cacheStore.set('https://example.com/', cached);
+    // A stale shell is already cached under the normalized `/` key. Network-first
+    // must NOT serve it while online — that is exactly the stale-bundle black
+    // screen this iteration fixes.
+    const stale = new Response('<!doctype html>STALE shell');
+    sw.cacheStore.set('https://example.com/', stale);
+    const fresh = new Response('<!doctype html>FRESH shell', { status: 200 });
+    sw.mockFetch.mockResolvedValue(fresh);
     const event = makeEvent('https://example.com/?notification=nid-1&thread=tid-1', 'GET', 'navigate');
     sw.handlers.fetch(event);
     expect(event.respondWith).toHaveBeenCalledTimes(1);
     const response = await event.respondWith.mock.calls[0][0];
-    expect(response).toBe(cached);
-    expect(sw.mockFetch).not.toHaveBeenCalled();
+    expect(response).toBe(fresh);
+    expect(sw.mockFetch).toHaveBeenCalledTimes(1);
     expect(sw.mockCaches.open).toHaveBeenCalledWith(STAMPED_SHELL_CACHE);
   });
 
-  it('built: navigate cache miss fetches network and caches under the normalized / key (query stripped)', async () => {
+  it('built: navigate caches the fresh shell under the normalized / key (query stripped)', async () => {
     const sw = loadSw({ buildId: STAMPED_BUILD });
     sw.mockFetch.mockResolvedValue(new Response('fresh shell', { status: 200 }));
     const event = makeEvent('https://example.com/?notification=nid-2', 'GET', 'navigate');
@@ -358,6 +386,18 @@ describe('Service Worker fetch handler — navigation shell caching', () => {
     expect(cachedReq.url).toBe('https://example.com/');
   });
 
+  it('built: offline (fetch fails) falls back to the cached shell', async () => {
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    const cached = new Response('<!doctype html>offline shell');
+    sw.cacheStore.set('https://example.com/', cached);
+    // Both the initial fetch and the fetchWithRetry retry reject.
+    sw.mockFetch.mockRejectedValue(new TypeError('Load failed'));
+    const event = makeEvent('https://example.com/?notification=nid-3', 'GET', 'navigate');
+    sw.handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(response).toBe(cached);
+  });
+
   it('built: navigate to an app-UI iframe (/app/<id>/) is NOT treated as the shell', () => {
     const sw = loadSw({ buildId: STAMPED_BUILD });
     const event = makeEvent('https://example.com/app/momentum/', 'GET', 'navigate');
@@ -365,25 +405,40 @@ describe('Service Worker fetch handler — navigation shell caching', () => {
     expect(event.respondWith).not.toHaveBeenCalled();
   });
 
-  it('built: a non-navigation GET to / falls through (only navigations hit the shell cache)', () => {
+  it('built: a non-navigation GET to / falls through (only navigations hit the shell path)', () => {
     const sw = loadSw({ buildId: STAMPED_BUILD });
     const event = makeEvent('https://example.com/', 'GET'); // no mode
     sw.handlers.fetch(event);
     expect(event.respondWith).not.toHaveBeenCalled();
   });
 
-  it('built: navigate does NOT cache a failed shell response (502 during an engine restart)', async () => {
+  it('built: navigate does NOT cache a failed shell response, and serves the cached shell instead (502 mid-restart)', async () => {
     const sw = loadSw({ buildId: STAMPED_BUILD });
+    const cached = new Response('<!doctype html>good shell');
+    sw.cacheStore.set('https://example.com/', cached);
     sw.mockFetch.mockResolvedValue(new Response('bad gateway', { status: 502 }));
     const event = makeEvent('https://example.com/', 'GET', 'navigate');
     sw.handlers.fetch(event);
-    await event.respondWith.mock.calls[0][0];
+    const response = await event.respondWith.mock.calls[0][0];
     expect(sw.mockCache.put).not.toHaveBeenCalled();
+    expect(response).toBe(cached); // prefers the last good shell over the 502
+  });
+
+  it('built: navigate with no cached shell returns the network response as-is (502 with empty cache)', async () => {
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    const bad = new Response('bad gateway', { status: 502 });
+    sw.mockFetch.mockResolvedValue(bad);
+    const event = makeEvent('https://example.com/', 'GET', 'navigate');
+    sw.handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(sw.mockCache.put).not.toHaveBeenCalled();
+    expect(response).toBe(bad);
   });
 });
 
-// install precaches the shell (built mode) so even the FIRST controlled reload
-// is a disk read — the fetch-handler cache-first is the fallback if this misses.
+// install precaches the shell (built mode) so an OFFLINE first navigation still
+// has an index.html to fall back to. The shell is served network-first, so this
+// precache is the offline safety net, not the hot path.
 describe('Service Worker install handler — shell precache', () => {
   function makeInstallEvent() {
     const waiting: Array<Promise<unknown>> = [];

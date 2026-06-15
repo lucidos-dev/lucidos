@@ -31,6 +31,45 @@ Don't design on paper. Once the questions are answered, scaffold the smallest th
 
 ## Scaffolding defaults
 
+- **Inherit the Lucidos theme — every new app, by default.** Apps follow the user's light/dark (OS) appearance for free, exactly like the rest of Lucidos. There is no separate "theme" to configure — the platform exposes it, the app just consumes it. The default scaffold does three things:
+  1. **Includes the theme assets in `<head>`** (full boilerplate in `system-knowhow/js-sdk.md` § Setup): `<script src="/api/v1/sdk-prefs.js"></script>`, then `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">`, then `<script src="/api/v1/sdk.js"></script>`.
+  2. **Calls `lucidos.ui.applyPreferences()`** (applies the theme on load — resolves a `system` preference to the live OS light/dark) **and `lucidos.ui.watchPreferences()`** (re-applies when the user changes it).
+  3. **Styles with the theme CSS variables — never hardcoded colors:** `var(--bg-primary)`, `var(--text-primary)`, `var(--accent)`, `var(--border-color)`, etc. (full list in `js-sdk.md` § Theme variables). These flip light↔dark automatically; hex literals do not.
+
+  Minimal scaffold to start from:
+
+  ```html
+  <!DOCTYPE html>
+  <html>
+    <head>
+      <meta charset="utf-8">
+      <title>My App</title>
+      <script src="/api/v1/sdk-prefs.js"></script>
+      <link rel="stylesheet" href="/api/v1/sdk-iframe.css">
+      <script src="/api/v1/sdk.js"></script>
+      <style>
+        /* Theme variables only — these follow the user's light/dark setting. */
+        .panel {
+          background: var(--bg-secondary);
+          color: var(--text-primary);
+          border: 1px solid var(--border-color);
+          border-radius: var(--radius-md);
+          padding: var(--space-lg);
+        }
+      </style>
+    </head>
+    <body>
+      <div class="panel">Hello</div>
+      <script>
+        lucidos.ui.applyPreferences();   // apply the user's theme on load
+        lucidos.ui.watchPreferences();   // re-apply when it changes live
+        // app code…
+      </script>
+    </body>
+  </html>
+  ```
+
+  Opt out only for an app that ships its own complete visual identity (a game, a full-bleed chart canvas, an embedded third-party UI). For everything else, inheriting is the default — a workspace in light mode must never get a dark-only app.
 - **Inline `<script>` for small apps.** Split into `app.js` only when the script grows past ~100 lines or you want to share it with another script.
 - **Inline `<style>` likewise.** External CSS is for shared design across apps.
 - **Use the SDK for everything stateful.** Direct `fetch` to `/api/v1/*` works but bypasses the workspace abstraction — `lucidos.data.read` / `lucidos.data.write` are the right primitives.
@@ -56,6 +95,7 @@ While the app coding-agent thread is open the user can preview the in-flight app
 
 - **Storing data in `apps/{id}/`.** App data goes in `artifacts/{app-id}/`. The app code is git-tracked source; the data is user state. (See `best-practices.md`.)
 - **Forgetting the `artifacts/` prefix in `lucidos.data.*` paths.** Paths are relative to `data/`, not `data/artifacts/`. App data lives at `artifacts/{app-id}/data.json` — *not* `{app-id}/data.json`. Without the prefix, `read` returns a 404 `SdkError` and `write` fails silently, which usually surfaces as "the checkbox toggles back" or "state doesn't persist".
+- **Hardcoding colors / shipping a light-only (or dark-only) app.** New apps inherit the Lucidos theme by default (see *Scaffolding defaults*): include the theme assets, call `lucidos.ui.applyPreferences()` + `lucidos.ui.watchPreferences()`, and style with the theme CSS variables (`var(--bg-primary)`, `var(--text-primary)`, `var(--accent)`, `var(--border-color)`, …) instead of hex literals. Hardcoded colors ignore the user's OS light/dark setting — a light-mode workspace gets a jarring dark app, or vice versa. This is the single most common theming regression.
 - **Creating an app for a one-shot.** If the user only wants the answer once, just give it.
 - **Inventing SDK calls.** Always check `system-knowhow/js-sdk.md` before writing app JS — the SDK surface is small and stable, but easy to misremember.
 - **Hand-rolling the proxy URL with raw `fetch`.** Both `fetch('https://<external-host>/...')` (mixed-content / CORS will block it) and `fetch('/api/v1/proxy/<name>/...')` (same-origin so it runs, but constructs the helper's URL by hand and bypasses the SDK) are wrong. Use `lucidos.proxy(name).fetch(path, init)` and configure the backend in `data/config/apis.json` — one shape, no string-building.

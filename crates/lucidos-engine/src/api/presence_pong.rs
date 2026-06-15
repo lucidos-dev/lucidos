@@ -1,7 +1,7 @@
 //! In-memory inbox for `POST /api/v1/presence-pong`. See
 //! `system-knowhow/notifications.md` §3 for the protocol.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -153,6 +153,11 @@ pub async fn presence_pong(
     // Always 200 — late pongs are normal, no value in surfacing the race
     // back to the page. See spec §3 "Failure handling".
     StatusCode::OK
+}
+
+/// Route for the PresenceCheck pong inbox (system-knowhow/notifications.md §3).
+pub(super) fn router() -> Router<AppState> {
+    Router::new().route("/presence-pong", post(presence_pong))
 }
 
 #[cfg(test)]

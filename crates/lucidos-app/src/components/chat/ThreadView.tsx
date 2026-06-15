@@ -1,20 +1,24 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, promptAnimating, effectiveThreadStatus, revealOnFocus } from '../../store/store';
+import { useEffect, useLayoutEffect, useMemo, useRef } from 'preact/hooks';
+import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, promptAnimating, revealOnFocus } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
 import { loadThreadEvents, forceRetryThreadEvents } from '../../store/actions/thread-loading';
 import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useAutoScroll, renderExchanges, ScrollControls } from './CreateThreadView';
-import { ThreadStatusIcon, resolveVisualStatus } from '../shared/ThreadStatusIcon';
+import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
 import { ThreadTitleEditor } from './ThreadTitleEditor';
 import { CopyThreadRefButton } from '../shared/CopyThreadRefButton';
 import { ExportThreadButton } from '../shared/ExportThreadButton';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, hasContentEvents } from '../../store/thread-events';
-import { awayFromBottom, notAtTop, scrollToBottom, scrolledUp } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottom, scrolledUp, hasPendingEventScroll } from './scrollState';
 import { useScrollMemory, hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
-import { isIOS } from '../../utils/platform';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
+import { DelayedSpinner } from '../shared/DelayedSpinner';
+import { forceIOSRepaint, createRepaintThrottle } from '../../utils/iosRepaint';
+import { onPageResume } from '../../utils/pageResume';
 import { threadDisplayTitle } from '../../utils/threadTitle';
+import { refreshClient } from '../../hooks/sw-update';
 
 // Module-level tracking survives component unmount/remount (e.g. Thread A → CreateThread → Thread B).
 // Using a ref would reset on remount, causing the fade-in to be skipped.
@@ -60,6 +64,11 @@ export function resetRevealTracking() {
 /** Timeout (ms) before showing "Tap to reload" in loading state. */
 const RELOAD_TIMEOUT = 8000;
 
+/** Minimum gap (ms) between forced iOS repaints while a thread streams. ~5/sec
+ *  keeps the compositor layer from getting stuck blank without thrashing it on
+ *  every token. */
+const STREAM_REPAINT_THROTTLE_MS = 200;
+
 /** Discriminated union — each variant is one render path. Impossible states
  *  (e.g. "loaded with events but animating") can't be constructed. */
 export type EmptyReason =
@@ -69,9 +78,9 @@ export type EmptyReason =
     | { kind: 'empty' };
 
 /** Derive the empty reason from thread state. During animation, returns
- *  'loading' — the spinner is the correct visual for a transition, and this
- *  prevents the error state from flashing when events arrive via SSE before
- *  the animation gate lifts.
+ *  'loading' — rendered as the delayed spinner — which prevents the error
+ *  state from flashing when events arrive via SSE before the animation gate
+ *  lifts.
  *
  *  `hasContent` is true iff the thread has at least one event that should
  *  contribute to a rendered exchange (see hasContentEvents). A composing draft
@@ -94,15 +103,9 @@ export function emptyReason(
 }
 
 function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
-    const [showReload, setShowReload] = useState(false);
-    const threadId = 'threadId' in reason ? reason.threadId : '';
-
-    useEffect(() => {
-        setShowReload(false);
-        if (reason.kind !== 'loading') return;
-        const timer = setTimeout(() => setShowReload(true), RELOAD_TIMEOUT);
-        return () => clearTimeout(timer);
-    }, [threadId, reason.kind]);
+    // Both call sites key this component by threadId, so the spinner delay
+    // (inside DelayedSpinner) and this reload timeout restart per thread.
+    const showReload = useDelayedFlag(reason.kind === 'loading', RELOAD_TIMEOUT);
 
     switch (reason.kind) {
         case 'failed':
@@ -112,7 +115,7 @@ function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
                 <div class="thread-empty-state thread-empty-error">
                     <p>{message}</p>
                     <button class="action-btn" onClick={() => forceRetryThreadEvents(reason.threadId)}>Retry</button>
-                    <button class="thread-empty-reload" onClick={() => location.reload()}>Reload page</button>
+                    <button class="thread-empty-reload" onClick={() => refreshClient()}>Reload page</button>
                 </div>
             );
         }
@@ -125,9 +128,9 @@ function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
         case 'loading':
             return (
                 <div class="thread-empty-state">
-                    <div class="loading-spinner" />
+                    <DelayedSpinner />
                     {showReload && (
-                        <button class="thread-empty-reload" onClick={() => location.reload()}>
+                        <button class="thread-empty-reload" onClick={() => refreshClient()}>
                             Taking too long? Tap to reload
                         </button>
                     )}
@@ -253,27 +256,10 @@ export function ThreadView() {
         return () => clearTimeout(timer);
     }, [threadId, threadInMap, eventsLoaded, eventsLoadFailed]);
 
-    // Force iOS Safari repaint — toggles the compositor layer's transform
-    // to invalidate iOS's cached texture and make content visible.
+    // Force iOS Safari repaint of the scroll container — invalidates iOS's
+    // cached compositor texture so DOM-present-but-black content shows.
     // Called on data changes AND on resume from background.
-    const forceIOSRepaint = () => {
-        const el = areaRef.current;
-        if (!el?.isConnected || !isIOS()) return;
-        let raf1: number | undefined;
-        let raf2: number | undefined;
-        raf1 = requestAnimationFrame(() => {
-            if (!el.isConnected) return;
-            el.style.transform = 'translateZ(0.1px)';
-            raf2 = requestAnimationFrame(() => {
-                if (!el.isConnected) return;
-                el.style.transform = '';
-            });
-        });
-        return () => {
-            if (raf1) cancelAnimationFrame(raf1);
-            if (raf2) cancelAnimationFrame(raf2);
-        };
-    };
+    const forceRepaint = () => forceIOSRepaint(areaRef.current);
 
     // Scroll to bottom when events finish loading for the focused thread.
     // focusThread() calls scrollToBottom() but its ResizeObserver suppression
@@ -313,26 +299,48 @@ export function ThreadView() {
             // loop would otherwise overwrite the restore set by useScrollMemory.
             // The saved key only holds a value when the user was scrolled up
             // (shouldSave: () => scrolledUp.value), so at-bottom defers here.
-            if (eventsLoaded && !hasSavedScroll(savedScrollKey)) scrollToBottom();
-            return forceIOSRepaint();
+            // Skip too while a notification deep-link owns the scroll. Its claim
+            // is held until scrollToEventAndPulse's deadline (not released the
+            // instant it lands), so it also covers the re-fire this effect does
+            // when `hasExchanges` flips 0→true a beat after the deep-link
+            // resolves. Deliberately NOT gated on scrolledUp: this effect's own
+            // purpose is to recover the at-bottom snap on a slow load where a
+            // ResizeObserver fire escalated scrolledUp=true (see the comment
+            // above) — a scrolledUp gate would defeat that recovery.
+            if (eventsLoaded && !hasSavedScroll(savedScrollKey) && !hasPendingEventScroll()) scrollToBottom();
+            return forceRepaint();
         }
     }, [threadId, eventsLoaded, hasExchanges]);
 
     // iOS PWA resume: force repaint when returning from background.
-    // Signal values don't change on resume (same thread, same events), so
-    // no re-render produces DOM changes. iOS Safari's compositor may have
-    // recycled the layer texture while backgrounded — content is in the DOM
-    // but invisible. Scrolling fixes it because scroll events force a
-    // compositor repaint. This listener forces the repaint proactively.
+    // Signal values don't change on resume (same thread, same events), so no
+    // re-render produces DOM changes. iOS Safari's compositor may have recycled
+    // the layer texture while backgrounded — content is in the DOM but invisible
+    // (renders black). Subscribing to the shared resume signal fires the repaint
+    // on visibilitychange / pageshow / focus, not just visibilitychange: iOS
+    // frequently restores a PWA via pageshow (bfcache) with no `visible`
+    // visibilitychange, which left the old handler silent and the content black
+    // until a tap — and that tap could land on an invisible question / permission
+    // and answer it (see utils/pageResume, which also swallows that wake-tap).
+    // forceRepaint is iOS-gated and null-safe.
+    useEffect(() => onPageResume(forceRepaint), []);
+
+    // Sustained-streaming repaint (iOS): entering a *running* thread, the rapid
+    // streaming DOM mutations can make WKWebView blank the .thread-content
+    // compositor layer AFTER the one-shot entry/load repaint above has already
+    // fired — the content stays in the DOM (still scrollable, chevron shows) but
+    // renders black until a manual scroll. eventsBump ticks on every append to
+    // THIS thread (tokens, tool events, CC text), so repaint on a throttle as
+    // content streams in. Fire-and-forget on purpose: this stream-driven repaint
+    // has no lifecycle to clean up. The gate keeps it to one repaint per ~200ms,
+    // and forceIOSRepaint supersedes an overlapping toggle (reusing the captured
+    // baseline) so nothing accumulates; forceRepaint is iOS-gated and null-safe.
+    const streamRepaintGate = useMemo(() => createRepaintThrottle(STREAM_REPAINT_THROTTLE_MS), []);
     useEffect(() => {
-        if (!isIOS()) return;
-        function onVisibilityChange() {
-            if (document.visibilityState !== 'visible') return;
-            forceIOSRepaint();
-        }
-        document.addEventListener('visibilitychange', onVisibilityChange);
-        return () => document.removeEventListener('visibilitychange', onVisibilityChange);
-    }, []);
+        if (!hasExchanges) return;
+        if (!streamRepaintGate(performance.now())) return;
+        forceRepaint();
+    }, [eventsBump, hasExchanges]);
 
     // Self-healing watchdog: if a thread has CONTENT events but exchanges are
     // empty, rebuild the events Map and re-fetch from the API. iOS Safari can
@@ -364,6 +372,14 @@ export function ThreadView() {
             paused: !eventsLoaded,
             shouldSave: () => scrolledUp.value,
             onRestored: () => { scrolledUp.value = true; },
+            // A notification deep-link (toast / push / inbox) owns the scroll
+            // when focusing an UNfocused thread: skip the saved-scroll restore
+            // so it doesn't fire after scrollToEventAndPulse and snap away from
+            // the source event. The claim is held until the deep-link's deadline,
+            // so this is true for the whole resolve window. (Already-focused
+            // threads don't re-run this hook, so they never needed the guard —
+            // which is why the bug only bit unfocused-thread deep-links.)
+            shouldRestore: () => !hasPendingEventScroll(),
         },
     );
 
@@ -385,15 +401,17 @@ export function ThreadView() {
         if (threadsLoaded.value) {
             unfocusThread();
         }
-        // Show spinner while waiting for thread to appear in map — never blank.
-        // This covers the window between page load (localStorage hydrates
-        // focusedThreadId) and loadAllThreads completing (thread enters map).
-        // On iOS Safari PWA cold start this can be several seconds.
+        // Waiting for the thread to appear in the map — same delayed-spinner
+        // empty state as the events-loading path, including the 8s "Taking too
+        // long? Tap to reload" escape hatch. This covers the window between
+        // page load (localStorage hydrates focusedThreadId) and loadAllThreads
+        // completing (thread enters map). On iOS Safari PWA cold start this
+        // can be several seconds.
         return (
             <div class="thread-view">
                 <div class="thread-content-wrap">
                     <div class="thread-content visible">
-                        <div class="loading-spinner" />
+                        <ThreadEmptyState key={threadId} reason={{ kind: 'loading', threadId }} />
                     </div>
                 </div>
             </div>
@@ -401,11 +419,7 @@ export function ThreadView() {
     }
 
     const threadTitle = threadDisplayTitle(eventThread);
-    const visualStatus = resolveVisualStatus(
-      effectiveThreadStatus(eventThread),
-      eventThread.meta.activeChildrenCount > 0,
-      eventThread.meta.codingAgentProposed,
-    );
+    const visualStatus = threadVisualStatus(eventThread);
     return (
         <div class="thread-view">
             <div class="thread-view-header">
@@ -421,7 +435,7 @@ export function ThreadView() {
                     <MobileThreadTitleBar />
 
                     {exchanges.length === 0 ? (
-                        <ThreadEmptyState reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!)} />
+                        <ThreadEmptyState key={threadId} reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!)} />
                     ) : (
                         renderExchanges(exchanges, threadId!, streamingBuffer)
                     )}

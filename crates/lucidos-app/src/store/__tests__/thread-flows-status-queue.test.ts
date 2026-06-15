@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { TS, getExchanges, getLabel, insertEvents, makeThread, nextSeq, resetSeqCounter } from './thread-flows-helpers';
-import { exchangeResponseEvents, exchangeResponseTimestamp, exchangeStatus, exchangeTimestamp, exchangeUserChannel, exchangeUserMessage, groupIntoExchanges, handleEvent, type Exchange, type ThreadState } from '../thread-events';
+import { TS, getExchanges, getExchangesWithPending, getLabel, insertEvents, makeThread, nextSeq, resetSeqCounter } from './thread-flows-helpers';
+import { activeExchangeIndex, exchangeResponseEvents, exchangeResponseTimestamp, exchangeStatus, exchangeTimestamp, exchangeUserChannel, exchangeUserMessage, groupIntoExchanges, handleEvent, isPendingFollowup, type Exchange, type ThreadState } from '../thread-events';
 import { handleEventWithAgg } from './aggregate-test-helper';
 import { isActive, statusLabel } from '../exchange-status';
 import { effectiveThreadStatus } from '../store';
@@ -415,7 +415,7 @@ describe('Flow: Message queue — multiple pending messages', () => {
     expect(statusLabel(status1, false).label).toBe('Queued');
   });
 
-  it('superseded queued exchange shows "Continued below" instead of "Queued"', () => {
+  it('superseded queued exchange shows "Done" instead of "Queued"', () => {
     const { map, id } = makeThread();
 
     // First exchange is active (streaming)
@@ -440,7 +440,7 @@ describe('Flow: Message queue — multiple pending messages', () => {
     // Exchange 1 is NOT last (exchange 2 exists after it) → superseded.
     // Even though hasPriorActive=true, it should NOT be 'queued' because it
     // was superseded by a later message. It should be 'done' so that
-    // ChatExchange displays it as "Continued below ↳".
+    // ChatExchange displays it as "Done ✓".
     const status1 = exchangeStatus(exchanges[1], '', false, true);
     expect(status1).not.toBe('queued');
     expect(status1).toBe('done');
@@ -469,7 +469,7 @@ describe('Flow: Message queue — multiple pending messages', () => {
     expect(thread.pendingUserMessages[0].eventId).toBe('msg-b');
   });
 
-  it('non-last superseded exchange returns done (displayed as "Continued below")', () => {
+  it('non-last superseded exchange returns done (displayed as "Done")', () => {
     const { map, id } = makeThread();
 
     // First exchange is active
@@ -491,7 +491,7 @@ describe('Flow: Message queue — multiple pending messages', () => {
       steps: [],
     });
 
-    // Exchange[1] is not last (superseded) → 'done' (ChatExchange shows "Continued below ↳")
+    // Exchange[1] is not last (superseded) → 'done' (ChatExchange shows "Done ✓")
     const status1 = exchangeStatus(exchanges[1], '', false, true);
     expect(status1).toBe('done');
 
@@ -757,6 +757,94 @@ describe('Bug: first message missing when only pending messages exist', () => {
     // effectiveThreadStatus checks pendingUserMessages and returns 'running'
     const status = effectiveThreadStatus(thread);
     expect(status).toBe('running');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Queued follow-ups: typed while the agent is busy, they sort to the end of the
+// timeline (no `created`, synthetic max seq). They must read 'Queued' while the
+// active turn keeps the live stream — regression guard for the bug where the
+// stream rendered under the LAST queued message, the active turn read
+// 'interrupted', and the earlier follow-ups read 'Done'.
+// ---------------------------------------------------------------------------
+describe('Queued follow-ups behind an active turn', () => {
+  const pend = (n: number): Exchange =>
+    ({ userEvent: { type: 'MessageReceived', text: 'p' + n, _displayCreated: TS } as any, userSeq: -n, steps: [] });
+  const real = (): Exchange =>
+    ({ userEvent: { type: 'MessageReceived', text: 'a', created: TS } as any, userSeq: 1, steps: [] });
+
+  it('isPendingFollowup: true only for an optimistic (no-created) chat MessageReceived', () => {
+    expect(isPendingFollowup(pend(1))).toBe(true);
+    expect(isPendingFollowup(real())).toBe(false); // confirmed message carries `created`
+    expect(isPendingFollowup({ userEvent: { type: 'UserQuestionAsked', tool_use_id: 't', question: 'q' } as any, userSeq: 1, steps: [] })).toBe(false);
+  });
+
+  it('activeExchangeIndex: last non-pending when busy, literal last when idle', () => {
+    const list = [real(), pend(1), pend(2)];
+    expect(activeExchangeIndex(list, /* busy */ true)).toBe(0);  // the active turn
+    expect(activeExchangeIndex(list, /* busy */ false)).toBe(2); // freshly-sent last
+    expect(activeExchangeIndex([real(), real()], true)).toBe(1); // all real → last
+    expect(activeExchangeIndex([pend(1), pend(2)], true)).toBe(1); // no active turn yet → last
+  });
+
+  it('active streaming turn keeps the stream; stacked pending follow-ups are all queued', () => {
+    const { map, id } = makeThread('q-stack', 'running');
+    // Confirmed first turn, mid-stream (TextStreamed, no terminator).
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'First', created: '2026-01-01T00:00:00Z' },
+      { type: 'TextStreamed', text: 'Working...', created: '2026-01-01T00:00:01Z' },
+    ]);
+    map.get(id)!.pendingUserMessages = [
+      { text: 'follow 1', eventId: 'f1', created: '2026-01-01T00:00:02Z' },
+      { text: 'follow 2', eventId: 'f2', created: '2026-01-01T00:00:03Z' },
+    ];
+    const exchanges = getExchangesWithPending(map, id, /* useDisplayCreated */ true);
+    expect(exchanges).toHaveLength(3);
+
+    const threadBusy = true; // status 'running'
+    const activeIdx = activeExchangeIndex(exchanges, threadBusy);
+    expect(activeIdx).toBe(0); // the active turn, not a queued follow-up
+
+    // Active turn (played as 'last') reads streaming — NOT 'interrupted' — so the
+    // live response stays under it, not under the last queued message.
+    expect(exchangeStatus(exchanges[0], '', /* isLast */ true, false)).toBe('streaming');
+
+    // BOTH follow-ups are queued (the engine drains the whole FIFO — none are
+    // superseded), mirroring renderExchanges' isQueued computation.
+    for (let i = 1; i < exchanges.length; i++) {
+      expect(threadBusy && i !== activeIdx && isPendingFollowup(exchanges[i])).toBe(true);
+    }
+  });
+
+  it('queued follow-up behind a pending question is queued; the divider stays active', () => {
+    const { map, id } = makeThread('q-wait');
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'First', created: '2026-01-01T00:00:00Z' },
+      { type: 'UserQuestionAsked', tool_use_id: 't1', cc_session_id: '', question: 'Pick one', options: [{ id: 'a', label: 'A' }] } as any,
+    ]);
+    map.get(id)!.pendingUserMessages = [
+      { text: 'meanwhile', eventId: 'm1', created: '2026-01-01T00:00:05Z' },
+    ];
+    const exchanges = getExchangesWithPending(map, id, true);
+    const threadBusy = true; // waiting_for_user_answer
+    const activeIdx = activeExchangeIndex(exchanges, threadBusy);
+    expect(exchanges[activeIdx].userEvent.type).toBe('UserQuestionAsked');
+    const followupIdx = exchanges.length - 1;
+    expect(threadBusy && followupIdx !== activeIdx && isPendingFollowup(exchanges[followupIdx])).toBe(true);
+  });
+
+  it('a freshly-sent first message is active (Requesting), not queued', () => {
+    const { map, id } = makeThread('q-first', 'running');
+    map.get(id)!.pendingUserMessages = [
+      { text: 'first ever', eventId: 'e1', created: '2026-01-01T00:00:00Z' },
+    ];
+    const exchanges = getExchangesWithPending(map, id, true);
+    expect(exchanges).toHaveLength(1);
+    const threadBusy = true;
+    const activeIdx = activeExchangeIndex(exchanges, threadBusy);
+    expect(activeIdx).toBe(0);
+    expect(threadBusy && 0 !== activeIdx && isPendingFollowup(exchanges[0])).toBe(false); // active, not queued
+    expect(exchangeStatus(exchanges[0], '', /* isLast */ true, false, false, /* threadIdle */ false)).toBe('pending');
   });
 });
 

@@ -1,18 +1,19 @@
 import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, SETTINGS_NAV_ITEMS, triggers, appsList, parseRepoPath, repoPending, selectedChange, wipPreviewThreadId, threadMap } from '../../store/store';
-import type { ThreadChannel, InlineForm } from '../../store/store';
+import { CODING_AGENT_CHANNEL, type ThreadChannel, type InlineForm } from '../../store/store';
 import { loadedOr } from '../../store/types';
 import { formatChannel } from '../../utils/formatChannel';
 import { PENDING_TITLE_PLACEHOLDER } from '../../store/thread-events';
 
 const menuLabels: Record<string, string> = {
   files: 'Files', apps: 'Apps', triggers: 'Triggers',
+  'thread-queue': 'Thread Queue',
   changes: 'Changes', notifications: 'Notifications',
   settings: 'Settings',
 };
 
 export const CHANNEL_OPTIONS: { value: ThreadChannel; label: string }[] = [
   { value: 'chat', label: formatChannel('chat') },
-  { value: 'claude_code', label: formatChannel('claude_code') },
+  { value: CODING_AGENT_CHANNEL, label: 'Coding Agent' },
   { value: 'trigger', label: formatChannel('trigger') },
 ];
 

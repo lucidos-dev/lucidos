@@ -4,7 +4,7 @@ import {
   UI_SCALE_MAX,
   UI_SCALE_STEP,
 } from '../../store/actions/preferences';
-import { ModalOverlay } from './ModalOverlay';
+import { Overlay } from './Overlay';
 import {
   scaleModalOpen,
   previewScale,
@@ -40,25 +40,23 @@ export function ScaleModal() {
   }
 
   return (
-    <ModalOverlay onClose={closeScaleModal} class="scale-modal-overlay">
-      <div class="scale-modal">
-        <div class="scale-modal-label">{previewScale.value}%</div>
-        <input
-          type="range"
-          class="scale-modal-slider"
-          min={UI_SCALE_MIN}
-          max={UI_SCALE_MAX}
-          step={UI_SCALE_STEP}
-          value={previewScale.value}
-          tabIndex={-1}
-          onInput={handleSliderInput}
-          onChange={handleSliderChange}
-        />
-        <div class="scale-modal-range">
-          <span>{UI_SCALE_MIN}%</span>
-          <span>{UI_SCALE_MAX}%</span>
-        </div>
+    <Overlay open onClose={closeScaleModal} overlayClass="scale-modal-overlay" panelClass="scale-modal">
+      <div class="scale-modal-label">{previewScale.value}%</div>
+      <input
+        type="range"
+        class="scale-modal-slider"
+        min={UI_SCALE_MIN}
+        max={UI_SCALE_MAX}
+        step={UI_SCALE_STEP}
+        value={previewScale.value}
+        tabIndex={-1}
+        onInput={handleSliderInput}
+        onChange={handleSliderChange}
+      />
+      <div class="scale-modal-range">
+        <span>{UI_SCALE_MIN}%</span>
+        <span>{UI_SCALE_MAX}%</span>
       </div>
-    </ModalOverlay>
+    </Overlay>
   );
 }

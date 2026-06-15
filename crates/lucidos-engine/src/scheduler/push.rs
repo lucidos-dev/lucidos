@@ -281,12 +281,22 @@ pub async fn send_push_to_all(
     .await;
 }
 
-/// Fan out an OS push notification per the §2 matrix in
-/// `system-knowhow/notifications.md`. Sends iff Step A's `push_allowed`
-/// is true; the PresenceCheck pong protocol (§3) is the authoritative
-/// decision input. Non-fatal: every DB / SSE / web-push failure is logged
-/// and execution continues so a single bad subscription doesn't sink the
-/// fan-out.
+/// Fan out the OS surface for a notification per the §2 matrix in
+/// `system-knowhow/notifications.md`. The PresenceCheck pong protocol (§3) is
+/// the authoritative decision input:
+/// - `push_allowed = false` (an active device pong'd in) → emit
+///   `NotificationToastRequested` so active pages show the in-app toast.
+/// - `push_allowed = true` (no active device) → emit `NativePushRequested` so a
+///   connected Tauri desktop app shows a native macOS banner, AND fan out the
+///   web push to every browser / PWA subscription.
+///
+/// The two emits are mutually exclusive by construction (opposite branches of
+/// one decision), so a device never gets both a toast and a push/native banner.
+/// The decision runs whenever ANY client is reachable — a web-push
+/// subscription OR an open SSE connection / fresh heartbeat — so a desktop-only
+/// (Tauri) workspace with zero web-push subscriptions still gets toasts and
+/// native banners. Non-fatal: every DB / SSE / web-push failure is logged and
+/// execution continues so a single bad subscription doesn't sink the fan-out.
 #[allow(clippy::too_many_arguments)]
 pub async fn send_push_to_all_with_app(
     engine: &SharedEngine,
@@ -299,8 +309,13 @@ pub async fn send_push_to_all_with_app(
     tap: crate::scheduler::notifications::Tap,
 ) {
     let pool = engine.pool();
-    // Subs first — short-circuits the no-push-permission case before
-    // bothering the PresenceCheck protocol.
+    // Web-push subscriptions (browser / PWA endpoints). MAY be empty — a
+    // desktop-only (Tauri) workspace never creates one, because the embedded
+    // WKWebView can't subscribe to Web Push. We deliberately do NOT bail on
+    // empty here: a connected client still needs either the in-app toast
+    // (push suppressed) or a native desktop banner (push allowed), and both
+    // are decided below. The combined "nobody reachable" bail comes after we
+    // know the connected-client count.
     let subs_with_ua = match PushSubscriptionStore::get_push_enabled(pool).await {
         Ok(subs) => subs,
         Err(e) => {
@@ -308,13 +323,6 @@ pub async fn send_push_to_all_with_app(
             return;
         }
     };
-    if subs_with_ua.is_empty() {
-        return;
-    }
-    // Pick wake targets before the move below consumes the paired list.
-    let wake_targets = pick_mac_chromium_wake_targets(&subs_with_ua);
-    let subscriptions: Vec<PushSubscription> =
-        subs_with_ua.into_iter().map(|(sub, _)| sub).collect();
 
     let candidates = match crate::core::DevicePresenceStore::candidates(pool).await {
         Ok(c) => c,
@@ -339,6 +347,21 @@ pub async fn send_push_to_all_with_app(
     // freshly-heartbeated page whose SSE just dropped), so we take the max.
     let sse_connections = engine.sse_connections.count();
     let expected_pongs = expected_pong_count(sse_connections, candidates.len());
+
+    // Nothing to deliver to at all: no web-push subscription AND nobody
+    // connected or recently heartbeating (no client to receive a toast or a
+    // native banner over SSE either). Bail before the PresenceCheck. Note the
+    // gate is now "no subs AND no reachable client", not the old "no subs" —
+    // a connected client with no subscription anywhere in the workspace is a
+    // valid recipient for the in-app toast / native push.
+    if subs_with_ua.is_empty() && expected_pongs == 0 {
+        return;
+    }
+
+    // Pick wake targets before the move below consumes the paired list.
+    let wake_targets = pick_mac_chromium_wake_targets(&subs_with_ua);
+    let subscriptions: Vec<PushSubscription> =
+        subs_with_ua.into_iter().map(|(sub, _)| sub).collect();
 
     let push_allowed = if expected_pongs == 0 {
         // Nobody connected and no fresh heartbeat → nobody to pong → push
@@ -385,6 +408,33 @@ pub async fn send_push_to_all_with_app(
             "[Push] Suppressed OS push (PresenceCheck: an active device pinged in); \
              requested in-app toast instead"
         );
+        return;
+    }
+
+    // Native desktop surface (§1, §4). Broadcast on the push-ALLOWED branch so
+    // a connected Tauri desktop app renders a native macOS notification — it
+    // can't receive the web push below (WKWebView has no service-worker push).
+    // Browser / PWA clients ignore this frame; only a non-active Tauri client
+    // acts on it. It rides the same branch as the web-push fan-out (and the
+    // opposite branch from `emit_toast_requested`), so a device never gets both
+    // a native banner and an in-app toast for one notification.
+    if let Some(nid) = notification_id {
+        emit_native_push_requested(
+            &engine.event_bus,
+            nid,
+            title,
+            body,
+            link_thread_id,
+            link_event_id,
+            app_id,
+            tap.clone(),
+        )
+        .await;
+    }
+
+    // No web-push subscriptions (e.g. a desktop-only workspace) → the native
+    // broadcast above is the whole OS surface; skip the web-push machinery.
+    if subscriptions.is_empty() {
         return;
     }
 
@@ -462,8 +512,9 @@ fn schedule_mac_chromium_wakes(
             tokio::time::sleep(delay).await;
             match send_wake_push_to_device(&engine, &device_id, notification_id).await {
                 Ok(0) => log!(
-                    "[Push] Layer-3 wake-push for {} on {}: no subscription \
-                     (device unsubscribed during the delay window)",
+                    "[Push] Layer-3 wake-push for {} on {}: nothing sent \
+                     (notification read during the delay window, or device \
+                     unsubscribed)",
                     notification_id,
                     device_id
                 ),
@@ -575,6 +626,51 @@ async fn emit_toast_requested(
     }
 }
 
+/// Broadcast a [`SystemEvent::NativePushRequested`] so a connected Tauri
+/// desktop app renders a NATIVE macOS notification for a notification whose OS
+/// push was allowed (§2 Step A found no active device). Broadcast SSE — browser
+/// / PWA pages ignore it (they receive the real web push), and a Tauri page
+/// shows the banner only when it is not currently active (§4 row matrix). This
+/// is the desktop counterpart of the web-push fan-out: the WKWebView the Tauri
+/// app embeds can't subscribe to Web Push, so the engine reaches it over the
+/// already-open SSE stream instead. Non-fatal: a failed emit is logged; the
+/// worst case is the desktop user sees only the bell badge (driven by
+/// `NotificationCreated`). See `system-knowhow/notifications.md` §1, §4.
+#[allow(clippy::too_many_arguments)]
+async fn emit_native_push_requested(
+    event_bus: &crate::engine::event_bus::EventBus,
+    notification_id: uuid::Uuid,
+    title: &str,
+    body: &str,
+    thread_id: Option<uuid::Uuid>,
+    event_id: Option<uuid::Uuid>,
+    app_id: Option<&str>,
+    tap: crate::scheduler::notifications::Tap,
+) {
+    let sent_at_ms = crate::engine::now_epoch_millis();
+    if let Err(e) = event_bus
+        .emit(crate::engine::event_bus::BusEvent::System(
+            crate::engine::event_bus::SystemEvent::NativePushRequested {
+                notification_id,
+                title: title.to_string(),
+                body: body.to_string(),
+                thread_id,
+                event_id,
+                app_id: app_id.map(|s| s.to_string()),
+                tap,
+                sent_at_ms,
+            },
+        ))
+        .await
+    {
+        log!(
+            "[Push] Failed to broadcast NativePushRequested for {}: {}",
+            notification_id,
+            e
+        );
+    }
+}
+
 /// Decides whether a device with the given `user_agent` is affected by
 /// Chromium #370536109 — the macOS-Chromium dispatcher bug where
 /// `notificationclick` is silently queued until a new push event drains
@@ -632,12 +728,33 @@ fn pick_mac_chromium_wake_targets(
     out
 }
 
+/// Whether a scheduled wake push should still fire once its delay elapses.
+///
+/// A wake push exists for one reason: resurrect a wedged service worker
+/// (Chromium #370536109) so a queued `notificationclick` drains. A notification
+/// that is already `read` proves the user's tap on the original banner already
+/// landed — the SW was NOT wedged — so the wake has nothing to drain and would
+/// only re-pop an already-handled notification as a fresh unread banner (macOS
+/// won't replace a banner the tap already closed; it stacks a new one). The
+/// read flag is thus a precise proxy for "was the SW wedged": read ⇒ tap
+/// succeeded ⇒ skip; unread ⇒ either the user hasn't tapped yet or the tap was
+/// swallowed by a wedged SW ⇒ the wake is still the right thing.
+///
+/// Pure so the decision is unit-testable without a DB; the caller re-fetches
+/// the live read state at fire time (the tap lands DURING the wake delay, so
+/// this cannot be decided when the wake is scheduled). See
+/// `system-knowhow/notifications.md` §4.5.
+fn wake_still_needed(notification: &crate::scheduler::notifications::Notification) -> bool {
+    !notification.read
+}
+
 /// Send a wake-push to a single device — the workaround for Chromium
 /// #370536109 (`notificationclick` silently queued on macOS-Chrome). Looks up
-/// the notification by id, builds a `wake: true` payload carrying the SAME
+/// the notification by id, skips if it was read in the meantime (see
+/// [`wake_still_needed`]), builds a `wake: true` payload carrying the SAME
 /// content (so Chrome counts the push as visible, see §4.5), filters
 /// subscriptions to the requesting device, and fans out. Returns the number
-/// of subscriptions actually delivered to.
+/// of subscriptions actually delivered to (0 when skipped).
 ///
 /// Per web.dev `push-notifications-common-issues`, sending a push is the
 /// canonical mechanism to wake an inactive SW — any push event resurrects
@@ -657,6 +774,13 @@ pub(crate) async fn send_wake_push_to_device(
             Some(n) => n,
             None => return Ok(0),
         };
+
+    // Re-checked at fire time: if the user tapped the original banner during the
+    // wake delay, the notification is now read and the wake would only resurrect
+    // it as a fresh banner. See `wake_still_needed`.
+    if !wake_still_needed(&notification) {
+        return Ok(0);
+    }
 
     let subscriptions =
         PushSubscriptionStore::get_push_enabled_for_device(pool, device_id).await?;

@@ -67,9 +67,9 @@ export function blurPromptInputIfFocused(): void {
 
 /** Install a document-level listener that blurs the prompt textarea on any
  *  `.action-btn` tap. Idempotent — safe to call from module init. Action
- *  buttons (Send / Discard draft / Apply / Archive / Cancel / Discard / Diff
- *  / Continue / Revert) never want the mobile keyboard to remain up or to
- *  surface via implicit focus retention.
+ *  buttons (Send / Apply / Archive / Cancel / Discard / Diff / Continue /
+ *  Revert) never want the mobile keyboard to remain up or to surface via
+ *  implicit focus retention.
  *
  *  Listen on `click` (bubble phase) — NOT `pointerdown`. Blurring on
  *  pointerdown triggers iOS Safari's animated keyboard dismissal mid-tap;

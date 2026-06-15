@@ -81,6 +81,23 @@ impl LucidosEngine {
             .and_then(|s| s.pending_stop)
     }
 
+    /// Read and clear the device that clicked Cancel on a live session (stamped
+    /// by `interrupt_agent`). The run_session interrupt arm calls this so the
+    /// emitted `ResponseCanceled.actor` records the cancelling device. Drained
+    /// on read — a resumed session must not carry a stale actor into its next
+    /// turn. The `agent_sessions` analog of `take_cancel_actor` (the chat
+    /// path's `ThreadHandle.cancel_actor` slot in `active_threads`).
+    pub(crate) async fn take_session_cancel_actor(
+        &self,
+        thread_id: Uuid,
+    ) -> Option<MessageOrigin> {
+        self.agent_sessions
+            .lock()
+            .await
+            .get_mut(&thread_id)
+            .and_then(|s| s.cancel_actor.take())
+    }
+
     /// Interrupt a running Claude Code session — sends control_request:interrupt to stop
     /// current work without killing the session (like pressing Esc in the CC terminal).
     /// The CC process stays alive and enters waiting state.
@@ -105,13 +122,17 @@ impl LucidosEngine {
         thread_id: Option<Uuid>,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let guard = self.agent_sessions.lock().await;
+        let mut guard = self.agent_sessions.lock().await;
 
         if let Some(tid) = thread_id {
-            if let Some(session) = guard.get(&tid) {
+            if let Some(session) = guard.get_mut(&tid) {
                 if session.is_waiting {
                     return Err(SESSION_ALREADY_WAITING.into());
                 }
+                // Record who clicked Cancel BEFORE the notify so the run_session
+                // interrupt arm can drain it and stamp `ResponseCanceled.actor`
+                // with the originating device (the popover's Device row).
+                session.cancel_actor = actor;
                 session.interrupt.notify_one();
                 Ok(())
             } else {
@@ -144,7 +165,7 @@ impl LucidosEngine {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let event = crate::engine::thread_events::ThreadEvent::from_control_request(
             &request,
-            crate::runtime::CodingAgent::ClaudeCode,
+            self.thread_coding_agent(thread_id).await,
         );
         {
             let mut guard = self.agent_sessions.lock().await;

@@ -87,6 +87,10 @@ impl EventBus {
                     ActorMode::Human => LegacyInitiator::User.as_str(),
                     ActorMode::Agent | ActorMode::Engine => LegacyInitiator::System.as_str(),
                 };
+                // A human-typed message is a user action; an agent/engine-driven
+                // one is agent activity. Drives which attributed-recency column
+                // the follow-up UPDATE bumps below.
+                let human = matches!(mode, ActorMode::Human);
                 // Compute child depth and inherit initiator from parent —
                 // a non-Human parent forces "system" on its descendants.
                 let (child_depth, initiator) = if let Some(pid) = parent_thread_id {
@@ -109,6 +113,11 @@ impl EventBus {
                        VALUES ($1, $2, $3, $6, NOW(), NOW(), 1, $4, $7, $5, 'running', NOW(), 'active')
                        ON CONFLICT (thread_id) DO UPDATE
                        SET last_activity = NOW(),
+                           -- Attributed recency: a human follow-up bumps
+                           -- last_user_action (the drawer sort key); an
+                           -- agent/engine follow-up bumps last_agent_action.
+                           last_user_action = CASE WHEN $8 THEN NOW() ELSE thread_summaries.last_user_action END,
+                           last_agent_action = CASE WHEN $8 THEN thread_summaries.last_agent_action ELSE NOW() END,
                            message_count = thread_summaries.message_count + 1,
                            status = 'running',
                            last_revived_at = NOW(),
@@ -138,6 +147,7 @@ impl EventBus {
                 .bind(child_depth)
                 .bind(initiator)
                 .bind(spawning_event_id)
+                .bind(human)
                 .execute(&mut **tx)
                 .await?;
 
@@ -183,11 +193,12 @@ impl EventBus {
                 // (`<ws>/data/apps/<id>/`), so consumers reconstruct it
                 // rather than storing it as its own column. See
                 // `change_ops::load_apply_kind_context`.
-                let (session_repo_id, session_kind, session_folder) = match &event {
+                let (session_repo_id, session_kind, session_folder, session_agent) = match &event {
                     ThreadEvent::SessionStarted {
                         repo_id,
                         coding_agent_kind,
                         coding_agent_folder,
+                        coding_agent,
                         ..
                     } => (
                         repo_id.as_deref(),
@@ -197,12 +208,13 @@ impl EventBus {
                         } else {
                             Some(coding_agent_folder.as_str())
                         },
+                        Some(coding_agent.as_str()),
                     ),
-                    _ => (None, None, None),
+                    _ => (None, None, None, None),
                 };
                 sqlx::query(
-                    r#"INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id, coding_agent_kind, coding_agent_folder, state)
-                       VALUES ($1, $2, TRUE, NOW(), NOW(), 0, 'running', NOW(), $3, $4, $5, 'active')
+                    r#"INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id, coding_agent_kind, coding_agent_folder, coding_agent, state)
+                       VALUES ($1, $2, TRUE, NOW(), NOW(), 0, 'running', NOW(), $3, $4, $5, $6, 'active')
                        ON CONFLICT (thread_id) DO UPDATE
                        SET is_coding_agent = TRUE, source = $2,
                            initiator = COALESCE(thread_summaries.initiator, 'unknown'),
@@ -213,6 +225,9 @@ impl EventBus {
                            cc_repo_id = COALESCE(thread_summaries.cc_repo_id, $3),
                            coding_agent_kind = COALESCE(thread_summaries.coding_agent_kind, $4),
                            coding_agent_folder = COALESCE(thread_summaries.coding_agent_folder, $5),
+                           -- Same lock for the backend: a thread can never flip
+                           -- between Claude Code and Codex mid-conversation.
+                           coding_agent = COALESCE(thread_summaries.coding_agent, $6),
                            state = 'active',
                            compose_text = '',
                            compose_images = '[]'::jsonb,
@@ -225,6 +240,7 @@ impl EventBus {
                 .bind(session_repo_id)
                 .bind(session_kind)
                 .bind(session_folder)
+                .bind(session_agent)
                 .execute(&mut **tx)
                 .await?;
                 Vec::new()
@@ -236,6 +252,8 @@ impl EventBus {
                        VALUES ($1, $2, $3, 'system', NOW(), NOW(), 1, 'running', NOW(), $4, $5, $6, 'active')
                        ON CONFLICT (thread_id) DO UPDATE
                        SET last_activity = NOW(),
+                           -- A trigger firing is autonomous agent activity.
+                           last_agent_action = NOW(),
                            message_count = thread_summaries.message_count + 1,
                            status = 'running',
                            last_revived_at = NOW(),
@@ -260,7 +278,8 @@ impl EventBus {
             ThreadEvent::ResponseGenerated { .. } => {
                 // Normal completion — go idle (or waiting if CC has a pending proposal).
                 sqlx::query(&format!(
-                    "UPDATE thread_summaries SET last_activity = NOW(), has_response = TRUE, \
+                    "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), \
+                     has_response = TRUE, \
                      status = {STATUS_FROM_PROPOSED_CHANGE} WHERE thread_id = $1"
                 ))
                 .bind(thread_id)
@@ -289,7 +308,8 @@ impl EventBus {
                 // stale-settle is engine cleanup of an already-gone process
                 // and uses the cancel-style `idle`/`waiting` mapping.
                 sqlx::query(&format!(
-                    "UPDATE thread_summaries SET last_activity = NOW(), has_response = TRUE, \
+                    "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), \
+                     has_response = TRUE, \
                      status = {} WHERE thread_id = $1",
                     cause.status_sql()
                 ))
@@ -331,12 +351,27 @@ impl EventBus {
                 // git-truth the seed/refresh paths consult. Setting it here
                 // means the Diff button is enabled the moment CC idles with
                 // a diff, regardless of whether `ChangeProposed` has fired.
+                //
+                // The `status` CASE preserves a `failed` status: a CC turn that
+                // ends in failure emits `ResponseFailed` (→ status='failed')
+                // immediately followed by this `CodingAgentIdled` in the SAME
+                // turn (`classify_result` returns `emit_idle=true` for every
+                // non-shutdown Result, including the Failed kind). Without the
+                // CASE this bookkeeping idle would downgrade 'failed' → 'idle'
+                // and erase the red error dot in the thread list. The terminal
+                // event owns the turn's status; this idle only parks the thread
+                // when the turn didn't already fail. A later follow-up
+                // (`CodingAgentUserMessageSent` → 'running') clears 'failed'
+                // before the next idle, so the failure can't wedge the thread.
+                // Mirrors the `CASE WHEN status='running'` preservation the
+                // `ChangeProposed` arm uses for the same class of reason.
                 sqlx::query(&format!(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
+                    "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), \
                      has_response = TRUE, \
                      coding_agent_is_external_repo = $2, \
                      coding_agent_has_diff = $3, \
-                     status = {STATUS_FROM_PROPOSED_CHANGE} \
+                     status = CASE WHEN status = 'failed' THEN 'failed' \
+                                   ELSE {STATUS_FROM_PROPOSED_CHANGE} END \
                      WHERE thread_id = $1",
                 ))
                 .bind(thread_id)
@@ -364,7 +399,7 @@ impl EventBus {
                 ..
             } => {
                 sqlx::query(&format!(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
+                    "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
                      {CLEAR_CODING_AGENT_FLAGS}, \
                      status = 'idle' \
                      WHERE thread_id = $1",
@@ -392,7 +427,7 @@ impl EventBus {
             }
             ThreadEvent::ChangeDiscarded { change_id, .. } => {
                 sqlx::query(&format!(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
+                    "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
                      {CLEAR_CODING_AGENT_FLAGS}, \
                      status = 'idle' \
                      WHERE thread_id = $1",
@@ -414,7 +449,7 @@ impl EventBus {
             ThreadEvent::CodingAgentUserMessageSent { .. }
             | ThreadEvent::UserPromptInjected { .. } => {
                 sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), message_count = message_count + 1, status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
+                    "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), message_count = message_count + 1, status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
                 )
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -423,7 +458,7 @@ impl EventBus {
                 // 'idle' after a CodingAgentIdled that already decremented the
                 // parent via notify_parent_if_child), the user follow-up flips
                 // it back. Bounce the parent's active_children_count up so the
-                // drawer's "X/Y sub-threads done" label tracks the live state.
+                // parent's status dot + collapsed sub-thread count track live state.
                 if let Some(pid) =
                     reincrement_parent_active_count_if_revived(tx, thread_id, &prev_sample).await?
                 {
@@ -475,9 +510,9 @@ impl EventBus {
                 // teardown columns. Children counters are NOT cleared —
                 // they're a cache of real child events, and family-lift
                 // routing surfaces this parent again whenever any descendant
-                // is still active; zeroing them would hide the
-                // `FamilyToggleRow` (gated on `totalChildrenCount > 0`) and
-                // leave the user unable to collapse the lifted family.
+                // is still active; zeroing them would hide the disclosure
+                // chevron (gated on `totalChildrenCount > 0`) and leave the
+                // user unable to collapse the lifted family.
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET status = 'idle', \
                      is_saved = FALSE, \
@@ -559,7 +594,7 @@ impl EventBus {
                 // changes to review) so the UI can render an error indicator.
                 // Set has_response so the thread stays visible.
                 sqlx::query(
-                    "UPDATE thread_summaries SET has_response = TRUE, status = 'failed' WHERE thread_id = $1",
+                    "UPDATE thread_summaries SET last_agent_action = NOW(), has_response = TRUE, status = 'failed' WHERE thread_id = $1",
                 )
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -601,7 +636,7 @@ impl EventBus {
                 // Trigger run done — go idle. Set has_response so the thread
                 // appears in get_recent_threads (which filters has_response=TRUE).
                 sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), has_response = TRUE, status = 'idle' WHERE thread_id = $1",
+                    "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), has_response = TRUE, status = 'idle' WHERE thread_id = $1",
                 )
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -814,6 +849,7 @@ impl EventBus {
                 } else {
                     sqlx::query(
                         "UPDATE thread_summaries SET last_activity = NOW(), \
+                         last_agent_action = NOW(), \
                          last_revived_at = CASE WHEN status != 'running' THEN NOW() \
                                                 ELSE last_revived_at END, \
                          status = 'running' \
@@ -833,9 +869,13 @@ impl EventBus {
             // 'waiting_for_user_answer' on the request and back to 'running'
             // on the resolution.
             ThreadEvent::UserQuestionAsked { .. }
-            | ThreadEvent::CodingAgentPermissionRequest { .. } => {
+            | ThreadEvent::CodingAgentPermissionRequest { .. }
+            | ThreadEvent::CommandPermissionRequested { .. } => {
+                // The agent asking for input is agent activity (bumps
+                // last_agent_action); the user's resolution below is the user
+                // action.
                 sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
+                    "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), \
                      status = 'waiting_for_user_answer' WHERE thread_id = $1",
                 )
                 .bind(thread_id)
@@ -844,9 +884,10 @@ impl EventBus {
                 Vec::new()
             }
             ThreadEvent::UserQuestionAnswered { .. }
-            | ThreadEvent::CodingAgentPermissionResolved { .. } => {
+            | ThreadEvent::CodingAgentPermissionResolved { .. }
+            | ThreadEvent::CommandPermissionResolved { .. } => {
                 sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
+                    "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
                      status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
                 )
                 .bind(thread_id)
@@ -887,6 +928,28 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
+            // Child-completion fan-in landing on the parent. Mark the child's
+            // `parent_callback_sent` HERE — in the same transaction as the
+            // event INSERT — so the marker and the event cannot disagree. A
+            // separate post-emit UPDATE (the old shape in
+            // `notify_parent_if_child`) left a crash window where the typed
+            // event committed but the marker didn't; the next terminal event
+            // then re-fired the fan-in and handed the parent a duplicate
+            // completion card. The parent's wake-up + agentic-loop replay
+            // handle the actual side effect — no other projection state
+            // changes for the parent row itself.
+            ThreadEvent::ChildThreadCompleted {
+                child_thread_id, ..
+            } => {
+                sqlx::query(
+                    "UPDATE thread_summaries SET parent_callback_sent = TRUE \
+                     WHERE thread_id = $1",
+                )
+                .bind(child_thread_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
             // Events that don't affect thread_summaries metadata or status.
             // Exhaustive match — adding a new ThreadEvent variant forces you to decide
             // whether it needs a projection update. Never use `_ =>` here.
@@ -920,10 +983,6 @@ impl EventBus {
             // section transition, no last_activity bump).
             | ThreadEvent::ImageUploaded { .. }
             | ThreadEvent::ContextCaptured { .. }
-            // Child-completion fan-in landing on the parent. Persisted as
-            // history; the parent's wake-up + agentic loop replay handle the
-            // actual side effect — no projection update needed here.
-            | ThreadEvent::ChildThreadCompleted { .. }
             // Agent-driven dismissal of a prior tool result / child completion
             // from future resume context. Pure resume-helper input; no
             // projection state change.
@@ -946,7 +1005,16 @@ impl EventBus {
             // Todo list snapshot from a `todo_write` tool call. The paired
             // `ToolCalled` / `ToolResult` already bumped last_activity; this
             // event exists for the sticky panel projection, not for routing.
-            | ThreadEvent::TodoListWritten { .. } => Vec::new(),
+            | ThreadEvent::TodoListWritten { .. }
+            // Command-guard checkpoint lifecycle (ADR 0002, Phase 4). The
+            // checkpoint is taken mid-turn, right before the command runs — the
+            // paired ToolCalled already bumped last_activity and the thread is
+            // still running, so there's no status change or section transition.
+            // The revert is a small one-click undo on a past card; persisted for
+            // the reverted-state render and broadcast over SSE, but it doesn't
+            // resurface the thread. Both are pure card/audit projection.
+            | ThreadEvent::CommandCheckpointed { .. }
+            | ThreadEvent::CommandCheckpointReverted { .. } => Vec::new(),
         };
 
         // Step 2: Validate and apply section transition via the lifecycle contract.

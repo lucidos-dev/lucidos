@@ -9,13 +9,15 @@ import {
 } from '../../store/actions/cross-workspace';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { loadRepositories } from '../../store/actions/chat';
-import { useDismissOnOutside, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { Overlay } from '../shared/Overlay';
 import { loadedOr } from '../../store/types';
 import {
   exchangeResponseModel,
   exchangeReasoningEffort,
   displayModelName,
   displayReasoningEffort,
+  findCommandPermissionResolution,
   findPermissionResolution,
   findQuestionAnswer,
   isChangeLifecycleEvent,
@@ -28,7 +30,7 @@ import {
   type StoredEvent,
   type ThreadMeta,
 } from '../../store/thread-events';
-import { describeAbortCause, describeEngineReason } from '../../utils/engineEventExplainers';
+import { describeAbortCause, describeCancelCause, describeEngineReason } from '../../utils/engineEventExplainers';
 
 /** Takes the full Exchange so the divider-starter cases (UserQuestionAsked,
  *  CodingAgentPermissionRequest) can walk the exchange's steps for the matching
@@ -46,6 +48,9 @@ export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
   }
   if (userEvent.type === 'CodingAgentPermissionRequest') {
     return findPermissionResolution(exchange, userEvent.request_id)?.actor;
+  }
+  if (userEvent.type === 'CommandPermissionRequested') {
+    return findCommandPermissionResolution(exchange, userEvent.request_id)?.actor;
   }
   // CredentialRequested / McpConsentRequested have no user-side answer event
   // today — the initiator row carries the disclosure on its own.
@@ -152,25 +157,27 @@ export function MessageRoutePanel() {
   // stays inside the chat column instead of overflowing into the content pane.
   const pos = useAnchoredPosition(state?.anchor ?? null, ref, '.thread-pane');
 
-  useDismissOnOutside(state !== null, ref, state?.anchor ?? null, closeMessageRoutePanel);
-
   if (!state) return null;
   const { exchange, threadId, section, priorModel, priorEffort } = state;
   const thread = threadMap.value.get(threadId);
   if (!thread) return null;
 
   return (
-    <div
-      ref={ref}
-      class={`message-route-panel ${pos?.placement ?? ''}`}
-      style={pos ? { top: `${pos.top}px`, left: `${pos.left}px` } : { visibility: 'hidden' }}
-      role="dialog"
-      aria-label={section === 'origin' ? 'Initiator info' : 'Executor info'}
+    <Overlay
+      open
+      onClose={closeMessageRoutePanel}
+      anchor={state.anchor}
+      backdrop={false}
+      panelClass={`message-route-panel ${pos?.placement ?? ''}`}
+      panelStyle={pos ? { top: `${pos.top}px`, left: `${pos.left}px` } : { visibility: 'hidden' }}
+      panelRole="dialog"
+      panelProps={{ 'aria-label': section === 'origin' ? 'Initiator info' : 'Executor info' }}
+      panelRef={ref}
     >
       {section === 'origin'
         ? renderOriginSection(exchange, thread.meta.parentThreadTitle, getLiveThreadTitle)
         : renderExecutorSection(exchange, thread.events, thread.meta, priorModel, priorEffort)}
-    </div>
+    </Overlay>
   );
 }
 
@@ -227,6 +234,28 @@ function renderOriginSection(
     );
   }
 
+  // User-driven `ResponseCanceled` (CancelCause). The "Response canceled" turn
+  // carries no actor chip — this popover IS its initiator disclosure. Cancel is
+  // user-driven by definition, so always attribute it to "You"; include the
+  // device when one was recorded (the chat-thread cancel path doesn't plumb an
+  // actor, so it's often absent). The cause line explains how it stopped.
+  if (userEvent.type === 'ResponseCanceled') {
+    return (
+      <section class="route-section">
+        <h4>Origin</h4>
+        <div class="route-row">
+          <strong>Issued by</strong>
+          <span>You</span>
+        </div>
+        {origin?.kind === 'device' && renderChannelSection(origin)}
+        <div class="route-explainer">
+          <strong>Why the response stopped</strong>
+          <p>{describeCancelCause(userEvent.cause)}</p>
+        </div>
+      </section>
+    );
+  }
+
   if (!initiatorRow && !channel && !audit && !explainer) {
     return (
       <section class="route-section">
@@ -247,11 +276,11 @@ function renderOriginSection(
   );
 }
 
-/** Initiator row for divider-starter ActionRequired events. The chip itself
- *  reads "You" (the device-owner who answers); this row discloses who *asked*
- *  — Claude Code for question/permission prompts, Lucidos for credential and
- *  MCP-consent requests. Returns null for non-divider events (their initiator
- *  is implied by the channel/audit rows). */
+/** Initiator row for divider-starter ActionRequired events. The chip reads the
+ *  asking agent (Lucidos Agent / Claude Code); this row mirrors who *asked* —
+ *  Claude Code or Lucidos Agent for questions (by thread kind), Claude Code for
+ *  permission gates, Lucidos for credential and MCP-consent requests. Returns
+ *  null for non-divider events (their initiator is implied by channel/audit). */
 export function renderInitiatorRow(userEvent: StoredEvent): preact.JSX.Element | null {
   const text = initiatorRowText(userEvent);
   if (!text) return null;
@@ -265,8 +294,9 @@ export function renderInitiatorRow(userEvent: StoredEvent): preact.JSX.Element |
 
 function initiatorRowText(userEvent: StoredEvent): string | null {
   switch (userEvent.type) {
-    case 'UserQuestionAsked':            return 'Claude Code';
+    case 'UserQuestionAsked':            return userEvent.cc_session_id ? 'Claude Code' : 'Lucidos Agent';
     case 'CodingAgentPermissionRequest': return 'Claude Code (permission gate)';
+    case 'CommandPermissionRequested':   return 'Lucidos Agent (command gate)';
     case 'CredentialRequested':          return 'Lucidos (credential request)';
     case 'McpConsentRequested':          return 'Lucidos (tool consent)';
     default:                             return null;
@@ -528,6 +558,9 @@ function resolveAppInfo(
   const appId = folder.split('/').filter(Boolean).pop();
   if (!appId) return undefined;
   const apps = appsList.value;
+  // Idempotent kick-off from the render path: loadApps() flips the signal to
+  // `loading` synchronously (setLoadingIfFresh), so the next render no longer
+  // sees `not-loaded` and won't re-fetch — exactly one fetch fires.
   if (apps.status === 'not-loaded') void loadApps();
   const FALLBACK_ICON = '\u{1F4E6}'; // 📦 — neutral "app" pictogram
   if (apps.status === 'failed') {
@@ -548,6 +581,8 @@ function resolveAppInfo(
 function resolveRepoLabel(repoId: string | undefined): { text: string; failed?: boolean } | undefined {
   if (!repoId) return undefined;
   const repos = repositories.value;
+  // Idempotent render-path kick-off — see resolveAppInfo above: loadRepositories
+  // flips the signal to `loading` synchronously, so only one fetch fires.
   if (repos.status === 'not-loaded') void loadRepositories();
   if (repos.status === 'failed') return { text: `${repoId} (load failed)`, failed: true };
   if (repos.status !== 'loaded') return { text: repoId };

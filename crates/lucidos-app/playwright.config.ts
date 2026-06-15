@@ -73,6 +73,25 @@ export default defineConfig({
         hasTouch: true,
         deviceScaleFactor: 3,
         userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+        // ROOT-CAUSE FIX for the "WebContent nav-wedge" (first page.goto in a
+        // fresh context times out, WebKit-only — see docs/e2e-test-decisions.md
+        // "mobile-webkit navigation wedge"). On a managed/MDM Mac the macOS
+        // system network config can carry proxy *auto-discovery* (WPAD) or a PAC
+        // URL. Playwright's WebKit network process honors the system proxy by
+        // default, so the FIRST navigation in each fresh context (= fresh network
+        // session) synchronously runs WPAD/PAC discovery before it issues the
+        // request — a DNS/captive-portal/PAC-fetch round trip that stalls for
+        // tens of seconds under load, then self-clears (which is why a fresh
+        // context recovers and why the engine never sees the `/` request). It is
+        // WebKit-only because Playwright's Chromium is launched without the
+        // system proxy. Setting an EXPLICIT proxy here makes WebKit skip system
+        // auto-discovery entirely; `bypass` routes our (localhost-only) e2e
+        // traffic DIRECT so the proxy is never actually contacted. `server` is a
+        // deliberately-inert loopback dead port — present only to disable
+        // discovery, fast-refused if ever hit (it won't be: every URL the suite
+        // loads is localhost). This prevents the wedge at the source rather than
+        // recovering from it via retry.
+        proxy: { server: 'http://127.0.0.1:1', bypass: 'localhost,127.0.0.1,::1' },
       },
     },
   ],

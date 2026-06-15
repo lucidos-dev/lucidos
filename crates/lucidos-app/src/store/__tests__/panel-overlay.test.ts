@@ -29,7 +29,6 @@ const fakeApp: App = {
   id: 'test-app',
   name: 'Test App',
   description: 'A test',
-  knowhow: [],
 };
 const fakeNotification: Notification = {
   id: 'notif-1',

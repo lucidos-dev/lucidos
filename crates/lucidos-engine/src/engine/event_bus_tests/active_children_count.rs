@@ -420,13 +420,13 @@ async fn test_continuation_requested_re_increments_parent_after_restart_park() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression for the "parent stuck at 1/1 sub-threads done while child is
-/// Working" bug: when a CC child idles, `notify_parent_if_child`
+/// Regression for the "parent stuck showing no active sub-thread while child
+/// is Working" bug: when a CC child idles, `notify_parent_if_child`
 /// decrements the parent's `active_children_count`. When the user types a
 /// follow-up (`CodingAgentUserMessageSent`), the projection flips the child
 /// back to `status='running'` — but without an explicit re-increment the
-/// parent's counter stays at 0, so the drawer's "X/Y sub-threads done"
-/// label is wrong and the parent's status icon stays idle (no pulsing
+/// parent's counter stays at 0, so the drawer's collapsed sub-thread count
+/// loses its active tint and the parent's status icon stays idle (no pulsing
 /// dot) even though the child is actively running.
 ///
 /// Mirrors `test_continuation_requested_re_increments_parent_after_restart_park`
@@ -470,8 +470,8 @@ async fn test_cc_user_message_re_increments_parent_after_idle() {
         parent_id,
         1,
         "CodingAgentUserMessageSent on an idled CC child must bring parent \
-         active_children_count back to 1 — otherwise the drawer shows '1/1 \
-         sub-threads done' while the child is Working",
+         active_children_count back to 1 — otherwise the parent's status dot \
+         and collapsed sub-thread count read as idle while the child is Working",
     )
     .await;
 
@@ -516,8 +516,8 @@ async fn test_cc_user_message_re_increments_parent_after_idle() {
 /// At step 3 the dedup guard in `notify_parent_if_child`
 /// (`is_coding_agent && callback_already_sent && CodingAgentIdled`)
 /// short-circuits and the decrement is skipped — so the parent's counter is
-/// stuck at 1 forever and the drawer reads "0/1 sub-threads done" while the
-/// child is actually Idle. The revive helper must therefore also clear
+/// stuck at 1 forever and the drawer shows the parent as having an active
+/// sub-thread while the child is actually Idle. The revive helper must therefore also clear
 /// `parent_callback_sent=FALSE` in the same tx, so the next terminal event
 /// is a fresh first-idle from the dedup's perspective.
 #[tokio::test]
@@ -574,8 +574,8 @@ async fn test_cc_second_idle_after_revive_decrements_parent_again() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression for the "parent stuck in ACTIVE with 0/1 sub-threads done" bug:
-/// a CC child whose session ends with a proposed change must NOT keep the
+/// Regression for the "parent stuck in ACTIVE with a phantom active sub-thread"
+/// bug: a CC child whose session ends with a proposed change must NOT keep the
 /// parent's `active_children_count` incremented. Under Option B the child
 /// settles to `status='idle'` (the diff is an artifact, not a parked loop),
 /// so the `CodingAgentIdled` decrement runs through `notify_parent_if_child`

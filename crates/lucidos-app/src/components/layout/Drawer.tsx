@@ -8,13 +8,14 @@ import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
 import { isTauri } from '../../utils/platform';
 import { hidePanelWebview, showPanelWebview } from '../../utils/tauri';
-import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
+import { Overlay } from '../shared/Overlay';
 import type { MenuItem } from '../../store/types';
 
 const menuItems: Array<{ id: MenuItem; label: string }> = [
   { id: 'files', label: 'Files' },
   { id: 'apps', label: 'Apps' },
   { id: 'triggers', label: 'Triggers' },
+  { id: 'thread-queue', label: 'Thread Queue' },
 ];
 
 export const drawerOpen = signal(false);
@@ -72,19 +73,13 @@ function resolvedPinnedUis(): PinnedUi[] {
 export function Drawer() {
   const isOpen = drawerOpen.value;
   const pinned = resolvedPinnedUis();
-  const drawerRef = useRef<HTMLElement>(null);
+  const drawerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!isOpen || !isTauri()) return;
     hidePanelWebview();
     return () => showPanelWebview();
   }, [isOpen]);
-
-  // Desktop backdrop only covers the panel area — outside-click on the chat
-  // pane still needs to close. Anchor is the hamburger that opened this
-  // drawer (stamped in openDrawer), so re-clicking it routes through its own
-  // toggle. The hook swallows the paired click for everything else outside.
-  useDismissOnOutside(isOpen, drawerRef, drawerAnchor.value, closeDrawer);
 
   if (!isOpen) return null;
 
@@ -98,15 +93,27 @@ export function Drawer() {
     changesLoadable.status === 'loaded' ? changesLoadable.data.length : null;
 
   return (
+    // The `.drawer-backdrop` wrapper stays the caller's own (it dims the chat
+    // pane and carries the slide-out `closing` class); <Overlay backdrop={false}>
+    // renders the `.drawer` panel inside it and owns the dismiss/swallow/Escape
+    // contract. Anchor is the hamburger that opened this drawer (stamped in
+    // openDrawer), so re-clicking it routes through its own toggle. closeDrawer
+    // returns false mid-animation so the dismiss hook stops eating neighbor taps.
     <div class={`drawer-backdrop ${drawerClosing.value ? 'closing' : ''}`}>
-      <nav
-        ref={drawerRef}
-        class={`drawer ${drawerClosing.value ? 'closing' : ''}`}
-        onAnimationEnd={(e) => {
-          if (drawerClosing.value && e.target === e.currentTarget) {
-            drawerClosing.value = false;
-            drawerOpen.value = false;
-          }
+      <Overlay
+        open
+        onClose={closeDrawer}
+        anchor={drawerAnchor.value}
+        backdrop={false}
+        panelClass={`drawer ${drawerClosing.value ? 'closing' : ''}`}
+        panelRef={drawerRef}
+        panelProps={{
+          onAnimationEnd: (e) => {
+            if (drawerClosing.value && e.target === e.currentTarget) {
+              drawerClosing.value = false;
+              drawerOpen.value = false;
+            }
+          },
         }}
       >
         {/* Pinned app UIs first */}
@@ -175,7 +182,7 @@ export function Drawer() {
         >
           Settings
         </div>
-      </nav>
+      </Overlay>
     </div>
   );
 }

@@ -24,7 +24,7 @@ test.describe('Section-aware Save/Archive buttons', () => {
   async function waitForThreadInSection(
     page: Page,
     threadId: string,
-    sectionKey: 'saved' | 'archive' | 'review',
+    sectionKey: 'saved' | 'archive' | 'current',
   ): Promise<void> {
     await page.waitForFunction(
       ({ id, key }) => {
@@ -39,7 +39,7 @@ test.describe('Section-aware Save/Archive buttons', () => {
   async function isThreadInSection(
     page: Page,
     threadId: string,
-    sectionKey: 'saved' | 'archive' | 'review',
+    sectionKey: 'saved' | 'archive' | 'current',
   ): Promise<boolean> {
     return page.evaluate(({ id, key }) => {
       const titles = Array.from(document.querySelectorAll(`[data-flip-id="__section_${key}"]`));

@@ -12,6 +12,7 @@ import { autoResizeTextarea } from '../../utils/dom';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
+import { DelayedSpinner } from '../shared/DelayedSpinner';
 
 export function AppUiEditModal() {
   const form = activeInlineForm.value;
@@ -27,7 +28,7 @@ export function AppUiEditModal() {
     );
   }
   if (appsList.value.status !== 'loaded') {
-    return <div class="inline-form"><div class="loading-spinner" /></div>;
+    return <div class="inline-form"><DelayedSpinner /></div>;
   }
 
   const app = appsList.value.data.find((s) => s.id === appId);

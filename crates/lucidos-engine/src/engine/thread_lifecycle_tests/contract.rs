@@ -90,9 +90,8 @@ fn generate_cross_validation_fixture() -> String {
                                 attention,
                             );
                             let result_str = match result {
-                                DisplaySection::Active => "active",
-                                DisplaySection::Review => "review",
                                 DisplaySection::Saved => "saved",
+                                DisplaySection::Current => "current",
                                 DisplaySection::Archive => "archive",
                             };
                             cases.push(format!(
@@ -126,7 +125,7 @@ fn generate_typescript() -> String {
     out.push_str("export type ThreadType = 'chat' | 'claude_code';\n");
     out.push_str("export type ArchiveState = 'archived' | 'inbox';\n");
     out.push_str(
-        "export type DisplaySection = 'active' | 'saved' | 'review' | 'archive';\n",
+        "export type DisplaySection = 'saved' | 'current' | 'archive';\n",
     );
     out.push_str("export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'failed';\n");
     out.push_str("export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';\n");
@@ -186,11 +185,9 @@ fn generate_typescript() -> String {
     out.push_str("  hasAttentionDescendants: boolean,\n");
     out.push_str("): DisplaySection {\n");
     out.push_str("  if (isSaved) return 'saved';\n");
-    out.push_str("  if (hasAttentionDescendants) return 'review';\n");
-    out.push_str("  if (status === 'running' || hasActiveChildren) return 'active';\n");
-    out.push_str("  if (hasPendingChanges) return 'review';\n");
-    out.push_str("  if (stored === 'archived') return 'archive';\n");
-    out.push_str("  return 'review';\n");
+    out.push_str("  const demandsSurface = status === 'running' || hasActiveChildren || hasPendingChanges || hasAttentionDescendants;\n");
+    out.push_str("  if (stored === 'archived' && !demandsSurface) return 'archive';\n");
+    out.push_str("  return 'current';\n");
     out.push_str("}\n\n");
 
     // isCcOnlyEvent
@@ -210,10 +207,10 @@ fn generate_typescript() -> String {
     out.push_str("): Action[] {\n");
     out.push_str("  const actions: Action[] = [];\n");
     out.push_str("  const live = status === 'running' || status === 'waiting_for_user_answer';\n");
-    out.push_str("  const ccPending = hasPendingChanges && threadType === 'claude_code';\n");
+    out.push_str("  const codingAgentPending = hasPendingChanges && threadType === 'claude_code';\n");
     out.push_str("  if (hasUnsentDraft) actions.push('discard_draft');\n");
     out.push_str("  if (!live) {\n");
-    out.push_str("    if (ccPending) {\n");
+    out.push_str("    if (codingAgentPending) {\n");
     out.push_str("      actions.push('discard', 'apply');\n");
     out.push_str("    } else if (storedSection === 'inbox' && !descendantsBlockArchive) {\n");
     out.push_str("      actions.push('archive');\n");

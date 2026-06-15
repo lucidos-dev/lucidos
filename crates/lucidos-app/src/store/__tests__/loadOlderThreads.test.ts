@@ -2,19 +2,24 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../api/threads', () => ({
   fetchOlderThreads: vi.fn().mockResolvedValue({ threads: [], family_threads: [], has_more: false }),
+  fetchArchivedCount: vi.fn().mockResolvedValue(0),
 }));
 
-import { fetchOlderThreads } from '../../api/threads';
-import { loadOlderThreads, reloadAfterFilterChange, _clearFamilyExtensionIdsForTest } from '../actions/thread-loading';
-import { threadMap, threadHasMore, threadLoadingMore, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, ALL_CHANNELS } from '../store';
+import { fetchOlderThreads, fetchArchivedCount } from '../../api/threads';
+import { loadOlderThreads, reloadAfterFilterChange, refreshArchivedCount, _clearFamilyExtensionIdsForTest } from '../actions/thread-loading';
+import { threadMap, threadHasMore, threadLoadingMore, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, archiveThreadCount, ALL_CHANNELS } from '../store';
 import { makeOptimisticThreadState } from '../thread-events';
 import type { ThreadState } from '../thread-events';
 import type { ThreadSummary } from '../../api/threads';
 
 const fetchMock = vi.mocked(fetchOlderThreads);
+const countMock = vi.mocked(fetchArchivedCount);
 
 function loaded(thread: ThreadState, updatedAt: string): ThreadState {
   thread.meta.updatedAt = updatedAt;
+  // The pagination cursor sorts by last user action, so set it to the same
+  // recency this helper is simulating.
+  thread.meta.lastUserAction = updatedAt;
   return thread;
 }
 
@@ -22,6 +27,9 @@ describe('loadOlderThreads', () => {
   beforeEach(() => {
     fetchMock.mockClear();
     fetchMock.mockResolvedValue({ threads: [], family_threads: [], has_more: false });
+    countMock.mockClear();
+    countMock.mockResolvedValue(0);
+    archiveThreadCount.value = 0;
     threadMap.value = new Map();
     threadHasMore.value = true;
     threadLoadingMore.value = false;
@@ -69,7 +77,7 @@ describe('loadOlderThreads', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       '2026-01-01T00:00:00Z',
       15,
-      ['claude_code'],
+      ['coding-agent'],
       undefined,
       ['repo-a'],
       undefined,
@@ -226,7 +234,7 @@ describe('loadOlderThreads', () => {
     // "no more" from the previous (unfiltered) cursor space.
     expect(fetchMock).toHaveBeenCalledOnce();
     const [before, limit, sources, triggerIds, repoIds, appIds] = fetchMock.mock.calls[0];
-    expect(sources).toEqual(['claude_code']);
+    expect(sources).toEqual(['coding-agent']);
     expect(repoIds).toEqual(['45d9a172-a23e-484b-bf3b-d6a0f9a7983f']);
     expect(triggerIds).toBeUndefined();
     expect(appIds).toBeUndefined();
@@ -253,5 +261,58 @@ describe('loadOlderThreads', () => {
     expect(triggerIds).toEqual(['gone-1']);
     expect(typeof before).toBe('string');
     expect(before).not.toBe('2026-01-01T00:00:00Z');
+  });
+
+  // The Archive badge must "respect the filter": refreshArchivedCount fetches a
+  // server-side count scoped to the active channel/facet selection and stores it
+  // in archiveThreadCount (the badge reads this directly, so it's stable
+  // regardless of how many rows are loaded or whether the section is expanded).
+  it('refreshArchivedCount fetches the filter-scoped count and stores it', async () => {
+    threadChannelFilter.value = new Set(['claude_code']);
+    selectedRepoIds.value = new Set(['repo-x']);
+    countMock.mockResolvedValueOnce(518);
+
+    await refreshArchivedCount();
+
+    expect(countMock).toHaveBeenCalledOnce();
+    const [sources, triggerIds, repoIds, appIds] = countMock.mock.calls[0];
+    expect(sources).toEqual(['coding-agent']);
+    expect(repoIds).toEqual(['repo-x']);
+    expect(triggerIds).toBeUndefined();
+    expect(appIds).toBeUndefined();
+    expect(archiveThreadCount.value).toBe(518);
+  });
+
+  it('refreshArchivedCount counts the whole pile when no filter is active', async () => {
+    // All channels selected, no facet → undefined params → server counts all.
+    countMock.mockResolvedValueOnce(4761);
+
+    await refreshArchivedCount();
+
+    const [sources, triggerIds, repoIds, appIds] = countMock.mock.calls[0];
+    expect(sources).toBeUndefined();
+    expect(triggerIds).toBeUndefined();
+    expect(repoIds).toBeUndefined();
+    expect(appIds).toBeUndefined();
+    expect(archiveThreadCount.value).toBe(4761);
+  });
+
+  it('refreshArchivedCount keeps the previous count when the fetch fails (best-effort)', async () => {
+    archiveThreadCount.value = 4761;
+    countMock.mockRejectedValueOnce(new Error('network'));
+
+    await refreshArchivedCount();
+
+    expect(archiveThreadCount.value).toBe(4761);
+  });
+
+  it('refreshArchivedCount reports an empty archive when the channel filter is empty', async () => {
+    threadChannelFilter.value = new Set();
+    archiveThreadCount.value = 99;
+
+    await refreshArchivedCount();
+
+    expect(countMock).not.toHaveBeenCalled();
+    expect(archiveThreadCount.value).toBe(0);
   });
 });

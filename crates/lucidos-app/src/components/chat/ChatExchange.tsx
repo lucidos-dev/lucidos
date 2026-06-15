@@ -3,15 +3,16 @@ import { memo } from 'preact/compat';
 import { useMemo, useRef } from 'preact/hooks';
 import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
+import type { CodingAgent } from '../../api/types';
 import type { Exchange, ThreadEvent } from '../../store/thread-events';
-import { ENGINE_LABEL, LUCIDOS_AGENT_ICON, LUCIDOS_AGENT_LABEL, actorInitiator, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, isEmptyContinuedExchange, isCanceledQuestionDivider, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, responseAbortedSummary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, ENGINE_ICON, actorInitiator, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, responseAbortedSummary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { artifacts, appsList, openImagePopupFromGroup, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { preserveOnToggle } from './scrollState';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openApp } from '../../store/actions/apps';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
-import { PermissionBody } from './PermissionCard';
+import { CommandPermissionBody, PermissionBody } from './PermissionCard';
 import { ChildCompletionCard } from './ChildCompletionCard';
 import { getEventToggleState, getCollapsedVisibleEvents, splitEventSections } from '../../store/event-rendering';
 import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
@@ -19,7 +20,7 @@ import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
-import { ChangeBody, ContinueButton, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, UserMessageBody, changeAccent, changeActions, describeExecutor } from './chat-exchange-parts';
+import { ChangeBody, CheckpointCard, ContinueButton, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, UserMessageBody, changeAccent, changeActions, describeExecutor } from './chat-exchange-parts';
 
 // Stable refs so loadedOr fallback doesn't yield a fresh [] each render —
 // without these, every dependent useMemo invalidates on every render whenever
@@ -27,8 +28,31 @@ import { ChangeBody, ContinueButton, FileList, GeneratedImage, InitiatorPanel, I
 const NO_ARTIFACTS: string[] = [];
 const NO_APPS: App[] = [];
 
+/** The change_id this exchange pertains to, used to stamp `data-change-id` so
+ *  the Changes panel can deep-link a row to its originating turn. The aggregate
+ *  `ChangeProposed` rides this turn as a (non-rendered) step — read it from
+ *  there; lifecycle panels (ChangeApplied/Discarded/Reverted/Failed) carry the
+ *  id on the userEvent. Per-commit ChangeProposed emits carry an empty
+ *  change_id, so the truthiness check skips them. */
+function exchangeChangeId(exchange: Exchange, isChangePanel: boolean, threadIsCC: boolean): string | undefined {
+  if (isChangePanel) return (exchange.userEvent as { change_id?: string }).change_id;
+  // ChangeProposed only ever rides a coding-agent turn — skip the step scan on
+  // chat exchanges entirely.
+  if (!threadIsCC) return undefined;
+  for (const { event } of exchange.steps) {
+    if (event.type === 'ChangeProposed' && event.change_id) return event.change_id;
+  }
+  return undefined;
+}
+
 interface Props {
   exchange: Exchange;
+  /** `exchange.revision ?? 0` captured at render time by the parent. The
+   *  incremental grouping cache mutates Exchange objects in place, so
+   *  `prev.exchange` and `next.exchange` can be the SAME object — field
+   *  compares through it are self-comparisons. This primitive is the
+   *  mutation signal the memo can actually see. */
+  revision: number;
   streamingBuffer: string;
   isLast: boolean;
   threadId: string;
@@ -40,17 +64,26 @@ interface Props {
    *  later ContinuationStarted in the thread — the only one that shows the
    *  Continue button. */
   isUnresumedAbort?: boolean;
+  /** True when this is a chat follow-up the user typed while the agent was busy
+   *  — it's queued behind the active turn and not yet ingested. Computed in
+   *  `renderExchanges` (it needs thread-level busy state + the active-exchange
+   *  index); drives the "Queued ○" marker on the bubble. */
+  isQueued?: boolean;
   /** Lifted from `threadMap.value.get(threadId)?.meta.channel === 'claude_code'`
    *  in `renderExchanges` so this component does not subscribe to threadMap
    *  itself — see `chatExchangePropsEqual` below for the memo contract. */
   threadIsCC: boolean;
-  /** Lifted from `isThreadQuiescent(threadMap.value.get(threadId)?.meta.status)`. */
+  /** Specific coding-agent backend for labels/icons. The channel remains
+   *  `claude_code` for both Claude Code and Codex for backwards compatibility. */
+  threadCodingAgent: CodingAgent;
+  /** Lifted from `isRenderedThreadIdle(threadMap.value.get(threadId))` — quiescent
+   *  by raw status, but false while an optimistic resume is in flight. */
   threadIdle: boolean;
   /** Lifted from `cancelingThreadIds.value.has(threadId)`. */
   threadCanceling: boolean;
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, threadId, hasPriorActive, imageOffset = 0, priorModel, priorEffort, isUnresumedAbort, threadIsCC, threadIdle, threadCanceling }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, imageOffset = 0, priorModel, priorEffort, isUnresumedAbort, threadIsCC, threadCodingAgent, threadIdle, threadCanceling }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
@@ -254,13 +287,29 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, threadId, hasPrio
   const responseTerminated = isTerminated(status) || exchange.questionOvertaken === true;
 
   const initiator = useMemo(
-    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated),
-    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated],
+    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent),
+    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent],
   );
   const canCollapseInitiator = !!initiator.summary || !!initiator.details;
   const isInitiatorCollapsed = canCollapseInitiator
     && collapsedInitiators.value.has(`${threadId}:${exchange.userSeq}`);
   const isChangePanel = isChangeLifecycleEvent(exchange.userEvent);
+  const changeId = exchangeChangeId(exchange, isChangePanel, threadIsCC);
+  // Card-less treatment: a human chat message renders as a right-aligned
+  // accent-tinted bubble; change-lifecycle turns render flat. Both drop the
+  // actor chip (icon + "You"/name) — attribution moves to the clickable
+  // timestamp/summary. Predicate is event-type based, NOT label-based:
+  // user-driven control turns (cancel/restart/continue/auto-prompt/credential/
+  // consent) keep the chip slot but render it iconless with the action AS the
+  // label (see actionInitiator), and question/permission dividers keep their
+  // agent chip.
+  const isUserMessageBubble = exchange.userEvent.type === 'MessageReceived' && initiator.variant === 'user';
+  // A queued follow-up (typed while the agent was busy, not yet ingested) shows
+  // a "Queued ○" tag in its own bubble header — where dividers show "Answered
+  // ✓" — instead of a faux "Lucidos Agent — Queued" response panel below it.
+  // The message is the user's, and a stack of them should each read as waiting.
+  const isQueuedUserMessage = !!isQueued && isUserMessageBubble;
+  const isChromeless = isUserMessageBubble || isChangePanel;
   const isAbortPanel = exchange.userEvent.type === 'ResponseAborted';
   const isCancelPanel = exchange.userEvent.type === 'ResponseCanceled';
   const isCanceledDivider = isCanceledQuestionDivider(exchange);
@@ -268,7 +317,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, threadId, hasPrio
   // divider exchanges are terminal — they have no response, just the initiator
   // panel with optional actions (Diff/Revert on change panels, Continue on the
   // unresumed abort, the QuestionCard's own ✓ Cancel button on the divider).
-  const showResponsePanel = !isChangePanel && !isAbortPanel && !isCancelPanel && !isCanceledDivider && !isEmptyContinued && (hasResponse || hasEvents || showStatus);
+  // Exception: a change banner whose session KEPT WORKING after the apply
+  // (no new user message → the continuation folded into this exchange as steps)
+  // must render its body, or that work + its follow-up proposal are invisible
+  // between two "Change applied" rows (real thread 76b4ee76).
+  const isChangeContinuation = isChangePanel && changePanelHasContinuation(exchange);
+  const showResponsePanel = (!isChangePanel || isChangeContinuation) && !isAbortPanel && !isCancelPanel && !isCanceledDivider && !isEmptyContinued && !isQueuedUserMessage && (hasResponse || hasEvents || showStatus);
   let initiatorActions: ComponentChildren | undefined;
   if (isChangePanel) {
     initiatorActions = changeActions(
@@ -278,7 +332,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, threadId, hasPrio
   } else if (isAbortPanel && isUnresumedAbort) {
     initiatorActions = <ContinueButton threadId={threadId} />;
   }
-  const executor = describeExecutor(threadIsCC);
+  const executor = describeExecutor(threadIsCC, threadCodingAgent);
 
   function renderResponseEvents(eventsList: ResponseEvent[]) {
     return eventsList.map((evt, i) => {
@@ -287,19 +341,29 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, threadId, hasPrio
       }
       if (evt.type === 'step' && showSteps) return <InlineStep key={`s${i}`} event={evt} />;
       if (evt.type === 'image') return <GeneratedImage key={`img${i}`} event={evt} />;
+      if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${i}`} event={evt} />;
+      if (evt.type === 'empty') return <div key={`e${i}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
       return null;
     });
   }
 
   return (
-    <div class="chat-exchange" ref={rootRef} data-event-id={exchange.userEvent._eventId}>
+    <div class="chat-exchange" ref={rootRef} data-event-id={exchange.userEvent._eventId} data-change-id={changeId || undefined}>
       <InitiatorPanel
-        initiator={initiator}
+        initiator={isQueuedUserMessage
+          ? { ...initiator, status: (
+              <span class="exchange-status-label exchange-status-queued">
+                {'Queued'}<span class="exchange-status-queued">{'○'}</span>
+              </span>
+            ) }
+          : initiator}
         timestamp={formatMessageTimestamp(timestamp)}
         onActorClick={initiator.actorClickable === false
           ? undefined
           : (e) => openInfoPanel('origin', e)}
         actions={initiatorActions}
+        bubble={isUserMessageBubble}
+        chromeless={isChromeless}
         collapsible={canCollapseInitiator}
         collapsed={isInitiatorCollapsed}
         onToggle={canCollapseInitiator
@@ -318,7 +382,6 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, threadId, hasPrio
               {statusClass === 'queued' && <span class="exchange-status-queued">{'○'}</span>}
               {statusClass === 'working' && <span class="mini-spinner" aria-hidden="true" />}
               {statusClass === 'waiting' && <span class="progress-dot progress-dot-waiting" />}
-              {statusClass === 'awaiting' && <span class="exchange-status-awaiting">{'?'}</span>}
               {statusClass === 'done' && status !== 'interrupted' && <span class="exchange-status-check">{'✓'}</span>}
               {status === 'interrupted' && <span class="exchange-status-continued">{'↳'}</span>}
               {statusClass === 'canceled' && <span class="exchange-status-x">{'✕'}</span>}
@@ -378,17 +441,20 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, threadId, hasPrio
 
 /** Custom prop equality for the `memo`-wrapped `ChatExchange` below.
  *
- *  Default `memo` would shallow-compare props, but `exchange` is a fresh
- *  object every `computeExchanges` invocation, so the default would re-render
- *  every child on every SSE event. We compare the **content-relevant**
- *  fingerprint of an Exchange instead:
+ *  Default `memo` would shallow-compare props; a from-scratch
+ *  `computeExchanges` pass produces fresh Exchange objects, so the default
+ *  would re-render every child on every SSE event. We compare a
+ *  **content-relevant** fingerprint instead:
  *
+ *   - `revision` — the in-place mutation counter, captured as a primitive at
+ *     render time. The incremental grouping cache keeps Exchange objects
+ *     identity-stable and mutates them in place (steps push,
+ *     questionOvertaken flip), so when `prev.exchange === next.exchange`
+ *     every field compare below is a self-comparison and detects nothing —
+ *     the captured revision numbers are the only honest change signal.
  *   - `userSeq` — the exchange boundary; switching to a different exchange.
  *   - `steps.length` + last step's `seq` — a new event landed in this
- *     exchange. Events are append-only via `Map.set(seq, …)` with fresh
- *     sequence numbers (never mutated in place — see CLAUDE.md "Events are
- *     immutable, append-only"), so "same length + same last seq" reliably
- *     implies same content.
+ *     exchange (covers the fresh-objects case where identities differ).
  *   - `questionOvertaken` — divider exchange flips this when the agent
  *     ignored a question; renders differently.
  *
@@ -396,8 +462,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, threadId, hasPrio
  *  every field matches we return `true` to skip the re-render entirely.
  */
 function chatExchangePropsEqual(prev: Props, next: Props): boolean {
+  if (prev.revision !== next.revision) return false;
   if (prev.streamingBuffer !== next.streamingBuffer) return false;
   if (prev.isLast !== next.isLast) return false;
+  if (prev.isQueued !== next.isQueued) return false;
   if (prev.threadId !== next.threadId) return false;
   if (prev.hasPriorActive !== next.hasPriorActive) return false;
   if (prev.imageOffset !== next.imageOffset) return false;
@@ -405,6 +473,7 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.priorEffort !== next.priorEffort) return false;
   if (prev.isUnresumedAbort !== next.isUnresumedAbort) return false;
   if (prev.threadIsCC !== next.threadIsCC) return false;
+  if (prev.threadCodingAgent !== next.threadCodingAgent) return false;
   if (prev.threadIdle !== next.threadIdle) return false;
   if (prev.threadCanceling !== next.threadCanceling) return false;
   const a = prev.exchange;
@@ -445,9 +514,14 @@ type InitiatorVariant = 'user' | 'system' | 'trigger' | 'lucidos';
 
 export interface InitiatorDescriptor {
   variant: InitiatorVariant;
-  icon: string;
+  /** Icon glyph (emoji string) or a component (e.g. the Claude logo for a
+   *  question asked inside a coding-agent thread). */
+  icon: ComponentChildren;
   /** WHO performed this — always the initiator's display name. */
   label: string;
+  /** Optional resolution status shown in the header (question/permission
+   *  dividers: "Answered" / "Needs your answer" / "Canceled"). */
+  status?: ComponentChildren;
   /** WHAT was done — short action description shown as the panel's lead line.
    *  Omitted for user messages where the message itself is the content. */
   summary?: string;
@@ -472,7 +546,8 @@ function initiatorSummary(ev: Exchange['userEvent']): string {
       ? 'Continued the response'
       : 'Resumed after engine restart';
     case 'ResponseAborted':            return responseAbortedSummary(ev.actor, ev.cause);
-    case 'ResponseCanceled':           return RESPONSE_CANCELED_SUMMARY;
+    // ResponseCanceled carries its text as the header label (RESPONSE_CANCELED_SUMMARY),
+    // not as a summary line — see its describeInitiator arm.
     case 'MissingHardeningDetected': return 'Hardening required';
     case 'MergeConflictDetected':    return 'Merging changes from main';
     case 'CodingAgentPromptSent':    return 'Engine-injected prompt';
@@ -511,11 +586,34 @@ function youInitiator(rest: Partial<InitiatorDescriptor> = {}): InitiatorDescrip
   return { variant: 'user', icon: '\u{1F464}', label: 'You', ...rest };
 }
 
-/** Build a `'system'`-variant descriptor with the engine chip (⚙ + Lucidos
+/** Build a `'system'`-variant descriptor with the engine chip (⬡ + Lucidos
  *  Engine). Shared by every arm where the engine narrates its own action
  *  (hardening / merge-conflict detection, legacy bare CC prompt). */
 function engineInitiator(summary: string, details?: ComponentChildren): InitiatorDescriptor {
-  return { variant: 'system', icon: '⚙', label: ENGINE_LABEL, summary, details };
+  return { variant: 'system', icon: ENGINE_ICON, label: ENGINE_LABEL, summary, details };
+}
+
+/** Build a descriptor in the "Response canceled" style: no icon, the action
+ *  text AS the label, and no separate summary line. The label chip stays
+ *  clickable (it opens the origin popover, which discloses who/what — "You",
+ *  the device, "Lucidos credential request", …). Shared by every user-driven
+ *  control turn (Restart, Continue, auto-prompt, credential/consent) so they
+ *  read as clean boundaries, matching the ResponseCanceled turn. `details`
+ *  carries any richer body (resume note, injected prompt). */
+function actionInitiator(label: string, details?: ComponentChildren): InitiatorDescriptor {
+  return { variant: 'system', icon: null, label, details };
+}
+
+/** Resolution status for question / permission dividers — shown in the initiator
+ *  header. Reuses the response panel's `.exchange-status-*` classes so "Answered"
+ *  renders exactly like the response's "Done" (gray label + green ✓ after it),
+ *  "Canceled" like a canceled response (red ✕), and the pending prompt as a
+ *  plain "Needs your answer" call-to-action (no glyph — it isn't a terminal
+ *  state). */
+function dividerStatus(resolved: boolean, terminated: boolean, resolvedLabel: string): ComponentChildren {
+  if (resolved) return <span class="exchange-status-label exchange-status-done">{resolvedLabel}<span class="exchange-status-check">{'✓'}</span></span>;
+  if (terminated) return <span class="exchange-status-label exchange-status-canceled">{'Canceled'}<span class="exchange-status-x">{'✕'}</span></span>;
+  return <span class="exchange-status-label exchange-status-awaiting">{'Needs your answer'}</span>;
 }
 
 export function describeInitiator(
@@ -527,6 +625,11 @@ export function describeInitiator(
    *  arms to disable their buttons. Default `false` so the many existing unit
    *  tests covering unrelated user events don't need to thread it through. */
   responseTerminated: boolean = false,
+  /** Whether this is a coding-agent thread — picks the asking agent's chip
+   *  (specific coding agent vs Lucidos Agent) for question/permission
+   *  dividers. */
+  threadIsCC: boolean = false,
+  threadCodingAgent: CodingAgent = 'claude-code',
 ): InitiatorDescriptor {
   const ev = exchange.userEvent;
   const summary = initiatorSummary(ev);
@@ -541,7 +644,12 @@ export function describeInitiator(
       };
     case 'ContinuationStarted':
       // ContinuationStarted carries an actor (device when triggered by Continue,
-      // engine if auto-resume returns). Drive the chip from that actor.
+      // engine if auto-resume returns). A device-driven continue is a user
+      // action → render it in the iconless ResponseCanceled style (action AS the
+      // label); engine auto-resume keeps the ⬡ chip.
+      if (ev.actor?.kind === 'device') {
+        return actionInitiator(summary, <ResumeNoteBody exchange={exchange} />);
+      }
       return {
         variant: actorVariant(ev.actor),
         ...actorInitiator(ev.actor),
@@ -550,21 +658,24 @@ export function describeInitiator(
       };
     case 'ResponseAborted':
       // Exchange boundary — let the actor drive the chip (engine for crashes,
-      // device for restarts and user-triggered stale-settle cleanups).
+      // device for restarts and user-triggered stale-settle cleanups). A
+      // device-driven abort (you hit Restart) renders iconless like a cancel;
+      // engine/system aborts keep their ⬡/⚙ chip.
+      if (ev.actor?.kind === 'device') {
+        return actionInitiator(summary);
+      }
       return {
         variant: actorVariant(ev.actor),
         ...actorInitiator(ev.actor),
         summary,
       };
     case 'ResponseCanceled':
-      // ResponseCanceled is an exchange boundary. Cancellation is user-driven
-      // on a real in-flight response by definition (CancelCause doc), so
-      // default to a 'You' chip when actor is absent — the chat-thread cancel
-      // path doesn't yet plumb the actor through. When actor is present (CC
-      // cancel paths), let it drive the chip.
-      return ev.actor
-        ? { variant: actorVariant(ev.actor), ...actorInitiator(ev.actor), summary }
-        : youInitiator({ summary });
+      // ResponseCanceled is an exchange boundary, always user-driven by
+      // definition (CancelCause doc). It is the archetype for the iconless
+      // boundary style (see actionInitiator): "Response canceled" IS the header
+      // label, and clicking it opens the Initiator info popover (which discloses
+      // "You", the device, and the cancel cause).
+      return actionInitiator(RESPONSE_CANCELED_SUMMARY);
     case 'MissingHardeningDetected':
       return engineInitiator(summary);
     case 'MergeConflictDetected':
@@ -597,7 +708,12 @@ export function describeInitiator(
         details: <ChangeBody changeId={ev.change_id} error={ev.error} />,
       };
     case 'UserPromptInjected':
-      // Legacy rows lack `origin` and fall back to the engine label.
+      // Legacy rows lack `origin` and fall back to the engine label. A
+      // device-origin injection (you re-prompted) renders iconless like a
+      // cancel, keeping the injected prompt as the body.
+      if (ev.origin?.kind === 'device') {
+        return actionInitiator(summary, <MarkdownBlock html={userMessageHtml} />);
+      }
       return {
         variant: actorVariant(ev.origin),
         ...actorInitiator(ev.origin),
@@ -614,10 +730,16 @@ export function describeInitiator(
       return youInitiator({ details });
     }
     case 'ChildThreadCompleted':
+      // The EventBus fan-in path raises this on the parent when a child thread
+      // reaches a terminal event — deterministic engine plumbing, not LLM work
+      // — so attribute it to the engine (⬡ Lucidos Engine), consistent with
+      // every other engine-injected event (trigger fired, hardening, merge).
+      // The child agent's authored summary lives in the card body; the chip is
+      // non-clickable because the title-link is the origin affordance.
       return {
-        variant: 'lucidos',
-        icon: LUCIDOS_AGENT_ICON,
-        label: LUCIDOS_AGENT_LABEL,
+        variant: 'system',
+        icon: ENGINE_ICON,
+        label: ENGINE_LABEL,
         actorClickable: false,
         details: (
           <ChildCompletionCard
@@ -629,11 +751,21 @@ export function describeInitiator(
         ),
       };
     case 'UserQuestionAsked': {
-      // Resolution lives on this exchange's steps as UserQuestionAnswered;
-      // matched by tool_use_id so a stale Answered from a different question
-      // can't bleed in.
+      // The agent ASKS the question; attribute the divider to it (Lucidos Agent
+      // or Claude Code), with a resolution status in the header. Resolution
+      // lives on this exchange's steps as UserQuestionAnswered; matched by
+      // tool_use_id so a stale Answered from a different question can't bleed in.
       const answered = findQuestionAnswer(exchange, ev.tool_use_id);
-      return youInitiator({
+      // A canceled question resolves via a UserQuestionAnswered{kind:'Canceled'},
+      // which findQuestionAnswer still returns — so exclude it from "Answered"
+      // and route it to the "Canceled" status instead.
+      const canceled = isCanceledQuestionDivider(exchange);
+      const agent = describeExecutor(threadIsCC, threadCodingAgent);
+      return {
+        variant: 'lucidos',
+        icon: agent.icon,
+        label: agent.label,
+        status: dividerStatus(!!answered && !canceled, responseTerminated || canceled, 'Answered'),
         details: (
           <QuestionBody
             threadId={threadId}
@@ -645,7 +777,7 @@ export function describeInitiator(
             terminated={responseTerminated}
           />
         ),
-      });
+      };
     }
     case 'CodingAgentPermissionRequest': {
       const resolvedStep = findPermissionResolution(exchange, ev.request_id);
@@ -656,7 +788,12 @@ export function describeInitiator(
             persist_scope: resolvedStep.persist_scope,
           }
         : undefined;
-      return youInitiator({
+      const agent = describeExecutor(true, threadCodingAgent);
+      return {
+        variant: 'lucidos',
+        icon: agent.icon,
+        label: agent.label,
+        status: dividerStatus(!!resolvedStep, responseTerminated, 'Resolved'),
         details: (
           <PermissionBody
             event={{
@@ -670,13 +807,45 @@ export function describeInitiator(
             terminated={responseTerminated}
           />
         ),
-      });
+      };
+    }
+    case 'CommandPermissionRequested': {
+      const resolvedStep = findCommandPermissionResolution(exchange, ev.request_id);
+      const resolved = resolvedStep
+        ? {
+            allowed: resolvedStep.allowed,
+            reason: resolvedStep.reason,
+            persist_scope: resolvedStep.persist_scope,
+          }
+        : undefined;
+      // The command guard only fires on chat threads → the Lucidos Agent.
+      const agent = describeExecutor(false);
+      return {
+        variant: 'lucidos',
+        icon: agent.icon,
+        label: agent.label,
+        status: dividerStatus(!!resolvedStep, responseTerminated, 'Resolved'),
+        details: (
+          <CommandPermissionBody
+            event={{
+              request_id: ev.request_id,
+              tool_use_id: ev.tool_use_id,
+              tool_name: ev.tool_name,
+              command: ev.command,
+              summary: ev.summary,
+            }}
+            resolved={resolved}
+            terminated={responseTerminated}
+          />
+        ),
+      };
     }
     case 'CredentialRequested':
     case 'McpConsentRequested':
-      // Minimal divider rendering — chip + summary line. No body component
-      // today; the engine surfaces these via separate transient flows.
-      return youInitiator({ summary });
+      // Iconless action label (ResponseCanceled style); the asker — "Lucidos
+      // credential request" — is disclosed in the timestamp popover. No body
+      // component today; the engine surfaces these via separate transient flows.
+      return actionInitiator(summary);
     default:
       // Unreachable in production (groupIntoExchanges only assigns starter
       // types to userEvent), but `userEvent: StoredEvent` covers every event

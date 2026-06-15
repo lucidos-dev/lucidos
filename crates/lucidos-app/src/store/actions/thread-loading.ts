@@ -1,10 +1,11 @@
-import { threadMap, focusedThreadId, setFocusedThread, showToast, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, ALL_CHANNELS, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, filterFacets, ccSessionVersion, engineRestarting, archivingThreadIds } from '../store';
+import { threadMap, focusedThreadId, setFocusedThread, showToast, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
+import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, recencyKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { applyDraftBatch, setDraft, clearDraft, type ComposeDraft } from '../composeDrafts';
-import { fetchThreads, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets } from '../../api/threads';
+import { fetchThreads, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets, fetchArchivedCount } from '../../api/threads';
 import type { ThreadSummary, ThreadEventRow } from '../../api/threads';
+import { isTransportError } from '../../api/client';
 import { toFailed } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
@@ -39,6 +40,10 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       saved,
       createdAt: info.created_at || new Date().toISOString(),
       updatedAt: info.last_activity || info.created_at || new Date().toISOString(),
+      // Absent (legacy/test mocks) → fall back to last_activity, matching
+      // recencyKey's fallback so the sort key + pagination cursor stay coherent.
+      lastUserAction: info.last_user_action || info.last_activity || info.created_at || new Date().toISOString(),
+      lastAgentAction: info.last_agent_action || info.last_activity || info.created_at || new Date().toISOString(),
       status: (info.status as ThreadStatus) || 'idle',
       messageCount: info.message_count || 0,
       section: (info.section as ThreadMeta['section']) || 'archived',
@@ -60,6 +65,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       repoName: info.cc_repo_name || undefined,
       codingAgentKind: info.coding_agent_kind || undefined,
       codingAgentFolder: info.coding_agent_folder || undefined,
+      codingAgent: info.coding_agent || undefined,
       state: info.state,
       latestTodoList: null,
     },
@@ -122,6 +128,11 @@ export function upsertThread(
     // YYYY-MM-DDTHH:MM:SS.fffZ with the same timezone suffix. A string `>`
     // is the cheapest valid "newer than" test; no Date parse needed.
     if (apiTime && apiTime > existing.meta.updatedAt) existing.meta.updatedAt = apiTime;
+    // Advance the attributed-recency fields monotonically too (same stale-GET
+    // guard as updatedAt): a slow GET must never regress the drawer sort key.
+    // Set outright if unset (optional field), else only move forward.
+    if (info.last_user_action && (!existing.meta.lastUserAction || info.last_user_action > existing.meta.lastUserAction)) existing.meta.lastUserAction = info.last_user_action;
+    if (info.last_agent_action && (!existing.meta.lastAgentAction || info.last_agent_action > existing.meta.lastAgentAction)) existing.meta.lastAgentAction = info.last_agent_action;
     if (info.channel) existing.meta.channel = info.channel as ThreadMeta['channel'];
     if (info.initiator) existing.meta.initiator = info.initiator;
     // Update status from API — the backend is authoritative.
@@ -139,7 +150,7 @@ export function upsertThread(
     existing.meta.totalChildrenCount = info.total_children_count || 0;
     existing.meta.blockingDescendantCount = info.blocking_descendant_count || 0;
     existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
-    // Update CC state fields from API
+    // Update coding-agent state fields from API
     existing.meta.codingAgentHasDiff = info.coding_agent_has_diff || false;
     existing.meta.codingAgentRequiresRestart = info.coding_agent_requires_restart || false;
     existing.meta.codingAgentIsExternalRepo = info.coding_agent_is_external_repo || false;
@@ -153,6 +164,7 @@ export function upsertThread(
     if (info.cc_repo_name) existing.meta.repoName = info.cc_repo_name;
     if (info.coding_agent_kind) existing.meta.codingAgentKind = info.coding_agent_kind;
     if (info.coding_agent_folder) existing.meta.codingAgentFolder = info.coding_agent_folder;
+    if (info.coding_agent) existing.meta.codingAgent = info.coding_agent;
     // Refresh compose state from API. Without this, an SSE skeleton stuck at
     // state='composing' (because MessageReceived was dropped) stays invisible
     // forever — categorizeThreads skips composing rows, so the thread never
@@ -287,6 +299,17 @@ async function loadAllThreadsInner(): Promise<void> {
   applyDraftBatch(draftBatch);
   threadMap.value = new Map(map);
   threadsLoaded.value = true;
+  // Collapsed Archive badge total. The inline `archive_count` is the UNFILTERED
+  // pile size — correct for the common no-filter drawer and instant (no extra
+  // round-trip). When a drawer filter is active (it persists across reloads via
+  // localStorage), that global total is wrong, so re-fetch the filter-scoped
+  // count. `?? 0` degrades gracefully when an older engine / test mock omits it.
+  const { sources, triggerIds, repoIds, appIds } = currentThreadFilterParams();
+  if (sources || triggerIds || repoIds || appIds) {
+    void refreshArchivedCount();
+  } else {
+    archiveThreadCount.value = response.archive_count ?? 0;
+  }
 
   // Refresh the complete filter-facet set (fire-and-forget) so the drawer
   // "Show" dropdown reflects newly-created / archived threads. Best-effort:
@@ -295,7 +318,7 @@ async function loadAllThreadsInner(): Promise<void> {
 
   // Load events for focused, active, and saved threads; others load lazily
   // on focus. Saved threads are always few and need events for correct
-  // drawer status (e.g. waiting CC threads after engine restart).
+  // drawer status (e.g. waiting coding-agent threads after engine restart).
   const loads: Promise<void>[] = [];
   if (focused && focused !== ghostFocusedThread) loads.push(loadThreadEvents(focused));
   for (const t of map.values()) {
@@ -305,11 +328,11 @@ async function loadAllThreadsInner(): Promise<void> {
   }
   if (loads.length > 0) await Promise.all(loads);
 
-  // Bump so CCControlMenu re-fetches commands after reload (SSE doesn't replay).
+  // Bump so CodingAgentControlMenu re-fetches commands after reload (SSE doesn't replay).
   if (focused) {
     const focusedThread = map.get(focused);
-    if (focusedThread?.meta.channel === 'claude_code') {
-      ccSessionVersion.value++;
+    if (focusedThread?.meta.channel === CODING_AGENT_CHANNEL) {
+      codingAgentSessionVersion.value++;
     }
   }
 }
@@ -447,14 +470,15 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
 
 /** Fetch only new events since the thread's last DB-loaded sequence and append them.
  *
- *  Retries once on DOMException (TimeoutError or AbortError). The
- *  runResumeSync / resyncLoadedThreads paths fan this out across every loaded
- *  thread on SSE reconnect or iOS PWA wake; iOS Safari frequently cancels
- *  in-flight fetches mid-flight (suspend/resume, lifecycle, network change),
- *  surfacing as transient AbortErrors that succeed on retry. Without the
- *  retry the user gets one toast per cancelled thread — dozens at once in a
- *  single wake cycle. Mirrors the retry-on-TimeoutError pattern in
- *  refreshChangesState. */
+ *  Retries once on transient wake failures — DOMException (TimeoutError or
+ *  AbortError) AND transport errors (TypeError "Load failed"/"Failed to fetch").
+ *  The runResumeSync / resyncLoadedThreads paths fan this out across every
+ *  loaded thread on SSE reconnect, iOS PWA wake, or right after an engine
+ *  restart. iOS Safari cancels in-flight fetches mid-flight (suspend/resume,
+ *  lifecycle, network change) and fails the first request on a stale HTTP/2
+ *  connection — both succeed on retry. Without the retry the user gets one
+ *  toast per affected thread — dozens at once in a single wake cycle. Mirrors
+ *  the retry-on-TimeoutError pattern in refreshChangesState. */
 export async function refreshThreadEvents(threadId: string): Promise<void> {
   if (engineRestarting.value) return;
   const map = threadMap.value;
@@ -464,7 +488,7 @@ export async function refreshThreadEvents(threadId: string): Promise<void> {
   try {
     const snapshot = await fetchThreadEvents(threadId, thread.lastDbSeq || undefined)
       .catch(err => {
-        if (!(err instanceof DOMException)) throw err;
+        if (!(err instanceof DOMException) && !isTransportError(err)) throw err;
         return fetchThreadEvents(threadId, thread.lastDbSeq || undefined);
       });
     // Always apply currentAggregate even when no new events arrived — the
@@ -475,19 +499,20 @@ export async function refreshThreadEvents(threadId: string): Promise<void> {
     }
   } catch (err) {
     if (engineRestarting.value) return;
-    // Telemetry carve-out (.claude/rules/frontend.md): on iOS PWA wake the
-    // engine is reachable and SSE will deliver any events we miss, but
-    // WebKit aborts every in-flight fetch on the suspend/resume boundary —
-    // sometimes both the original AND the retry. The user did NOT initiate
-    // this refresh (resyncLoadedThreads / runResumeSync did, behind their
-    // back); a toast per aborted thread shows up to a dozen at once on wake
-    // and the user can't do anything with the information. Self-recovery:
-    // the next SSE event (constant on any active thread) re-syncs via
-    // handleThreadEvent, or the next resync cycle (engine wake-up, SSE
-    // reconnect) refreshes successfully now that WebKit has settled.
-    // Genuine errors (5xx, parse, network unreachable) still toast.
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      console.warn(`[ThreadLoading] refresh aborted for ${threadId} (iOS PWA wake or visibility change); SSE will recover`);
+    // Telemetry carve-out (.claude/rules/frontend.md): this refresh is
+    // background (resyncLoadedThreads / runResumeSync on wake, SSE reconnect,
+    // or right after an engine restart), never user-initiated. On the iOS
+    // suspend/resume boundary WebKit aborts the in-flight fetch (AbortError)
+    // and the freshly-resumed page's stale HTTP/2 connection fails the request
+    // at the transport layer (TypeError "Load failed") — sometimes both the
+    // original AND the retry. The engine is reachable and SSE delivers any
+    // events we miss, so a toast per affected thread is a dozen unactionable
+    // errors at once. Self-recovery: the next SSE event (constant on any active
+    // thread) re-syncs via handleThreadEvent, or the next resync cycle (engine
+    // wake-up, SSE reconnect) refreshes successfully once the connection has
+    // settled. Genuine errors (5xx, parse, TimeoutError) still toast.
+    if ((err instanceof DOMException && err.name === 'AbortError') || isTransportError(err)) {
+      console.warn(`[ThreadLoading] refresh failed transiently for ${threadId} (iOS PWA wake / engine restart); SSE will recover`, err);
       return;
     }
     console.warn(`[ThreadLoading] Failed to refresh events for ${threadId}:`, err);
@@ -500,10 +525,10 @@ export async function refreshThreadEvents(threadId: string): Promise<void> {
  *  newly-applied filter.
  *
  *  The drawer's IntersectionObserver sentinel cannot be relied on to populate a
- *  freshly-filtered view: it is suppressed while the Archive section is collapsed
- *  (`shouldLoadOlderOnIntersection`) and only re-observes when `threadHasMore`
- *  flips, so selecting a facet whose matches are all archived/old would strand
- *  the user on "No threads" until they manually scrolled. The drawer calls this
+ *  freshly-filtered view: its fill loop is suppressed while the Archive section
+ *  is collapsed (`archivePaginationAllowed`) and only re-fires on a scroll
+ *  transition, so selecting a facet whose matches are all archived/old would
+ *  strand the user on "No threads" until they manually scrolled. The drawer calls this
  *  whenever the channel / trigger / repo / app selection changes so that
  *  "select a facet → see its threads" is deterministic. `loadOlderThreads`
  *  self-guards against concurrent calls and falls back to a now()-cursor when
@@ -512,7 +537,59 @@ export async function reloadAfterFilterChange(): Promise<void> {
   // Different filter = different cursor space; clear any stale "no more" from
   // the previous selection before fetching, or loadOlderThreads early-returns.
   threadHasMore.value = true;
+  // Re-fetch the filter-scoped Archive badge total so it reflects the new
+  // selection immediately (stable, server-sourced — not the loaded count).
+  void refreshArchivedCount();
   await loadOlderThreads();
+}
+
+/** Channel/facet filter params for the older-threads + archived-count APIs,
+ *  read from the live drawer-filter signals. `sources` is undefined when every
+ *  channel is selected (no narrowing); each facet array is undefined when its
+ *  selection is empty. Shared by `loadOlderThreads` (pagination cursor space)
+ *  and `refreshArchivedCount` (badge total) so both target the identical set. */
+export function currentThreadFilterParams(): {
+  sources: ThreadFilterSource[] | undefined;
+  triggerIds: string[] | undefined;
+  repoIds: string[] | undefined;
+  appIds: string[] | undefined;
+} {
+  const filter = threadChannelFilter.value;
+  const isFiltered = filter.size < ALL_CHANNELS.length;
+  const triggerIdSet = selectedTriggerIds.value;
+  const repoIdSet = selectedRepoIds.value;
+  const appIdSet = selectedAppIds.value;
+  return {
+    sources: isFiltered ? [...filter].map(threadChannelToFilterSource) : undefined,
+    triggerIds: triggerIdSet.size > 0 ? [...triggerIdSet] : undefined,
+    repoIds: repoIdSet.size > 0 ? [...repoIdSet] : undefined,
+    appIds: appIdSet.size > 0 ? [...appIdSet] : undefined,
+  };
+}
+
+/** Refresh `archiveThreadCount` — the collapsed Archive badge total — so it
+ *  reflects the ACTIVE drawer filter and stays stable regardless of how many
+ *  rows are paginated in (the badge reads this signal directly; it must NOT
+ *  change as the user scrolls or collapses/expands the section). Fetches the
+ *  true server-side count of archived (unsaved) threads matching the current
+ *  channel/trigger/repo/app selection.
+ *
+ *  Best-effort: on failure the badge keeps its previous value and the next
+ *  filter change / reload re-fetches. It's an informational count, not a
+ *  blocking fetch — the rows themselves still load via pagination — so a
+ *  transient miss must not pop a toast (per the frontend telemetry carve-out). */
+export async function refreshArchivedCount(): Promise<void> {
+  // Empty channel filter = nothing shown by intent → the archive is empty.
+  if (threadChannelFilter.value.size === 0) {
+    archiveThreadCount.value = 0;
+    return;
+  }
+  const { sources, triggerIds, repoIds, appIds } = currentThreadFilterParams();
+  try {
+    archiveThreadCount.value = await fetchArchivedCount(sources, triggerIds, repoIds, appIds);
+  } catch (err) {
+    console.warn('[threads] archived-count refresh failed:', errorDetail(err));
+  }
 }
 
 /** Load older threads for infinite scroll. Self-guards against concurrent calls.
@@ -530,14 +607,10 @@ export async function loadOlderThreads(): Promise<void> {
   try {
     const map = threadMap.value;
     const filter = threadChannelFilter.value;
-    const isFiltered = filter.size < ALL_CHANNELS.length;
-    const sources = isFiltered ? [...filter] : undefined;
+    const { sources, triggerIds, repoIds, appIds } = currentThreadFilterParams();
     const triggerIdSet = selectedTriggerIds.value;
-    const triggerIds = triggerIdSet.size > 0 ? [...triggerIdSet] : undefined;
     const repoIdSet = selectedRepoIds.value;
-    const repoIds = repoIdSet.size > 0 ? [...repoIdSet] : undefined;
     const appIdSet = selectedAppIds.value;
-    const appIds = appIdSet.size > 0 ? [...appIdSet] : undefined;
 
     let oldestTime: string | null = null;
     for (const t of map.values()) {
@@ -551,14 +624,21 @@ export async function loadOlderThreads(): Promise<void> {
       // thread that actually matches the active filter (channel + trigger +
       // repo/app union) — never drifts from what's shown.
       if (!threadPassesChannelFilter(t, filter, triggerIdSet, repoIdSet, appIdSet)) continue;
-      if (!oldestTime || t.meta.updatedAt < oldestTime) oldestTime = t.meta.updatedAt;
+      // Cursor on last_user_action — the column the backend `get_older_threads`
+      // pages by — so the cursor axis matches the sort axis (else pagination
+      // skips or repeats rows).
+      const key = recencyKey(t);
+      if (!oldestTime || key < oldestTime) oldestTime = key;
     }
 
     // Empty filter result on loaded threads — fall back to now() so the server
     // can find matches in history. Without this, a freshly-applied filter
     // permanently halts with "no more" even though matches exist on disk.
     if (!oldestTime) {
-      if (!isFiltered && !triggerIds && !repoIds && !appIds) {
+      // No channel narrowing (sources undefined ⇔ all channels) and no facet
+      // selection → genuinely nothing left to page. With a filter, fall through
+      // to the now()-cursor so the server can find matches deeper in history.
+      if (!sources && !triggerIds && !repoIds && !appIds) {
         threadHasMore.value = false;
         return;
       }

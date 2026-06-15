@@ -1,40 +1,51 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { ComponentChildren, VNode } from 'preact';
 
 vi.mock('../../store/actions/threads', () => ({
   focusThreadOrBootstrap: vi.fn(),
 }));
 
-import { ThreadLinkButton } from './ChangesView';
+import { openChangeThread } from './ChangesView';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
+import type { Change } from '../../api/client';
 
-interface AnyVNode extends VNode<{ children?: ComponentChildren; class?: string; [k: string]: unknown }> {}
-
-function vnodeText(n: ComponentChildren): string {
-  if (n === null || n === undefined || typeof n === 'boolean') return '';
-  if (typeof n === 'string' || typeof n === 'number') return String(n);
-  if (Array.isArray(n)) return n.map(vnodeText).join('');
-  return vnodeText((n as AnyVNode).props.children);
+function makeChange(over: Partial<Change> = {}): Change {
+  return {
+    id: 'change-1',
+    request_id: '00000000-0000-0000-0000-000000000000',
+    thread_id: 'thread-uuid-1',
+    thread_title: null,
+    branch_name: 'b',
+    repo_root: '/r',
+    description: 'desc',
+    file_count: 1,
+    files: ['a.rs'],
+    requires_restart: false,
+    hardened: true,
+    status: 'pending',
+    created_at: '2026-01-01T00:00:00Z',
+    resolved_at: null,
+    pre_merge_sha: null,
+    post_merge_sha: null,
+    commits: [],
+    incomplete: false,
+    ...over,
+  };
 }
 
-describe('ThreadLinkButton', () => {
+describe('openChangeThread', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('renders an action-btn labeled "Thread"', () => {
-    const node = ThreadLinkButton({ threadId: 'thread-uuid-1' }) as AnyVNode;
-    expect(node.type).toBe('button');
-    expect(node.props.class).toBe('action-btn');
-    expect(vnodeText(node)).toBe('Thread');
+  it('routes through focusThreadOrBootstrap, deep-linking to the change\'s own diff event', () => {
+    // targetChangeId (the change row's id), NOT the bottom of the thread — the
+    // change isn't necessarily the thread's last turn.
+    openChangeThread(makeChange({ thread_id: 'thread-uuid-1', id: 'change-7' }));
+    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('thread-uuid-1', { targetChangeId: 'change-7' });
   });
 
-  it('click routes through focusThreadOrBootstrap with the change\'s thread id', () => {
-    const node = ThreadLinkButton({ threadId: 'thread-uuid-1' }) as AnyVNode;
-    const onClick = node.props.onClick as (e: { stopPropagation: () => void }) => void;
-    const stopPropagation = vi.fn();
-    onClick({ stopPropagation });
-    expect(stopPropagation).toHaveBeenCalledTimes(1);
-    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('thread-uuid-1');
+  it('is a no-op when the change has no originating thread', () => {
+    openChangeThread(makeChange({ thread_id: null }));
+    expect(focusThreadOrBootstrap).not.toHaveBeenCalled();
   });
 });

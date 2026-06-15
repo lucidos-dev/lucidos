@@ -111,6 +111,7 @@ impl LucidosEngine {
                 // Phase 4: Mark the orphaned session as idle (turn boundary)
                 // rather than terminating it. The thread stays alive — the user
                 // can still send a follow-up that re-spawns CC via --resume.
+                let coding_agent = self.thread_coding_agent(thread_id).await;
                 self.event_bus
                     .emit_or_log(
                         crate::engine::event_bus::BusEvent::Thread {
@@ -120,7 +121,7 @@ impl LucidosEngine {
                                 is_external_repo: false,
                                 requires_restart: false,
                                 cc_session_id: None,
-                                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                                coding_agent,
                                 reason: None,
                                 worktree_path: None,
                                 worktree_head_sha: None,
@@ -257,6 +258,7 @@ impl LucidosEngine {
         // mark the orphaned turn as ended without terminating the thread —
         // ChangeProposed/ChangeDiscarded events emitted earlier already drive
         // the panel state for change-bearing branches.
+        let coding_agent = self.thread_coding_agent(thread_id).await;
         self.event_bus
             .emit_or_log(
                 crate::engine::event_bus::BusEvent::Thread {
@@ -266,7 +268,7 @@ impl LucidosEngine {
                         is_external_repo: false,
                         requires_restart: false,
                         cc_session_id: None,
-                        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                        coding_agent,
                         reason: None,
                         // Worktree was removed above (`worktree remove --force`)
                         // before this idle fires. Recording the now-deleted path
@@ -609,7 +611,9 @@ impl LucidosEngine {
         // "continue?" affordance instead of treating the idle as natural.
         let end_stuck_session = |engine: &Arc<Self>, thread_id: Uuid| {
             let bus = engine.event_bus.clone();
+            let engine = engine.clone();
             async move {
+                let coding_agent = engine.thread_coding_agent(thread_id).await;
                 bus.emit_or_log(
                     crate::engine::event_bus::BusEvent::Thread {
                         thread_id,
@@ -618,7 +622,7 @@ impl LucidosEngine {
                             is_external_repo: false,
                             requires_restart: false,
                             cc_session_id: None,
-                            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                            coding_agent,
                             reason: Some(ENGINE_RESTART_INTERRUPT_REASON.to_string()),
                             // No worktree to record — this path fires when
                             // recovery cannot locate the worktree at all
@@ -931,6 +935,7 @@ impl LucidosEngine {
                 .await;
             }
 
+            let coding_agent = self.thread_coding_agent(thread_id).await;
             self.event_bus
                 .emit_or_log(
                     crate::engine::event_bus::BusEvent::Thread {
@@ -940,7 +945,7 @@ impl LucidosEngine {
                             is_external_repo,
                             requires_restart,
                             cc_session_id,
-                            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                            coding_agent,
                             reason: Some(ENGINE_RESTART_INTERRUPT_REASON.to_string()),
                             worktree_path: Some(wt_path.to_string_lossy().into_owned()),
                             // Snapshot the worktree's HEAD so the next spawn

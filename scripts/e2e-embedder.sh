@@ -7,9 +7,8 @@
 # Compiles lucidos-engine with `--features real-embedder-tests` and runs only
 # the tests gated behind that feature. They exercise properties of the real
 # fastembed model (MultilingualE5Small): single + batch embedding, semantic
-# similarity, Norwegian synonyms, cross-language thread search, knowhow
-# discovery ranking. They download ~465 MB from huggingface.co on first run
-# and are cached after.
+# similarity, Norwegian synonyms, cross-language thread search. They download
+# ~465 MB from huggingface.co on first run and are cached after.
 #
 # These tests do NOT need a running Lucidos workspace — they construct an
 # embedder in-process.
@@ -29,9 +28,6 @@ GATED_TESTS=(
     test_similar_texts_have_similar_embeddings
     test_norwegian_synonyms_have_high_similarity
     test_bil_verksted_query_matches_norwegian_vehicle_service_thread
-    discover_semantic_match
-    discover_ranks_related_above_unrelated
-    discover_ranks_by_relevance
 )
 
 # Drift check: any test annotated with both `#[cfg(feature =
@@ -60,8 +56,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Pin the fastembed model cache to a stable, machine-persistent location so the
+# ~465 MB seed survives `cargo clean`, worktree churn, and is shared across every
+# worktree + the nightly main checkout — instead of fastembed's default
+# `.fastembed_cache` relative to cwd, which each worktree re-downloads. A warm
+# cache makes hf-hub's `ApiRepo::get` short-circuit before any network call, so
+# seeded runs are fully offline and deterministic. fastembed reads this var via
+# `get_cache_dir()`. (If the cache is cold AND huggingface.co is unreachable, the
+# tests skip rather than fail — see `shared_embedder()` in lucidos-engine.)
+export FASTEMBED_CACHE_DIR="${FASTEMBED_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/lucidos/fastembed}"
+mkdir -p "$FASTEMBED_CACHE_DIR"
+echo "Using fastembed model cache: $FASTEMBED_CACHE_DIR"
+
 echo "Running real-embedder tests (downloads ~465 MB on first run)..."
 # Test names go after `--` so libtest receives them as substring filters.
 # `cargo test` itself only accepts one positional [TESTNAME] before --.
+# `--nocapture` surfaces the SKIP line `shared_embedder()` prints when the model
+# can't be fetched, so an HF outage reads as an explicit skip rather than a
+# silent pass.
 cargo test -p lucidos-engine --features real-embedder-tests --lib \
-    -- "${GATED_TESTS[@]}" "${CARGO_ARGS[@]}"
+    -- "${GATED_TESTS[@]}" --nocapture "${CARGO_ARGS[@]}"

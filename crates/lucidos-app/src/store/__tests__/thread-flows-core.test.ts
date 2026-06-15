@@ -157,7 +157,7 @@ describe('Flow: Claude Code session', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
-    expect(exchangeStatus(exchanges[0], '', true)).toBe('cc-working');
+    expect(exchangeStatus(exchanges[0], '', true)).toBe('coding-agent-working');
     expect(getLabel(exchanges[0])).toBe('Working');
   });
 
@@ -593,7 +593,7 @@ describe('Flow: Thread status', () => {
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
     expect(exchanges[1].userEvent.type).toBe('ChangeApplied');
     expect(exchangeUserMessage(exchanges[2])).toBe('Now fix tests');
-    expect(exchangeStatus(exchanges[2], '', true)).toBe('cc-working');
+    expect(exchangeStatus(exchanges[2], '', true)).toBe('coding-agent-working');
   });
 
   it('long-running tool call (>60s) stays running (MessageReceived sets status)', () => {
@@ -788,5 +788,5 @@ describe('Flow: Toggle visibility', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Flow 11: Interrupted (Continued below)
+// Flow 11: Interrupted (Done ↳)
 // ---------------------------------------------------------------------------

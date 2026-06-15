@@ -142,6 +142,85 @@ const PERMISSION_CONFIG_RULE: &str = "\n\n\
     every tool and every path including the CC-protected ones. Lost on engine restart, scoped \
     to one thread.";
 
+/// App-building knowhow pointer shared by the two app worktree prompts
+/// (`app_worktree_system_prompt`, `app_worktree_recovery_system_prompt`).
+///
+/// The engine ships authoritative app-building guides under `system-knowhow/`
+/// (`building-an-app`, `js-sdk`, `best-practices`, …) that the chat agent
+/// loads via its `load_knowhow` tool. An app coding-agent thread can't reach
+/// them: its worktree is a sparse-checkout of the *workspace* git narrowed to
+/// one app folder, so the docs are neither on disk nor exposed via that tool.
+/// The `lucidos knowhow` CLI subcommand fetches them from the parent engine
+/// over HTTP, giving the session the same guidance on demand — without it,
+/// app sessions reinvent the SDK surface and repeat the documented mistakes
+/// (wrong `artifacts/` data path, hand-rolled proxy URLs, storing data under
+/// `apps/<id>/`). Lucidos-source prompts deliberately omit this: that worktree
+/// is a full repo checkout with `system-knowhow/` already on disk.
+const APP_KNOWHOW_RULE: &str = "APP-BUILDING KNOWHOW: This workspace's engine ships \
+    authoritative guides for building Lucidos apps — file layout, the `lucidos.*` SDK \
+    surface, data-path rules, the external-API proxy pattern, and common mistakes. They \
+    are NOT in this worktree (it is sparse-checkout-narrowed to the app folder), so fetch \
+    them with the `lucidos` CLI on your PATH:\n\
+    - `lucidos knowhow list` — the full catalog (id + one-line description of every \
+    available doc; there is more than just the app guides).\n\
+    - `lucidos knowhow read <id>` — load one doc's full content.\n\
+    Start with `lucidos knowhow read system-knowhow/building-an-app` (when an app is the \
+    right answer, scaffolding defaults, common mistakes). Before writing app JS read \
+    `system-knowhow/js-sdk` (the `lucidos.*` SDK surface is small but easy to misremember); \
+    for file layout and where app data lives read `system-knowhow/best-practices`. Load the \
+    relevant knowhow before writing app code rather than guessing.";
+
+/// Codex-only teaching appended to every Codex-bound system prompt by
+/// [`append_backend_rules`]. Two gaps it closes (see ADR 0004 follow-up +
+/// `docs/plans/2026-06-12-codex-workspace-writes-and-user-questions.md`):
+/// CC sessions get the lucidos-cli skill installed into the worktree and the
+/// native `AskUserQuestion` tool; Codex gets neither, so without this section
+/// a Codex session can't land files in the workspace's `data/` tree and
+/// guesses instead of asking. Deliberately condensed — it costs tokens on
+/// every fresh Codex session. The AGENTS.md alternative was rejected
+/// (dirty-diff in external repos + shared-git-dir exclude leakage).
+const CODEX_SESSION_RULES: &str = "\n\n\
+    LUCIDOS CLI: The `lucidos` CLI is on your PATH. Your sandbox only permits writes inside \
+    this worktree, but the CLI talks HTTP to the parent Lucidos engine (network is enabled), \
+    so it works where direct writes are blocked. Use it whenever output belongs in the parent \
+    workspace rather than in this worktree's source tree:\n\
+    - `lucidos data write <relative> [--from <file>|-]` — write a file under the workspace's \
+    `data/` tree (artifacts/, knowhow/, apps/, triggers/). Writing such files with your editor \
+    tools or scripts puts them inside the worktree, where the engine cannot serve them and \
+    links 404. `lucidos data path <relative> --mkdir` prints the resolved absolute path.\n\
+    - `lucidos events emit <EventType> --summary \"...\" --payload '{...}'` — emit a domain \
+    event (PascalCase past tense, e.g. `AnalysisCompleted`) to the workspace event store; \
+    `lucidos events query [--type T] [--limit N]` reads prior events.\n\
+    - `lucidos changes list` / `lucidos changes apply <id>` — list / apply a pending change. \
+    Never hand-roll the HTTP call with curl — the CLI forwards the subprocess-origin headers \
+    so the action is attributed to the agent, not the user.\n\
+    - `lucidos spawn-thread --to <workspace> [--cc] --message ... --title ...` — spawn a new \
+    Lucidos thread (always ask the user before spawning).\n\n\
+    ASKING USERS: When you need the user's decision — a yes/no, picking between approaches, \
+    choosing from a short list — call the `ask_user_question` tool (on the `lucidos` MCP \
+    server) instead of guessing or asking in plain text. The Lucidos UI renders the options \
+    as clickable buttons and the call blocks until the user answers, so you get a real answer \
+    mid-turn. Arguments: `question` (required, the full question text), `options` (2-4 short \
+    answer labels; omit for free-text), `multi_select` (allow picking several). One question \
+    per call. An answer of `(canceled)` means the user dismissed the question — stop and wait \
+    for their next instruction instead of re-asking. Do not guess when the tool can ask.";
+
+/// Append backend-specific rules to a finished system prompt. Claude Code
+/// prompts pass through unchanged (CC gets the lucidos-cli skill file + the
+/// native `AskUserQuestion` tool instead); Codex prompts gain
+/// [`CODEX_SESSION_RULES`]. Called from `resolve_run_worktree_context` with
+/// the backend `run_direct_agent` already resolved — do NOT re-query
+/// `thread_summaries` here.
+pub(super) fn append_backend_rules(
+    prompt: String,
+    coding_agent: crate::runtime::CodingAgent,
+) -> String {
+    match coding_agent {
+        crate::runtime::CodingAgent::ClaudeCode => prompt,
+        crate::runtime::CodingAgent::Codex => format!("{prompt}{CODEX_SESSION_RULES}"),
+    }
+}
+
 /// Build the system prompt for Lucidos-source coding-agent threads.
 /// Used by both user-initiated Claude Code sessions and LLM-invoked
 /// `claude_code` tool calls when editing the Lucidos source tree. Three
@@ -325,6 +404,7 @@ pub(super) fn app_worktree_system_prompt(
          APP MANIFEST:\n{app_manifest_json}\n\n\
          The rest of the app's structure — `index.html`, knowhow / intents / scripts \
          files, etc. — is on disk inside the app folder; use Read on demand.\n\n\
+         {app_knowhow}\n\n\
          ISOLATION RULES: Your worktree is your entire world. ALL file edits MUST happen \
          inside the app folder under your cwd. Don't reach for absolute paths to other \
          workspace folders — the Apply review surface shows every changed file across the \
@@ -362,6 +442,7 @@ pub(super) fn app_worktree_system_prompt(
          your lifecycle. Running `exit` in bash can crash the host application.{process_safety}{permission_config}",
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
+        app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
         permission_config = PERMISSION_CONFIG_RULE,
     )
@@ -389,6 +470,7 @@ pub(super) fn app_worktree_recovery_system_prompt(
          ff-merges your branch into the workspace git's `main`. No engine restart; no \
          `/harden` (apps own their hardening). Apply emits `AppUiRefreshRequested` if any \
          iframe-bundled file changed.\n\n\
+         {app_knowhow}\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check \
          for uncommitted changes. Discard unintentional changes with `git checkout -- <file>`.\n\n\
          COMMANDS: Never use /cpa. Just commit with `git add` + `git commit -m \"…\"`.\n\n\
@@ -397,6 +479,7 @@ pub(super) fn app_worktree_recovery_system_prompt(
          CRITICAL: Never run `exit` as a bash command.{process_safety}{permission_config}",
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
+        app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
         permission_config = PERMISSION_CONFIG_RULE,
     )
@@ -517,6 +600,17 @@ mod tests {
             prompt.contains("`/harden`"),
             "must explicitly opt out of /harden so CC doesn't try to run it",
         );
+        // The sparse-checkout worktree can't see `system-knowhow/` on disk and
+        // app sessions have no `load_knowhow` tool, so the prompt must point at
+        // the `lucidos knowhow` CLI and name building-an-app as the entry doc.
+        assert!(
+            prompt.contains("lucidos knowhow read system-knowhow/building-an-app"),
+            "must point app sessions at building-an-app knowhow via the CLI",
+        );
+        assert!(
+            prompt.contains("lucidos knowhow list"),
+            "must tell app sessions the full knowhow catalog is available via the CLI",
+        );
         // App prompts must not advertise Lucidos-source scripts (cargo,
         // npx tsc, web-dev.sh, e2e.sh) — those don't resolve from the app
         // worktree's cwd. `/harden` and `/cpa` are intentionally NAMED in
@@ -540,6 +634,12 @@ mod tests {
         assert!(prompt.contains("`momentum`"));
         assert!(prompt.contains("claude-code/app/momentum/20260527-100000-abc123"));
         assert!(prompt.contains("RECOVERED"));
+        // A resumed app session writes app code too — it needs the same
+        // knowhow pointer as a fresh app spawn.
+        assert!(
+            prompt.contains("lucidos knowhow read system-knowhow/building-an-app"),
+            "recovery app prompt must also point at building-an-app knowhow via the CLI",
+        );
         for token in &["./scripts/stop.sh", "./scripts/web-dev.sh", "./scripts/e2e"] {
             assert!(
                 !prompt.contains(token),
@@ -788,6 +888,46 @@ mod tests {
                 "{label} must explicitly tell CC not to retry the call",
             );
         }
+    }
+
+    /// The Codex teaching section must be appended for Codex and ONLY for
+    /// Codex: CC sessions already get the lucidos-cli skill file + the native
+    /// `AskUserQuestion` tool, so duplicating the teaching there wastes
+    /// context; a Codex session without it can't land workspace `data/` files
+    /// (the sandbox blocks direct writes) and guesses instead of asking.
+    #[test]
+    fn codex_prompts_carry_cli_and_question_teaching() {
+        let base = worktree_system_prompt("feature/x", "dev");
+        let codex = append_backend_rules(base.clone(), crate::runtime::CodingAgent::Codex);
+        for needle in [
+            "lucidos data write",
+            "lucidos events emit",
+            "lucidos changes apply",
+            "lucidos spawn-thread",
+            "ask_user_question",
+            "(canceled)",
+        ] {
+            assert!(
+                codex.contains(needle),
+                "Codex prompt must teach `{needle}` — the sandboxed session has no other \
+                 path to workspace writes / user questions",
+            );
+        }
+        assert!(
+            codex.starts_with(&base),
+            "backend rules must append, not replace, the worktree prompt",
+        );
+
+        let cc = append_backend_rules(base.clone(), crate::runtime::CodingAgent::ClaudeCode);
+        assert_eq!(
+            cc, base,
+            "Claude Code prompts must pass through unchanged — CC gets the lucidos-cli \
+             skill + native AskUserQuestion instead",
+        );
+        assert!(
+            !cc.contains("lucidos data write"),
+            "the CC base prompt must not duplicate the CLI teaching",
+        );
     }
 
     /// Conflict-resolution sessions run unattended in a temp worktree — the

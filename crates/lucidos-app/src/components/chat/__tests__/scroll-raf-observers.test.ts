@@ -225,7 +225,7 @@ describe('scrollToBottom does not touch notAtTop (scroll listener owns it)', () 
 // ---------------------------------------------------------------------------
 // composeHandlers contract — used by mode toggles + attach-photo button to
 // keep the iOS keyboard open across the re-render those actions trigger.
-// Action buttons (Send / Discard draft / etc.) deliberately do NOT use this
+// Action buttons (Send / Apply / etc.) deliberately do NOT use this
 // helper — see installActionBtnBlurListener() in promptFocus.ts.
 // ---------------------------------------------------------------------------
 describe('composeHandlers focuses before action', () => {

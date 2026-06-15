@@ -155,14 +155,49 @@ pub(super) struct CommandsQuery {
     /// "Lucidos" repo, mirroring the frontend's `selectedRepoId` convention.
     /// Missing = same as empty string.
     repo_id: Option<String>,
+    /// Compose-view backend selector (`claude-code` | `codex`). Only
+    /// consulted when no `thread_id` is given — an existing thread's backend
+    /// comes from its `thread_summaries` row, not the client.
+    coding_agent: Option<crate::runtime::CodingAgent>,
 }
 
-/// Return available CC commands: control subtypes (always) + categorized slash commands (if a session is active).
+/// Return available coding-agent commands: control subtypes (always, per
+/// backend) + categorized slash commands (CC only, if a session is active).
 pub(super) async fn claude_code_commands(
     State(state): State<AppState>,
     Query(query): Query<CommandsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let tid = super::parse_optional_uuid(query.thread_id.as_deref())?;
+    let coding_agent = match tid {
+        Some(tid) => state.engine.thread_coding_agent(tid).await,
+        None => query
+            .coding_agent
+            .unwrap_or(crate::runtime::CodingAgent::ClaudeCode),
+    };
+    if coding_agent == crate::runtime::CodingAgent::Codex {
+        // Codex has no slash commands / skills surface — only the control
+        // menu. Model/effort still come from the session settings events so
+        // the picker shows the thread's current selection.
+        let (current_model, current_effort) = match tid {
+            Some(tid) => state.engine.cc_thread_settings(tid).await,
+            None => (None, None),
+        };
+        let has_active_session = match tid {
+            Some(tid) => {
+                let guard = state.engine.agent_sessions.lock().await;
+                guard.get(&tid).is_some_and(|s| !s.process_exited)
+            }
+            None => false,
+        };
+        return Ok(Json(serde_json::json!({
+            "control_commands": crate::runtime::codex::codex_command_definitions(),
+            "builtin_commands": [],
+            "skill_commands": [],
+            "current_model": current_model,
+            "current_reasoning_effort": current_effort,
+            "has_active_session": has_active_session,
+        })));
+    }
     let res = if let Some(tid) = tid {
         state.engine.cc_categorized_commands(tid).await
     } else {
@@ -234,3 +269,29 @@ pub(super) async fn claude_code_interrupt(
     }
 }
 
+
+/// Routes for the `/claude-code/*` surface.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/claude-code/stop", post(claude_code_stop))
+        .route(
+            "/claude-code/interrupt",
+            post(claude_code_interrupt),
+        )
+        .route(
+            "/claude-code/control",
+            post(claude_code_control),
+        )
+        .route(
+            "/claude-code/commands",
+            get(claude_code_commands),
+        )
+        .route(
+            "/claude-code/apply-now",
+            post(claude_code_apply_now),
+        )
+        .route(
+            "/claude-code/discard",
+            post(claude_code_discard),
+        )
+}

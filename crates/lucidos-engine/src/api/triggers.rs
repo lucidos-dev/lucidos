@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::core::PreferenceStore;
+use crate::engine::command_guard::SideEffectCategory;
 use crate::engine::event_bus::SystemEvent;
 use crate::triggers::{
     is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
@@ -38,6 +39,10 @@ pub struct TriggerInfo {
     /// "Ungrouped" section.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
+    /// The trigger's **side-effect grant** (ADR 0002, Phase 5) — the irreversible
+    /// side-effect categories it may perform unattended. Empty = none granted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub side_effect_grant: Vec<SideEffectCategory>,
 }
 
 impl TriggerInfo {
@@ -66,6 +71,7 @@ impl TriggerInfo {
             app_id: config.owning_app_id(),
             go_to_review: config.go_to_review,
             group_id: config.group_id.clone(),
+            side_effect_grant: config.side_effect_grant.clone(),
         }
     }
 }
@@ -121,6 +127,12 @@ pub struct CreateTriggerCronRequest {
     /// against the in-memory group registry and rejects unknown values.
     #[serde(default)]
     pub group_id: Option<String>,
+    /// The trigger's **side-effect grant** (ADR 0002, Phase 5): the irreversible
+    /// side-effect categories it's authorized to perform unattended. Empty (the
+    /// default) = the command guard fails the trigger if its intent attempts any
+    /// irreversible side-effect. Unknown category strings 4xx via serde.
+    #[serde(default)]
+    pub side_effect_grant: Vec<SideEffectCategory>,
 }
 
 #[derive(Deserialize)]
@@ -159,6 +171,11 @@ pub struct UpdateTriggerCronRequest {
         deserialize_with = "deserialize_optional_nullable::<String, _>"
     )]
     pub group_id: Option<Option<String>>,
+    /// Full replacement for the **side-effect grant** (ADR 0002, Phase 5). None =
+    /// field absent (don't change), Some(empty) = clear all grants, Some(non-empty)
+    /// = replace with the new set. Unknown category strings 4xx via serde.
+    #[serde(default)]
+    pub side_effect_grant: Option<Vec<SideEffectCategory>>,
 }
 
 /// Deserialize a field that can be absent, null, or a value.
@@ -343,6 +360,12 @@ pub(super) async fn create_trigger(
             payload["group_id"] = serde_json::json!(trimmed);
         }
     }
+    // Side-effect grant (Phase 5): only stamp when non-empty so legacy/no-grant
+    // triggers keep a clean payload (an absent field reads back as "no grant").
+    if !request.side_effect_grant.is_empty() {
+        payload["side_effect_grant"] = serde_json::to_value(&request.side_effect_grant)
+            .expect("SideEffectCategory serialization is infallible");
+    }
 
     state
         .engine
@@ -467,6 +490,12 @@ pub(super) async fn update_trigger(
         }
         update_payload["group_id"] = serde_json::json!(normalized);
     }
+    // Side-effect grant (Phase 5): full replacement when present. Some(empty)
+    // serializes to `[]`, which `apply_update` reads back as "clear all grants".
+    if let Some(ref grant) = request.side_effect_grant {
+        update_payload["side_effect_grant"] = serde_json::to_value(grant)
+            .expect("SideEffectCategory serialization is infallible");
+    }
 
     // Ensure trigger still has at least one firing mechanism after update
     let updated_crons = request
@@ -527,6 +556,22 @@ pub(super) async fn delete_trigger(
         .await;
 
     ApiResult::ok()
+}
+
+/// Routes for the `/triggers*` surface.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/triggers",
+            get(list_triggers)
+                .post(create_trigger)
+                .put(update_trigger)
+                .delete(delete_trigger),
+        )
+        .route(
+            "/triggers/historical",
+            get(list_historical_triggers),
+        )
 }
 
 #[cfg(test)]

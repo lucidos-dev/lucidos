@@ -137,7 +137,7 @@ describe('exchangeStatus — full branch coverage', () => {
     // A non-last chat exchange with steps but no completion is one the user
     // moved past — the response continues in the panel below (mid-flight
     // injection redirects post-UPI events to the follow-up). Render as
-    // 'interrupted' ("Continued below ↳") so only the last panel shows
+    // 'interrupted' ("Done ↳") so only the last panel shows
     // "Working" — same treatment as CC follow-ups. Holds whether the engine
     // has gone idle or is still processing.
     const exchange = makeExchange(msg(), [
@@ -149,12 +149,12 @@ describe('exchangeStatus — full branch coverage', () => {
     expect(exchangeStatus(exchange, '', /* isLast */ false, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ false)).toBe('interrupted');
   });
 
-  it('returns "cc-working" for last CC exchange without completion or idle', () => {
+  it('returns "coding-agent-working" for last CC exchange without completion or idle', () => {
     const exchange = makeExchange(msg(), [
       step(1, { type: 'SessionStarted', session_id: 's1' }),
       step(2, { type: 'CodingAgentToolCalled', name: 'bash', args: {} }),
     ]);
-    expect(exchangeStatus(exchange, '', true)).toBe('cc-working');
+    expect(exchangeStatus(exchange, '', true)).toBe('coding-agent-working');
   });
 
   it('returns "streaming" when streamingBuffer has content', () => {
@@ -336,8 +336,8 @@ describe('exchangeStatus — full branch coverage', () => {
       step(8, { type: 'CodingAgentToolCalled', name: 'Read', args: {} }),
       step(9, { type: 'CodingAgentToolResult', name: 'Read', result: 'ok' }),
     ]);
-    // Should be 'cc-working' (hardening in progress), NOT 'aborted'
-    expect(exchangeStatus(exchange, '', true, false, true)).toBe('cc-working');
+    // Should be 'coding-agent-working' (hardening in progress), NOT 'aborted'
+    expect(exchangeStatus(exchange, '', true, false, true)).toBe('coding-agent-working');
   });
 
   it('SessionEnded(changes_applied) after CodingAgentPromptSent does not flash aborted', () => {
@@ -364,7 +364,7 @@ describe('exchangeStatus — full branch coverage', () => {
   it('SessionEnded(changes_applied) without prior CodingAgentIdled is terminal (done)', () => {
     // Even if CodingAgentIdled was never emitted (auto-harden bail-out, etc.),
     // a deliberate SessionEnded with a normal lifecycle reason marks the CC
-    // exchange as terminal — must NOT show 'aborted' nor stay on 'cc-working'.
+    // exchange as terminal — must NOT show 'aborted' nor stay on 'coding-agent-working'.
     const exchange = makeExchange(msg(), [
       step(1, { type: 'SessionStarted', session_id: 's1' }),
       step(2, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} }),

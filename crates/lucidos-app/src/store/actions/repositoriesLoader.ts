@@ -16,7 +16,22 @@ import type { Repository } from '../store';
 import { setLoadingIfFresh, toFailed } from '../types';
 import { API, json as apiJson } from '../../api/client';
 
-export async function loadRepositories(): Promise<void> {
+// Shared in-flight load so concurrent callers await the SAME fetch instead of
+// racing duplicate GETs: the compose destination picker's render-path kick-off
+// and useStartup's eager load both fire on a cold start. An early `return`
+// would resolve immediately while the real fetch is still in flight, so an
+// `await loadRepositories()` caller (loadChangeContext, viewThreadCcDiff) would
+// then read a still-'loading' Loadable — hence sharing the promise, not skipping.
+let repositoriesLoadInFlight: Promise<void> | null = null;
+
+export function loadRepositories(): Promise<void> {
+  if (repositoriesLoadInFlight) return repositoriesLoadInFlight;
+  repositoriesLoadInFlight = loadRepositoriesInner()
+    .finally(() => { repositoriesLoadInFlight = null; });
+  return repositoriesLoadInFlight;
+}
+
+async function loadRepositoriesInner(): Promise<void> {
   setLoadingIfFresh(repositories);
   try {
     const data = await apiJson<Repository[]>(`${API}/repositories`);

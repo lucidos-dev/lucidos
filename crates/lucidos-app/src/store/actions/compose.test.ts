@@ -1,10 +1,11 @@
 /**
  * Without compose-clear on the active-thread send path, the textarea's
  * useEffect resyncs el.value from the draft signal after submit and the
- * "Discard draft" button stays visible — even though the message was already
- * delivered. The bug surfaced most visibly when a user typed a free-text
- * answer to an AskUserQuestion: the answer rendered as "YOUR ANSWER" in the
- * exchange but the same text persisted as a Draft below.
+ * cleared draft reappears (the clear-X stays visible, the row lingers in the
+ * Drafts panel) — even though the message was already delivered. The bug
+ * surfaced most visibly when a user typed a free-text answer to an
+ * AskUserQuestion: the answer rendered as "YOUR ANSWER" in the exchange but the
+ * same text persisted as a Draft below.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -22,9 +23,9 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue([]),
 }));
 
-import { discardCompose, ensureFocusedComposeThread, pendingComposePuts, sendCompose, sendFollowup, updateCompose, applyRemoteCompose } from './compose';
+import { discardCompose, ensureFocusedComposeThread, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, updateCompose, applyRemoteCompose } from './compose';
 import { focusThread, unfocusThread } from './threads';
-import { connectionStatus, focusedThreadId, inputMode, threadMap, FOCUSED_THREAD_KEY, toasts } from '../store';
+import { codingAgentPendingModel, codingAgentPendingReasoningEffort, connectionStatus, focusedThreadId, inputMode, threadMap, FOCUSED_THREAD_KEY, toasts } from '../store';
 import {
   _resetThreadNavForTesting,
   _threadNavStateForTesting,
@@ -136,6 +137,63 @@ describe('sendFollowup clears the active-thread draft', () => {
 
     resolveSend!(new Response(null, { status: 200 }));
     await sendPromise;
+  });
+
+  it('can send a queued follow-up to its original thread without stealing focus', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeActiveThread({ id: 't-1', composeText: 'queued', composeImages: ['hash-1'] }));
+    map.set('t-2', makeActiveThread({ id: 't-2' }));
+    threadMap.value = map;
+    focusedThreadId.value = 't-2';
+
+    await sendFollowup('t-1', 'queued', ['hash-1'], { focus: false });
+
+    const chatCall = mockFetch.mock.calls.find(([url, init]) =>
+      typeof url === 'string'
+        && url.endsWith('/chat/stream')
+        && (init as RequestInit | undefined)?.method === 'POST',
+    );
+    expect(chatCall, 'expected chat POST').toBeDefined();
+    const body = JSON.parse((chatCall![1] as RequestInit).body as string);
+    expect(body.thread_id).toBe('t-1');
+    expect(body.image_hashes).toEqual(['hash-1']);
+    expect(focusedThreadId.value).toBe('t-2');
+  });
+});
+
+describe('prefillCompose — starter suggestion drop-in', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockFetch = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    connectionStatus.value = 'connected';
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    _resetComposeDraftsForTesting();
+    vi.restoreAllMocks();
+  });
+
+  it('writes the prompt into the focused composing draft and does NOT send', () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeThread({ state: 'composing' }));
+    threadMap.value = map;
+    focusedThreadId.value = 't-1';
+
+    const id = prefillCompose('Build me an app that tracks my reading list.');
+
+    expect(id).toBe('t-1');
+    expect(getDraft('t-1').text).toBe('Build me an app that tracks my reading list.');
+    // The thread stays composing — prefill is not a send.
+    expect(threadMap.value.get('t-1')!.meta.state).toBe('composing');
+    const chatCall = mockFetch.mock.calls.find(([url]) =>
+      typeof url === 'string' && url.endsWith('/chat/stream'));
+    expect(chatCall, 'prefill must not POST a chat message').toBeUndefined();
   });
 });
 
@@ -793,5 +851,95 @@ describe('inputMode is sticky across compose sessions (toggle remembers last pic
     await sendCompose('t-1', { useClaudeCode: false });
 
     expect(inputMode.value).toEqual({ type: 'do' });
+  });
+});
+
+/** A CC reasoning-effort (or model) pick made in the compose view is a
+ *  ONE-SHOT intent: it must apply to exactly the thread spawned by the next
+ *  send, then revert to the default. The pending pick lives in a module
+ *  signal; `sendCompose` focuses the freshly-spawned thread via
+ *  `setFocusedThread` (NOT `focusThread`), so `resetCodingAgentPendingPreferences`
+ *  never ran on this path. Before the fix a single "Max" pick rode onto every
+ *  subsequent new thread, silently overriding the user's `~/.claude`
+ *  effortLevel default until an unrelated thread-switch/reload reset it. */
+describe('CC pending pick is one-shot per spawned thread (no cross-thread leak)', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+  let chatBodies: Array<{ use_claude_code?: boolean; reasoning_effort?: string; cc_model?: string }>;
+
+  beforeEach(() => {
+    chatBodies = [];
+    mockFetch = vi.fn((url: string, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (typeof url === 'string' && url.endsWith('/chat/stream') && method === 'POST') {
+        try { chatBodies.push(JSON.parse(init!.body as string)); } catch { /* ignore */ }
+        return Promise.resolve(new Response(JSON.stringify({ event_id: 'evt' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+      return Promise.resolve(new Response(null, { status: 200 }));
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    connectionStatus.value = 'connected';
+    codingAgentPendingReasoningEffort.value = null;
+    codingAgentPendingModel.value = null;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    codingAgentPendingReasoningEffort.value = null;
+    codingAgentPendingModel.value = null;
+    _resetComposeDraftsForTesting();
+    vi.restoreAllMocks();
+  });
+
+  function composingCcThread(id: string, text: string): ThreadState {
+    return makeThread({
+      id, state: 'composing', channel: 'claude_code',
+      composeText: text, composeMode: 'claude_code',
+    });
+  }
+
+  it('clears the pending effort once the spawn has consumed it', async () => {
+    codingAgentPendingReasoningEffort.value = 'max';
+    threadMap.value = new Map<string, ThreadState>().set('cc-1', composingCcThread('cc-1', 'do a thing'));
+    focusedThreadId.value = 'cc-1';
+
+    await sendCompose('cc-1', { useClaudeCode: true });
+
+    expect(chatBodies).toHaveLength(1);
+    expect(chatBodies[0].reasoning_effort).toBe('max'); // the pick reached the spawn
+    expect(codingAgentPendingReasoningEffort.value).toBeNull();   // ...and was consumed
+  });
+
+  it('does NOT leak the pick onto the next new thread', async () => {
+    codingAgentPendingReasoningEffort.value = 'max';
+
+    threadMap.value = new Map<string, ThreadState>().set('cc-A', composingCcThread('cc-A', 'first'));
+    focusedThreadId.value = 'cc-A';
+    await sendCompose('cc-A', { useClaudeCode: true });
+
+    // Brand-new compose; the user did NOT pick an effort this time.
+    threadMap.value = new Map(threadMap.value).set('cc-B', composingCcThread('cc-B', 'second'));
+    focusedThreadId.value = 'cc-B';
+    await sendCompose('cc-B', { useClaudeCode: true });
+
+    const ccBodies = chatBodies.filter((b) => b.use_claude_code);
+    expect(ccBodies).toHaveLength(2);
+    expect(ccBodies[0].reasoning_effort).toBe('max');     // first thread honored the pick
+    expect(ccBodies[1].reasoning_effort).toBeUndefined();  // second falls through to the default
+  });
+
+  it('also consumes a pending model pick (symmetry with effort)', async () => {
+    codingAgentPendingModel.value = 'opus[1m]';
+    threadMap.value = new Map<string, ThreadState>().set('cc-m', composingCcThread('cc-m', 'pick model once'));
+    focusedThreadId.value = 'cc-m';
+
+    await sendCompose('cc-m', { useClaudeCode: true });
+
+    expect(chatBodies[0].cc_model).toBe('opus[1m]');
+    expect(codingAgentPendingModel.value).toBeNull();
   });
 });

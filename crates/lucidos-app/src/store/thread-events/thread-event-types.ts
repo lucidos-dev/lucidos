@@ -1,4 +1,5 @@
 import type { EventChannel, SessionEndReason } from '../../generated/thread-lifecycle';
+import type { CodingAgent } from '../../api/types';
 import type { ContextSection } from '../types';
 
 export type ThreadInitiator = 'user' | 'system';
@@ -61,10 +62,21 @@ export type MessageOrigin =
 /** Display label for engine-deliberate work (hardening, merging, scheduler). */
 export const ENGINE_LABEL = 'Lucidos Engine';
 
+/** Icon paired with `ENGINE_LABEL` — a hexagon ("system module"), deliberately
+ *  NOT the ⚙ gear, which reads as Settings. Kept distinct from `SYSTEM_ICON`
+ *  (the gear) so engine-deliberate work and host-killed processes are
+ *  distinguishable at a glance. */
+export const ENGINE_ICON = '⬡';
+
 /** Display label for process killed by the host system (engine shutdown,
  *  safety-net catch, OS signal). Distinct from `ENGINE_LABEL`: the engine
  *  acts deliberately; the system just kills processes. */
 export const SYSTEM_LABEL = 'System';
+
+/** Icon paired with `SYSTEM_LABEL` — the ⚙ gear, reserved for the host system
+ *  killing a process (shutdown, OS signal, crash). Distinct from `ENGINE_ICON`
+ *  (the hexagon) used for engine-deliberate work. */
+export const SYSTEM_ICON = '⚙';
 
 /** Display label for work kicked off by a Lucidos LLM agent in another thread
  *  (parent_thread origin) — distinct from the engine, which only owns events
@@ -117,12 +129,12 @@ export function originMode(origin: MessageOrigin | undefined): ActorMode {
  *  impersonate the user in the timeline. The popover still discloses the
  *  origin kind, user-agent, and workspace name underneath. */
 export function actorInitiator(actor: MessageOrigin | undefined): { icon: string; label: string } {
-  if (actor?.kind === 'system') return { icon: '⚙', label: SYSTEM_LABEL };
+  if (actor?.kind === 'system') return { icon: SYSTEM_ICON, label: SYSTEM_LABEL };
   if (actor?.kind === 'device') return { icon: '\u{1F464}', label: 'You' };
   switch (originMode(actor)) {
     case 'human':  return { icon: API_CALLER_ICON, label: API_CALLER_LABEL };
     case 'agent':  return { icon: LUCIDOS_AGENT_ICON, label: LUCIDOS_AGENT_LABEL };
-    case 'engine': return { icon: '⚙', label: ENGINE_LABEL };
+    case 'engine': return { icon: ENGINE_ICON, label: ENGINE_LABEL };
   }
 }
 
@@ -159,9 +171,11 @@ export function responseAbortedSummary(
   return actor?.kind === 'device' ? 'Restarted' : 'Response interrupted';
 }
 
-/** Summary text for a `ResponseCanceled` event — always a user-driven stop
- *  on a real in-flight response, so no cause-dependent branching is needed. */
-export const RESPONSE_CANCELED_SUMMARY = 'Canceled the response';
+/** Header label / preview text for a `ResponseCanceled` turn — always a
+ *  user-driven stop on a real in-flight response, so no cause-dependent
+ *  branching is needed. Rendered as the turn's header (no actor chip); the
+ *  cancel cause is surfaced in the Initiator info popover instead. */
+export const RESPONSE_CANCELED_SUMMARY = 'Response canceled';
 
 // Persisted thread events — stored in DB, appear in snapshots.
 // Optional fields (`?`) allow older DB rows (before the field was added) to deserialize safely.
@@ -187,7 +201,7 @@ export type ThreadEvent =
   | { type: 'ContextAssembled'; sections: ContextSection[]; tools: string[]; model: string; total_chars: number }
   | {
       type: 'ContextCaptured';
-      producer: 'main_llm' | 'claude_code';
+      producer: 'main_llm' | 'claude_code' | 'codex';
       model: string;
       context_window: number;
       /** Absent on snapshot rows (server strips for size — see
@@ -222,7 +236,7 @@ export type ThreadEvent =
   | { type: 'ResponseCanceled'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; actor?: MessageOrigin; channel?: EventChannel; cause?: CancelCause }
   | { type: 'ResponseAborted'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; request_event_id?: string; actor?: MessageOrigin; channel?: EventChannel; cause?: AbortCause }
   | { type: 'ResponseFailed'; error: string; request_event_id?: string; channel?: EventChannel }
-  | { type: 'SessionStarted'; session_id: string; branch?: string; repo_id?: string }
+  | { type: 'SessionStarted'; session_id: string; branch?: string; repo_id?: string; coding_agent?: CodingAgent }
   | { type: 'ContinuationStarted'; branch?: string; origin?: MessageOrigin; actor?: MessageOrigin }
   // SessionEnded.reason is loosely typed to tolerate legacy DB rows whose
   // payloads carry removed values like 'completed' / 'changes_proposed' /
@@ -231,13 +245,13 @@ export type ThreadEvent =
   // the engine's 'legacy_non_terminal' catch-all; everything else is a
   // historical row and should be treated as a harmless terminal end.
   | { type: 'SessionEnded'; reason?: SessionEndReason | string }
-  | { type: 'CodingAgentTextStreamed'; text: string }
-  | { type: 'CodingAgentToolCalled'; name: string; args: unknown; description?: string; tool_use_id?: string }
-  | { type: 'CodingAgentToolResult'; name: string; result: string; tool_use_id?: string }
-  | { type: 'CodingAgentUserMessageSent'; text: string }
-  | { type: 'CodingAgentPromptSent'; text: string; origin?: MessageOrigin }
+  | { type: 'CodingAgentTextStreamed'; text: string; coding_agent?: CodingAgent }
+  | { type: 'CodingAgentToolCalled'; name: string; args: unknown; description?: string; tool_use_id?: string; coding_agent?: CodingAgent }
+  | { type: 'CodingAgentToolResult'; name: string; result: string; tool_use_id?: string; coding_agent?: CodingAgent }
+  | { type: 'CodingAgentUserMessageSent'; text: string; coding_agent?: CodingAgent }
+  | { type: 'CodingAgentPromptSent'; text: string; origin?: MessageOrigin; coding_agent?: CodingAgent }
   | { type: 'MissingHardeningDetected'; origin?: MessageOrigin }
-  | { type: 'CodingAgentIdled'; has_changes?: boolean; requires_restart?: boolean; is_external_repo?: boolean; cc_session_id?: string }
+  | { type: 'CodingAgentIdled'; has_changes?: boolean; requires_restart?: boolean; is_external_repo?: boolean; cc_session_id?: string; coding_agent?: CodingAgent }
   | { type: 'ThreadTitleGenerated'; title: string }
   | { type: 'ThreadTitleRenamed'; title: string; actor?: MessageOrigin }
   | { type: 'ThreadSaved'; actor?: MessageOrigin }
@@ -256,11 +270,19 @@ export type ThreadEvent =
   | { type: 'UserPromptInjected'; text: string; mode?: ActorMode; origin?: MessageOrigin; injected_message_id?: string }
   | { type: 'CredentialRequested'; provider: string }
   | { type: 'McpConsentRequested'; tool: string; args: unknown }
-  | { type: 'CodingAgentSettingsChanged'; model?: string; reasoning_effort?: string; permission_mode?: string; cc_session_id?: string }
+  | { type: 'CodingAgentSettingsChanged'; model?: string; reasoning_effort?: string; permission_mode?: string; cc_session_id?: string; coding_agent?: CodingAgent }
   | { type: 'UserQuestionAsked'; tool_use_id: string; cc_session_id: string; question: string; options?: QuestionOption[]; multi_select?: boolean }
   | { type: 'UserQuestionAnswered'; tool_use_id: string; answer: AnswerKind; actor?: MessageOrigin }
   | { type: 'CodingAgentPermissionRequest'; request_id: string; tool_use_id: string; tool_name: string; input: Record<string, unknown>; summary: string }
   | { type: 'CodingAgentPermissionResolved'; request_id: string; allowed: boolean; reason?: string; persist_scope?: PersistScope; actor?: MessageOrigin }
+  // Command guard (ADR 0002) — the chat mirror of the CodingAgentPermission* pair.
+  // Carries the inspected `command` text instead of CC's structured tool `input`.
+  | { type: 'CommandPermissionRequested'; request_id: string; tool_use_id: string; tool_name: string; command: string; summary: string }
+  | { type: 'CommandPermissionResolved'; request_id: string; allowed: boolean; reason?: string; persist_scope?: PersistScope; actor?: MessageOrigin }
+  // Command guard checkpoint/undo (ADR 0002, Phase 4) — a ReversibleDanger
+  // command was snapshotted before running; the user can one-click Undo.
+  | { type: 'CommandCheckpointed'; checkpoint_id: string; command: string; summary: string }
+  | { type: 'CommandCheckpointReverted'; checkpoint_id: string; actor?: MessageOrigin }
   | { type: 'ChildThreadCompleted'; child_thread_id: string; child_thread_title?: string; status: ChildCompletionStatus; summary: string; pending_change_ids?: string[] }
   // Background Flash enrichment of a prior MessageReceived's attached images
   // (one event per attached hash, all carrying the same description text).
@@ -326,12 +348,12 @@ export type TransientEvent =
   | { type: 'PluginUninstallRequested'; payload: string }
   | { type: 'EmailConfirmRequested'; payload: string }
   | { type: 'PushNotificationRequested' }
-  | { type: 'McpConsentPromptRequested'; data: string }
+  | { type: 'McpConsentPromptRequested'; payload: string }
   | { type: 'FileRefreshRequested'; path: string }
   | { type: 'AppUiRefreshRequested'; app_id: string }
   | { type: 'AppUiCaptureRequested'; app_id: string; request_id: string }
   | { type: 'NavigationRequested'; payload: string }
-  | { type: 'CodingAgentThreadSpawned'; cc_thread_id: string; title: string }
+  | { type: 'CodingAgentThreadSpawned'; cc_thread_id: string; title: string; coding_agent?: CodingAgent }
   | { type: 'ChildrenCountChanged'; active: number; total: number };
 
 export type StoredEvent = ThreadEvent & { created?: string; _displayCreated?: string; _eventId?: string };

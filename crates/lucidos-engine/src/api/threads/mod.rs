@@ -7,6 +7,8 @@
 //! `api::threads::<child>::<Type>`.
 
 use axum::http::StatusCode;
+use axum::routing::{get, post, put};
+use axum::Router;
 use uuid::Uuid;
 
 mod actions;
@@ -25,8 +27,8 @@ pub(super) use events_snapshot::{
     get_context_capture, get_thread_events_snapshot, get_tool_result,
 };
 pub(super) use list::{
-    count_thread_summaries, get_filter_facets, get_older_threads, get_thread_summary,
-    list_thread_summaries, list_threads,
+    count_thread_summaries, get_archived_count, get_filter_facets, get_older_threads,
+    get_thread_summary, list_thread_summaries, list_threads,
 };
 pub(super) use search::{combined_thread_search, search_threads};
 
@@ -96,6 +98,66 @@ pub(in crate::api) async fn available_thread_actions_for(
         has_unsent_draft,
         f.is_saved,
     ))
+}
+
+/// Routes for the `/threads*` URL surface. Grouped by path, not handler
+/// location: compose / blob-upload / cc-diff / image handlers live in
+/// sibling modules, but their thread-shaped routes register here so a
+/// reader looking for `/threads/...` finds every route in one place.
+pub(super) fn router() -> Router<super::AppState> {
+    Router::new()
+        .route("/threads", get(list_threads))
+        .route("/threads", post(super::threads_compose::post_thread))
+        .route("/threads/list", get(list_thread_summaries))
+        .route("/threads/count", get(count_thread_summaries))
+        .route("/threads/archived-count", get(get_archived_count))
+        .route("/threads/search", get(search_threads))
+        .route("/threads/save", post(save_thread))
+        .route("/threads/unsave", post(unsave_thread))
+        .route("/threads/rename", post(rename_thread))
+        .route("/threads/archive", post(archive_thread))
+        .route("/threads/suggest-title", post(suggest_title))
+        .route("/threads/older", get(get_older_threads))
+        .route("/threads/filter-facets", get(get_filter_facets))
+        .route(
+            "/threads/:thread_id/answer-question",
+            post(answer_thread_question),
+        )
+        .route(
+            "/threads/:thread_id/messages",
+            get(get_thread_messages),
+        )
+        .route(
+            "/threads/:thread_id/events",
+            get(get_thread_events_snapshot),
+        )
+        .route(
+            "/threads/:thread_id/continue",
+            post(continue_thread),
+        )
+        .route(
+            "/threads/:thread_id/cc-diff",
+            get(super::repositories::get_thread_cc_diff),
+        )
+        .route(
+            "/threads/:thread_id/images",
+            get(super::images::list_thread_images),
+        )
+        .route(
+            "/threads/:thread_id/images/:index",
+            get(super::images::get_thread_image),
+        )
+        // By-id summary GET shares the `/threads/:id` leaf with delete_thread.
+        // It MUST use the `:id` param name: only ONE bare `/threads/<param>`
+        // leaf may exist — a second one with a different param name makes
+        // matchit panic at router build. Same path + non-overlapping methods
+        // → axum merges GET+DELETE into one method router.
+        .route(
+            "/threads/:id",
+            get(get_thread_summary).delete(super::threads_compose::delete_thread),
+        )
+        .route("/threads/:id/compose", put(super::threads_compose::put_compose))
+        .route("/threads/:id/blobs", post(super::blobs::post_blob))
 }
 
 #[cfg(test)]

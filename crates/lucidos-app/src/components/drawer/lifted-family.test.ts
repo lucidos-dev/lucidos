@@ -6,7 +6,7 @@
  *
  * - **Demoted parent**: the family root renders in its native-section style
  *   even while sitting in the lifted section, so a row that looks archived in
- *   Review reads as "I'm here under protest — the real work is one of my
+ *   Current reads as "I'm here under protest — the real work is one of my
  *   children."
  * - **Bright child rail**: descendants whose own natural section matches the
  *   routed section (i.e. they earned the lift) get the section-accent rail
@@ -67,9 +67,9 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
     };
 }
 
-const inReview = (id: string, opts: ThreadOpts = {}) =>
+const withCta = (id: string, opts: ThreadOpts = {}) =>
     makeThread(id, { ...opts, codingAgentProposed: true, section: 'inbox' });
-const inActive = (id: string, opts: ThreadOpts = {}) =>
+const running = (id: string, opts: ThreadOpts = {}) =>
     makeThread(id, { ...opts, status: 'running' });
 const inSaved = (id: string, opts: ThreadOpts = {}) =>
     makeThread(id, { ...opts, saved: true });
@@ -78,50 +78,50 @@ const inArchive = (id: string, opts: ThreadOpts = {}) =>
 
 describe('computeFamilyDecorations', () => {
     it('marks no family as lifted when parent and children share the same natural section', () => {
-        // Two-thread family, both naturally in Active. No lift happened — the
-        // family is in Active because both members are. Neither cue should fire.
-        const parent = inActive('parent');
-        const child = inActive('child', { parentId: 'parent' });
+        // Two-thread family, both naturally in Current. No lift happened — the
+        // family is in Current because both members are. Neither cue should fire.
+        const parent = running('parent');
+        const child = running('child', { parentId: 'parent' });
         const graph = computeFamilyGraph([parent, child]);
         const decorations = computeFamilyDecorations([parent, child], graph);
 
         expect(decorations.liftedRoots.size).toBe(0);
-        expect(decorations.routedByThread.get('parent')).toBe('active');
-        expect(decorations.routedByThread.get('child')).toBe('active');
+        expect(decorations.routedByThread.get('parent')).toBe('current');
+        expect(decorations.routedByThread.get('child')).toBe('current');
     });
 
     it('marks the root as lifted when a child drags the family into a higher-priority section', () => {
-        // Parent naturally archived, child active. Family routes to Active.
+        // Parent naturally archived, child running. Family routes to Current.
         // The root is lifted; the child is the one responsible.
         const parent = inArchive('parent');
-        const child = inActive('child', { parentId: 'parent' });
+        const child = running('child', { parentId: 'parent' });
         const graph = computeFamilyGraph([parent, child]);
         const decorations = computeFamilyDecorations([parent, child], graph);
 
         expect(decorations.liftedRoots.has('parent')).toBe(true);
-        expect(decorations.routedByThread.get('parent')).toBe('active');
-        expect(decorations.routedByThread.get('child')).toBe('active');
+        expect(decorations.routedByThread.get('parent')).toBe('current');
+        expect(decorations.routedByThread.get('child')).toBe('current');
     });
 
     it('marks the root as lifted for a deeper chain when a grandchild earned the lift', () => {
-        // grandparent archived, mid saved, leaf active → family in Active.
+        // grandparent archived, mid saved, leaf running → family in Current.
         const grandparent = inArchive('grandparent');
         const mid = inSaved('mid', { parentId: 'grandparent' });
-        const leaf = inActive('leaf', { parentId: 'mid' });
+        const leaf = running('leaf', { parentId: 'mid' });
         const graph = computeFamilyGraph([grandparent, mid, leaf]);
         const decorations = computeFamilyDecorations([grandparent, mid, leaf], graph);
 
         expect(decorations.liftedRoots.has('grandparent')).toBe(true);
-        expect(decorations.routedByThread.get('grandparent')).toBe('active');
-        expect(decorations.routedByThread.get('mid')).toBe('active');
-        expect(decorations.routedByThread.get('leaf')).toBe('active');
+        expect(decorations.routedByThread.get('grandparent')).toBe('current');
+        expect(decorations.routedByThread.get('mid')).toBe('current');
+        expect(decorations.routedByThread.get('leaf')).toBe('current');
     });
 
     it('marks separate families independently', () => {
         const liftedRoot = inArchive('lifted-root');
-        const liftingChild = inActive('lifting-child', { parentId: 'lifted-root' });
-        const naturalRoot = inActive('natural-root');
-        const naturalChild = inActive('natural-child', { parentId: 'natural-root' });
+        const liftingChild = running('lifting-child', { parentId: 'lifted-root' });
+        const naturalRoot = running('natural-root');
+        const naturalChild = running('natural-child', { parentId: 'natural-root' });
         const threads = [liftedRoot, liftingChild, naturalRoot, naturalChild];
         const graph = computeFamilyGraph(threads);
         const decorations = computeFamilyDecorations(threads, graph);
@@ -134,19 +134,19 @@ describe('computeFamilyDecorations', () => {
         // Orphan child has no anchor — it becomes its own family root. Its
         // natural section IS the routed section (because the family is just
         // itself), so it isn't lifted.
-        const orphan = inReview('orphan', { parentId: 'missing-parent' });
+        const orphan = withCta('orphan', { parentId: 'missing-parent' });
         const graph = computeFamilyGraph([orphan]);
         const decorations = computeFamilyDecorations([orphan], graph);
 
         expect(decorations.liftedRoots.size).toBe(0);
-        expect(decorations.routedByThread.get('orphan')).toBe('review');
+        expect(decorations.routedByThread.get('orphan')).toBe('current');
     });
 
     it('excludes composing and discarded threads from the routing map', () => {
-        const parent = inActive('parent');
-        const composing = inReview('composing-child', { parentId: 'parent' });
+        const parent = running('parent');
+        const composing = withCta('composing-child', { parentId: 'parent' });
         composing.meta.state = 'composing';
-        const discarded = inReview('discarded-child', { parentId: 'parent' });
+        const discarded = withCta('discarded-child', { parentId: 'parent' });
         discarded.meta.state = 'discarded';
         const graph = computeFamilyGraph([parent, composing, discarded]);
         const decorations = computeFamilyDecorations([parent, composing, discarded], graph);
@@ -155,14 +155,14 @@ describe('computeFamilyDecorations', () => {
         expect(decorations.routedByThread.has('composing-child')).toBe(false);
         expect(decorations.routedByThread.has('discarded-child')).toBe(false);
         expect(decorations.liftedRoots.size).toBe(0);
-        expect(decorations.routedByThread.get('parent')).toBe('active');
+        expect(decorations.routedByThread.get('parent')).toBe('current');
     });
 
     it('routes a saved-parent + review-child family to Saved without a lift', () => {
         // Saved root pins the family to Saved — root's natural section
         // matches the routed one, so no lift cue fires.
         const parent = inSaved('parent');
-        const child = inReview('child', { parentId: 'parent' });
+        const child = withCta('child', { parentId: 'parent' });
         const graph = computeFamilyGraph([parent, child]);
         const decorations = computeFamilyDecorations([parent, child], graph);
 

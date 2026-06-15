@@ -5,14 +5,37 @@
 //! triggers). Patterns are written relative to `data/` so the LLM can use the
 //! same paths it sees in `list_files` output (e.g. `apps/**/index.html`).
 
+use super::ClampBounds;
 use serde::Serialize;
 use std::path::Path;
 
-pub const GLOB_DEFAULT_LIMIT: usize = 200;
-pub const GLOB_MAX_LIMIT: usize = 1000;
-pub const GREP_DEFAULT_MAX_MATCHES: usize = 100;
-pub const GREP_MAX_MAX_MATCHES: usize = 500;
-pub const GREP_MAX_CONTEXT_LINES: usize = 5;
+/// Default + clamp bounds for `glob_files`'s `limit` arg. An absent arg
+/// resolves to the default (200); any supplied value is clamped into
+/// `[1, 1000]`. Owning both the default and the bounds in one `ClampBounds`
+/// here is the single source of truth: the dispatch handler in `files.rs`
+/// forwards the raw `Option<usize>` and never re-states the default.
+pub(crate) const GLOB_LIMIT: ClampBounds<usize> = ClampBounds {
+    default: 200,
+    min: 1,
+    max: 1000,
+};
+
+/// Default + clamp bounds for `grep_files`'s `max_matches` arg: default 100,
+/// clamped into `[1, 500]`. Same single-source-of-truth rule as `GLOB_LIMIT`.
+pub(crate) const GREP_MAX_MATCHES: ClampBounds<usize> = ClampBounds {
+    default: 100,
+    min: 1,
+    max: 500,
+};
+
+/// Default + clamp bounds for `grep_files`'s `context_lines` arg: default 0
+/// (no surrounding context), clamped into `[0, 5]`. The cap keeps a wide
+/// context window from dumping unbounded text per match.
+pub(crate) const GREP_CONTEXT_LINES: ClampBounds<usize> = ClampBounds {
+    default: 0,
+    min: 0,
+    max: 5,
+};
 /// Per-line truncation cap. Files like PDF text dumps or single-line JSON have
 /// individual lines of many KB; without a cap the matched line + context window
 /// can dump megabytes of text into the LLM context.
@@ -65,12 +88,16 @@ fn validate_pattern(label: &str, pattern: &str) -> Result<(), String> {
 }
 
 /// Match files under `data/` against a glob pattern (relative to `data/`).
+///
+/// `limit` is `None` when the caller omitted the arg (→ [`GLOB_LIMIT`]'s
+/// default) and `Some(n)` otherwise; either way it is resolved through
+/// `GLOB_LIMIT.apply`, so the default and the clamp live in one place.
 pub fn glob_files(
     workspace_path: &Path,
     pattern: &str,
-    limit: usize,
+    limit: Option<usize>,
 ) -> Result<GlobResult, String> {
-    let limit = limit.clamp(1, GLOB_MAX_LIMIT);
+    let limit = GLOB_LIMIT.apply(limit);
     let pattern = pattern.trim();
     if pattern.is_empty() {
         return Err("pattern is required".to_string());
@@ -120,16 +147,20 @@ fn cap_line(s: &str) -> String {
 
 /// Search file contents for a regex pattern. Walks the same directories as
 /// `list_files` / `glob_files` and stops as soon as `max_matches` is reached.
+///
+/// `max_matches` / `context_lines` are `None` when the caller omitted the arg
+/// (→ each bound's default) and `Some(n)` otherwise; both are resolved through
+/// their [`ClampBounds`] so the defaults and clamps live in one place.
 pub fn grep_files(
     workspace_path: &Path,
     pattern: &str,
     path_glob: Option<&str>,
     case_insensitive: bool,
-    max_matches: usize,
-    context_lines: usize,
+    max_matches: Option<usize>,
+    context_lines: Option<usize>,
 ) -> Result<GrepResult, String> {
-    let max_matches = max_matches.clamp(1, GREP_MAX_MAX_MATCHES);
-    let context_lines = context_lines.min(GREP_MAX_CONTEXT_LINES);
+    let max_matches = GREP_MAX_MATCHES.apply(max_matches);
+    let context_lines = GREP_CONTEXT_LINES.apply(context_lines);
     let pattern = pattern.trim();
     if pattern.is_empty() {
         return Err("pattern is required".to_string());
@@ -255,7 +286,7 @@ mod tests {
         write(ws.path(), "artifacts/todo.md", "y");
         write(ws.path(), "artifacts/data.csv", "z");
 
-        let r = glob_files(ws.path(), "artifacts/*.md", 200).unwrap();
+        let r = glob_files(ws.path(), "artifacts/*.md", Some(200)).unwrap();
         assert_eq!(
             r.paths,
             vec!["artifacts/notes.md".to_string(), "artifacts/todo.md".to_string()]
@@ -270,7 +301,7 @@ mod tests {
         write(ws.path(), "apps/foo/sub/index.html", "y");
         write(ws.path(), "apps/bar/main.html", "z");
 
-        let r = glob_files(ws.path(), "apps/**/index.html", 200).unwrap();
+        let r = glob_files(ws.path(), "apps/**/index.html", Some(200)).unwrap();
         assert_eq!(
             r.paths,
             vec![
@@ -288,7 +319,7 @@ mod tests {
         write(ws.path(), "triggers/sub/c.md", "z");
         write(ws.path(), "apps/x/notes.md", "w");
 
-        let r = glob_files(ws.path(), "**/*.md", 200).unwrap();
+        let r = glob_files(ws.path(), "**/*.md", Some(200)).unwrap();
         assert_eq!(r.paths.len(), 4);
         assert!(r.paths.contains(&"artifacts/a.md".to_string()));
         assert!(r.paths.contains(&"knowhow/b.md".to_string()));
@@ -300,7 +331,7 @@ mod tests {
     fn glob_skips_postgres_and_lucidos() {
         let ws = make_workspace();
         // No matches under artifacts/apps/knowhow/triggers — only postgres and .lucidos
-        let r = glob_files(ws.path(), "**/*.txt", 200).unwrap();
+        let r = glob_files(ws.path(), "**/*.txt", Some(200)).unwrap();
         assert!(
             r.paths.is_empty(),
             "should not find files in postgres/ or .lucidos/, got {:?}",
@@ -314,7 +345,7 @@ mod tests {
         for i in 0..10 {
             write(ws.path(), &format!("artifacts/f{:02}.md", i), "x");
         }
-        let r = glob_files(ws.path(), "artifacts/*.md", 3).unwrap();
+        let r = glob_files(ws.path(), "artifacts/*.md", Some(3)).unwrap();
         assert_eq!(r.paths.len(), 3);
         assert!(r.truncated);
         assert_eq!(r.paths[0], "artifacts/f00.md");
@@ -325,8 +356,8 @@ mod tests {
     fn glob_clamps_limit_above_max() {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "x");
-        // limit > GLOB_MAX_LIMIT should be clamped, not error
-        let r = glob_files(ws.path(), "**/*.md", GLOB_MAX_LIMIT * 5).unwrap();
+        // limit > GLOB_LIMIT.max should be clamped, not error
+        let r = glob_files(ws.path(), "**/*.md", Some(GLOB_LIMIT.max * 5)).unwrap();
         assert_eq!(r.paths, vec!["artifacts/a.md".to_string()]);
     }
 
@@ -334,7 +365,7 @@ mod tests {
     fn glob_rejects_path_traversal() {
         let ws = make_workspace();
         for bad in ["../../etc/passwd", "/etc/passwd", "\\windows\\system32"] {
-            let err = glob_files(ws.path(), bad, 200).unwrap_err();
+            let err = glob_files(ws.path(), bad, Some(200)).unwrap_err();
             assert!(
                 err.contains("rejected"),
                 "expected traversal rejection for '{}', got: {}",
@@ -347,7 +378,7 @@ mod tests {
     #[test]
     fn grep_rejects_path_traversal_in_pattern_glob() {
         let ws = make_workspace();
-        let err = grep_files(ws.path(), "x", Some("../../*"), false, 100, 0).unwrap_err();
+        let err = grep_files(ws.path(), "x", Some("../../*"), false, Some(100), Some(0)).unwrap_err();
         assert!(err.contains("rejected"), "got: {}", err);
     }
 
@@ -366,7 +397,7 @@ mod tests {
             )
             .unwrap();
 
-            let r = glob_files(ws.path(), "**/*.md", 200).unwrap();
+            let r = glob_files(ws.path(), "**/*.md", Some(200)).unwrap();
             assert!(
                 r.paths.is_empty(),
                 "should not follow symlink out of data/, got {:?}",
@@ -378,14 +409,14 @@ mod tests {
     #[test]
     fn glob_invalid_pattern_returns_error() {
         let ws = make_workspace();
-        let err = glob_files(ws.path(), "artifacts/[unclosed", 200).unwrap_err();
+        let err = glob_files(ws.path(), "artifacts/[unclosed", Some(200)).unwrap_err();
         assert!(err.contains("Invalid glob"));
     }
 
     #[test]
     fn glob_empty_pattern_returns_error() {
         let ws = make_workspace();
-        let err = glob_files(ws.path(), "  ", 200).unwrap_err();
+        let err = glob_files(ws.path(), "  ", Some(200)).unwrap_err();
         assert!(err.contains("required"));
     }
 
@@ -395,7 +426,7 @@ mod tests {
         write(ws.path(), "artifacts/zebra.md", "x");
         write(ws.path(), "artifacts/apple.md", "y");
         write(ws.path(), "artifacts/middle.md", "z");
-        let r = glob_files(ws.path(), "artifacts/*.md", 200).unwrap();
+        let r = glob_files(ws.path(), "artifacts/*.md", Some(200)).unwrap();
         assert_eq!(
             r.paths,
             vec![
@@ -414,7 +445,7 @@ mod tests {
         write(ws.path(), "artifacts/a.md", "hello world\nsecond line");
         write(ws.path(), "artifacts/b.md", "no match here");
 
-        let r = grep_files(ws.path(), "world", None, false, 100, 0).unwrap();
+        let r = grep_files(ws.path(), "world", None, false, Some(100), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 1);
         assert_eq!(r.matches[0].path, "artifacts/a.md");
         assert_eq!(r.matches[0].line_number, 1);
@@ -428,7 +459,7 @@ mod tests {
     fn grep_case_sensitive_by_default() {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "HELLO\nhello");
-        let r = grep_files(ws.path(), "hello", None, false, 100, 0).unwrap();
+        let r = grep_files(ws.path(), "hello", None, false, Some(100), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 1);
         assert_eq!(r.matches[0].line, "hello");
     }
@@ -437,7 +468,7 @@ mod tests {
     fn grep_case_insensitive_flag_works() {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "HELLO\nhello\nWORLD");
-        let r = grep_files(ws.path(), "hello", None, true, 100, 0).unwrap();
+        let r = grep_files(ws.path(), "hello", None, true, Some(100), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 2);
     }
 
@@ -445,7 +476,7 @@ mod tests {
     fn grep_supports_regex_syntax() {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "TODO: x\nDONE: y\nTODO: z");
-        let r = grep_files(ws.path(), r"^TODO:", None, false, 100, 0).unwrap();
+        let r = grep_files(ws.path(), r"^TODO:", None, false, Some(100), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 2);
         assert_eq!(r.matches[0].line_number, 1);
         assert_eq!(r.matches[1].line_number, 3);
@@ -458,7 +489,7 @@ mod tests {
         write(ws.path(), "apps/bar/page.md", "Hello there");
         write(ws.path(), "artifacts/notes.md", "Hello world");
 
-        let r = grep_files(ws.path(), "Hello", Some("apps/**/*.html"), false, 100, 0).unwrap();
+        let r = grep_files(ws.path(), "Hello", Some("apps/**/*.html"), false, Some(100), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 1);
         assert_eq!(r.matches[0].path, "apps/foo/index.html");
     }
@@ -469,7 +500,7 @@ mod tests {
         let big = "X".repeat((GREP_MAX_FILE_BYTES + 1) as usize);
         write(ws.path(), "artifacts/huge.log", &big);
         write(ws.path(), "artifacts/small.md", "X");
-        let r = grep_files(ws.path(), "X", None, false, 100, 0).unwrap();
+        let r = grep_files(ws.path(), "X", None, false, Some(100), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 1);
         assert_eq!(r.matches[0].path, "artifacts/small.md");
     }
@@ -485,7 +516,7 @@ mod tests {
         std::fs::write(&bin_path, &binary).unwrap();
         write(ws.path(), "artifacts/text.md", "hello text");
 
-        let r = grep_files(ws.path(), "hello", None, false, 100, 0).unwrap();
+        let r = grep_files(ws.path(), "hello", None, false, Some(100), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 1);
         assert_eq!(r.matches[0].path, "artifacts/text.md");
     }
@@ -498,7 +529,7 @@ mod tests {
             content.push_str("hit\n");
         }
         write(ws.path(), "artifacts/a.md", &content);
-        let r = grep_files(ws.path(), "hit", None, false, 3, 0).unwrap();
+        let r = grep_files(ws.path(), "hit", None, false, Some(3), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 3);
         assert!(r.truncated);
     }
@@ -508,7 +539,7 @@ mod tests {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "x");
         // Should clamp without erroring
-        let r = grep_files(ws.path(), "x", None, false, GREP_MAX_MAX_MATCHES * 10, 0).unwrap();
+        let r = grep_files(ws.path(), "x", None, false, Some(GREP_MAX_MATCHES.max * 10), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 1);
     }
 
@@ -520,7 +551,7 @@ mod tests {
             "artifacts/a.md",
             "line1\nline2\nline3 MATCH\nline4\nline5",
         );
-        let r = grep_files(ws.path(), "MATCH", None, false, 100, 2).unwrap();
+        let r = grep_files(ws.path(), "MATCH", None, false, Some(100), Some(2)).unwrap();
         assert_eq!(r.matches.len(), 1);
         let m = &r.matches[0];
         assert_eq!(m.line_number, 3);
@@ -533,7 +564,7 @@ mod tests {
     fn grep_context_clamps_at_file_boundaries() {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "MATCH\nafter");
-        let r = grep_files(ws.path(), "MATCH", None, false, 100, 5).unwrap();
+        let r = grep_files(ws.path(), "MATCH", None, false, Some(100), Some(5)).unwrap();
         let m = &r.matches[0];
         assert!(m.context_before.is_empty(), "no lines before line 1");
         assert_eq!(m.context_after, vec!["after".to_string()]);
@@ -551,32 +582,32 @@ mod tests {
             content.push_str(&format!("after{}\n", i));
         }
         write(ws.path(), "artifacts/a.md", &content);
-        // request 50 — should clamp to GREP_MAX_CONTEXT_LINES (5)
-        let r = grep_files(ws.path(), "MATCH", None, false, 100, 50).unwrap();
+        // request 50 — should clamp to GREP_CONTEXT_LINES.max (5)
+        let r = grep_files(ws.path(), "MATCH", None, false, Some(100), Some(50)).unwrap();
         let m = &r.matches[0];
-        assert_eq!(m.context_before.len(), GREP_MAX_CONTEXT_LINES);
-        assert_eq!(m.context_after.len(), GREP_MAX_CONTEXT_LINES);
+        assert_eq!(m.context_before.len(), GREP_CONTEXT_LINES.max);
+        assert_eq!(m.context_after.len(), GREP_CONTEXT_LINES.max);
     }
 
     #[test]
     fn grep_skips_postgres_and_lucidos_dirs() {
         let ws = make_workspace();
         // Contents are set up by make_workspace; nothing under artifacts/apps/knowhow/triggers
-        let r = grep_files(ws.path(), "secret", None, false, 100, 0).unwrap();
+        let r = grep_files(ws.path(), "secret", None, false, Some(100), Some(0)).unwrap();
         assert!(r.matches.is_empty(), "must not search postgres/ or .lucidos/");
     }
 
     #[test]
     fn grep_invalid_regex_returns_error() {
         let ws = make_workspace();
-        let err = grep_files(ws.path(), "[unclosed", None, false, 100, 0).unwrap_err();
+        let err = grep_files(ws.path(), "[unclosed", None, false, Some(100), Some(0)).unwrap_err();
         assert!(err.contains("Invalid regex"));
     }
 
     #[test]
     fn grep_empty_pattern_returns_error() {
         let ws = make_workspace();
-        let err = grep_files(ws.path(), "  ", None, false, 100, 0).unwrap_err();
+        let err = grep_files(ws.path(), "  ", None, false, Some(100), Some(0)).unwrap_err();
         assert!(err.contains("required"));
     }
 
@@ -584,7 +615,7 @@ mod tests {
     fn grep_invalid_path_glob_returns_error() {
         let ws = make_workspace();
         let err =
-            grep_files(ws.path(), "x", Some("apps/[unclosed"), false, 100, 0).unwrap_err();
+            grep_files(ws.path(), "x", Some("apps/[unclosed"), false, Some(100), Some(0)).unwrap_err();
         assert!(err.contains("Invalid path_glob"));
     }
 
@@ -592,7 +623,7 @@ mod tests {
     fn grep_empty_path_glob_treated_as_none() {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "hello");
-        let r = grep_files(ws.path(), "hello", Some(""), false, 100, 0).unwrap();
+        let r = grep_files(ws.path(), "hello", Some(""), false, Some(100), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 1);
     }
 
@@ -603,7 +634,7 @@ mod tests {
         let prefix = "x".repeat(GREP_MAX_LINE_CHARS + 500);
         let line = format!("{}MATCH{}", prefix, "y".repeat(500));
         write(ws.path(), "artifacts/a.md", &line);
-        let r = grep_files(ws.path(), "MATCH", None, false, 100, 0).unwrap();
+        let r = grep_files(ws.path(), "MATCH", None, false, Some(100), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 1);
         let returned = &r.matches[0].line;
         assert!(
@@ -625,7 +656,7 @@ mod tests {
         let big = "z".repeat(GREP_MAX_LINE_CHARS + 200);
         let content = format!("{}\nMATCH\n{}", big, big);
         write(ws.path(), "artifacts/a.md", &content);
-        let r = grep_files(ws.path(), "MATCH", None, false, 100, 1).unwrap();
+        let r = grep_files(ws.path(), "MATCH", None, false, Some(100), Some(1)).unwrap();
         assert_eq!(r.matches.len(), 1);
         let m = &r.matches[0];
         assert_eq!(m.context_before.len(), 1);
@@ -644,7 +675,7 @@ mod tests {
     fn grep_short_lines_not_truncated() {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "short MATCH line\nbefore\nMATCH again");
-        let r = grep_files(ws.path(), "MATCH", None, false, 100, 1).unwrap();
+        let r = grep_files(ws.path(), "MATCH", None, false, Some(100), Some(1)).unwrap();
         for m in &r.matches {
             assert!(
                 !m.line.ends_with('…'),
@@ -669,7 +700,7 @@ mod tests {
             content.push('\n');
         }
         write(ws.path(), "artifacts/a.md", &content);
-        let r = grep_files(ws.path(), "MATCH", None, false, 500, 0).unwrap();
+        let r = grep_files(ws.path(), "MATCH", None, false, Some(500), Some(0)).unwrap();
         assert!(r.truncated, "expected total-bytes cap to trip");
         let total_bytes: usize = r
             .matches
@@ -703,7 +734,7 @@ mod tests {
         // verifies we don't drop the first match even if it would push us over).
         let line = format!("{} MATCH", "p".repeat(GREP_MAX_LINE_CHARS - 10));
         write(ws.path(), "artifacts/a.md", &line);
-        let r = grep_files(ws.path(), "MATCH", None, false, 100, 0).unwrap();
+        let r = grep_files(ws.path(), "MATCH", None, false, Some(100), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 1, "first match must always be returned");
     }
 
@@ -714,7 +745,7 @@ mod tests {
         let prefix = "ñ".repeat(GREP_MAX_LINE_CHARS + 100);
         let line = format!("{}MATCH", prefix);
         write(ws.path(), "artifacts/a.md", &line);
-        let r = grep_files(ws.path(), "MATCH", None, false, 100, 0).unwrap();
+        let r = grep_files(ws.path(), "MATCH", None, false, Some(100), Some(0)).unwrap();
         assert_eq!(r.matches.len(), 1);
         let returned = &r.matches[0].line;
         assert!(returned.ends_with('…'));
@@ -722,5 +753,47 @@ mod tests {
             returned.chars().count() <= GREP_MAX_LINE_CHARS + 1,
             "char-aware truncation should respect codepoint boundaries"
         );
+    }
+
+    // -------- default resolution (None → ClampBounds default) --------
+    // These guard the unification: the default for an absent arg now lives in
+    // the pure fn (via ClampBounds), not in the dispatch handler. None must
+    // resolve to the documented default, not the clamp minimum.
+
+    #[test]
+    fn glob_none_limit_resolves_to_default() {
+        let ws = make_workspace();
+        write(ws.path(), "artifacts/a.md", "x");
+        write(ws.path(), "artifacts/b.md", "y");
+        // Absent arg (None) must behave like an explicit Some(default): return
+        // the whole small set without truncating to the clamp minimum.
+        let none = glob_files(ws.path(), "artifacts/*.md", None).unwrap();
+        let default = glob_files(ws.path(), "artifacts/*.md", Some(GLOB_LIMIT.default)).unwrap();
+        assert_eq!(none.paths, default.paths);
+        assert_eq!(none.paths.len(), 2);
+        assert!(!none.truncated);
+    }
+
+    #[test]
+    fn grep_none_args_resolve_to_defaults() {
+        let ws = make_workspace();
+        write(ws.path(), "artifacts/a.md", "before\nMATCH\nafter");
+        // Absent max_matches/context_lines (None) must resolve to the defaults
+        // (100 matches, 0 context lines), matching an explicit Some(default).
+        let none = grep_files(ws.path(), "MATCH", None, false, None, None).unwrap();
+        let default = grep_files(
+            ws.path(),
+            "MATCH",
+            None,
+            false,
+            Some(GREP_MAX_MATCHES.default),
+            Some(GREP_CONTEXT_LINES.default),
+        )
+        .unwrap();
+        assert_eq!(none.matches.len(), 1);
+        assert_eq!(none.matches.len(), default.matches.len());
+        // context_lines default is 0 → no surrounding context captured.
+        assert!(none.matches[0].context_before.is_empty());
+        assert!(none.matches[0].context_after.is_empty());
     }
 }

@@ -1,17 +1,22 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, animationSpeed, speedMultiplier, repositories } from '../../store/store';
+import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, animationSpeed, speedMultiplier, repositories } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, toggleDevicePush, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCaptureContext, setCaptureContext, currentMobileHeaderSticky, setMobileHeaderSticky, type Theme, type FontFamily } from '../../store/actions/preferences';
+import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCaptureContext, setCaptureContext, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/scaleModalState';
 import { formatDateTime } from '../../utils/formatTime';
 import { loadOAuthAccounts, disconnectOAuthAccount, grantOAuthScope } from '../../store/actions/oauth';
 import { initPushSubscription } from '../../store/actions/push';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import { MODELS, availableReasoningLevels } from '../../store/models';
+import { availableReasoningLevels } from '../../store/models';
+import { chatModelOptions, loadChatModels } from '../../store/actions/models';
+import { ModelsManager } from './ModelsManager';
+import { AnthropicProviderSettings } from './AnthropicProviderSettings';
+import { OpenAiProviderSettings } from './OpenAiProviderSettings';
 import { Dropdown } from '../shared/Dropdown';
 import { MemoryInspector } from './MemoryInspector';
 import { BackupSection } from './BackupSection';
-import { CcAllowedToolsSection } from './CcAllowedToolsSection';
+import { AllowlistEditor } from './AllowlistEditor';
+import { getCcAllowedTools, putCcAllowedTools, getAgentAllowedCommands, putAgentAllowedCommands } from '../../api/client';
 import { KeyboardShortcutsSection } from './KeyboardShortcutsSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { ChevronRightIcon } from '../shared/icons';
@@ -56,6 +61,37 @@ function formatScopes(scopes: string): string {
     .join(', ');
 }
 
+/** A toggle switch backed by a `Loadable` preference. Until the preference has
+ *  loaded it renders a neutral placeholder pill — NOT a definite on/off position
+ *  — so the persisted value mounts in its final spot instead of animating across
+ *  from the loading default on every page reload (the `.toggle-slider` knob has a
+ *  0.2s transition that would otherwise visibly slide off→on). CSS transitions
+ *  don't fire on initial mount, so a freshly-mounted checked toggle lands
+ *  silently. The placeholder is a `<span>` (not the real `<label>`) so Preact
+ *  replaces the whole subtree when `loaded` flips — guaranteeing the fresh mount
+ *  rather than an in-place `checked` update that would animate. */
+function LoadableToggle(props: {
+  loaded: boolean;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  if (!props.loaded) {
+    return <span class="toggle-switch toggle-switch-loading" aria-hidden="true" />;
+  }
+  return (
+    <label class={`toggle-switch${props.disabled ? ' toggle-switch-disabled' : ''}`}>
+      <input
+        type="checkbox"
+        checked={props.checked}
+        disabled={props.disabled}
+        onChange={(e) => props.onChange((e.currentTarget as HTMLInputElement).checked)}
+      />
+      <span class="toggle-slider" />
+    </label>
+  );
+}
+
 const THEMES: Array<{ value: Theme; label: string }> = [
   { value: 'light', label: 'Light' },
   { value: 'dark', label: 'Dark' },
@@ -78,14 +114,17 @@ const IMAGE_MODELS = [
   { value: 'gpt-image-2', label: 'GPT Image 2' },
 ];
 
+// Curated cheap/fast models for auxiliary background work (title generation,
+// image description, memory extraction, command judge). Deliberately a small
+// list separate from the full chat registry — these run on every turn, so the
+// options are the low-cost tiers. GPT-5.4 mini is the OpenAI option — the
+// Flash/Haiku-class peer of the others (not the flagship GPT-5.4 Standard);
+// routed via the MemoryExtractor's gpt-* prefix when picked.
 const BACKGROUND_MODELS = [
   { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
-  { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
-  { value: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite' },
-  { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' },
   { value: 'claude-haiku-4-5', label: 'Haiku 4.5' },
-  { value: 'claude-3-5-haiku@20241022', label: 'Haiku 3.5' },
+  { value: 'gpt-5.4-mini', label: 'GPT-5.4 mini' },
 ];
 
 function parseUserAgent(ua: string | null): string {
@@ -352,6 +391,12 @@ export function SettingsView() {
   }, []);
 
   useEffect(() => {
+    if (chatModels.value.status === 'not-loaded') {
+      void loadChatModels();
+    }
+  }, []);
+
+  useEffect(() => {
     // Mirrors the devices/credentials/oauth effects above. Previously this
     // ran inside `repositoriesSection()`'s render body, which fires a
     // setState during render and trips preact lint.
@@ -564,6 +609,89 @@ export function SettingsView() {
     );
   }
 
+  function commandSafetySection() {
+    // Parent master (`command_guard`) gates the whole feature; the children
+    // (LLM judge on/off + judge model) are independent but only take effect —
+    // and are only enabled — while the master is on.
+    // `command_guard` / `command_guard_judge` default to a definite value while
+    // `preferences` is still loading; gate the toggles on the loaded status so
+    // they mount in their persisted position rather than animating across on
+    // reload (see `LoadableToggle`).
+    const loaded = preferences.value.status === 'loaded';
+    const guardOn = currentCommandGuard();
+    const judgeOn = currentCommandGuardJudge();
+    return (
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="command-safety">Command Safety</div>
+        <div class="settings-row" data-search-anchor="command-safety:guard">
+          <span class="settings-row-label">Command guard</span>
+          <LoadableToggle
+            loaded={loaded}
+            checked={guardOn}
+            onChange={(c) => void setCommandGuard(c)}
+          />
+        </div>
+        <div class="settings-row settings-row-child" data-search-anchor="command-safety:judge">
+          <span class="settings-row-label">LLM judge</span>
+          <LoadableToggle
+            loaded={loaded}
+            checked={judgeOn}
+            disabled={!guardOn}
+            onChange={(c) => void setCommandGuardJudge(c)}
+          />
+        </div>
+        <div class="settings-row settings-row-child" data-search-anchor="command-safety:judge-model">
+          <span class="settings-row-label">Judge model</span>
+          <Dropdown
+            options={BACKGROUND_MODELS}
+            value={currentBackgroundModel('model_command_judge')}
+            onChange={(v) => void setBackgroundModel('model_command_judge', v)}
+            disabled={!guardOn || !judgeOn}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  /** Permissions subview: the Command Safety guard plus the two per-agent
+   *  command/tool allowlists, each an editable + deletable list. */
+  function permissionsSection() {
+    return (
+      <>
+        {commandSafetySection()}
+        <AllowlistEditor
+          title="Lucidos Agent permissions"
+          anchor="permissions:lucidos"
+          noun="command permissions"
+          placeholder="Bash(git:*)"
+          load={getAgentAllowedCommands}
+          save={putAgentAllowedCommands}
+          description={
+            <>
+              Commands the Lucidos Agent may run without asking when the command guard is on.
+              Patterns: <code>Bash(&lt;first-token&gt;:*)</code> e.g. <code>Bash(git:*)</code>, <code>Bash</code> (any shell), <code>Python</code> (any Python).
+              Use the <strong>Always allow</strong> buttons on a command prompt to add entries quickly. Edits apply to the next command — no restart.
+            </>
+          }
+        />
+        <AllowlistEditor
+          title="Claude Code permissions"
+          anchor="permissions:claude-code"
+          noun="tool permissions"
+          placeholder="Bash(npm:*)"
+          load={getCcAllowedTools}
+          save={putCcAllowedTools}
+          description={
+            <>
+              Patterns passed to Claude Code as <code>--allowedTools</code>.
+              Use the <strong>Always allow</strong> buttons on permission prompts to add entries quickly. Changes apply to new Claude Code sessions.
+            </>
+          }
+        />
+      </>
+    );
+  }
+
   function modelsSection() {
     return (
       <>
@@ -572,7 +700,7 @@ export function SettingsView() {
           <div class="settings-row">
             <span class="settings-row-label">Model</span>
             <Dropdown
-              options={MODELS}
+              options={chatModelOptions()}
               value={currentModel.value}
               onChange={(v) => void setCurrentModel(v)}
             />
@@ -639,6 +767,12 @@ export function SettingsView() {
           </div>
         </div>
         <VertexRegionSetting />
+        <div class="settings-section">
+          <div class="settings-section-title" data-search-anchor="models:providers">Providers</div>
+          <AnthropicProviderSettings />
+          <OpenAiProviderSettings />
+        </div>
+        <ModelsManager />
       </>
     );
   }
@@ -727,7 +861,7 @@ export function SettingsView() {
       case 'accounts': return accountsSection();
       case 'backup': return <BackupSection />;
       case 'repositories': return repositoriesSection();
-      case 'tool-permissions': return <CcAllowedToolsSection />;
+      case 'permissions': return permissionsSection();
       case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
       case 'disk-usage': return <DiskUsagePage />;
       default: return null;

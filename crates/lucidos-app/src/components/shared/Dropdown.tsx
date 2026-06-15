@@ -1,15 +1,22 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { isTauri } from '../../utils/platform';
 import { hidePanelWebview, showPanelWebview } from '../../utils/tauri';
-import { useDismissOnOutside, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { Overlay } from './Overlay';
 
 export interface DropdownOption {
   value: string;
   label: string;
   /** Non-selectable section header. Renders dimmer + ignores click / keyboard
-   *  select. Use to group options inside a flat list (e.g. compose-view scope
-   *  picker grouping Lucidos / external repos / apps). */
+   *  select. Use to group options inside a flat list (e.g. the compose
+   *  destination picker grouping coding targets under "Coding agent on…"). */
   disabled?: boolean;
+  /** Optional second line rendered muted under the label in the open menu.
+   *  Not part of the trigger sizing — only labels feed `.dropdown-sizer`. */
+  description?: string;
+  /** Error styling for a (usually disabled) row — a failed load must look
+   *  different from an empty group (frontend.md "No Hidden Errors"). */
+  danger?: boolean;
 }
 
 interface DropdownProps {
@@ -86,12 +93,6 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
     }
     setDraftValue(trimmed || lastCommittedRef.current);
   }
-
-  // Trigger button and menu both live inside the wrapper ref, so it acts as
-  // both panel and anchor — re-clicking the trigger is "inside" and routes
-  // through its own onClick toggle. The Tauri panel-webview hide/show stays
-  // as its own effect, scoped to the same open-gate.
-  useDismissOnOutside(open, ref, null, closeDropdown);
 
   useEffect(() => {
     if (!open || !isTauri()) return;
@@ -234,19 +235,22 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
           <span class="dropdown-chevron">{open ? '▴' : '▾'}</span>
         </button>
       )}
-      {anchor && (
-        <div
-          class="dropdown-menu"
-          ref={menuRef}
-          style={pos
-            ? {
-                position: 'fixed',
-                top: `${pos.top}px`,
-                left: `${pos.left}px`,
-                minWidth: `${anchor.getBoundingClientRect().width}px`,
-              }
-            : { visibility: 'hidden' }}
-        >
+      <Overlay
+        open={open}
+        onClose={closeDropdown}
+        anchor={ref.current}
+        backdrop={false}
+        panelClass="dropdown-menu"
+        panelRef={menuRef}
+        panelStyle={anchor && pos
+          ? {
+              position: 'fixed',
+              top: `${pos.top}px`,
+              left: `${pos.left}px`,
+              minWidth: `${anchor.getBoundingClientRect().width}px`,
+            }
+          : { visibility: 'hidden' }}
+      >
           {filterable && !freeText && (
             <input
               ref={filterRef}
@@ -264,7 +268,10 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
           {filtered.map((o, i) => (
             <div
               key={o.value}
-              class={`dropdown-option${o.value === value ? ' active' : ''}${i === focusedIndex ? ' focused' : ''}${o.disabled ? ' dropdown-option-header' : ''}`}
+              // `danger` suppresses the header look (uppercase/letter-spacing)
+              // even when the row is also `disabled` — an error row is prose,
+              // not a section heading.
+              class={`dropdown-option${o.value === value ? ' active' : ''}${i === focusedIndex ? ' focused' : ''}${o.disabled && !o.danger ? ' dropdown-option-header' : ''}${o.danger ? ' dropdown-option-danger' : ''}`}
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
                 if (o.disabled) return;
@@ -273,11 +280,16 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
                 inputRef.current?.blur();
               }}
             >
-              {o.label}
+              {/* One DOM shape for every option: label always wrapped, so
+                  per-caller ellipsis/styling rules don't fork on whether a
+                  description is present. */}
+              <div class="dropdown-option-label">{o.label}</div>
+              {o.description !== undefined && (
+                <div class="dropdown-option-description">{o.description}</div>
+              )}
             </div>
           ))}
-        </div>
-      )}
+      </Overlay>
     </div>
   );
 }

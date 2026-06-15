@@ -1,9 +1,10 @@
-import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, updateAvailable, restartGroups, applyingChangeIds, toasts, engineRestarting, engineVersion, latestEngineVersion } from '../store';
+import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, updateAvailable, restartGroups, applyingChangeIds, applyAllInProgress, toasts, engineRestarting, engineVersion, latestEngineVersion } from '../store';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
 import type { RestartGroup } from '../store';
-import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, restartEngine, ApiError } from '../../api/client';
+import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, cancelApplyAllChanges as apiCancelApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, restartEngine, ApiError } from '../../api/client';
 import { isNewerVersion } from '../../utils/version';
+import { refreshClient } from '../../hooks/sw-update';
 import { errorDetail } from '../../utils/errorDetail';
 import { focusThread } from './threads';
 import { formatThreadLabel } from './thread-label';
@@ -30,7 +31,11 @@ export function appliedToastRefreshAction(
   clientUpdate: boolean,
 ): ToastAction | undefined {
   if (!clientUpdate || requiresRestart) return undefined;
-  return { label: 'Refresh', onClick: () => window.location.reload() };
+  // SW-aware refresh: a bare reload keeps the current service worker, so it
+  // won't pick up the new sw.js (and the cache-first /assets/* graph can serve
+  // stale code). refreshClient() checks for the new sw.js and reloads once it
+  // controls the page.
+  return { label: 'Refresh', onClick: () => refreshClient() };
 }
 
 /** Check if any applied change with frontend files was resolved after the page loaded.
@@ -102,7 +107,10 @@ const RESTART_TOAST_MESSAGE = 'Engine restart required to apply changes.';
 export async function initiateEngineRestart(): Promise<void> {
   engineRestarting.value = true;
   // dismissable: false — see ToastItem.dismissable.
-  showToast('Restarting engine...', 'info', { key: RESTART_TOAST_KEY, spinning: true, dismissable: false });
+  // showDuringRestart: true — this is the one toast allowed while engineRestarting
+  // is set; without it the central suppression in showToast would eat its own
+  // status banner.
+  showToast('Restarting engine...', 'info', { key: RESTART_TOAST_KEY, spinning: true, dismissable: false, showDuringRestart: true });
   try {
     await restartEngine();
   } catch (e) {
@@ -247,8 +255,10 @@ export async function applySingleChange(id: string): Promise<void> {
     if (result.status === 'hardening') {
       // Hardening recovery: backend spawned a hardening session that will auto-apply.
       // Track the change as "applying" so ChangesPanel shows persistent state.
+      // The user-facing toast is fired by the MissingHardeningDetected SSE
+      // handler (thread-sync.ts) — like merge conflict, so it surfaces uniformly
+      // across Apply Now / Apply All / recovery and doesn't double-fire here.
       applyingChangeIds.value = new Set([...applyingChangeIds.value, id]);
-      showToast('Hardening in progress — change will apply automatically after hardening.', 'info');
     }
   } catch (e) {
     showToast(errorDetail(e) || 'Failed to apply change', 'error');
@@ -266,8 +276,20 @@ export async function discardSingleChange(id: string): Promise<void> {
 
 /** Apply all changes. */
 export async function applyAllChanges(): Promise<void> {
+  // Optimistic busy state: the batch applies the first change synchronously and
+  // drives the rest in the background — including a multi-minute pause while it
+  // hardens an unhardened member — so reflect "in progress" the instant the
+  // user clicks. ApplyAllBatchCompleted (SSE) clears it; an immediate HTTP
+  // error clears it in the catch below. Set before the await so a double-click
+  // can't fire a second batch in the click→SSE gap.
+  applyAllInProgress.value = true;
   try {
     const result = await apiApplyAll();
+    // When the first change needs hardening (status === 'hardening'), the
+    // MissingHardeningDetected SSE handler (thread-sync.ts) fires the toast —
+    // uniform with merge conflict and single Apply, no double-fire here. The
+    // bulk button stays "Applying..." for the whole wait via applyAllInProgress
+    // until ApplyAllBatchCompleted (SSE) clears it.
     const conflictThreadId = result.conflict_thread_id;
     if (conflictThreadId) {
       // Backend stopped at a conflict — surface the same toast as Apply Now.
@@ -283,7 +305,25 @@ export async function applyAllChanges(): Promise<void> {
       );
     }
   } catch (e) {
+    // No batch was started — drop the optimistic busy state so the button
+    // doesn't stay stuck on "Applying...".
+    applyAllInProgress.value = false;
     showToast(errorDetail(e) || 'Failed to apply changes', 'error');
+  }
+}
+
+/** Cancel the running Apply All batch (from the sticky batch toast). Aborts the
+ *  in-flight hardening/merge and stops applying the rest; already-applied
+ *  changes stay applied, the remainder return to pending. The
+ *  ApplyAllBatchCompleted SSE clears `applyAllInProgress` and dismisses the
+ *  toast — here we optimistically swap the toast to "Canceling..." (replacing
+ *  the Cancel action so a second click can't fire) for immediate feedback. */
+export async function cancelApplyAllBatch(): Promise<void> {
+  showToast('Canceling apply...', 'info', { key: 'apply-all-batch', spinning: true, dismissable: false });
+  try {
+    await apiCancelApplyAll();
+  } catch (e) {
+    showToast(errorDetail(e) || 'Failed to cancel apply', 'error');
   }
 }
 

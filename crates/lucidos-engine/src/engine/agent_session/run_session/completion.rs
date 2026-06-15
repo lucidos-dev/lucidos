@@ -45,9 +45,11 @@ impl LucidosEngine {
         agent_cancel: &tokio_util::sync::CancellationToken,
         emitted_terminal_event: bool,
         watchdog_fired: bool,
+        killed_by_signal: bool,
         last_emitted_idle: bool,
         is_external_repo: bool,
         mut proposed_change: bool,
+        coding_agent: crate::runtime::CodingAgent,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         // Mark exited before emitting terminal events — forces follow-ups arriving
         // after the event loop exits to spawn a new session instead of routing to
@@ -68,18 +70,27 @@ impl LucidosEngine {
         // Safety net: CC's event loop ended without a natural terminator.
         // The decision tree is pinned by `safety_net_action` (lifecycle.rs):
         //   - watchdog_fired → ContinuationRequested (auto-recovery, user never knew)
+        //   - stray signal-kill (no engine cancel) → ContinuationRequested (auto-resume)
         //   - else           → ResponseAborted(SafetyNet) (red dot, user notified)
         //   - external terminal already emitted → Skip (don't relabel)
         // The cleanup path below reads `safety_net_fired` and skips
         // propose_change either way so partial commits don't surface as an
         // Apply card.
         let safety_net_fired = !emitted_terminal_event;
+        // The engine deliberately cancelled this session (user Stop, shutdown,
+        // restart, eviction, stale-resume) when its token is already tripped at
+        // the safety-net decision point — finalize cancels it only later (below).
+        // Gates the stray-signal auto-resume so our own teardown SIGKILL isn't
+        // mistaken for an external kill.
+        let engine_cancelled = agent_cancel.is_cancelled();
         if safety_net_fired {
             log!(
-                "[ClaudeCode] safety net firing for thread {} — buffered_text_len={}, watchdog_fired={}",
+                "[ClaudeCode] safety net firing for thread {} — buffered_text_len={}, watchdog_fired={}, killed_by_signal={}, engine_cancelled={}",
                 thread_id,
                 claude_text_buf.len(),
                 watchdog_fired,
+                killed_by_signal,
+                engine_cancelled,
             );
         }
         let external_already = Self::external_terminal_already_emitted(
@@ -91,6 +102,8 @@ impl LucidosEngine {
             safety_net_fired,
             watchdog_fired,
             external_already,
+            killed_by_signal,
+            engine_cancelled,
         ) {
             crate::engine::agent_session::lifecycle::SafetyNetAction::Nothing
             | crate::engine::agent_session::lifecycle::SafetyNetAction::Skip => {}
@@ -511,6 +524,7 @@ impl LucidosEngine {
                                             worktree_path: worktree_path.as_deref(),
                                         },
                                         meta,
+                                        coding_agent,
                                     )
                                     .await;
                                 }

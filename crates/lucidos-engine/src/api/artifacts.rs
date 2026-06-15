@@ -170,3 +170,10 @@ pub(super) fn read_file_at_commit(
     let blob = repo.find_blob(entry.id())?;
     Ok(blob.content().to_vec())
 }
+
+/// Routes for the `/commits*` surface (artifact git history).
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/commits", get(list_commits))
+        .route("/commits/before", get(get_commit_at_timestamp))
+}

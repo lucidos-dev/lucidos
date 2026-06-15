@@ -36,6 +36,44 @@ fn todo_write_is_in_chat_agent_default_tools() {
     );
 }
 
+#[test]
+fn load_knowhow_schema_example_resolves_to_shipped_knowhow() {
+    let tools = get_default_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == tn::LOAD_KNOWHOW)
+        .expect("load_knowhow must be in the default chat tool set");
+    let id_description = tool
+        .parameters
+        .get("properties")
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.get("description"))
+        .and_then(|v| v.as_str())
+        .expect("load_knowhow.id must have a description");
+
+    let removed_workspace_specific_example = ["lucidos", "cross-workspace"].join("/");
+    assert!(
+        !id_description.contains(&removed_workspace_specific_example),
+        "schema must not point at the removed workspace-specific example: {id_description:?}"
+    );
+
+    let example = "system-knowhow/best-practices";
+    assert!(
+        id_description.contains(example),
+        "schema should advertise a shipped knowhow example, got: {id_description:?}"
+    );
+
+    let system_id = example
+        .strip_prefix(crate::core::knowhow::SYSTEM_KNOWHOW_PREFIX)
+        .expect("example must use the system knowhow prefix");
+    let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+    let doc = crate::core::SystemKnowhowStore::load(&repo.join("system-knowhow"), system_id);
+    assert!(
+        doc.is_some(),
+        "load_knowhow schema example must resolve to a shipped system knowhow doc"
+    );
+}
+
 /// The chat agent's `ask_user_question` MUST expose the same schema CC's
 /// `AskUserQuestion` does, because the same engine-side parser
 /// (`parse_ask_user_question_inputs`) consumes both. Drift here would make
@@ -426,6 +464,61 @@ fn apply_change_requires_change_id_and_list_changes_requires_nothing() {
     assert!(
         list_required.is_empty(),
         "list_changes must require no args, got: {list_required:?}"
+    );
+}
+
+/// Thread Queue policy changes need a typed in-process tool. Without this
+/// surface, the LLM falls back to `curl` / `http_request` against local engine
+/// ports and then tries to read temp files, which is brittle and poorly
+/// attributed.
+#[test]
+fn thread_queue_tools_are_registered_and_policy_patch_is_partial() {
+    let tools = get_default_tools();
+    for name in [tn::LIST_THREAD_QUEUE, tn::UPDATE_THREAD_QUEUE_POLICY] {
+        assert!(
+            tools.iter().any(|t| t.name == name),
+            "{name} must be registered in get_default_tools()",
+        );
+    }
+
+    let update = tools
+        .iter()
+        .find(|t| t.name == tn::UPDATE_THREAD_QUEUE_POLICY)
+        .expect("update_thread_queue_policy must be in the default chat tool set");
+    assert_eq!(
+        update
+            .parameters
+            .get("minProperties")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "update_thread_queue_policy must require at least one patched field"
+    );
+    let props = update
+        .parameters
+        .get("properties")
+        .expect("update_thread_queue_policy must declare properties");
+    for field in [
+        "max_concurrent_total",
+        "max_concurrent_event_trigger",
+        "max_concurrent_cron",
+        "max_concurrent_sub_thread",
+        "max_concurrent_coding_agent",
+        "max_concurrent_per_trigger",
+        "max_queued_per_trigger",
+        "reserved_background",
+        "overflow",
+    ] {
+        assert!(
+            props.get(field).is_some(),
+            "update_thread_queue_policy schema missing `{field}`"
+        );
+    }
+    assert!(
+        update
+            .description
+            .contains("Only fields you provide are changed"),
+        "description must steer the LLM away from full-policy resets: {:?}",
+        update.description
     );
 }
 

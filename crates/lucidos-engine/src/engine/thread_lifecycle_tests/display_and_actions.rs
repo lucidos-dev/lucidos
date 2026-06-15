@@ -1,20 +1,20 @@
 use super::*;
 
-// 16. running_status_maps_to_running
+// 16. running_status_maps_to_current
 #[test]
-fn running_status_maps_to_running() {
+fn running_status_maps_to_current() {
     assert_eq!(
         display_section(ArchiveState::Archived, ThreadStatus::Running, false, false, false, false),
-        DisplaySection::Active
+        DisplaySection::Current
     );
 }
 
-// 17. inbox_maps_to_review
+// 17. inbox_maps_to_current
 #[test]
-fn inbox_maps_to_review() {
+fn inbox_maps_to_current() {
     assert_eq!(
         display_section(ArchiveState::Inbox, ThreadStatus::Idle, false, false, false, false),
-        DisplaySection::Review
+        DisplaySection::Current
     );
 }
 
@@ -45,12 +45,12 @@ fn archived_idle_not_saved_maps_to_archive() {
     );
 }
 
-// 21. active_children_idle_maps_to_active — Waiting was folded into Active
+// 21. active_children_idle_maps_to_current — running/waiting/delegated child work all surface in Current
 #[test]
-fn active_children_idle_maps_to_active() {
+fn active_children_idle_maps_to_current() {
     assert_eq!(
         display_section(ArchiveState::Archived, ThreadStatus::Idle, false, true, false, false),
-        DisplaySection::Active
+        DisplaySection::Current
     );
 }
 
@@ -63,42 +63,42 @@ fn active_children_saved_still_saved() {
     );
 }
 
-// 22a. running_with_active_children_stays_active
+// 22a. running_with_active_children_stays_current
 #[test]
-fn running_with_active_children_stays_active() {
+fn running_with_active_children_stays_current() {
     assert_eq!(
         display_section(ArchiveState::Archived, ThreadStatus::Running, false, true, false, false),
-        DisplaySection::Active
+        DisplaySection::Current
     );
 }
 
-// 22b. inbox_with_active_children_maps_to_active
+// 22b. inbox_with_active_children_maps_to_current
 #[test]
-fn inbox_with_active_children_maps_to_active() {
+fn inbox_with_active_children_maps_to_current() {
     assert_eq!(
         display_section(ArchiveState::Inbox, ThreadStatus::Idle, false, true, false, false),
-        DisplaySection::Active
+        DisplaySection::Current
     );
 }
 
-// 22c. inbox_idle_no_children_maps_to_review
+// 22c. inbox_idle_no_children_maps_to_current
 #[test]
-fn inbox_idle_no_children_maps_to_review() {
+fn inbox_idle_no_children_maps_to_current() {
     assert_eq!(
         display_section(ArchiveState::Inbox, ThreadStatus::Idle, false, false, false, false),
-        DisplaySection::Review
+        DisplaySection::Current
     );
 }
 
-// 22d. archived_with_pending_changes_routes_to_review — pending changes
+// 22d. archived_with_pending_changes_routes_to_current — pending changes
 //      outrank archive so users can never lose unresolved work behind the
 //      archive curtain. Once the user resolves all pending changes, the
 //      thread settles into Archive (covered by 20).
 #[test]
-fn archived_with_pending_changes_routes_to_review() {
+fn archived_with_pending_changes_routes_to_current() {
     assert_eq!(
         display_section(ArchiveState::Archived, ThreadStatus::Idle, false, false, true, false),
-        DisplaySection::Review
+        DisplaySection::Current
     );
 }
 
@@ -113,19 +113,19 @@ fn saved_overrides_pending() {
     );
 }
 
-// 22f. running_overrides_pending — Active wins so live work isn't masked
+// 22f. running_overrides_pending — running keeps it in Current so live work isn't masked
 //      by a pending change row carried in from a previous turn.
 #[test]
 fn running_overrides_pending() {
     assert_eq!(
         display_section(ArchiveState::Archived, ThreadStatus::Running, false, false, true, false),
-        DisplaySection::Active
+        DisplaySection::Current
     );
 }
 
-// 22g. attention_descendant_overrides_active — REVIEW-bubble rule: if any
+// 22g. attention_descendant_overrides_active — attention-bubble rule: if any
 //      descendant needs user attention (WFUA, or CC with pending changes),
-//      the parent surfaces in Review even when sibling work is still running
+//      the parent surfaces in Current even when sibling work is still running
 //      locally OR via has_active_children. Otherwise the permission card
 //      would only be reachable via the child's own row.
 #[test]
@@ -139,13 +139,13 @@ fn attention_descendant_overrides_active() {
             false,
             true, // has_attention_descendants
         ),
-        DisplaySection::Review
+        DisplaySection::Current
     );
 }
 
 // 22h. attention_descendant_overrides_running — even when the thread is
 //      mid-turn (Running), an attention-needing descendant still bubbles
-//      to REVIEW. Symmetric with 22g via the local-Running route.
+//      to Current. Symmetric with 22g via the local-Running route.
 #[test]
 fn attention_descendant_overrides_running() {
     assert_eq!(
@@ -157,13 +157,13 @@ fn attention_descendant_overrides_running() {
             false,
             true,
         ),
-        DisplaySection::Review
+        DisplaySection::Current
     );
 }
 
 // 22i. attention_descendant_overrides_archive — same archive-curtain rule
 //      as has_pending_changes: a thread the user archived must still
-//      surface in Review while a descendant needs attention, so the
+//      surface in Current while a descendant needs attention, so the
 //      attention card isn't lost behind the curtain.
 #[test]
 fn attention_descendant_overrides_archive() {
@@ -176,7 +176,7 @@ fn attention_descendant_overrides_archive() {
             false,
             true,
         ),
-        DisplaySection::Review
+        DisplaySection::Current
     );
 }
 
@@ -448,10 +448,10 @@ fn cc_archived_no_changes_shows_only_save() {
 
 #[test]
 fn cc_archived_with_pending_changes_shows_apply_discard() {
-    // display_section surfaces archived+pending threads in Review specifically
+    // display_section surfaces archived+pending threads in Current specifically
     // so the user can never lose unresolved work behind the archive curtain.
     // available_thread_actions must keep the action set in sync — otherwise the
-    // user sees the thread in Review with dots but has no buttons to resolve it.
+    // user sees the thread in Current with dots but has no buttons to resolve it.
     let actions = available_thread_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,

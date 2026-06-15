@@ -1,9 +1,10 @@
-import { preferences, showToast, notificationsFilter, currentModel, reasoningEffort } from '../store';
+import { preferences, showToast, notificationsFilter, currentModel, reasoningEffort, selectedCodingAgent } from '../store';
+import type { CodingAgent } from '../../api/types';
 import { toFailed } from '../types';
 import { getPreferences, setPreference } from '../../api/client';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
-import { MODELS, REASONING_LEVELS, clampReasoningEffort, DEFAULT_CHAT_MODEL } from '../models';
+import { REASONING_LEVELS, clampReasoningEffort, DEFAULT_CHAT_MODEL } from '../models';
 import { isIOS } from '../../utils/platform';
 
 export type Theme = 'light' | 'dark' | 'system';
@@ -229,11 +230,16 @@ export function currentNotificationsFilter(): 'all' | 'unread' {
 
 // --- Chat model & reasoning effort ---
 
-const MODEL_VALUES = MODELS.map(m => m.value);
 const REASONING_VALUES = REASONING_LEVELS.map(l => l.value);
 
+/** The user's chat model preference. Unlike most preferences this is NOT
+ *  validated against a fixed allow-list — the model set is now the DB-backed
+ *  registry (user-extensible), and `RoutingProvider` resolves any id (with a
+ *  prefix fallback), so any stored non-empty value is honored. */
 export function currentChatModel(): string {
-  return currentPreference('chat_model', MODEL_VALUES, DEFAULT_CHAT_MODEL);
+  if (preferences.value.status !== 'loaded') return DEFAULT_CHAT_MODEL;
+  const v = preferences.value.data['chat_model'];
+  return v && v.trim() ? v : DEFAULT_CHAT_MODEL;
 }
 
 export function currentChatReasoningEffort(): string {
@@ -276,6 +282,7 @@ export async function loadPreferences(): Promise<void> {
     currentModel.value = currentChatModel();
     reasoningEffort.value = clampReasoningEffort(currentChatReasoningEffort(), currentModel.value);
     notificationsFilter.value = currentNotificationsFilter();
+    selectedCodingAgent.value = currentCodingAgentDefault();
   } catch (e) {
     preferences.value = toFailed(e);
   }
@@ -325,13 +332,121 @@ export function setMobileHeaderSticky(enabled: boolean): Promise<void> {
 // --- Background model ---
 
 /** Background model preference keys — stored in the DB, read by the engine. */
-export type BackgroundModelKey = 'model_title' | 'model_image_description' | 'model_memory';
+export type BackgroundModelKey =
+  | 'model_title'
+  | 'model_image_description'
+  | 'model_memory'
+  | 'model_command_judge';
+
+/** Default model for the command-guard judge (Haiku, per ADR 0002). Mirrors the
+ *  backend `DEFAULT_COMMAND_JUDGE_MODEL` in `core/preferences.rs`. */
+export const DEFAULT_COMMAND_JUDGE_MODEL = 'claude-haiku-4-5';
+
+/** Per-key default shown when the preference is unset — most background tasks
+ *  default to Gemini Flash; the command-guard judge defaults to Haiku. */
+const BACKGROUND_MODEL_DEFAULTS: Record<BackgroundModelKey, string> = {
+  model_title: 'gemini-3-flash-preview',
+  model_image_description: 'gemini-3-flash-preview',
+  model_memory: 'gemini-3-flash-preview',
+  model_command_judge: DEFAULT_COMMAND_JUDGE_MODEL,
+};
 
 export function currentBackgroundModel(key: BackgroundModelKey): string {
-  if (preferences.value.status !== 'loaded') return 'gemini-3-flash-preview';
-  return preferences.value.data[key] || 'gemini-3-flash-preview';
+  const fallback = BACKGROUND_MODEL_DEFAULTS[key];
+  if (preferences.value.status !== 'loaded') return fallback;
+  return preferences.value.data[key] || fallback;
 }
 
 export function setBackgroundModel(key: BackgroundModelKey, model: string): Promise<void> {
   return savePreference(key, model);
+}
+
+// --- Compose destination (coding-agent chip + hand-off hint) ---
+
+/** Last-used coding agent for the compose destination picker's chip.
+ *  Workspace-scoped (not device-scoped) so the pick follows the user across
+ *  devices. Default Claude Code — same as the engine's NULL fallback. */
+export function currentCodingAgentDefault(): CodingAgent {
+  return currentPreference('coding_agent_default', ['claude-code', 'codex'], 'claude-code');
+}
+
+export function setCodingAgentDefault(agent: CodingAgent): Promise<void> {
+  // The Dropdown fires onChange on every click, including the already-selected
+  // option — skip the no-op so a re-pick doesn't PUT + fan out
+  // PreferencesChanged for an unchanged value.
+  if (selectedCodingAgent.value === agent) return Promise.resolve();
+  return savePreference('coding_agent_default', agent, () => {
+    selectedCodingAgent.value = agent;
+  });
+}
+
+/** Whether the compose view's "Not sure? Start with the Lucidos Agent" hint
+ *  has been retired. Treats not-yet-loaded (and failed) preferences as
+ *  dismissed so a user who already retired it never sees a flash during the
+ *  preferences fetch — an onboarding hint fails closed. */
+export function composeHandoffHintDismissed(): boolean {
+  if (preferences.value.status !== 'loaded') return true;
+  return preferences.value.data['compose_handoff_hint_dismissed'] === 'true';
+}
+
+/** One-way retire — called on the user's first send to a coding destination
+ *  (`sendCompose`) and on explicit ✕ dismiss. Idempotent: skips the write
+ *  only when the LOADED preference already says dismissed — while preferences
+ *  are still loading the write goes through, so a fast first coding send
+ *  can't slip past the retire. */
+export function dismissComposeHandoffHint(): Promise<void> {
+  if (preferences.value.status === 'loaded'
+    && preferences.value.data['compose_handoff_hint_dismissed'] === 'true') {
+    return Promise.resolve();
+  }
+  return savePreference('compose_handoff_hint_dismissed', 'true');
+}
+
+// --- New-workspace welcome + starter suggestions ---
+
+/** Whether the new-workspace welcome + starter suggestions have been retired
+ *  via "Don't show this again". Treats not-yet-loaded (and failed) preferences
+ *  as dismissed so a returning user who already retired it never sees a flash
+ *  during the preferences fetch — an onboarding surface fails closed. A genuinely
+ *  new workspace gets it back once the preference loads and reads unset. */
+export function welcomeSuggestionsDismissed(): boolean {
+  if (preferences.value.status !== 'loaded') return true;
+  return preferences.value.data['welcome_suggestions_dismissed'] === 'true';
+}
+
+/** One-way retire — the user clicked "Don't show this again" on the
+ *  new-workspace welcome. Idempotent: skips the write only when the LOADED
+ *  preference already says dismissed. */
+export function dismissWelcomeSuggestions(): Promise<void> {
+  if (preferences.value.status === 'loaded'
+    && preferences.value.data['welcome_suggestions_dismissed'] === 'true') {
+    return Promise.resolve();
+  }
+  return savePreference('welcome_suggestions_dismissed', 'true');
+}
+
+// --- Command guard (ADR 0002) ---
+
+/** Master toggle for the command guard (the bash/python safety gate). Defaults
+ *  to false — the feature ships dark and is enabled per-workspace. Mirrors the
+ *  backend `command_guard` preference (`core/preferences.rs`). */
+export function currentCommandGuard(): boolean {
+  if (preferences.value.status !== 'loaded') return false;
+  return preferences.value.data['command_guard'] === 'true';
+}
+
+export function setCommandGuard(enabled: boolean): Promise<void> {
+  return savePreference('command_guard', enabled ? 'true' : 'false');
+}
+
+/** Sub-toggle for the LLM judge — when off, the guard uses only the static
+ *  "dangerous" list for the ask lane. Defaults to true (on when the guard is on).
+ *  Only meaningful while the master `command_guard` toggle is on. */
+export function currentCommandGuardJudge(): boolean {
+  if (preferences.value.status !== 'loaded') return true;
+  return preferences.value.data['command_guard_judge'] !== 'false';
+}
+
+export function setCommandGuardJudge(enabled: boolean): Promise<void> {
+  return savePreference('command_guard_judge', enabled ? 'true' : 'false');
 }

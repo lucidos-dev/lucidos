@@ -68,6 +68,105 @@ async fn get_older_threads_resolves_parent_title() {
     teardown_test_db(&db).await;
 }
 
+/// The drawer sorts by `last_user_action`, NOT `last_activity` — so a thread the
+/// agent churned on more recently must still sort BELOW one the user touched more
+/// recently. This is the core of the "stop background agent churn reshuffling my
+/// list" change. `churned` has the newer last_activity but older last_user_action;
+/// `acted` is the opposite. Expected order: acted, then churned.
+#[tokio::test]
+async fn get_recent_threads_sorts_by_last_user_action_not_last_activity() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let churned = Uuid::new_v4();
+    let acted = Uuid::new_v4();
+    // churned: agent streamed 1 min ago, but the user last acted 1 day ago.
+    // acted:   user typed 1 hour ago, agent silent since (last_activity also 1h).
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+             (thread_id, title, source, message_count, has_response, archive_state, \
+              last_activity, last_user_action, last_agent_action) \
+         VALUES \
+             ($1, 'Churned', 'claude_code', 1, TRUE, 'archived', \
+              NOW() - INTERVAL '1 minute', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 minute'), \
+             ($2, 'Acted',   'chat',        1, TRUE, 'archived', \
+              NOW() - INTERVAL '1 hour',   NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour')",
+    )
+    .bind(churned)
+    .bind(acted)
+    .execute(&pool)
+    .await
+    .expect("insert thread_summaries");
+
+    let recent = store
+        .get_recent_threads(15)
+        .await
+        .expect("get_recent_threads");
+    let order: Vec<&str> = recent.iter().map(|t| t.thread_id.as_str()).collect();
+    let acted_s = acted.to_string();
+    let churned_s = churned.to_string();
+    let acted_pos = order.iter().position(|id| *id == acted_s).expect("acted present");
+    let churned_pos = order
+        .iter()
+        .position(|id| *id == churned_s)
+        .expect("churned present");
+    assert!(
+        acted_pos < churned_pos,
+        "the recently-USER-acted thread must sort above the recently-AGENT-churned one \
+         (last_user_action drives the order, not last_activity); got {order:?}"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The two attributed-recency columns plumb through `get_threads_by_ids` (the
+/// canonical single-summary read) onto `ThreadSummary`, and the camelCase wire
+/// keys land on `ThreadAggregate` — those are what the frontend's
+/// `meta.lastUserAction` (sort) and the row tooltip read.
+#[tokio::test]
+async fn thread_summary_and_aggregate_include_attributed_recency() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+             (thread_id, title, source, message_count, has_response, \
+              last_user_action, last_agent_action) \
+         VALUES ($1, 'T', 'chat', 1, TRUE, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '30 minutes')",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .expect("insert thread_summaries");
+
+    let infos = store
+        .get_threads_by_ids(&[id.to_string()])
+        .await
+        .expect("get_threads_by_ids");
+    assert_eq!(infos.len(), 1);
+    assert!(
+        infos[0].last_user_action < infos[0].last_agent_action,
+        "the agent acted more recently than the user in this fixture"
+    );
+
+    let agg = fetch_thread_aggregate(&pool, id)
+        .await
+        .expect("fetch_thread_aggregate")
+        .expect("aggregate row exists");
+    let json = serde_json::to_value(&agg).expect("serialize ThreadAggregate");
+    assert!(
+        json.get("lastUserAction").is_some(),
+        "wire JSON must carry camelCase 'lastUserAction' (the frontend sort key); got {json}"
+    );
+    assert!(
+        json.get("lastAgentAction").is_some(),
+        "wire JSON must carry camelCase 'lastAgentAction' (the tooltip's Agent line); got {json}"
+    );
+
+    teardown_test_db(&db).await;
+}
+
 /// `get_recent_threads` must surface every thread that NEEDS user action
 /// (`coding_agent_proposed=TRUE`, `status='waiting_for_user_answer'`, `status='failed'`)
 /// even when the per-source `rn <= per_source` window would otherwise drop it.
@@ -246,6 +345,205 @@ async fn get_recent_threads_caps_archived_threads_at_per_source() {
         "archived threads must stay capped at per_source; got {}",
         chat_count
     );
+
+    teardown_test_db(&db).await;
+}
+
+/// `count_archived_threads` powers the collapsed Archive section's count badge.
+/// It counts the archived pile — `archive_state='archived'` AND NOT saved — so
+/// the badge shows the true total instead of the loaded window. A saved+archived
+/// thread routes to the Saved section, not Archive, so it must NOT be counted;
+/// inbox threads (saved or not) belong to Review, so they're excluded too.
+#[tokio::test]
+async fn count_archived_threads_counts_archived_unsaved_only() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    // (archive_state, is_saved) → counted?
+    //   ('archived', false) ×3  → yes
+    //   ('archived', true)  ×1  → no  (shows in Saved)
+    //   ('inbox',    false) ×1  → no  (shows in Review)
+    //   ('inbox',    true)  ×1  → no  (shows in Saved)
+    let rows: &[(&str, bool)] = &[
+        ("archived", false),
+        ("archived", false),
+        ("archived", false),
+        ("archived", true),
+        ("inbox", false),
+        ("inbox", true),
+    ];
+    for (i, (archive_state, is_saved)) in rows.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO thread_summaries \
+                 (thread_id, title, source, message_count, last_activity, has_response, \
+                  status, archive_state, is_saved) \
+                 VALUES ($1, $2, 'chat', 1, NOW(), TRUE, 'idle', $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(format!("Thread {}", i))
+        .bind(*archive_state)
+        .bind(*is_saved)
+        .execute(&pool)
+        .await
+        .expect("insert thread_summaries");
+    }
+
+    let count = store
+        .count_archived_threads(None, None, None, None)
+        .await
+        .expect("count_archived_threads");
+
+    assert_eq!(
+        count, 3,
+        "only archived + unsaved threads count toward the Archive badge total"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The Archive badge must "respect the filter": when the drawer is narrowed to a
+/// channel (`sources`) or a repo facet (`repo_ids`), the count reflects only the
+/// archived threads matching that filter — mirroring what scroll-pagination
+/// surfaces. Without the filter params the badge undercounts (shows the loaded
+/// window) or overcounts (shows the global total) under an active filter.
+#[tokio::test]
+async fn count_archived_threads_respects_source_and_repo_filters() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let repo_a = Uuid::new_v4().to_string();
+    // (source, archived?, cc_repo_id) — all unsaved.
+    //   chat archived       ×2
+    //   claude_code archived ×3 (2 bound to repo_a, 1 to another repo)
+    //   chat inbox          ×1 (excluded — not archived)
+    let other_repo = Uuid::new_v4().to_string();
+    let rows: &[(&str, &str, Option<&str>)] = &[
+        ("chat", "archived", None),
+        ("chat", "archived", None),
+        ("claude_code", "archived", Some(repo_a.as_str())),
+        ("claude_code", "archived", Some(repo_a.as_str())),
+        ("claude_code", "archived", Some(other_repo.as_str())),
+        ("chat", "inbox", None),
+    ];
+    for (i, (source, archive_state, repo)) in rows.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO thread_summaries \
+                 (thread_id, title, source, message_count, last_activity, has_response, \
+                  status, archive_state, is_saved, cc_repo_id) \
+                 VALUES ($1, $2, $3, 1, NOW(), TRUE, 'idle', $4, FALSE, $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(format!("Thread {}", i))
+        .bind(*source)
+        .bind(*archive_state)
+        .bind(*repo)
+        .execute(&pool)
+        .await
+        .expect("insert thread_summaries");
+    }
+
+    // Unfiltered: 5 archived (2 chat + 3 claude_code).
+    assert_eq!(
+        store
+            .count_archived_threads(None, None, None, None)
+            .await
+            .expect("count unfiltered"),
+        5,
+    );
+
+    // Channel filter → only claude_code archived (3).
+    let cc = vec!["claude_code".to_string()];
+    assert_eq!(
+        store
+            .count_archived_threads(Some(&cc), None, None, None)
+            .await
+            .expect("count by source"),
+        3,
+        "source filter counts only archived threads on that channel"
+    );
+
+    // Repo facet narrows WITHIN the selected channel: claude_code is gated in by
+    // `sources`, then the repo facet keeps only the 2 archived threads bound to
+    // repo_a (the third claude_code thread is on another repo). The chat rows are
+    // already excluded by the channel gate, so the union here is just repo_a's 2.
+    let repos = vec![repo_a.clone()];
+    assert_eq!(
+        store
+            .count_archived_threads(Some(&cc), None, Some(&repos), None)
+            .await
+            .expect("count by repo"),
+        2,
+        "repo facet counts only archived threads bound to that repo"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// Regression for the "count is wrong for lucidos, cc and ONE trigger" report:
+/// when whole channels are combined with a single facet, the badge must count
+/// the UNION, mirroring the frontend `threadPassesChannelFilter` (channel gate,
+/// THEN per-channel facet narrowing). The pre-fix facet branch ignored
+/// `sources` entirely, so it counted ONLY the trigger's archived threads and
+/// dropped every archived chat / claude_code thread — the badge read a tiny
+/// number while the drawer listed far more.
+#[tokio::test]
+async fn count_archived_threads_channels_plus_facet_counts_union() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    // All archived + unsaved. The two trigger rows split between the selected
+    // trigger and another, so the per-trigger narrowing is observable.
+    let rows: &[(&str, Option<&str>)] = &[
+        ("chat", None),
+        ("chat", None),
+        ("claude_code", None),
+        ("trigger", Some("trig-keep")),
+        ("trigger", Some("trig-drop")),
+    ];
+    for (i, (source, trigger_id)) in rows.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO thread_summaries \
+                 (thread_id, title, source, message_count, last_activity, has_response, \
+                  status, archive_state, is_saved, trigger_id) \
+                 VALUES ($1, $2, $3, 1, NOW(), TRUE, 'idle', 'archived', FALSE, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(format!("Thread {}", i))
+        .bind(*source)
+        .bind(*trigger_id)
+        .execute(&pool)
+        .await
+        .expect("insert thread_summaries");
+    }
+
+    // chat + claude_code + trigger all selected → `sources` is None (the
+    // all-channels case the frontend sends as `sources: undefined`), plus ONE
+    // trigger sub-selected.
+    let trig = vec!["trig-keep".to_string()];
+    let count = store
+        .count_archived_threads(None, Some(&trig), None, None)
+        .await
+        .expect("count channels + facet");
+
+    assert_eq!(
+        count, 4,
+        "2 chat + 1 claude_code + 1 trig-keep — NOT just the single trigger match \
+         (pre-fix: the facet branch ignored the channel selections)"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn count_archived_threads_empty_is_zero() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let count = store
+        .count_archived_threads(None, None, None, None)
+        .await
+        .expect("count_archived_threads");
+    assert_eq!(count, 0, "empty projection → zero archived");
 
     teardown_test_db(&db).await;
 }

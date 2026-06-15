@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { appPath, createIframeAppFixture } from './db-helpers';
+import { gotoWithRetry } from './helpers';
 
 // Verifies that opening an app via the deep-link flow mounts exactly one
 // iframe and triggers exactly one fetch of /api/v1/sdk-prefs.js *from the
@@ -76,7 +77,7 @@ test.describe('App iframe mount — single fetch on open', () => {
     // mount-discipline bug this test guards against is the inactive layout
     // also creating an iframe and double-fetching sdk-prefs.js.
     await openAppOnLoad(page);
-    await page.goto('/');
+    await gotoWithRetry(page, '/');
 
     const iframeLoc = page.locator('iframe[data-role="app-ui-frame"]:visible');
     await expect(iframeLoc).toBeVisible({ timeout: 10_000 });
@@ -96,7 +97,7 @@ test.describe('App iframe mount — single fetch on open', () => {
 
   test('opening an app via deep-link mounts exactly one app iframe', async ({ page }) => {
     await openAppOnLoad(page);
-    await page.goto('/');
+    await gotoWithRetry(page, '/');
     await expect(
       page.locator('iframe[data-role="app-ui-frame"]:visible'),
     ).toBeVisible({ timeout: 10_000 });

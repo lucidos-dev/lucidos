@@ -21,10 +21,10 @@ The integrated environment makes for a smooth user experience, where researching
 
 ```bash
 # Start with a workspace directory
-./scripts/web-dev.sh -w ~/workspaces/personal
+./scripts/web-dev.sh -w ~/workspaces/dev
 
 # Build engine first if no binary exists
-./scripts/web-dev.sh -w ~/workspaces/personal -b
+./scripts/web-dev.sh -w ~/workspaces/dev -b
 
 # Other scripts
 ./scripts/stop.sh              # Graceful shutdown
@@ -158,11 +158,13 @@ After this, Safari and Chrome on iOS will trust your dev server's HTTPS certific
 Two independent version axes:
 
 - **`RELEASE`** (repo root) — the umbrella user-facing version of the Lucidos
-  release that bundles all crates. Currently `0.7`. Think Ubuntu 24.04: one
-  number per shipped release, regardless of how the individual components
-  inside have moved. Exposed at runtime as `lucidos_engine::LUCIDOS_RELEASE`,
-  in the `release` field of `/api/health`, in the engine's `--version` output,
-  and in the desktop app's control panel.
+  release that bundles all crates. The `RELEASE` file is the source of truth
+  for the current number (mirrored by the latest `v<version>` tag on
+  [GitHub Releases](https://github.com/lucidos-dev/lucidos/releases)). Think
+  Ubuntu 24.04: one number per shipped release, regardless of how the
+  individual components inside have moved. Exposed at runtime as
+  `lucidos_engine::LUCIDOS_RELEASE`, in the `release` field of `/api/health`,
+  in the engine's `--version` output, and in the desktop app's control panel.
 - **Per-crate `Cargo.toml` versions** — semver per component (lucidos-engine,
   lucidos-app, etc.), bumped on their own cadence by `build.rs`. Visible as
   `engine_version` / `latest_tauri_app_version` in `/api/health`.
@@ -171,3 +173,23 @@ Two independent version axes:
 
 Releases are produced as squashed-orphan commits on `lucidos/main` (one per
 `v<version>` tag); per-release notes live in `CHANGELOG.md`.
+
+---
+
+## Contributing
+
+Contributions are welcome — Lucidos is pre-1.0, so there's plenty to do (and
+expect breakage before 1.0). Start with [CONTRIBUTING.md](CONTRIBUTING.md) for
+dev setup, the branch/PR flow, commit conventions, and the DCO sign-off
+(`git commit -s`) required on every commit. Please also read the
+[Code of Conduct](CODE_OF_CONDUCT.md), report security issues privately via
+[SECURITY.md](SECURITY.md), and see [GOVERNANCE.md](GOVERNANCE.md) for how the
+project is run. Questions and ideas are welcome in
+[GitHub Discussions](https://github.com/lucidos-dev/lucidos/discussions).
+
+Thanks to everyone who has contributed — see the full list on the
+[contributors graph](https://github.com/lucidos-dev/lucidos/graphs/contributors).
+
+## License
+
+Lucidos is released under the [MIT License](LICENSE). © 2026 Kenneth Tiller.

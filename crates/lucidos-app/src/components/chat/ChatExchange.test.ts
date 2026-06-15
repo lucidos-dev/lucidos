@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { VNode } from 'preact';
 import { describeExecutor, shouldShowResponseStatusBadge } from './ChatExchange';
-import { ClaudeIcon } from '../shared/icons';
+import { ClaudeIcon, CodexIcon } from '../shared/icons';
 import { LUCIDOS_AGENT_ICON, LUCIDOS_AGENT_LABEL } from '../../store/thread-events';
 
 describe('describeExecutor', () => {
@@ -9,6 +9,21 @@ describe('describeExecutor', () => {
     const { icon, label } = describeExecutor(true);
     expect(label).toBe('Claude Code');
     expect((icon as VNode).type).toBe(ClaudeIcon);
+  });
+
+  it('shows Codex label and icon for Codex coding-agent threads', () => {
+    const { icon, label } = describeExecutor(true, 'codex');
+    expect(label).toBe('Codex');
+    expect((icon as VNode).type).toBe(CodexIcon);
+  });
+
+  it('uses the Codex app mark instead of a red code glyph', () => {
+    const icon = CodexIcon() as VNode;
+    const props = icon.props as Record<string, unknown>;
+    expect(props.stroke).toBe('var(--accent-light)');
+    expect(props['stroke-width']).toBe('2.25');
+    const group = icon.props.children as VNode;
+    expect((group.props as Record<string, unknown>).transform).toBe('translate(-1.2 -1.2) scale(1.1)');
   });
 
   it('shows Lucidos Agent label for non-CC threads (same entity as the parent_thread initiator label)', () => {

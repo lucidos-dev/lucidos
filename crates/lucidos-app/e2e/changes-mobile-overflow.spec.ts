@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { assertHealthy, uniqueMessage } from './helpers';
+import { assertHealthy, uniqueMessage, gotoWithRetry } from './helpers';
 import { createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 
 test.describe('Changes panel — long thread title on mobile', () => {
@@ -19,7 +19,7 @@ test.describe('Changes panel — long thread title on mobile', () => {
         localStorage.setItem('lucidos-active-menu-item', 'changes');
         sessionStorage.setItem('lucidos-mobile-view', 'content');
       });
-      await page.goto('/');
+      await gotoWithRetry(page, '/');
 
       const row = page.locator(`.list-row:visible:has(.list-row-label:has-text("${longTitle}"))`).first();
       await expect(row).toBeVisible({ timeout: 15_000 });

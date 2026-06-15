@@ -1,6 +1,6 @@
 use base64::Engine as _;
 
-use crate::core::blobs::{ext_for_mime, resolve_blob, ResolvedBlob};
+use crate::core::blobs::{ext_for_mime, resolve_blob};
 use crate::llm::{ContentBlock, MessageContent};
 
 /// Maximum total base64 bytes for all images included in a single LLM call.
@@ -40,10 +40,25 @@ pub(super) fn filter_recent_history_image_hashes(
         .collect()
 }
 
+/// Build a base64 image content block for an LLM message. Single constructor so
+/// every chat image→LLM site (current message, history, the description pass)
+/// emits the identical block shape. Callers fit the image with
+/// [`crate::api::ChatImage::fit_for_llm`] first so the per-call byte budget is
+/// measured against the bytes actually sent.
+pub(super) fn image_content_block(img: crate::api::ChatImage) -> ContentBlock {
+    ContentBlock::Image {
+        source_type: "base64".to_string(),
+        media_type: img.mime_type,
+        data: img.base64,
+    }
+}
+
 /// Build the user message content. History hashes resolve to bytes via
 /// the blob store; current images come in already-decoded from the HTTP
-/// body. The hint text labels the two groups so the LLM can tell stale
-/// from current.
+/// body. Each image is fit to the LLM size target (compressed only if over)
+/// before it counts against the budget, so a large photo can't blow the
+/// provider's per-image limit. The hint text labels the two groups so the
+/// LLM can tell stale from current.
 pub(super) fn build_user_content_with_images(
     user_message_text: String,
     workspace: &std::path::Path,
@@ -54,51 +69,40 @@ pub(super) fn build_user_content_with_images(
     let mut current_blocks: Vec<ContentBlock> = Vec::new();
     let mut total_image_bytes: usize = 0;
 
-    // Resolve every hash up front so the budget pre-check and the read pass
-    // share one set of `resolve_blob` calls — otherwise each hash pays the
-    // ~5-extension `metadata` syscall fan-out twice.
+    // History images: resolve each hash to its blob, read the bytes, and fit it
+    // to the LLM size target before counting it against the per-call budget.
+    // Blobs are stored at original resolution (so the UI shows full-res), so the
+    // fit happens here, on the way to the model. An image that still can't be
+    // shrunk under the remaining budget is skipped — the provider would reject
+    // it anyway — while smaller later images still get their chance.
     for hashes in history_image_hashes.iter() {
-        let resolved: Vec<ResolvedBlob> = hashes
-            .iter()
-            .filter_map(|h| resolve_blob(workspace, h))
-            .collect();
-        let group_b64_estimate = resolved
-            .iter()
-            .map(|b| b.byte_size as usize)
-            .sum::<usize>()
-            .saturating_mul(4)
-            / 3;
-        if total_image_bytes + group_b64_estimate > MAX_TOTAL_IMAGE_BASE64 {
-            continue;
-        }
-
-        for blob in resolved {
+        for blob in hashes.iter().filter_map(|h| resolve_blob(workspace, h)) {
             let Ok(bytes) = std::fs::read(&blob.path) else {
                 continue;
             };
-            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            total_image_bytes += data.len();
-            history_blocks.push(ContentBlock::Image {
-                source_type: "base64".to_string(),
-                media_type: blob.mime,
-                data,
-            });
+            let fitted = crate::api::ChatImage {
+                base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                mime_type: blob.mime,
+            }
+            .fit_for_llm();
+            if total_image_bytes + fitted.base64.len() > MAX_TOTAL_IMAGE_BASE64 {
+                continue;
+            }
+            total_image_bytes += fitted.base64.len();
+            history_blocks.push(image_content_block(fitted));
         }
     }
 
-    // Then: images from the current message — already base64-decoded by the HTTP
-    // body decoder; just budget-check and push.
+    // Then: images attached to the current message — base64-decoded by the HTTP
+    // body decoder. Same fit + budget rule as history.
     if let Some(imgs) = current_images {
         for img in imgs {
-            if total_image_bytes + img.base64.len() > MAX_TOTAL_IMAGE_BASE64 {
-                break;
+            let fitted = img.clone().fit_for_llm();
+            if total_image_bytes + fitted.base64.len() > MAX_TOTAL_IMAGE_BASE64 {
+                continue;
             }
-            total_image_bytes += img.base64.len();
-            current_blocks.push(ContentBlock::Image {
-                source_type: "base64".to_string(),
-                media_type: img.mime_type.clone(),
-                data: img.base64.clone(),
-            });
+            total_image_bytes += fitted.base64.len();
+            current_blocks.push(image_content_block(fitted));
         }
     }
 

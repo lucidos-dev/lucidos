@@ -44,8 +44,10 @@ fn test_image_content_marker_format() {
 
 #[test]
 fn test_image_size_guard() {
-    // Verify the constant is 5 MB
-    assert_eq!(IMAGE_MAX_BYTES, 5 * 1024 * 1024);
+    // 25 MB outer safety bound — normal iPhone photos (3–12 MB) stay well under it
+    // and are downsampled-on-read rather than rejected.
+    assert_eq!(IMAGE_MAX_BYTES, 25 * 1024 * 1024);
+    const { assert!(12 * 1024 * 1024 < IMAGE_MAX_BYTES) };
 }
 
 #[test]
@@ -134,11 +136,121 @@ fn strip_image_content_marker_strips_real_size() {
 
 #[test]
 fn test_large_image_error_message() {
-    let size: u64 = 6 * 1024 * 1024; // 6 MB
+    let size: u64 = 30 * 1024 * 1024; // 30 MB — over the 25 MB outer cap
     assert!(size > IMAGE_MAX_BYTES);
     let mb = size as f64 / (1024.0 * 1024.0);
-    let msg = format!("Image too large to read directly ({:.1} MB). Max 5MB.", mb);
-    assert_eq!(msg, "Image too large to read directly (6.0 MB). Max 5MB.");
+    let msg = format!(
+        "Image too large to read directly ({:.1} MB). Max 25MB; \
+         smaller images are automatically resized to fit.",
+        mb
+    );
+    assert_eq!(
+        msg,
+        "Image too large to read directly (30.0 MB). Max 25MB; \
+         smaller images are automatically resized to fit."
+    );
+}
+
+#[test]
+fn read_oversized_image_is_downsampled_not_rejected() {
+    // Regression: a moderately large image whose base64 payload exceeds the LLM
+    // target (MAX_IMAGE_BASE64_BYTES) but is under the 25 MB outer cap must be
+    // downsampled-on-read, not rejected. Generate a noisy PNG (noise resists PNG
+    // compression, so the encoded file stays large).
+    let (w, h) = (1600u32, 1600u32);
+    let mut buf = image::RgbImage::new(w, h);
+    let mut state: u32 = 0x9E3779B9;
+    let mut next = || {
+        // xorshift32 — incompressible pseudo-noise
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state & 0xFF) as u8
+    };
+    for px in buf.pixels_mut() {
+        *px = image::Rgb([next(), next(), next()]);
+    }
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(buf)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let png_bytes = png.into_inner();
+
+    // Fixture sanity: over the LLM target (so downsampling is exercised) and under
+    // the 25 MB outer cap (so the read path accepts it).
+    let raw_b64_len = base64::engine::general_purpose::STANDARD
+        .encode(&png_bytes)
+        .len();
+    assert!(
+        raw_b64_len > crate::api::MAX_IMAGE_BASE64_BYTES,
+        "fixture must exceed the LLM target to exercise downsampling (got {raw_b64_len} base64 bytes)"
+    );
+    assert!((png_bytes.len() as u64) < IMAGE_MAX_BYTES);
+
+    let result = encode_image_for_read(png_bytes, "image/png");
+    assert!(
+        result.starts_with("[IMAGE_CONTENT:"),
+        "oversized image is downsampled and returned, not rejected"
+    );
+    let (media_type, b64) =
+        parse_image_content_marker(&result).expect("result is a valid IMAGE_CONTENT sentinel");
+    // compress() re-encodes to JPEG, so the sentinel names the actual bytes' type.
+    assert_eq!(media_type, "image/jpeg");
+    assert!(
+        b64.len() <= crate::api::MAX_IMAGE_BASE64_BYTES,
+        "downsampled payload must fit the LLM target, got {} base64 bytes",
+        b64.len()
+    );
+    // The returned base64 decodes to a valid image.
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .expect("returned base64 decodes");
+    assert!(image::load_from_memory(&decoded).is_ok());
+}
+
+#[test]
+fn read_undecodable_oversized_image_reports_clear_error() {
+    // A file with an image extension whose bytes aren't a decodable image and whose
+    // base64 payload exceeds the LLM target: compress() can't shrink it (decode fails,
+    // returns the input unchanged), so the read path must fail fast with a clear
+    // message rather than emit an oversized IMAGE_CONTENT block the model would reject.
+    let bytes: Vec<u8> = (0..4 * 1024 * 1024usize).map(|i| (i % 251) as u8).collect();
+    assert!(
+        base64::engine::general_purpose::STANDARD
+            .encode(&bytes)
+            .len()
+            > crate::api::MAX_IMAGE_BASE64_BYTES
+    );
+    let result = encode_image_for_read(bytes, "image/png");
+    assert!(
+        !result.starts_with("[IMAGE_CONTENT:"),
+        "undecodable oversized image must not produce an IMAGE_CONTENT payload, got: {}",
+        &result[..result.floor_char_boundary(80)]
+    );
+    assert!(
+        result.contains("could not be"),
+        "result names the failure: {result}"
+    );
+}
+
+#[test]
+fn read_small_image_is_not_recompressed() {
+    // A small image stays in its original format/media type — compression only
+    // kicks in when the payload would exceed the LLM target.
+    let png_bytes: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+        0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+        0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE5, 0x27, 0xDE, 0xFC, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let result = encode_image_for_read(png_bytes.clone(), "image/png");
+    let (media_type, b64) = parse_image_content_marker(&result).unwrap();
+    assert_eq!(media_type, "image/png");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .unwrap();
+    assert_eq!(decoded, png_bytes);
 }
 
 #[test]

@@ -12,7 +12,7 @@ interface AppRowProps {
 export function AppRow({ app, onOpen, onEdit, onDelete }: AppRowProps) {
   const pinned = isAppPinned(app.id);
   return (
-    <div class="list-row">
+    <div class="list-row app-row clickable" onClick={onOpen}>
       <div class="list-row-info">
         <div class="title list-row-name">
           {app.name}
@@ -29,7 +29,6 @@ export function AppRow({ app, onOpen, onEdit, onDelete }: AppRowProps) {
         >
           <PinIcon filled={pinned} />
         </button>
-        <button class="action-btn" onClick={(e) => { e.stopPropagation(); onOpen(); }}>Open</button>
         <button class="action-btn" onClick={(e) => { e.stopPropagation(); onEdit(); }}>Edit</button>
         <button class="action-btn action-btn-danger" onClick={(e) => { e.stopPropagation(); onDelete(); }}>Delete</button>
       </div>

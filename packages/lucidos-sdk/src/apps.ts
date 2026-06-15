@@ -5,7 +5,6 @@ export interface App {
   name: string;
   description: string;
   icon?: string;
-  knowhow: string[];
 }
 
 export const apps = {

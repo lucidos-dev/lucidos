@@ -15,6 +15,9 @@ pub struct ProviderInfo {
     pub ready: bool,
     /// The scope substring required for this provider (e.g. "drive"), empty if none needed.
     pub required_scope: &'static str,
+    /// Web URL to this provider's backups folder ("View backups folder" link), or
+    /// null when the provider can't form one.
+    pub folder_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -81,16 +84,6 @@ pub struct ScheduleResponse {
     pub provider: Option<String>,
 }
 
-/// JSON error response so the frontend can parse the actual error message.
-#[derive(Serialize)]
-pub(crate) struct ErrorResponse {
-    error: String,
-}
-
-fn json_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
-    (status, Json(ErrorResponse { error: msg.into() }))
-}
-
 pub(crate) fn progress_sender(
     event_bus: crate::engine::event_bus::EventBus,
 ) -> impl Fn(&str, usize, usize) + Send + Sync + 'static {
@@ -115,13 +108,13 @@ pub(crate) fn progress_sender(
 fn resolve_provider(
     provider_id: &str,
     pool: &PgPool,
-) -> Result<Box<dyn backup::BackupProvider>, (StatusCode, Json<ErrorResponse>)> {
-    backup::get_provider(provider_id, pool).map_err(|e| json_error(StatusCode::BAD_REQUEST, e))
+) -> Result<Box<dyn backup::BackupProvider>, ApiError> {
+    backup::get_provider(provider_id, pool).map_err(ApiError::bad_request)
 }
 
 pub async fn list_providers(
     State(state): State<AppState>,
-) -> Result<Json<Vec<ProviderInfo>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<Vec<ProviderInfo>>, ApiError> {
     let metas = backup::list_providers();
     let mut result = Vec::with_capacity(metas.len());
     for meta in metas {
@@ -130,13 +123,10 @@ pub async fn list_providers(
         let account = OAuthStore::get_by_provider(&state.pool, meta.oauth_provider)
             .await
             .map_err(|e| {
-                json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "Failed to query OAuth account for {}: {e}",
-                        meta.oauth_provider
-                    ),
-                )
+                ApiError::internal(format!(
+                    "Failed to query OAuth account for {}: {e}",
+                    meta.oauth_provider
+                ))
             })?;
         let connected = account.is_some();
         let ready = connected
@@ -144,12 +134,30 @@ pub async fn list_providers(
                 || account
                     .as_ref()
                     .is_some_and(|a| a.scopes.contains(meta.required_scope)));
+        // Best-effort folder link, computed only for a ready provider (it's the
+        // only state the link is shown in). For Drive this resolves the folder id
+        // live with one Drive lookup, so bound it — a slow or unreachable provider
+        // must not stall the settings page; omit the link on timeout or error.
+        let folder_url = if ready {
+            match backup::get_provider(meta.id, &state.pool) {
+                Ok(provider) => {
+                    tokio::time::timeout(std::time::Duration::from_secs(8), provider.folder_url())
+                        .await
+                        .ok()
+                        .flatten()
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         result.push(ProviderInfo {
             id: meta.id,
             name: meta.name,
             connected,
             ready,
             required_scope: meta.required_scope,
+            folder_url,
         });
     }
     Ok(Json(result))
@@ -162,23 +170,19 @@ pub async fn list_providers(
 /// key) and surfaced as a misleading "New backup key generated" toast when a
 /// user only meant to view their key. Generation now lives behind the explicit
 /// POST below.
-pub async fn get_backup_key(
-    State(state): State<AppState>,
-) -> Result<Json<KeyResponse>, (StatusCode, Json<ErrorResponse>)> {
+pub async fn get_backup_key(State(state): State<AppState>) -> Result<Json<KeyResponse>, ApiError> {
     let key_path = backup::key_file_path(&state.workspace_path);
     match crypto::load_key_file(&key_path) {
         Ok(Some(key)) => Ok(Json(KeyResponse {
             key: crypto::key_to_base64(&key),
             is_new: false,
         })),
-        Ok(None) => Err(json_error(
-            StatusCode::NOT_FOUND,
+        Ok(None) => Err(ApiError::not_found(
             "No backup key exists yet. Generate one to enable encrypted backups.",
         )),
-        Err(e) => Err(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read backup key: {e}"),
-        )),
+        Err(e) => Err(ApiError::internal(format!(
+            "Failed to read backup key: {e}"
+        ))),
     }
 }
 
@@ -189,13 +193,9 @@ pub async fn get_backup_key(
 /// can never overwrite the key that protects existing backups.
 pub async fn generate_backup_key(
     State(state): State<AppState>,
-) -> Result<Json<KeyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let (key, is_new) = crypto::ensure_key(&state.workspace_path).map_err(|e| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to generate backup key: {e}"),
-        )
-    })?;
+) -> Result<Json<KeyResponse>, ApiError> {
+    let (key, is_new) = crypto::ensure_key(&state.workspace_path)
+        .map_err(|e| ApiError::internal(format!("Failed to generate backup key: {e}")))?;
     Ok(Json(KeyResponse {
         key: crypto::key_to_base64(&key),
         is_new,
@@ -219,18 +219,14 @@ pub async fn backup_key_exists(State(state): State<AppState>) -> Json<KeyExistsR
 pub async fn create_backup(
     State(state): State<AppState>,
     Json(req): Json<BackupRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let guard = crate::scheduler::BackupGuard::try_acquire(&state.engine)
-        .ok_or_else(|| json_error(StatusCode::CONFLICT, "Backup already in progress"))?;
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "Backup already in progress"))?;
 
     // Validate sync — guard drops on early return so the flag is released.
     let provider = resolve_provider(&req.provider, &state.pool)?;
-    let (key, _) = crypto::ensure_key(&state.workspace_path).map_err(|e| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to get backup key: {e}"),
-        )
-    })?;
+    let (key, _) = crypto::ensure_key(&state.workspace_path)
+        .map_err(|e| ApiError::internal(format!("Failed to get backup key: {e}")))?;
 
     let engine = state.engine.clone();
     let pool = state.pool.clone();
@@ -259,15 +255,13 @@ pub async fn create_backup(
 pub async fn list_backups(
     State(state): State<AppState>,
     Query(params): Query<BackupRequest>,
-) -> Result<Json<Vec<backup::BackupEntry>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<Vec<backup::BackupEntry>>, ApiError> {
     let provider = resolve_provider(&params.provider, &state.pool)?;
 
-    let entries = provider.list_backups().await.map_err(|e| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to list backups: {e}"),
-        )
-    })?;
+    let entries = provider
+        .list_backups()
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to list backups: {e}")))?;
 
     Ok(Json(entries))
 }
@@ -334,7 +328,7 @@ fn build_backup_status(
 pub async fn get_backup_status(
     State(state): State<AppState>,
     Query(params): Query<BackupRequest>,
-) -> Result<Json<BackupStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<BackupStatusResponse>, ApiError> {
     let provider = resolve_provider(&params.provider, &state.pool)?;
 
     let running = state
@@ -454,16 +448,16 @@ fn restore_progress_sender(
 pub async fn restore_backup(
     State(state): State<AppState>,
     Json(req): Json<RestoreRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     // Validate synchronously so obvious mistakes are a clean 4xx, not a failure
     // the user only discovers via SSE after the spawn.
     let provider = resolve_provider(&req.provider, &state.pool)?;
     let key = crypto::key_from_base64(&req.key)
-        .map_err(|e| json_error(StatusCode::BAD_REQUEST, format!("Invalid key: {e}")))?;
+        .map_err(|e| ApiError::bad_request(format!("Invalid key: {e}")))?;
     // Same target-exists check the pipeline does, surfaced up front as a 400
     // before we flip state to Running.
     backup::resolve_restore_workspace_path(&req.workspace_name)
-        .map_err(|e| json_error(StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     // Atomically claim the single restore slot. Holding the write lock across
     // the check-and-set (inside try_start) makes it indivisible, so two
@@ -476,9 +470,9 @@ pub async fn restore_backup(
             .engine
             .restore_state
             .write()
-            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "restore state poisoned"))?;
+            .map_err(|_| ApiError::internal("restore state poisoned"))?;
         if !st.try_start(&req.workspace_name) {
-            return Err(json_error(
+            return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "A restore is already in progress",
             ));
@@ -551,12 +545,12 @@ pub async fn restore_backup(
 /// stream also broadcasts. Idle when no restore has run since startup.
 pub async fn get_restore_status(
     State(state): State<AppState>,
-) -> Result<Json<backup::RestoreState>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<backup::RestoreState>, ApiError> {
     let st = state
         .engine
         .restore_state
         .read()
-        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "restore state poisoned"))?
+        .map_err(|_| ApiError::internal("restore state poisoned"))?
         .clone();
     Ok(Json(st))
 }
@@ -565,16 +559,14 @@ pub async fn get_restore_status(
 /// restore result back to Idle so the banner clears and a reload agrees.
 /// Refused with 409 while a restore is running so a stray call can't wipe live
 /// progress.
-pub async fn clear_restore_status(
-    State(state): State<AppState>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+pub async fn clear_restore_status(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
     let mut st = state
         .engine
         .restore_state
         .write()
-        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "restore state poisoned"))?;
+        .map_err(|_| ApiError::internal("restore state poisoned"))?;
     if st.is_running() {
-        return Err(json_error(
+        return Err(ApiError::new(
             StatusCode::CONFLICT,
             "A restore is in progress",
         ));
@@ -585,53 +577,39 @@ pub async fn clear_restore_status(
 
 pub async fn start_workspace(
     Json(req): Json<StartWorkspaceRequest>,
-) -> Result<Json<StartWorkspaceResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<StartWorkspaceResponse>, ApiError> {
     let workspace_path = PathBuf::from(&req.workspace_path);
 
     // Validate the path is under ~/workspaces/ to prevent arbitrary command execution
     let allowed_parent = std::env::var("HOME")
         .map(|h| PathBuf::from(h).join("workspaces"))
-        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "HOME not set"))?;
+        .map_err(|_| ApiError::internal("HOME not set"))?;
     let canonical = workspace_path
         .canonicalize()
-        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "Workspace path does not exist"))?;
+        .map_err(|_| ApiError::bad_request("Workspace path does not exist"))?;
     if !canonical.starts_with(&allowed_parent) {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
             "Workspace path must be under ~/workspaces/",
         ));
     }
 
     // Read ports file to determine the URL
     let ports_file = canonical.join(".lucidos").join("ports");
-    let ports_content = std::fs::read_to_string(&ports_file).map_err(|_| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Workspace not initialized — no ports file",
-        )
-    })?;
+    let ports_content = std::fs::read_to_string(&ports_file)
+        .map_err(|_| ApiError::internal("Workspace not initialized — no ports file"))?;
     let port = ports_content
         .lines()
         .find_map(|l| l.strip_prefix("API_PORT="))
-        .ok_or_else(|| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "No API_PORT in ports file",
-            )
-        })?
+        .ok_or_else(|| ApiError::internal("No API_PORT in ports file"))?
         .to_string();
 
-    let web_dev = crate::paths::script("web-dev.sh").map_err(|e| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Cannot find scripts: {e}"),
-        )
-    })?;
+    let web_dev = crate::paths::script("web-dev.sh")
+        .map_err(|e| ApiError::internal(format!("Cannot find scripts: {e}")))?;
 
     let ws_name = canonical
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "Invalid workspace path"))?
+        .ok_or_else(|| ApiError::bad_request("Invalid workspace path"))?
         .to_string();
 
     std::process::Command::new("bash")
@@ -641,12 +619,7 @@ pub async fn start_workspace(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to start workspace: {e}"),
-            )
-        })?;
+        .map_err(|e| ApiError::internal(format!("Failed to start workspace: {e}")))?;
 
     // Determine protocol
     let proto = if std::env::var("LUCIDOS_TLS_CERT").is_ok() {
@@ -661,12 +634,7 @@ pub async fn start_workspace(
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
-        .map_err(|e| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to build HTTP client: {e}"),
-            )
-        })?;
+        .map_err(|e| ApiError::internal(format!("Failed to build HTTP client: {e}")))?;
 
     for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -683,24 +651,14 @@ pub async fn start_workspace(
 
 pub async fn get_schedule(
     State(state): State<AppState>,
-) -> Result<Json<ScheduleResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<ScheduleResponse>, ApiError> {
     // Read directly from preferences — no scheduler lock needed
     let cron = PreferenceStore::get(&state.pool, backup::PREF_BACKUP_SCHEDULE)
         .await
-        .map_err(|e| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to get schedule: {e}"),
-            )
-        })?;
+        .map_err(|e| ApiError::internal(format!("Failed to get schedule: {e}")))?;
     let provider = PreferenceStore::get(&state.pool, backup::PREF_BACKUP_PROVIDER)
         .await
-        .map_err(|e| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to get schedule: {e}"),
-            )
-        })?;
+        .map_err(|e| ApiError::internal(format!("Failed to get schedule: {e}")))?;
 
     match (cron, provider) {
         (Some(c), Some(p)) if backup::is_schedule_active(&c) => Ok(Json(ScheduleResponse {
@@ -718,18 +676,14 @@ pub async fn set_schedule(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ScheduleRequest>,
-) -> Result<Json<ScheduleResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<ScheduleResponse>, ApiError> {
     // Validate provider exists
     let _ = resolve_provider(&req.provider, &state.pool)?;
 
     // Ensure a backup key exists before enabling a schedule
     if backup::is_schedule_active(&req.schedule) {
-        crypto::ensure_key(&state.workspace_path).map_err(|e| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to ensure backup key: {e}"),
-            )
-        })?;
+        crypto::ensure_key(&state.workspace_path)
+            .map_err(|e| ApiError::internal(format!("Failed to ensure backup key: {e}")))?;
     }
 
     let active = backup::is_schedule_active(&req.schedule);
@@ -744,12 +698,7 @@ pub async fn set_schedule(
         scheduler
             .set_backup_schedule(cron, &req.provider)
             .await
-            .map_err(|e| {
-                json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to set schedule: {e}"),
-                )
-            })?;
+            .map_err(|e| ApiError::bad_request(format!("Failed to set schedule: {e}")))?;
     }
 
     // Mirror set_retention: emit PreferencesChanged for every preference the
@@ -843,7 +792,7 @@ pub struct RetentionRequest {
 
 pub async fn get_retention(
     State(state): State<AppState>,
-) -> Result<Json<RetentionResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<RetentionResponse>, ApiError> {
     let keep = backup::get_retention_count(&state.pool).await;
     Ok(Json(RetentionResponse { keep }))
 }
@@ -852,34 +801,52 @@ pub async fn set_retention(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<RetentionRequest>,
-) -> Result<Json<RetentionResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<RetentionResponse>, ApiError> {
     if req.keep == 0 {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "Must keep at least 1 backup",
-        ));
+        return Err(ApiError::bad_request("Must keep at least 1 backup"));
     }
     let value = req.keep.to_string();
     PreferenceStore::set(&state.pool, backup::PREF_BACKUP_RETENTION, &value)
         .await
-        .map_err(|e| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to save retention: {e}"),
-            )
-        })?;
+        .map_err(|e| ApiError::internal(format!("Failed to save retention: {e}")))?;
     state
         .engine
         .event_bus
-        .emit_user_system(&headers, &state.pool, "[Backup] PreferencesChanged", |actor| {
-            crate::engine::event_bus::SystemEvent::PreferencesChanged {
+        .emit_user_system(
+            &headers,
+            &state.pool,
+            "[Backup] PreferencesChanged",
+            |actor| crate::engine::event_bus::SystemEvent::PreferencesChanged {
                 key: backup::PREF_BACKUP_RETENTION.to_string(),
                 value: Some(value.clone()),
                 actor,
-            }
-        })
+            },
+        )
         .await;
     Ok(Json(RetentionResponse { keep: req.keep }))
+}
+
+/// Routes for the `/backup*` surface.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/backup", post(create_backup))
+        .route("/backup/list", get(list_backups))
+        .route("/backup/status", get(get_backup_status))
+        .route("/backup/restore", post(restore_backup))
+        .route(
+            "/backup/restore-status",
+            get(get_restore_status).delete(clear_restore_status),
+        )
+        .route("/backup/key", get(get_backup_key).post(generate_backup_key))
+        .route("/backup/key/exists", get(backup_key_exists))
+        .route("/backup/providers", get(list_providers))
+        .route("/backup/schedule", get(get_schedule).put(set_schedule))
+        .route("/backup/retention", get(get_retention).put(set_retention))
+        .route(
+            "/backup/validate-workspace-name",
+            get(validate_workspace_name),
+        )
+        .route("/backup/start-workspace", post(start_workspace))
 }
 
 #[cfg(test)]
@@ -977,7 +944,12 @@ mod tests {
     #[test]
     fn build_status_stale_when_old() {
         let now = Utc::now();
-        let status = build_backup_status(false, None, Ok(vec![entry("old", Duration::hours(30))]), now);
+        let status = build_backup_status(
+            false,
+            None,
+            Ok(vec![entry("old", Duration::hours(30))]),
+            now,
+        );
         assert!(status.stale);
         assert!(status.age_seconds.unwrap() > BACKUP_STALE_AFTER_SECONDS);
     }

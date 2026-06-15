@@ -1,5 +1,5 @@
-import { attentionThreadCount } from '../../store/store';
 import { toggleThreads } from '../../store/actions/pane';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { ThreadsIcon } from './icons';
 
 interface Props {
@@ -16,12 +16,9 @@ export function ThreadToggleButton({ class: cls, ariaLabel = 'Toggle thread draw
       class={`icon-btn header-icon thread-toggle${cls ? ` ${cls}` : ''}`}
       onClick={() => toggleThreads()}
       aria-label={ariaLabel}
-      data-tooltip={ariaLabel}
+      data-tooltip={tooltipWithShortcut(ariaLabel, 'toggleThreadDrawer')}
     >
       <ThreadsIcon />
-      {attentionThreadCount.value > 0 && (
-        <span class="badge">{attentionThreadCount.value}</span>
-      )}
     </button>
   );
 }

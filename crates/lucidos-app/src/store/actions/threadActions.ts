@@ -140,9 +140,9 @@ function tagAction(
         kind,
         category: 'close',
         label: 'Discard draft',
-        // The button's onClick reads discardDraft's boolean (to gate DOM
-        // cleanup); the cascade only needs to await it, so the wrapper drops
-        // the result to keep invoke's `Promise<void>` contract.
+        // discardDraft returns a boolean (false = user canceled the confirm),
+        // but the cascade only needs to await it, so the wrapper drops the
+        // result to keep invoke's `Promise<void>` contract.
         invoke: async () => { await discardDraft(threadId); },
       };
     case 'discard':
@@ -238,8 +238,7 @@ export async function runCloseCascade(): Promise<void> {
   switch (nextCloseLayer(actions)) {
     case 'draft': {
       // The draft layer confirms (per-layer reversibility); the confirm lives
-      // on the action (discardDraft), which the TaggedAction invoke calls — the
-      // same path the visible "Discard draft" button takes.
+      // on the action (discardDraft), which the TaggedAction invoke calls.
       const draft = actions.find((a) => a.kind === 'discard_draft');
       await draft?.invoke();
       return;

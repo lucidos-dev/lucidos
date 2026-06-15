@@ -11,6 +11,7 @@ import {
   waitForTitleInput,
   getVisibleTitleText,
   getMobileTitleHeight,
+  disableMobileHeaderSticky,
 } from './helpers';
 
 test.describe('Thread title editing — desktop', () => {
@@ -43,7 +44,7 @@ test.describe('Thread title editing — desktop', () => {
       const els = document.querySelectorAll('.thread-title-display');
       return Array.from(els).some(el => {
         const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0 && ((el as HTMLTextAreaElement).value ?? '').trim() === expected;
+        return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim() === expected;
       });
     }, newTitle, { timeout: 10_000 });
 
@@ -78,10 +79,13 @@ test.describe('Thread title editing — desktop', () => {
     await clickVisibleElement(page, '.thread-title-display');
     input = await waitForTitleInput(page);
 
-    // Sanity: the input is the active element and editable.
+    // Sanity: the edit field is the active element and editable. It's an
+    // <input> on desktop and a <textarea> on mobile, and this block runs at
+    // both widths across the Playwright projects, so accept either tag.
     const isFocused = await page.evaluate(() => {
       const el = document.activeElement;
-      return el?.tagName === 'INPUT' && el.classList.contains('thread-title-edit-input');
+      return (el?.tagName === 'INPUT' || el?.tagName === 'TEXTAREA')
+        && el.classList.contains('thread-title-edit-input');
     });
     expect(isFocused).toBe(true);
   });
@@ -154,7 +158,7 @@ test.describe('Thread title editing — mobile', () => {
       const els = document.querySelectorAll('.thread-title-display');
       return Array.from(els).some(el => {
         const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0 && ((el as HTMLTextAreaElement).value ?? '').trim() === expected;
+        return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim() === expected;
       });
     }, newTitle, { timeout: 10_000 });
 
@@ -162,7 +166,7 @@ test.describe('Thread title editing — mobile', () => {
     expect(displayed).toBe(newTitle);
   });
 
-  test('edit input persists in DOM for synchronous focus (iOS keyboard fix)', async ({ page }) => {
+  test('edit field persists in DOM for synchronous focus (iOS keyboard fix)', async ({ page }) => {
     await navigateToApp(page);
 
     const msg = uniqueMessage('ios-focus');
@@ -170,33 +174,33 @@ test.describe('Thread title editing — mobile', () => {
     await waitForResponse(page);
     await waitForThreadTitle(page);
 
-    // The edit <input> must exist in the DOM BEFORE clicking (not created on
+    // The edit field must exist in the DOM BEFORE clicking (not created on
     // click). This is required for iOS Safari to open the keyboard via the
-    // synchronous focus() call inside the click handler on the display
-    // textarea.
-    const inputExistsBeforeClick = await page.evaluate(() => {
+    // synchronous focus() call inside the click handler on the display div.
+    // On mobile the edit field is a <textarea> so a long title wraps multi-line.
+    const fieldExistsBeforeClick = await page.evaluate(() => {
       const rows = document.querySelectorAll('.mobile-thread-title-row');
       for (const row of rows) {
         const rect = row.getBoundingClientRect();
         if (rect.width > 0 && rect.height > 0) {
-          return !!row.querySelector('input.thread-title-edit-input');
+          return !!row.querySelector('textarea.thread-title-edit-input');
         }
       }
       return false;
     });
-    expect(inputExistsBeforeClick).toBe(true);
+    expect(fieldExistsBeforeClick).toBe(true);
 
-    // Click the display textarea — focus should jump to the edit <input>.
+    // Click the display div — focus should jump to the edit <textarea>.
     await clickVisibleElement(page, '.thread-title-display');
 
-    const editInputIsFocused = await page.evaluate(() => {
+    const editFieldIsFocused = await page.evaluate(() => {
       const el = document.activeElement;
-      return el?.tagName === 'INPUT' && el.classList.contains('thread-title-edit-input');
+      return el?.tagName === 'TEXTAREA' && el.classList.contains('thread-title-edit-input');
     });
-    expect(editInputIsFocused).toBe(true);
+    expect(editFieldIsFocused).toBe(true);
   });
 
-  test('edit input has user-select != none at focus time (iOS PWA keyboard fix)', async ({ page }) => {
+  test('edit field has user-select != none at focus time (iOS PWA keyboard fix)', async ({ page }) => {
     await navigateToApp(page);
 
     const msg = uniqueMessage('user-select');
@@ -204,11 +208,12 @@ test.describe('Thread title editing — mobile', () => {
     await waitForResponse(page);
     await waitForThreadTitle(page);
 
-    // .mobile-thread-title-row sets user-select: none; the edit input must
-    // override it (via CSS) so iOS PWA opens the keyboard on focus.
+    // .mobile-thread-title-row sets user-select: none; the edit field (a
+    // <textarea> on mobile) must override it (via CSS) so iOS PWA opens the
+    // keyboard on focus.
     await page.evaluate(() => {
       const el = document.querySelector(
-        '.mobile-swipe-pane .mobile-thread-title-row input.thread-title-edit-input',
+        '.mobile-swipe-pane .mobile-thread-title-row textarea.thread-title-edit-input',
       );
       if (el) {
         el.addEventListener('focus', () => {
@@ -220,8 +225,8 @@ test.describe('Thread title editing — mobile', () => {
       }
     });
 
-    // The transparent edit input is intentionally overlaid on the display
-    // textarea so iOS PWA opens the keyboard on native focus. The overlay
+    // The transparent edit field is intentionally overlaid on the display
+    // div so iOS PWA opens the keyboard on native focus. The overlay
     // intercepts real pointer events on the row, so use force:true to
     // dispatch the click on the display — its onClick handler calls
     // inputRef.focus(), firing the listener above.
@@ -234,16 +239,12 @@ test.describe('Thread title editing — mobile', () => {
   });
 
   test('title display retains full height after rename (SSE race)', async ({ page }) => {
-    // Repro for: editing the title on mobile and saving causes the title
-    // display to collapse to ~2px (border height) — title appears to "disappear"
-    // until reload restores it.
-    //
-    // Race: SSE delivers ThreadTitleRenamed before the rename HTTP response
-    // resolves. The new title flows into ThreadTitleEditor via the threadMap
-    // signal; its [title]-keyed useEffect runs autoResizeTextarea against the
-    // display textarea while editing is still true (display:none → scrollHeight
-    // 0 → style.height pinned to ~2px). When setEditing(false) finally runs,
-    // the display becomes visible at the broken 2px height and never recomputes.
+    // Originally a repro for a textarea-height bug: an SSE ThreadTitleRenamed that
+    // raced ahead of the rename HTTP response ran autoResizeTextarea on the
+    // display:none textarea, pinning its height to ~2px so the title "disappeared"
+    // after a mobile rename. The display is now a self-sizing <div> (no JS height),
+    // which makes that collapse structurally impossible — this test stays as a
+    // regression guard that a renamed title still renders at full height.
     //
     // We force the race by delaying /api/v1/threads/rename so SSE always wins.
     await page.route('**/api/v1/threads/rename', async (route) => {
@@ -272,7 +273,7 @@ test.describe('Thread title editing — mobile', () => {
       const els = document.querySelectorAll('.thread-title-display');
       return Array.from(els).some(el => {
         const rect = el.getBoundingClientRect();
-        return rect.width > 0 && ((el as HTMLTextAreaElement).value ?? '').trim() === expected;
+        return rect.width > 0 && (el.textContent ?? '').trim() === expected;
       });
     }, newTitle, { timeout: 10_000 });
 
@@ -285,6 +286,10 @@ test.describe('Thread title editing — mobile', () => {
   });
 
   test('title hides with header on scroll down', async ({ page }) => {
+    // "Keep header visible" defaults ON, which pins the header and disables
+    // hide-on-scroll. This test asserts the header (and sticky title bar) scroll
+    // off, so opt out of the sticky pin before the page boots.
+    await disableMobileHeaderSticky(page);
     await navigateToApp(page);
 
     // Send multiple messages to create scrollable content

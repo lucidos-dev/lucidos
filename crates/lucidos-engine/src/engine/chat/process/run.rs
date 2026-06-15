@@ -24,6 +24,28 @@ use super::super::process_helpers::{
 };
 use super::context_build::{build_capture_sections, build_loaded_knowhow_block};
 
+/// Whether a typed-instead-of-clicked message is eligible to answer a pending
+/// `UserQuestionAsked` via the FreeText fast-path.
+///
+/// Only a genuine **human** follow-up may be consumed as the user's answer.
+/// Agent- and engine-driven re-entries on the same thread — most importantly a
+/// child-completion wake (`ActorMode::Agent`, see
+/// `notify_parent_of_child_completion`), but also trigger fires and engine
+/// recovery notes — must NOT be routed as the answer. Without this guard the
+/// child's `[CHILD THREAD COMPLETED] …` block gets persisted as a bogus
+/// `UserQuestionAnswered { FreeText }` (actor = `thread_link`/`child`),
+/// silently consuming the user's open question. Excluded here, the wake falls
+/// through to the injection fast-path below, which queues it as `WakeFromChild`
+/// so the question stays live for the user and the completion is processed
+/// right after they answer it.
+pub(super) fn message_can_answer_pending_question(
+    is_new_thread: bool,
+    user_message: &str,
+    mode: ActorMode,
+) -> bool {
+    !is_new_thread && !user_message.is_empty() && mode == ActorMode::Human
+}
+
 impl LucidosEngine {
     /// Internal: Process a message with optional trigger context
     // Same wide signature as `process_message_with_steps` plus trigger context.
@@ -48,6 +70,7 @@ impl LucidosEngine {
         spawning_event_id: Option<Uuid>, // event in parent thread that triggered the spawn (mode != Human only)
         mode: ActorMode,
         cc_model: Option<&str>, // CC-specific model override (from compose view pre-session selection)
+        coding_agent: Option<crate::runtime::CodingAgent>, // backend for a NEW coding-agent thread; stored value wins on follow-ups
         pre_emitted_origin: Option<Uuid>, // skip MessageReceived if already emitted by spawn_thread
         title: Option<&str>,    // caller-provided title (skips async LLM title gen)
         origin: Option<MessageOrigin>,
@@ -108,14 +131,13 @@ impl LucidosEngine {
                         // hits via `provider_for_model`'s "" / "default" branch).
                         let recorded_model =
                             if img_desc_model.is_empty() || img_desc_model == "default" {
-                                use crate::llm::provider::LlmProvider;
                                 provider.default_model().to_string()
                             } else {
                                 img_desc_model
                             };
                         let imgs: Vec<crate::api::ChatImage> = imgs.to_vec();
                         Some(tokio::spawn(async move {
-                            match describe_images(&provider, &imgs).await {
+                            match describe_images(provider.as_ref(), &imgs).await {
                                 Ok(desc) => Some((desc, recorded_model)),
                                 Err(e) => {
                                     log!("[Chat] Image description failed: {}", e);
@@ -155,12 +177,18 @@ impl LucidosEngine {
         // typed text would spawn a brand-new turn while the prior turn's tool
         // stays blocked, leaving the thread stuck "Requesting" forever.
         //
+        // Gated on `mode == Human` (see `message_can_answer_pending_question`):
+        // only a real human follow-up answers the question. An agent-driven
+        // child-completion wake (`ActorMode::Agent`) must fall through to the
+        // injection fast-path below instead of being persisted as a bogus
+        // FreeText answer.
+        //
         // Uses `lookup_active_question_tool_use_id` (not `..pending..`) so a
         // question orphaned by a prior `ResponseAborted`/`Canceled`/`Failed`/
         // `CodingAgentIdled` doesn't intercept the follow-up — otherwise the
         // typed text would be silently consumed as the dead question's answer
         // and `MessageReceived` would never be emitted.
-        if !is_new_thread && !user_message.is_empty() {
+        if message_can_answer_pending_question(is_new_thread, user_message, mode) {
             if let Some(pending_tool_use_id) =
                 crate::engine::agent_question::lookup_active_question_tool_use_id(
                     self.pool(),
@@ -224,6 +252,22 @@ impl LucidosEngine {
                 self.pool(),
                 &self.event_bus,
                 &self.pending_cc_permission,
+                thread_id,
+                origin.clone(),
+            )
+            .await;
+        }
+
+        // Same supersede for the command-guard permission lane (ADR 0002): a
+        // chat thread parked on a `CommandPermissionRequested` whose user types
+        // a new message instead of clicking resolves the card as denied (which
+        // also unblocks the parked agentic loop). Chat-only — the command lane
+        // never fires on a CC thread.
+        if use_claude_code != Some(true) && !is_new_thread && !user_message.is_empty() {
+            crate::engine::command_permission::resolve_pending_command_permissions_as_superseded(
+                self.pool(),
+                &self.event_bus,
+                &self.pending_command_permission,
                 thread_id,
                 origin.clone(),
             )
@@ -605,6 +649,7 @@ impl LucidosEngine {
                     repo_id,
                     cc_model,
                     reasoning_effort,
+                    coding_agent,
                     conflict_change_id,
                     origin_id,
                     spawning_event_id,
@@ -951,6 +996,13 @@ impl LucidosEngine {
 
         // Run the agentic loop (LLM call → parse response → execute tools → repeat)
         let mut terminator_emitted = false;
+        // The firing trigger's side-effect grant (ADR 0002, Phase 5); empty for
+        // chat. The command guard consults it only on the trigger channel.
+        let trigger_side_effect_grant: Vec<crate::engine::command_guard::SideEffectCategory> =
+            trigger
+                .as_ref()
+                .map(|tc| tc.side_effect_grant.clone())
+                .unwrap_or_default();
         let result = self
             .run_agentic_loop(
                 &mut messages,
@@ -977,6 +1029,7 @@ impl LucidosEngine {
                     model: &capture_model,
                     capture_body,
                 },
+                &trigger_side_effect_grant,
             )
             .await;
 

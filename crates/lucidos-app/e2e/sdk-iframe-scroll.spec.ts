@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { appPath, createIframeAppFixture } from './db-helpers';
+import { gotoWithRetry } from './helpers';
 
 // Verifies that the SDK preserves an app's scrollY across iframe unmount/remount.
 // The parent destroys/recreates the iframe element on every app switch
@@ -56,7 +57,7 @@ for (let i = 0; i < 200; i++) {
     // Pre-seed the per-app key from the parent (same-origin iframe shares
     // sessionStorage with parent). This isolates the restore path from the
     // save path, which is independently exercised in the next test.
-    await page.goto('/');
+    await gotoWithRetry(page, '/');
     await page.evaluate((id) => {
       sessionStorage.setItem(`lucidos-scroll-app-${id}`, '1000');
     }, APP_ID);
@@ -77,7 +78,7 @@ for (let i = 0; i < 200; i++) {
   });
 
   test('saves scrollY on pagehide so the next mount restores it', async ({ page }) => {
-    await page.goto('/');
+    await gotoWithRetry(page, '/');
     // Clear any stored value from a previous test.
     await page.evaluate((id) => {
       sessionStorage.removeItem(`lucidos-scroll-app-${id}`);
@@ -131,7 +132,7 @@ for (let i = 0; i < 200; i++) {
     });
 
     try {
-      await page.goto('/');
+      await gotoWithRetry(page, '/');
       // Seed scroll memory for the FIRST app only.
       await page.evaluate((id) => {
         sessionStorage.setItem(`lucidos-scroll-app-${id}`, '1000');

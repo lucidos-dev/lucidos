@@ -6,16 +6,17 @@
  * (composeText.length > 0 || composeImages.length > 0). Composing rows with
  * neither text nor images are ghost rows — never surface them; the centered
  * compose view is the only UI for an empty draft. See the matching
- * composingThreads tests for the New section's mirror filter.
+ * composingThreads tests for the Current-section draft rows' mirror filter.
  *
  * Composing (new) threads come first, then drafts on existing threads; within
  * each group the most recently touched is on top.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { composingThreads, draftThreads } from './ThreadDrawer';
+import { composingThreads, draftThreadCount, draftThreads, hasDrafts } from './ThreadDrawer';
 import type { ThreadState, ThreadMeta } from '../../store/thread-events';
 import { _resetComposeDraftsForTesting, setDraft, type ComposeDraft } from '../../store/composeDrafts';
+import { threadMap } from '../../store/store';
 
 interface MakeThreadOpts extends Partial<ThreadMeta> {
   composeText?: string;
@@ -25,6 +26,7 @@ interface MakeThreadOpts extends Partial<ThreadMeta> {
 
 beforeEach(() => {
   _resetComposeDraftsForTesting();
+  threadMap.value = new Map();
 });
 
 function makeThread(id: string, overrides: MakeThreadOpts = {}): ThreadState {
@@ -149,8 +151,8 @@ describe('draftThreads', () => {
 
 describe('composingThreads', () => {
   it('excludes composing threads with no text and no images', () => {
-    // Mirror of draftThreads — the New section must never render an
-    // "Empty draft" row. Ghost composing rows arise from POST/DELETE races,
+    // Mirror of draftThreads — the Current-section draft rows must never
+    // render an "Empty draft" row. Ghost composing rows arise from POST/DELETE races,
     // SSE skeletons born from a peer device's ThreadStarted with no
     // follow-up ThreadComposeChanged, and failed local discards.
     const composing = makeThread('a', { state: 'composing' });
@@ -192,5 +194,62 @@ describe('composingThreads', () => {
     // (visible "Empty draft"-style row) recurs with whitespace as the title.
     const composing = makeThread('a', { state: 'composing', composeText: '   \n\t' });
     expect(composingThreads(asMap([composing]))).toEqual([]);
+  });
+});
+
+describe('hasDrafts', () => {
+  // Mirrors the `draftThreads` predicate: true iff that list would be non-empty.
+  // Drives drafts-icon visibility — see the matching draftThreads tests above.
+  it('is false with no threads at all', () => {
+    threadMap.value = new Map();
+    expect(hasDrafts.value).toBe(false);
+  });
+
+  it('is false when threads exist but none carry a draft', () => {
+    threadMap.value = asMap([
+      makeThread('a', { state: 'active' }),
+      makeThread('b', { state: 'composing' }), // ghost composing row, no content
+    ]);
+    expect(hasDrafts.value).toBe(false);
+  });
+
+  it('is true when a composing thread carries draft text', () => {
+    threadMap.value = asMap([makeThread('a', { state: 'composing', composeText: 'hi' })]);
+    expect(hasDrafts.value).toBe(true);
+  });
+
+  it('is true when an active thread carries a follow-up draft', () => {
+    threadMap.value = asMap([makeThread('a', { state: 'active', composeText: 'follow-up' })]);
+    expect(hasDrafts.value).toBe(true);
+  });
+
+  it('is false when only a discarded thread has stale compose content', () => {
+    threadMap.value = asMap([makeThread('a', { state: 'discarded', composeText: 'orphan' })]);
+    expect(hasDrafts.value).toBe(false);
+  });
+});
+
+describe('draftThreadCount', () => {
+  it('counts only draft rows the Drafts view would render', () => {
+    threadMap.value = asMap([
+      makeThread('new-draft', { state: 'composing', composeText: 'hi' }),
+      makeThread('follow-up-draft', { state: 'active', composeText: 'follow-up' }),
+      makeThread('image-draft', { state: 'active', composeImages: ['data:image/png;base64,xxx'] }),
+      makeThread('ghost-composing', { state: 'composing' }),
+      makeThread('discarded-stale', { state: 'discarded', composeText: 'orphan' }),
+      makeThread('idle', { state: 'active' }),
+    ]);
+
+    expect(draftThreadCount.value).toBe(3);
+  });
+
+  it('returns zero when no thread has a visible draft', () => {
+    threadMap.value = asMap([
+      makeThread('ghost-composing', { state: 'composing' }),
+      makeThread('discarded-stale', { state: 'discarded', composeText: 'orphan' }),
+      makeThread('idle', { state: 'active' }),
+    ]);
+
+    expect(draftThreadCount.value).toBe(0);
   });
 });

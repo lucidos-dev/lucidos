@@ -750,3 +750,35 @@ pub(super) async fn serve_html2canvas() -> impl IntoResponse {
         js.as_slice(),
     )
 }
+
+/// Routes for the `/apps`, `/app*`, `/app-capture`, and `/static/*`
+/// surfaces (html2canvas is served for the app-capture flow).
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/apps", get(list_apps))
+        .route(
+            "/app",
+            get(get_app)
+                .put(update_app)
+                .delete(delete_app),
+        )
+        .route(
+            "/app/:app_id/source",
+            get(read_app_source).put(write_app_source),
+        )
+        .route("/app/versions", get(get_app_versions))
+        .route("/app/restore", post(restore_app_version))
+        // App capture endpoints
+        .route("/app-capture", post(submit_app_capture))
+        .route("/static/html2canvas.min.js", get(serve_html2canvas))
+}
+
+/// App UI routes nested at top-level `/app/*` (NOT under `/api/v1/`) — file
+/// serving must be path-shaped, because relative URLs in app HTML resolve
+/// against the document path.
+pub(super) fn ui_router() -> Router<AppState> {
+    Router::new()
+        .route("/:app_id/", get(serve_app_ui))
+        .route("/:app_id/artifacts/*path", get(serve_app_artifact))
+        .route("/:app_id/*path", get(serve_app_file))
+}

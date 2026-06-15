@@ -79,6 +79,11 @@ pub(super) async fn serve_sdk_prefs_js() -> Response {
         .into_response()
 }
 
+/// Route for the `/sdk-prefs.js` asset.
+pub(super) fn router() -> Router<AppState> {
+    Router::new().route("/sdk-prefs.js", get(serve_sdk_prefs_js))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

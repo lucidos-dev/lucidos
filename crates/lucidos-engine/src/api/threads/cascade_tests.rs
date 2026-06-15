@@ -145,6 +145,7 @@ async fn spawn_child(bus: &EventBus, parent_id: Uuid, bring_to_idle: bool) -> Uu
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: format!("test-session-{}", child_id),
             branch: "claude-code/test".into(),
             repo_id: None,
@@ -220,6 +221,7 @@ async fn spawn_cc_child(
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: "claude-code/test".into(),
             repo_id: None,
@@ -611,6 +613,7 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-orphan".into(),
             branch: "claude-code/test".into(),
             repo_id: None,
@@ -731,6 +734,7 @@ async fn archive_rejects_when_fresh_cc_child_is_running_without_idle() {
     bus.emit(BusEvent::Thread {
         thread_id: fresh_child,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "fresh-session".into(),
             branch: "claude-code/fresh".into(),
             repo_id: None,

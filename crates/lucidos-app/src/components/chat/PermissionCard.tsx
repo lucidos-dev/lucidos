@@ -1,10 +1,9 @@
 import type { ComponentChildren } from 'preact';
 import { useSignal } from '@preact/signals';
 import { showToast } from '../../store/store';
-import { postMcpConsent } from '../../api/client';
+import { resolveCodingAgentPermission, resolveCommandPermission } from '../../store/actions/permissions';
 import type { PersistScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
-import { preserveAtBottom } from './scrollState';
 
 interface PermissionEvent {
   request_id: string;
@@ -26,17 +25,20 @@ interface PermissionBodyProps {
  *  rather than burying it as a flat prefix in the summary. The original wording
  *  ("Claude Code wants to use Edit /path") read like a sentence about an action
  *  on a path; users didn't realise "Edit" was the tool whose permission they
- *  were about to grant. */
+ *  were about to grant. The subject is "the coding agent" — the same card is
+ *  raised by Claude Code's MCP permission prompt AND the Codex app-server
+ *  approval bridge, so naming Claude Code here would misattribute a Codex
+ *  escalation at the exact moment the user is making a security decision. */
 export function renderQuestion(toolName: string, summary: string) {
   const space = summary.indexOf(' ');
   const arg = space === -1 ? null : summary.slice(space + 1);
   return arg ? (
     <>
-      Claude Code wants to use the <strong>{toolName}</strong> tool on <code>{arg}</code>. Allow?
+      The coding agent wants to use the <strong>{toolName}</strong> tool on <code>{arg}</code>. Allow?
     </>
   ) : (
     <>
-      Claude Code wants to use the <strong>{toolName}</strong> tool. Allow?
+      The coding agent wants to use the <strong>{toolName}</strong> tool. Allow?
     </>
   );
 }
@@ -110,7 +112,7 @@ export function sessionLabel(toolName: string, input: Record<string, unknown>): 
     const basename = path.split('/').filter(Boolean).pop();
     return basename || path;
   }
-  if (toolName === 'Bash') {
+  if (toolName === 'Bash' || toolName === 'command_execution') {
     const command = typeof input.command === 'string' ? input.command : null;
     if (!command) return null;
     const first = command.trim().split(/\s+/)[0];
@@ -124,6 +126,20 @@ export function sessionLabel(toolName: string, input: Record<string, unknown>): 
   }
   return null;
 }
+
+/** Codex backend tool names (raised by the app-server approval bridge).
+ *  Persisted scopes (Broad / Narrow) are meaningless for them — only Claude
+ *  Code reads `cc-allowed-tools` — and `file_change` additionally derives no
+ *  session pattern (its input has no stable identifier, so a session grant
+ *  would blanket-approve every future out-of-sandbox write). Mirror of
+ *  `CODEX_BACKEND_TOOLS` in `claude_code.rs`. */
+const CODEX_BACKEND_TOOLS: ReadonlySet<string> = new Set(['command_execution', 'file_change']);
+
+/** Tools whose "Allow for this thread" click would record nothing (the
+ *  engine derives no session pattern) — the button is hidden so a click
+ *  can't silently behave as allow-once. Mirror of the `file_change` arm in
+ *  `derive_allow_pattern`'s Session branch. */
+const SESSION_ALLOW_INEFFECTIVE: ReadonlySet<string> = new Set(['file_change']);
 
 /** Tools whose bare entry in `--allowedTools` cannot be respected by CC.
  *  Two reasons a tool ends up here:
@@ -173,9 +189,110 @@ export function permissionButtonState({
 }): { disabled: boolean; stateClass: string } {
   const disabled = answered || terminated;
   const stateClass = !answered ? ''
-    : isPicked ? ' cc-permission-btn-picked'
-    : ' cc-permission-btn-rejected';
+    : isPicked ? ' permission-btn-picked'
+    : ' permission-btn-rejected';
   return { disabled, stateClass };
+}
+
+type ButtonSpec = {
+  choice: PermissionChoice;
+  btnClass: string;
+  label: ComponentChildren;
+  ariaLabel: string;
+  row: 'primary' | 'secondary';
+  onClick: () => void;
+};
+
+/** Render one permission button with answered/terminated state styling. Shared
+ *  by both the coding-agent and command-guard cards. */
+function renderPermissionButton(
+  spec: ButtonSpec,
+  state: { selected: PermissionChoice | null; answered: boolean; terminated: boolean },
+) {
+  const isPicked = state.selected === spec.choice;
+  const { disabled, stateClass } = permissionButtonState({
+    answered: state.answered,
+    terminated: state.terminated,
+    isPicked,
+  });
+  return (
+    <button
+      type="button"
+      class={`${spec.btnClass}${stateClass}`}
+      onClick={disabled ? undefined : spec.onClick}
+      disabled={disabled}
+      aria-pressed={state.answered ? isPicked : undefined}
+      aria-label={spec.ariaLabel}
+    >
+      {isPicked && <span class="permission-btn-check" aria-hidden="true">✓ </span>}
+      {spec.label}
+    </button>
+  );
+}
+
+/** The shared card chrome: a question line + a primary row + one row per
+ *  secondary button. Both permission cards (coding-agent, command-guard) build
+ *  their own `buttons` and feed them here. */
+function PermissionBodyShell({
+  requestId,
+  question,
+  buttons,
+  selected,
+  answered,
+  terminated,
+}: {
+  requestId: string;
+  question: ComponentChildren;
+  buttons: ButtonSpec[];
+  selected: PermissionChoice | null;
+  answered: boolean;
+  terminated: boolean;
+}) {
+  const primary = buttons.filter(b => b.row === 'primary');
+  const secondary = buttons.filter(b => b.row === 'secondary');
+  const bodyStateClass = answered ? ' permission-body-answered'
+    : terminated ? ' permission-body-terminated'
+    : '';
+  const state = { selected, answered, terminated };
+  return (
+    <div class={`permission-body${bodyStateClass}`} data-request-id={requestId}>
+      <div class="permission-text">{question}</div>
+      <div class="permission-actions">
+        {primary.map(spec => renderPermissionButton(spec, state))}
+      </div>
+      {secondary.map(spec => (
+        <div key={spec.choice} class="permission-actions permission-actions-secondary">
+          {renderPermissionButton(spec, state)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Optimistic decide helper shared by both cards: stamp the pending choice,
+ *  fire the resolve action, roll back + toast on failure. `resolve` is the
+ *  permission action (`resolveCodingAgentPermission` / `resolveCommandPermission`),
+ *  which force-scrolls to the bottom before POSTing consent so the agent's
+ *  resumed stream tails. */
+function usePermissionDecide(
+  requestId: string,
+  resolve: (id: string, allowed: boolean, persist?: PersistScope) => Promise<void>,
+) {
+  const pending = useSignal<{ allowed: boolean; persist_scope?: PersistScope } | null>(null);
+  const decide = async (allowed: boolean, persist?: PersistScope) => {
+    pending.value = { allowed, persist_scope: persist };
+    if (allowed && persist === 'broad') {
+      // Coarse trust granted — let the user feel the weight of it.
+      showToast('You only live once', 'info');
+    }
+    try {
+      await resolve(requestId, allowed, persist);
+    } catch (e) {
+      pending.value = null;
+      showToast(`Could not send decision: ${errorDetail(e)}`, 'error');
+    }
+  };
+  return { pending, decide };
 }
 
 /** Body of a `CodingAgentPermissionRequest` divider exchange — rendered inside
@@ -183,41 +300,23 @@ export function permissionButtonState({
  *  override; SSE swaps in `resolved` once the paired
  *  `CodingAgentPermissionResolved` event arrives. */
 export function PermissionBody({ event, resolved, terminated }: PermissionBodyProps) {
-  const pending = useSignal<{ allowed: boolean; persist_scope?: PersistScope } | null>(null);
+  const { pending, decide } = usePermissionDecide(event.request_id, resolveCodingAgentPermission);
 
   const effective = resolved ?? pending.value;
 
-  const decide = async (allowed: boolean, persist?: PersistScope) => {
-    preserveAtBottom();
-    pending.value = { allowed, persist_scope: persist };
-    if (allowed && persist === 'broad') {
-      // Coarse trust granted — let the user feel the weight of it.
-      showToast('You only live once', 'info');
-    }
-    try {
-      await postMcpConsent(event.request_id, allowed, persist);
-    } catch (e) {
-      pending.value = null;
-      showToast(`Could not send decision: ${errorDetail(e)}`, 'error');
-    }
-  };
-
   const touchesProtected = inputTouchesProtectedPath(event.tool_name, event.input);
-  const narrow = touchesProtected ? null : narrowPattern(event.tool_name, event.input);
-  const showBroad = !BROAD_ALLOW_INEFFECTIVE.has(event.tool_name) && !touchesProtected;
+  const isCodexTool = CODEX_BACKEND_TOOLS.has(event.tool_name);
+  const narrow = touchesProtected || isCodexTool
+    ? null
+    : narrowPattern(event.tool_name, event.input);
+  const showBroad = !BROAD_ALLOW_INEFFECTIVE.has(event.tool_name)
+    && !isCodexTool
+    && !touchesProtected;
+  const showSession = !SESSION_ALLOW_INEFFECTIVE.has(event.tool_name);
   const session = sessionLabel(event.tool_name, event.input);
 
   const selected = effective ? resolvedChoice(effective) : null;
   const answered = selected !== null;
-
-  type ButtonSpec = {
-    choice: PermissionChoice;
-    btnClass: string;
-    label: ComponentChildren;
-    ariaLabel: string;
-    row: 'primary' | 'secondary';
-    onClick: () => void;
-  };
 
   const buttons: ButtonSpec[] = [
     {
@@ -236,14 +335,14 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       row: 'primary',
       onClick: () => void decide(true),
     },
-    {
-      choice: 'session',
+    ...(showSession ? [{
+      choice: 'session' as const,
       btnClass: 'action-btn action-btn-confirm',
       label: 'Allow for this thread',
       ariaLabel: `Allow ${session ?? event.tool_name} for the rest of this thread`,
-      row: 'secondary',
+      row: 'secondary' as const,
       onClick: () => void decide(true, 'session'),
-    },
+    }] : []),
     ...(narrow ? [{
       choice: 'narrow' as const,
       btnClass: 'action-btn action-btn-confirm',
@@ -262,48 +361,132 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
     }] : []),
   ];
 
-  const renderButton = (spec: ButtonSpec) => {
-    const isPicked = selected === spec.choice;
-    const { disabled, stateClass } = permissionButtonState({
-      answered,
-      terminated: !!terminated,
-      isPicked,
-    });
-    return (
-      <button
-        type="button"
-        class={`${spec.btnClass}${stateClass}`}
-        onClick={disabled ? undefined : spec.onClick}
-        disabled={disabled}
-        aria-pressed={answered ? isPicked : undefined}
-        aria-label={spec.ariaLabel}
-      >
-        {isPicked && <span class="cc-permission-btn-check" aria-hidden="true">✓ </span>}
-        {spec.label}
-      </button>
-    );
-  };
-
-  const primary = buttons.filter(b => b.row === 'primary');
-  const secondary = buttons.filter(b => b.row === 'secondary');
-
-  const bodyStateClass = answered ? ' cc-permission-body-answered'
-    : terminated ? ' cc-permission-body-terminated'
-    : '';
   return (
-    <div
-      class={`cc-permission-body${bodyStateClass}`}
-      data-request-id={event.request_id}
-    >
-      <div class="cc-permission-text">{renderQuestion(event.tool_name, event.summary)}</div>
-      <div class="cc-permission-actions">
-        {primary.map(renderButton)}
-      </div>
-      {secondary.map(spec => (
-        <div key={spec.choice} class="cc-permission-actions cc-permission-actions-secondary">
-          {renderButton(spec)}
-        </div>
-      ))}
-    </div>
+    <PermissionBodyShell
+      requestId={event.request_id}
+      question={renderQuestion(event.tool_name, event.summary)}
+      buttons={buttons}
+      selected={selected}
+      answered={answered}
+      terminated={!!terminated}
+    />
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Command-guard permission card (ADR 0002) — the chat mirror of the above.
+// Different event shape (`command` text, not a structured tool `input`) and a
+// different consent endpoint, but the same buttons + answered-state machinery.
+// ---------------------------------------------------------------------------
+
+interface CommandPermissionEvent {
+  request_id: string;
+  tool_use_id: string;
+  tool_name: string;
+  command: string;
+  summary: string;
+}
+
+interface CommandPermissionBodyProps {
+  event: CommandPermissionEvent;
+  resolved?: { allowed: boolean; reason?: string; persist_scope?: PersistScope };
+  terminated?: boolean;
+}
+
+const BASH_TOOLS: ReadonlySet<string> = new Set(['run_bash', 'run_bash_background']);
+
+/** The command head shown on the Bash narrow / session buttons — mirror of the
+ *  engine's `first_command_token`: skip privilege/wrapper prefixes and
+ *  `VAR=value` assignments, take the basename. Display-only (the engine derives
+ *  the actually-stored pattern). `null` for an empty command. */
+export function commandHead(command: string): string | null {
+  const benign = new Set(['sudo', 'env', 'command', 'time', 'nice', 'builtin', 'exec']);
+  const toks = command.trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < toks.length && (benign.has(toks[i]) || (!toks[i].startsWith('-') && toks[i].includes('=')))) {
+    i++;
+  }
+  const head = toks[i];
+  if (!head) return null;
+  const base = head.split('/').filter(Boolean).pop();
+  return base || null;
+}
+
+/** Body of a `CommandPermissionRequested` divider exchange. */
+export function CommandPermissionBody({ event, resolved, terminated }: CommandPermissionBodyProps) {
+  const { pending, decide } = usePermissionDecide(event.request_id, resolveCommandPermission);
+
+  const effective = resolved ?? pending.value;
+  const selected = effective ? resolvedChoice(effective) : null;
+  const answered = selected !== null;
+
+  const isBash = BASH_TOOLS.has(event.tool_name);
+  const head = isBash ? commandHead(event.command) : null;
+  // Bash gets a narrow `Bash(<head>:*)` sub-scope; Python is coarse (no narrow).
+  const narrow = isBash && head ? `Bash(${head}:*)` : null;
+  const sessionLabelText = isBash ? (head ? `${head} …` : null) : 'Python';
+
+  const buttons: ButtonSpec[] = [
+    {
+      choice: 'deny',
+      btnClass: 'action-btn action-btn-danger',
+      label: 'Deny',
+      ariaLabel: 'Deny running this command',
+      row: 'primary',
+      onClick: () => void decide(false),
+    },
+    {
+      choice: 'allow',
+      btnClass: 'action-btn action-btn-confirm',
+      label: 'Allow once',
+      ariaLabel: 'Allow this command once',
+      row: 'primary',
+      onClick: () => void decide(true),
+    },
+    {
+      choice: 'session',
+      btnClass: 'action-btn action-btn-confirm',
+      label: 'Allow for this thread',
+      ariaLabel: `Allow ${sessionLabelText ?? 'this command'} for the rest of this thread`,
+      row: 'secondary',
+      onClick: () => void decide(true, 'session'),
+    },
+    ...(narrow ? [{
+      choice: 'narrow' as const,
+      btnClass: 'action-btn action-btn-confirm',
+      label: <>Always allow <code>{narrow}</code></>,
+      ariaLabel: `Always allow ${narrow}`,
+      row: 'secondary' as const,
+      onClick: () => void decide(true, 'narrow'),
+    }] : []),
+    {
+      choice: 'broad',
+      btnClass: 'action-btn',
+      label: 'Always allow',
+      ariaLabel: isBash ? 'Always allow any shell command' : 'Always allow any Python',
+      row: 'secondary',
+      onClick: () => void decide(true, 'broad'),
+    },
+  ];
+
+  return (
+    <PermissionBodyShell
+      requestId={event.request_id}
+      question={renderCommandQuestion(event.command, event.summary)}
+      buttons={buttons}
+      selected={selected}
+      answered={answered}
+      terminated={!!terminated}
+    />
+  );
+}
+
+/** The question line for a command-guard card: the command itself plus the
+ *  risk summary the guard produced. */
+export function renderCommandQuestion(command: string, summary: string) {
+  return (
+    <>
+      The Lucidos Agent wants to run <code>{command}</code>. {summary} Allow?
+    </>
   );
 }

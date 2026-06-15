@@ -11,7 +11,7 @@ describe('CC stale resume — SessionEnded(stale_resume) must not cause aborted 
   const now = Date.now();
   const t = (offset: number) => new Date(now + offset).toISOString();
 
-  it('mid-resume: SessionEnded(stale_resume) followed by new SessionStarted is cc-working, not aborted', () => {
+  it('mid-resume: SessionEnded(stale_resume) followed by new SessionStarted is coding-agent-working, not aborted', () => {
     resetSeqCounter();
     const { map, id } = makeThread('stale-resume-1', 'running');
 
@@ -39,7 +39,7 @@ describe('CC stale resume — SessionEnded(stale_resume) must not cause aborted 
     // Must NOT be 'aborted' — stale_resume is a normal lifecycle event
     const status = exchangeStatus(followUp, '', true, false, true);
     expect(status).not.toBe('aborted');
-    expect(status).toBe('cc-working');
+    expect(status).toBe('coding-agent-working');
   });
 
   it('stale_resume only (before retry SessionStarted arrives) is not aborted', () => {
@@ -98,8 +98,8 @@ describe('CC stale resume — SessionEnded(stale_resume) must not cause aborted 
 
     const thread = map.get(id)!;
     expect(thread.meta.status).toBe('running');
-    // displaySection should be 'active', not 'review' or 'archive'
-    expect(displaySection(thread.meta.section, thread.meta.status, thread.meta.saved, thread.meta.activeChildrenCount > 0, thread.meta.codingAgentProposed, false)).toBe('active');
+    // displaySection should be 'current', not 'archive'
+    expect(displaySection(thread.meta.section, thread.meta.status, thread.meta.saved, thread.meta.activeChildrenCount > 0, thread.meta.codingAgentProposed, false)).toBe('current');
   });
 });
 
@@ -236,7 +236,7 @@ describe('stale exchange recovery (incomplete last exchange)', () => {
     expect(exchanges).toHaveLength(2);
 
     // Exchange A: pre-injection work only. No terminal — non-last with steps
-    // → 'interrupted' ("Continued below ↳"). The response continues in the
+    // → 'interrupted' ("Done ↳"). The response continues in the
     // follow-up exchange after the UPI absorbed the new prompt.
     expect(exchanges[0].userEvent.type).toBe('MessageReceived');
     expect((exchanges[0].userEvent as { text: string }).text).toBe('ferdig');
@@ -260,7 +260,7 @@ describe('stale exchange recovery (incomplete last exchange)', () => {
 // exchange stuck on "Working". Happens when the engine's auto-harden `continue`
 // path skips the in-loop CodingAgentIdled emission and the loop then exits via
 // post-loop cleanup (which today only emits SessionEnded). The exchange has no
-// terminal CC event, so the status falls through to 'cc-working' forever.
+// terminal CC event, so the status falls through to 'coding-agent-working' forever.
 // ---------------------------------------------------------------------------
 describe('CC SessionEnded(changes_proposed) without preceding CodingAgentIdled', () => {
   const t = (offset: number) => new Date(Date.now() + offset).toISOString();
@@ -286,8 +286,8 @@ describe('CC SessionEnded(changes_proposed) without preceding CodingAgentIdled',
     expect(exchanges).toHaveLength(1);
 
     const status = exchangeStatus(exchanges[0], '', true, false, true);
-    // Must NOT be 'cc-working' — SessionEnded means the agent is no longer running.
-    expect(status).not.toBe('cc-working');
+    // Must NOT be 'coding-agent-working' — SessionEnded means the agent is no longer running.
+    expect(status).not.toBe('coding-agent-working');
     // SessionEnded with a normal lifecycle reason is terminal → 'done'.
     expect(status).toBe('done');
   });
@@ -578,8 +578,8 @@ describe('chat follow-up while parent loop still running', () => {
       'ResponseGenerated',
     ]);
 
-    // E1 (non-last with pre-injection steps) → 'interrupted' ("Continued
-    // below ↳"). E2 (last, with full response) → 'done'.
+    // E1 (non-last with pre-injection steps) → 'interrupted' ("Done ↳").
+    // E2 (last, with full response) → 'done'.
     expect(exchangeStatus(exchanges[0], '', /* isLast */ false, false, false, /* threadIdle */ true)).toBe('interrupted');
     expect(exchangeStatus(exchanges[1], '', /* isLast */ true, false, false, /* threadIdle */ true)).toBe('done');
   });

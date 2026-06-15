@@ -230,7 +230,7 @@ describe('exchangeStatus on divider exchanges', () => {
     expect(exchangeStatus(divider, '', true, false, true)).toBe('awaiting-answer');
   });
 
-  it('answered question divider with CC resume is cc-working', () => {
+  it('answered question divider with CC resume is coding-agent-working', () => {
     const events = thread(
       ev(1, { type: 'MessageReceived', text: 'hi' }),
       ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu1', cc_session_id: 's', question: 'q', options: [] }),
@@ -239,7 +239,7 @@ describe('exchangeStatus on divider exchanges', () => {
     );
     const exchanges = groupIntoExchanges(events);
     const divider = exchanges[1];
-    expect(exchangeStatus(divider, '', true, false, true)).toBe('cc-working');
+    expect(exchangeStatus(divider, '', true, false, true)).toBe('coding-agent-working');
   });
 
   it('canceled question divider settles into a non-awaiting terminal status', () => {

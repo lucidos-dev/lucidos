@@ -1,13 +1,12 @@
 import { useRef, useEffect, useState, useMemo } from 'preact/hooks';
-import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
+import { Overlay } from '../shared/Overlay';
 import { signal, useSignalEffect } from '@preact/signals';
-import { pendingChatMessage, showToast, inputMode, openImagePopupFromGroup, focusedThreadId, threadMap, repositories, selectedScope, appsList, panelUrl, panelTitle, cancelingThreadIds, effectiveThreadStatus, isMidTurn, type Scope, currentApp, wipPreviewThreadId } from '../../store/store';
-import { loadApps } from '../../store/actions/apps';
-import { sendMessage, loadRepositories, handleCancelExchange } from '../../store/actions/chat';
-import { currentChatContext } from '../../store/actions/chatContext';
+import { pendingChatMessage, showToast, showConfirm, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, isMidTurn, currentApp, wipPreviewThreadId, selectedCodingAgent } from '../../store/store';
+import { sendMessage, handleCancelExchange } from '../../store/actions/chat';
+import { currentChatContext, type ChatContext } from '../../store/actions/chatContext';
 import { handleSaveThread, handleUnsaveThread } from '../../store/actions/threads';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
-import { type AnswerKind } from '../../store/thread-events';
+import { type AnswerKind, type ThreadState } from '../../store/thread-events';
 import {
   multiSelectedByToolUse,
   pendingAnswerByToolUse,
@@ -16,28 +15,29 @@ import {
   setPendingAnswer,
   clearPendingAnswer,
 } from './QuestionCard';
-import { updateCompose, sendCompose, sendFollowup, ensureFocusedComposeThread, type ComposeMode } from '../../store/actions/compose';
+import { updateCompose, sendCompose, sendFollowup, ensureFocusedComposeThread } from '../../store/actions/compose';
 import { pushNavState } from '../../store/actions/navigation';
 import { getDraft } from '../../store/composeDrafts';
+import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { scrollToBottom, preserveAtBottom } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon } from '../shared/icons';
-import { Dropdown } from '../shared/Dropdown';
-import { CCControlMenu, ccMenuOpenRequest } from './CCControlMenu';
+import { CodingAgentControlMenu, codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
+import { LucidosControlMenu } from './LucidosControlMenu';
 import { TodoListIndicator } from './TodoListPanel';
 import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
-import { composeHasContent, computeMorphMode, dispatchSend, computeSubmitMultiCount, findPendingMultiSelectQuestion, findLatestPendingQuestion, shouldClearCanceling, shouldLiftSectionButtons, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion } from './prompt-input-helpers';
-import { resolveThreadActions, discardDraft } from '../../store/actions/threadActions';
+import { composeHasContent, computeMorphMode, dispatchSend, computeSubmitMultiCount, findPendingMultiSelectQuestion, findLatestPendingQuestion, shouldClearCanceling, shouldLiftSectionButtons, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, type UploadSendIntent } from './prompt-input-helpers';
+import { resolveThreadActions } from '../../store/actions/threadActions';
 export * from './prompt-input-helpers';
 import { useFitsInOneRow } from '../../hooks/useFitsInOneRow';
 import { focusIfNeeded, composeHandlers } from './promptFocus';
 import { syncTextareaValue, shouldSkipSyncWhileEditing } from './promptValueSync';
-import { effectiveSendMode } from './promptToggleMode';
+import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
 import { resizeTextarea, useFontMetricsResize } from './promptResize';
 import { isMobile } from '../../utils/viewport';
 import { createTapGate } from '../../utils/tapGesture';
 import { errorDetail } from '../../utils/errorDetail';
 import { extractPasteUrl, escapeMarkdownLinkText } from '../../utils/extractPasteUrl';
-import { attachedImagesForCurrentThread, getAttachedImages, removeAttachedImage } from './pastedImages';
+import { attachedImagesForCurrentThread, getAttachedImages, removeAttachedImage, type AttachedImage } from './pastedImages';
 import { getPendingUploads, hasInFlightUploads, removePendingUpload, pendingUploads } from '../../store/pendingUploads';
 import { attachImageToActiveDraft } from './attachToDraft';
 import { computeCaptureGeometry, readDeviceAngle } from './cameraGeometry';
@@ -118,9 +118,9 @@ function CameraCapture() {
 
 // Pending uploads count as content: while a pasted/picked image is still
 // uploading, treat the prompt as actively composing so the section buttons
-// (Save/Archive) and waiting banner yield to Send + Discard. Without this,
-// the Save chip briefly appears in place of Send during the upload window
-// for any thread in the review section.
+// (Save/Archive) and waiting banner yield to Send. Without this, the Save
+// chip briefly appears in place of Send during the upload window for any
+// thread in the review section.
 
 function SavePromptButton({ threadId }: { threadId: string }) {
   return (
@@ -160,8 +160,8 @@ export function PromptInput() {
   // compares against promptActionsAreaRef.clientWidth, so user font scaling,
   // browser zoom, and per-thread label changes (Apply ↔ Apply & Restart) all
   // feed in directly — no viewport-width heuristics that miss the squeeze on
-  // dense rows. When false, the secondary candidate (Diff for the banner,
-  // Discard draft for compose) lifts to a row above the icons.
+  // dense rows. When false, the secondary candidate (the Diff button, in the
+  // banner or standalone while composing) lifts to a row above the icons.
   const fitsInOneRow = useFitsInOneRow(promptActionsAreaRef);
   // Scroll-vs-tap gate for the morph Send→Cancel button. Without it, an iOS
   // PWA touch that stays under iOS's ~10 px native cancel threshold during a
@@ -194,7 +194,14 @@ export function PromptInput() {
     if (!el) return;
     const sameThread = prevTidRef.current === tid;
     const thisElementActive = document.activeElement === el;
-    if (!shouldSkipSyncWhileEditing(el, sameThread, thisElementActive)
+    // An empty canonical draft must reach the textarea even while it is focused:
+    // clearing is never "clobbering in-flight typing" — composeText is '' only
+    // when the draft is genuinely empty (a keystroke updates it synchronously).
+    // The skip guard exists to protect non-empty in-flight content; letting it
+    // block an empty sync left stale text stuck in a focused textarea after the
+    // clear-X on WebKit (the "Clearing a follow-up draft" flake).
+    const forceEmptySync = composeText === '';
+    if ((forceEmptySync || !shouldSkipSyncWhileEditing(el, sameThread, thisElementActive))
         && syncTextareaValue(el, composeText, sameThread)) {
       autoResize();
       requestAnimationFrame(() => requestAnimationFrame(() => autoResize()));
@@ -206,10 +213,6 @@ export function PromptInput() {
   }, [tid, composeText]);
 
   useFontMetricsResize(() => autoResize());
-
-  useDismissOnOutside(attachMenuOpen.value, menuRef, null, () => {
-    attachMenuOpen.value = false;
-  });
 
   function autoResize() {
     const el = inputRef.current;
@@ -229,77 +232,115 @@ export function PromptInput() {
     }
   }
 
+  function beginSend(
+    threadId: string | null,
+    thread: ThreadState | undefined,
+    msg: string,
+    currentImages: AttachedImage[],
+    intent: UploadSendIntent<ChatContext>,
+  ): Promise<void> {
+    const imageHashes = currentImages.length > 0 ? currentImages.map((i) => i.hash) : undefined;
+    const shouldFocus = threadId === null || focusedThreadId.value === threadId;
+
+    const { promise: sendPromise, submittedId } = dispatchSend(threadId, () => {
+      if (threadId && thread?.meta.state === 'composing') {
+        // Composing thread: send through compose so server transitions
+        // state→active and clears compose fields atomically.
+        return sendCompose(threadId, { useClaudeCode: intent.useClaudeCode, context: intent.context, focus: shouldFocus });
+      } else if (threadId) {
+        return sendFollowup(threadId, msg, imageHashes, { useClaudeCode: intent.useClaudeCode || undefined, context: intent.context, focus: shouldFocus });
+      } else {
+        return sendMessage(msg, imageHashes, { useClaudeCode: intent.useClaudeCode || undefined, context: intent.context, focus: shouldFocus });
+      }
+    });
+
+    return sendPromise.catch((error) => {
+      if (submittedId) {
+        clearSubmittingThread(submittedId);
+      }
+      showToast('Failed to send message: ' + errorDetail(error), 'error');
+    });
+  }
+
+  function sendQueuedAfterUpload(
+    threadId: string,
+    intent: UploadSendIntent<ChatContext>,
+  ): Promise<void> {
+    const thread = threadMap.value.get(threadId);
+    if (!thread) {
+      clearSubmittingThread(threadId);
+      return Promise.resolve();
+    }
+    const draft = getDraft(threadId);
+    const msg = thread.meta.state === 'composing' ? draft.text : draft.text.trim();
+    const currentImages = getAttachedImages(threadId);
+    if (!msg.trim() && currentImages.length === 0) {
+      clearSubmittingThread(threadId);
+      return Promise.resolve();
+    }
+    if (effectiveThreadStatus(thread) === 'waiting_for_user_answer' && currentImages.length > 0) {
+      showToast('Remove attached images to answer this question — answers are text only.', 'info');
+      clearSubmittingThread(threadId);
+      return Promise.resolve();
+    }
+    return beginSend(threadId, thread, msg, currentImages, intent);
+  }
+
   async function submit() {
     const el = inputRef.current;
     if (!el) return;
     const msg = el.value.trim();
     const threadId = focusedThreadId.value;
     const currentImages = threadId ? getAttachedImages(threadId) : [];
-    if (!msg && currentImages.length === 0) return;
+    const pendingForThread = threadId ? getPendingUploads(threadId) : [];
+    const uploadInFlight = threadId ? hasInFlightUploads(threadId) : false;
+    if (!msg && currentImages.length === 0 && !uploadInFlight) return;
     // Backend reroutes typed text to the pending question's answer (see
     // chat/process.rs free-form path), but the answer payload drops images.
     // Refuse the send so the user can remove the images instead of silently
     // losing them. Disabling the attach buttons covers fresh attachments; this
     // catches images attached before the question opened.
-    if (isAnsweringQuestion && currentImages.length > 0) {
+    if (isAnsweringQuestion && (currentImages.length > 0 || pendingForThread.length > 0)) {
       showToast('Remove attached images to answer this question — answers are text only.', 'info');
       return;
     }
     const thread = threadId ? threadMap.value.get(threadId) : undefined;
+    const useClaudeCode = effectiveSendMode(thread) === 'claude_code';
+    const context = currentChatContext();
+    if (threadId && uploadInFlight) {
+      queueUploadSend(threadId, { useClaudeCode, context });
+      preserveAtBottom();
+      return;
+    }
     el.value = '';
     el.style.height = 'auto';
     scrollToBottom();
     if (isMobile()) el.blur();
 
-    const useClaudeCode = effectiveSendMode(thread) === 'claude_code';
-
-    const imageHashes = currentImages.length > 0 ? currentImages.map((i) => i.hash) : undefined;
-
-    const context = currentChatContext();
-
-    const { promise: sendPromise, submittedId } = dispatchSend(threadId, () => {
-      if (threadId && thread?.meta.state === 'composing') {
-        // Composing thread: send through compose so server transitions
-        // state→active and clears compose fields atomically.
-        return sendCompose(threadId, { useClaudeCode, context });
-      } else if (threadId) {
-        return sendFollowup(threadId, msg, imageHashes, { useClaudeCode: useClaudeCode || undefined, context });
-      } else {
-        return sendMessage(msg, imageHashes, { useClaudeCode: useClaudeCode || undefined, context });
-      }
-    });
-
-    sendPromise.catch((error) => {
-      if (submittedId) {
-        const next = new Set(submittingThreadIds.value);
-        next.delete(submittedId);
-        submittingThreadIds.value = next;
-      }
-      showToast('Failed to send message: ' + errorDetail(error), 'error');
-    });
+    await beginSend(threadId, thread, msg, currentImages, { useClaudeCode, context });
   }
 
-  async function handleDiscard() {
-    const el = inputRef.current;
-    if (!el) return;
-    const id = focusedThreadId.value;
-    if (!id) return;
-    // The confirm + the active-vs-composing branch both live on the action
-    // (discardDraft), so this button confirms identically to the close-cascade
-    // shortcut — confirmation is tied to the action, never to how it's invoked.
-    // Bail without touching the textarea or focus when the user cancels.
-    if (!(await discardDraft(id))) return;
-    el.value = '';
-    el.style.height = 'auto';
-    // Discard is an exit from compose — drop focus so the mobile keyboard
-    // goes down.
-    el.blur();
-  }
+  useSignalEffect(() => {
+    const queued = queuedUploadSends.value;
+    if (queued.size === 0) return;
+    const uploads = pendingUploads.value;
+    for (const [threadId] of queued) {
+      const pendingForThread = uploads.get(threadId) ?? [];
+      if (pendingForThread.some((u) => u.status === 'uploading')) continue;
+      if (pendingForThread.some((u) => u.status === 'failed')) {
+        clearQueuedUploadSend(threadId);
+        continue;
+      }
+      const intent = takeQueuedUploadSend(threadId);
+      if (!intent) continue;
+      void sendQueuedAfterUpload(threadId, intent as UploadSendIntent<ChatContext>);
+    }
+  });
 
   function handleInput() {
     autoResize();
     // Typing the first character flips hasContent → the action row swaps
-    // section buttons for Send/Discard, often changing prompt-actions-row
+    // section buttons for Send, often changing prompt-actions-row
     // height even when the textarea itself didn't grow. Pin the user to the
     // bottom across the upcoming re-render so onResize can't escalate
     // scrolledUp=true on the layout shift.
@@ -307,14 +348,16 @@ export function PromptInput() {
     const el = inputRef.current;
     if (!el) return;
     const val = el.value;
-    // "/" prefix in CC mode opens command menu with filter
+    // "/" prefix opens Claude Code slash commands. Codex shares the legacy
+    // claude_code channel but has no slash-command surface, so Codex prompts
+    // keep the slash as normal message text.
     const tid = focusedThreadId.value;
     const thread = tid ? threadMap.value.get(tid) : undefined;
-    const isCCMode = effectiveSendMode(thread) === 'claude_code';
-    if (isCCMode && val.startsWith('/')) {
+    const isClaudeCodeMode = effectiveCodingAgentBackend(thread, selectedCodingAgent.value) === 'claude-code';
+    if (isClaudeCodeMode && val.startsWith('/')) {
       el.value = '';
       autoResize();
-      ccMenuOpenRequest.value = val.slice(1);
+      codingAgentMenuOpenRequest.value = val.slice(1);
       if (tid) updateCompose(tid, { text: '' });
       return;
     }
@@ -381,18 +424,6 @@ export function PromptInput() {
     removeAttachedImage(id, index);
   }
 
-  /** Mode toggle. For a focused composing thread, persist the choice on the
-   *  thread row so peers see it. Otherwise (no thread or active thread) just
-   *  set the inputMode signal — there's nothing server-side to update. */
-  function setMode(mode: ComposeMode) {
-    inputMode.value = mode === 'claude_code' ? { type: 'claude_code' } : { type: 'do' };
-    const id = focusedThreadId.value;
-    if (!id) return;
-    const thread = threadMap.value.get(id);
-    if (thread?.meta.state !== 'composing') return;
-    updateCompose(id, { mode });
-  }
-
   const focusedThread = focusedThreadId.value ? threadMap.value.get(focusedThreadId.value) : undefined;
 
   // Toggle visibility: visible whenever the channel choice is mutable — the
@@ -420,6 +451,7 @@ export function PromptInput() {
   const focusedTid = focusedThreadId.value;
   const pending = focusedTid ? getPendingUploads(focusedTid) : [];
   const uploadsBlocking = focusedTid ? hasInFlightUploads(focusedTid) : false;
+  const uploadSendQueued = focusedTid ? queuedUploadSends.value.has(focusedTid) : false;
   const hasContent = composeHasContent(hasText, images.length, pending.length);
   void multiSelectedByToolUse.value;
   const pendingAnswers = pendingAnswerByToolUse.value;
@@ -443,13 +475,21 @@ export function PromptInput() {
     : null;
   const multiSelectedIds = pendingMultiQ ? getMultiSelectedIds(pendingMultiQ.toolUseId) : [];
   const hasPendingMultiQ = pendingMultiQ !== null;
-  // Submit consumes the typed text — keep the morph in 'cancel' even with content.
-  const morphHasContent = hasContent && !hasPendingMultiQ;
-  // CC doesn't use browser context — hide the pill when it won't be sent
+  // Submit consumes the typed text; queued upload sends also count as already
+  // submitted so the normal Send→Cancel morph takes over while the hash lands.
+  const morphHasContent = hasContent && !hasPendingMultiQ && !uploadSendQueued;
+  // Coding agents don't use browser context — hide the pill when it won't be sent.
   const toggleMode = effectiveSendMode(focusedThread);
-  const willUseClaudeCode = toggleMode === 'claude_code';
-  const hasUrlContext = !!panelUrl.value && !willUseClaudeCode;
-  const showCCCommands = willUseClaudeCode;
+  const willUseCodingAgent = toggleMode === 'claude_code';
+  const hasUrlContext = !!panelUrl.value && !willUseCodingAgent;
+  const promptCodingAgent = effectiveCodingAgentBackend(focusedThread, selectedCodingAgent.value);
+  const showCodingAgentControls = promptCodingAgent !== null;
+  // A focused composing draft has no backend session yet. Load controls as a
+  // compose-view menu so Codex/Claude and repo scope come from the picker,
+  // not from the server's legacy thread default.
+  const codingAgentControlThreadId = focusedThread?.meta.state === 'active'
+    ? focusedThreadId.value ?? undefined
+    : undefined;
 
   const waitingState = getWaitingState();
 
@@ -540,6 +580,25 @@ export function PromptInput() {
     // is intentionally omitted from deps.
   }, [focusedThreadId.value, threadMap.value]);
 
+  // Release the optimistic answering flag once the real projection status
+  // leaves `waiting_for_user_answer` — the agent's resume is confirmed (status
+  // → running) or the turn finished (→ idle), so the real status can drive
+  // `isRenderedThreadIdle` from here. Read RAW `meta.status`, NOT
+  // effectiveThreadStatus: the flag itself is what suppresses the false
+  // "Aborted" via isRenderedThreadIdle (not effectiveThreadStatus), and gating
+  // on raw status keeps the release honest against the live projection.
+  useEffect(() => {
+    const focused = focusedThreadId.value;
+    if (!focused || !answeringThreadIds.value.has(focused)) return;
+    const thread = threadMap.value.get(focused);
+    if (!thread) return;
+    if (thread.meta.status !== 'waiting_for_user_answer') {
+      clearThreadAnswering(focused);
+    }
+    // See cancelingThreadIds effect above for why answeringThreadIds.value is
+    // intentionally omitted from deps.
+  }, [focusedThreadId.value, threadMap.value]);
+
   // Force-close the attach menu when a question arrives mid-open. The dropdown
   // already hides via the `!isAnsweringQuestion` render gate, but without this
   // the signal stays `true` and the menu would pop back the moment the
@@ -599,28 +658,16 @@ export function PromptInput() {
     </button>
   ) : null;
 
-  const composeDiscardButton = hasContent && !bannerState ? (
-    <button
-      key="discard-draft"
-      class="action-btn action-btn-danger"
-      onClick={handleDiscard}
-      aria-label="Discard draft"
-      data-row-item
-    >
-      Discard draft
-    </button>
-  ) : null;
   // sectionButtons (Save / ✓ Saved) are rendered separately below so they
-  // anchor to the bottom row instead of lifting alongside Diff / Discard draft
-  // when the row stacks.
+  // anchor to the bottom row instead of lifting alongside Diff when the row
+  // stacks.
   // When the banner is suppressed (mid-turn 'canceling', or composing without
   // any waiting actions), the in-banner Diff disappears too. The standalone
   // Diff button fills that gap so "branch has commits → Diff visible" holds
-  // regardless of CC's run-state. Discard-draft wins when the user is
-  // actively composing (only one liftable slot exists).
+  // regardless of CC's run-state — it's the only liftable slot while composing.
   const slots = bannerState
     ? getBannerSlots(bannerState)
-    : { liftable: composeDiscardButton ?? getStandaloneCcDiffButton(), primary: null };
+    : { liftable: getStandaloneCcDiffButton(), primary: null };
   const stacked = !fitsInOneRow;
   const sendButton = morphMode !== 'hidden' ? (
     <button
@@ -637,22 +684,38 @@ export function PromptInput() {
         if (!morphGate.isTap()) return;
         if (morphMode === 'send') void submit();
         else if (morphMode === 'cancel') {
-          // Capture the question this cancel targets (if any) so the cleanup
-          // effect can release the optimistic flag once it resolves — even when
-          // the agent answers the cancel by re-asking (thread stays mid-turn).
-          setCanceledQuestion(cancelTargetId!, findLatestPendingQuestion(focusedThread)?.toolUseId);
-          void handleCancelExchange(cancelTargetId!);
+          // Snapshot the target thread and the question this cancel targets (if
+          // any) BEFORE the async confirm — the user can switch focus or the
+          // question can resolve while the dialog is open, and we must not
+          // cancel the wrong thread. The captured question id lets the cleanup
+          // effect release the optimistic flag once it resolves — even when the
+          // agent answers the cancel by re-asking (thread stays mid-turn).
+          const targetId = cancelTargetId!;
+          const targetQuestionId = findLatestPendingQuestion(focusedThread)?.toolUseId;
+          void (async () => {
+            if (!(await showConfirm('Cancel this response?', 'Cancel response', {
+              cancelLabel: 'Keep going',
+              variant: 'danger',
+            }))) return;
+            if (queuedUploadSends.value.has(targetId)) {
+              clearQueuedUploadSend(targetId);
+              setCanceledQuestion(targetId, undefined);
+              return;
+            }
+            setCanceledQuestion(targetId, targetQuestionId);
+            void handleCancelExchange(targetId);
+          })();
         }
       }}
       aria-label={morphMode === 'cancel' || morphMode === 'canceling' ? 'Cancel' : 'Send message'}
       aria-hidden={morphMode === 'placeholder' ? 'true' : undefined}
       tabIndex={morphMode === 'send' || morphMode === 'cancel' ? undefined : -1}
       disabled={
-        morphMode === 'send' ? uploadsBlocking
+        morphMode === 'send' ? false
         : morphMode === 'cancel' ? false
         : true
       }
-      data-tooltip={morphMode === 'send' && uploadsBlocking ? 'Waiting for image upload…' : undefined}
+      data-tooltip={morphMode === 'send' && uploadsBlocking ? 'Send after image upload' : undefined}
       data-row-item
     >
       {morphMode === 'canceling' ? 'Cancel...'
@@ -709,83 +772,11 @@ export function PromptInput() {
         </div>
       )}
       {togglesMounted && <div key="toggles" class={`input-toggles-wrapper${togglesFading ? ' fading-out' : ''}`}>
-      <div class="input-target-tabs segmented-control">
-        <button
-          class={`segmented-btn ${toggleMode === 'lucidos' ? 'active' : ''}`}
-          {...composeHandlers(() => setMode('lucidos'))}
-        >
-          Lucidos
-        </button>
-        <button
-          class={`segmented-btn ${toggleMode === 'claude_code' ? 'active' : ''}`}
-          {...composeHandlers(() => setMode('claude_code'))}
-        >
-          Claude
-        </button>
-      </div>
-        {!togglesFading && toggleMode === 'claude_code' && (() => {
-          const reposLoadable = repositories.value;
-          const appsLoadable = appsList.value;
-          if (reposLoadable.status === 'not-loaded') void loadRepositories();
-          if (appsLoadable.status === 'not-loaded') void loadApps();
-          if (reposLoadable.status === 'failed') {
-            return (
-              <div class="cc-repo-submenu cc-repo-submenu-error" data-tooltip={reposLoadable.error}>
-                <span>›</span>
-                <span class="error-text">Failed to load repositories</span>
-              </div>
-            );
-          }
-          if (reposLoadable.status !== 'loaded') return null;
-          const repos = reposLoadable.data;
-          // External repos = registered repos minus the Lucidos-source row,
-          // which is the implicit default and gets its own (top) option.
-          const externalRepos = repos.filter(r => r.name !== 'Lucidos');
-          const apps = appsLoadable.status === 'loaded' ? appsLoadable.data : [];
-          // Encode the discriminated Scope on the option `value` so the
-          // Dropdown — which only knows string values — can round-trip the
-          // selection. `lucidos` is the literal, repo:<uuid> is external,
-          // app:<id> is app.
-          const SCOPE_LUCIDOS = 'lucidos';
-          const scopeToOptionValue = (s: Scope): string => {
-            switch (s.kind) {
-              case 'lucidos': return SCOPE_LUCIDOS;
-              case 'external': return `repo:${s.repoId}`;
-              case 'app': return `app:${s.appId}`;
-            }
-          };
-          const parseOptionValue = (v: string): Scope => {
-            if (v.startsWith('repo:')) return { kind: 'external', repoId: v.slice(5) };
-            if (v.startsWith('app:')) return { kind: 'app', appId: v.slice(4) };
-            return { kind: 'lucidos' };
-          };
-          const options: Array<{ value: string; label: string; disabled?: boolean }> = [
-            { value: SCOPE_LUCIDOS, label: 'Lucidos' },
-          ];
-          if (externalRepos.length > 0) {
-            options.push({ value: '__hdr-repos', label: 'External repos', disabled: true });
-            for (const r of externalRepos) {
-              options.push({ value: `repo:${r.id}`, label: r.name });
-            }
-          }
-          if (apps.length > 0) {
-            options.push({ value: '__hdr-apps', label: 'Apps', disabled: true });
-            for (const a of apps) {
-              options.push({ value: `app:${a.id}`, label: a.name });
-            }
-          }
-          return (
-            <div class="cc-repo-submenu">
-              <span>›</span>
-              <Dropdown
-                options={options}
-                value={scopeToOptionValue(selectedScope.value)}
-                onChange={(v) => { selectedScope.value = parseOptionValue(v); }}
-                class="cc-repo-selector"
-              />
-            </div>
-          );
-        })()}
+        <ComposeDestinationRow
+          threadId={focusedThreadId.value}
+          toggleMode={toggleMode}
+          fading={togglesFading}
+        />
       </div>}
       {hasUrlContext && (
         <div class="url-context-pill" data-tooltip={panelUrl.value ?? undefined}>
@@ -800,7 +791,7 @@ export function PromptInput() {
             class="prompt-textarea"
             data-role="prompt-input"
             data-thread-id={tid ?? ''}
-            placeholder={focusedThreadId.value ? 'Post a follow up…' : 'Go ahead…'}
+            placeholder={focusedThreadId.value ? 'Post a follow up…' : 'What can I help with today?'}
             rows={1}
             onInput={handleInput}
             onKeyDown={handleKeyDown}
@@ -839,9 +830,9 @@ export function PromptInput() {
           onChange={handleFileSelect}
         />
         <div class={rowClass} ref={promptActionsAreaRef}>
-          {showCCCommands
-            ? <CCControlMenu threadId={focusedThreadId.value ?? undefined} />
-            : <TodoListIndicator />}
+          {showCodingAgentControls
+            ? <CodingAgentControlMenu threadId={codingAgentControlThreadId} codingAgent={promptCodingAgent} />
+            : <><LucidosControlMenu /><TodoListIndicator /></>}
           {(() => {
             // WIP app preview toggle: visible only when the focused thread is
             // an app coding-agent thread AND that app is open in the
@@ -906,18 +897,22 @@ export function PromptInput() {
               >
                 <ImageIcon />
               </button>
-              {attachMenuOpen.value && !isAnsweringQuestion && (
-                <div class="image-attach-menu">
-                  <button onClick={() => { attachMenuOpen.value = false; cameraOpen.value = true; }}>
-                    <CameraIcon />
-                    Camera
-                  </button>
-                  <button onClick={() => { attachMenuOpen.value = false; fileInputRef.current?.click(); }}>
-                    <FileIcon />
-                    File
-                  </button>
-                </div>
-              )}
+              <Overlay
+                open={attachMenuOpen.value && !isAnsweringQuestion}
+                onClose={() => { attachMenuOpen.value = false; }}
+                anchor={menuRef.current}
+                backdrop={false}
+                panelClass="image-attach-menu"
+              >
+                <button onClick={() => { attachMenuOpen.value = false; cameraOpen.value = true; }}>
+                  <CameraIcon />
+                  Camera
+                </button>
+                <button onClick={() => { attachMenuOpen.value = false; fileInputRef.current?.click(); }}>
+                  <FileIcon />
+                  File
+                </button>
+              </Overlay>
             </div>
           )}
           <div class={rightClass}>

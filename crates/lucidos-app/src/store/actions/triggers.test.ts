@@ -100,6 +100,7 @@ describe('submitTrigger scroll reset', () => {
       cronExpressions: ['0 0 0 * * *'],
       triggerId: 't1',
       goToReview: false,
+      sideEffectGrant: [],
     });
 
     expect(ok).toBe(true);
@@ -115,6 +116,7 @@ describe('submitTrigger scroll reset', () => {
       run: { type: 'intent', intent: 'do thing' },
       cronExpressions: ['0 0 0 * * *'],
       goToReview: false,
+      sideEffectGrant: [],
     });
 
     expect(ok).toBe(true);
@@ -131,6 +133,7 @@ describe('submitTrigger scroll reset', () => {
       cronExpressions: ['0 0 0 * * *'],
       triggerId: 't1',
       goToReview: false,
+      sideEffectGrant: [],
     });
 
     expect(ok).toBe(false);

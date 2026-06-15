@@ -17,7 +17,7 @@ vi.mock('../actions/notifications', () => ({
   handleNotificationSSE: vi.fn(),
   markReadOptimistic: (...args: unknown[]) => markReadOptimistic(...args),
   viewNotification: vi.fn(),
-  refreshUnreadCount: vi.fn(),
+  loadUnreadNotifications: vi.fn(),
   loadNotifications: vi.fn(),
 }));
 const switchMenuItem = vi.fn();
@@ -33,6 +33,7 @@ vi.mock('../actions/devices', () => ({ getDeviceId: () => 'dev-test' }));
 
 import type { Tap } from '@lucidos/sdk';
 import { handleGlobalEvent } from '../actions/thread-sync';
+import { focusThreadOrBootstrap } from '../actions/threads';
 import {
   handleNotificationToastRequested,
   TOAST_REQUEST_STALE_AFTER_MS,
@@ -121,6 +122,29 @@ describe('NotificationToastRequested (active page) → in-app toast', () => {
     // change-applied / discarded toasts in thread-sync.ts).
     expect(t.action).toBeUndefined();
     expect(t.onClick).toBeTypeOf('function');
+  });
+
+  it('forwards tap.kind=navigate (to a thread + event) so the toast click deep-links to the source event', () => {
+    // The reported bug was the in-app toast NOT landing on the source event in
+    // a thread. The toast click must route through the SAME navigate dispatch
+    // the inbox modal and push taps use → focusThreadOrBootstrap(threadId, {
+    // targetEventId }). This pins the wiring that feeds the scroll the event id;
+    // the scroll-and-pulse itself (and its fix for unfocused threads) is covered
+    // by e2e/notifications.spec.ts.
+    emitToast({
+      notification_id: 'notif-q',
+      title: 'Claude is asking',
+      body: 'Ship it?',
+      thread_id: 't-9',
+      event_id: 'e-7',
+      tap: { kind: 'navigate', to: { target: 'thread', id: 't-9', event_id: 'e-7' } },
+    });
+
+    const t = toasts.value[0];
+    expect(t.onClick).toBeTypeOf('function');
+    t.onClick!();
+
+    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t-9', { targetEventId: 'e-7' });
   });
 
   it('marks tap=none read as soon as the toast is shown (no user interaction needed)', () => {

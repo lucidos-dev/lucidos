@@ -34,8 +34,8 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const chatExchangeSource = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
 
 const APPS: App[] = [
-  { id: 'work-tracker', name: 'Lucidos Work', description: 'x', knowhow: [] },
-  { id: 'momentum-autoresearch', name: 'Momentum Autoresearch', description: 'y', knowhow: [] },
+  { id: 'work-tracker', name: 'Lucidos Work', description: 'x' },
+  { id: 'momentum-autoresearch', name: 'Momentum Autoresearch', description: 'y' },
 ];
 
 interface MockAnchor {

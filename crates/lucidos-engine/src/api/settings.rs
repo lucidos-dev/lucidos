@@ -1,16 +1,24 @@
 use super::*;
 
-use crate::core::{AuthType, CredentialStore, OAuthStore, PinnedAppStore, PreferenceStore};
+use crate::core::{
+    AuthType, CredentialStore, ModelStore, OAuthStore, PinnedAppStore, PreferenceStore,
+};
 use crate::engine::claude_code::{read_allowed_tools_file, write_allowed_tools_file};
+use crate::engine::command_permission::{
+    read_agent_allowed_commands_file, write_agent_allowed_commands_file,
+};
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 
+/// Response/request body for both allowlist editors (`cc-allowed-tools` and
+/// `agent-allowed-commands`) — the raw file text, one pattern per line. The
+/// settings UI parses it into editable rows and reserializes on save.
 #[derive(Serialize)]
-pub(super) struct CcAllowedToolsResponse {
+pub(super) struct AllowlistResponse {
     contents: String,
 }
 
 #[derive(Deserialize)]
-pub(super) struct CcAllowedToolsRequest {
+pub(super) struct AllowlistRequest {
     contents: String,
 }
 
@@ -19,7 +27,7 @@ pub(super) struct CcAllowedToolsRequest {
 /// file returns the seeded header (mirrors `cc_allowed_tools` semantics).
 pub(super) async fn get_cc_allowed_tools(
     State(state): State<AppState>,
-) -> Result<Json<CcAllowedToolsResponse>, (StatusCode, String)> {
+) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
     let dir = state.engine.user_dir().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "User directory not configured".to_string(),
@@ -30,7 +38,7 @@ pub(super) async fn get_cc_allowed_tools(
             format!("Failed to read cc-allowed-tools: {}", e),
         )
     })?;
-    Ok(Json(CcAllowedToolsResponse { contents }))
+    Ok(Json(AllowlistResponse { contents }))
 }
 
 /// PUT /api/v1/cc-allowed-tools — overwrite the file with the provided contents
@@ -38,7 +46,7 @@ pub(super) async fn get_cc_allowed_tools(
 /// subprocesses keep their frozen `--allowedTools` flag until they restart.
 pub(super) async fn put_cc_allowed_tools(
     State(state): State<AppState>,
-    Json(body): Json<CcAllowedToolsRequest>,
+    Json(body): Json<AllowlistRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let dir = state.engine.user_dir().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -48,6 +56,46 @@ pub(super) async fn put_cc_allowed_tools(
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to write cc-allowed-tools: {}", e),
+        )
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/v1/agent-allowed-commands — return the raw contents of
+/// `~/.lucidos/agent-allowed-commands`, the Lucidos Agent command-guard
+/// allowlist (ADR 0002). Missing file returns the seeded header. The chat
+/// counterpart of `get_cc_allowed_tools`.
+pub(super) async fn get_agent_allowed_commands(
+    State(state): State<AppState>,
+) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
+    let dir = state.engine.user_dir().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "User directory not configured".to_string(),
+    ))?;
+    let contents = read_agent_allowed_commands_file(dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read agent-allowed-commands: {}", e),
+        )
+    })?;
+    Ok(Json(AllowlistResponse { contents }))
+}
+
+/// PUT /api/v1/agent-allowed-commands — overwrite the file (atomic). The command
+/// guard reads it fresh on each prompt, so an edit takes effect on the next
+/// gated command — no restart.
+pub(super) async fn put_agent_allowed_commands(
+    State(state): State<AppState>,
+    Json(body): Json<AllowlistRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let dir = state.engine.user_dir().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "User directory not configured".to_string(),
+    ))?;
+    write_agent_allowed_commands_file(dir, &body.contents).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write agent-allowed-commands: {}", e),
         )
     })?;
     Ok(StatusCode::NO_CONTENT)
@@ -270,6 +318,149 @@ pub(super) async fn delete_credential(
         }
         Ok(false) => ApiResult::err(format!("Credential '{}' not found", service)),
         Err(e) => ApiResult::err(format!("Failed to delete credential: {}", e)),
+    }
+}
+
+// ===== Model Registry Endpoints =====
+
+/// Provider values the registry accepts. Kept in lockstep with
+/// `crate::llm::model_registry::ProviderKind`.
+fn valid_provider(p: &str) -> bool {
+    matches!(p, "vertex" | "anthropic" | "openai")
+}
+
+/// GET /api/v1/models — the full registry (enabled + disabled). The chat picker
+/// filters to `enabled`; the Settings → Models manager shows all.
+pub(super) async fn list_models(
+    State(state): State<AppState>,
+) -> Result<Json<ModelsListResponse>, (StatusCode, String)> {
+    let models = ModelStore::list(&state.pool).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list models: {}", e),
+        )
+    })?;
+    Ok(Json(ModelsListResponse { models }))
+}
+
+/// POST /api/v1/models — add a user model.
+pub(super) async fn create_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateModelRequest>,
+) -> Json<ApiResult> {
+    let id = request.id.trim();
+    let label = request.label.trim();
+    if id.is_empty() {
+        return ApiResult::err("Model id cannot be empty");
+    }
+    if label.is_empty() {
+        return ApiResult::err("Model label cannot be empty");
+    }
+    if !valid_provider(&request.provider) {
+        return ApiResult::err("Provider must be one of: vertex, anthropic, openai");
+    }
+    // User models sort after the builtins by default.
+    let sort_order = request.sort_order.unwrap_or(1000);
+    match ModelStore::create(&state.pool, id, label, &request.provider, sort_order).await {
+        Ok(model) => {
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Settings] ModelCreated", |actor| {
+                    SystemEvent::ModelCreated {
+                        id: model.id.clone(),
+                        label: model.label.clone(),
+                        provider: model.provider.clone(),
+                        actor,
+                    }
+                })
+                .await;
+            ApiResult::ok()
+        }
+        Err(e) => ApiResult::err(format!("Failed to create model (id may already exist): {}", e)),
+    }
+}
+
+/// PUT /api/v1/models?id= — edit a model. Builtins are disable-only: only the
+/// `enabled` flag is applied. User models update any provided field.
+pub(super) async fn update_model(
+    State(state): State<AppState>,
+    Query(query): Query<ModelIdQuery>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateModelRequest>,
+) -> Json<ApiResult> {
+    let existing = match ModelStore::get(&state.pool, &query.id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return ApiResult::err(format!("Model '{}' not found", query.id)),
+        Err(e) => return ApiResult::err(format!("Failed to load model: {}", e)),
+    };
+
+    let result = if existing.is_builtin() {
+        // Builtins keep their identity — only the enable toggle is honored.
+        match request.enabled {
+            Some(enabled) => ModelStore::set_enabled(&state.pool, &existing.id, enabled).await,
+            None => Ok(true),
+        }
+    } else {
+        let label = request.label.unwrap_or_else(|| existing.label.clone());
+        let provider = request.provider.unwrap_or_else(|| existing.provider.clone());
+        if !valid_provider(&provider) {
+            return ApiResult::err("Provider must be one of: vertex, anthropic, openai");
+        }
+        let sort_order = request.sort_order.unwrap_or(existing.sort_order);
+        let enabled = request.enabled.unwrap_or(existing.enabled);
+        ModelStore::update(&state.pool, &existing.id, &label, &provider, sort_order, enabled).await
+    };
+
+    match result {
+        Ok(_) => {
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Settings] ModelUpdated", |actor| {
+                    SystemEvent::ModelUpdated {
+                        id: existing.id.clone(),
+                        actor,
+                    }
+                })
+                .await;
+            ApiResult::ok()
+        }
+        Err(e) => ApiResult::err(format!("Failed to update model: {}", e)),
+    }
+}
+
+/// DELETE /api/v1/models?id= — delete a user model. Builtins are not deletable
+/// (disable instead), since deleting one could orphan a saved `chat_model` pref.
+pub(super) async fn delete_model(
+    State(state): State<AppState>,
+    Query(query): Query<ModelIdQuery>,
+    headers: HeaderMap,
+) -> Json<ApiResult> {
+    let existing = match ModelStore::get(&state.pool, &query.id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return ApiResult::err(format!("Model '{}' not found", query.id)),
+        Err(e) => return ApiResult::err(format!("Failed to load model: {}", e)),
+    };
+    if existing.is_builtin() {
+        return ApiResult::err("Builtin models cannot be deleted — disable it instead");
+    }
+    match ModelStore::delete(&state.pool, &existing.id).await {
+        Ok(_) => {
+            state
+                .engine
+                .event_bus
+                .emit_user_system(&headers, &state.pool, "[Settings] ModelDeleted", |actor| {
+                    SystemEvent::ModelDeleted {
+                        id: existing.id.clone(),
+                        actor,
+                    }
+                })
+                .await;
+            ApiResult::ok()
+        }
+        Err(e) => ApiResult::err(format!("Failed to delete model: {}", e)),
     }
 }
 
@@ -923,6 +1114,79 @@ pub(super) async fn get_oauth_access_token(
     fetch_oauth_access_token(&state.pool, &provider)
         .await
         .map(Json)
+}
+
+/// Routes for the settings-owned surfaces: credentials, model registry,
+/// OAuth accounts, preferences, tool allowlists, devices, pinned apps, and
+/// email send.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        // Credentials endpoints
+        .route(
+            "/credentials",
+            get(list_credentials)
+                .post(create_credential)
+                .put(update_credential)
+                .delete(delete_credential),
+        )
+        .route("/credential-value", get(get_credential_value))
+        .route("/email-account", get(get_email_account))
+        // Model registry — the DB-backed chat model list (Settings → Models).
+        // Drives the Lucidos Agent picker + RoutingProvider provider selection.
+        .route(
+            "/models",
+            get(list_models)
+                .post(create_model)
+                .put(update_model)
+                .delete(delete_model),
+        )
+        // OAuth account endpoints
+        .route(
+            "/oauth/accounts",
+            get(list_oauth_accounts).delete(delete_oauth_account),
+        )
+        .route("/oauth/reauthorize", post(reauthorize_oauth))
+        .route("/oauth/complete", post(complete_oauth))
+        // Short-lived OAuth access-token for in-browser SDKs (e.g. Spotify
+        // Web Playback SDK). Refresh token never leaves the engine.
+        .route(
+            "/oauth/:provider/access-token",
+            get(get_oauth_access_token),
+        )
+        // Preferences endpoints
+        .route(
+            "/preferences",
+            get(get_preferences)
+                .put(set_preference)
+                .delete(delete_preference),
+        )
+        // CC tool-permission allowlist (~/.lucidos/cc-allowed-tools)
+        .route(
+            "/cc-allowed-tools",
+            get(get_cc_allowed_tools).put(put_cc_allowed_tools),
+        )
+        // Lucidos Agent command-guard allowlist (~/.lucidos/agent-allowed-commands, ADR 0002)
+        .route(
+            "/agent-allowed-commands",
+            get(get_agent_allowed_commands).put(put_agent_allowed_commands),
+        )
+        // Device endpoints
+        .route("/devices/register", post(register_device))
+        .route("/devices", get(list_devices))
+        .route("/devices/:device_id/name", put(rename_device))
+        .route("/devices/:device_id/push", put(set_device_push))
+        .route(
+            "/devices/:device_id",
+            axum::routing::delete(delete_device),
+        )
+        .route(
+            "/pinned-apps",
+            get(get_pinned_apps)
+                .post(pin_app)
+                .delete(unpin_app),
+        )
+        // Email endpoints
+        .route("/email/send", post(send_email_confirmed))
 }
 
 #[cfg(test)]

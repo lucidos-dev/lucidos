@@ -182,8 +182,13 @@ export function backupHealthCard(props: {
   if (status.status !== 'loaded') return null;
 
   const s = status.data;
+  // Severity drives the card hue. A failed last run escalates the whole card to
+  // the error (red) state so a failure never reads as a cheerful yellow box;
+  // a merely-stale-but-not-failed state stays a soft yellow warning.
+  const lastRunFailed = s.last_run != null && s.last_run.status !== 'success';
+  const state = lastRunFailed ? 'error' : s.stale ? 'stale' : 'idle';
   return (
-    <div class="backup-health-card" data-state={s.stale ? 'stale' : 'idle'}>
+    <div class="backup-health-card" data-state={state}>
       {lastRunLine(s.last_run)}
       {cloudLine(s)}
       {s.list_error && (
@@ -638,6 +643,19 @@ export function BackupSection() {
             >
               {granting ? 'Waiting for browser...' : 'Grant access'}
             </button>
+          </div>
+        )}
+
+        {providerInfo?.ready && providerInfo.folder_url && (
+          <div class="backup-folder-link-row">
+            <a
+              class="accent-link"
+              href={providerInfo.folder_url}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              View backups folder in {providerInfo.name} ↗
+            </a>
           </div>
         )}
 

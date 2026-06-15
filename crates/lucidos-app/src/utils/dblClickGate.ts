@@ -16,7 +16,10 @@ export function createDblClickGate(maxMs = DEFAULT_MAX_MS) {
       current = Date.now();
     },
     allow(): boolean {
-      return current > prev && current - prev <= maxMs;
+      // prev === 0 → fewer than two clicks recorded. Equal timestamps are
+      // valid: synthetic double-clicks (test drivers, HTMLElement.click())
+      // can land both pointerdowns in the same millisecond.
+      return prev !== 0 && current - prev <= maxMs;
     },
   };
 }

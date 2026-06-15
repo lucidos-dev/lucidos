@@ -309,12 +309,6 @@ pub(crate) async fn lookup_latest_session_repo_and_branch(
     .flatten()
 }
 
-/// Return the `cc_session_id` from the most recent `CodingAgentIdled` event
-/// for the thread, or `None` if there is no idled event yet (truly first turn)
-/// or the recorded sid is empty. Used to recover the resume target when CC
-/// must continue an existing conversation (e.g., after a pending change, or
-/// after the in-memory `agent_sessions` entry has been removed because the
-/// Claude Code subprocess exited at idle).
 /// Look up the most recent "originating event" id for a thread — the event
 /// whose id every event in the latest turn carries as `request_event_id`.
 /// Used by abort/recovery paths to stamp `request_event_id` on

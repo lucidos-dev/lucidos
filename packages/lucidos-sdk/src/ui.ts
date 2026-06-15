@@ -21,6 +21,21 @@ const GOOGLE_FONT_URLS: Record<string, string> = {
 const loadedFonts = new Set<string>();
 let watchingPrefs = false;
 
+/**
+ * iOS / iPadOS detection — mirrors `crates/lucidos-app/src/utils/platform.ts`.
+ * Exported for tests; `nav` defaults to the global navigator. Used to skip the
+ * live OS-appearance listener on iOS, whose WKWebView fires bogus
+ * `prefers-color-scheme` change events (telemetry-confirmed theme flashing).
+ */
+export function isIOSAgent(
+  nav: { userAgent: string; platform?: string; maxTouchPoints?: number } | undefined =
+    typeof navigator !== 'undefined' ? navigator : undefined,
+): boolean {
+  if (!nav) return false;
+  return /iPad|iPhone|iPod/.test(nav.userAgent) ||
+    (nav.platform === 'MacIntel' && (nav.maxTouchPoints ?? 0) > 1);
+}
+
 let confirmCounter = 0;
 const pendingConfirms = new Map<string, (value: boolean) => void>();
 let confirmListenerInstalled = false;
@@ -98,6 +113,18 @@ export const ui = {
       ui.applyPreferences();
     });
     sse.connect();
+    // A live OS light/dark flip under a `system` theme preference does NOT emit
+    // PreferencesChanged, so also re-apply on the media-query change — matching
+    // the host shell (preferences.ts → syncSystemThemeListener). `applyPreferences`
+    // stays the source of truth for which theme actually applies (for an explicit
+    // light/dark preference it re-applies the same value — a visual no-op). Skipped
+    // on iOS, whose WKWebView fires bogus
+    // prefers-color-scheme events; there `system` resolves once per applyPreferences().
+    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function' && !isIOSAgent()) {
+      window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+        ui.applyPreferences();
+      });
+    }
   },
 
   /**

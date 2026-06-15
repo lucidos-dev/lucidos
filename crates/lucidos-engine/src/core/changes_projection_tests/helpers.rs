@@ -68,6 +68,7 @@ pub(super) async fn start_cc_thread(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: format!("cc-{thread_id}"),
             branch: String::new(),
             repo_id: None,

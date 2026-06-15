@@ -130,10 +130,18 @@ fn project_event(event_type: &str, payload: &serde_json::Value) -> Option<String
             let text = text_field("text")?;
             Some(format!("User: {}", text))
         }
-        "CodingAgentTextStreamed" | "ResponseGenerated" => {
+        "CodingAgentTextStreamed" => {
             let text = text_field("text")?;
             Some(format!("You (assistant): {}", text))
         }
+        "ResponseGenerated" => match text_field("text") {
+            Some(text) => Some(format!("You (assistant): {}", text)),
+            // A benign empty completion (model ended its turn cleanly with no
+            // text) — surface the gap so an orchestrator re-reading its own
+            // history sees the child produced no text, without mislabeling it
+            // a failure.
+            None => Some("You (assistant): (no text response)".to_string()),
+        },
         // Surface failures (incl. empty completions) so an orchestrator
         // re-reading its own history sees that it once produced no response —
         // otherwise the gap is invisible and looks like the turn succeeded.
@@ -388,6 +396,7 @@ mod tests {
             &bus,
             thread_id,
             ThreadEvent::SessionStarted {
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: "sess-1".into(),
                 branch: "claude-code/foo".into(),
                 repo_id: None,
@@ -445,6 +454,7 @@ mod tests {
             &bus,
             thread_id,
             ThreadEvent::SessionStarted {
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: "sess-1".into(),
                 branch: "claude-code/trunc".into(),
                 repo_id: None,

@@ -14,6 +14,7 @@ pub mod image_migration;
 pub mod intents;
 pub mod knowhow;
 pub mod mcp_servers;
+pub mod models;
 pub mod oauth;
 pub mod pinned_apps;
 pub mod plugins;
@@ -317,10 +318,11 @@ pub fn load_workspace_env(workspace: &std::path::Path) -> Option<std::path::Path
 
 pub use events::EventRow;
 pub use mcp_servers::{McpServer, McpServerStore};
+pub use models::{Model, ModelStore};
 pub use preferences::{
-    PreferenceStore, DEFAULT_CHAT_MODEL, PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT,
-    PREF_IMAGE_MODEL, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE,
-    PREF_VERTEX_REGION,
+    PreferenceStore, DEFAULT_CHAT_MODEL, DEFAULT_COMMAND_JUDGE_MODEL, PREF_CHAT_MODEL,
+    PREF_CHAT_REASONING_EFFORT, PREF_IMAGE_MODEL, PREF_MODEL_COMMAND_JUDGE,
+    PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE, PREF_VERTEX_REGION,
 };
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, ResponseEvent, SessionMessage, Step,
@@ -1077,6 +1079,42 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
                 format!("Edit {}", basename(p))
             }
         }
+        // Codex item types (see runtime/codex_parse.rs) — Codex reports
+        // coarse-grained items, not named tools like CC.
+        "command_execution" => {
+            let cmd = str_arg("command");
+            if cmd.is_empty() {
+                "Run command".into()
+            } else {
+                let first_line = cmd
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| l.trim())
+                    .unwrap_or(cmd);
+                format!("Run {}", middle_truncate(first_line, 60))
+            }
+        }
+        "file_change" => {
+            let n = args
+                .get("changes")
+                .and_then(|c| c.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            match n {
+                0 => "Apply file changes".into(),
+                1 => "Apply 1 file change".into(),
+                n => format!("Apply {} file changes", n),
+            }
+        }
+        "web_search" => {
+            let q = str_arg("query");
+            if q.is_empty() {
+                "Web search".into()
+            } else {
+                format!("Search '{}'", middle_truncate(q, 60))
+            }
+        }
+        "todo_list" => "Update plan".into(),
         _ => name.to_string(),
     }
 }

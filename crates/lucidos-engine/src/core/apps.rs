@@ -3,8 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::memory::EmbeddingProvider;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppManifest {
     pub name: String,
@@ -12,8 +10,6 @@ pub struct AppManifest {
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub knowhow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,8 +19,6 @@ pub struct App {
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub knowhow: Vec<String>,
 }
 
 pub struct AppManager {
@@ -108,7 +102,6 @@ impl AppManager {
             name: manifest.name,
             description: manifest.description,
             icon: manifest.icon,
-            knowhow: manifest.knowhow,
         })
     }
 
@@ -164,7 +157,6 @@ impl AppManager {
             name: name.to_string(),
             description: description.to_string(),
             icon: None,
-            knowhow: Vec::new(),
         };
         std::fs::write(
             app_dir.join("manifest.json"),
@@ -204,7 +196,7 @@ impl AppManager {
         Ok(super::commit_index(&repo, &message)?)
     }
 
-    /// Update an app's name and description in manifest.json, preserving icon and knowhow.
+    /// Update an app's name and description in manifest.json, preserving icon.
     pub fn update_app_metadata(
         &self,
         app_id: &str,
@@ -222,7 +214,6 @@ impl AppManager {
             name: name.to_string(),
             description: description.to_string(),
             icon: existing.icon,
-            knowhow: existing.knowhow,
         };
         std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
 
@@ -354,73 +345,39 @@ impl AppManager {
         index.write()?;
         Ok(super::commit_index(&repo, message)?)
     }
-
-    /// Stamp know-how references into an app's manifest.json.
-    /// Discovers relevant know-how from the app's HTML content and explicit references
-    /// using semantic similarity, then writes the IDs into the manifest's `knowhow` field.
-    pub async fn stamp_knowhow(
-        &self,
-        app_id: &str,
-        summaries: &[super::knowhow::KnowhowSummary],
-        explicit_refs: &[String],
-        embedder: &dyn EmbeddingProvider,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let manifest_path = self.apps_path.join(app_id).join("manifest.json");
-        if !manifest_path.exists() {
-            return Err(format!("App not found: {}", app_id).into());
-        }
-
-        // Read current manifest
-        let mut manifest: AppManifest =
-            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
-
-        // Read app HTML content for semantic discovery
-        let index_path = self.apps_path.join(app_id).join("index.html");
-        let html_content = std::fs::read_to_string(&index_path).unwrap_or_default();
-
-        // Discover know-how semantically from content + explicit refs
-        let discovered = super::knowhow::discover_knowhow(
-            &format!("{} {}", manifest.name, html_content),
-            summaries,
-            explicit_refs,
-            embedder,
-        )
-        .await;
-
-        if discovered == manifest.knowhow {
-            return Ok(()); // No change needed
-        }
-
-        manifest.knowhow = discovered;
-        std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
-
-        // Commit the updated manifest
-        self.commit(
-            &format!("{}/manifest.json", app_id),
-            &format!("Stamp know-how refs for app: {}", app_id),
-        )?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::KeywordEmbedder;
 
     #[test]
     fn app_manifest_deserializes() {
         let json = r#"{
             "name": "Varmepumpe Dashboard",
             "description": "Heat pump monitoring and control",
-            "icon": "thermometer",
-            "knowhow": ["heatpump"]
+            "icon": "thermometer"
         }"#;
         let manifest: AppManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.name, "Varmepumpe Dashboard");
         assert_eq!(manifest.description, "Heat pump monitoring and control");
         assert_eq!(manifest.icon.as_deref(), Some("thermometer"));
-        assert_eq!(manifest.knowhow, vec!["heatpump"]);
+    }
+
+    #[test]
+    fn app_manifest_ignores_legacy_knowhow_field() {
+        // Manifests stamped by the old know-how pass still carry a `knowhow`
+        // array on disk. The field is no longer part of AppManifest; serde must
+        // ignore the unknown key rather than fail to deserialize, so existing
+        // apps keep loading (and the stale field drops on the next rewrite).
+        let json = r#"{
+            "name": "Legacy App",
+            "description": "Has a stamped knowhow array",
+            "knowhow": ["oura/api-ref", "browser-learning/observation"]
+        }"#;
+        let manifest: AppManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.name, "Legacy App");
+        assert_eq!(manifest.description, "Has a stamped knowhow array");
     }
 
     #[test]
@@ -430,7 +387,6 @@ mod tests {
         assert_eq!(manifest.name, "Minimal App");
         assert_eq!(manifest.description, "");
         assert!(manifest.icon.is_none());
-        assert!(manifest.knowhow.is_empty());
     }
 
     #[test]
@@ -439,14 +395,12 @@ mod tests {
             name: "Test App".to_string(),
             description: "A test application".to_string(),
             icon: Some("star".to_string()),
-            knowhow: vec!["topic-a".to_string(), "topic-b".to_string()],
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AppManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, manifest.name);
         assert_eq!(deserialized.description, manifest.description);
         assert_eq!(deserialized.icon, manifest.icon);
-        assert_eq!(deserialized.knowhow, manifest.knowhow);
     }
 
     #[test]
@@ -468,95 +422,6 @@ mod tests {
         let result = manager.write_app_source("test-app", &files);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid filename"));
-    }
-
-    #[tokio::test]
-    async fn stamp_knowhow_discovers_from_content() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path();
-        let manager = AppManager::new(ws).unwrap();
-        // Deterministic embedder keyed on "heatpump" — both the app's
-        // content ("Heatpump Dashboard <h1>Heatpump Status</h1>") and the
-        // know-how description ("Controls and monitors Panasonic
-        // heatpumps...") contain it, so they encode to identical vectors
-        // and clear the discovery threshold without touching the network.
-        let embedder = KeywordEmbedder::new(&["heatpump"]);
-
-        let app_dir = ws.join("data/apps/test-app");
-        std::fs::create_dir_all(&app_dir).unwrap();
-        let manifest = AppManifest {
-            name: "Heatpump Dashboard".to_string(),
-            description: "Monitor heatpump".to_string(),
-            icon: None,
-            knowhow: vec![],
-        };
-        std::fs::write(
-            app_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(app_dir.join("index.html"), "<h1>Heatpump Status</h1>").unwrap();
-
-        let kh_dir = ws.join("data/knowhow");
-        std::fs::create_dir_all(&kh_dir).unwrap();
-        std::fs::write(
-            kh_dir.join("heatpump.md"),
-            "---\nname: Panasonic Heatpump\ndescription: Controls and monitors Panasonic heatpumps via Comfort Cloud API\n---\nAPI docs...",
-        ).unwrap();
-
-        let summaries = crate::core::KnowhowStore::load_summaries(&kh_dir);
-        let result = manager
-            .stamp_knowhow("test-app", &summaries, &[], &embedder)
-            .await;
-        assert!(result.is_ok());
-
-        let updated: AppManifest =
-            serde_json::from_str(&std::fs::read_to_string(app_dir.join("manifest.json")).unwrap())
-                .unwrap();
-        assert!(updated.knowhow.contains(&"heatpump".to_string()));
-    }
-
-    #[tokio::test]
-    async fn stamp_knowhow_includes_explicit_refs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path();
-        let manager = AppManager::new(ws).unwrap();
-        // No semantic match needed — the explicit ref is added before any
-        // similarity scoring happens.
-        let embedder = KeywordEmbedder::new(&["oura"]);
-
-        let app_dir = ws.join("data/apps/test-app");
-        std::fs::create_dir_all(&app_dir).unwrap();
-        let manifest = AppManifest {
-            name: "Generic App".to_string(),
-            description: "".to_string(),
-            icon: None,
-            knowhow: vec![],
-        };
-        std::fs::write(
-            app_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(app_dir.join("index.html"), "<h1>Hello</h1>").unwrap();
-
-        let kh_dir = ws.join("data/knowhow");
-        std::fs::create_dir_all(&kh_dir).unwrap();
-        std::fs::write(
-            kh_dir.join("oura.md"),
-            "---\nname: Oura Ring\ndescription: Oura Ring sleep and activity tracking API\n---\nOura API...",
-        ).unwrap();
-
-        let summaries = crate::core::KnowhowStore::load_summaries(&kh_dir);
-        let result = manager
-            .stamp_knowhow("test-app", &summaries, &["oura".to_string()], &embedder)
-            .await;
-        assert!(result.is_ok());
-
-        let updated: AppManifest =
-            serde_json::from_str(&std::fs::read_to_string(app_dir.join("manifest.json")).unwrap())
-                .unwrap();
-        assert_eq!(updated.knowhow, vec!["oura"]);
     }
 
     #[test]

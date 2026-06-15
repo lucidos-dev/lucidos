@@ -131,11 +131,20 @@ mod tests {
     // `real-embedder-tests` Cargo feature to keep default `cargo test`
     // offline. Run with:
     //     cargo test -p lucidos-engine --features real-embedder-tests
+    //
+    // Each test asks `shared_embedder()` for the model and early-returns (skips,
+    // logging a SKIP line) when it's `None` — i.e. huggingface.co was
+    // unreachable on a cold cache. A transient HF outage therefore degrades
+    // these tests to skipped, never failed. When the model IS available (warm
+    // `.fastembed_cache` or a successful download) every assertion below runs
+    // unchanged. Assertion failures are NOT skipped — only the model-fetch path.
 
     #[cfg(feature = "real-embedder-tests")]
     #[tokio::test]
     async fn test_embed_single_text() {
-        let provider = crate::test_util::shared_embedder();
+        let Some(provider) = crate::test_util::shared_embedder() else {
+            return;
+        };
         let embedding = provider.embed("hello world").await.unwrap();
 
         assert_eq!(embedding.len(), provider.dimensions());
@@ -145,7 +154,9 @@ mod tests {
     #[cfg(feature = "real-embedder-tests")]
     #[tokio::test]
     async fn test_embed_batch() {
-        let provider = crate::test_util::shared_embedder();
+        let Some(provider) = crate::test_util::shared_embedder() else {
+            return;
+        };
         let embeddings = provider.embed_batch(&["hello", "world"]).await.unwrap();
 
         assert_eq!(embeddings.len(), 2);
@@ -155,7 +166,9 @@ mod tests {
     #[cfg(feature = "real-embedder-tests")]
     #[tokio::test]
     async fn test_similar_texts_have_similar_embeddings() {
-        let provider = crate::test_util::shared_embedder();
+        let Some(provider) = crate::test_util::shared_embedder() else {
+            return;
+        };
         let emb1 = provider.embed("sales report for Q4").await.unwrap();
         let emb2 = provider.embed("quarterly sales analysis").await.unwrap();
         let emb3 = provider.embed("chocolate cake recipe").await.unwrap();
@@ -175,7 +188,9 @@ mod tests {
     #[cfg(feature = "real-embedder-tests")]
     #[tokio::test]
     async fn test_norwegian_synonyms_have_high_similarity() {
-        let provider = crate::test_util::shared_embedder();
+        let Some(provider) = crate::test_util::shared_embedder() else {
+            return;
+        };
         let bil = provider.embed("bil").await.unwrap();
         let kjoretoy = provider.embed("kjøretøy").await.unwrap();
 
@@ -194,7 +209,9 @@ mod tests {
     #[cfg(feature = "real-embedder-tests")]
     #[tokio::test]
     async fn test_bil_verksted_query_matches_norwegian_vehicle_service_thread() {
-        let provider = crate::test_util::shared_embedder();
+        let Some(provider) = crate::test_util::shared_embedder() else {
+            return;
+        };
 
         let embeddings = provider
             .embed_batch(&[

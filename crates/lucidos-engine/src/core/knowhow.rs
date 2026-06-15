@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::core::system_knowhow::SystemKnowhowStore;
-use crate::memory::{cosine_similarity, EmbeddingProvider};
 
 /// Prefix that routes a knowhow ID to engine-shipped reference knowhow at
 /// `<repo>/system-knowhow/`. IDs without this prefix come from the
@@ -154,7 +153,7 @@ pub(crate) fn collect_md_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// e.g., `knowhow/lucidos/cross-workspace.md` → `lucidos/cross-workspace`
+/// e.g., `knowhow/weather/api.md` → `weather/api`
 pub(crate) fn id_from_path(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
     let without_ext = rel.with_extension("");
@@ -292,7 +291,7 @@ impl KnowhowStore {
     }
 
     /// Load full content for a specific know-how file.
-    /// The id may contain forward slashes for files in subdirectories (e.g., "lucidos/cross-workspace").
+    /// The id may contain forward slashes for files in subdirectories (e.g., "weather/api").
     pub fn load(knowhow_dir: &Path, id: &str) -> Option<Knowhow> {
         if !is_safe_id(id) {
             log!("[Knowhow] Invalid id (path traversal): {}", id);
@@ -506,85 +505,6 @@ pub fn load_app_knowhow(knowhow_dir: &Path) -> String {
     } else {
         format!("\n{}\n", sections.join("\n\n"))
     }
-}
-
-/// Semantic similarity threshold for knowhow discovery.
-/// TODO(2026-04-21): recalibrate against real workspace data — orthogonal
-/// English text scores ~0.75-0.85 with MultilingualE5Small, so 0.5 filters
-/// nothing; `DISCOVERY_MAX_RESULTS` currently caps the noise.
-const DISCOVERY_THRESHOLD: f32 = 0.5;
-/// Maximum number of semantically matched knowhow results.
-const DISCOVERY_MAX_RESULTS: usize = 5;
-
-/// Discover relevant know-how using semantic similarity.
-/// Embeds the message and knowhow descriptions, then returns the top matches
-/// above a similarity threshold. Also includes any explicitly referenced IDs.
-pub async fn discover_knowhow(
-    message: &str,
-    summaries: &[KnowhowSummary],
-    explicit_refs: &[String],
-    embedder: &dyn EmbeddingProvider,
-) -> Vec<String> {
-    let mut result: Vec<String> = Vec::new();
-
-    // Always include explicit refs
-    for id in explicit_refs {
-        if !result.contains(id) {
-            result.push(id.clone());
-        }
-    }
-
-    if message.is_empty() || summaries.is_empty() {
-        return result;
-    }
-
-    // Filter out summaries already included via explicit refs
-    let candidates: Vec<&KnowhowSummary> = summaries
-        .iter()
-        .filter(|s| !result.contains(&s.id))
-        .collect();
-
-    if candidates.is_empty() {
-        return result;
-    }
-
-    let mut texts: Vec<&str> = Vec::with_capacity(1 + candidates.len());
-    texts.push(message);
-    for s in &candidates {
-        texts.push(&s.description);
-    }
-
-    let embeddings = match embedder.embed_batch(&texts).await {
-        Ok(e) => e,
-        Err(e) => {
-            log!("[Knowhow] Embedding failed, falling back to empty: {}", e);
-            return result;
-        }
-    };
-
-    let message_embedding = &embeddings[0];
-
-    // Score each candidate by cosine similarity
-    let mut scored: Vec<(&str, f32)> = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            (
-                s.id.as_str(),
-                cosine_similarity(message_embedding, &embeddings[i + 1]),
-            )
-        })
-        .filter(|(_, sim)| *sim >= DISCOVERY_THRESHOLD)
-        .collect();
-
-    // Sort by similarity descending
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    for (id, _) in scored.into_iter().take(DISCOVERY_MAX_RESULTS) {
-        result.push(id.to_string());
-    }
-
-    result
 }
 
 #[cfg(test)]

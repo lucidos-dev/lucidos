@@ -555,11 +555,13 @@ impl PgVectorIndex {
                 .fetch_all(&self.pool)
                 .await?;
 
-        // Re-serialize through serde_json to get consistent key ordering
-        Ok(rows
-            .into_iter()
-            .map(|(v,)| serde_json::to_string(&v).unwrap_or_default())
-            .collect())
+        // Re-serialize through serde_json to get consistent key ordering.
+        // Propagate (rather than swallow to "") a serialize failure: it can't
+        // happen for well-formed JSONB, but surfacing it beats silently
+        // inserting an empty source into the indexed set.
+        rows.into_iter()
+            .map(|(v,)| serde_json::to_string(&v).map_err(Into::into))
+            .collect()
     }
 
     /// Get a reference to the connection pool

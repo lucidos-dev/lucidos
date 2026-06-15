@@ -202,6 +202,18 @@ pub(crate) fn combine_messages(
     if queued.is_empty() {
         return (leader_text.to_string(), leader_images);
     }
+    // Presentation-only divider between coalesced follow-ups. This is NOT a
+    // parseable boundary: the combined text is handed to a single CC turn as
+    // one stream-json input (see `chat::process_cc::run_cc_chat_branch` →
+    // `run_direct_agent`) and is never split back into separate messages
+    // anywhere in the codebase — the only `splitn(_, "---")` is
+    // `core::split_md_frontmatter`, an unrelated markdown YAML-frontmatter
+    // parser. So a follow-up whose own text contains `\n\n---\n\n` is harmless:
+    // it reads to the model as an extra horizontal rule, exactly as a literal
+    // `---` inside any single user message already would. Do NOT "fix" this
+    // into a sentinel token — that would change the LLM-visible input for zero
+    // functional gain, since nothing downstream could be fooled by a collision.
+    // `combine_is_collision_safe_when_followup_contains_divider` pins this.
     const SEPARATOR: &str = "\n\n---\n\n";
     let mut text = String::from(leader_text);
     let mut images = leader_images.unwrap_or_default();
@@ -368,6 +380,24 @@ mod tests {
             vec![msg("second"), msg("third")],
         );
         assert_eq!(text, "first\n\n---\n\nsecond\n\n---\n\nthird");
+    }
+
+    /// The divider is presentation-only — never parsed back into messages
+    /// (see the comment at the `SEPARATOR` const). So a follow-up whose body
+    /// literally contains the divider sequence must coalesce exactly like any
+    /// other text: plain concatenation with one divider between each message,
+    /// nothing stripped, merged, or re-split. This pins the "collision is a
+    /// non-event" contract so a future reader doesn't swap in a sentinel token.
+    #[test]
+    fn combine_is_collision_safe_when_followup_contains_divider() {
+        let sep = "\n\n---\n\n";
+        // First follow-up's body is exactly the divider sequence.
+        let (text, _images) = combine_messages("leader", None, vec![msg(sep), msg("after")]);
+        // leader + sep(divider) + sep(msg1 body) + sep(divider) + "after".
+        assert_eq!(text, format!("leader{sep}{sep}{sep}after"));
+        // Every message still survives in order — none collapsed by the collision.
+        assert!(text.starts_with("leader"));
+        assert!(text.ends_with("after"));
     }
 
     #[test]

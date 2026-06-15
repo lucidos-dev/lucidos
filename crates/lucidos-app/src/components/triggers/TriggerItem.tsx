@@ -19,7 +19,7 @@ export function TriggerItem({ trigger }: Props) {
   const noMoreRuns = hasNoMoreRuns(trigger);
 
   return (
-    <div class={`list-row trigger-row${trigger.paused ? ' trigger-disabled' : ''}`}>
+    <div class={`list-row trigger-row clickable${trigger.paused ? ' trigger-disabled' : ''}`} onClick={() => openEditTrigger(trigger.id)}>
       <div class="list-row-info">
         <div class="title list-row-name">{trigger.name}</div>
         <div class="list-row-details">
@@ -66,21 +66,15 @@ export function TriggerItem({ trigger }: Props) {
       <div class="list-row-actions">
         <button
           class="action-btn action-btn-danger"
-          onClick={() => void deleteTrigger(trigger.id, trigger.name)}
+          onClick={(e) => { e.stopPropagation(); void deleteTrigger(trigger.id, trigger.name); }}
         >
           Delete
         </button>
         <button
           class="action-btn"
-          onClick={() => void toggleTrigger(trigger.id, !trigger.paused)}
+          onClick={(e) => { e.stopPropagation(); void toggleTrigger(trigger.id, !trigger.paused); }}
         >
           {trigger.paused ? 'Resume' : 'Pause'}
-        </button>
-        <button
-          class="action-btn"
-          onClick={() => openEditTrigger(trigger.id)}
-        >
-          Edit
         </button>
       </div>
     </div>

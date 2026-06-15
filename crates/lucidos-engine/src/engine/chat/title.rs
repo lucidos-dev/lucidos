@@ -151,11 +151,11 @@ fn build_title_user_content(message: &str, image_description: Option<&str>) -> S
 /// Generate a short title (3-6 words) for a new thread using Flash.
 /// Standalone function so it can be spawned into a background task.
 pub(crate) async fn generate_thread_title(
-    provider: &crate::llm::vertex::VertexProvider,
+    provider: &dyn crate::llm::provider::LlmProvider,
     message: &str,
     image_description: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::llm::provider::{LlmProvider, Message, MessageContent};
+    use crate::llm::provider::{Message, MessageContent};
 
     let user_content = build_title_user_content(message, image_description);
 
@@ -201,7 +201,7 @@ pub(crate) async fn generate_thread_title(
 /// used to short-circuit the LLM for image-only messages (see [`decide_title_path`]).
 pub(crate) async fn emit_generated_title(
     bus: &crate::engine::event_bus::EventBus,
-    provider: &crate::llm::vertex::VertexProvider,
+    provider: &dyn crate::llm::provider::LlmProvider,
     thread_id: uuid::Uuid,
     message: &str,
     image_description: Option<&str>,
@@ -213,7 +213,6 @@ pub(crate) async fn emit_generated_title(
         TitleDecision::Image => "Image".to_string(),
         TitleDecision::Images => "Images".to_string(),
         TitleDecision::Llm => {
-            use crate::llm::provider::LlmProvider;
             // Log model + duration on every round-trip so a slow call
             // (success path emits no other line) is triageable.
             let started = std::time::Instant::now();

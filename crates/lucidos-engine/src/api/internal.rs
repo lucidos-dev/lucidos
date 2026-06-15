@@ -1,11 +1,7 @@
 use super::*;
-use crate::engine::cc_permission::{
-    CcPermissionEntry, CcPermissionState, DedupKey, DENIAL_REASON, SESSION_ALLOW_REASON,
-};
-use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
+use crate::engine::cc_permission::prompt_coding_agent_permission;
 use crate::engine::event_bus::BusEvent;
-use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
-use sqlx::PgPool;
+use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 
 #[derive(Deserialize)]
 pub(super) struct PermissionPromptRequest {
@@ -42,10 +38,10 @@ fn should_auto_allow(tool_name: &str) -> bool {
 /// `MCP_TOOL_TIMEOUT` env vars (both set to 24h in `runtime::claude_code`)
 /// are the only practical bounds.
 ///
-/// Concurrent identical requests (same `thread_id` + `tool_name` + `input`)
-/// dedup onto one canonical entry: the first emits the event, every
-/// subsequent identical request subscribes to the same broadcast. One click
-/// answers them all.
+/// The dedup / session-allow / emit / wait core is shared with the Codex
+/// app-server approval bridge — see
+/// `engine::cc_permission::prompt_coding_agent_permission`. This handler
+/// only adds the CC-specific auto-allow gate and the HTTP wire shape.
 pub(super) async fn permission_prompt(
     State(state): State<AppState>,
     Json(body): Json<PermissionPromptRequest>,
@@ -63,154 +59,22 @@ pub(super) async fn permission_prompt(
         .into_response();
     }
 
-    // Pre-prompt session-allow check: if the user previously clicked "Allow
-    // for this thread" on a request whose `Session` pattern matches this one,
-    // skip the prompt entirely and answer the MCP call immediately. The
-    // matching pattern is derived from this prompt's input, so it works for
-    // tools/paths CC's `--allowedTools` doesn't reach (notably `.claude/`
-    // and `.git/` writes, which CC always routes through the prompt).
-    let session_pattern = derive_allow_pattern(&body.tool_name, &body.input, AllowScope::Session);
-    let is_session_allowed = match session_pattern.as_deref() {
-        Some(p) => {
-            let pending = state.engine.pending_cc_permission.lock().unwrap();
-            pending.matches_session_allow(thread_id, p)
-        }
-        None => false,
-    };
-    if is_session_allowed {
-        return Json(PermissionPromptResponse {
-            allowed: true,
-            reason: Some(SESSION_ALLOW_REASON.to_string()),
-        })
-        .into_response();
-    }
-
-    let canonical_input = serde_json::to_string(&body.input).unwrap_or_else(|_| "{}".to_string());
-    let dedup_key: DedupKey = (thread_id, body.tool_name.clone(), canonical_input);
-    let summary = build_summary(&body.tool_name, &body.input);
-
-    let (request_id, mut rx, is_canonical) = {
-        let mut pending = state.engine.pending_cc_permission.lock().unwrap();
-        register_or_attach(
-            &mut pending,
-            dedup_key,
-            thread_id,
-            body.tool_name.clone(),
-            body.input.clone(),
-        )
-    };
-
-    if is_canonical {
-        // The MCP subprocess invokes this endpoint; it has no header-borne
-        // actor. Recover the originating CC actor by reading the most recent
-        // event on this thread that carries one (the human who sent the
-        // message that spawned the CC turn). Fall back to NONE only if no
-        // prior event has an actor — defensive; shouldn't happen in practice.
-        let actor = lookup_thread_actor(state.engine.pool(), thread_id).await;
-        let meta = match actor {
-            Some(a) => EventMeta::with_actor(Some(a)),
-            None => EventMeta::NONE,
-        };
-        state
-            .engine
-            .event_bus
-            .emit_or_log(
-                BusEvent::Thread {
-                    thread_id,
-                    event: ThreadEvent::CodingAgentPermissionRequest {
-                        request_id: request_id.clone(),
-                        tool_use_id: body.tool_use_id,
-                        tool_name: body.tool_name,
-                        input: body.input,
-                        summary,
-                    },
-                    meta,
-                },
-                "[Internal] CodingAgentPermissionRequest",
-            )
-            .await;
-    }
-
-    // Wait forever for the user. The paired `CodingAgentPermissionResolved`
-    // is emitted by `submit_mcp_consent` (so it fires once per click, not
-    // once per deduped listener).
-    let allowed = rx.recv().await.unwrap_or(false);
-    let reason = if allowed {
-        None
-    } else {
-        Some(DENIAL_REASON.to_string())
-    };
-
-    Json(PermissionPromptResponse { allowed, reason }).into_response()
-}
-
-/// Recover the originating user actor for a CC thread by reading the most
-/// recent user-message event on the thread (`MessageReceived` for chat-spawned
-/// CC, `CodingAgentUserMessageSent` for in-CC follow-ups). Narrowing to these
-/// two event types ensures a later engine-stamped event
-/// (e.g. `CodingAgentSettingsChanged`) doesn't overwrite the human actor.
-/// Returns `None` if no such event carries an actor — caller falls back to
-/// `EventMeta::NONE`.
-async fn lookup_thread_actor(pool: &PgPool, thread_id: uuid::Uuid) -> Option<MessageOrigin> {
-    let row: Result<Option<(serde_json::Value,)>, sqlx::Error> = sqlx::query_as(
-        "SELECT payload->'actor' FROM events \
-         WHERE thread_id = $1 \
-           AND event_type IN ('MessageReceived', 'CodingAgentUserMessageSent') \
-           AND payload ? 'actor' \
-           AND payload->'actor' != 'null'::jsonb \
-         ORDER BY sequence DESC LIMIT 1",
+    let outcome = prompt_coding_agent_permission(
+        state.engine.pool(),
+        &state.engine.event_bus,
+        &state.engine.pending_cc_permission,
+        thread_id,
+        body.tool_use_id,
+        body.tool_name,
+        body.input,
     )
-    .bind(thread_id)
-    .fetch_optional(pool)
     .await;
-    match row {
-        Ok(Some((v,))) => serde_json::from_value::<MessageOrigin>(v).ok(),
-        Ok(None) => None,
-        Err(e) => {
-            crate::log!(
-                "[Internal] lookup_thread_actor failed for thread {}: {}",
-                thread_id,
-                e
-            );
-            None
-        }
-    }
-}
 
-/// Look up `dedup_key`. If a canonical entry already exists (a duplicate
-/// concurrent request), subscribe and reuse its `request_id`. Otherwise
-/// create a fresh entry, register both indexes, and return its receiver.
-///
-/// Returns `(request_id, receiver, is_canonical)`. The caller emits the
-/// `CodingAgentPermissionRequest` event only when `is_canonical` is true.
-fn register_or_attach(
-    state: &mut CcPermissionState,
-    dedup_key: DedupKey,
-    thread_id: Uuid,
-    tool_name: String,
-    input: serde_json::Value,
-) -> (String, tokio::sync::broadcast::Receiver<bool>, bool) {
-    // Opportunistic sweep: each new prompt is a chance to evict orphans
-    // whose HTTP handlers were canceled (CC died, MCP request aborted) and
-    // would otherwise leak until engine restart.
-    state.gc_dead_entries();
-    if let Some(entry) = state.by_dedup_key.get(&dedup_key) {
-        return (entry.request_id.clone(), entry.tx.subscribe(), false);
-    }
-    let request_id = Uuid::new_v4().to_string();
-    let (tx, rx) = tokio::sync::broadcast::channel(1);
-    state.by_dedup_key.insert(
-        dedup_key.clone(),
-        CcPermissionEntry {
-            thread_id,
-            request_id: request_id.clone(),
-            tool_name,
-            input,
-            tx,
-        },
-    );
-    state.by_request_id.insert(request_id.clone(), dedup_key);
-    (request_id, rx, true)
+    Json(PermissionPromptResponse {
+        allowed: outcome.allowed,
+        reason: outcome.reason,
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -544,30 +408,6 @@ fn reject_unsafe_relative(path: &str) -> Option<&'static str> {
     None
 }
 
-fn build_summary(tool_name: &str, input: &serde_json::Value) -> String {
-    let arg = [
-        "file_path",
-        "path",
-        "command",
-        "notebook_path",
-        "skill",
-        "url",
-        "pattern",
-    ]
-    .iter()
-    .find_map(|k| input.get(k).and_then(|v| v.as_str()))
-    .unwrap_or("");
-    let display_name = match tool_name {
-        "Skill" => "skill",
-        _ => tool_name,
-    };
-    if arg.is_empty() {
-        display_name.to_string()
-    } else {
-        format!("{} {}", display_name, arg)
-    }
-}
-
 #[derive(Deserialize)]
 pub(super) struct AskUserQuestionRequest {
     pub thread_id: String,
@@ -587,9 +427,12 @@ struct AskUserQuestionResponse {
     answers: serde_json::Value,
 }
 
-/// POST /api/v1/internal/ask-user-question — invoked by the lucidos-cli
-/// `ask-user-question-hook` subcommand from inside a Claude Code subprocess when CC
-/// fires the `AskUserQuestion` PreToolUse hook.
+/// POST /api/v1/internal/ask-user-question — two callers, same contract:
+/// the lucidos-cli `ask-user-question-hook` subcommand (from inside a Claude
+/// Code subprocess when CC fires the `AskUserQuestion` PreToolUse hook) and
+/// the lucidos-cli `mcp-permission-server`'s `ask_user_question` MCP tool
+/// (from inside a Codex session — one question per call, answer returned as
+/// the MCP tool result so the turn continues in place).
 ///
 /// CC's tool schema accepts 1–4 questions per call. Lucidos renders them
 /// **one at a time** so the user only ever sees a single question card on
@@ -660,6 +503,31 @@ pub(super) async fn ask_user_question(
     .into_response()
 }
 
+/// Routes for the `/internal/*` surface (engine-internal hooks used by CC
+/// sessions and the e2e harness).
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/internal/permission-prompt",
+            post(permission_prompt),
+        )
+        .route(
+            "/internal/ask-user-question",
+            post(ask_user_question),
+        )
+        .route("/internal/mark-hardened", post(mark_hardened))
+        .route("/internal/hardened-state", get(query_hardened))
+        .route(
+            "/internal/cc-edit-preread",
+            get(cc_edit_preread_check),
+        )
+        .route("/internal/client-log", post(client_log))
+        .route(
+            "/internal/seed-change-for-test",
+            post(seed_change_for_test),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,104 +554,5 @@ mod tests {
                 tool
             );
         }
-    }
-
-    #[test]
-    fn build_summary_uses_file_path() {
-        let s = build_summary(
-            "Edit",
-            &serde_json::json!({ "file_path": "/tmp/foo.md", "old_string": "x" }),
-        );
-        assert_eq!(s, "Edit /tmp/foo.md");
-    }
-
-    #[test]
-    fn build_summary_falls_back_to_command() {
-        let s = build_summary("Bash", &serde_json::json!({ "command": "ls -la" }));
-        assert_eq!(s, "Bash ls -la");
-    }
-
-    #[test]
-    fn build_summary_returns_tool_name_when_no_arg_field() {
-        let s = build_summary("WeirdTool", &serde_json::json!({ "foo": 1 }));
-        assert_eq!(s, "WeirdTool");
-    }
-
-    #[test]
-    fn build_summary_uses_skill_for_skill_tool() {
-        let s = build_summary("Skill", &serde_json::json!({ "skill": "update-config" }));
-        assert_eq!(s, "skill update-config");
-    }
-
-    #[test]
-    fn build_summary_uses_url_for_webfetch() {
-        let s = build_summary(
-            "WebFetch",
-            &serde_json::json!({ "url": "https://example.com", "prompt": "x" }),
-        );
-        assert_eq!(s, "WebFetch https://example.com");
-    }
-
-    fn register(
-        state: &mut CcPermissionState,
-        key: DedupKey,
-    ) -> (String, tokio::sync::broadcast::Receiver<bool>, bool) {
-        let tool_name = key.1.clone();
-        register_or_attach(state, key, Uuid::nil(), tool_name, serde_json::json!({}))
-    }
-
-    #[test]
-    fn register_or_attach_creates_canonical_entry_first_time() {
-        let mut state = CcPermissionState::default();
-        let key: DedupKey = (Uuid::nil(), "Edit".into(), "{}".into());
-        let (request_id, _rx, is_canonical) = register(&mut state, key.clone());
-        assert!(is_canonical, "first request must be canonical");
-        assert!(state.by_dedup_key.contains_key(&key));
-        assert!(state.by_request_id.contains_key(&request_id));
-    }
-
-    #[test]
-    fn register_or_attach_returns_existing_request_id_for_duplicate() {
-        let mut state = CcPermissionState::default();
-        let key: DedupKey = (Uuid::nil(), "Edit".into(), "{}".into());
-        let (first_id, _rx1, first_canonical) = register(&mut state, key.clone());
-        let (second_id, _rx2, second_canonical) = register(&mut state, key.clone());
-        assert!(first_canonical);
-        assert!(!second_canonical, "duplicate must not be canonical");
-        assert_eq!(
-            first_id, second_id,
-            "duplicate must reuse the canonical request_id"
-        );
-    }
-
-    #[test]
-    fn register_or_attach_stores_tool_name_and_input_on_canonical_entry() {
-        let mut state = CcPermissionState::default();
-        let key: DedupKey = (Uuid::nil(), "Skill".into(), "{\"skill\":\"x:y\"}".into());
-        let (request_id, _rx, _) = register_or_attach(
-            &mut state,
-            key,
-            Uuid::nil(),
-            "Skill".into(),
-            serde_json::json!({"skill": "x:y"}),
-        );
-        let entry = state.take(&request_id).unwrap();
-        assert_eq!(entry.tool_name, "Skill");
-        assert_eq!(entry.input, serde_json::json!({"skill": "x:y"}));
-    }
-
-    #[tokio::test]
-    async fn duplicate_subscribers_both_receive_the_answer() {
-        let mut state = CcPermissionState::default();
-        let key: DedupKey = (Uuid::nil(), "Edit".into(), "{}".into());
-        let (id, mut rx1, _) = register(&mut state, key.clone());
-        let (_, mut rx2, _) = register(&mut state, key.clone());
-
-        // Resolve via the same path the consent endpoint uses.
-        let entry = state.take(&id).expect("entry must be present");
-        let _ = entry.tx.send(true);
-
-        assert!(rx1.recv().await.unwrap());
-        assert!(rx2.recv().await.unwrap());
     }
 }

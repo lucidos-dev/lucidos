@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { restartRequired, restartGroups, toasts, showToast, engineVersion, latestEngineVersion } from '../store';
+import { restartRequired, restartGroups, toasts, showToast, engineVersion, latestEngineVersion, engineRestarting } from '../store';
 import { syncRestartToast, restoreRestartToast, addRestartGroup, dismissRestartToast, RESTART_LS_KEY, RESTART_DISMISSED_FP_LS_KEY } from '../actions/chat-changes';
 
 const RESTART_TOAST_KEY = 'restart-required';
@@ -10,6 +10,11 @@ beforeEach(() => {
   restartRequired.value = false;
   restartGroups.value = [];
   toasts.value = [];
+  // The "clicking Restart …" test fires initiateEngineRestart(), which sets
+  // engineRestarting=true and (with restartEngine unmocked here) network-fails
+  // into the "leave flag set" branch. showToast suppresses every non-restart
+  // toast while that flag is set, so reset it or later tests see no toasts.
+  engineRestarting.value = false;
   localStorage.removeItem(RESTART_LS_KEY);
   localStorage.removeItem(RESTART_GROUPS_LS_KEY);
   localStorage.removeItem(LEGACY_REASONS_LS_KEY);

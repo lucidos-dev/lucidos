@@ -105,15 +105,20 @@ impl EventBus {
                     c.parent_callback_sent, p.is_coding_agent \
              FROM thread_summaries c \
              LEFT JOIN thread_summaries p ON p.thread_id = c.parent_thread_id \
-             WHERE c.thread_id = $1"
+             WHERE c.thread_id = $1",
         )
         .bind(child_thread_id)
         .fetch_optional(&self.pool)
-        .await {
+        .await
+        {
             Ok(Some(row)) => Some(row),
             Ok(None) => return,
             Err(e) => {
-                crate::log!("[FanOut] Failed to look up parent for child {}: {}", child_thread_id, e);
+                crate::log!(
+                    "[FanOut] Failed to look up parent for child {}: {}",
+                    child_thread_id,
+                    e
+                );
                 return;
             }
         };
@@ -125,7 +130,8 @@ impl EventBus {
             first_msg,
             callback_already_sent,
             parent_is_coding_agent,
-        )) = row else {
+        )) = row
+        else {
             return;
         };
 
@@ -133,7 +139,10 @@ impl EventBus {
         // auto-harden, background agents). Only process the first one —
         // subsequent idles should not decrement the counter again or send
         // duplicate callbacks to the parent.
-        if is_coding_agent && callback_already_sent && matches!(event, ThreadEvent::CodingAgentIdled { .. }) {
+        if is_coding_agent
+            && callback_already_sent
+            && matches!(event, ThreadEvent::CodingAgentIdled { .. })
+        {
             return;
         }
 
@@ -194,7 +203,8 @@ impl EventBus {
         // Decrement-only paths must still mark the child or a follow-up event
         // (CodingAgentIdled, SessionEnded) re-decrements via the
         // `!callback_already_sent` gate above. The should_callback path marks
-        // after the typed-event emit succeeds; abort never emits, so mark here.
+        // in-tx via the ChildThreadCompleted projection arm; abort never
+        // emits a typed event, so mark here directly.
         // Non-CC chat children emit exactly one terminator per request (the
         // agentic loop's `has_terminator` guard), so they need no marker; CC
         // children can have multiple terminal events for the same turn.
@@ -339,11 +349,15 @@ impl EventBus {
             }
         };
 
-        // Emit the typed source-of-truth event onto the parent thread BEFORE
-        // marking the callback sent — that ordering means a crash in between
-        // re-fires this whole path on next visit instead of leaving the parent
-        // permanently silent. `EventMeta::NONE` because this fan-in is engine
-        // orchestration, not user/agent actor.
+        // Emit the typed source-of-truth event onto the parent thread. The
+        // `parent_callback_sent` marker is written by THIS emit's projection
+        // arm (see ChildThreadCompleted in `update_thread_projection`), in
+        // the same transaction as the event INSERT — so the event and the
+        // marker cannot disagree. The previous shape (emit, then a separate
+        // post-emit UPDATE) left a crash window where the event committed
+        // but the marker didn't, and the next terminal event handed the
+        // parent a duplicate completion card. `EventMeta::NONE` because this
+        // fan-in is engine orchestration, not user/agent actor.
         let typed_event = ThreadEvent::ChildThreadCompleted {
             child_thread_id,
             child_thread_title: Some(label.clone()),
@@ -398,19 +412,45 @@ impl EventBus {
         // Defensive: `parent_is_coding_agent` should always be `Some` here
         // (the parent thread row must exist for its child to have spawned),
         // so a `None` is a serious state corruption — skip the kick rather
-        // than guess. The typed `ChildThreadCompleted` is already on the
-        // parent's history, so a future recovery sweep can still pick it up.
+        // than guess. The projection arm already marked the child atomically
+        // with the emit, which would consume the callback and block every
+        // later terminal's retry through the `callback_already_sent` gate —
+        // so un-mark here to keep the pre-atomicity retry semantics for this
+        // corruption case: the next terminal event re-fires the fan-in and
+        // gets another shot at the kick. Cost while the corruption persists:
+        // one duplicate persisted ChildThreadCompleted per terminal event
+        // (unbounded across a long session, N duplicate cards if the parent
+        // row is later repaired) — accepted as the lesser evil vs. a
+        // permanently silent parent.
         let Some(parent_is_cc) = parent_is_coding_agent else {
             crate::log!(
                 "[FanOut] Parent {} for child {} missing from thread_summaries — \
-                 skipping wake-up kick; typed event already persisted",
+                 skipping wake-up kick; typed event already persisted. Clearing \
+                 the callback marker so the next terminal event retries.",
                 parent_id,
                 child_thread_id
             );
+            if let Err(e) = sqlx::query(
+                "UPDATE thread_summaries SET parent_callback_sent = FALSE WHERE thread_id = $1",
+            )
+            .bind(child_thread_id)
+            .execute(&self.pool)
+            .await
+            {
+                crate::log!(
+                    "[FanOut] Failed to clear callback marker for child {}: {}",
+                    child_thread_id,
+                    e
+                );
+            }
             return;
         };
-        self.mark_parent_callback_sent(child_thread_id).await;
-        self.send_parent_callback(parent_id, child_thread_id, emit_result.event_id, parent_is_cc);
+        self.send_parent_callback(
+            parent_id,
+            child_thread_id,
+            emit_result.event_id,
+            parent_is_cc,
+        );
     }
 
     /// Surface the parent to inbox on a child completion that warrants user
@@ -446,19 +486,18 @@ impl EventBus {
             }
         };
         let Some((active, total)) = row else { return };
-        let aggregate = match crate::core::store::fetch_thread_aggregate(&self.pool, parent_id)
-            .await
-        {
-            Ok(agg) => agg,
-            Err(e) => {
-                crate::log!(
-                    "[FanOut] Failed to fetch aggregate for parent {}: {}",
-                    parent_id,
-                    e
-                );
-                None
-            }
-        };
+        let aggregate =
+            match crate::core::store::fetch_thread_aggregate(&self.pool, parent_id).await {
+                Ok(agg) => agg,
+                Err(e) => {
+                    crate::log!(
+                        "[FanOut] Failed to fetch aggregate for parent {}: {}",
+                        parent_id,
+                        e
+                    );
+                    None
+                }
+            };
         self.send_children_count_event(parent_id, active, total, aggregate);
     }
 

@@ -6,6 +6,7 @@ import {
   openFilesPanel,
   waitForVisibleElement,
   clickVisibleElement,
+  gotoWithRetry,
 } from './helpers';
 
 /** Create a markdown data file via the API. Returns the relative data path. */
@@ -38,7 +39,7 @@ test.describe('File preview inline editing', () => {
     fileName = `e2e-edit-${Date.now()}.md`;
     filePath = await createMdFile(page, fileName, '# E2E heading\n\noriginal body\n');
 
-    await page.goto('/', { waitUntil: 'domcontentloaded' });
+    await gotoWithRetry(page, '/');
     await page.waitForFunction(() =>
       document.querySelector('#app')?.childElementCount! > 0,
       undefined, { timeout: 30_000 },

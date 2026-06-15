@@ -18,7 +18,7 @@ export interface ThreadSummary {
   total_children_count: number;
   /** 'idle' | 'running' | 'waiting' | 'failed' | 'waiting_for_user_answer'.
    *  Active = 'running' | 'waiting_for_user_answer' (the agentic loop is
-   *  mid-flow). `waiting` is NOT active — it means CC has stopped and
+   *  mid-flow). `waiting` is NOT active — it means the coding agent has stopped and
    *  proposed changes the user must act on; the loop has paused. */
   status: string;
   coding_agent_has_diff: boolean;
@@ -42,10 +42,11 @@ export interface ThreadSummary {
 export interface ThreadsListOptions {
   /** When true, return only threads whose `status` indicates the agentic
    *  loop is still running (`running` / `waiting_for_user_answer`).
-   *  `waiting` is NOT active — it means CC has stopped and proposed
+   *  `waiting` is NOT active — it means the coding agent has stopped and proposed
    *  changes the user must act on; the loop has paused. */
   active?: boolean;
-  /** Comma-separated source filter (`chat`, `trigger`, `claude_code`). */
+  /** Comma-separated source filter (`chat`, `trigger`, `coding-agent`).
+   *  Legacy `claude_code` is also accepted. */
   source?: string;
   /** Server clamps to 1..=1000 (default 100). */
   limit?: number;

@@ -14,6 +14,10 @@ export function isRedundantTooltip(visibleText: string, tooltipText: string, isT
 /** Touch movement past this many pixels is treated as a swipe/scroll, not a tap. */
 const TOUCH_SWIPE_THRESHOLD_PX = 10;
 
+/** Hold this long (without swiping) on a `data-tooltip-longpress` element to
+ *  reveal its tooltip on touch. Tuned to the platform long-press convention. */
+const LONG_PRESS_MS = 450;
+
 /** Did the finger travel far enough between touchstart and the current point
  *  that we should treat the gesture as a swipe (not a tap)? */
 export function isTouchSwipe(startX: number, startY: number, currentX: number, currentY: number): boolean {
@@ -219,12 +223,52 @@ export function useTooltip() {
     let touchStartX = 0;
     let touchStartY = 0;
     let touchMoved = false;
+    let longPressTimer: number | null = null;
+    let longPressFired = false;
+
+    function clearLongPress() {
+      if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+    }
+
+    // After a long-press reveals a tooltip, the gesture's terminating tap still
+    // dispatches a `click` — which would activate whatever is under the finger
+    // (e.g. open the thread). Swallow the next click at the document capture
+    // phase, before any bubble-phase handler runs. Mirrors the Overlay
+    // paired-swallow pattern; self-disarms if no click arrives (some browsers
+    // suppress the click after a long touch).
+    function armClickSwallow() {
+      const swallow = (ev: Event) => {
+        ev.stopPropagation();
+        ev.preventDefault();
+        document.removeEventListener('click', swallow, true);
+        clearTimeout(disarm);
+      };
+      document.addEventListener('click', swallow, true);
+      const disarm = window.setTimeout(() => document.removeEventListener('click', swallow, true), 700);
+    }
 
     function onTouchStart(e: TouchEvent) {
       const touch = e.touches[0];
       touchStartX = touch.clientX;
       touchStartY = touch.clientY;
       touchMoved = false;
+      longPressFired = false;
+      clearLongPress();
+
+      // Long-press reveal: the touch counterpart of desktop hover. Opt-in via
+      // data-tooltip-longpress so it never hijacks a plain tappable row.
+      const target = findTarget(e.target);
+      if (target?.hasAttribute('data-tooltip-longpress') && !shouldSuppress(target)) {
+        const x = touch.clientX;
+        const y = touch.clientY;
+        longPressTimer = window.setTimeout(() => {
+          longPressTimer = null;
+          if (touchMoved) return; // became a scroll/swipe — not a long press
+          longPressFired = true;
+          show(target, x, y);
+          armClickSwallow();
+        }, LONG_PRESS_MS);
+      }
     }
 
     function onTouchMove(e: TouchEvent) {
@@ -232,10 +276,19 @@ export function useTooltip() {
       const touch = e.touches[0];
       if (isTouchSwipe(touchStartX, touchStartY, touch.clientX, touch.clientY)) {
         touchMoved = true;
+        clearLongPress(); // a swipe cancels the pending long-press reveal
       }
     }
 
     function onTouchEnd(e: TouchEvent) {
+      const wasLongPress = longPressFired;
+      longPressFired = false;
+      clearLongPress();
+
+      // The release that ENDS a long-press must keep the just-revealed tooltip
+      // visible (the click-swallow is already armed); a later tap dismisses it.
+      if (wasLongPress) return;
+
       if (touchMoved) return; // Swipe, not tap — ignore.
 
       // Tap on an already-visible tooltip dismisses it.

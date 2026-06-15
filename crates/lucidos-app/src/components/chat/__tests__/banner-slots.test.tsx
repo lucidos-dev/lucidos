@@ -6,6 +6,7 @@ import {
   focusedThreadId,
   archivingThreadIds,
   applyingNowThreadIds,
+  applyingChangeIds,
   discardingCCThreadIds,
   cancelingThreadIds,
   changes,
@@ -69,6 +70,7 @@ beforeEach(() => {
   focusedThreadId.value = null;
   archivingThreadIds.value = new Set();
   applyingNowThreadIds.value = new Map();
+  applyingChangeIds.value = new Set();
   discardingCCThreadIds.value = new Set();
   cancelingThreadIds.value = new Set();
   changes.value = { status: 'loaded', data: [] };
@@ -226,6 +228,58 @@ describe('showDiff is driven by codingAgentHasDiff alone', () => {
     if (state!.type === 'actions') {
       expect(state!.showDiff).toBe(false);
     }
+  });
+
+  it('shows disabled "applying" for a QUEUED Apply All member (change applying, thread idle/waiting)', () => {
+    // Apply All marks every batch member's change as applying (change-level
+    // applyingChangeIds → reverse-mapped by applyingChangeThreadIds). A member
+    // still waiting its turn has no live session (status 'waiting', not mid-turn)
+    // — nothing to interrupt — so it shows the disabled "Apply...".
+    const thread = makeCCThread('t1', { status: 'waiting', codingAgentHasDiff: true });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+    changes.value = { status: 'loaded', data: [{ id: 'c1', thread_id: 't1' } as never] };
+    applyingChangeIds.value = new Set(['c1']);
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('applying');
+  });
+
+  it('shows Cancel (not disabled applying) when this thread\'s change is actively hardening', () => {
+    // The in-flight Apply All member runs /harden as a live CC turn (status
+    // 'running' = mid-turn). The user must be able to cancel it — the mid-turn
+    // branch wins over the applyingChangeThreadIds disabled state.
+    const thread = makeCCThread('t1', { status: 'running' });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+    changes.value = { status: 'loaded', data: [{ id: 'c1', thread_id: 't1' } as never] };
+    applyingChangeIds.value = new Set(['c1']);
+
+    const state = getWaitingState();
+    expect(state!.type).toBe('canceling');
+  });
+
+  it('shows Cancel (not disabled applying) while a merge-conflict resolution runs', () => {
+    // codingAgentApplying=true + status 'running' = an apply-driven merge. Cancel
+    // is best-effort but must be offered (regression fix: it used to be disabled).
+    const thread = makeCCThread('t1', { status: 'running', codingAgentApplying: true });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state!.type).toBe('canceling');
+  });
+
+  it('does not show "applying" when the applying change belongs to a different thread', () => {
+    const thread = makeCCThread('t1', { status: 'waiting' });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+    changes.value = { status: 'loaded', data: [{ id: 'c2', thread_id: 't2' } as never] };
+    applyingChangeIds.value = new Set(['c2']);
+
+    const state = getWaitingState();
+    expect(state!.type).not.toBe('applying');
   });
 
   it('Diff click always routes to viewThreadCcDiff', () => {

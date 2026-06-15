@@ -12,13 +12,15 @@ import {
   navigateToNotification,
 } from '../../store/actions/notifications';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
+import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { formatNotificationDate } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
 import { loadedOr } from '../../store/types';
-import { ModalOverlay } from '../shared/ModalOverlay';
+import { Overlay } from '../shared/Overlay';
 import { ChevronLeftIcon, ChevronRightIcon, CloseIcon } from '../shared/icons';
 import { resolveLinkedApp } from './resolveLinkedApp';
+import { navigateTapLabel } from './notificationTapLabel';
 
 export function NotificationsModal() {
   const isOpen = notificationsModalOpen.value;
@@ -46,6 +48,17 @@ export function NotificationsModal() {
   const content = linkifyPaths(renderMarkdown(detail.message), [], apps);
   const dateStr = formatNotificationDate(new Date(detail.created_at));
 
+  // A `navigate` tap (e.g. the "N changes ready to apply" trigger push → the
+  // Changes panel) is actionable from the OS-push tap and the in-app toast, but
+  // the inbox modal would otherwise ignore the tap entirely. Surface it as a
+  // button here too. Skip it when a dedicated button already covers the same
+  // destination (thread / app), so we never show two buttons that do the same.
+  const navTap = detail.tap?.kind === 'navigate' ? detail.tap.to : null;
+  const navDuplicatesDedicatedButton =
+    (navTap?.target === 'thread' && !!detail.thread_id) ||
+    (navTap?.target === 'app' && linked.kind === 'linked');
+  const showNavButton = !!navTap && !navDuplicatesDedicatedButton;
+
   function handleOpenApp() {
     if (linked.kind !== 'linked') return;
     close();
@@ -58,6 +71,12 @@ export function NotificationsModal() {
     focusThreadOrBootstrap(detail.thread_id, {
       targetEventId: detail.event_id ?? null,
     });
+  }
+
+  function handleNavigateTap() {
+    if (!navTap) return;
+    close();
+    handleNavigationRequest(navTap);
   }
 
   function handleBodyClick(e: MouseEvent) {
@@ -76,8 +95,7 @@ export function NotificationsModal() {
   }
 
   return (
-    <ModalOverlay onClose={close} class="notifications-modal-overlay">
-      <div class="notifications-modal" onClick={(e) => e.stopPropagation()}>
+    <Overlay open onClose={close} overlayClass="notifications-modal-overlay" panelClass="notifications-modal">
         <div class="notifications-modal-header">
           <button
             class="icon-btn"
@@ -113,7 +131,7 @@ export function NotificationsModal() {
           onClick={handleBodyClick}
           dangerouslySetInnerHTML={{ __html: content }}
         />
-        {(linked.kind === 'linked' || detail.thread_id) && (
+        {(linked.kind === 'linked' || detail.thread_id || showNavButton) && (
           <div class="notification-detail-actions">
             {linked.kind === 'linked' && (
               <button class="action-btn" onClick={handleOpenApp}>
@@ -125,6 +143,11 @@ export function NotificationsModal() {
                 Open thread
               </button>
             )}
+            {showNavButton && navTap && (
+              <button class="action-btn" onClick={handleNavigateTap}>
+                {navigateTapLabel(navTap)}
+              </button>
+            )}
           </div>
         )}
         {linked.kind === 'unknown' && (
@@ -132,7 +155,6 @@ export function NotificationsModal() {
             <span class="error-text">Unknown app: {linked.appId}</span>
           </div>
         )}
-      </div>
-    </ModalOverlay>
+    </Overlay>
   );
 }

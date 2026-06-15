@@ -45,16 +45,15 @@ async function clickThreadNav(page: Page, ariaLabel: 'Previous thread' | 'Next t
   }
 }
 
-/** Click "Discard draft" and accept the confirm. Discarding an unsent draft is
- *  destructive, so the confirm is tied to the ACTION — it now appears whether
- *  the discard is triggered by this button or by the close-cascade shortcut. */
-async function discardDraftViaButton(page: Page): Promise<void> {
-  if (!await clickVisibleElement(page, 'button[aria-label="Discard draft"]')) {
-    throw new Error('Discard button not visible');
+/** Clear the prompt via the textarea's clear-X. The dedicated "Discard draft"
+ *  button was removed — the clear-X (plus per-image remove X) is the discard
+ *  affordance now. For a never-sent compose draft, emptying the text auto-
+ *  discards it (updateCompose routes an empty patch through discardCompose); for
+ *  an active thread it's a local clear of the follow-up text, no confirm. */
+async function clearDraft(page: Page): Promise<void> {
+  if (!await clickVisibleElement(page, 'button.prompt-clear')) {
+    throw new Error('Clear button not visible');
   }
-  const ok = page.locator('.confirm-dialog .confirm-btn-ok:visible').first();
-  await expect(ok).toBeVisible({ timeout: 5_000 });
-  await ok.click();
 }
 
 test.describe('Per-thread drafts', () => {
@@ -111,10 +110,11 @@ test.describe('Per-thread drafts', () => {
     const third = await waitForVisibleInput(page);
     await expect(third).toHaveValue('');
 
-    // Open drawer — Drafts section now lists both prior compose drafts
+    // Open drawer — the Current section now lists both prior compose drafts at
+    // the top.
     await openThreadDrawer(page);
-    const newSection = page.locator('.list-section-title:visible', { hasText: 'New' });
-    await expect(newSection).toBeVisible({ timeout: 5_000 });
+    const currentSection = page.locator('.list-section-title:visible', { hasText: 'Current' });
+    await expect(currentSection).toBeVisible({ timeout: 5_000 });
 
     const firstRow = page.locator('.compose-draft-row:visible .thread-row-title', { hasText: 'first compose draft' });
     const secondRow = page.locator('.compose-draft-row:visible .thread-row-title', { hasText: 'second compose draft' });
@@ -145,37 +145,23 @@ test.describe('Per-thread drafts', () => {
     await expect(restored).toHaveValue('return to me', { timeout: 5_000 });
   });
 
-  test('existing thread → New → type → Discard → Back returns to the existing thread', async ({ page }) => {
-    // Regression: after Discard, the cursor sits on the existing thread but
-    // focusedThreadId is null (compose pane). A naive "decrement cursor" Back
-    // skipped that entry and jumped to whatever was navigated before it.
+  test('existing thread → New → type → clear (auto-discard) → Back returns to the existing thread', async ({ page }) => {
+    // Regression: after the draft is discarded, the cursor sits on the existing
+    // thread but focusedThreadId is null (compose pane). A naive "decrement
+    // cursor" Back skipped that entry and jumped to whatever was navigated
+    // before it. Clearing the compose text auto-discards the never-sent draft.
     const { promptInput, activeId } = await startThreadThenCompose(page, 'discard-back', 'soon to be discarded');
 
-    await discardDraftViaButton(page);
+    await clearDraft(page);
     const cleared = await waitForVisibleInput(page);
     await expect(cleared).toHaveValue('', { timeout: 5_000 });
 
-    const back = page.locator('button[aria-label="Previous thread"]:visible').first();
-    await expect(back).toBeEnabled({ timeout: 5_000 });
-    await back.click();
+    // Dual-layout-safe: a raw `.first().click()` resolves to the offscreen
+    // layout's nav button, which the visible thread-pane-body intercepts on
+    // mobile (pointer-events) — clickThreadNav uses a synthetic el.click that
+    // fires the handler regardless. (Was failing on mobile + mobile-webkit.)
+    await clickThreadNav(page, 'Previous thread');
     await expect(promptInput).toHaveAttribute('data-thread-id', activeId, { timeout: 5_000 });
-  });
-
-  test('Discard draft can be canceled — the draft survives the confirm', async ({ page }) => {
-    // The confirm lives on the action, so it appears for the button too;
-    // canceling it must leave the typed draft exactly as it was.
-    await startThreadThenCompose(page, 'discard-cancel', 'keep this draft');
-
-    if (!await clickVisibleElement(page, 'button[aria-label="Discard draft"]')) {
-      throw new Error('Discard button not visible');
-    }
-    const cancel = page.locator('.confirm-dialog .confirm-btn-cancel:visible').first();
-    await expect(cancel).toBeVisible({ timeout: 5_000 });
-    await cancel.click();
-
-    // Draft text is untouched.
-    const stillThere = await waitForVisibleInput(page);
-    await expect(stillThere).toHaveValue('keep this draft', { timeout: 5_000 });
   });
 
   test('existing thread → New → type → Back lands on the existing thread, Forward returns to the draft', async ({ page }) => {
@@ -240,14 +226,15 @@ test.describe('Per-thread drafts', () => {
     const input = await waitForVisibleInput(page);
     await input.fill('section draft');
 
-    // The drawer's New section only renders composing threads with content.
+    // The drawer only renders composing threads with content; they ride at the
+    // top of the Current section.
     await newThread(page);
     const composeInput = await waitForVisibleInput(page);
     await composeInput.fill('new compose with text');
 
     await openThreadDrawer(page);
-    const newSection = page.locator('.list-section-title:visible', { hasText: 'New' });
-    await expect(newSection).toBeVisible({ timeout: 5_000 });
+    const draftRow = page.locator('.compose-draft-row:visible .thread-row-title', { hasText: 'new compose with text' });
+    await expect(draftRow).toBeVisible({ timeout: 5_000 });
   });
 
   test('focused thread draft visibility in Drafts section depends on viewport', async ({ page }) => {
@@ -262,8 +249,6 @@ test.describe('Per-thread drafts', () => {
 
     await openThreadDrawer(page);
 
-    const newSection = page.locator('.list-section-title:visible', { hasText: 'New' });
-
     if (isMobileViewport(page)) {
       // Mobile hides the textarea from the threads pane, so a focused thread's
       // follow-up draft only surfaces in the dedicated Drafts view.
@@ -272,9 +257,10 @@ test.describe('Per-thread drafts', () => {
       const draftsSection = page.locator('.list-section-title:visible', { hasText: 'Drafts' });
       await expect(draftsSection).toBeVisible({ timeout: 5_000 });
     } else {
-      // On desktop, the focused thread's draft is visible in the textarea,
-      // so it should NOT appear in the Drafts section
-      await expect(newSection).not.toBeVisible({ timeout: 5_000 });
+      // On desktop, the focused thread's follow-up draft is shown inline in the
+      // visible textarea — no drafts view needed to see it.
+      const visibleInput = await waitForVisibleInput(page);
+      await expect(visibleInput).toHaveValue('focused draft', { timeout: 5_000 });
     }
   });
 
@@ -298,8 +284,8 @@ test.describe('Per-thread drafts', () => {
     await ensureOnThreadPane(page);
 
     await openThreadDrawer(page);
-    const newSection = page.locator('.list-section-title:visible', { hasText: 'New' });
-    await expect(newSection).toBeVisible({ timeout: 5_000 });
+    const currentSection = page.locator('.list-section-title:visible', { hasText: 'Current' });
+    await expect(currentSection).toBeVisible({ timeout: 5_000 });
 
     const titledRow = page.locator('.compose-draft-row:visible .thread-row-title', { hasText: 'compose only draft' });
     await expect(titledRow).toBeVisible({ timeout: 5_000 });
@@ -317,12 +303,12 @@ test.describe('Per-thread drafts', () => {
     // After clearing the text, the draft is empty and should NOT be saved
     await newThread(page);
     await openThreadDrawer(page);
-    const newSection = page.locator('.list-section-title:visible', { hasText: 'New' });
-    // No persisted compose drafts — section should be absent
-    await expect(newSection).not.toBeVisible({ timeout: 2_000 });
+    // No persisted compose drafts and no other threads — no draft row renders.
+    const draftRow = page.locator('.compose-draft-row:visible');
+    await expect(draftRow).toHaveCount(0, { timeout: 2_000 });
   });
 
-  test('Discard clears the compose textarea and removes the draft from the panel', async ({ page }) => {
+  test('Clearing the text discards the compose draft and removes it from the panel', async ({ page }) => {
     await navigateToApp(page);
 
     // Type, navigate away to establish, then come back so the draft has a panel row
@@ -340,20 +326,20 @@ test.describe('Per-thread drafts', () => {
     const restored = await waitForVisibleInput(page);
     await expect(restored).toHaveValue('about to be discarded', { timeout: 5_000 });
 
-    // Click Discard and accept the confirm
-    await discardDraftViaButton(page);
+    // Clear the text — emptying a never-sent compose draft auto-discards it
+    await clearDraft(page);
 
     // Textarea is empty
     const cleared = await waitForVisibleInput(page);
     await expect(cleared).toHaveValue('', { timeout: 5_000 });
 
-    // Open drawer again — the draft is gone (no row, no New section)
+    // Open drawer again — the draft is gone (no compose-draft row)
     await openThreadDrawer(page);
     const stale = page.locator('.compose-draft-row:visible .thread-row-title', { hasText: 'about to be discarded' });
     await expect(stale).toHaveCount(0);
   });
 
-  test('Discard on a follow-up draft clears the compose without deleting the active thread', async ({ page }) => {
+  test('Clearing a follow-up draft clears the compose without deleting the active thread', async ({ page }) => {
     await navigateToApp(page);
 
     const msg = uniqueMessage('discard-thread-mode');
@@ -364,15 +350,14 @@ test.describe('Per-thread drafts', () => {
     const input = await waitForVisibleInput(page);
     await input.fill('thread follow-up to discard');
 
-    // Discard button is visible whenever the prompt has content (compose or followup)
-    const discardBtn = page.locator('button[aria-label="Discard draft"]:visible');
-    await expect(discardBtn).toHaveCount(1);
+    // The clear-X is visible whenever the prompt has text (compose or followup)
+    const clearBtn = page.locator('button.prompt-clear:visible');
+    await expect(clearBtn).toHaveCount(1);
 
-    // Click Discard (and accept the confirm) — for an active thread, clears the
-    // in-progress text/images but keeps the thread intact. Must not attempt to
-    // delete the thread server-side (which would 409 with "thread is active —
-    // use archive instead").
-    await discardDraftViaButton(page);
+    // Clear the follow-up text — for an active thread this is a local clear that
+    // keeps the thread intact. Must not attempt to delete the thread server-side
+    // (which would 409 with "thread is active — use archive instead").
+    await clearDraft(page);
 
     const cleared = await waitForVisibleInput(page);
     await expect(cleared).toHaveValue('', { timeout: 5_000 });
@@ -381,7 +366,7 @@ test.describe('Per-thread drafts', () => {
     await expect(page.locator('.toast-error')).toHaveCount(0, { timeout: 1_000 });
 
     // User stays on the active thread — placeholder is the follow-up one,
-    // not the compose-view "Go ahead…". Asserting placeholder also avoids
+    // not the compose-view "What can I help with today?". Asserting placeholder also avoids
     // the dual-layout-render trap (desktop and mobile copies coexist in DOM).
     await expect(cleared).toHaveAttribute('placeholder', 'Post a follow up…');
 
@@ -452,8 +437,8 @@ test.describe('Per-thread drafts', () => {
     // Bug: when focusIfNeeded grabs focus on initial mount before
     // loadAllThreads resolves, the previous "skip sync while focused" guard
     // suppressed the eventual composeText overwrite. Result: the textarea
-    // stayed blank while the drawer label and Discard button still reflected
-    // the saved draft. Reproduction: focus the textarea immediately after
+    // stayed blank while the drawer label and clear-X still reflected the
+    // saved draft. Reproduction: focus the textarea immediately after
     // reload, then assert the persisted text reaches it anyway.
     await navigateToApp(page);
 
@@ -472,11 +457,11 @@ test.describe('Per-thread drafts', () => {
     // textarea was focused first and the older guard stuck on userTyping.
     await reloadedInput.focus();
     await expect(reloadedInput).toHaveValue('persists with focus', { timeout: 10_000 });
-    // The "Discard draft" button is gated on composeText.length > 0; if the
-    // text is missing but the draft state still shows, the button is the
-    // visible artifact users reported.
-    const discardBtn = page.locator('button[aria-label="Discard draft"]:visible');
-    await expect(discardBtn).toHaveCount(1);
+    // The clear-X is gated on composeText.length > 0; if the text were missing
+    // but the draft state still showed, this button would be the visible
+    // artifact users reported.
+    const clearBtn = page.locator('button.prompt-clear:visible');
+    await expect(clearBtn).toHaveCount(1);
   });
 
   test('compose draft survives page reload — same thread id, not a new one', async ({ page }) => {
@@ -555,5 +540,19 @@ test.describe('Per-thread drafts', () => {
     await expect(draftRow).toHaveCount(0, { timeout: 5_000 });
     await expect(page.locator('.thread-title-display:visible')).toHaveCount(0);
     await expect(page.getByText('Empty draft')).toHaveCount(0);
+  });
+
+  test('drafts toggle is hidden with no drafts on both viewports', async ({ page }) => {
+    // beforeEach cleared all threads, so there are zero drafts. The shared slot
+    // scheme (AltViewToggles) keeps both toggles mounted but marks an empty one
+    // `altview-hidden` — display:none on both viewports (shell.css) — so the
+    // toggle is present in the DOM but never visible or interactive when it has
+    // no content.
+    await navigateToApp(page);
+    await openThreadDrawer(page);
+
+    const headerSel = isMobileViewport(page) ? '.mobile-threads-header' : '.threads-header';
+    const toggle = page.locator(`${headerSel} button[aria-label="Toggle drafts view"]`);
+    await expect(toggle).toBeHidden({ timeout: 5_000 });
   });
 });

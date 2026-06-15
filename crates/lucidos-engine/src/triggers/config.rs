@@ -1,3 +1,4 @@
+use crate::engine::command_guard::SideEffectCategory;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -136,6 +137,12 @@ pub struct TriggerConfig {
     /// organizational label — does not affect firing. None renders the
     /// trigger under the implicit "Ungrouped" section in the panel.
     pub group_id: Option<String>,
+    /// The trigger's **side-effect grant** (ADR 0002, Phase 5): the set of
+    /// irreversible side-effect categories it's authorized to perform
+    /// unattended. Empty (the default) means the trigger may NOT perform any
+    /// irreversible side-effect — the command guard fails the trigger if its
+    /// intent tries to. Only consulted when the `command_guard` preference is on.
+    pub side_effect_grant: Vec<SideEffectCategory>,
 }
 
 /// Convert a human-facing trigger name to a stable kebab-case slug.
@@ -212,6 +219,26 @@ pub(crate) fn parse_event_subscriptions(on_field: Option<&Value>) -> Vec<EventSu
         .collect()
 }
 
+/// Parse a payload's `side_effect_grant` field into a deduped list of
+/// [`SideEffectCategory`]. Accepts an array of snake_case category strings
+/// (`["email", "external_api"]`); absent / null / non-array → empty. Unknown
+/// entries are skipped silently so a forward-compat value (a category a newer
+/// engine added) can't wedge the in-memory config on an older one.
+pub(crate) fn parse_side_effect_grant(field: Option<&Value>) -> Vec<SideEffectCategory> {
+    let Some(arr) = field.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SideEffectCategory> = Vec::new();
+    for entry in arr {
+        if let Ok(cat) = serde_json::from_value::<SideEffectCategory>(entry.clone()) {
+            if !out.contains(&cat) {
+                out.push(cat);
+            }
+        }
+    }
+    out
+}
+
 impl TriggerConfig {
     /// Build a TriggerConfig from a TriggerCreated event payload.
     pub fn from_created_payload(payload: &Value) -> Result<Self, String> {
@@ -256,6 +283,7 @@ impl TriggerConfig {
             .and_then(|v| v.as_str())
             .map(String::from)
             .unwrap_or_else(|| slugify_trigger_name_with_fallback(&name, &id));
+        let side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
 
         Ok(TriggerConfig {
             id,
@@ -270,6 +298,7 @@ impl TriggerConfig {
             app_id,
             go_to_review,
             group_id,
+            side_effect_grant,
         })
     }
 
@@ -398,6 +427,12 @@ impl TriggerConfig {
             } else if let Some(s) = v.as_str() {
                 self.group_id = Some(s.to_string());
             }
+        }
+        // side_effect_grant update: full replacement when present (array → the
+        // new grant set, `[]` / null → clears it); absent leaves it as-is. The
+        // HTTP layer always sends the whole array on a change, mirroring `on`.
+        if payload.get("side_effect_grant").is_some() {
+            self.side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
         }
     }
 }

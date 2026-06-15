@@ -60,7 +60,7 @@ describe('exchangeStatus + spinner behavior around UserQuestionAsked', () => {
     expect(exchangeStatus(ex, '', true, false, true)).toBe('awaiting-answer');
   });
 
-  it('exchangeStatus returns to cc-working once CC resumes after answer', () => {
+  it('exchangeStatus returns to coding-agent-working once CC resumes after answer', () => {
     const ex = exchange([
       step(1, { type: 'SessionStarted', session_id: 'sess', branch: '' }),
       step(2, {
@@ -77,7 +77,7 @@ describe('exchangeStatus + spinner behavior around UserQuestionAsked', () => {
       }),
       step(4, { type: 'CodingAgentTextStreamed', text: 'continuing…' }),
     ]);
-    expect(exchangeStatus(ex, '', true, false, true)).toBe('cc-working');
+    expect(exchangeStatus(ex, '', true, false, true)).toBe('coding-agent-working');
   });
 
   it('keeps resume-marker Thinking step spinning when AskUserQuestion ToolResult fires', () => {

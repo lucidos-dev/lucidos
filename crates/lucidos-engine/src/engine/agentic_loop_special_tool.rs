@@ -104,6 +104,35 @@ impl Relation {
         }
     }
 
+    /// Tool-result text returned when a spawn lands in the *Thread Queue*
+    /// instead of starting immediately (the system is at background
+    /// capacity). `label` names the spawn flavor ("Thread" / "Claude Code
+    /// session"). The callback contract per relation is unchanged — it just
+    /// starts later — so each branch restates it, mirroring the success
+    /// texts.
+    pub(crate) fn queued_spawn_text(
+        self,
+        label: &str,
+        thread_id: Uuid,
+        position: usize,
+    ) -> String {
+        let base = format!(
+            "{label} queued at position {position} in the Thread Queue — Lucidos is at \
+             background capacity. It starts automatically when a slot frees; its \
+             thread_id will be {thread_id}."
+        );
+        match self {
+            Self::Child => format!(
+                "{base} When it eventually finishes, this conversation will \
+                 automatically resume with its results — you don't need to check on it."
+            ),
+            Self::Top => format!(
+                "{base} It runs independently and will NOT report back to this \
+                 conversation."
+            ),
+        }
+    }
+
     /// Tool-result text returned for `run_claude`. Mirrors the
     /// callback-contract guarantee of `run_thread_success_text` so the LLM
     /// sees both spawn tools as a uniform pair. Stamps `workspace` into the
@@ -429,31 +458,38 @@ impl LucidosEngine {
                     _ => None,
                 };
 
+                if spawn_app_id.is_some() && repo_id.is_some() {
+                    return Some(
+                        "Error: Cannot pass both `app_id` and `repo_id` — an app \
+                         coding-agent thread is not a repo"
+                            .to_string(),
+                    );
+                }
                 let caller_title = tool_args["title"].as_str();
-                let images = resolved_images
-                    .as_deref()
-                    .or(user_images)
-                    .map(<[crate::api::ChatImage]>::to_vec);
-                Some(
-                    match self.spawn_agent_thread(
-                        crate::engine::claude_code::SpawnAgentThreadParams {
-                            prompt: prompt.to_string(),
-                            user_images: images,
-                            device_id: device_id.map(str::to_string),
-                            parent_thread_id,
-                            spawning_event_id,
-                            repo_id,
-                            caller_title: caller_title.map(str::to_string),
-                            app_id: spawn_app_id,
-                        },
-                    ) {
-                        Ok(cc_thread_id) => {
-                            let ws = current_ws.unwrap_or_else(|| self.workspace_name());
-                            relation.run_claude_success_text(cc_thread_id, &ws)
-                        }
-                        Err(e) => format!("Error: Failed to start Claude Code: {}", e),
-                    },
-                )
+                let images = resolved_images.as_deref().or(user_images);
+                let cc_thread_id = uuid::Uuid::new_v4();
+                let request = crate::engine::thread_queue::ThreadQueueRequest::CodingAgent {
+                    prompt: prompt.to_string(),
+                    cc_thread_id,
+                    image_hashes: self.queued_image_hashes(images),
+                    device_id: device_id.map(str::to_string),
+                    parent_thread_id,
+                    spawning_event_id,
+                    repo_id,
+                    title: caller_title.map(str::to_string),
+                    app_id: spawn_app_id,
+                };
+                let outcome = self.thread_queue.submit(request, None, None).await;
+                Some(if outcome.admitted {
+                    let ws = current_ws.unwrap_or_else(|| self.workspace_name());
+                    relation.run_claude_success_text(cc_thread_id, &ws)
+                } else {
+                    relation.queued_spawn_text(
+                        "Claude Code session",
+                        cc_thread_id,
+                        outcome.position,
+                    )
+                })
             }
         } else if tool_name == tn::RUN_THREAD {
             let prompt = tool_args["prompt"].as_str().unwrap_or("");
@@ -475,64 +511,35 @@ impl LucidosEngine {
                             // instead of the user's chat-mode preference.
                             let (chat_model, chat_effort) =
                                 crate::core::PreferenceStore::user_chat_settings(&self.pool).await;
-                            // Eager emit BEFORE the background spawn: a Child relation
-                            // child's active_children_count must increment before the parent
-                            // can complete this turn, otherwise ResponseGenerated wins
-                            // the race and the parent flips to "review" before the
-                            // child is on the projection. origin=None so
-                            // make_message_received synthesizes a ThreadLink origin
-                            // from mode + parent_thread_id — emits None for a Top
-                            // spawn since parent_thread_id is None there.
-                            let eager_result = self
-                                .event_bus
-                                .emit(BusEvent::Thread {
-                                    thread_id: child_thread_id,
-                                    event: crate::engine::chat::make_message_received(
-                                        &self.workspace_path,
-                                        prompt,
-                                        None,
-                                        None,
-                                        None,
-                                        parent_thread_id,
-                                        spawning_event_id,
-                                        ActorMode::Agent,
-                                        chat_model.as_deref(),
-                                        chat_effort.as_deref(),
-                                        None,
-                                    ),
-                                    meta: EventMeta {
-                                        channel: Some(
-                                            EventChannel::Chat,
-                                        ),
-                                        ..EventMeta::NONE
-                                    },
-                                })
-                                .await;
-                            match eager_result {
-                                Ok(Some(emit)) => {
-                                    let origin_id = emit.event_id;
-                                    let caller_title = tool_args["title"].as_str();
-                                    match self.spawn_thread(
-                                        prompt,
-                                        parent_thread_id,
-                                        spawning_event_id,
-                                        child_thread_id,
-                                        Some(origin_id),
-                                        caller_title,
-                                        chat_model,
-                                        chat_effort,
-                                    ) {
-                                        Ok(cid) => relation.run_thread_success_text(
-                                            cid,
-                                            &self.workspace_name(),
-                                        ),
-                                        Err(e) => format!("Error starting thread: {}", e),
-                                    }
-                                }
-                                Ok(None) => {
-                                    "Error: MessageReceived emit returned no result".to_string()
-                                }
-                                Err(e) => format!("Error starting thread: {}", e),
+                            let caller_title = tool_args["title"].as_str();
+                            // The eager MessageReceived (a Child relation child's
+                            // active_children_count must increment before the parent
+                            // can complete this turn) lives in the Thread Queue
+                            // executor's `prepare` hook — `submit` awaits it inline
+                            // on the admitted path, preserving the ordering.
+                            let request =
+                                crate::engine::thread_queue::ThreadQueueRequest::SubThread {
+                                    prompt: prompt.to_string(),
+                                    child_thread_id,
+                                    parent_thread_id,
+                                    spawning_event_id,
+                                    title: caller_title.map(str::to_string),
+                                    model: chat_model,
+                                    reasoning_effort: chat_effort,
+                                    pre_emitted_origin: None,
+                                };
+                            let outcome = self.thread_queue.submit(request, None, None).await;
+                            if outcome.admitted {
+                                relation.run_thread_success_text(
+                                    child_thread_id,
+                                    &self.workspace_name(),
+                                )
+                            } else {
+                                relation.queued_spawn_text(
+                                    "Thread",
+                                    child_thread_id,
+                                    outcome.position,
+                                )
                             }
                         }
                     },
@@ -578,7 +585,7 @@ impl LucidosEngine {
                         BusEvent::Thread {
                             thread_id,
                             event: ThreadEvent::McpConsentPromptRequested {
-                                data: serde_json::json!({
+                                payload: serde_json::json!({
                                     "request_id": consent_request_id,
                                     "server_name": server_name,
                                     "tool_name": mcp_tool_name,

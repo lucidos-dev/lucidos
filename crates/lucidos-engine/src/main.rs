@@ -1,6 +1,6 @@
 use lucidos_engine::api::{create_router, SharedEngine};
 use lucidos_engine::engine::LucidosEngine;
-use lucidos_engine::llm::{OpenAiProvider, RoutingProvider, VertexProvider};
+use lucidos_engine::llm::{resolve_openai_api_key, OpenAiProvider, RoutingProvider, VertexProvider};
 use lucidos_engine::log;
 use lucidos_engine::scheduler::SchedulerManager;
 use std::net::SocketAddr;
@@ -87,9 +87,6 @@ async fn shutdown_signal(
     // Close browser to avoid orphaned Chrome processes
     engine.shutdown_browser().await;
 
-    // Update user profile before shutdown
-    engine.update_user_profile().await;
-
     // Shutdown the scheduler
     if let Err(e) = scheduler.lock().await.shutdown().await {
         log!("[Shutdown] Error shutting down scheduler: {}", e);
@@ -114,6 +111,113 @@ async fn read_vertex_region_pref(database_url: &str) -> Option<String> {
     .ok()
     .flatten()
     .filter(|s| !s.is_empty())
+}
+
+/// Build the direct-OpenAI provider from a resolved key, logging where the key
+/// came from and degrading to `None` (rather than aborting startup) if the
+/// reqwest client can't be built. Shared by both branches of
+/// `load_direct_providers_and_registry` so the DB-up and DB-down paths honor
+/// the OPENAI_API_KEY fallback identically.
+fn build_openai_provider(
+    credential: Option<(lucidos_engine::core::AuthType, String)>,
+    env_key: Option<String>,
+    default_model: &str,
+) -> Option<OpenAiProvider> {
+    match resolve_openai_api_key(credential, env_key) {
+        Some((key, source)) => {
+            log!("[Startup] OpenAI provider configured (key from {})", source);
+            OpenAiProvider::new(key, default_model.to_string())
+                .map_err(|e| log!("[Startup] Failed to build OpenAI provider: {}", e))
+                .ok()
+        }
+        None => None,
+    }
+}
+
+/// Open a short-lived pool to assemble the direct OpenAI + Anthropic providers
+/// (from the `openai` / `anthropic` credentials set in Settings → Providers)
+/// and the model→provider registry. Providers are built before
+/// `LucidosEngine::new` creates its own pool, so — like `read_vertex_region_pref`
+/// — this uses a throwaway connection. The OpenAI key prefers the stored
+/// credential and falls back to `openai_env_key` (the `OPENAI_API_KEY` launch
+/// env var). Returns `(openai, anthropic, id→provider map)`; each degrades to
+/// `None`/empty on any DB or credential error so the engine still boots on its
+/// other providers.
+async fn load_direct_providers_and_registry(
+    database_url: &str,
+    default_model: &str,
+    openai_env_key: Option<String>,
+) -> (
+    Option<OpenAiProvider>,
+    Option<lucidos_engine::llm::AnthropicProvider>,
+    std::collections::HashMap<String, lucidos_engine::llm::ProviderKind>,
+) {
+    let pool = match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(database_url)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            log!(
+                "[Startup] Could not open pool for direct-provider credentials / model registry: {}",
+                e
+            );
+            // No DB access, but the OPENAI_API_KEY env fallback must still work.
+            let openai = build_openai_provider(None, openai_env_key, default_model);
+            return (openai, None, std::collections::HashMap::new());
+        }
+    };
+
+    let registry_map = lucidos_engine::llm::model_registry::load_from_db(&pool).await;
+
+    let anthropic = match lucidos_engine::core::CredentialStore::get(&pool, "anthropic").await {
+        Ok(Some(cred)) => {
+            use lucidos_engine::core::AuthType;
+            use lucidos_engine::llm::AnthropicAuth;
+            let auth = match cred.auth_type {
+                AuthType::ApiKey => Some(AnthropicAuth::ApiKey(cred.auth_value)),
+                AuthType::Bearer => Some(AnthropicAuth::OAuthBearer(cred.auth_value)),
+                other => {
+                    log!(
+                        "[Startup] Anthropic credential auth_type {} unsupported (expected api_key or bearer) — direct Anthropic disabled",
+                        other
+                    );
+                    None
+                }
+            };
+            match auth.and_then(|a| {
+                lucidos_engine::llm::AnthropicProvider::new(a, default_model.to_string())
+                    .map_err(|e| log!("[Startup] Failed to build Anthropic provider: {}", e))
+                    .ok()
+            }) {
+                Some(p) => {
+                    log!("[Startup] Direct Anthropic provider configured");
+                    Some(p)
+                }
+                None => None,
+            }
+        }
+        Ok(None) => None,
+        Err(e) => {
+            log!("[Startup] Failed to read Anthropic credential: {}", e);
+            None
+        }
+    };
+
+    // OpenAI: a stored `openai` credential wins; otherwise the env fallback.
+    let openai_credential = match lucidos_engine::core::CredentialStore::get(&pool, "openai").await {
+        Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
+        Ok(None) => None,
+        Err(e) => {
+            log!("[Startup] Failed to read OpenAI credential: {}", e);
+            None
+        }
+    };
+    let openai = build_openai_provider(openai_credential, openai_env_key, default_model);
+
+    (openai, anthropic, registry_map)
 }
 
 fn get_gcloud_project() -> Option<String> {
@@ -145,9 +249,35 @@ fn raise_fd_limit() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Handle --version / -V before any heavy startup (DB, TLS, env loading).
+/// Worker-thread stack size for the Tokio runtime.
+///
+/// The engine polls deeply-nested async chains on a single worker thread. A
+/// trigger fire descends scheduler → Thread Queue executor → `process_trigger`
+/// → the agentic loop → `execute_intent` → a *nested* intent agentic sub-loop →
+/// tool execution, all as one un-spawned future. Tokio's default 2 MiB worker
+/// stack is marginal for that depth: once the Thread Queue executor added a few
+/// frames to the front of the chain, a trigger that ran an app-scoped intent
+/// overflowed the worker stack and aborted the engine (SIGABRT), crash-looping
+/// via boot-resume. The depth is bounded — `execute_intent` is excluded from
+/// the intent sub-loop's tool set (`build_intent_tools`), so the sub-loop can't
+/// nest further — so a larger fixed stack fully resolves it. 16 MiB is reserved
+/// virtual address space (committed lazily per touched page), so the headroom is
+/// effectively free.
+const WORKER_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Build the multi-threaded Tokio runtime the engine runs on. Mirrors what
+/// `#[tokio::main]` produces (multi-thread, all drivers enabled, one worker per
+/// CPU) but pins a larger worker-thread stack — see [`WORKER_THREAD_STACK_SIZE`].
+/// Shared with the runtime test so it exercises the exact production config.
+fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_THREAD_STACK_SIZE)
+        .build()
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Handle --version / -V before any heavy startup (runtime, DB, TLS, env).
     // Output prepends the umbrella Lucidos release to the per-crate engine version.
     // Uses bare `println!` (not `log!`) because this is user-facing CLI output that
     // tooling parses — the timestamp/pid/label prefix from `log!` would break callers.
@@ -163,6 +293,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
+    build_runtime()?.block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Multiple crates enable both aws-lc-rs and ring features on rustls,
     // so auto-detection fails — install a provider explicitly before any TLS use.
     rustls::crypto::aws_lc_rs::default_provider()
@@ -262,6 +396,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     log!("[Startup] Using default model: {}", model);
 
+    // Shared model→provider routing map. Populated from the DB below for real
+    // providers; left empty for mock. Cloned into RoutingProvider and handed to
+    // the engine so the reload subscriber can hot-swap it on Model* events.
+    let model_registry = lucidos_engine::llm::model_registry::empty();
+
     // Create LLM provider — mock mode bypasses real providers entirely
     let (llm, vertex_token_cache): (
         Arc<dyn lucidos_engine::llm::LlmProvider>,
@@ -289,19 +428,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             (None, None)
         };
 
-        let openai = match std::env::var("OPENAI_API_KEY") {
-            Ok(api_key) => {
-                log!("[Startup] OpenAI API configured");
-                Some(OpenAiProvider::new(api_key, model.clone())?)
-            }
-            Err(_) => None,
-        };
-
-        if vertex.is_none() && openai.is_none() {
-            panic!("No LLM provider configured. Set VERTEX_PROJECT_ID (for Claude/Gemini), OPENAI_API_KEY (for GPT), or LUCIDOS_MODEL=mock (for testing).");
+        // Direct OpenAI + Anthropic providers (Settings → Providers) and the
+        // DB-backed model→provider routing map, all read from a throwaway pool.
+        // OpenAI prefers a stored `openai` credential and falls back to the
+        // OPENAI_API_KEY launch env var.
+        let openai_env_key = std::env::var("OPENAI_API_KEY").ok();
+        let (openai, anthropic, registry_map) =
+            load_direct_providers_and_registry(&database_url, &model, openai_env_key).await;
+        if let Ok(mut guard) = model_registry.write() {
+            *guard = registry_map;
         }
 
-        (Arc::new(RoutingProvider::new(vertex, openai, model)), vtc)
+        if vertex.is_none() && openai.is_none() && anthropic.is_none() {
+            panic!("No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI or Anthropic credential (Settings → Providers) or OPENAI_API_KEY (GPT), or LUCIDOS_MODEL=mock (for testing).");
+        }
+
+        (
+            Arc::new(RoutingProvider::new(
+                vertex,
+                openai,
+                anthropic,
+                model_registry.clone(),
+                model,
+            )),
+            vtc,
+        )
     };
 
     // Create engine with pgvector for embeddings
@@ -312,15 +463,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         project_id,
         vertex_region,
         vertex_token_cache,
+        model_registry,
     )
     .await?;
     log!("[Startup] PostgreSQL connected");
-
-    // Generate user profile if it doesn't exist (uses same code path as session-end updates)
-    if !engine.has_user_profile().await {
-        log!("[Startup] Generating initial user profile...");
-        engine.update_user_profile().await;
-    }
 
     // Extract shared read-only resources before wrapping engine in Arc
     let event_store = engine.event_store().clone();
@@ -347,6 +493,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Must run before the orphan running/waiting resets: emitting Resolved
     // flips status to 'running', which those resets then settle to 'idle'.
     lucidos_engine::engine::agent_recovery::recover_orphan_cc_permission_requests(
+        shared_engine.pool(),
+        &shared_engine.event_bus,
+    )
+    .await;
+    // Same for the command-guard permission lane (ADR 0002): a chat turn parked
+    // on a CommandPermissionRequested is dead after restart, so clear the card.
+    lucidos_engine::engine::command_permission::recover_orphan_command_permission_requests(
         shared_engine.pool(),
         &shared_engine.event_bus,
     )
@@ -547,6 +700,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // terminal. See `engine::agent_session::external_watchdog`.
     let _watchdog_handle = shared_engine.spawn_external_watchdog();
 
+    // Rebuild the Thread Queue's in-memory state from the `thread_queue`
+    // projection BEFORE the scheduler starts (the scheduler is the first
+    // submission path to come alive — loading the persisted backlog first
+    // keeps per-trigger FIFO intact across the restart). Admitted rows whose
+    // work died with the previous process re-queue; spawn rows whose thread
+    // already materialized hand off to the thread-level recovery above.
+    shared_engine.thread_queue.recover_persisted_entries().await;
+
+    // Keep the in-memory user-initiated pool a faithful mirror of each thread's
+    // `thread_summaries.status`: one subscriber reconciles the slot on every
+    // status change (running → occupies one slot; parked / idle / terminal →
+    // none; resume / continuation / restart → re-added). Without this the slot
+    // is freed only when the chat task returns — which never happens while a
+    // coding-agent thread is parked on an AskUserQuestion / permission prompt —
+    // and, before reconcile, an answered thread that resumed running showed as
+    // "Nothing running". Subscribe before the API server (the chat handler that
+    // acquires user slots) comes alive.
+    shared_engine.thread_queue.spawn_settle_subscriber();
+
     // Use the engine's shared pool for scheduler
     let pool = shared_engine.pool().clone();
 
@@ -555,6 +727,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut scheduler = SchedulerManager::new(scheduler_engine, pool.clone()).await?;
     scheduler.start().await?;
     let scheduler = Arc::new(tokio::sync::Mutex::new(scheduler));
+
+    // Start draining the Thread Queue only now — drain consults trigger
+    // pause/deletion state, which the scheduler's event replay just loaded.
+    // Also runs the periodic safety-net drain + backlog-age notifications.
+    shared_engine.thread_queue.start_draining();
 
     // Start API server with graceful shutdown
     let started_at = chrono::Utc::now();
@@ -611,4 +788,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::{build_runtime, WORKER_THREAD_STACK_SIZE};
+
+    /// Recurse with a large live stack frame per level to emulate the engine's
+    /// deep, un-spawned async poll chain (a trigger fire descending the agentic
+    /// loop into a nested `execute_intent` sub-loop and a tool). Combining
+    /// `#[inline(never)]`, `black_box`, and reading `buf` *after* the recursive
+    /// call defeats tail-call and dead-store optimization so every level
+    /// genuinely consumes stack.
+    #[inline(never)]
+    fn consume_stack(depth: usize) -> u64 {
+        let mut buf = [0u8; 64 * 1024]; // 64 KiB of stack per frame
+        let idx = depth % buf.len();
+        buf[idx] = depth as u8;
+        std::hint::black_box(&buf);
+        let deeper = if depth == 0 { 0 } else { consume_stack(depth - 1) };
+        deeper.wrapping_add(buf[idx] as u64)
+    }
+
+    /// Regression for the trigger stack-overflow (SIGABRT) crash: a cron/event
+    /// trigger that ran an app-scoped intent descended
+    /// `executor → process_trigger → agentic loop → execute_intent → intent
+    /// sub-loop → tool` as one future and overflowed tokio's default 2 MiB
+    /// worker stack. The engine's runtime must give that bounded-but-deep chain
+    /// real headroom.
+    #[test]
+    fn worker_stack_holds_deep_nested_async_chain() {
+        // Must comfortably exceed tokio's 2 MiB default that overflowed in prod.
+        // Checked at compile time — the invariant is over a const, so a runtime
+        // assert would be dead weight.
+        const {
+            assert!(
+                WORKER_THREAD_STACK_SIZE >= 8 * 1024 * 1024,
+                "worker stack must exceed tokio's 2 MiB default with headroom"
+            );
+        }
+
+        // Run a chain needing ~4 MiB of stack (65 levels * 64 KiB) on a worker
+        // thread of the *production* runtime builder. On the old 2 MiB default
+        // this aborts the process (the original SIGABRT); on the configured
+        // stack it completes cleanly.
+        let rt = build_runtime().expect("runtime builds");
+        let sum = rt.block_on(async {
+            tokio::spawn(async { consume_stack(64) })
+                .await
+                .expect("deep-stack task joins without overflowing the worker stack")
+        });
+        let expected: u64 = (0..=64).sum();
+        assert_eq!(sum, expected, "deep recursion ran every level to completion");
+    }
 }

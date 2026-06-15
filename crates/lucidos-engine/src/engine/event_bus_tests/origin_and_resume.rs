@@ -301,6 +301,7 @@ async fn cc_follow_up_after_exit_resumes_via_db() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "s1".into(),
             branch: "claude-code/test".into(),
             repo_id: None,
@@ -428,6 +429,7 @@ async fn cc_session_id_survives_engine_restart() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "s1".into(),
             branch: "claude-code/test".into(),
             repo_id: None,

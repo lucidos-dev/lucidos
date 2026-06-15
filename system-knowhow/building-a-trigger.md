@@ -65,9 +65,9 @@ The scheduler auto-creates an error notification when a trigger fails. Don't dou
 
 ## Where the thread lands: `go_to_review`
 
-By default, trigger runs are unattended — their threads go straight to ARCHIVE when they finish, and only surface in REVIEW if the user follows up with a message. This is right for most cron triggers (silent imports, periodic syncs, idle nudges).
+By default, trigger runs are unattended — their threads go straight to Archive when they finish, and only surface in the Current section if the user follows up with a message. This is right for most cron triggers (silent imports, periodic syncs, idle nudges).
 
-Set `go_to_review: true` when the trigger's *output is the point* — a daily summary the user is meant to read, an alert that needs acknowledgement, a scheduled report. The thread then surfaces in REVIEW on completion so it's not lost in ARCHIVE.
+Set `go_to_review: true` when the trigger's *output is the point* — a daily summary the user is meant to read, an alert that needs acknowledgement, a scheduled report. The thread then surfaces in the Current section on completion so it's not lost in Archive.
 
 | User phrasing that answers it | Flag |
 |---|---|
@@ -234,6 +234,19 @@ Use a group when several triggers form an emergent workflow (one trigger emits a
 | `delete_trigger_group(group_id)` | Refused if the group still has members — move or delete them first (the error response lists them). |
 
 Groups are orthogonal to `app_id`. An app-owned trigger can live in any group; the engine doesn't auto-couple the two. `app_id` drives notification deep-linking; `group_id` drives panel layout.
+
+## Side-effect grant — authorizing unattended risk
+
+This matters **only when the workspace has the command guard on** (Settings → Permissions → Command Safety; off by default). When it's on, the command guard classifies every `run_bash` / `run_python` command a trigger's intent runs. Most commands (reads, data crunching, downloads, writes inside the workspace) run untouched. But an **irreversible** one — sending email, a mutating HTTP request (POST/PUT/DELETE), a cloud-CLI change (`gh`/`aws`/`gcloud`), destroying files outside the workspace — is gated.
+
+A chat turn would *ask* the user to approve such a command. A trigger fires unattended: there's nobody to ask. So instead the trigger carries a **side-effect grant** — the set of irreversible side-effect categories it's pre-authorized to perform. At fire time:
+
+- the command's side-effect category **is in the grant** → it runs;
+- it **isn't** → the command is blocked and **the whole trigger run fails** (a failure notification surfaces it, naming the missing grant).
+
+The categories are: **email**, **external API** (mutating HTTP), **cloud CLI** (gh/aws/gcloud), **out-of-workspace destruction**, and **other** (anything irreversible that fits none of the above). The default grant is empty — a new trigger may perform *no* irreversible side-effect.
+
+**The grant is set by the user, not by you.** The `create_trigger` / `update_trigger` tools do **not** accept a grant field — that's deliberate, so an autonomous agent can't widen its own unattended authority. The user grants side-effects in the trigger's settings UI (the "Allowed side-effects" checkboxes). So when you build a trigger whose intent needs an irreversible side-effect (e.g. "email me the digest every morning"), **tell the user** they must tick the matching side-effect (here, *Send email or messages*) in the trigger's settings, or — if Command Safety is on — the run will fail the first time it tries to send. If Command Safety is off, none of this applies and the command runs unguarded.
 
 ## Edit, don't recreate
 

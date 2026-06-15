@@ -5,7 +5,7 @@ import { formatTimeAgo } from '../../utils/formatTime';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
+import { Overlay } from '../shared/Overlay';
 
 const PAGE_SIZE = 10;
 
@@ -19,8 +19,6 @@ export function TimeTravelDropdown() {
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const appId = app?.id ?? null;
-
-  useDismissOnOutside(open, ref, null, () => setOpen(false));
 
   // Clicking into an iframe steals focus without firing pointerdown in our
   // document, so the dismiss hook can't see it — the blur listener catches it.
@@ -113,8 +111,15 @@ export function TimeTravelDropdown() {
           <polyline points="12 6 12 12 16 14" />
         </svg>
       </button>
-      {open && (
-        <div class="time-travel-menu" ref={menuRef} onScroll={handleScroll}>
+      <Overlay
+        open={open}
+        onClose={() => setOpen(false)}
+        anchor={ref.current}
+        backdrop={false}
+        panelClass="time-travel-menu"
+        panelRef={menuRef}
+        panelProps={{ onScroll: handleScroll }}
+      >
           <div
             class={`time-travel-item${!activeCommit ? ' active' : ''}`}
             onClick={() => selectVersion(null)}
@@ -142,8 +147,7 @@ export function TimeTravelDropdown() {
           {loadedVersions && loadedVersions.length === 0 && (
             <div class="time-travel-item time-travel-empty">No history</div>
           )}
-        </div>
-      )}
+      </Overlay>
     </div>
   );
 }

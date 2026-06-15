@@ -1,4 +1,5 @@
-import type { ThreadStatus } from '../../store/thread-events';
+import type { ThreadStatus, ThreadState } from '../../store/thread-events';
+import { effectiveThreadStatus } from '../../store/store';
 
 /** 'changes' = static dot (CC has pending changes); 'question' = "?" badge
  *  (CC paused on AskUserQuestion). 'waiting' = pulsing dot, used only when
@@ -19,6 +20,41 @@ export function resolveVisualStatus(
   return 'idle';
 }
 
+/** The single source of truth for a thread's status dot. Every surface that
+ *  paints the dot — the drawer row, the desktop panel header, the mobile
+ *  thread title bar — calls THIS with the same live thread from `threadMap`,
+ *  so the dot can never disagree between the drawer and the panel (the
+ *  invariant: same thread → same status, everywhere). Don't reconstruct the
+ *  `resolveVisualStatus(effectiveThreadStatus(t), …)` triple at a call site;
+ *  call this instead. */
+export function threadVisualStatus(thread: ThreadState): VisualStatus {
+  return resolveVisualStatus(
+    effectiveThreadStatus(thread),
+    thread.meta.activeChildrenCount > 0,
+    thread.meta.codingAgentProposed,
+  );
+}
+
+/** User-facing label + one-line explanation for each status dot, shown in its
+ *  hover tooltip. Single source of truth so the dot and its explanation can
+ *  never drift. (idle has no dot, so it needs no entry.) */
+const STATUS_INFO: { status: VisualStatus; label: string; desc: string }[] = [
+  { status: 'running', label: 'Running', desc: 'Actively working on a response.' },
+  { status: 'waiting', label: 'Waiting', desc: 'Waiting for its child threads to finish.' },
+  { status: 'question', label: 'Waiting for your answer', desc: 'Paused until you answer its question.' },
+  { status: 'changes', label: 'Changes to review', desc: 'A coding agent proposed changes to open and Apply.' },
+  { status: 'failed', label: 'Failed', desc: 'The last response failed.' },
+];
+
+/** Tooltip for a status dot: its status name as the bold title, the one-line
+ *  explanation as the body — consumed by the global tooltip system
+ *  (`data-tooltip-title` / `data-tooltip`). */
+export function statusTooltip(status: VisualStatus): { title: string; text: string } {
+  const current = STATUS_INFO.find((s) => s.status === status);
+  if (!current) return { title: '', text: '' };
+  return { title: current.label, text: current.desc };
+}
+
 interface Props {
   status: VisualStatus | null;  // null = not loaded yet
 }
@@ -29,8 +65,14 @@ export function ThreadStatusIcon({ status }: Props) {
       <span class="progress-dot progress-dot-loading" />
     </span>
   );
+  // idle has no dot to hover, so skip the tooltip (it'd attach to a 0-size span).
+  const tip = status === 'idle' ? null : statusTooltip(status);
   return (
-    <span class={`thread-status thread-status-${status}`}>
+    <span
+      class={`thread-status thread-status-${status}`}
+      data-tooltip={tip?.text}
+      data-tooltip-title={tip?.title}
+    >
       {status === 'running' && (
         <span class="mini-spinner" />
       )}

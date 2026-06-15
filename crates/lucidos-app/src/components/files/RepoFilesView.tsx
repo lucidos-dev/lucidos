@@ -21,6 +21,9 @@ export function RepoFilesView() {
   const loadable = repoFiles.value;
   const showLoading = useDelayedLoading(loadable);
   const diffLoadable = repoDiff.value;
+  // App-CC branch shows the diff directly (no repoFiles tree), so its spinner
+  // must key off the diff's own load state, not repoFiles'.
+  const diffShowLoading = useDelayedLoading(diffLoadable);
   const pending = repoPending.value;
   const mode = repoViewMode.value;
   // Without a registered repo (app coding-agent threads use the workspace
@@ -60,8 +63,11 @@ export function RepoFilesView() {
   // controls apply) and render the inline diff. The empty bordered toolbar
   // bar was a visual artifact.
   if (!hasRepo) {
-    if (diffLoadable.status === 'loading') {
-      return showLoading ? <div class="loading-spinner" /> : null;
+    // A non-terminal diff (loading or not-loaded) must show the spinner, not
+    // fall through to InlineDiffList([]) -> "No changes". viewThreadCcDiff sets
+    // loading before this view mounts, but guard not-loaded defensively too.
+    if (diffLoadable.status !== 'loaded') {
+      return diffShowLoading ? <div class="loading-spinner" /> : null;
     }
     return (
       <div class="artifacts-desktop">

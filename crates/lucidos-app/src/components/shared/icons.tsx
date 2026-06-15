@@ -188,11 +188,20 @@ export function ComposeIcon() {
 export function DraftsIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-      <polyline points="14 2 14 8 20 8" />
-      <line x1="16" y1="13" x2="8" y2="13" />
-      <line x1="16" y1="17" x2="8" y2="17" />
-      <polyline points="10 9 9 9 8 9" />
+      <rect x="4" y="2" width="16" height="20" rx="2" />
+      <line x1="8" y1="9" x2="16" y2="9" />
+      <line x1="8" y1="13" x2="16" y2="13" />
+      <line x1="8" y1="17" x2="16" y2="17" />
+    </svg>
+  );
+}
+
+export function AttentionIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="10" />
+      <line x1="12" y1="8" x2="12" y2="12" />
+      <line x1="12" y1="16" x2="12.01" y2="16" />
     </svg>
   );
 }
@@ -226,17 +235,6 @@ export function FilterIcon() {
       <line x1="2" y1="4" x2="14" y2="4" />
       <line x1="4" y1="8" x2="12" y2="8" />
       <line x1="6" y1="12" x2="10" y2="12" />
-    </svg>
-  );
-}
-
-export function GridIcon() {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <rect x="4" y="4" width="6.5" height="6.5" rx="1" />
-      <rect x="13.5" y="4" width="6.5" height="6.5" rx="1" />
-      <rect x="4" y="13.5" width="6.5" height="6.5" rx="1" />
-      <rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1" />
     </svg>
   );
 }
@@ -285,6 +283,18 @@ export function CodeIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <polyline points="18 16 22 12 18 8" /><polyline points="6 8 2 12 6 16" /><line x1="14.5" y1="4" x2="9.5" y2="20" />
+    </svg>
+  );
+}
+
+export function CodexIcon() {
+  return (
+    <svg class="codex-icon" viewBox="0 0 24 24" fill="none" stroke="var(--accent-light)" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+      <g transform="translate(-1.2 -1.2) scale(1.1)">
+        <path d="M9.6 5.5c1.4-2 4.7-1.9 6 .2.9.2 1.7.8 2.2 1.7.5.8.6 1.7.4 2.6 2 .5 3.3 2.1 3.3 4.1 0 1.3-.6 2.5-1.6 3.3.1 2.3-1.8 4.1-4.2 4.1-1 0-1.9-.3-2.6-.9-.8.8-1.9 1.2-3.1 1.2-2 0-3.6-1.2-4.2-2.8-2-.3-3.5-1.9-3.5-3.8 0-1.7 1-3.2 2.6-3.8-.3-2.4 1.6-4.5 4-4.5.3 0 .5 0 .7.1Z" />
+        <path d="M8.4 10.2 10.4 12l-2 1.8" />
+        <path d="M13.5 14h2.4" />
+      </g>
     </svg>
   );
 }

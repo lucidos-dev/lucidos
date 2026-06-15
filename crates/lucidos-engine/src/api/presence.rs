@@ -41,3 +41,8 @@ pub(super) async fn update_device_presence(
         Err(e) => ApiResult::err(format!("Failed to record device presence: {}", e)),
     }
 }
+
+/// Route for device presence (any visible tab → PresenceCheck candidate).
+pub(super) fn router() -> Router<AppState> {
+    Router::new().route("/device-presence", post(update_device_presence))
+}

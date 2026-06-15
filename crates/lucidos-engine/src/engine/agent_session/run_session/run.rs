@@ -5,7 +5,7 @@ use crate::engine::change_ops::now_epoch_millis;
 use crate::engine::claude_code::STALE_RESUME_ERROR;
 use crate::engine::git_ops::{
     auto_commit_preserving_marker, branch_changed_files, default_local_branch,
-    describe_branch_changes, files_require_restart, git_cmd, is_external_repo_path,
+    describe_branch_changes, files_require_restart, is_external_repo_path,
     is_harden_marker_present, main_worktree,
 };
 use crate::engine::thread_events::{EventChannel, SessionEndReason};
@@ -20,12 +20,25 @@ use crate::engine::agent_session::lifecycle::{
     classify_result, idle_action,
     is_silent_resume, is_stale_resume_signal, reset_per_turn_flags,
     should_auto_commit_on_cleanup, should_propose_change_at_idle,
-    terminate_decision, watchdog_gate, IdleAction, TerminalKind,
+    terminal_clears_user_hit_stop, terminate_decision, watchdog_gate, IdleAction, TerminalKind,
     TerminateDecision, WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS,
     WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
 };
 use crate::engine::agent_session::resume::{change_description_fallback, resolve_resume_context, CC_TURN_CLOSER_EVENTS};
 use crate::engine::agent_session::spawn::spawn_or_resume;
+
+/// Decrement the paired-tool counter, flooring at 0. An unpaired decrement
+/// going negative would permanently disarm the hang watchdog —
+/// `watchdog_gate` reads `tools_in_flight > 0` and would never gate-skip
+/// again — so every decrement site (the ToolResult arm and the
+/// permission-bridge waiter task) shares this one contract. `Relaxed`
+/// matches the increments: the only reader tolerates one-tick staleness.
+fn release_tool_slot(tools_in_flight: &std::sync::atomic::AtomicI32) {
+    let prev = tools_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if prev <= 0 {
+        tools_in_flight.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 impl LucidosEngine {
     // Bridges every per-session input (thread / user msg / images / origin /
@@ -50,9 +63,42 @@ impl LucidosEngine {
         cc_reasoning_effort: Option<String>,
         // CWD for `--resume`. See the `UserQuestionAsked.worktree_path` doc.
         resume_worktree_path: Option<PathBuf>,
+        // Backend requested by the caller (chat API / spawn tool). Only
+        // honored for a thread's FIRST session — afterwards the stored
+        // `thread_summaries.coding_agent` wins so a thread can never flip
+        // backends mid-conversation (the new backend has no session to
+        // resume and would silently lose all context).
+        requested_coding_agent: Option<CodingAgent>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         let cc_start = std::time::Instant::now();
         let thread_id_str = thread_id.to_string();
+
+        let coding_agent = {
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT coding_agent FROM thread_summaries WHERE thread_id = $1",
+            )
+            .bind(thread_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten();
+            match stored {
+                Some(s) => {
+                    let stored_agent = CodingAgent::parse(&s);
+                    if let Some(req) = requested_coding_agent {
+                        if req != stored_agent {
+                            log!(
+                                "[AgentSession] thread {} is locked to {:?} — ignoring requested backend {:?}",
+                                thread_id,
+                                stored_agent,
+                                req
+                            );
+                        }
+                    }
+                    stored_agent
+                }
+                None => requested_coding_agent.unwrap_or(CodingAgent::ClaudeCode),
+            }
+        };
 
         // Pre-spawn app-coding-agent-thread detection: `spawn_agent_thread`
         // stashes the app id here when the LLM picks `folder=data/apps/<id>`;
@@ -110,7 +156,11 @@ impl LucidosEngine {
         };
         let is_app_spawn = app_spawn_id.is_some();
 
-        let meta = crate::engine::thread_events::EventMeta {
+        // Mutable so the interrupt arm can stamp `meta.actor` with the device
+        // that clicked Cancel — the terminal `ResponseCanceled` then carries it
+        // for the Initiator popover's Device row. Cleared at the next turn
+        // boundary so a resumed session doesn't inherit a stale actor.
+        let mut meta = crate::engine::thread_events::EventMeta {
             request_event_id: Some(origin_id),
             channel: Some(EventChannel::ClaudeCode),
             ..crate::engine::thread_events::EventMeta::NONE
@@ -286,6 +336,8 @@ impl LucidosEngine {
             interactive_session,
             adoption_note,
             resume_session_id,
+            worktree_created,
+            branch_created,
         } = self
             .resolve_run_worktree_context(
                 recovery_worktree,
@@ -304,6 +356,7 @@ impl LucidosEngine {
                 resume_session_id,
                 thread_id,
                 cc_start,
+                coding_agent,
             )
             .await?;
 
@@ -369,10 +422,15 @@ impl LucidosEngine {
             (None, None)
         };
         let cc_model = cc_model.or(prev_model).or(event_model);
-        let cc_reasoning_effort = cc_reasoning_effort
-            .or(prev_effort)
-            .or(event_effort)
-            .or_else(crate::runtime::claude_code::read_cc_default_effort);
+        let cc_reasoning_effort = cc_reasoning_effort.or(prev_effort).or(event_effort).or_else(
+            || {
+                // The Claude Code settings files are a CC-only fallback —
+                // their effort vocabulary must not leak into other backends.
+                (coding_agent == CodingAgent::ClaudeCode)
+                    .then(crate::runtime::claude_code::read_cc_default_effort)
+                    .flatten()
+            },
+        );
 
         // Acquire startup semaphore — limits concurrent CC process initializations.
         // Hold the permit until Init event is received (process is initialized and mostly idle).
@@ -394,7 +452,7 @@ impl LucidosEngine {
         let allowed_tools = crate::engine::claude_code::cc_allowed_tools(self.user_dir());
         let runtime = match spawn_or_resume(
             self,
-            CodingAgent::ClaudeCode,
+            coding_agent,
             crate::runtime::SpawnArgs {
                 worktree_path: &cwd,
                 workspace_path: self.workspace_path(),
@@ -407,6 +465,13 @@ impl LucidosEngine {
                 spawning_event_id,
                 repo_name: repo_name.as_deref(),
                 interactive: interactive_session,
+                // Resume with no fresh input = the engine expects the agent
+                // to pick up on its own (recovery / ContinuationRequested).
+                // Mirrors the `has_content` gate below that skips the
+                // initial input send.
+                continuation: user_message.is_empty()
+                    && user_images.is_none_or(|imgs| imgs.is_empty())
+                    && resume_session_id.is_some(),
             },
             agent_cancel.clone(),
         )
@@ -414,15 +479,19 @@ impl LucidosEngine {
         {
             Ok(r) => r,
             Err(e) => {
-                if let Some(ref wt) = worktree_path {
-                    let wt_str = wt.to_string_lossy();
-                    let _ = git_cmd(
-                        &["worktree", "remove", "--force", &wt_str],
-                        &repo_root,
-                    )
-                    .await;
-                }
-                let _ = git_cmd(&["branch", "-D", &branch_name], &repo_root).await;
+                // Remove ONLY what this attempt created. The old shape ran
+                // both git calls unconditionally under `let _ =` — a failed
+                // RESUME force-removed the pre-existing worktree and
+                // force-deleted the branch holding the thread's committed
+                // work, silently.
+                crate::engine::git_ops::cleanup_failed_spawn(
+                    &repo_root,
+                    worktree_path.as_deref(),
+                    &branch_name,
+                    worktree_created,
+                    branch_created,
+                )
+                .await;
                 return Err(format!("Failed to start Claude Code: {}", e).into());
             }
         };
@@ -437,6 +506,10 @@ impl LucidosEngine {
             input_tx: agent_input_tx,
             control_tx: agent_control_tx,
             kind: _,
+            // In-band approval requests (Codex app-server). `None` for CC and
+            // the Codex exec escape hatch — the matching select arm below then
+            // pends forever. Mutable so a closed channel can disable the arm.
+            permission_rx: mut agent_permission_rx,
         } = runtime;
 
         // Skip empty messages (warm-up resumes) to avoid triggering unwanted LLM output.
@@ -501,15 +574,17 @@ impl LucidosEngine {
                 })
                 .is_err()
             {
-                if let Some(ref wt) = worktree_path {
-                    let wt_str = wt.to_string_lossy();
-                    let _ = git_cmd(
-                        &["worktree", "remove", "--force", &wt_str],
-                        &repo_root,
-                    )
-                    .await;
-                }
-                let _ = git_cmd(&["branch", "-D", &branch_name], &repo_root).await;
+                // Same contract as the spawn_or_resume failure arm above:
+                // remove ONLY what this attempt created — a resumed
+                // worktree/branch holds the thread's committed work.
+                crate::engine::git_ops::cleanup_failed_spawn(
+                    &repo_root,
+                    worktree_path.as_deref(),
+                    &branch_name,
+                    worktree_created,
+                    branch_created,
+                )
+                .await;
                 return Err(
                     "Agent input channel closed before initial prompt could be sent".into(),
                 );
@@ -544,6 +619,7 @@ impl LucidosEngine {
                 has_changes: false,
                 requires_restart: false,
                 pending_stop: None,
+                cancel_actor: None,
                 stop: stop.clone(),
                 interrupt: interrupt.clone(),
                 idle_notify: idle_notify.clone(),
@@ -608,6 +684,7 @@ impl LucidosEngine {
                     coding_agent_kind: session_kind,
                     coding_agent_folder: session_folder,
                     app_id: app_spawn_id.clone(),
+                    coding_agent,
                 },
                 meta: meta.clone(),
             })
@@ -658,7 +735,7 @@ impl LucidosEngine {
                         model: normalized_model.clone(),
                         reasoning_effort: cc_reasoning_effort.clone(),
                         permission_mode: None,
-                        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                        coding_agent,
                         // Fires before CC's Init — the session id isn't known
                         // yet. The Init handler emits a second SettingsChanged
                         // carrying it (see below).
@@ -708,6 +785,10 @@ impl LucidosEngine {
         // from `agent_cancel.is_cancelled()` because the stale-resume and
         // question-cancel paths also cancel the token for non-hang reasons.
         let mut watchdog_fired = false;
+        // Set from `AgentEvent::Exited { killed_by_signal }` — true when the CC
+        // child died from a signal the engine did NOT initiate (the exit=143
+        // stray-SIGTERM bug). Consumed by the safety net to auto-resume.
+        let mut killed_by_signal = false;
 
         // Bounded Esc fallback. A real Cancel (Stop) forwards CC's native
         // interrupt (Esc) and waits for CC to wind down and emit a `Result`. If
@@ -733,14 +814,15 @@ impl LucidosEngine {
                         );
                         break;
                     };
-                    if let AgentEvent::Exited = ev {
+                    if let AgentEvent::Exited { killed_by_signal: ev_killed_by_signal } = ev {
+                        killed_by_signal = ev_killed_by_signal;
                         // Final flush of any pending text
                         if !claude_text_buf.is_empty() {
                             let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
                             if !delta.is_empty() {
                                 self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                     thread_id,
-                                    event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent: crate::runtime::CodingAgent::ClaudeCode },
+                                    event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent },
                                     meta: meta.clone(),
                                 }, "[ClaudeCode] CodingAgentTextStreamed (final flush on exit)").await;
                             }
@@ -871,7 +953,7 @@ impl LucidosEngine {
                                     model: normalized_model.clone(),
                                     reasoning_effort: cc_reasoning_effort.clone(),
                                     permission_mode: None,
-                                    coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                                    coding_agent,
                                     cc_session_id: Some(cc_sid.clone()),
                                 },
                                 meta: meta.clone(),
@@ -895,6 +977,24 @@ impl LucidosEngine {
                                 }
                             }
                         }
+                        // Straggler guard: the agent runtime sometimes delivers a
+                        // trailing Message AFTER this turn's terminal event (e.g. a
+                        // final "Understood." arriving on `events_rx` once the
+                        // `Result` arm already emitted ResponseGenerated +
+                        // CodingAgentIdled). Emitting it as CodingAgentTextStreamed
+                        // would re-flip the projection to status='running' (the
+                        // activity-event arm in `event_bus_projection_thread.rs`
+                        // bumps running), stranding an already-idled thread as
+                        // "running" forever — the "thread reports running when it's
+                        // not" bug. Drop it; a real follow-up turn re-arms emission
+                        // via `reset_per_turn_flags` when its prompt lands on msg_rx.
+                        AgentEvent::Message { text, .. } if emitted_terminal_event => {
+                            log!(
+                                "[ClaudeCode] Dropping post-terminal straggler text ({} chars) for thread {} — would resurrect 'running' on an idled thread",
+                                text.len(),
+                                thread_id
+                            );
+                        }
                         AgentEvent::Message { text, .. } => {
                             // CC resumed after waiting — clear waiting state
                             if is_waiting {
@@ -909,12 +1009,23 @@ impl LucidosEngine {
                                 if !delta.is_empty() {
                                     self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                         thread_id,
-                                        event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent: crate::runtime::CodingAgent::ClaudeCode },
+                                        event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent },
                                         meta: meta.clone(),
                                     }, "[ClaudeCode] CodingAgentTextStreamed (Message flush)").await;
                                     last_text_persisted_len = claude_text_buf.len();
                                 }
                             }
+                        }
+                        // Straggler guard (see the Message arm above): a tool call
+                        // arriving after the turn's terminal event would resurrect
+                        // status='running' on an idled thread. Drop it without
+                        // touching the in-flight counter — a post-terminal turn has
+                        // no live watchdog to disarm.
+                        AgentEvent::ToolUse { .. } if emitted_terminal_event => {
+                            log!(
+                                "[ClaudeCode] Dropping post-terminal straggler tool call for thread {} — would resurrect 'running' on an idled thread",
+                                thread_id
+                            );
                         }
                         AgentEvent::ToolUse { name, input, id } => {
                             // CC resumed after waiting — clear waiting state
@@ -928,7 +1039,7 @@ impl LucidosEngine {
                                 if !delta.is_empty() {
                                     self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                         thread_id,
-                                        event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent: crate::runtime::CodingAgent::ClaudeCode },
+                                        event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent },
                                         meta: meta.clone(),
                                     }, "[ClaudeCode] CodingAgentTextStreamed (pre-ToolUse flush)").await;
                                     last_text_persisted_len = claude_text_buf.len();
@@ -946,13 +1057,17 @@ impl LucidosEngine {
                             // loop watchdog inside this same `select!` observes
                             // the value monotonically anyway.
                             tools_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if name == "AskUserQuestion" {
-                                // Handled by the PreToolUse hook in the Claude Code subprocess (see
-                                // `crate::engine::cc_settings` and `api/internal.rs::ask_user_question`).
-                                // CC stays alive; the hook blocks until the user answers, then injects
-                                // a synthetic `tool_result` and CC continues. run_session has nothing to
-                                // do with this `tool_use` event — no emit (the endpoint emits
-                                // `UserQuestionAsked`), no kill (CC keeps running), no session removal.
+                            if crate::engine::agent_session::lifecycle::is_user_question_tool(&name) {
+                                // Question flow — the agent subprocess blocks until the user
+                                // answers and the engine renders the card from the
+                                // `UserQuestionAsked` the internal endpoint emits. CC routes
+                                // here via its PreToolUse hook (`crate::engine::cc_settings` +
+                                // `api/internal.rs::ask_user_question`); Codex via the
+                                // `mcp__lucidos__ask_user_question` MCP tool hitting the same
+                                // endpoint. run_session has nothing to do with this `tool_use`
+                                // event — no emit (a tool-call step would double-surface the
+                                // question), no kill (the subprocess keeps running), no
+                                // session removal.
                             } else {
                                 let description = crate::core::describe_cc_tool(&name, &input);
                                 // Safety net: env-side fix (`pg_env_vars` injected
@@ -970,33 +1085,39 @@ impl LucidosEngine {
                                         name,
                                         args: input,
                                         description,
-                                        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                                        coding_agent,
                                         tool_use_id: id,
                                     },
                                     meta: meta.clone(),
                                 }, "[ClaudeCode] CodingAgentToolCalled").await;
                             }
                         }
+                        // Straggler guard (see the Message arm above): a tool result
+                        // arriving after the turn's terminal event would resurrect
+                        // status='running' on an idled thread. Still release the
+                        // in-flight slot in case a pre-terminal ToolUse incremented
+                        // it (release_tool_slot floors at 0, so an unpaired result is
+                        // a no-op), then drop the event without emitting.
+                        AgentEvent::ToolResult { .. } if emitted_terminal_event => {
+                            release_tool_slot(&tools_in_flight);
+                            log!(
+                                "[ClaudeCode] Dropping post-terminal straggler tool result for thread {} — would resurrect 'running' on an idled thread",
+                                thread_id
+                            );
+                        }
                         AgentEvent::ToolResult { output, status: _, id } => {
                             let summary: String = output.chars().take(200).collect();
                             // Re-arm the watchdog if this was the last in-flight
-                            // tool. Floor at 0 so an unpaired ToolResult (CC
-                            // oddity / replay) can't underflow into negative,
-                            // which would falsely re-arm the watchdog forever:
-                            // `watchdog_gate` reads `tools_in_flight > 0` and
-                            // would never gate-skip again. `Relaxed` matches the
-                            // increment.
-                            let prev = tools_in_flight
-                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                            if prev <= 0 {
-                                tools_in_flight.store(0, std::sync::atomic::Ordering::Relaxed);
-                            }
+                            // tool. Floored at 0 so an unpaired ToolResult (CC
+                            // oddity / replay) can't underflow — see
+                            // `release_tool_slot`.
+                            release_tool_slot(&tools_in_flight);
                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentToolResult {
                                     name: String::new(),
                                     result: summary,
-                                    coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                                    coding_agent,
                                     tool_use_id: id,
                                 },
                                 meta: meta.clone(),
@@ -1049,7 +1170,7 @@ impl LucidosEngine {
                                     crate::engine::event_bus::BusEvent::Thread {
                                         thread_id,
                                         event: crate::engine::thread_events::ThreadEvent::ContextCaptured {
-                                            producer: crate::engine::ContextProducer::ClaudeCode,
+                                            producer: crate::engine::ContextProducer::from_coding_agent(coding_agent),
                                             model: snapshot_model,
                                             context_window,
                                             sections: Vec::new(),
@@ -1064,7 +1185,7 @@ impl LucidosEngine {
                                 )
                                 .await;
                         }
-                        AgentEvent::Exited => unreachable!("Exited handled above"),
+                        AgentEvent::Exited { .. } => unreachable!("Exited handled above"),
                         AgentEvent::Result { text, error: cc_error, .. } => {
                                         let err_suffix = cc_error.as_deref().map(|e| format!(" (error: {})", e)).unwrap_or_default();
                                         log!("[ClaudeCode] Result event received — entering waiting state{}", err_suffix);
@@ -1092,7 +1213,7 @@ impl LucidosEngine {
                                             if !delta.is_empty() {
                                                 self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                     thread_id,
-                                                    event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent: crate::runtime::CodingAgent::ClaudeCode },
+                                                    event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent },
                                                     meta: meta.clone(),
                                                 }, "[ClaudeCode] CodingAgentTextStreamed (Result flush)").await;
                                             }
@@ -1103,7 +1224,7 @@ impl LucidosEngine {
                                             // frontend displays it.
                                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                 thread_id,
-                                                event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: text.trim().to_string(), coding_agent: crate::runtime::CodingAgent::ClaudeCode },
+                                                event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: text.trim().to_string(), coding_agent },
                                                 meta: meta.clone(),
                                             }, "[ClaudeCode] CodingAgentTextStreamed (slash command result)").await;
                                         }
@@ -1146,14 +1267,22 @@ impl LucidosEngine {
                                                 },
                                                 meta: meta.clone(),
                                             }, "[ClaudeCode] SessionEnded (stale resume)").await;
-                                            // Clean up the worktree and branch so the retry
-                                            // starts fresh (otherwise orphaned on disk until
-                                            // engine restart).
+                                            // Clean up so the retry starts fresh — but a stale
+                                            // resume by definition reuses a prior session's
+                                            // branch, which may hold committed work from
+                                            // earlier turns (including a pending change's
+                                            // source branch). Remove the worktree, and delete
+                                            // the branch ONLY when it has no unique commits:
+                                            // that's exactly the cleanup worker's helper. The
+                                            // old shape (`branch -D` under `let _ =`) silently
+                                            // destroyed the thread's commits on retry.
                                             if let Some(ref wt) = worktree_path {
-                                                let wt_str = wt.to_string_lossy();
-                                                let _ = git_cmd(&["worktree", "remove", "--force", &wt_str], &repo_root).await;
+                                                // pre_size: Some(0) — the size is only used for
+                                                // the freed-bytes stat we discard; None would
+                                                // walk a possibly multi-GB worktree inline and
+                                                // delay the retry for nothing.
+                                                crate::engine::worktree_cleanup::remove_worktree_and_optionally_delete_branch(wt, Some(0)).await;
                                             }
-                                            let _ = git_cmd(&["branch", "-D", &branch_name], &repo_root).await;
                                             return Err(STALE_RESUME_ERROR.into());
                                         }
 
@@ -1174,8 +1303,16 @@ impl LucidosEngine {
                                         // both read this to refuse half-assed work.
                                         last_terminal_kind = terminal_kind.clone();
                                         if let Some(kind) = terminal_kind {
-                                            if matches!(kind, TerminalKind::Aborted(_)) {
-                                                // Reset on next user follow-up.
+                                            // A Result is a turn boundary — both
+                                            // the user-stop latch and the cancel
+                                            // actor on `meta` must clear here so an
+                                            // interrupt kept alive by inflight
+                                            // follow-ups can't relabel the
+                                            // follow-ups' successful completion as a
+                                            // second Canceled, and a resumed turn
+                                            // doesn't inherit the cancelling device.
+                                            let clears = terminal_clears_user_hit_stop(&kind);
+                                            if clears {
                                                 user_hit_stop = false;
                                             }
                                             if !Self::external_terminal_already_emitted(&external_terminal_emitted, thread_id, "Result classify") {
@@ -1190,6 +1327,11 @@ impl LucidosEngine {
                                                     event: terminal_event,
                                                     meta: meta.clone(),
                                                 }, "[ClaudeCode] terminal event (Result classify)").await;
+                                            }
+                                            // Clear AFTER the emit so the cancel
+                                            // terminal still carries the device.
+                                            if clears {
+                                                meta.actor = None;
                                             }
                                         }
                                         emitted_terminal_event = true;
@@ -1308,6 +1450,7 @@ impl LucidosEngine {
                                                     worktree_path: worktree_path.as_deref(),
                                                 },
                                                 &meta,
+                                                coding_agent,
                                             ).await;
                                             last_emitted_idle = true;
                                         }
@@ -1425,6 +1568,75 @@ impl LucidosEngine {
                                 }
                 }
 
+                // Codex app-server approval bridge. Each request spawns its
+                // own waiter task so this loop NEVER blocks on the user — a
+                // pending card must not stall event processing, interrupts,
+                // or the watchdog (run.rs is the engine's highest-traffic
+                // loop; keep this arm minimal).
+                perm_req = async {
+                    match agent_permission_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // No in-band permission channel (CC / codex exec) —
+                        // pend forever so the arm never fires.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match perm_req {
+                        Some(req) => {
+                            let pool = self.pool.clone();
+                            let bus = self.event_bus.clone();
+                            let pending = self.pending_cc_permission.clone();
+                            // Disarm the watchdog while the card waits — the
+                            // approval may arrive BEFORE the item's ToolUse
+                            // (codex raises it pre-execution), so the paired
+                            // tool counter alone can't be relied on to cover
+                            // the wait.
+                            let tools = tools_in_flight.clone();
+                            tokio::spawn(async move {
+                                tools.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let mut respond = req.respond;
+                                tokio::select! {
+                                    outcome = crate::engine::cc_permission::prompt_coding_agent_permission(
+                                        &pool,
+                                        &bus,
+                                        &pending,
+                                        thread_id,
+                                        req.id,
+                                        req.tool_name,
+                                        req.input,
+                                    ) => {
+                                        // Send failure = driver died between answer
+                                        // and delivery; nothing to deliver to.
+                                        let _ = respond.send(outcome.allowed);
+                                    }
+                                    // Driver died (interrupt escalation, child
+                                    // crash) while the card was pending — the
+                                    // driver's JoinSet aborts its waiter task,
+                                    // dropping the oneshot receiver, which fires
+                                    // this arm. Abandoning the wait drops our
+                                    // broadcast receiver so the next prompt's
+                                    // gc_dead_entries sweep evicts the entry. The
+                                    // persisted card resolves via the same recovery
+                                    // paths CC uses (supersede-on-new-message,
+                                    // orphan sweep).
+                                    _ = respond.closed() => {
+                                        log!(
+                                            "[AgentSession] agent died with permission card pending for thread {} — abandoning waiter",
+                                            thread_id
+                                        );
+                                    }
+                                }
+                                release_tool_slot(&tools);
+                            });
+                        }
+                        None => {
+                            // Driver dropped its sender — disable the arm so a
+                            // closed channel doesn't re-resolve every loop tick.
+                            agent_permission_rx = None;
+                        }
+                    }
+                }
+
                 Some(user_input) = msg_rx.recv() => {
                     reset_per_turn_flags(
                         &mut is_waiting,
@@ -1432,6 +1644,7 @@ impl LucidosEngine {
                         &mut emitted_terminal_event,
                         &mut user_hit_stop,
                         &mut last_terminal_kind,
+                        &mut meta.actor,
                     );
                     {
                         let mut sessions = self.agent_sessions.lock().await;
@@ -1442,7 +1655,7 @@ impl LucidosEngine {
                         if !delta.is_empty() {
                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
-                                event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent: crate::runtime::CodingAgent::ClaudeCode },
+                                event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent },
                                 meta: meta.clone(),
                             }, "[ClaudeCode] CodingAgentTextStreamed (flush before user_input)").await;
                         }
@@ -1466,7 +1679,7 @@ impl LucidosEngine {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::CodingAgentPromptSent {
                                 text: user_input.text,
-                                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                                coding_agent,
                                 // Audit trail for a user-driven prompt — origin is
                                 // carried by the MessageReceived emitted at the API
                                 // boundary.
@@ -1478,7 +1691,7 @@ impl LucidosEngine {
                 }
 
                 _ = interrupt.notified() => {
-                    // Stop button = Esc in Claude Code CLI.
+                    // Cancel button = Esc in Claude Code CLI.
                     // Sends control_request:interrupt → CC stops current work, emits
                     // a Result, and goes idle. We set user_hit_stop so the Result
                     // handler emits ResponseCanceled (→ exchange "Canceled") instead
@@ -1489,6 +1702,13 @@ impl LucidosEngine {
                     // after restart via recover_orphaned_worktrees.
                     if !is_waiting {
                         user_hit_stop = true;
+                        // Drain the device that clicked Cancel (stamped by
+                        // `interrupt_agent`) onto `meta` so the terminal
+                        // `ResponseCanceled` records it — the popover's Device row.
+                        // Cleared again at the Result turn boundary below.
+                        if let Some(cancel_actor) = self.take_session_cancel_actor(thread_id).await {
+                            meta.actor = Some(cancel_actor);
+                        }
                         log!("[ClaudeCode] Sending control_request interrupt to CC process");
                         if agent_control_tx
                             .send(crate::runtime::ControlRequest::Interrupt)
@@ -1527,6 +1747,7 @@ impl LucidosEngine {
                         &external_terminal_emitted,
                         &normalized_model,
                         &cc_reasoning_effort,
+                        coding_agent,
                     ).await;
                     emitted_terminal_event = true;
                     break;
@@ -1567,6 +1788,7 @@ impl LucidosEngine {
                         &external_terminal_emitted,
                         &normalized_model,
                         &cc_reasoning_effort,
+                        coding_agent,
                     ).await;
                     emitted_terminal_event = true;
                     break;
@@ -1589,6 +1811,7 @@ impl LucidosEngine {
                         &external_terminal_emitted,
                         &normalized_model,
                         &cc_reasoning_effort,
+                        coding_agent,
                     ).await;
                     emitted_terminal_event = true;
                     break;
@@ -1677,9 +1900,11 @@ impl LucidosEngine {
             &agent_cancel,
             emitted_terminal_event,
             watchdog_fired,
+            killed_by_signal,
             last_emitted_idle,
             is_external_repo,
             proposed_change,
+            coding_agent,
         )
         .await
     }

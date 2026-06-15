@@ -36,6 +36,7 @@ export function handleNavigationRequest(nav: {
     case 'files':
     case 'apps':
     case 'triggers':
+    case 'thread-queue':
     case 'changes':
     case 'notifications':
       switchMenuItem(nav.target as MenuItem);

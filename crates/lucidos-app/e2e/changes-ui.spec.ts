@@ -1,9 +1,9 @@
 import { test, expect } from '@playwright/test';
 import {
-  navigateToApp, uniqueMessage, assertHealthy,
+  navigateToApp, uniqueMessage, assertHealthy, gotoWithRetry,
 } from './helpers';
 import {
-  createCCThreadWithChange, cleanupCCThread, cleanupFileFromMain,
+  createCCThreadWithChange, cleanupCCThread, cleanupFileFromMain, psql, WORKSPACE,
 } from './db-helpers';
 
 test.describe('Claude Code changes - apply and discard via UI', () => {
@@ -84,6 +84,85 @@ test.describe('Claude Code changes - apply and discard via UI', () => {
       }, changeId, { timeout: 15_000 });
     } finally {
       cleanupCCThread(threadId, changeId, branch, file);
+    }
+  });
+});
+
+test.describe('Changes panel infinite scroll', () => {
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+  });
+
+  test('scrolling the applied list loads older pages beyond the first', async ({ page }) => {
+    // Regression: the "Scroll for more" affordance never loaded the next page
+    // of Recently Applied changes. The load-more trigger was an `onScroll`
+    // handler bound to the inner `.panel-content`, which has no overflow and
+    // never scrolls — the real scroll container is the ancestor
+    // `.content-pane-body`, and scroll events don't bubble. So the list stayed
+    // stuck at the first 15. Mirrors the notifications infinite-scroll fix
+    // (IntersectionObserver rooted at `.content-pane-body`).
+    const marker = uniqueMessage('scroll-more').replace(/[^a-z0-9-]/g, '');
+    const TOTAL = 30;
+    // Clear pre-existing applied/reverted rows so the seeded set is the only
+    // thing in the Recently Applied list — first page is then exactly 15 and
+    // the full list exactly TOTAL, with no ties at the cursor boundary
+    // (strictly-decreasing resolved_at per row).
+    psql(
+      `DELETE FROM changes WHERE status IN ('applied', 'reverted');\n` +
+        `INSERT INTO changes ` +
+        `(id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, hardened, status, created_at, resolved_at) ` +
+        `SELECT gen_random_uuid(), gen_random_uuid(), 'e2e-scroll-' || g || '-${marker}', '${WORKSPACE}', ` +
+        `'Applied change ${marker} #' || g, 1, ARRAY['e2e-${marker}-' || g || '.txt'], false, true, 'applied', ` +
+        `NOW() - (g || ' seconds')::interval, NOW() - (g || ' seconds')::interval ` +
+        `FROM generate_series(1, ${TOTAL}) AS g`,
+    );
+
+    try {
+      // Land directly on the Changes panel (content pane on mobile).
+      await page.addInitScript(() => {
+        localStorage.setItem('lucidos-active-menu-item', 'changes');
+        sessionStorage.setItem('lucidos-mobile-view', 'content');
+      });
+      await gotoWithRetry(page, '/');
+
+      // Count only physically-visible seeded rows (filter by marker so other
+      // suites' rows and any leftover pending rows don't skew the total).
+      const visibleCount = () =>
+        page.evaluate((m) => {
+          const els = document.querySelectorAll('.change-row');
+          return Array.from(els).filter((el) => {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && (el.textContent || '').includes(m);
+          }).length;
+        }, marker);
+
+      // First page renders exactly one page (15) — proves the list paginates
+      // instead of dumping all 30 at once.
+      await expect.poll(visibleCount, { timeout: 15_000 }).toBe(15);
+
+      // Scroll the REAL scroll container (`.content-pane-body`) to the bottom
+      // inside the poll so multi-page lists keep advancing each iteration. The
+      // bug left this stuck at 15 forever.
+      await expect
+        .poll(
+          async () => {
+            await page.evaluate(() => {
+              const els = document.querySelectorAll('.content-pane-body');
+              for (const el of els) {
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {
+                  el.scrollTop = el.scrollHeight;
+                  return;
+                }
+              }
+            });
+            return visibleCount();
+          },
+          { timeout: 15_000, intervals: [200, 300, 500, 1000] },
+        )
+        .toBe(TOTAL);
+    } finally {
+      psql(`DELETE FROM changes WHERE description LIKE '%${marker}%'`);
     }
   });
 });

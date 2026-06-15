@@ -10,6 +10,11 @@ import type { ShortcutId } from '../utils/shortcuts';
 import { adjustUiScale, resetUiScale, scaleModalOpen, dismissScaleModal } from '../components/shared/scaleModalState';
 import { UI_SCALE_STEP } from '../store/actions/preferences';
 import { isMobile } from '../utils/viewport';
+import {
+  toggleThreads, toggleThreadPane, toggleContentPane,
+  stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout,
+} from '../store/actions/pane';
+import { threadNavBack, threadNavForward } from '../store/actions/thread-navigation';
 
 function startNewThread() {
   unfocusThread();
@@ -26,6 +31,16 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   newThread: startNewThread,
   closeThread: () => void runCloseCascade(),
   searchEverywhere: () => { searchEverywhereOpen.value = !searchEverywhereOpen.value; },
+  previousThread: () => threadNavBack(),
+  nextThread: () => threadNavForward(),
+  toggleThreadDrawer: toggleThreads,
+  toggleThreadPane,
+  toggleContentPane,
+  narrowThreadPane: () => stepThreadPaneWidth(-1),
+  widenThreadPane: () => stepThreadPaneWidth(1),
+  narrowThreadDrawer: () => stepThreadDrawerWidth(-1),
+  widenThreadDrawer: () => stepThreadDrawerWidth(1),
+  resetPaneLayout,
   zoomIn: () => adjustUiScale(UI_SCALE_STEP),
   zoomOut: () => adjustUiScale(-UI_SCALE_STEP),
   zoomReset: () => resetUiScale(),

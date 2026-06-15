@@ -11,7 +11,7 @@ use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::api::actor::user_actor_resolved;
-use crate::api::AppState;
+use crate::api::{ApiError, AppState};
 use crate::core::blobs::write_blob_from_base64;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
@@ -57,21 +57,10 @@ pub(super) struct PutComposeBody {
     pub mode: Option<String>,
 }
 
-fn internal_err<E: std::fmt::Display>(e: E) -> (StatusCode, Json<JsonValue>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": e.to_string() })),
-    )
-}
-
-fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<JsonValue>) {
-    (code, Json(serde_json::json!({ "error": msg })))
-}
-
-fn validate_mode(mode: &str) -> Result<(), (StatusCode, Json<JsonValue>)> {
+fn validate_mode(mode: &str) -> Result<(), ApiError> {
     match mode {
         "lucidos" | "claude_code" => Ok(()),
-        _ => Err(err(StatusCode::BAD_REQUEST, "mode must be lucidos|claude_code")),
+        _ => Err(ApiError::bad_request("mode must be lucidos|claude_code")),
     }
 }
 
@@ -89,13 +78,13 @@ fn validate_mode(mode: &str) -> Result<(), (StatusCode, Json<JsonValue>)> {
 /// Listed exhaustively so a new `ThreadState` variant forces the author to
 /// make a deliberate accept/reject decision instead of inheriting whatever
 /// a catch-all happened to do.
-fn compose_error(state: Option<ThreadState>) -> Option<(StatusCode, Json<JsonValue>)> {
+fn compose_error(state: Option<ThreadState>) -> Option<ApiError> {
     let Some(state) = state else {
-        return Some(err(StatusCode::NOT_FOUND, "thread not found"));
+        return Some(ApiError::not_found("thread not found"));
     };
     match state {
         ThreadState::Composing | ThreadState::Active => None,
-        ThreadState::Discarded => Some(err(StatusCode::GONE, "thread discarded")),
+        ThreadState::Discarded => Some(ApiError::new(StatusCode::GONE, "thread discarded")),
     }
 }
 
@@ -108,7 +97,7 @@ pub(super) async fn post_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<PostThreadBody>,
-) -> Result<StatusCode, (StatusCode, Json<JsonValue>)> {
+) -> Result<StatusCode, ApiError> {
     validate_mode(&body.mode)?;
 
     let row: Option<(String, String, Option<String>)> = sqlx::query_as(
@@ -117,10 +106,11 @@ pub(super) async fn post_thread(
     .bind(body.id)
     .fetch_optional(state.engine.pool())
     .await
-    .map_err(internal_err)?;
+    .map_err(|e| ApiError::internal(e.to_string()))?;
 
     if let Some((state_str, archive_state_str, existing_mode)) = row {
-        let existing_state = ThreadState::from_db_str(&state_str).map_err(internal_err)?;
+        let existing_state = ThreadState::from_db_str(&state_str)
+            .map_err(|e| ApiError::internal(e.to_string()))?;
         // Each arm fully handles its state — no spatial-ordering dependency
         // between an early-return and a later match. Discarded returns 410
         // unconditionally (the `ThreadDiscarded` projection sets BOTH
@@ -133,7 +123,7 @@ pub(super) async fn post_thread(
                 if existing_mode.as_deref() == Some(body.mode.as_str()) {
                     Ok(StatusCode::OK)
                 } else {
-                    Err(err(
+                    Err(ApiError::new(
                         StatusCode::CONFLICT,
                         "thread already exists with a different mode",
                     ))
@@ -141,12 +131,12 @@ pub(super) async fn post_thread(
             }
             ThreadState::Active => {
                 if archive_state_str == "archived" {
-                    Err(err(StatusCode::CONFLICT, "thread archived"))
+                    Err(ApiError::new(StatusCode::CONFLICT, "thread archived"))
                 } else {
-                    Err(err(StatusCode::CONFLICT, "thread already active"))
+                    Err(ApiError::new(StatusCode::CONFLICT, "thread already active"))
                 }
             }
-            ThreadState::Discarded => Err(err(StatusCode::GONE, "thread discarded")),
+            ThreadState::Discarded => Err(ApiError::new(StatusCode::GONE, "thread discarded")),
         };
     }
 
@@ -167,7 +157,7 @@ pub(super) async fn post_thread(
         .event_bus
         .emit(event)
         .await
-        .map_err(internal_err)?;
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(StatusCode::CREATED)
 }
 
@@ -187,9 +177,9 @@ pub(super) async fn put_compose(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<PutComposeBody>,
-) -> Result<StatusCode, (StatusCode, Json<JsonValue>)> {
+) -> Result<StatusCode, ApiError> {
     if body.text.len() > MAX_COMPOSE_TEXT_BYTES {
-        return Err(err(
+        return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "compose_text exceeds 64 KiB cap",
         ));
@@ -223,7 +213,7 @@ pub(super) async fn put_compose(
                                 StatusCode::INTERNAL_SERVER_ERROR
                             }
                         };
-                        err(status, &e.to_string())
+                        ApiError::new(status, e.to_string())
                     })?;
                 hashes.push(blob.hash);
             }
@@ -235,7 +225,7 @@ pub(super) async fn put_compose(
 
     if let Some(ref h) = new_image_hashes {
         if h.len() > MAX_COMPOSE_IMAGES {
-            return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "too many compose images"));
+            return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many compose images"));
         }
     }
 
@@ -274,7 +264,7 @@ pub(super) async fn put_compose(
     .bind(body.mode.as_deref())
     .fetch_optional(state.engine.pool())
     .await
-    .map_err(internal_err)?;
+    .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let (_state_str, resolved_mode, post_compose_images) = match row {
         Some(r) => r,
@@ -288,11 +278,11 @@ pub(super) async fn put_compose(
             .bind(id)
             .fetch_optional(state.engine.pool())
             .await
-            .map_err(internal_err)?;
+            .map_err(|e| ApiError::internal(e.to_string()))?;
             let st = lookup
                 .map(|(s,)| ThreadState::from_db_str(&s))
                 .transpose()
-                .map_err(internal_err)?;
+                .map_err(|e| ApiError::internal(e.to_string()))?;
             // Mode locks at first send — once the thread leaves Composing,
             // mode is fixed. Archived rows carry state='active' so they hit
             // this branch naturally. Without it the cold-path would fall
@@ -300,7 +290,7 @@ pub(super) async fn put_compose(
             // updates from post-send states, masking the mode lock as a
             // silent no-op.
             if body.mode.is_some() && matches!(st, Some(ThreadState::Active)) {
-                return Err(err(
+                return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     "mode is locked once the thread has been sent",
                 ));
@@ -344,7 +334,7 @@ pub(super) async fn put_compose(
         .event_bus
         .emit(event)
         .await
-        .map_err(internal_err)?;
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -357,18 +347,19 @@ pub(super) async fn delete_thread(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<StatusCode, (StatusCode, Json<JsonValue>)> {
+) -> Result<StatusCode, ApiError> {
     let lookup: Option<(String, String)> = sqlx::query_as(
         "SELECT state, archive_state FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(id)
     .fetch_optional(state.engine.pool())
     .await
-    .map_err(internal_err)?;
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     let Some((state_str, archive_state_str)) = lookup else {
         return Ok(StatusCode::NO_CONTENT);
     };
-    let current_state = ThreadState::from_db_str(&state_str).map_err(internal_err)?;
+    let current_state = ThreadState::from_db_str(&state_str)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     // Each arm fully handles its state — no spatial-ordering dependency.
     // Discarded is idempotent (204). Active is rejected; the
     // already-archived sub-case takes the more specific 409 message
@@ -380,9 +371,9 @@ pub(super) async fn delete_thread(
         ThreadState::Discarded => return Ok(StatusCode::NO_CONTENT),
         ThreadState::Active => {
             if archive_state_str == "archived" {
-                return Err(err(StatusCode::CONFLICT, "thread already archived"));
+                return Err(ApiError::new(StatusCode::CONFLICT, "thread already archived"));
             }
-            return Err(err(
+            return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "thread is active — use archive instead",
             ));
@@ -405,6 +396,6 @@ pub(super) async fn delete_thread(
         .event_bus
         .emit(event)
         .await
-        .map_err(internal_err)?;
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }

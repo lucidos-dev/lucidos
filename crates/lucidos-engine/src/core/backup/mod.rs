@@ -213,6 +213,9 @@ pub trait BackupProvider: Send + Sync {
     fn id(&self) -> &str;
     /// The OAuth provider name used for token lookup (e.g. "google", "dropbox").
     fn oauth_provider(&self) -> &str;
+    /// Web URL to this provider's backups folder, for the Settings → Backup
+    /// "View backups folder" link. `None` when the provider can't form one.
+    async fn folder_url(&self) -> Option<String>;
     /// Fail-fast checks run BEFORE any expensive backup work (pg_dump, the
     /// multi-GB tar, the multi-minute encrypt). `estimated_upload_bytes` is the
     /// orchestrator's estimate of the encrypted archive size; the provider uses

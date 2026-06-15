@@ -396,6 +396,77 @@ fn __panel_content_report(
     Ok(())
 }
 
+/// Set the macOS notification "application" once. In dev the binary isn't a
+/// packaged `.app`, so `mac-notification-sys` can't deliver under our own
+/// identifier — borrow Terminal's (mirrors notify-rust's dev behaviour) so
+/// banners still show while developing. A packaged build uses our real bundle
+/// identifier, so the banner is attributed to Lucidos.
+#[cfg(target_os = "macos")]
+fn ensure_notification_app_set(app: &tauri::AppHandle) {
+    static SET: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        let ident = if tauri::is_dev() {
+            "com.apple.Terminal".to_string()
+        } else {
+            app.config().identifier.clone()
+        };
+        if let Err(e) = mac_notification_sys::set_application(&ident) {
+            eprintln!("[Tauri] set_application({ident}) failed: {e}");
+        }
+    });
+}
+
+/// Show a native macOS notification and route a tap to the page.
+///
+/// `tauri-plugin-notification`'s desktop `show()` is fire-and-forget — it never
+/// reports the click — so we drive `mac-notification-sys` directly (the crate
+/// notify-rust uses under the hood) with `wait_for_click(true)`. That call
+/// blocks until the user interacts, so it runs on a dedicated thread; on a
+/// click we focus the main window (the OS also activates the app) and emit
+/// `native-notification-tapped` carrying the deep-link target. The page routes
+/// it through the SAME `dispatchDeepLink` the web-push tap uses (see
+/// `store/actions/native-push.ts`). `link` is the SW-message shape
+/// (`notification_id` / `thread_id` / `event_id` / `tap`).
+#[tauri::command]
+fn show_native_notification(
+    app: tauri::AppHandle,
+    title: String,
+    body: String,
+    link: serde_json::Value,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        ensure_notification_app_set(&app);
+        std::thread::spawn(move || {
+            // Blocks until the user clicks / dismisses the banner.
+            let response = mac_notification_sys::Notification::new()
+                .title(&title)
+                .message(&body)
+                .wait_for_click(true)
+                .send();
+            match response {
+                Ok(mac_notification_sys::NotificationResponse::Click)
+                | Ok(mac_notification_sys::NotificationResponse::ActionButton(_)) => {
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.unminimize();
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
+                    let _ = app.emit("native-notification-tapped", link);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[Tauri] native notification failed: {e}"),
+            }
+        });
+    }
+    // Non-macOS desktop has no native path (the engine still web-pushes browser
+    // / PWA clients); consume the args so they don't warn as unused.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&app, &title, &body, &link);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -418,6 +489,7 @@ pub fn run() {
             __panel_content_report,
             heartbeat,
             restart_app,
+            show_native_notification,
         ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Started) {

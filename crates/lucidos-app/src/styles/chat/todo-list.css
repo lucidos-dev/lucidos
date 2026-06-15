@@ -1,6 +1,6 @@
 /* ───────────────────────────────────────────────────────────────────────
    TodoListIndicator + TodoListPanel — chat-agent todo list.
-   Slot is the same as `.cc-control-menu` for CC threads (see
+   Slot is the same as `.control-menu` for CC threads (see
    PromptInput.tsx); the indicator is hidden when the chat agent
    hasn't called `todo_write` yet (component returns null).
    ─────────────────────────────────────────────────────────────────────── */

@@ -8,11 +8,21 @@ export type ShortcutId =
   | 'newThread'
   | 'closeThread'
   | 'searchEverywhere'
+  | 'previousThread'
+  | 'nextThread'
+  | 'toggleThreadDrawer'
+  | 'toggleThreadPane'
+  | 'toggleContentPane'
+  | 'narrowThreadPane'
+  | 'widenThreadPane'
+  | 'narrowThreadDrawer'
+  | 'widenThreadDrawer'
+  | 'resetPaneLayout'
   | 'zoomIn'
   | 'zoomOut'
   | 'zoomReset';
 
-export type ShortcutCategory = 'Navigation' | 'View';
+export type ShortcutCategory = 'Navigation' | 'Panes' | 'View';
 
 /** A normalized key chord. `mod` means "the platform primary modifier" and
  *  matches either Cmd (meta) or Ctrl — the same lenient rule the handlers have
@@ -40,6 +50,16 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'newThread', label: 'New thread', category: 'Navigation', defaultBinding: B(true, true, false, 'o') },
   { id: 'closeThread', label: 'Close thread (cascade)', category: 'Navigation', defaultBinding: B(true, true, false, 'w') },
   { id: 'searchEverywhere', label: 'Search everywhere', category: 'Navigation', defaultBinding: B(true, true, false, 's') },
+  { id: 'previousThread', label: 'Previous thread', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowUp') },
+  { id: 'nextThread', label: 'Next thread', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowDown') },
+  { id: 'toggleThreadDrawer', label: 'Toggle thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1') },
+  { id: 'toggleThreadPane', label: 'Toggle thread pane', category: 'Panes', defaultBinding: B(true, true, false, '2') },
+  { id: 'toggleContentPane', label: 'Toggle content pane', category: 'Panes', defaultBinding: B(true, true, false, '3') },
+  { id: 'narrowThreadPane', label: 'Narrow thread pane', category: 'Panes', defaultBinding: B(true, false, true, 'ArrowLeft') },
+  { id: 'widenThreadPane', label: 'Widen thread pane', category: 'Panes', defaultBinding: B(true, false, true, 'ArrowRight') },
+  { id: 'narrowThreadDrawer', label: 'Narrow thread drawer', category: 'Panes', defaultBinding: B(true, true, true, 'ArrowLeft') },
+  { id: 'widenThreadDrawer', label: 'Widen thread drawer', category: 'Panes', defaultBinding: B(true, true, true, 'ArrowRight') },
+  { id: 'resetPaneLayout', label: 'Reset pane layout', category: 'Panes', defaultBinding: B(true, false, true, '0') },
   { id: 'zoomIn', label: 'Zoom in', category: 'View', defaultBinding: B(true, false, false, '=') },
   { id: 'zoomOut', label: 'Zoom out', category: 'View', defaultBinding: B(true, false, false, '-') },
   { id: 'zoomReset', label: 'Reset zoom', category: 'View', defaultBinding: B(true, false, false, '0') },
@@ -144,15 +164,26 @@ export function bindingSearchText(b: Binding): string {
   return out.join(' ').toLowerCase();
 }
 
+/** Named keys whose display form is a glyph rather than the raw
+ *  `KeyboardEvent.key` token. */
+const KEY_GLYPHS: Record<string, string> = {
+  ArrowLeft: '←',
+  ArrowRight: '→',
+  ArrowUp: '↑',
+  ArrowDown: '↓',
+};
+
 /** Platform-correct display string, e.g. Mac `⌘K` / `⌃⇧O`, Win/Linux
- *  `Ctrl+K` / `Ctrl+Shift+O`. On Mac a `mod+Shift+<letter>` chord renders with
- *  the Control glyph (⌃) rather than Command (⌘): the OS reserves
- *  Cmd+Shift+<letter>, so Ctrl is the modifier that actually fires — matching
- *  the long-standing display for the New-thread chord. */
+ *  `Ctrl+K` / `Ctrl+Shift+O`. On Mac a `mod+Shift+<letter-or-digit>` chord
+ *  renders with the Control glyph (⌃) rather than Command (⌘): the OS reserves
+ *  Cmd+Shift+<letter> (and the Cmd+Shift+3/4/5 screenshot digits), so Ctrl is
+ *  the modifier that actually fires — matching the long-standing display for
+ *  the New-thread chord. The rule covers digits too so the three pane toggles
+ *  read uniformly. Named keys display as glyphs (←→↑↓). */
 export function formatBinding(b: Binding, isMac: boolean): string {
-  const isLetter = /^[a-z]$/.test(b.key);
-  const macUsesCtrl = b.mod && b.shift && isLetter;
-  const keyDisplay = b.key.length === 1 ? b.key.toUpperCase() : b.key;
+  const isAlnum = /^[a-z0-9]$/.test(b.key);
+  const macUsesCtrl = b.mod && b.shift && isAlnum;
+  const keyDisplay = KEY_GLYPHS[b.key] ?? (b.key.length === 1 ? b.key.toUpperCase() : b.key);
   if (isMac) {
     let out = '';
     if (b.mod) out += macUsesCtrl ? '⌃' : '⌘';

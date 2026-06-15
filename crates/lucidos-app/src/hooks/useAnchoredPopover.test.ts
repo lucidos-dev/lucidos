@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { computeAnchorPosition, isOutsidePointerTarget, makeDismissHandlers } from './useAnchoredPopover';
+import { computeAnchorPosition, isOutsidePointerTarget, makeDismissHandlers, installPairedSwallow } from './useAnchoredPopover';
 
 function fakeAnchor(rect: { top: number; bottom: number; left: number; right: number }): HTMLElement {
   return { getBoundingClientRect: () => rect } as unknown as HTMLElement;
@@ -145,6 +145,15 @@ function clickEvent(target?: Node): MouseEvent {
     stopPropagation: vi.fn(),
     preventDefault: vi.fn(),
   } as unknown as MouseEvent;
+}
+
+function touchEndAt(target: Node): TouchEvent {
+  return {
+    type: 'touchend',
+    target,
+    stopPropagation: vi.fn(),
+    preventDefault: vi.fn(),
+  } as unknown as TouchEvent;
 }
 
 describe('makeDismissHandlers', () => {
@@ -381,5 +390,203 @@ describe('makeDismissHandlers', () => {
     h.onClickCapture(click);
     expect(click.stopPropagation).not.toHaveBeenCalled();
     expect(click.preventDefault).not.toHaveBeenCalled();
+  });
+
+  // ── Touch path ──────────────────────────────────────────────────────────
+  // A button can run its action on `touchend` and `preventDefault()` the
+  // synthetic click (the iOS keyboard-nudge pattern in `composeHandlers`). On
+  // touch the dismiss contract must swallow that `touchend` too — otherwise the
+  // outside pointerdown dismisses the overlay AND the button still fires its
+  // action on the same tap (the reported compose-on-first-tap bug), and because
+  // the button preventDefaults the synthetic click, the click never arrives to
+  // disarm the suppressor (the stranded-flag second bug).
+
+  it('swallows an outside touch-driven action: outside pointerdown then outside touchend is stopped + prevented', () => {
+    const panel = elWith();
+    const anchor = elWith();
+    const elsewhere = elWith();
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, anchor, onDismiss);
+
+    h.onPointerDown(pointerDownAt(elsewhere));
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+
+    const touch = touchEndAt(elsewhere);
+    h.onTouchEnd(touch);
+    expect(touch.stopPropagation).toHaveBeenCalledTimes(1);
+    expect(touch.preventDefault).toHaveBeenCalledTimes(1);
+  });
+
+  it('touchend disarms the suppressor so a (hypothetical) later click is not double-swallowed', () => {
+    // touchend.preventDefault cancels the synthetic click on touch, but if any
+    // click DID arrive afterwards the suppressor must already be consumed — the
+    // touchend owns the disarm. Guards the stranded-flag regression.
+    const panel = elWith();
+    const anchor = elWith();
+    const elsewhere = elWith();
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, anchor, onDismiss);
+
+    h.onPointerDown(pointerDownAt(elsewhere));
+    h.onTouchEnd(touchEndAt(elsewhere));
+
+    // A subsequent click ON the panel must pass through — the suppressor was
+    // already disarmed by the touchend, not left stranded.
+    const click = clickEvent(panel);
+    h.onClickCapture(click);
+    expect(click.stopPropagation).not.toHaveBeenCalled();
+    expect(click.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('does NOT swallow a touchend on the anchor — the toggle must close via its own handler', () => {
+    // Real anchor tap: pointerdown on the anchor is exempt, so the suppressor
+    // never arms; the touchend then passes through to the anchor's own toggle.
+    const panel = elWith();
+    const anchor = elWith();
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, anchor, onDismiss);
+
+    h.onPointerDown(pointerDownAt(anchor));
+    expect(onDismiss).not.toHaveBeenCalled();
+
+    const touch = touchEndAt(anchor);
+    h.onTouchEnd(touch);
+    expect(touch.stopPropagation).not.toHaveBeenCalled();
+    expect(touch.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('does NOT swallow a touchend inside the panel', () => {
+    const panel = elWith();
+    const anchor = elWith();
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, anchor, onDismiss);
+
+    h.onPointerDown(pointerDownAt(panel));
+    const touch = touchEndAt(panel);
+    h.onTouchEnd(touch);
+    expect(touch.stopPropagation).not.toHaveBeenCalled();
+    expect(touch.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('does NOT swallow a touchend on the anchor even when an outside pointerdown armed the suppressor (target guard)', () => {
+    // Contrived finger-move (outside pointerdown → anchor touchend): the target
+    // guard keeps the anchor exempt so its own handler still toggles.
+    const panel = elWith();
+    const anchor = elWith();
+    const elsewhere = elWith();
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, anchor, onDismiss);
+
+    h.onPointerDown(pointerDownAt(elsewhere)); // arms the suppressor
+    const touch = touchEndAt(anchor);
+    h.onTouchEnd(touch);
+    expect(touch.stopPropagation).not.toHaveBeenCalled();
+    expect(touch.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('a bare touchend with no preceding outside pointerdown is not swallowed', () => {
+    const panel = elWith();
+    const anchor = elWith();
+    const elsewhere = elWith();
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, anchor, onDismiss);
+
+    const touch = touchEndAt(elsewhere);
+    h.onTouchEnd(touch);
+    expect(touch.stopPropagation).not.toHaveBeenCalled();
+    expect(touch.preventDefault).not.toHaveBeenCalled();
+  });
+
+  // ── onArm: the overlay-outliving swallow ──────────────────────────────────
+  // The dismiss closes the overlay, whose re-render tears down these handlers
+  // before the paired touchend/click fires. So an outside-primary pointerdown
+  // also calls onArm() to install a swallow that survives the unmount.
+
+  it('calls onArm on an outside primary pointerdown that dismissed', () => {
+    const panel = elWith();
+    const anchor = elWith();
+    const elsewhere = elWith();
+    const onArm = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, anchor, vi.fn(), onArm);
+
+    h.onPointerDown(pointerDownAt(elsewhere));
+    expect(onArm).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT call onArm for inside / anchor / right-click / no-op dismiss', () => {
+    const panel = elWith();
+    const anchor = elWith();
+    const elsewhere = elWith();
+
+    const armInside = vi.fn();
+    makeDismissHandlers({ current: panel }, anchor, vi.fn(), armInside).onPointerDown(pointerDownAt(panel));
+    expect(armInside).not.toHaveBeenCalled();
+
+    const armAnchor = vi.fn();
+    makeDismissHandlers({ current: panel }, anchor, vi.fn(), armAnchor).onPointerDown(pointerDownAt(anchor));
+    expect(armAnchor).not.toHaveBeenCalled();
+
+    const armRight = vi.fn();
+    makeDismissHandlers({ current: panel }, anchor, vi.fn(), armRight).onPointerDown(pointerDownAt(elsewhere, 2));
+    expect(armRight).not.toHaveBeenCalled();
+
+    // onDismiss returning false (e.g. Drawer mid-close) → no arm, so the
+    // surviving swallow can't eat the user's tap on a sibling button.
+    const armNoop = vi.fn();
+    makeDismissHandlers({ current: panel }, anchor, () => false as const, armNoop).onPointerDown(pointerDownAt(elsewhere));
+    expect(armNoop).not.toHaveBeenCalled();
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// installPairedSwallow — the overlay-outliving one-shot. An outside-primary
+// pointerdown dismiss re-renders and removes the overlay's own listeners before
+// the gesture's paired touchend/click fires, so the swallow lives on document
+// listeners that aren't tied to the overlay's mount. Uses the document stub from
+// test-setup.ts (add/remove/dispatch).
+// ──────────────────────────────────────────────────────────────────────────
+describe('installPairedSwallow', () => {
+  function dispatch(type: string): { stopPropagation: ReturnType<typeof vi.fn>; preventDefault: ReturnType<typeof vi.fn> } {
+    const e = { type, stopPropagation: vi.fn(), preventDefault: vi.fn() };
+    (document as unknown as { dispatchEvent: (e: unknown) => boolean }).dispatchEvent(e);
+    return e;
+  }
+
+  it('swallows the next touchend, then removes itself (one-shot)', () => {
+    installPairedSwallow();
+    const first = dispatch('touchend');
+    expect(first.stopPropagation).toHaveBeenCalledTimes(1);
+    expect(first.preventDefault).toHaveBeenCalledTimes(1);
+
+    // A later touchend is no longer swallowed — the one-shot tore itself down.
+    const second = dispatch('touchend');
+    expect(second.stopPropagation).not.toHaveBeenCalled();
+    expect(second.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('swallows the next click (mouse case), then removes itself', () => {
+    installPairedSwallow();
+    const click = dispatch('click');
+    expect(click.stopPropagation).toHaveBeenCalledTimes(1);
+    expect(click.preventDefault).toHaveBeenCalledTimes(1);
+
+    const later = dispatch('click');
+    expect(later.stopPropagation).not.toHaveBeenCalled();
+  });
+
+  it('after a touchend swallow, a follow-up click is NOT also swallowed', () => {
+    // Touch fires touchend then (preventDefaulted) would-be click; the one-shot
+    // is consumed by the touchend, so any click that slips through passes.
+    installPairedSwallow();
+    dispatch('touchend');
+    const click = dispatch('click');
+    expect(click.stopPropagation).not.toHaveBeenCalled();
+  });
+
+  it('a touchcancel tears the swallow down without eating a later tap', () => {
+    installPairedSwallow();
+    dispatch('touchcancel');
+    const touch = dispatch('touchend');
+    expect(touch.stopPropagation).not.toHaveBeenCalled();
   });
 });

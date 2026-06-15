@@ -4,20 +4,22 @@ import {
   activeExchanges,
   activeStreamingBuffer,
   threadsLoaded,
-  artifacts,
+  workspaceHasHistory,
   mobileView,
   focusedThreadId,
   threadMap,
-  isThreadQuiescent,
+  isRenderedThreadIdle,
   cancelingThreadIds,
 } from '../../store/store';
-import { scrolledUp, awayFromBottom, notAtTop, scrollToBottom, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers } from './scrollState';
+import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
+import { scrolledUp, awayFromBottom, notAtTop, scrollToBottom, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, hasPendingEventScroll } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
 import type { Exchange } from '../../store/thread-events';
-import { exchangeStatus as getExchangeStatus, exchangeImageCount, exchangeResponseModel, exchangeReasoningEffort, unresumedAbortIndex } from '../../store/thread-events';
+import { exchangeStatus as getExchangeStatus, exchangeImageCount, exchangeResponseModel, exchangeReasoningEffort, unresumedAbortIndex, activeExchangeIndex, isPendingFollowup } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
+import { forceIOSRepaint } from '../../utils/iosRepaint';
 
 /** Threads imageOffset + last model/effort across exchanges so each child sees its predecessors' state. */
 export function renderExchanges(
@@ -37,12 +39,27 @@ export function renderExchanges(
   // seq + threadIsCC + threadIdle + threadCanceling + streamingBuffer + …) is
   // unchanged. On a 29-exchange thread that's 28× fewer markdown re-parses
   // per SSE event compared with each child subscribing independently.
-  const threadMeta = threadMap.value.get(threadId)?.meta;
+  const thread = threadMap.value.get(threadId);
+  const threadMeta = thread?.meta;
   const threadIsCC = threadMeta?.channel === 'claude_code';
-  const threadIdle = isThreadQuiescent(threadMeta?.status);
+  const threadCodingAgent = threadMeta?.codingAgent ?? 'claude-code';
+  // Quiescent by raw status, but false while an optimistic resume is in flight
+  // (just-answered question / un-ingested follow-up) — see isRenderedThreadIdle.
+  const threadIdle = isRenderedThreadIdle(thread);
   const threadCanceling = cancelingThreadIds.value.has(threadId);
+  // When the agent is busy (running, or paused on a question), chat follow-ups
+  // typed meanwhile are queued and sort to the end — so the exchange the agent
+  // is actually working on (and that owns the live stream) is the last
+  // NON-pending one, not the literal last. `activeIdx` finds it; the trailing
+  // pending exchanges render as 'Queued' rather than stealing the stream and
+  // the active 'last' role (which would mislabel them 'Working'/'Done').
+  const threadBusy = threadMeta?.status === 'running' || threadMeta?.status === 'waiting_for_user_answer';
+  const activeIdx = activeExchangeIndex(exchanges, threadBusy);
   return exchanges.reduce<{ nodes: VNode[]; imgOffset: number; lastModel?: string; lastEffort?: string }>((acc, ex, i) => {
-    const isLast = i === exchanges.length - 1;
+    // The active exchange plays the 'last' role (gets the stream, reads
+    // 'streaming'/'working'); queued follow-ups after it are explicitly flagged.
+    const isLast = i === activeIdx;
+    const isQueued = threadBusy && i !== activeIdx && isPendingFollowup(ex);
     // Pass isLast=false for the prior exchange (it's at i-1, never the last
     // here): a mid-flight chat parent must read as 'streaming' so this
     // exchange's gate flips to 'queued', not slip through to 'done'.
@@ -51,8 +68,13 @@ export function renderExchanges(
       <ChatExchange
         key={'ex-' + ex.userSeq}
         exchange={ex}
+        // Captured as a primitive at render time: the incremental grouping
+        // cache mutates Exchange objects in place, so the memo can't see a
+        // change through the identity-stable object — see Exchange.revision.
+        revision={ex.revision ?? 0}
         streamingBuffer={isLast ? streamingBuffer : ''}
         isLast={isLast}
+        isQueued={isQueued}
         threadId={threadId}
         hasPriorActive={priorActive}
         imageOffset={acc.imgOffset}
@@ -60,6 +82,7 @@ export function renderExchanges(
         priorEffort={acc.lastEffort}
         isUnresumedAbort={i === unresumedIdx}
         threadIsCC={threadIsCC}
+        threadCodingAgent={threadCodingAgent}
         threadIdle={threadIdle}
         threadCanceling={threadCanceling}
       />
@@ -114,6 +137,12 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     const delta = el.offsetTop - offsetBefore;
     container.scrollTop = scrollBefore + delta;
     container.style.overflow = overflowBefore;
+
+    // The overflow freeze + large DOM shrink (hiding steps drops every tool-call
+    // row across the thread) can leave iOS WKWebView showing a blanked layer
+    // texture — the whole .thread-content (sticky title bar included) renders
+    // black until a scroll forces a repaint. Trigger that repaint proactively.
+    forceIOSRepaint(container);
 
     // iOS may adjust after unfreeze — re-check in next frame.
     if (delta !== 0) {
@@ -226,7 +255,10 @@ export function useAutoScroll(ref: preact.RefObject<HTMLDivElement>, deps: unkno
   // the panel-expand "show the chevron" behaviour is untouched.
   useLayoutEffect(() => {
     const el = ref.current;
-    if (!el || scrolledUp.value) return;
+    // Defer while a notification deep-link is resolving a scroll to a specific
+    // event — snapping to the bottom here would override its scrollIntoView the
+    // moment an unfocused thread's lazily-loaded events render.
+    if (!el || scrolledUp.value || hasPendingEventScroll()) return;
     el.scrollTop = el.scrollHeight;
   }, deps);
 }
@@ -240,13 +272,16 @@ export function CreateThreadView() {
   const isUp = awayFromBottom.value;
   const isNotAtTop = notAtTop.value;
 
-  const artLoadable = artifacts.value;
-  const hasArtifacts = artLoadable.status === 'loaded' && artLoadable.data.length > 0;
   const isEmpty = exchanges.length === 0;
-  // Show welcome when there are no exchanges and no loaded artifacts.
-  // Don't gate on artifact loading status — that caused the scroll container
-  // to be removed from the DOM while artifacts loaded, showing a blank screen.
-  const showWelcome = isEmpty && !hasArtifacts;
+  // Show the new-workspace welcome + starter suggestions only on a genuinely
+  // NEW workspace: no exchanges in this draft, no conversation history yet, and
+  // the user hasn't retired it via "Don't show this again". Gating on
+  // `workspaceHasHistory` (threads) instead of the old "any data/ file" check
+  // fixes the welcome silently vanishing when a fresh workspace happened to
+  // carry a stray config/script. Both reads are reactive: the welcome appears
+  // once threads + preferences settle and never flashes for returning users.
+  const isNewWorkspace = loaded && !workspaceHasHistory.value;
+  const showWelcome = isEmpty && isNewWorkspace && !welcomeSuggestionsDismissed();
 
   // hasContent: true exactly when the thread-content div will be in the DOM.
   // useAutoScroll depends on this — if we only pass `loaded`, the effect runs

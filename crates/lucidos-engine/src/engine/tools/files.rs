@@ -3,7 +3,12 @@ use super::super::LucidosEngine;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use base64::Engine as _;
 
-const IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// Outer safety bound on image files `read_file` will load. This is *not* the
+/// reject point for normal photos — anything under this cap is read, and if its
+/// base64 payload would exceed `api::MAX_IMAGE_BASE64_BYTES` it is downsampled
+/// via `ChatImage::compress` rather than rejected. Files above this absurd-size
+/// bound are still refused.
+const IMAGE_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Why a write to `data_path` should be rejected, or `None` if it's allowed.
 /// Centralized so all write tools share the same policy and message.
@@ -285,6 +290,35 @@ fn image_media_type(ext: &str) -> Option<&'static str> {
     }
 }
 
+/// Encode image `bytes` (with source `media_type`) into the `[IMAGE_CONTENT:<type>]\n<base64>`
+/// sentinel that `read_file` returns for images. The image is run through
+/// `ChatImage::fit_for_llm` — the same fit-to-target step every LLM-bound image path uses —
+/// so an oversized iPhone photo is downsampled to fit rather than rejected. Fitting compresses
+/// to JPEG when it shrinks the image, so the emitted media type becomes `image/jpeg` for those;
+/// the sentinel always names the media type of the bytes actually returned.
+fn encode_image_for_read(bytes: Vec<u8>, media_type: &str) -> String {
+    let fitted = crate::api::ChatImage {
+        base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        mime_type: media_type.to_string(),
+    }
+    .fit_for_llm();
+
+    // `fit_for_llm` compresses only when over target, and `compress` can't shrink bytes it
+    // can't decode (a corrupt file with an image extension), so the payload may still be over
+    // target. Don't emit an oversized IMAGE_CONTENT block the model API would reject with an
+    // opaque error — fail fast with a clear message instead.
+    if fitted.base64.len() > crate::api::MAX_IMAGE_BASE64_BYTES {
+        let mb = fitted.base64.len() as f64 / (1024.0 * 1024.0);
+        return format!(
+            "Image could not be read: it could not be resized to fit ({:.1} MB after \
+             compression) — the file may be corrupt or not a valid image.",
+            mb
+        );
+    }
+
+    format!("[IMAGE_CONTENT:{}]\n{}", fitted.mime_type, fitted.base64)
+}
+
 /// Lowercased file extension via `Path::extension`, or `""` if none.
 fn lowercase_extension(path: &str) -> String {
     std::path::Path::new(path)
@@ -536,16 +570,13 @@ impl LucidosEngine {
                             if size > IMAGE_MAX_BYTES {
                                 let mb = size as f64 / (1024.0 * 1024.0);
                                 Ok(format!(
-                                    "Image too large to read directly ({:.1} MB). Max 5MB.",
+                                    "Image too large to read directly ({:.1} MB). Max 25MB; \
+                                     smaller images are automatically resized to fit.",
                                     mb
                                 ))
                             } else {
                                 match std::fs::read(&full_path) {
-                                    Ok(bytes) => {
-                                        let b64 = base64::engine::general_purpose::STANDARD
-                                            .encode(&bytes);
-                                        Ok(format!("[IMAGE_CONTENT:{}]\n{}", media_type, b64))
-                                    }
+                                    Ok(bytes) => Ok(encode_image_for_read(bytes, media_type)),
                                     Err(e) => Err(format!("reading image file: {}", e).into()),
                                 }
                             }
@@ -722,11 +753,12 @@ impl LucidosEngine {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                // Forward the raw arg; `search::glob_files` owns the default
+                // (when None) and the clamp via `GLOB_LIMIT`.
                 let limit = args
                     .get("limit")
                     .and_then(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .unwrap_or(search::GLOB_DEFAULT_LIMIT);
+                    .map(|n| n as usize);
                 let workspace = self.workspace_path().to_path_buf();
                 let result = tokio::task::spawn_blocking(move || {
                     search::glob_files(&workspace, &pattern, limit)
@@ -754,16 +786,17 @@ impl LucidosEngine {
                     .get("case_insensitive")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // Forward the raw args; `search::grep_files` owns the defaults
+                // (when None) and the clamps via `GREP_MAX_MATCHES` /
+                // `GREP_CONTEXT_LINES`.
                 let max_matches = args
                     .get("max_matches")
                     .and_then(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .unwrap_or(search::GREP_DEFAULT_MAX_MATCHES);
+                    .map(|n| n as usize);
                 let context_lines = args
                     .get("context_lines")
                     .and_then(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .unwrap_or(0);
+                    .map(|n| n as usize);
                 let workspace = self.workspace_path().to_path_buf();
                 let result = tokio::task::spawn_blocking(move || {
                     search::grep_files(

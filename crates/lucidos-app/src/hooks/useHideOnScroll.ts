@@ -1,7 +1,7 @@
 import { useEffect } from 'preact/hooks';
 import { mobileView, panelOverlay, preferences, type MobileView, type PanelOverlay } from '../store/store';
 import { opensSoftwareKeyboard, getRemPx } from '../utils/dom';
-import { getResizeMode, pinToBottomNow, scrolledUp } from '../components/chat/scrollState';
+import { getResizeMode, pinToBottomNow, scrolledUp, isHeaderPinnedForScroll } from '../components/chat/scrollState';
 import { isMobile } from '../utils/viewport';
 import { currentMobileHeaderSticky } from '../store/actions/preferences';
 
@@ -199,8 +199,11 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       const scrollTop = Math.min(Math.max(0, rawScrollTop), maxScroll);
 
       // Programmatic scroll (scrollToBottom) — reset header to visible so
-      // opening a thread shows the mobile header, not hides it.
-      if (getResizeMode() === 'scroll') {
+      // opening a thread shows the mobile header, not hides it. Same for an
+      // in-flight deep-link scroll (isHeaderPinnedForScroll): .chat-exchange's
+      // scroll-margin-top is sized for the visible-header case, so a half-hidden
+      // header mid-scroll would leave the landed event partly covered.
+      if (getResizeMode() === 'scroll' || isHeaderPinnedForScroll()) {
         prevScrollTop = scrollTop;
         headerOffset = 0;
         applyTransform();

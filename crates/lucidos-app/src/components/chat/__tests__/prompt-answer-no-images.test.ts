@@ -58,13 +58,15 @@ describe('PromptInput refuses image attach while answering a UserQuestion', () =
     const fn = promptSource.match(/async function submit\(\)[\s\S]*?\n  \}/);
     expect(fn, 'submit() not found').not.toBeNull();
     const body = fn![0];
-    expect(body).toMatch(/if\s*\(\s*isAnsweringQuestion\s*&&\s*currentImages\.length\s*>\s*0\s*\)/);
-    // Guard returns BEFORE dispatchSend so the silently-dropped payload never
-    // reaches sendFollowup / sendMessage / sendCompose.
-    const guardIdx = body.search(/isAnsweringQuestion\s*&&\s*currentImages\.length/);
-    const dispatchIdx = body.indexOf('dispatchSend');
+    expect(body).toMatch(/if\s*\(\s*isAnsweringQuestion\s*&&\s*\(currentImages\.length\s*>\s*0\s*\|\|\s*pendingForThread\.length\s*>\s*0\)\s*\)/);
+    // Guard returns BEFORE queueing or sending so the silently-dropped payload
+    // never reaches sendFollowup / sendMessage / sendCompose.
+    const guardIdx = body.search(/isAnsweringQuestion\s*&&\s*\(currentImages\.length/);
+    const queueIdx = body.indexOf('queueUploadSend');
+    const beginSendIdx = body.indexOf('beginSend');
     expect(guardIdx).toBeGreaterThan(-1);
-    expect(dispatchIdx).toBeGreaterThan(guardIdx);
+    expect(queueIdx).toBeGreaterThan(guardIdx);
+    expect(beginSendIdx).toBeGreaterThan(guardIdx);
   });
 
   it('both attach buttons (narrow + wide) bind disabled to isAnsweringQuestion', () => {

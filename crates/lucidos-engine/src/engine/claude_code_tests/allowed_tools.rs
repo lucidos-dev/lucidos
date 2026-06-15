@@ -19,6 +19,59 @@ fn cc_allowed_tools_seeds_empty_default_file_on_first_use() {
     assert_eq!(seeded, CC_ALLOWED_TOOLS_HEADER);
 }
 
+/// Codex backend tools (raised by the app-server approval bridge) must never
+/// derive a PERSISTED pattern: `cc-allowed-tools` only reaches Claude Code's
+/// `--allowedTools`; no Codex driver reads it, so persisting
+/// `command_execution` would claim a suppression nothing enforces.
+#[test]
+fn derive_allow_pattern_codex_tools_have_no_persisted_scopes() {
+    let cmd_input = serde_json::json!({ "command": "git push", "cwd": "/wt" });
+    let fc_input = serde_json::json!({ "reason": "writes outside worktree" });
+    for scope in [AllowScope::Broad, AllowScope::Narrow] {
+        assert_eq!(
+            derive_allow_pattern("command_execution", &cmd_input, scope),
+            None,
+            "{scope:?} must not persist a codex command pattern"
+        );
+        assert_eq!(
+            derive_allow_pattern("file_change", &fc_input, scope),
+            None,
+            "{scope:?} must not persist a codex file-change pattern"
+        );
+    }
+}
+
+/// Session scope for codex commands is first-token-scoped, exactly like
+/// Bash — the bare-name fallback would let one "Allow for this thread"
+/// click on `git push` silently auto-approve a later `rm -rf ~/x`.
+#[test]
+fn derive_allow_pattern_codex_command_session_is_first_token_scoped() {
+    let input = serde_json::json!({ "command": "git push origin main", "cwd": "/wt" });
+    assert_eq!(
+        derive_allow_pattern("command_execution", &input, AllowScope::Session).as_deref(),
+        Some("command_execution(git:*)"),
+    );
+    // A DIFFERENT first token must produce a different pattern — that's the
+    // whole point of the scoping.
+    let rm = serde_json::json!({ "command": "rm -rf /tmp/x" });
+    assert_eq!(
+        derive_allow_pattern("command_execution", &rm, AllowScope::Session).as_deref(),
+        Some("command_execution(rm:*)"),
+    );
+}
+
+/// file_change approvals carry no stable identifier (only reason/grant_root)
+/// — there is nothing meaningful to scope a session grant to, so NO session
+/// pattern derives and every file-change approval renders its own card.
+#[test]
+fn derive_allow_pattern_codex_file_change_has_no_session_pattern() {
+    let input = serde_json::json!({ "reason": "writes outside worktree", "grant_root": "/etc" });
+    assert_eq!(
+        derive_allow_pattern("file_change", &input, AllowScope::Session),
+        None,
+    );
+}
+
 #[test]
 fn derive_allow_pattern_skill_narrow_uses_plugin_glob() {
     let input = serde_json::json!({ "skill": "code-review:code-review" });

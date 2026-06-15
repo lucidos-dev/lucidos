@@ -465,6 +465,24 @@ pub(super) async fn upload_data(
     super::artifacts::upload_file(State(state), multipart).await
 }
 
+/// Routes for the `/data*` surface. The wildcard `/data/*path` write route
+/// relies on the 100 MiB `DefaultBodyLimit` that `create_router` layers over
+/// the merged API router — larger binary writes (PNG, PDF) would otherwise
+/// be rejected by axum's 2 MiB default with "Failed to buffer the request
+/// body".
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/data", get(list_data))
+        .route("/data/edit", post(edit_data))
+        .route("/data/upload", post(upload_data))
+        .route(
+            "/data/*path",
+            get(read_data)
+                .put(write_data)
+                .delete(delete_data),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

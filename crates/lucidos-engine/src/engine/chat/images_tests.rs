@@ -186,6 +186,103 @@ fn current_vs_history_images_distinguished() {
     }
 }
 
+/// Generate a noisy PNG whose base64 payload exceeds the per-image LLM target.
+/// Noise resists PNG compression so the encoded image stays large; a smooth
+/// gradient would shrink under target and never exercise the fit/compress path.
+fn oversized_noisy_png_chat_image() -> crate::api::ChatImage {
+    use base64::Engine as _;
+    let img_buf: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> =
+        image::ImageBuffer::from_fn(1400, 1400, |x, y| {
+            let mut h = x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(2_246_822_519);
+            h ^= h >> 15;
+            h = h.wrapping_mul(0x85EB_CA6B);
+            h ^= h >> 13;
+            let b = h.to_le_bytes();
+            image::Rgba([b[0], b[1], b[2], 255])
+        });
+    let mut png = std::io::Cursor::new(Vec::new());
+    img_buf
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    crate::api::ChatImage {
+        base64: base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+        mime_type: "image/png".to_string(),
+    }
+}
+
+#[test]
+fn oversized_current_image_is_fitted_to_target() {
+    // Regression: an uploaded photo larger than the provider's per-image limit
+    // must be downsampled at the LLM boundary, not sent raw (which 400s with
+    // "image exceeds 5 MB maximum").
+    use base64::Engine as _;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let img = oversized_noisy_png_chat_image();
+    assert!(
+        img.base64.len() > crate::api::MAX_IMAGE_BASE64_BYTES,
+        "fixture must start over the target, got {} bytes",
+        img.base64.len()
+    );
+    let current = vec![img];
+    let result = build_user_content_with_images("look".into(), tmp.path(), &[], Some(&current));
+    match result {
+        MessageContent::Blocks(blocks) => {
+            let (data, media_type) = blocks
+                .iter()
+                .find_map(|b| match b {
+                    ContentBlock::Image {
+                        data, media_type, ..
+                    } => Some((data, media_type)),
+                    _ => None,
+                })
+                .expect("must contain an image block");
+            assert!(
+                data.len() <= crate::api::MAX_IMAGE_BASE64_BYTES,
+                "current image must be downsampled to fit, got {} bytes",
+                data.len()
+            );
+            // fit_for_llm compresses to JPEG when it shrinks the image.
+            assert_eq!(media_type, "image/jpeg");
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap();
+            assert!(image::load_from_memory(&decoded).is_ok());
+        }
+        _ => panic!("expected Blocks"),
+    }
+}
+
+#[test]
+fn oversized_history_image_is_fitted_to_target() {
+    // Same fit applies to images pulled from history on a follow-up message —
+    // otherwise a thread with a large image would 400 on every subsequent turn.
+    use base64::Engine as _;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(oversized_noisy_png_chat_image().base64)
+        .unwrap();
+    let hash = write_blob(tmp.path(), &raw).unwrap().hash;
+    let history = vec![vec![hash]];
+    let result = build_user_content_with_images("recall".into(), tmp.path(), &history, None);
+    match result {
+        MessageContent::Blocks(blocks) => {
+            let data = blocks
+                .iter()
+                .find_map(|b| match b {
+                    ContentBlock::Image { data, .. } => Some(data),
+                    _ => None,
+                })
+                .expect("history image block present");
+            assert!(
+                data.len() <= crate::api::MAX_IMAGE_BASE64_BYTES,
+                "history image must be downsampled to fit, got {} bytes",
+                data.len()
+            );
+        }
+        _ => panic!("expected Blocks"),
+    }
+}
+
 // --- save_images_to_tmp tests ---
 
 #[test]
@@ -239,11 +336,11 @@ fn save_images_to_tmp_empty_returns_empty() {
 
 #[test]
 fn oversized_history_images_skipped() {
-    // The filter is byte_size-based on the resolved blob, so we need a real
-    // big blob for the over-budget group and a real small blob for the
-    // surviving group. The minimal PNG fixture is ~30 bytes — far under
-    // MAX_TOTAL_IMAGE_BASE64 — so the small blob always fits while the
-    // padded one trips the budget check.
+    // Budget is measured on the fitted (compressed-if-over) size. The big blob
+    // is a PNG header followed by megabytes of zero padding — not a decodable
+    // image, so `fit_for_llm`/`compress` can't shrink it; it stays over the
+    // budget and is skipped. The minimal PNG fixture is ~30 bytes, far under
+    // MAX_TOTAL_IMAGE_BASE64, so the small blob always fits.
     let tmp = tempfile::TempDir::new().unwrap();
     let big_bytes = {
         let mut buf = png_with_marker(1);

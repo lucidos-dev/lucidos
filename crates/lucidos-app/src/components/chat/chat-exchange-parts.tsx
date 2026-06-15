@@ -1,4 +1,4 @@
-import { blobPreviewUrl, continueThread } from '../../api/client';
+import { blobPreviewUrl, continueThread, postCommandCheckpointUndo } from '../../api/client';
 import type { Change } from '../../api/client';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
@@ -7,9 +7,10 @@ import { findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDe
 import { LUCIDOS_AGENT_ICON, LUCIDOS_AGENT_LABEL, resumeEngineNote, stepStatus } from '../../store/thread-events';
 import type { Exchange } from '../../store/thread-events';
 import type { Loadable, ResponseEvent } from '../../store/types';
+import type { CodingAgent } from '../../api/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { contextPercent, formatTokens } from '../../utils/formatTokens';
-import { ClaudeIcon } from '../shared/icons';
+import { ClaudeIcon, CodexIcon } from '../shared/icons';
 import { highlightEllipsis } from './highlightEllipsis';
 import { getSessionBlobUrlForHash } from './pastedImages';
 import { useSignal } from '@preact/signals';
@@ -177,6 +178,17 @@ function handlePanelHeaderClick(e: MouseEvent, onToggle?: () => void): void {
   onToggle();
 }
 
+/** Shown in place of a collapsed panel's body (initiator OR response) so a
+ *  folded turn never reads as an empty row — a muted "⋯", rendered as an
+ *  accent stub bubble for user messages. Clicking it expands the panel. */
+function CollapsedIndicator({ bubble = false, onToggle }: { bubble?: boolean; onToggle?: () => void }) {
+  return (
+    <div class={`turn-collapsed${bubble ? ' turn-collapsed-bubble' : ''}`} onClick={onToggle}>
+      <span class="turn-collapsed-dots" aria-label="Collapsed — click to expand">⋯</span>
+    </div>
+  );
+}
+
 interface InitiatorPanelProps {
   initiator: InitiatorDescriptor;
   timestamp: string;
@@ -185,28 +197,41 @@ interface InitiatorPanelProps {
   collapsible: boolean;
   collapsed: boolean;
   onToggle?: () => void;
+  /** User message → render the body as a right-aligned gray bubble. */
+  bubble?: boolean;
+  /** Drop the actor chip (icon + name) entirely — used for user messages and
+   *  change-lifecycle turns. Attribution is reached via the clickable timestamp
+   *  (and, for change turns, the summary line), which open the route popover. */
+  chromeless?: boolean;
 }
 
 function ActorChipBody({ initiator }: { initiator: InitiatorDescriptor }) {
   return (
     <>
-      <span class="initiator-icon">{initiator.icon}</span>
+      {/* Iconless chips (e.g. the "Response canceled" boundary header) skip the
+          icon span entirely so the label sits flush, with no leading gap. */}
+      {initiator.icon != null && initiator.icon !== '' && (
+        <span class="initiator-icon">{initiator.icon}</span>
+      )}
       <span class="initiator-label">{initiator.label}</span>
     </>
   );
 }
 
-export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, collapsible, collapsed, onToggle }: InitiatorPanelProps) {
+export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, collapsible, collapsed, onToggle, bubble = false, chromeless = false }: InitiatorPanelProps) {
   const accentClass = initiator.accent ? ` initiator-panel-${initiator.accent}` : '';
   const hasBody = !!initiator.summary || !!initiator.details;
+  // A chromeless turn whose summary opens the popover renders that summary as a
+  // button ("Change applied" → origin info). Plain summaries stay a <div>.
+  const summaryLinks = chromeless && !!onActorClick;
 
   return (
-    <div class={`initiator-panel initiator-panel-${initiator.variant}${accentClass}${collapsed ? ' initiator-panel-collapsed' : ''}`}>
+    <div class={`initiator-panel initiator-panel-${initiator.variant}${accentClass}${bubble ? ' initiator-panel-bubble' : ''}${collapsed ? ' initiator-panel-collapsed' : ''}`}>
       <div
         class={`initiator-header${collapsible ? ' initiator-header-clickable' : ''}`}
         onClick={(e) => handlePanelHeaderClick(e, onToggle)}
       >
-        {onActorClick ? (
+        {!chromeless && (onActorClick ? (
           <button
             type="button"
             class="initiator-actor"
@@ -219,15 +244,39 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, co
           <span class="initiator-actor">
             <ActorChipBody initiator={initiator} />
           </span>
-        )}
-        <span class="initiator-timestamp">{timestamp}</span>
+        ))}
+        {/* Status (question/permission resolution) + timestamp, grouped right.
+            Chromeless turns have no actor chip — the timestamp is the popover
+            trigger; it's a <button> so it's excluded from the collapse click. */}
+        <span class="initiator-meta">
+          {initiator.status}
+          {chromeless && onActorClick ? (
+            <button
+              type="button"
+              class="initiator-timestamp initiator-timestamp-button"
+              onClick={onActorClick}
+              aria-label={`Show info for ${initiator.label}`}
+            >
+              {timestamp}
+            </button>
+          ) : (
+            <span class="initiator-timestamp">{timestamp}</span>
+          )}
+        </span>
       </div>
       {hasBody && !collapsed && (
         <div class="initiator-body">
-          {initiator.summary && <div class="initiator-summary">{initiator.summary}</div>}
-          {initiator.details}
+          {initiator.summary && (summaryLinks ? (
+            <button type="button" class="initiator-summary initiator-summary-link" onClick={onActorClick}>
+              {initiator.summary}
+            </button>
+          ) : (
+            <div class="initiator-summary">{initiator.summary}</div>
+          ))}
+          {bubble ? <div class="user-bubble">{initiator.details}</div> : initiator.details}
         </div>
       )}
+      {hasBody && collapsed && <CollapsedIndicator bubble={bubble} onToggle={onToggle} />}
       {actions && !collapsed && <div class="initiator-footer">{actions}</div>}
     </div>
   );
@@ -246,7 +295,9 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, co
  *  spawns another — same entity, same display. */
 export function describeExecutor(
   isCC: boolean,
+  codingAgent: CodingAgent = 'claude-code',
 ): { icon: ComponentChildren; label: string } {
+  if (isCC && codingAgent === 'codex') return { icon: <CodexIcon />, label: 'Codex' };
   if (isCC) return { icon: <ClaudeIcon />, label: 'Claude Code' };
   return { icon: LUCIDOS_AGENT_ICON, label: LUCIDOS_AGENT_LABEL };
 }
@@ -291,6 +342,7 @@ export function ResponsePanel({
           {children}
         </div>
       )}
+      {hasBody && collapsed && <CollapsedIndicator onToggle={onToggle} />}
     </div>
   );
 }
@@ -341,5 +393,49 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
         </span>
       )}
     </button>
+  );
+}
+
+/** The command-guard checkpoint card (ADR 0002, Phase 4): an inline affordance
+ *  shown before an in-workspace destructive command, with a one-click Undo that
+ *  restores the workspace from the snapshot. Once reverted (live via the paired
+ *  `CommandCheckpointReverted` event, or on reload), the button is replaced with
+ *  a reverted marker. */
+export function CheckpointCard({ event }: { event: Extract<ResponseEvent, { type: 'checkpoint' }> }) {
+  const pending = useSignal(false);
+  const onUndo = async () => {
+    if (pending.value || event.reverted) return;
+    pending.value = true;
+    try {
+      // Success flips `reverted` via the SSE CommandCheckpointReverted event,
+      // which re-groups into this exchange and re-renders the card.
+      await postCommandCheckpointUndo(event.checkpoint_id);
+    } catch (e) {
+      showToast('Undo failed: ' + errorDetail(e), 'error');
+    } finally {
+      pending.value = false;
+    }
+  };
+  return (
+    <div class="checkpoint-card" data-role="checkpoint-card">
+      <span class="checkpoint-icon" aria-hidden="true">{'⎌'}</span>
+      <div class="checkpoint-body">
+        <div class="checkpoint-summary">{event.summary}</div>
+        <code class="checkpoint-command">{event.command}</code>
+      </div>
+      {event.reverted ? (
+        <span class="checkpoint-reverted">Reverted ✓</span>
+      ) : (
+        <button
+          type="button"
+          class="action-btn action-btn-danger"
+          data-role="checkpoint-undo"
+          disabled={pending.value}
+          onClick={onUndo}
+        >
+          {pending.value ? 'Undoing…' : 'Undo'}
+        </button>
+      )}
+    </div>
   );
 }

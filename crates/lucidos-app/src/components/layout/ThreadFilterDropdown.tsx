@@ -1,12 +1,12 @@
 import { Fragment } from 'preact';
 import { useRef, useEffect } from 'preact/hooks';
-import { threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds } from '../../store/store';
+import { threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, CODING_AGENT_CHANNEL } from '../../store/store';
 import { CHANNEL_OPTIONS } from './headerHelpers';
 import { toggleChannel, triggerFilterOptions, toggleTriggerId, toggleTriggerChannel, type TriggerFilterOption } from '../../store/triggerFilters';
-import { repoFilterOptions, toggleRepoId, toggleClaudeCodeChannel, type RepoFilterOption } from '../../store/repoFilters';
+import { repoFilterOptions, toggleRepoId, toggleCodingAgentChannel, type RepoFilterOption } from '../../store/repoFilters';
 import { appFilterOptions, toggleAppId, type AppFilterOption } from '../../store/appFilters';
 import { formatShortDateWithYear } from '../../utils/formatTime';
-import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
+import { Overlay } from '../shared/Overlay';
 
 /** Children rendered under an expanded parent share the same shape — all
  *  child options carry id/label/deleted/lastActivity. */
@@ -29,13 +29,19 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
   const selectedRepos = selectedRepoIds.value;
   const selectedApps = selectedAppIds.value;
 
-  // Component is mounted only while open, so isOpen=true is correct.
-  // Anchor is the toggle button so re-clicking it routes through its own
-  // onClick toggle instead of being swallowed by dismiss.
-  useDismissOnOutside(true, ref, toggleRef.current, onClose);
-
+  // Mounted only while open, so open is always true here. Anchor is the toggle
+  // button so re-clicking it routes through its own onClick toggle instead of
+  // being swallowed by dismiss. Contract (dismiss + swallow + Escape) is in
+  // <Overlay>; backdrop={false} since this dropdown positions via CSS.
   return (
-    <div class="thread-filter-dropdown" ref={ref}>
+    <Overlay
+      open
+      onClose={onClose}
+      anchor={toggleRef.current}
+      backdrop={false}
+      panelClass="thread-filter-dropdown"
+      panelRef={ref}
+    >
       <div class="thread-filter-title">Show</div>
       {CHANNEL_OPTIONS.map(opt => {
         if (opt.value === 'trigger') {
@@ -51,7 +57,7 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
             />
           );
         }
-        if (opt.value === 'claude_code') {
+        if (opt.value === CODING_AGENT_CHANNEL) {
           const groups: ChildGroup[] = [];
           if (repoChildren.length > 0) {
             groups.push({ label: 'Repos', items: repoChildren, selected: selectedRepos, onToggleChild: toggleRepoId });
@@ -62,10 +68,10 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
           return (
             <ExpandableChannelRow
               key={opt.value}
-              channelOn={filter.has('claude_code')}
+              channelOn={filter.has(CODING_AGENT_CHANNEL)}
               label={opt.label}
               groups={groups}
-              onToggleChannel={toggleClaudeCodeChannel}
+              onToggleChannel={toggleCodingAgentChannel}
             />
           );
         }
@@ -80,7 +86,7 @@ export function ThreadFilterDropdown({ onClose, toggleRef }: { onClose: () => vo
           </label>
         );
       })}
-    </div>
+    </Overlay>
   );
 }
 

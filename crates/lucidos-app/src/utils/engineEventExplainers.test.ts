@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { describeAbortCause, describeEngineReason } from './engineEventExplainers';
-import type { AbortCause } from '../store/thread-events';
+import { describeAbortCause, describeCancelCause, describeEngineReason } from './engineEventExplainers';
+import type { AbortCause, CancelCause } from '../store/thread-events';
 
 describe('describeEngineReason', () => {
   it('returns explainer for session_recovered', () => {
@@ -71,6 +71,25 @@ describe('describeAbortCause', () => {
     for (const cause of causes) {
       const text = describeAbortCause(cause);
       expect(text.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('describeCancelCause', () => {
+  it('mentions the Cancel button for user_stop', () => {
+    expect(describeCancelCause('user_stop')).toMatch(/cancel/i);
+  });
+  it('mentions apply/discard/archive for user_action', () => {
+    expect(describeCancelCause('user_action')).toMatch(/appl|discard|archiv/i);
+  });
+  it('falls back for unknown / undefined', () => {
+    expect(describeCancelCause('unknown')).toMatch(/cause not recorded/i);
+    expect(describeCancelCause(undefined)).toMatch(/cause not recorded/i);
+  });
+  it('attributes every cause to the user ("You")', () => {
+    const causes: CancelCause[] = ['user_stop', 'user_action', 'unknown'];
+    for (const cause of causes) {
+      expect(describeCancelCause(cause)).toMatch(/^You\b/);
     }
   });
 });

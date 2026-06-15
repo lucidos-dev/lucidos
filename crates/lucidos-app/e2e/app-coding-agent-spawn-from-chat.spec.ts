@@ -1,20 +1,20 @@
 import { test, expect } from '@playwright/test';
-import { navigateToApp, assertHealthy, switchToClaudeMode } from './helpers';
+import { navigateToApp, assertHealthy } from './helpers';
 import { createIframeAppFixture } from './db-helpers';
 
-test.describe('App coding-agent thread — compose-view scope picker', () => {
+test.describe('App coding-agent thread — compose destination picker', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
   });
 
-  // The scope picker (compose view, Claude mode) groups options into Lucidos
-  // / external repos / installed apps. Once an app exists in the workspace,
-  // the dropdown must surface it under the "Apps" header. End-to-end CC
-  // spawn from the dropdown is exercised by app-coding-agent-wip-preview
-  // (which uses a seeded thread to skip the LLM); this spec stays focused
-  // on the picker contract because LLM-driven spawn from a chat message is
-  // non-deterministic.
-  test('scope picker exposes installed apps under an "Apps" group', async ({ page }) => {
+  // The compose destination picker groups coding targets (Lucidos source /
+  // apps / repositories) under one "Coding agent on…" header, below the
+  // Lucidos Agent default. Once an app exists in the workspace, the dropdown
+  // must surface it as `<name> · app`. End-to-end CC spawn from the dropdown
+  // is exercised by app-coding-agent-wip-preview (which uses a seeded thread
+  // to skip the LLM); this spec stays focused on the picker contract because
+  // LLM-driven spawn from a chat message is non-deterministic.
+  test('destination picker exposes installed apps as coding targets', async ({ page }) => {
     const appId = `e2e-scope-${Date.now()}`;
     const fixture = createIframeAppFixture(appId, {
       html: '<!doctype html><title>scope picker fixture</title>',
@@ -22,38 +22,59 @@ test.describe('App coding-agent thread — compose-view scope picker', () => {
       manifest: { id: appId, name: `${appId} fixture`, description: 'scope picker e2e' },
     });
     try {
-      await navigateToApp(page);
-      await switchToClaudeMode(page);
+      // The chip default is the workspace-persisted `coding_agent_default`
+      // preference, which survives across test runs in the e2e workspace —
+      // pin it so a stray Codex pick (manual debugging, a future spec) can't
+      // poison the 'Claude Code' assertion below.
+      const prefReset = await page.request.put('/api/v1/preferences?key=coding_agent_default', {
+        data: { value: 'claude-code' },
+      });
+      expect(prefReset.ok()).toBeTruthy();
 
-      // Open the cc-repo-selector dropdown — the picker is the only
-      // .cc-repo-selector on the page.
-      const trigger = page.locator('.cc-repo-selector .dropdown-trigger:visible').first();
+      await navigateToApp(page);
+
+      const trigger = page.locator('.compose-destination-picker .dropdown-trigger:visible').first();
       await expect(trigger).toBeVisible({ timeout: 10_000 });
       await trigger.click();
 
-      // The "Apps" header is a disabled option; the app's name is a
-      // selectable option below it. Asserting both proves the grouping.
+      // "Coding agent on…" is a disabled section header; the app rides below
+      // it as a selectable `<name> · app` option. Asserting both proves the
+      // grouping survived.
       const menu = page.locator('.dropdown-menu:visible').first();
       await expect(menu).toBeVisible({ timeout: 5_000 });
-      const appsHeader = menu.locator('.dropdown-option-header', { hasText: 'Apps' });
-      await expect(appsHeader).toBeVisible();
-      const appOption = menu.locator('.dropdown-option', { hasText: `${appId} fixture` });
+      const codingHeader = menu.locator('.dropdown-option-header', { hasText: 'Coding agent on…' });
+      await expect(codingHeader).toBeVisible();
+      const appOption = menu.locator('.dropdown-option', { hasText: `${appId} fixture · app` });
       await expect(appOption).toBeVisible();
-      // Lucidos is always present as the implicit default.
-      await expect(menu.locator('.dropdown-option', { hasText: 'Lucidos' }).first()).toBeVisible();
+      // The two fixed rows: the Lucidos Agent default and the Lucidos source
+      // coding target.
+      await expect(menu.locator('.dropdown-option', { hasText: 'Lucidos Agent' }).first()).toBeVisible();
+      await expect(menu.locator('.dropdown-option', { hasText: 'Lucidos source' }).first()).toBeVisible();
 
       // Picking the app writes `{kind:'app',appId}` into localStorage under
-      // the migrated key. Assert the write so a regression in the
-      // option-value encoding (repo: vs app: prefix) doesn't silently send
-      // the wrong scope on the next compose send.
+      // the persisted scope key AND flips the channel to claude_code (one
+      // pick does both — that's the point of the destination picker). Assert
+      // the writes so a regression in the option-value encoding (repo: vs
+      // app: prefix) doesn't silently send the wrong scope on the next send.
       await appOption.click();
       const stored = await page.evaluate(
-        () => localStorage.getItem('lucidos-cc-last-scope'),
+        () => localStorage.getItem('lucidos-coding-agent-last-scope'),
       );
       expect(stored).toBeTruthy();
       const parsed = JSON.parse(stored!);
       expect(parsed.kind).toBe('app');
       expect(parsed.appId).toBe(appId);
+      const mode = await page.evaluate(
+        () => localStorage.getItem('lucidos-input-mode'),
+      );
+      expect(mode).toBeTruthy();
+      expect(JSON.parse(mode!).type).toBe('claude_code');
+
+      // With a coding target picked, the coding-agent chip appears with the
+      // remembered backend (Claude Code by default).
+      await expect(
+        page.locator('.compose-coding-agent-chip .dropdown-sizer > :first-child:visible').first(),
+      ).toHaveText('Claude Code');
     } finally {
       fixture.cleanup();
     }

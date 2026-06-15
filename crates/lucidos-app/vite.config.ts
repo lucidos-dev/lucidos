@@ -4,6 +4,7 @@ import preact from '@preact/preset-vite';
 import { resolve } from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import { normalizeCss, isCssWedge, type CssBuildSnapshot } from './src/dev/cssWedgeDetect';
 
 const VITE_PORT = parseInt(process.env.VITE_PORT || '5173');
 
@@ -27,7 +28,15 @@ const hasCerts = !!(certFile && keyFile);
  * and after Vite rebuilds (client new, engine old → user needs restart).
  *
  * Re-reads on each module load and invalidates when VERSION changes, so the
- * engine-only restart path (which doesn't restart Vite) still picks up bumps.
+ * engine-only restart path (which doesn't restart Vite) still picks up bumps —
+ * in BOTH run modes: `addWatchFile` in `load` registers VERSION as a build
+ * dependency so `vite build --watch` (the `--built` dev mode) re-runs `load`
+ * and re-bakes ENGINE_VERSION on a bump, and `configureServer` does the same
+ * for the live `--hmr` dev server. Without the `addWatchFile`, Rollup's watch
+ * treated the virtual module as dependency-free and cached it forever, freezing
+ * the bundled Client version at whatever VERSION was when the watch started —
+ * so the control panel showed a permanent "Client (latest: …)" that no refresh
+ * could clear, since every rebuilt bundle still carried the stale value.
  */
 function engineVersionPlugin(): Plugin {
   const engineVersionFile = resolve(__dirname, '../lucidos-engine/VERSION');
@@ -47,6 +56,10 @@ function engineVersionPlugin(): Plugin {
     },
     load(id) {
       if (id === resolvedId) {
+        // Declare the dependency so `vite build --watch` re-runs this load (and
+        // rebuilds the bundle → new asset hashes → new sw.js BUILD_ID → update
+        // toast) whenever VERSION changes on disk.
+        this.addWatchFile(engineVersionFile);
         return `export const ENGINE_VERSION = ${JSON.stringify(readVersion())};`;
       }
     },
@@ -107,22 +120,59 @@ function suppressMergeReload(): Plugin {
 }
 
 /**
- * Stamp each production build into dist/sw.js (the `--built` dev mode and the
- * shipped app). The service worker carries a `__LUCIDOS_BUILD_ID__` placeholder
- * folded into its cache name; replacing it with a per-build id makes every
- * rebuild a byte-different sw.js, so the browser detects a service-worker update
- * and fires the client's "New version available → Refresh" toast
- * (hooks/useStartup.ts). Without this, a rebuild produces an identical sw.js and
- * the toast never fires — which is the whole "how do I know it's ready to
- * reload" signal in built mode.
+ * Expose the per-build id to the app bundle as the virtual module
+ * `virtual:build-id` (`CLIENT_BUILD_ID`). The module ships the
+ * `__LUCIDOS_BUILD_ID__` placeholder; the `lucidos-sw-stamp` plugin's
+ * writeBundle rewrites it to the real id in the emitted JS — the SAME id it
+ * stamps into sw.js — so the running bundle knows EXACTLY which build produced
+ * it.
+ *
+ * This is what lets the client judge "is the loaded code stale?" honestly: it
+ * compares CLIENT_BUILD_ID (the build that produced the code executing now)
+ * against the served sw.js BUILD_ID, instead of the controlling service
+ * worker's id (which can run ahead of the loaded page after a claim-without-
+ * reload). No `apply` gate — the virtual module must resolve in both `vite
+ * serve` (the live dev server) and `vite build`; in serve the stamp plugin is
+ * inert, so it stays the literal `__…__` placeholder, which
+ * syncClientUpdateFromBuild treats as "no signal" (no update).
+ */
+function buildIdVirtualModule(): Plugin {
+  const moduleId = 'virtual:build-id';
+  const resolvedId = '\0' + moduleId;
+  return {
+    name: 'lucidos-build-id',
+    resolveId(id) {
+      if (id === moduleId) return resolvedId;
+    },
+    load(id) {
+      if (id === resolvedId) {
+        return `export const CLIENT_BUILD_ID = '__LUCIDOS_BUILD_ID__';`;
+      }
+    },
+  };
+}
+
+/**
+ * Stamp each production build (the `--built` dev mode and the shipped app) with a
+ * per-build id, replacing the `__LUCIDOS_BUILD_ID__` placeholder in two places:
+ *
+ *  - dist/sw.js — folded into the cache name, so every rebuild is a
+ *    byte-different sw.js. That byte difference is what the browser's
+ *    service-worker update check detects, firing the client's "New version
+ *    available → Refresh" toast (hooks/useStartup.ts). Without it a rebuild
+ *    produces an identical sw.js and the toast never fires.
+ *  - the emitted app JS — the `virtual:build-id` module's `CLIENT_BUILD_ID`, so
+ *    the running code carries its own build id and can compare it against the
+ *    served sw.js to detect when the loaded bundle is stale.
  *
  * The id is derived from the emitted asset filenames (which embed content
  * hashes), so it is DETERMINISTIC: a no-op rebuild (e.g. relaunching the dev
  * harness with unchanged source) yields the same id and does not spuriously
- * report an update. Vite copies public/ (including sw.js) into dist/ at
- * BUNDLE_START — before this writeBundle hook — so dist/sw.js already exists
- * here. `apply: 'build'` keeps it inert during `vite serve` (the live dev
- * server), where the literal placeholder is a harmless static cache name.
+ * report an update. Rewriting the placeholder in already-hashed JS leaves the
+ * filename (and thus the next build's id) untouched, so determinism holds. Vite
+ * copies public/ (including sw.js) into dist/ at BUNDLE_START — before this
+ * writeBundle hook — so dist/sw.js already exists here. `apply: 'build'` keeps
+ * it inert during `vite serve`, where the literal placeholder is harmless.
  */
 function stampServiceWorker(): Plugin {
   return {
@@ -134,14 +184,144 @@ function stampServiceWorker(): Plugin {
       if (!fs.existsSync(swPath)) return;
       const assetNames = Object.keys(bundle).sort().join('\n');
       const buildId = crypto.createHash('sha256').update(assetNames).digest('hex').slice(0, 12);
-      const src = fs.readFileSync(swPath, 'utf-8');
-      fs.writeFileSync(swPath, src.replace(/__LUCIDOS_BUILD_ID__/g, buildId));
+      const stamp = (filePath: string): void => {
+        if (!fs.existsSync(filePath)) return;
+        const src = fs.readFileSync(filePath, 'utf-8');
+        if (!src.includes('__LUCIDOS_BUILD_ID__')) return;
+        fs.writeFileSync(filePath, src.replace(/__LUCIDOS_BUILD_ID__/g, buildId));
+      };
+      // sw.js (cache name + update-detect byte change) is copied from public/,
+      // so it's not a bundle key — stamp it by path. The app JS chunks carrying
+      // CLIENT_BUILD_ID are bundle keys — stamp each one.
+      stamp(swPath);
+      for (const name of Object.keys(bundle)) {
+        if (name.endsWith('.js')) stamp(resolve(outDir, name));
+      }
+    },
+  };
+}
+
+/**
+ * Atomic dist publish for `vite build --watch` (the `--built` dev mode).
+ *
+ * Vite empties the outDir at the start of every (re)build, so an interrupted or
+ * failed watch rebuild leaves the SERVED dist/ with only the public/ copy and no
+ * index.html — `vite preview` then 404s every route until the next *successful*
+ * rebuild, which only fires on the next source change. That exact failure took
+ * the dev frontend down. To make a failed build a no-op for the running app,
+ * this plugin (active only when LUCIDOS_ATOMIC_DIST is set — i.e. the built-watch
+ * launch in workspace.sh) redirects the build to a staging dir and atomically
+ * publishes it onto the live dist/ in `closeBundle`, which Rollup runs ONLY after
+ * a complete build (and after every `writeBundle`, so the sw-stamp has already
+ * run on the staged files). A crashed build never reaches closeBundle, so the
+ * last good dist/ stays in place and preview keeps serving it.
+ *
+ * Production builds (npm run build / CI / Tauri) run without the env var → outDir
+ * stays the default dist/, no staging, byte-identical to before.
+ */
+function atomicDistPublish(): Plugin {
+  const enabled = !!process.env.LUCIDOS_ATOMIC_DIST;
+  const staging = resolve(__dirname, 'dist.staging');
+  const live = resolve(__dirname, 'dist');
+  const prev = resolve(__dirname, 'dist.prev');
+  return {
+    name: 'lucidos-atomic-dist-publish',
+    apply: 'build',
+    config() {
+      if (enabled) return { build: { outDir: 'dist.staging' } };
+    },
+    closeBundle() {
+      if (!enabled) return;
+      // Refuse to publish a build that didn't emit the app shell — never let a
+      // degenerate build clobber a working dist/.
+      if (!fs.existsSync(resolve(staging, 'index.html'))) {
+        console.warn('[atomic-dist] staged build has no index.html — keeping previous dist/');
+        return;
+      }
+      // rename() is atomic but can't overwrite a populated dir, so swap via a
+      // backup: the only window where dist/ is absent is the two back-to-back
+      // renames (sub-millisecond), and only on a SUCCESSFUL build.
+      fs.rmSync(prev, { recursive: true, force: true });
+      if (fs.existsSync(live)) fs.renameSync(live, prev);
+      fs.renameSync(staging, live);
+      fs.rmSync(prev, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * Warn when the long-running `vite build --watch` (the `--built` dev mode) has
+ * wedged its CSS pipeline and is serving STALE CSS.
+ *
+ * The watch survives engine-only Apply restarts (workspace.sh keeps it running),
+ * so a single watch process can stay alive for days across many rebuilds. Once
+ * observed (after a 1.5-day-old watch + a large class rename), it kept re-emitting
+ * fresh JS from changed source while serving a FROZEN, stale CSS bundle — the
+ * served index.html paired new JS (new class names) with old CSS (old class
+ * names), so every renamed/new class had no rule and the app rendered unstyled,
+ * SILENTLY. The fix is operational (restart the frontend → clean build), but the
+ * desync was invisible until the bundles were diffed by hand.
+ *
+ * This guard makes it loud. Its signature is precise: read the CSS *source* fresh
+ * from disk each build (independent of Vite's wedged module cache) and compare a
+ * normalized hash of it against the previous build; if the source changed but the
+ * emitted CSS bundle did NOT, the pipeline is serving stale CSS — log it. The
+ * `lucidos:css-staleness` line lands in `<ws>/.lucidos/build-watch.log` the
+ * instant the wedge produces a desync, turning an hour of bundle archaeology into
+ * one log line.
+ *
+ * Scoped to the dev build-watch (LUCIDOS_ATOMIC_DIST) — a single-shot production
+ * build (`npm run build` / CI / Tauri) is a fresh process and cannot wedge, and
+ * stays byte-identical. Warn-only and fully try/catch-guarded: a guard must never
+ * break a build or alter its output.
+ */
+function cssStalenessGuard(): Plugin {
+  const enabled = !!process.env.LUCIDOS_ATOMIC_DIST;
+  const srcDir = resolve(__dirname, 'src');
+  let prev: CssBuildSnapshot | null = null;
+
+  function collectCss(dir: string, out: string[]): void {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = resolve(dir, entry.name);
+      if (entry.isDirectory()) collectCss(p, out);
+      else if (entry.name.endsWith('.css')) out.push(p);
+    }
+  }
+
+  return {
+    name: 'lucidos-css-staleness-guard',
+    apply: 'build',
+    writeBundle(_options, bundle) {
+      if (!enabled) return;
+      try {
+        const files: string[] = [];
+        collectCss(srcDir, files);
+        files.sort();
+        const normalized = files
+          .map((f) => normalizeCss(fs.readFileSync(f, 'utf-8')))
+          .join('\n');
+        const curr: CssBuildSnapshot = {
+          cssSourceHash: crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 16),
+          cssOutputFingerprint: Object.keys(bundle).filter((k) => k.endsWith('.css')).sort().join('\n'),
+        };
+        if (isCssWedge(prev, curr)) {
+          console.warn(
+            '\n[lucidos:css-staleness] CSS source changed but the emitted CSS bundle did NOT — ' +
+            'the long-running `vite build --watch` has wedged its CSS cache and is serving STALE styles ' +
+            '(fresh JS, frozen CSS → renamed/new classes have no rules and render unstyled). ' +
+            'Restart the frontend build: `./scripts/stop.sh -w <ws> && ./scripts/web-dev.sh -w <ws>`.\n'
+          );
+        }
+        prev = curr;
+      } catch {
+        // A guard must never break the build — skip silently on any error.
+      }
     },
   };
 }
 
 export default defineConfig({
-  plugins: [engineVersionPlugin(), suppressMergeReload(), stampServiceWorker(), preact()],
+  plugins: [engineVersionPlugin(), buildIdVirtualModule(), suppressMergeReload(), stampServiceWorker(), cssStalenessGuard(), preact(), atomicDistPublish()],
   build: {
     rollupOptions: {
       output: {

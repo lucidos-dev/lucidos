@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import {
   navigateToApp, sendMessage, sendFollowUp, waitForResponse, uniqueMessage,
-  assertHealthy, openThreadDrawer, userMessageBody, switchToClaudeMode, newThread,
+  assertHealthy, openThreadDrawer, userMessageBody, pickComposeDestination, newThread,
   waitForCCToFinish, waitForCCToStart,
 } from './helpers';
 
@@ -78,9 +78,9 @@ test.describe('Chat - send and receive messages', () => {
 
     await navigateToApp(page);
     await newThread(page);
-    await switchToClaudeMode(page);
+    await pickComposeDestination(page);
 
-    // msg1: long-running bash task — the same shape as cc-cancel's
+    // msg1: long-running bash task — the same shape as coding-agent-cancel's
     // BUSY_BASH_PROMPT (15 iterations of sleep 2 ≈ 30s). The "widgetN" tokens
     // are easy to assert on, and the wide window absorbs scheduling jitter
     // so msg2 reliably lands while CC is still inside the bash tool call.

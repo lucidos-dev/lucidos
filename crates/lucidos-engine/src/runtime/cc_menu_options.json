@@ -2,6 +2,8 @@
   "_note": "Source of truth for Claude Code's /model and /effort pickers. Hand-maintained because CC does not expose available models programmatically (https://github.com/anthropics/claude-code/issues/12612). Updates: use the `update-lucidos-cc-models` skill — it diffs this file against `claude /model` and bumps entries to match. include_str!() baked at compile time, parsed once via LazyLock — no runtime IO cost.",
   "models": [
     { "value": "default",          "label": "Default",         "description": "Use the default model for your plan" },
+    { "value": "claude-fable-5",    "label": "Fable 5",         "description": "Most powerful — tier above Opus" },
+    { "value": "claude-fable-5[1m]","label": "Fable 5 (1M)",    "description": "Fable 5 for long sessions" },
     { "value": "sonnet",           "label": "Sonnet 4.6",      "description": "Best for everyday tasks" },
     { "value": "sonnet[1m]",       "label": "Sonnet 4.6 (1M)", "description": "Sonnet 4.6 for long sessions" },
     { "value": "claude-opus-4-8@default", "label": "Opus 4.8",  "description": "Latest and most capable" },

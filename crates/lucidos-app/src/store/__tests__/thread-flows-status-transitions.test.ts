@@ -47,14 +47,14 @@ describe('Bug: applying a change keeps thread in Review until CC actually runs',
       // boundary events that precede them) should flip the thread to running.
       expect(effectiveThreadStatus(thread)).toBe('waiting');
 
-      // displaySection then routes to Review, not Active.
+      // displaySection then routes to Current.
       const section = displaySection(
         thread.meta.section, effectiveThreadStatus(thread),
         thread.meta.saved, thread.meta.activeChildrenCount > 0,
         thread.meta.codingAgentProposed,
         thread.meta.attentionDescendantCount > 0,
       );
-      expect(section).toBe('review');
+      expect(section).toBe('current');
     } finally {
       applyingNowThreadIds.value = new Map();
     }
@@ -135,7 +135,7 @@ describe('Bug: CC follow-up creates proper exchange boundary with pending messag
     const exchanges = getExchangesWithPending(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // Old exchange should NOT be 'cc-working' — it should be 'interrupted'
+    // Old exchange should NOT be 'coding-agent-working' — it should be 'interrupted'
     // because there's a newer exchange after it
     const status0 = exchangeStatus(exchanges[0], '', false, false, true);
     expect(status0).toBe('interrupted');
@@ -214,7 +214,7 @@ describe('Bug: CC follow-up creates proper exchange boundary with pending messag
 // Flow: CC revival — CC resumes after idle
 // ---------------------------------------------------------------------------
 describe('Flow: CC revival from waiting', () => {
-  it('CC resumes work in same exchange after CodingAgentIdled → status becomes cc-working', () => {
+  it('CC resumes work in same exchange after CodingAgentIdled → status becomes coding-agent-working', () => {
     const { map, id } = makeThread();
 
     // Claude Code session: works, goes idle, then resumes (more tool calls arrive)
@@ -233,8 +233,8 @@ describe('Flow: CC revival from waiting', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
-    // Status should be cc-working (not done) because CC resumed
-    expect(exchangeStatus(exchanges[0], '', true)).toBe('cc-working');
+    // Status should be coding-agent-working (not done) because CC resumed
+    expect(exchangeStatus(exchanges[0], '', true)).toBe('coding-agent-working');
     expect(getLabel(exchanges[0])).toBe('Working');
   });
 
@@ -260,7 +260,7 @@ describe('Flow: CC revival from waiting', () => {
     expect(getLabel(exchanges[0])).toBe('Done');
   });
 
-  it('CC follow-up creates new exchange — old exchange becomes done, new is cc-working', () => {
+  it('CC follow-up creates new exchange — old exchange becomes done, new is coding-agent-working', () => {
     const { map, id } = makeThread();
     map.get(id)!.meta.channel = 'claude_code';
 
@@ -286,11 +286,11 @@ describe('Flow: CC revival from waiting', () => {
     expect(exchangeStatus(exchanges[0], '', false, false, true)).toBe('done');
     expect(getLabel(exchanges[0], '', false, false, true)).toBe('Done');
     // New exchange: actively working
-    expect(exchangeStatus(exchanges[1], '', true, false, true)).toBe('cc-working');
+    expect(exchangeStatus(exchanges[1], '', true, false, true)).toBe('coding-agent-working');
     expect(getLabel(exchanges[1], '', true, false, true)).toBe('Working');
   });
 
-  it('CodingAgentPromptSent after idle resets exchange status to cc-working', () => {
+  it('CodingAgentPromptSent after idle resets exchange status to coding-agent-working', () => {
     // Bug: CodingAgentPromptSent (automated prompt, e.g. hardening/conflict resolution)
     // was not handled in exchangeStatus, so isCCWaiting stayed true → 'done'.
     // Meanwhile the backend status correctly showed 'running' (active Claude Code session).
@@ -308,8 +308,8 @@ describe('Flow: CC revival from waiting', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
-    // Exchange should be cc-working (not done) — CC is processing the automated prompt
-    expect(exchangeStatus(exchanges[0], '', true)).toBe('cc-working');
+    // Exchange should be coding-agent-working (not done) — CC is processing the automated prompt
+    expect(exchangeStatus(exchanges[0], '', true)).toBe('coding-agent-working');
     expect(getLabel(exchanges[0])).toBe('Working');
 
     // Thread status should also be running (CC activity after completion)
@@ -317,7 +317,7 @@ describe('Flow: CC revival from waiting', () => {
     expect(thread.meta.status).toBe('running');
   });
 
-  it('CodingAgentPromptSent after idle + more work → cc-working', () => {
+  it('CodingAgentPromptSent after idle + more work → coding-agent-working', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
@@ -330,7 +330,7 @@ describe('Flow: CC revival from waiting', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    expect(exchangeStatus(exchanges[0], '', true)).toBe('cc-working');
+    expect(exchangeStatus(exchanges[0], '', true)).toBe('coding-agent-working');
   });
 
   it('CodingAgentPromptSent after idle then idle again → done', () => {

@@ -39,8 +39,15 @@
     visibility: hidden;
 }
 
+/* Same duration/easing as the header regions' left/width transitions — the
+   pane and the header section above it must arrive together or the header
+   reads as disconnected from the panel. flex-grow is transitioned alongside
+   flex-basis: maximizing a pane flips it from basis-driven (flex: 0 0 X%) to
+   grow-driven (flex: 1) sizing, and without easing flex-grow the 0→1 jump
+   snaps the pane to full width instantly while its header still slides. */
 .split-layout.snap-animate .pane {
-    transition: flex-basis 0.25s ease-out, visibility 0.25s;
+    transition: flex-grow var(--duration-slow) ease, flex-basis var(--duration-slow) ease,
+                visibility var(--duration-slow);
 }
 
 .pane-thread {
@@ -89,7 +96,6 @@
     align-items: center;
     gap: 0.25rem;
     padding: 0 var(--header-padding-x);
-    border-bottom: 1px solid var(--border-color);
     background: var(--bg-secondary);
     flex-shrink: 0;
     height: 2.5rem;
@@ -262,6 +268,25 @@
     position: relative;
 }
 
+/* Slot holding the needs-attention / drafts toggles (AltViewToggles), placed
+   immediately right of the filter icon. The slot reserves a fixed two-toggle
+   width per viewport (see the media queries) so the Threads title and adjacent
+   controls do not move when a count appears or clears. */
+.altview-slot {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    gap: 0.25rem;
+}
+
+/* A toggle with no content collapses so the remaining toggle packs to the
+   first slot — immediately right of the filter, with no empty gap between
+   them. The slot's reserved width parks the freed space on the right, toward
+   the title. attention first, drafts second (DOM order in AltViewToggles). */
+.altview-slot .altview-hidden {
+    display: none;
+}
+
 /* Desktop: position burger, brand, and panel title to track the split layout */
 @media (min-width: 769px) {
     /* Compute the divider x-position accounting for thread drawer offset.
@@ -329,14 +354,38 @@
         opacity: 0;
     }
 
-    .app-header .panel-nav {
-        position: absolute;
-        left: calc(var(--divider-x) + var(--divider-width));
-        top: 50%;
-        transform: translateY(-50%);
+    /* Content-side header region — a real flex container pinned between the
+       split divider and the header's right padding. Children (panel-nav,
+       centered title, action icons) lay out with flex, so they can never
+       overlap each other; when the content pane drops below its minimum the
+       region clips from the left (flex-end keeps the always-present right-side
+       actions visible longest). Replaces the old per-element absolute
+       positioning with hardcoded width reservations. */
+    .app-header .content-header-elements {
         display: flex;
         align-items: center;
-        transition: left var(--duration-slow) ease;
+        justify-content: flex-end;
+        gap: 0.25rem;
+        position: absolute;
+        left: calc(var(--divider-x) + var(--divider-width));
+        right: var(--header-padding-x);
+        top: 50%;
+        transform: translateY(-50%);
+        overflow: clip;
+        transition: left var(--duration-slow) ease,
+                    opacity var(--duration-slow) ease, visibility var(--duration-slow);
+    }
+
+    /* TimeTravelDropdown opens below the header from inside this region —
+       lift the clip while it's open (same pattern as the control-panel
+       exemption on .pane-header-brand). */
+    .app-header .content-header-elements:has(.time-travel-menu) {
+        overflow: visible;
+    }
+
+    .app-header .panel-nav,
+    .app-header .content-header-actions {
+        flex-shrink: 0;
     }
 
     /* Thread toggle + compose — grouped at left edge when drawer is closed.
@@ -353,6 +402,18 @@
         align-items: center;
         gap: 0.25rem;
         z-index: calc(var(--z-control-panel) + 1);
+        transition: opacity var(--duration-slow) ease, visibility var(--duration-slow);
+    }
+
+    /* Always mounted (AppHeader renders both nav-icon hosts); faded out while
+       the drawer header owns the icons, or while the whole thread side is
+       collapsed. Fading instead of unmounting is what lets the drawer toggle
+       animate the swap. */
+    :root[data-thread-drawer-open] .collapsed-thread-actions,
+    :root[data-thread-collapsed] .collapsed-thread-actions {
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
     }
 
     /* Threads header — icon left, title centered, actions right, positioned in drawer width.
@@ -370,16 +431,54 @@
         gap: 0.25rem;
         padding: 0 0.5rem; /* toggle is a flex child, no magic offset needed */
         z-index: 3;
-        transition: width var(--duration-slow) ease;
+        /* Always mounted: width rides --co to 0 when the drawer closes, so
+           the drawer header slides shut in lockstep with the drawer body
+           instead of popping out. Clip hides the icon row as it shrinks. */
+        overflow: clip;
+        transition: width var(--duration-slow) ease,
+                    padding var(--duration-slow) ease,
+                    opacity var(--duration-slow) ease,
+                    visibility var(--duration-slow);
     }
 
+    /* The filter dropdown renders inside .threads-header and opens below the
+       header — lift the clip while it's open or it renders cut off. */
+    .threads-header:has(.thread-filter-dropdown) {
+        overflow: visible;
+    }
+
+    /* Drawer closed (or thread pane collapsed → drawerVisible false): the
+       width transition is the exit animation; visibility transitions so the
+       clipped buttons leave the tab order only after the slide finishes.
+       padding must collapse too — border-box width bottoms out at the
+       horizontal padding (16px), leaving a phantom sliver otherwise. */
+    :root:not([data-thread-drawer-open]) .threads-header {
+        padding: 0;
+        visibility: hidden;
+        pointer-events: none;
+    }
+
+    /* Reserve both desktop toggle positions (two 2.25rem icons + 0.25rem gap)
+       so the Threads title holds its place as counts appear/clear; a single
+       visible toggle packs to the left edge, right of the filter. */
+    .threads-header .altview-slot {
+        width: 4.75rem;
+    }
+
+    /* Title fills the space after the toggle slot (flex:1, so the search icon
+       stays pinned right) but its text packs to the LEFT edge — i.e. directly
+       beside the needs-attention/drafts toggles — rather than centering in that
+       gap and drifting toward the search icon. The toggles are anchored left
+       (next to the filter), so "right beside the toggles" is as far left as the
+       title can sit without overlapping them; the slot's reserved width keeps
+       that left edge fixed as counts appear/clear. */
     .threads-header-title {
         flex: 1;
         font-size: 0.875rem;
         font-weight: 600;
         color: var(--text-primary);
         white-space: nowrap;
-        text-align: center;
+        text-align: left;
         overflow: hidden;
         text-overflow: ellipsis;
     }
@@ -399,7 +498,12 @@
         z-index: var(--z-control-panel);
         overflow-x: clip;
         overflow-y: visible;
-        transition: left var(--duration-slow) ease, width var(--duration-slow) ease;
+        /* padding-left flips with the drawer state (reserves room for
+           .collapsed-thread-actions) — transition it so the label doesn't
+           jump inside the sliding box. */
+        transition: left var(--duration-slow) ease, width var(--duration-slow) ease,
+                    padding-left var(--duration-slow) ease,
+                    opacity var(--duration-slow) ease, visibility var(--duration-slow);
     }
 
     :root:not([data-thread-drawer-open]) .app-header .pane-header-brand {
@@ -425,17 +529,12 @@
         transform: translateX(-50%);
     }
 
-    /* Center panel title between panel-nav group (left) and header action icons (right).
-       --pnav-w: panel-nav width (back + forward + hamburger: 3 × 2.25rem ≈ 7rem).
-       --ract-w: right actions width (worst case: 5 icons × 2.25rem + gaps ≈ 12rem). */
+    /* Panel title fills the space between panel-nav (left) and the header
+       action icons (right), centering its text in that space. Flex sizing
+       means it shrinks to zero before anything can overlap. */
     .app-header .pane-header-content-title {
-        --pnav-w: 7rem;
-        --ract-w: 12rem;
-        position: absolute;
-        left: calc(var(--divider-x) + var(--divider-width) + var(--pnav-w));
-        width: calc(100% - var(--divider-x) - var(--divider-width) - var(--pnav-w) - var(--ract-w));
-        top: 50%;
-        transform: translateY(-50%);
+        flex: 1;
+        min-width: 0;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -447,7 +546,6 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        transition: left var(--duration-slow) ease, width var(--duration-slow) ease;
     }
 
     .app-header .pane-header-content-title .pane-header-title-text,
@@ -458,11 +556,26 @@
         pointer-events: auto;
     }
 
-    /* Ensure right-side items render above the panel title */
-    .app-header .pane-header-spacer,
-    .app-header .pane-header-spacer ~ * {
-        position: relative;
-        z-index: 1;
+    /* While a divider drag is live (data-pane-resizing, set by
+       beginPaneResize in splitHelpers.ts), geometry transitions go off so the
+       header regions and the drawer track the pointer 1:1 with the panes —
+       the always-on var(--duration-slow) eases otherwise leave the header
+       visibly lagging behind the panels mid-drag. They come back on at
+       release so the deferred snap-to-minimum/hidden animates everything in
+       lockstep. */
+    :root[data-pane-resizing] .app-header::before,
+    :root[data-pane-resizing] .app-header::after,
+    :root[data-pane-resizing] .app-header .content-header-elements,
+    :root[data-pane-resizing] .app-header .pane-header-brand,
+    :root[data-pane-resizing] .threads-header,
+    :root[data-pane-resizing] .thread-drawer,
+    :root[data-pane-resizing] .split-layout.snap-animate .pane {
+        transition: none;
+    }
+
+    /* Ease the needs-attention / drafts toggles' active-state color change. */
+    .threads-header .icon-btn {
+        transition: color var(--duration-normal), background var(--duration-normal);
     }
 }
 
@@ -472,37 +585,40 @@
     flex-shrink: 0;
 }
 
-/* Hide brand thread-nav-group when drawer is closed — collapsed-thread-actions takes over */
+/* Drawer closed → the nav icons live in .collapsed-thread-actions instead;
+   collapse this group with a max-width slide + fade (display:none would pop
+   it out of the brand while the brand box is still animating). max-width
+   slightly above the natural 3 × 2.25rem icon row. */
+.desktop-header .pane-header-brand .thread-nav-group {
+    max-width: 7rem;
+    overflow: clip;
+    transition: max-width var(--duration-slow) ease,
+                opacity var(--duration-slow) ease, visibility var(--duration-slow);
+}
+
 :root:not([data-thread-drawer-open]) .desktop-header .pane-header-brand .thread-nav-group {
-    display: none;
+    max-width: 0;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
 }
 
 @media (min-width: 769px) {
-    :root[data-thread-collapsed] .thread-header-elements,
-    :root[data-thread-collapsed] .toast-container,
-    :root[data-content-collapsed] .content-header-elements {
+    :root[data-thread-collapsed] .toast-container {
         display: none;
     }
-}
 
-/* Animation: brand returns to thread pane when expanding from collapsed */
-@keyframes brand-return-in {
-    0% {
+    /* Collapsing a pane fades its header regions out while their left/width
+       transitions slide them to zero — display:none here popped them out at
+       the start of the pane animation. (.collapsed-thread-actions has its
+       matching rule next to its base styles above.) */
+    :root[data-thread-collapsed] .app-header .threads-header,
+    :root[data-thread-collapsed] .app-header .pane-header-brand,
+    :root[data-content-collapsed] .app-header .content-header-elements {
         opacity: 0;
-        transform: translateY(-50%) translateX(var(--brand-return-x, 1.875rem));
+        visibility: hidden;
+        pointer-events: none;
     }
-    15% {
-        opacity: 1;
-    }
-    100% {
-        opacity: 1;
-        transform: translateY(-50%) translateX(0);
-    }
-}
-
-:root[data-brand-returning] .app-header .pane-header-brand {
-    animation: brand-return-in 0.55s cubic-bezier(0.5, 0, 0.1, 1) both;
-    overflow: visible;
 }
 
 
@@ -571,7 +687,7 @@
 /* Blink animation for standard-size dots */
 .connection-status-inline .status-dot.disconnected,
 .control-panel-status-row .status-dot.disconnected {
-    animation: cc-blink-red 0.6s ease-in-out infinite;
+    animation: progress-blink-red 0.6s ease-in-out infinite;
 }
 
 /* Size: small (workspace rows) */
@@ -603,10 +719,6 @@
 
 .control-panel-section {
     padding: 0.625rem 0.75rem;
-}
-
-.control-panel-section + .control-panel-section {
-    border-top: 1px solid var(--border-color);
 }
 
 .control-panel-status-row {
@@ -756,4 +868,3 @@
     margin-left: -0.25rem;
     flex-shrink: 0;
 }
-

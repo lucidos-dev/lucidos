@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { clampLeftWithin } from '../utils/dom';
 
 export interface AnchorPosition {
@@ -119,36 +119,98 @@ export function useAnchoredPosition(
   return pos;
 }
 
-/** Build the three handlers (`pointerdown`, `click` capture, `keydown`) that
- *  implement the canonical Lucidos modal dismiss contract:
+/** Install one-shot, capture-phase `touchend` + `click` swallowers on `document`
+ *  that **outlive the dismissing overlay**. An outside-primary-pointerdown
+ *  dismiss closes the overlay, which re-renders and tears down the overlay's own
+ *  (open-gated) listeners — and that teardown runs in the microtask checkpoint
+ *  BETWEEN the pointerdown task and the next event task, i.e. BEFORE the browser
+ *  dispatches the paired `touchend` (touch) / `click` (mouse) of the same
+ *  gesture. So the open-gated `onTouchEnd`/`onClickCapture` below are already
+ *  gone by the time the paired event fires; the swallow has to live somewhere
+ *  the unmount can't reach. These listeners aren't tied to any component, so
+ *  they survive. The first swallowed event (or a `touchcancel`/`pointercancel`,
+ *  or a short fuse if the gesture is canceled with no paired event) removes them
+ *  all, so a later unrelated tap is never eaten. The `touchend` `preventDefault`
+ *  also cancels the synthetic click. Exported for unit tests. */
+export function installPairedSwallow(): void {
+  if (typeof document === 'undefined') return;
+  let done = false;
+  let fuse: ReturnType<typeof setTimeout>;
+  function teardown() {
+    if (done) return;
+    done = true;
+    document.removeEventListener('touchend', swallow, true);
+    document.removeEventListener('click', swallow, true);
+    document.removeEventListener('touchcancel', teardown, true);
+    document.removeEventListener('pointercancel', teardown, true);
+    clearTimeout(fuse);
+  }
+  function swallow(e: Event) {
+    e.stopPropagation();
+    e.preventDefault();
+    teardown();
+  }
+  document.addEventListener('touchend', swallow, { capture: true, passive: false });
+  document.addEventListener('click', swallow, true);
+  document.addEventListener('touchcancel', teardown, { capture: true });
+  document.addEventListener('pointercancel', teardown, { capture: true });
+  // A canceled gesture may emit no paired event; the fuse keeps a stranded arm
+  // from eating a later unrelated tap. Longer than any real tap's down→up.
+  fuse = setTimeout(teardown, 1500);
+}
+
+/** Build the handlers (`pointerdown`, `touchend` capture, `click` capture,
+ *  `keydown`) that implement the canonical Lucidos modal dismiss contract:
  *
  *  - `pointerdown` outside the panel+anchor → call `onDismiss`. For
  *    primary-button (left-click / touch / pen) pointerdowns, also arm
- *    "swallow next click" so the paired `click` event the browser is about
- *    to dispatch doesn't fire the underlying element.
+ *    "swallow next paired event" so the `touchend`/`click` the browser is
+ *    about to dispatch doesn't fire the underlying element. Arming has two
+ *    halves: a local `suppressNextClick` flag (consumed by `onTouchEnd` /
+ *    `onClickCapture` below when those listeners are still alive — the
+ *    same-task / synthetic-driver case) AND `onArm()`, which installs the
+ *    overlay-outliving one-shot (`installPairedSwallow`) for the common case
+ *    where the dismiss's re-render has already torn these handlers down before
+ *    the paired event fires. The two are complementary, not redundant: the
+ *    local flag covers same-task swallows, `onArm` covers cross-task ones.
  *  - Right-click / middle-click outside still dismisses, but does NOT arm
  *    the suppressor — those buttons dispatch `contextmenu` / `auxclick`,
  *    not `click`, so a stranded flag would swallow a later unrelated
  *    left-click.
+ *  - `touchend` (in capture phase) outside the panel+anchor, when the flag is
+ *    armed, is `stopPropagation`+`preventDefault`d and disarms. This covers
+ *    touch buttons that run their action on `onTouchEnd` and `preventDefault()`
+ *    the synthetic click (the iOS keyboard-nudge pattern in `composeHandlers`):
+ *    the outside pointerdown dismisses the overlay but the button's own
+ *    `touchend` would otherwise fire the action on the same tap, and — because
+ *    the button cancels the synthetic click — no `click` ever arrives. The
+ *    capture phase precedes the target button's bubble-phase `onTouchEnd`, so
+ *    the swallow wins. (When the re-render has removed this handler first, the
+ *    `onArm` one-shot does the same job.)
  *  - The next `click` (in capture phase) is `stopPropagation`+`preventDefault`d
  *    when the flag is armed. Clicks not preceded by an outside-primary-pointerdown
- *    pass through.
+ *    pass through. On touch the `touchend` already consumed the flag, so the
+ *    click path is the mouse case.
  *  - `Escape` always dismisses.
  *
  *  `onDismiss` may return `false` to declare the call was a no-op (e.g. the
  *  popover is already on its way out via an animation). In that case the
- *  suppressor stays disarmed so the user's tap on a sibling button still
- *  reaches its handler. Returning `void` / `true` keeps the default swallow.
+ *  suppressor stays disarmed (and `onArm` is NOT called) so the user's tap on a
+ *  sibling button still reaches its handler. Returning `void` / `true` keeps the
+ *  default swallow.
  *
  *  Exported as a pure factory so `.test.ts` can drive the handlers without
- *  jsdom — `useDismissOnOutside` is the hook that wires these to `document`.
+ *  jsdom — `useDismissOnOutside` is the hook that wires these to `document`
+ *  (and passes `installPairedSwallow` as `onArm`).
  *  See `.claude/rules/frontend.md` § "Modals & popovers: click-outside dismiss". */
 export function makeDismissHandlers(
   panelRef: { current: HTMLElement | null },
   anchor: HTMLElement | null,
   onDismiss: () => void | boolean,
+  onArm?: () => void,
 ): {
   onPointerDown(e: PointerEvent): void;
+  onTouchEnd(e: TouchEvent): void;
   onClickCapture(e: MouseEvent): void;
   onKey(e: KeyboardEvent): void;
 } {
@@ -157,7 +219,24 @@ export function makeDismissHandlers(
     onPointerDown(e) {
       if (!isOutsidePointerTarget(e.target as Node, panelRef.current, anchor)) return;
       const dismissed = onDismiss();
-      if (e.button === 0 && dismissed !== false) suppressNextClick = true;
+      if (e.button === 0 && dismissed !== false) {
+        suppressNextClick = true;
+        // Survives the unmount the dismiss is about to trigger — see
+        // installPairedSwallow. No-op in unit tests that don't pass onArm.
+        onArm?.();
+      }
+    },
+    onTouchEnd(e) {
+      // Only the outside-primary-pointerdown path arms the suppressor, so a set
+      // flag already means "an outside tap just dismissed". Still re-check the
+      // target: never swallow on the anchor (must toggle via its own handler)
+      // or inside the panel. preventDefault() here also cancels the synthetic
+      // click, so the flag can't strand.
+      if (!suppressNextClick) return;
+      if (!isOutsidePointerTarget(e.target as Node, panelRef.current, anchor)) return;
+      suppressNextClick = false;
+      e.stopPropagation();
+      e.preventDefault();
     },
     onClickCapture(e) {
       if (suppressNextClick) {
@@ -207,14 +286,28 @@ export function useDismissOnOutside(
   // updated every render so the latest callback always wins on fire.
   const dismissRef = useRef(onDismiss);
   dismissRef.current = onDismiss;
-  useEffect(() => {
+  // useLayoutEffect (not useEffect) so the document listeners attach
+  // synchronously in the same commit that mounts the popover — i.e. BEFORE the
+  // browser paints. A plain useEffect attaches a frame later, after paint, which
+  // opens a window where the popover is already visible (and dismissible) but no
+  // listener is live yet. Any click landing in that gap — a synthetic
+  // HTMLElement.click() from a keyboard shortcut or an e2e driver — is missed and
+  // the popover wedges open (the thread-filter-dropdown WebKit e2e flake). Pairs
+  // with the synthetic-click fallback in makeDismissHandlers: the fallback only
+  // helps once the listener exists, so the listener must exist from frame zero.
+  useLayoutEffect(() => {
     if (!isOpen) return;
-    const handlers = makeDismissHandlers(panelRef, anchor, () => dismissRef.current());
+    const handlers = makeDismissHandlers(panelRef, anchor, () => dismissRef.current(), installPairedSwallow);
     document.addEventListener('pointerdown', handlers.onPointerDown, true);
+    // Capture phase so this precedes the target button's own bubble-phase
+    // `onTouchEnd`; non-passive so `preventDefault()` (which cancels the
+    // synthetic click) is honored.
+    document.addEventListener('touchend', handlers.onTouchEnd, { capture: true, passive: false });
     document.addEventListener('click', handlers.onClickCapture, true);
     document.addEventListener('keydown', handlers.onKey);
     return () => {
       document.removeEventListener('pointerdown', handlers.onPointerDown, true);
+      document.removeEventListener('touchend', handlers.onTouchEnd, true);
       document.removeEventListener('click', handlers.onClickCapture, true);
       document.removeEventListener('keydown', handlers.onKey);
     };

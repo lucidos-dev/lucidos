@@ -206,38 +206,36 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
   });
 
   describe('Negative: illegal section transitions', () => {
-    it('displaySection never returns review for stored=default (no pending changes)', () => {
-      for (const status of ['idle', 'running', 'waiting'] as const) {
-        const display = displaySection('archived', status, false, false, false, false);
-        expect(display).not.toBe('review');
+    it('an archived thread with no pending changes stays in archive unless it is doing live work', () => {
+      // Idle / waiting archived threads with nothing pending settle into Archive.
+      for (const status of ['idle', 'waiting'] as const) {
+        expect(displaySection('archived', status, false, false, false, false)).toBe('archive');
       }
+      // Running is the exception: live work surfaces in Current even when archived.
+      expect(displaySection('archived', 'running', false, false, false, false)).toBe('current');
     });
 
-    it('running status maps to active when not saved, saved when saved (save overrides)', () => {
+    it('running status maps to current when not saved, saved when saved (save overrides)', () => {
       for (const stored of ['archived', 'inbox'] as const) {
-        expect(displaySection(stored, 'running', false, false, false, false)).toBe('active');
+        expect(displaySection(stored, 'running', false, false, false, false)).toBe('current');
         expect(displaySection(stored, 'running', true, false, false, false)).toBe('saved');
       }
     });
 
-    it('badge count must not include review threads that display as running', () => {
-      // Simulates the attentionThreadCount logic: only count threads whose
-      // displaySection is 'review', not just those with stored section 'inbox'.
-      // Bug: a running CC thread with section='inbox' showed in RUNNING but
-      // the badge counted it, producing a phantom "1" with no REVIEW section.
-      const threads = [
-        { section: 'inbox' as ArchiveState, status: 'running' as const, saved: false, hasActiveChildren: false },
-        { section: 'inbox' as ArchiveState, status: 'idle' as const, saved: false, hasActiveChildren: false },
-        { section: 'inbox' as ArchiveState, status: 'idle' as const, saved: false, hasActiveChildren: true },
-        { section: 'archived' as ArchiveState, status: 'idle' as const, saved: false, hasActiveChildren: false },
+    it('running, idle, and active-children inbox threads all share the Current section', () => {
+      // The merge collapsed the former Active + Review split: a thread no longer
+      // changes section when it starts or stops running. Attention is now a
+      // per-row signal (reviewTier), not a section — see attentionThreadCount.
+      const inbox: Array<{ status: ThreadStatus; hasActiveChildren: boolean }> = [
+        { status: 'running', hasActiveChildren: false },
+        { status: 'idle', hasActiveChildren: false },
+        { status: 'idle', hasActiveChildren: true },
       ];
-
-      // Only the idle thread without active children should display as 'review'.
-      // Running threads and threads with active children display as 'running'/'waiting'.
-      const count = threads.filter(t =>
-        displaySection(t.section, t.status, t.saved, t.hasActiveChildren, false, false) === 'review'
-      ).length;
-      expect(count).toBe(1);
+      for (const t of inbox) {
+        expect(displaySection('inbox', t.status, false, t.hasActiveChildren, false, false)).toBe('current');
+      }
+      // An archived idle thread with no live work or pending changes stays in archive.
+      expect(displaySection('archived', 'idle', false, false, false, false)).toBe('archive');
     });
   });
 });

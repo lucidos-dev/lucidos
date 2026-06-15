@@ -212,7 +212,7 @@ pub(crate) fn resolve_device_name(stored: Option<&str>, id: &str) -> String {
             return n.to_string();
         }
     }
-    let short = &id[..id.floor_char_boundary(8.min(id.len()))];
+    let short = &id[..id.floor_char_boundary(8)];
     format!("device-{}", short)
 }
 

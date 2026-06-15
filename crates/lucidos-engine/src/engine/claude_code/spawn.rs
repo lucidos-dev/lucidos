@@ -87,6 +87,7 @@ impl LucidosEngine {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await;
 
@@ -276,20 +277,21 @@ impl LucidosEngine {
         Ok(())
     }
 
-    /// Spawn a new Claude Code sub-thread via the `run_thread` LLM tool.
-    /// Routes the actual CC work through `process_message_with_steps` (the
-    /// unified router), mirroring the chat parallel `spawn_thread`. Sync
-    /// return so the LLM tool result gets `cc_thread_id` back without
-    /// waiting on the Claude Code session; the background task does the rest.
+    /// Run a Claude Code sub-thread spawn (the `run_claude` LLM tool's work,
+    /// executed by the Thread Queue once the entry is admitted). Routes the
+    /// actual CC work through `process_message_with_steps` (the unified
+    /// router), mirroring the chat parallel `spawn_thread`. The future
+    /// resolves when the session's turn finishes — the queue executor awaits
+    /// it (wrapped in `monitor_cc_task` for panic cleanup) so the spawn's
+    /// capacity slot is held for the session's duration.
     ///
-    /// Visibility race: between this returning and the spawned task emitting
-    /// MessageReceived, a frontend `list_threads` could miss `cc_thread_id`
-    /// in the active set. Same race as `spawn_thread` for chat sub-threads —
-    /// accepted; the window is microseconds in practice.
-    pub(crate) fn spawn_agent_thread(
-        &self,
+    /// `cc_thread_id` is pre-allocated by the submitter so the tool result
+    /// can return it without waiting for admission.
+    pub(crate) async fn run_agent_thread_spawn(
+        self: Arc<Self>,
         params: SpawnAgentThreadParams,
-    ) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
+        cc_thread_id: Uuid,
+    ) {
         let SpawnAgentThreadParams {
             prompt,
             user_images,
@@ -300,12 +302,6 @@ impl LucidosEngine {
             caller_title,
             app_id,
         } = params;
-
-        if app_id.is_some() && repo_id.is_some() {
-            return Err("Cannot pass both `app_id` and `repo_id` — an app coding-agent thread is not a repo".into());
-        }
-
-        let cc_thread_id = Uuid::new_v4();
 
         // Stash the app id for run_direct_agent to pick up. Cleared by the
         // run_direct_agent path once the spawn target is resolved.
@@ -325,13 +321,13 @@ impl LucidosEngine {
         let initial_title = explicit_title
             .unwrap_or_else(|| prompt.chars().take(60).collect::<String>());
 
-        let engine = self.clone_arc();
+        let engine = self;
         let prompt_owned = prompt;
         let images_owned = user_images;
         let device_id_owned = device_id;
         let repo_id_owned = repo_id;
 
-        let handle = tokio::spawn(async move {
+        {
             // Emit placeholder title + spawn LLM title gen. Matches
             // `spawn_thread` (chat parallel) — the placeholder shows up
             // before the LLM-generated title arrives, and
@@ -377,7 +373,7 @@ impl LucidosEngine {
                                 // prompt carried images.
                                 crate::engine::chat::emit_generated_title(
                                     &bus,
-                                    &provider,
+                                    provider.as_ref(),
                                     cc_thread_id,
                                     &msg,
                                     None,
@@ -403,6 +399,9 @@ impl LucidosEngine {
                         event: crate::engine::thread_events::ThreadEvent::CodingAgentThreadSpawned {
                             cc_thread_id: cc_thread_id.to_string(),
                             title: initial_title,
+                            // spawn_agent_thread is CC-only today (it passes
+                            // no backend to the router); revisit when the
+                            // tool grows a coding_agent arg.
                             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                         },
                         meta: crate::engine::thread_events::EventMeta::NONE,
@@ -437,6 +436,7 @@ impl LucidosEngine {
                     spawning_event_id,
                     ActorMode::Agent,
                     None,
+                    None, // coding_agent — spawn_agent_thread is CC-only today
                     None, // pre_emitted_origin — router emits MR itself
                     None, // title — already emitted placeholder above
                     None,
@@ -447,43 +447,9 @@ impl LucidosEngine {
                 Ok(ref res) => {
                     if res.proposed_change {
                         if res.auto_apply {
-                            let pending = match engine.changes().list_pending().await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    log!(
-                                        "[ClaudeCode] auto-apply: list_pending: {} — skipping auto-apply",
-                                        e
-                                    );
-                                    Vec::new()
-                                }
-                            };
-                            if let Some(change) =
-                                pending.iter().find(|c| c.request_id == res.request_id)
-                            {
-                                match engine.apply_change(change.id, None).await {
-                                    Ok(r) => {
-                                        log!("[ClaudeCode] Auto-applied change: {}", r.message)
-                                    }
-                                    Err(e) => {
-                                        log!("[ClaudeCode] Failed to auto-apply: {}", e);
-                                        engine
-                                            .event_bus
-                                            .emit_or_log(
-                                                crate::engine::event_bus::BusEvent::Thread {
-                                                    thread_id: cc_thread_id,
-                                                    event: crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
-                                                        change_id: change.id.to_string(),
-                                                        error: e.to_string(),
-                                                        actor: None,
-                                                    },
-                                                    meta: crate::engine::thread_events::EventMeta::NONE,
-                                                },
-                                                "[ClaudeCode] ChangeApplyFailed",
-                                            )
-                                            .await;
-                                    }
-                                }
-                            }
+                            engine
+                                .auto_apply_proposed_change(res.request_id, cc_thread_id, None)
+                                .await;
                         }
 
                         engine.broadcast_changes_updated().await;
@@ -495,15 +461,58 @@ impl LucidosEngine {
                         &engine,
                         cc_thread_id,
                         &e,
-                        "[ClaudeCode] spawn_agent_thread failure",
+                        "[ClaudeCode] run_agent_thread_spawn failure",
                     )
                     .await;
                 }
             }
-        });
+        }
+    }
 
-        Self::monitor_cc_task(self.clone_arc(), cc_thread_id, handle);
-
-        Ok(cc_thread_id)
+    /// Look up the pending change a finished background turn proposed (by
+    /// `request_id`) and apply it; an apply failure surfaces as a
+    /// `ChangeApplyFailed` event on the thread. Shared by the coding-agent
+    /// and agent-chat Thread Queue execution paths.
+    pub(crate) async fn auto_apply_proposed_change(
+        self: &Arc<Self>,
+        request_id: Uuid,
+        thread_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) {
+        let pending = match self.changes().list_pending().await {
+            Ok(v) => v,
+            Err(e) => {
+                log!(
+                    "[ClaudeCode] auto-apply: list_pending: {} — skipping auto-apply",
+                    e
+                );
+                Vec::new()
+            }
+        };
+        let Some(change) = pending.iter().find(|c| c.request_id == request_id) else {
+            return;
+        };
+        match self.apply_change(change.id, actor.clone()).await {
+            Ok(r) => {
+                log!("[ClaudeCode] Auto-applied change: {}", r.message)
+            }
+            Err(e) => {
+                log!("[ClaudeCode] Failed to auto-apply: {}", e);
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
+                                change_id: change.id.to_string(),
+                                error: e.to_string(),
+                                actor,
+                            },
+                            meta: crate::engine::thread_events::EventMeta::NONE,
+                        },
+                        "[ClaudeCode] ChangeApplyFailed",
+                    )
+                    .await;
+            }
+        }
     }
 }

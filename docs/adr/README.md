@@ -31,3 +31,12 @@ Keep entries scannable. A decision log nobody reads is just more drift.
 ## Index
 
 - [0001 — External-repo coding-agent thread surfacing: keep the carve-out](0001-external-repo-thread-surfacing.md)
+- [0002 — Lucidos Agent command safety: gate the dangerous slice, not every command](0002-lucidos-agent-command-safety.md)
+- [0003 — Agent-session loop and chat agentic loop stay separate; no shared loop orchestrator](0003-twin-agent-loops-stay-separate.md)
+- [0004 — Codex integrates as per-turn `codex exec` processes; backend locked per thread; coding-agent channel names stay `claude_code`](0004-codex-as-second-coding-agent.md)
+- [0005 — Codex defaults to the `codex app-server` protocol; `codex exec` stays as the escape hatch](0005-codex-app-server-protocol.md)
+- [0006 — Compose destination picker: one "To:" pick, remembered coding-agent chip, no auto-routing](0006-compose-destination-picker.md)
+- [0007 — One Thread Queue gates all background spawns; user chat preempts; restart re-fires, never replays](0007-thread-queue-admission-control.md) *(the "user preempts and doesn't count" part superseded by 0008)*
+- [0008 — User-initiated work shares the one capacity pool: prioritized, but counted and queued (reserves a background floor)](0008-user-initiated-work-counts-against-the-pool.md)
+- [0009 — An empty completion is an error only when it's genuinely an error, classified per-cause across providers](0009-empty-completion-classification.md)
+- [0010 — The user-half of the Thread Queue pool mirrors `thread_summaries.status` (one reconcile point, not hand-synced acquire/release)](0010-user-pool-mirrors-thread-status.md)

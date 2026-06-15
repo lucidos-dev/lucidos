@@ -15,6 +15,16 @@ import { pushNavState } from './navigation';
 import { isTauri } from '../../utils/platform';
 import { errorDetail } from '../../utils/errorDetail';
 
+// The file-preview restore is a page-reload re-hydration step — it belongs to
+// the FIRST loadArtifacts() after a fresh load, never to the SSE-driven
+// refreshes that fire all session long (artifact created/edited during an
+// agent run → DataFileEdited → loadArtifacts). Without this one-shot gate, any
+// such refresh re-opens the last-viewed file and yanks the content pane there,
+// clobbering an open app/URL/form mid-conversation — e.g. "Refreshing Planer"
+// jumping back to the last generated PDF. Resets to false on page reload
+// (module re-init).
+let filePreviewRestoreAttempted = false;
+
 export async function loadArtifacts(): Promise<void> {
   setLoadingIfFresh(artifacts);
   try {
@@ -33,13 +43,17 @@ export async function loadArtifacts(): Promise<void> {
       expandedFolders.value = newExpanded;
     }
 
-    // Restore previously open file preview
-    const savedPath = localStorage.getItem('file-preview-open');
-    if (savedPath && panelOverlay.value?.type !== 'file-preview') {
-      if (paths.includes(savedPath)) {
-        openFilePreview(savedPath, { preserveSource: true });
-      } else {
-        localStorage.removeItem('file-preview-open');
+    // Restore previously open file preview — once, on the first load after a
+    // page reload (see filePreviewRestoreAttempted above).
+    if (!filePreviewRestoreAttempted) {
+      filePreviewRestoreAttempted = true;
+      const savedPath = localStorage.getItem('file-preview-open');
+      if (savedPath && panelOverlay.value?.type !== 'file-preview') {
+        if (paths.includes(savedPath)) {
+          openFilePreview(savedPath, { preserveSource: true });
+        } else {
+          localStorage.removeItem('file-preview-open');
+        }
       }
     }
   } catch (error) {

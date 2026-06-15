@@ -45,6 +45,27 @@
     background-color: var(--accent);
 }
 
+/* Disabled (e.g. a child toggle whose parent master is off) — dimmed and
+   non-interactive, but still shows its on/off position. */
+.toggle-switch-disabled {
+    cursor: not-allowed;
+}
+
+/* Neutral placeholder shown while the backing preference is still loading — a
+   dimmed pill with no knob, so the toggle mounts in its real on/off position
+   once loaded instead of animating across from a loading default on reload (see
+   `LoadableToggle`). */
+.toggle-switch-loading {
+    background-color: var(--bg-tertiary);
+    border-radius: 1.25rem;
+    opacity: 0.4;
+    cursor: default;
+}
+
+.toggle-switch input:disabled + .toggle-slider {
+    opacity: 0.4;
+}
+
 @media (max-width: 600px) {
     .response-content table {
         font-size: 0.6875rem;

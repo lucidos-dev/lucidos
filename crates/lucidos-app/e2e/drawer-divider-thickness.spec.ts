@@ -55,10 +55,14 @@ test.describe('Drawer divider thickness', () => {
         await page.waitForTimeout(200);
 
         const colors = await targetRow.evaluate((row) => {
-            const wrapper = row.closest('.thread-row-wrap')!;
             return {
                 hoveredBg: getComputedStyle(row).backgroundColor,
-                dividerBg: getComputedStyle(wrapper, '::before').backgroundColor,
+                // The divider is the row's own bottom-edge hairline, drawn as an
+                // `::after` (Apple Messages style). The row above contributes the
+                // line that sits at this hovered row's top edge — same
+                // `--border-color`, so the row's own `::after` border-bottom-color
+                // is the representative value.
+                dividerBg: getComputedStyle(row, '::after').borderBottomColor,
             };
         });
 

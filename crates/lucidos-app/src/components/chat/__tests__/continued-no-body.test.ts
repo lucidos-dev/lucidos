@@ -16,7 +16,7 @@ const partsSource = readFileSync(resolve(here, '../chat-exchange-parts.tsx'), 'u
  * A non-last CC exchange that produced nothing (no response, no events) is
  * pure visual noise — the entire response panel is hidden, not just its body.
  * The next exchange's user message implies the chronological flow without
- * needing a "Continued below ↳" placeholder.
+ * needing a "Done ↳" placeholder.
  *
  * Both terminal-ish statuses qualify: 'done' (clean handoff — CC went idle or
  * the session ended normally) and 'interrupted' (mid-work follow-up — CC had a

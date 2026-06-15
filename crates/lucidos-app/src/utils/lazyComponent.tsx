@@ -1,6 +1,7 @@
 import { signal } from '@preact/signals';
 import { h, type ComponentType } from 'preact';
 import { showToast } from '../store/store';
+import { reloadForStaleChunk } from '../hooks/sw-update';
 
 /**
  * Render a code-split component lazily — fetched on first mount, then cached.
@@ -8,9 +9,11 @@ import { showToast } from '../store/store';
  * (`{open.value && <Lazy />}`) so the chunk only fetches on first open;
  * mounting unconditionally would defeat the split.
  *
- * Failed loads surface a toast and reset the loading flag, so re-mounting
- * (e.g. user reopens the overlay) retries. The common cause is a stale bundle
- * after deploy — the toast tells the user to refresh.
+ * The common failure is a stale bundle: a rebuild shipped while this tab kept
+ * the old build in memory, so the lazy chunk's old hashed URL now 404s. We
+ * auto-reload to the new build (`reloadForStaleChunk`) instead of stranding the
+ * user — and only fall back to a "Refresh the page" toast if the loop guard
+ * trips. The `loading` flag is reset either way, so a re-mount retries.
  */
 export function lazyComponent<P>(
   loader: () => Promise<ComponentType<P> | { default: ComponentType<P> }>,
@@ -29,7 +32,11 @@ export function lazyComponent<P>(
       (err) => {
         loading = null;
         console.error('[lazyComponent] load failed', err);
-        showToast('Failed to load. Refresh the page to try again.', 'error');
+        // Almost always a stale chunk after a rebuild — reload to the new build.
+        // Toast only if the loop guard already reloaded us recently.
+        if (!reloadForStaleChunk()) {
+          showToast('Failed to load. Refresh the page to try again.', 'error');
+        }
       },
     );
   }

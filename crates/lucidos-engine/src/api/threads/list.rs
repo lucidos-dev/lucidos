@@ -23,7 +23,7 @@ pub struct ListThreadsQuery {
 /// Hard cap on how many family-extension threads `list_threads` and
 /// `get_older_threads` will pull in alongside the paginated base set. Without
 /// a cap, an archive page covering a pathological fan-out root (one chat
-/// spawning hundreds of CC / trigger children) balloons the initial payload
+/// spawning hundreds of coding-agent / trigger children) balloons the initial payload
 /// into the hundreds, and the frontend's drawer re-renders every row on each
 /// SSE flush. 100 is enough to render typical families completely; deeper
 /// families reveal themselves on scroll-pagination.
@@ -68,7 +68,7 @@ pub(in crate::api) async fn list_threads(
     Query(query): Query<ListThreadsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Active thread IDs — only threads with a live processing task (chat loop running).
-    // Claude Code session existence no longer makes a thread "active" — the status column in
+    // Coding-agent session existence no longer makes a thread "active" — the status column in
     // thread_summaries handles that (set by CodingAgentIdled → 'waiting').
     let active_id_strings: Vec<String> = state
         .engine
@@ -77,13 +77,17 @@ pub(in crate::api) async fn list_threads(
         .map(|id| id.to_string())
         .collect();
 
-    // Run all four DB queries in parallel
+    // Run all DB queries in parallel
     let store = state.engine.event_store();
-    let (saved_result, recent_result, active_result, composing_result) = tokio::join!(
+    let (saved_result, recent_result, active_result, composing_result, archive_count_result) = tokio::join!(
         store.get_saved_threads(),
         store.get_recent_threads(15),
         store.get_threads_by_ids(&active_id_strings),
         store.get_composing_threads(),
+        // Unfiltered total for the first-paint badge; the frontend re-fetches a
+        // filter-scoped count via GET /threads/archived-count when a drawer
+        // filter is active (see `refreshArchivedCount`).
+        store.count_archived_threads(None, None, None, None),
     );
 
     let saved = saved_result.map_err(|e| {
@@ -112,6 +116,13 @@ pub(in crate::api) async fn list_threads(
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to get composing threads: {}", e),
+        )
+    })?;
+    let archive_count = archive_count_result.map_err(|e| {
+        log!("[API] Failed to count archived threads: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to count archived threads: {}", e),
         )
     })?;
 
@@ -160,6 +171,10 @@ pub(in crate::api) async fn list_threads(
     let mut response = serde_json::json!({
         "saved": saved,
         "archive": recent,
+        // Total archived-pile size (not just the loaded `archive` window) — the
+        // collapsed Archive section's count badge reads this so it reflects the
+        // true total instead of however many rows happen to be paginated in.
+        "archive_count": archive_count,
         "active": active_id_strings,
         "active_threads": active_threads,
         "composing": composing,
@@ -192,7 +207,8 @@ pub struct ListThreadSummariesQuery {
     /// Omitted → no filter.
     #[serde(default)]
     pub active: Option<bool>,
-    /// Comma-separated source filter: `chat`, `trigger`, `claude_code`.
+    /// Comma-separated source filter: `chat`, `trigger`, `coding-agent`
+    /// (`claude_code` is accepted as a legacy alias).
     #[serde(default)]
     pub source: Option<String>,
     /// Server clamps to 1..=1000. Default 100. Only consumed by the list
@@ -201,13 +217,29 @@ pub struct ListThreadSummariesQuery {
     pub limit: Option<i64>,
 }
 
-/// Map an optional comma-separated query param to the filter shape the
-/// store helpers expect. An empty list (no items after trim) collapses to
-/// `None` so the SQL `IS NULL` branch fires; `Some(vec![])` would bind as
-/// `ANY('{}')` and silently return zero rows.
+fn canonical_source_filter_value(value: String) -> String {
+    match value.as_str() {
+        "coding-agent" => "claude_code".to_string(),
+        _ => value,
+    }
+}
+
+fn parse_source_csv(value: &str) -> Vec<String> {
+    parse_csv(value)
+        .into_iter()
+        .map(canonical_source_filter_value)
+        .collect()
+}
+
+/// Map an optional comma-separated query param to the filter shape the store
+/// helpers expect. API callers should use `coding-agent`; legacy callers may
+/// still send `claude_code`, which is the persisted `thread_summaries.source`
+/// value. An empty list (no items after trim) collapses to `None` so the SQL
+/// `IS NULL` branch fires; `Some(vec![])` would bind as `ANY('{}')` and
+/// silently return zero rows.
 fn parse_source_filter(raw: &Option<String>) -> Option<Vec<String>> {
     raw.as_deref()
-        .map(parse_csv)
+        .map(parse_source_csv)
         .filter(|v| !v.is_empty())
 }
 
@@ -304,17 +336,65 @@ pub(in crate::api) async fn count_thread_summaries(
     Ok(Json(serde_json::json!({ "count": count })))
 }
 
+/// Query params for `GET /api/v1/threads/archived-count` — the filter-scoped
+/// Archive-badge count. Mirrors [`OlderThreadsQuery`]'s facet params minus the
+/// pagination cursor (a `COUNT(*)` needs no `before`/`limit`).
+#[derive(Deserialize)]
+pub struct ArchivedCountQuery {
+    pub sources: Option<String>,
+    pub trigger_ids: Option<String>,
+    pub repo_ids: Option<String>,
+    pub app_ids: Option<String>,
+}
+
+/// GET /api/v1/threads/archived-count?sources=&trigger_ids=&repo_ids=&app_ids=
+/// → `{ "count": N }`. True size of the archived pile MATCHING the active drawer
+/// filter, so the collapsed Archive badge reflects the filter and stays stable
+/// regardless of how many rows are paginated in. Same predicate as
+/// `/threads/older` (`channel_facet_filter_sql`): a `sources` channel gate
+/// ANDed with per-channel facet narrowing, so whole channels and facet ids
+/// compose (chat + coding-agent + one trigger counts the union, not the trigger
+/// alone).
+pub(in crate::api) async fn get_archived_count(
+    State(state): State<AppState>,
+    Query(q): Query<ArchivedCountQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let sources = parse_source_filter(&q.sources);
+    let trigger_ids: Option<Vec<String>> = q.trigger_ids.as_deref().map(parse_csv);
+    let repo_ids: Option<Vec<String>> = q.repo_ids.as_deref().map(parse_csv);
+    let app_ids: Option<Vec<String>> = q.app_ids.as_deref().map(parse_csv);
+    let count = state
+        .engine
+        .event_store()
+        .count_archived_threads(
+            sources.as_deref(),
+            trigger_ids.as_deref(),
+            repo_ids.as_deref(),
+            app_ids.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            log!("[API] Failed to count archived threads: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to count archived threads: {}", e),
+            )
+        })?;
+    Ok(Json(serde_json::json!({ "count": count })))
+}
+
 #[derive(Deserialize)]
 pub struct OlderThreadsQuery {
     pub before: String,
     pub limit: Option<i64>,
-    /// Comma-separated list of sources to filter by (e.g. "chat,claude_code")
+    /// Comma-separated list of sources to filter by (e.g. "chat,coding-agent").
+    /// `claude_code` remains accepted as a legacy alias.
     pub sources: Option<String>,
     /// Comma-separated list of trigger ids to filter by — narrows to
     /// trigger-channel threads spawned by one of the given triggers.
     pub trigger_ids: Option<String>,
     /// Comma-separated list of repository UUIDs to filter by — narrows to
-    /// CC-channel threads bound to one of the given repos. Composes with
+    /// coding-agent threads bound to one of the given repos. Composes with
     /// `trigger_ids` via OR (see `EventStore::get_older_threads`).
     pub repo_ids: Option<String>,
     /// Comma-separated list of app ids to filter by — narrows to app
@@ -331,7 +411,7 @@ fn parse_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// GET /api/v1/threads/older?before=ISO8601&limit=15&sources=chat,claude_code&trigger_ids=t1,t2&repo_ids=r1,r2
+/// GET /api/v1/threads/older?before=ISO8601&limit=15&sources=chat,coding-agent&trigger_ids=t1,t2&repo_ids=r1,r2
 pub(in crate::api) async fn get_older_threads(
     State(state): State<AppState>,
     Query(query): Query<OlderThreadsQuery>,
@@ -343,7 +423,7 @@ pub(in crate::api) async fn get_older_threads(
         )
     })?;
     let limit = query.limit.unwrap_or(15).min(50);
-    let sources: Option<Vec<String>> = query.sources.as_deref().map(parse_csv);
+    let sources = parse_source_filter(&query.sources);
     let trigger_ids: Option<Vec<String>> = query.trigger_ids.as_deref().map(parse_csv);
     let repo_ids: Option<Vec<String>> = query.repo_ids.as_deref().map(parse_csv);
     let app_ids: Option<Vec<String>> = query.app_ids.as_deref().map(parse_csv);
@@ -401,4 +481,29 @@ pub(in crate::api) async fn get_filter_facets(
             )
         })?;
     Ok(Json(facets))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_source_filter;
+
+    #[test]
+    fn parse_source_filter_normalizes_coding_agent_filter_value() {
+        let raw = Some("chat,coding-agent,claude_code, trigger ".to_string());
+        assert_eq!(
+            parse_source_filter(&raw),
+            Some(vec![
+                "chat".to_string(),
+                "claude_code".to_string(),
+                "claude_code".to_string(),
+                "trigger".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_source_filter_collapses_blank_to_none() {
+        let raw = Some(" , ".to_string());
+        assert_eq!(parse_source_filter(&raw), None);
+    }
 }

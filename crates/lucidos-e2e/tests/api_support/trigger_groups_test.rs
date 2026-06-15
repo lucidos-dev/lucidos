@@ -299,8 +299,28 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
     let res: serde_json::Value = resp.json().await.expect("Invalid JSON");
     assert_eq!(res["success"], true, "Clearing group_id must succeed: {:?}", res);
 
-    let resp = delete_group(&client, &group_id).await;
-    assert_eq!(resp.status().as_u16(), 204, "Empty group delete must succeed");
+    // Clearing group_id rides the same async projection as the create above:
+    // PUT /triggers returns once the TriggerUpdated event is persisted, but the
+    // in-memory trigger registry the delete handler reads is updated by the
+    // EventBus subscriber asynchronously. Poll the delete until the membership
+    // drop has propagated (204) instead of asserting on the first attempt — a
+    // single shot races the subscriber under parallel load and flakes with 409.
+    // Delete is a safe retry: a 409 emits nothing, so re-issuing is a no-op
+    // until the registry catches up.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let resp = delete_group(&client, &group_id).await;
+        let status = resp.status().as_u16();
+        if status == 204 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Empty group delete must succeed within 5s (last status {})",
+            status
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     // Cleanup: delete the trigger so other tests' /triggers polls aren't
     // polluted by stale entries.

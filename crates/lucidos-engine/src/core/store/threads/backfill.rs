@@ -115,4 +115,65 @@ impl EventStore {
         crate::core::PreferenceStore::set(&self.pool, BACKFILL_TRIGGER_ID_V5_MARKER, "1").await?;
         Ok(updated)
     }
+
+    /// Recover a `repo_names` entry for repos that predate the `RepositoryAdded`
+    /// event, so the filter / thread rows stop showing their raw UUID.
+    ///
+    /// Why: the `repo_names` projection (migration `20260614162518`) and its
+    /// initial backfill draw the name from the live `repositories` registry and
+    /// the `RepositoryAdded` event log. But a repo added before that event was
+    /// wired up emits no `RepositoryAdded`, and once removed (`DELETE FROM
+    /// repositories`) it's absent from the registry too — so neither source
+    /// knows its name and the read path falls back to the UUID. The repo's
+    /// *path*, however, still lives in `changes.repo_root` (recorded per
+    /// proposed change), and a repo's name is conventionally the path's final
+    /// segment. This scavenges that basename as a last-resort name.
+    ///
+    /// `ON CONFLICT DO NOTHING` keeps the authoritative names (registry / event)
+    /// from the initial backfill untouched — this only fills genuine gaps. App
+    /// coding-agent threads record a *workspace* root in `repo_root` (whose
+    /// basename is the workspace, not a repo), so they're excluded. Once-only —
+    /// guarded by a marker; going forward `RepositoryAdded` keeps `repo_names`
+    /// current with the real user-chosen name.
+    pub async fn backfill_repo_names_from_changes(
+        &self,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        if crate::core::PreferenceStore::get(&self.pool, BACKFILL_REPO_NAMES_FROM_CHANGES_MARKER)
+            .await?
+            .is_some()
+        {
+            return Ok(0);
+        }
+
+        // Per repo, take the most-recent change's `repo_root` and reduce it to
+        // its final path segment (`^.*/` strips everything up to the last
+        // separator; `rtrim` drops a stray trailing slash first). The regex
+        // guards the `::uuid` cast against any malformed `cc_repo_id`.
+        let inserted = sqlx::query(
+            "INSERT INTO repo_names (id, name) \
+             SELECT DISTINCT ON (ts.cc_repo_id) \
+                 ts.cc_repo_id::uuid AS id, \
+                 regexp_replace(rtrim(c.repo_root, '/'), '^.*/', '') AS name \
+             FROM thread_summaries ts \
+             JOIN changes c ON c.thread_id = ts.thread_id \
+             WHERE ts.cc_repo_id IS NOT NULL \
+               AND ts.cc_repo_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+               AND ts.coding_agent_kind IS DISTINCT FROM 'app' \
+               AND c.repo_root IS NOT NULL \
+               AND regexp_replace(rtrim(c.repo_root, '/'), '^.*/', '') <> '' \
+             ORDER BY ts.cc_repo_id, c.created_at DESC \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected() as usize;
+
+        crate::core::PreferenceStore::set(
+            &self.pool,
+            BACKFILL_REPO_NAMES_FROM_CHANGES_MARKER,
+            "1",
+        )
+        .await?;
+        Ok(inserted)
+    }
 }

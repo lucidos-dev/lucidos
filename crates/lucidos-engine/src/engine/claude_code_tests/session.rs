@@ -270,6 +270,7 @@ fn make_test_session(
         has_changes: false,
         requires_restart: false,
         pending_stop: None,
+        cancel_actor: None,
         stop: Arc::new(tokio::sync::Notify::new()),
         interrupt: Arc::new(tokio::sync::Notify::new()),
         idle_notify: Arc::new(tokio::sync::Notify::new()),
@@ -388,6 +389,52 @@ async fn is_in_flight_false_for_exited_session() {
     let mut session = make_test_session(msg_tx, false);
     session.process_exited = true;
     assert!(!session.is_in_flight());
+}
+
+// Regression coverage for the "ResponseCanceled is missing device" gap on a
+// LIVE Claude Code session: `POST /api/v1/claude-code/stop` (UserStop) resolves
+// the actor from the request headers and `interrupt_agent` stamps it on the
+// session's `cancel_actor` field before firing the `interrupt` notify. The
+// run_session interrupt arm drains it (`take_session_cancel_actor`) into
+// `meta.actor` so the emitted `ResponseCanceled` records WHICH device clicked
+// Cancel — the Initiator popover's Device row. These tests exercise the field's
+// stamp-and-drain contract in isolation (a full `LucidosEngine` isn't built
+// here; the integration through `interrupt_agent` / `take_session_cancel_actor`
+// is identical, just behind the `agent_sessions` map lock).
+
+/// `interrupt_agent` stamps then the run loop drains; the second drain is empty
+/// so a resumed turn on the same session can't inherit a stale device.
+#[tokio::test]
+async fn cancel_actor_field_stores_and_drains() {
+    use crate::engine::thread_events::MessageOrigin;
+
+    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut session = make_test_session(msg_tx, false);
+
+    assert!(
+        session.cancel_actor.is_none(),
+        "a fresh session has no pending cancel actor — engine-internal interrupts \
+         must not inherit a phantom device"
+    );
+
+    // Stamp (mirrors interrupt_agent's live-session branch).
+    let actor = MessageOrigin::Device {
+        device_id: "ios-1".into(),
+        label: "Kenneth's iPhone".into(),
+    };
+    session.cancel_actor = Some(actor.clone());
+
+    // First drain returns the stamped actor (what take_session_cancel_actor does).
+    assert_eq!(
+        session.cancel_actor.take(),
+        Some(actor),
+        "first take must return the device that clicked Cancel"
+    );
+    // One-shot: a resumed turn must not re-stamp the same device.
+    assert!(
+        session.cancel_actor.take().is_none(),
+        "second take must be empty"
+    );
 }
 
 #[test]

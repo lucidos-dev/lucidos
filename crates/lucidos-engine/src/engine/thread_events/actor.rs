@@ -199,7 +199,7 @@ impl MessageOrigin {
     }
 
     /// Convenience constructor for engine-initiated origins. Tightens emit sites
-    /// like `Some(MessageOrigin::engine(EngineReason::SessionRecovered))`.
+    /// like `Some(MessageOrigin::engine(EngineReason::ContinuationStarted))`.
     pub fn engine(reason: EngineReason) -> Self {
         Self::Engine { reason }
     }

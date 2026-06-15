@@ -910,3 +910,68 @@ fn next_run_returns_none_when_paused() {
     config.paused = true;
     assert!(config.next_run().is_none());
 }
+
+// --- Side-effect grant (ADR 0002, Phase 5) ---
+
+#[test]
+fn from_created_payload_parses_side_effect_grant() {
+    use crate::engine::command_guard::SideEffectCategory;
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+        "side_effect_grant": ["email", "external_api"],
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(
+        config.side_effect_grant,
+        vec![SideEffectCategory::Email, SideEffectCategory::ExternalApi]
+    );
+}
+
+#[test]
+fn from_created_payload_side_effect_grant_defaults_empty_and_skips_unknown() {
+    use crate::engine::command_guard::SideEffectCategory;
+    // Absent → empty (no grant).
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+    });
+    assert!(TriggerConfig::from_created_payload(&payload)
+        .unwrap()
+        .side_effect_grant
+        .is_empty());
+
+    // Unknown / forward-compat entries are skipped, duplicates deduped.
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+        "side_effect_grant": ["email", "email", "future_category", "cloud_cli"],
+    });
+    assert_eq!(
+        TriggerConfig::from_created_payload(&payload).unwrap().side_effect_grant,
+        vec![SideEffectCategory::Email, SideEffectCategory::CloudCli]
+    );
+}
+
+#[test]
+fn apply_update_replaces_and_clears_side_effect_grant() {
+    use crate::engine::command_guard::SideEffectCategory;
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+        "side_effect_grant": ["email"],
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+
+    // Replacement.
+    config.apply_update(&json!({ "trigger_id": "t1", "side_effect_grant": ["cloud_cli"] }));
+    assert_eq!(config.side_effect_grant, vec![SideEffectCategory::CloudCli]);
+
+    // Absent field leaves it as-is.
+    config.apply_update(&json!({ "trigger_id": "t1", "name": "T2" }));
+    assert_eq!(config.side_effect_grant, vec![SideEffectCategory::CloudCli]);
+
+    // Empty array clears it.
+    config.apply_update(&json!({ "trigger_id": "t1", "side_effect_grant": [] }));
+    assert!(config.side_effect_grant.is_empty());
+}

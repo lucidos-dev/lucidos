@@ -133,7 +133,7 @@ describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / Sys
   });
   it('api with mode=engine → Lucidos Engine', () => {
     expect(actorInitiator({ kind: 'api', mode: 'engine' }))
-      .toEqual({ icon: '⚙', label: 'Lucidos Engine' });
+      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
   });
   it('workspace with mode=human → API caller (a human in another workspace is not "You" here)', () => {
     expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'human' }))
@@ -145,7 +145,7 @@ describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / Sys
   });
   it('workspace with mode=engine → Lucidos Engine', () => {
     expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'engine' }))
-      .toEqual({ icon: '⚙', label: 'Lucidos Engine' });
+      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
   });
   it('parent_thread (default mode=agent) → Lucidos Agent', () => {
     expect(actorInitiator({ kind: 'thread_link', thread_id: 't' }))
@@ -153,16 +153,16 @@ describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / Sys
   });
   it('parent_thread with mode=engine → Lucidos Engine', () => {
     expect(actorInitiator({ kind: 'thread_link', thread_id: 't', mode: 'engine' }))
-      .toEqual({ icon: '⚙', label: 'Lucidos Engine' });
+      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
   });
   it('engine origin → Lucidos Engine', () => {
     expect(actorInitiator({ kind: 'engine', reason: { kind: 'session_recovered' } }))
-      .toEqual({ icon: '⚙', label: 'Lucidos Engine' });
+      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
   });
   it('system origin → System (distinct from engine — process killed by host, not engine-deliberate)', () => {
     expect(actorInitiator({ kind: 'system' })).toEqual({ icon: '⚙', label: 'System' });
   });
   it('undefined origin → Lucidos Engine', () => {
-    expect(actorInitiator(undefined)).toEqual({ icon: '⚙', label: 'Lucidos Engine' });
+    expect(actorInitiator(undefined)).toEqual({ icon: '⬡', label: 'Lucidos Engine' });
   });
 });

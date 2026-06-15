@@ -1,6 +1,6 @@
 import { signal, computed } from '@preact/signals';
 import { focusedThreadId } from '../store';
-import { focusThread, type FocusThreadOptions } from './threads';
+import { focusThread } from './threads';
 
 export type ThreadNavEntry = { type: 'thread'; id: string };
 
@@ -159,33 +159,33 @@ export function removeThreadNavEntries(threadId: string): void {
   saveThreadNavState();
 }
 
-function restore(entry: ThreadNavEntry, options?: FocusThreadOptions): void {
+function restore(entry: ThreadNavEntry): void {
   _restoring = true;
   try {
-    focusThread(entry.id, options);
+    focusThread(entry.id);
   } finally {
     _restoring = false;
   }
 }
 
-export function threadNavBack(options?: FocusThreadOptions): void {
+export function threadNavBack(): void {
   ensureInitialized();
   if (!canGoBackThread.value) return;
   // See canGoBackThread: unfocused short-circuits without decrementing.
   if (focusedThreadId.value === null) {
-    restore(threadNavStack.value[threadNavCursor.value], options);
+    restore(threadNavStack.value[threadNavCursor.value]);
     return;
   }
   threadNavCursor.value--;
-  restore(threadNavStack.value[threadNavCursor.value], options);
+  restore(threadNavStack.value[threadNavCursor.value]);
   saveThreadNavState();
 }
 
-export function threadNavForward(options?: FocusThreadOptions): void {
+export function threadNavForward(): void {
   ensureInitialized();
   if (!canGoForwardThread.value) return;
   threadNavCursor.value++;
-  restore(threadNavStack.value[threadNavCursor.value], options);
+  restore(threadNavStack.value[threadNavCursor.value]);
   saveThreadNavState();
 }
 

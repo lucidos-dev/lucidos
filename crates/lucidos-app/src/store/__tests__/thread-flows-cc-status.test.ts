@@ -28,10 +28,10 @@ describe('Bug: aborted Claude Code session (engine restart) should be in inbox f
     expect(map.get(id)!.meta.status).toBe('failed');
   });
 
-  it('ResponseAborted + inbox stored section → displaySection is review', () => {
+  it('ResponseAborted + inbox stored section → displaySection is current', () => {
     // ResponseAborted sets status='failed' when no CC changes are pending and
-    // marks the section as 'inbox' — together they place the thread in REVIEW.
-    expect(displaySection('inbox', 'failed', false, false, false, false)).toBe('review');
+    // marks the section as 'inbox' — together they place the thread in Current.
+    expect(displaySection('inbox', 'failed', false, false, false, false)).toBe('current');
   });
 
   it('aborted then recovered → running while recovery CC works', () => {
@@ -278,9 +278,9 @@ describe('Bug: CC follow-up messages should never show "Queued" or premature "Wo
     const exchanges = getExchangesWithPending(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // Follow-up with no steps: should be "pending" (Requesting), not "cc-working" (Working)
+    // Follow-up with no steps: should be "pending" (Requesting), not "coding-agent-working" (Working)
     const status = exchangeStatus(exchanges[1], '', true, false, true);
-    expect(status).not.toBe('cc-working');
+    expect(status).not.toBe('coding-agent-working');
     expect(status).toBe('pending');
     expect(getLabel(exchanges[1], '', true, false, true)).toBe('Requesting');
   });
@@ -303,9 +303,9 @@ describe('Bug: CC follow-up messages should never show "Queued" or premature "Wo
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // CodingAgentPromptSent adds a step → hasSteps=true → cc-working → "Working"
+    // CodingAgentPromptSent adds a step → hasSteps=true → coding-agent-working → "Working"
     const status = exchangeStatus(exchanges[1], '', true, false, true);
-    expect(status).toBe('cc-working');
+    expect(status).toBe('coding-agent-working');
     expect(getLabel(exchanges[1], '', true, false, true)).toBe('Working');
   });
 
@@ -327,9 +327,9 @@ describe('Bug: CC follow-up messages should never show "Queued" or premature "Wo
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // Follow-up WITH steps: should be "cc-working"
+    // Follow-up WITH steps: should be "coding-agent-working"
     const status = exchangeStatus(exchanges[1], '', true, false, true);
-    expect(status).toBe('cc-working');
+    expect(status).toBe('coding-agent-working');
     expect(getLabel(exchanges[1], '', true, false, true)).toBe('Working');
   });
 
@@ -570,9 +570,9 @@ describe('CC follow-up after resolved changes correctly shows running', () => {
     // MessageReceived → running
     expect(thread.meta.status).toBe('running');
 
-    // And display section must be active, not archive
+    // And display section must be current, not archive
     const section = displaySection('archived', 'running', false, false, false, false);
-    expect(section).toBe('active');
+    expect(section).toBe('current');
   });
 
   it('CodingAgentUserMessageSent after resolved changes → running (with live process)', () => {

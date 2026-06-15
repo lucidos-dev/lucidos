@@ -1,4 +1,20 @@
-import type { AbortCause, EngineReason } from '../store/thread-events';
+import type { AbortCause, CancelCause, EngineReason } from '../store/thread-events';
+
+/** Why a user-driven `ResponseCanceled` fired, for the Initiator info popover.
+ *  Mirrors Rust's `CancelCause` doc comments. The heading ("Why the response
+ *  stopped") is owned by the renderer; every branch returns a non-empty string
+ *  so the row never silently drops. */
+export function describeCancelCause(cause: CancelCause | undefined): string {
+  switch (cause) {
+    case 'user_stop':
+      return 'You clicked Cancel on the running response.';
+    case 'user_action':
+      return 'You applied, discarded, or archived a still-running Claude Code session — the action stopped the current turn first.';
+    case 'unknown':
+    case undefined:
+      return 'You canceled the response (cause not recorded).';
+  }
+}
 
 /** Why a system-driven `ResponseAborted` fired, for the route popover. The
  *  heading ("Why the response stopped") is owned by the renderer. Each branch

@@ -132,3 +132,12 @@ pub(super) async fn ui_navigate(
 
     Json(serde_json::json!({ "success": true })).into_response()
 }
+
+/// Routes for the SDK static assets and the `/ui/navigate` SDK bridge.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/sdk.js", get(serve_sdk_js))
+        .route("/sdk-iframe.css", get(serve_sdk_iframe_css))
+        .route("/sdk-iframe-audio.js", get(serve_sdk_iframe_audio_js))
+        .route("/ui/navigate", post(ui_navigate))
+}

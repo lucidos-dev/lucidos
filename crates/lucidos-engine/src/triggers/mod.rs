@@ -2,11 +2,13 @@ pub mod condition;
 pub mod config;
 pub mod groups;
 pub mod replay;
+pub mod summary;
 
 pub use config::{
     is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
     EventSubscription, TriggerConfig, TriggerRun,
 };
+pub use summary::{ensure_non_empty_error, ensure_non_empty_summary, script_fallback_summary};
 pub use groups::{
     find_group_by_name_ci, replay_trigger_group_events, TriggerGroup, TriggerGroupEventRow,
 };
@@ -63,6 +65,7 @@ mod tests {
             app_id: None,
             go_to_review: false,
             group_id: None,
+            side_effect_grant: vec![],
         }
     }
 
@@ -170,6 +173,7 @@ mod tests {
             app_id: None,
             go_to_review: false,
             group_id: None,
+            side_effect_grant: vec![],
         };
         configs.insert("cron-only".into(), cron_trigger);
 

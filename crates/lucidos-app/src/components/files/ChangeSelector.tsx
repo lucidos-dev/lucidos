@@ -6,7 +6,7 @@ import { selectRepoChange, loadMoreRepoChanges } from '../../store/actions/repos
 import { formatTimeAgo } from '../../utils/formatTime';
 import type { Change } from '../../api/client';
 import { LoadableError } from '../shared/LoadableError';
-import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
+import { Overlay } from '../shared/Overlay';
 
 function changeLabel(change: Change): string {
   return (change.description || 'Claude Code changes').split('\n')[0];
@@ -16,8 +16,6 @@ export function ChangeSelector() {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
-
-  useDismissOnOutside(open, ref, null, () => setOpen(false));
 
   const loadable = repoChanges.value;
   if (loadable.status === 'failed') return <LoadableError error={loadable.error} noun="changes" />;
@@ -57,8 +55,15 @@ export function ChangeSelector() {
         </span>
         <span class="dropdown-chevron">{open ? '\u25B4' : '\u25BE'}</span>
       </button>
-      {open && (
-        <div class="dropdown-menu change-selector-menu" ref={listRef} onScroll={handleScroll}>
+      <Overlay
+        open={open}
+        onClose={() => setOpen(false)}
+        anchor={ref.current}
+        backdrop={false}
+        panelClass="dropdown-menu change-selector-menu"
+        panelRef={listRef}
+        panelProps={{ onScroll: handleScroll }}
+      >
           <div
             class={`dropdown-option${!selectedId ? ' active' : ''}`}
             onClick={() => handleSelect(null)}
@@ -108,8 +113,7 @@ export function ChangeSelector() {
               Scroll for more
             </div>
           )}
-        </div>
-      )}
+      </Overlay>
     </div>
   );
 }

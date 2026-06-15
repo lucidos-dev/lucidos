@@ -271,6 +271,7 @@ async fn continuation_requested_produces_spawn_request() {
         &bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-cont".into(),
             branch: "claude-code/cont".into(),
             repo_id: None,
@@ -361,6 +362,7 @@ async fn dispatcher_skips_trigger_already_followed_by_cc_event() {
         &bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-x".into(),
             branch: "claude-code/x".into(),
             repo_id: None,
@@ -517,6 +519,7 @@ async fn session_ended_does_not_trigger_dispatch() {
         &bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-end".into(),
             branch: "claude-code/end".into(),
             repo_id: None,

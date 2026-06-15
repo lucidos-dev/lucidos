@@ -1,7 +1,9 @@
+use crate::llm::openai::OpenAiProvider;
 use crate::llm::provider::{LlmProvider, LlmResponse, Message, MessageContent};
 use crate::llm::vertex::{location_handle, LocationHandle, TokenCache, VertexProvider};
 use crate::memory::RETRIEVAL_MIN_IMPORTANCE;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Bump when extractor logic changes in a way that produces materially
 /// different facts from the same input — new prompt, new filter, new context
@@ -147,6 +149,11 @@ pub struct MemoryExtractor {
     project_id: String,
     location: LocationHandle,
     token_cache: TokenCache,
+    /// Resolved OpenAI API key (a Settings → Providers `openai` credential or
+    /// the `OPENAI_API_KEY` env var), attached via [`Self::with_openai_key`].
+    /// Lets `provider_for_model` route `gpt-*` background-task models to OpenAI;
+    /// `None` → a `gpt-*` model errors clearly instead of hitting Vertex.
+    openai_api_key: Option<String>,
 }
 
 impl MemoryExtractor {
@@ -174,38 +181,62 @@ impl MemoryExtractor {
             project_id,
             location,
             token_cache,
+            openai_api_key: None,
         })
     }
 
-    /// Access the underlying Flash provider for lightweight LLM tasks.
+    /// Attach the resolved OpenAI key so background-task models named `gpt-*`
+    /// (title, image description, memory, command judge) route to OpenAI.
+    /// Builder-style so the existing constructor call sites stay unchanged.
+    pub fn with_openai_key(mut self, key: Option<String>) -> Self {
+        self.openai_api_key = key;
+        self
+    }
+
+    /// Access the underlying Flash provider for lightweight LLM tasks. Returns
+    /// the concrete `VertexProvider` because callers (e.g. grounded web search)
+    /// use Vertex-only methods not on the `LlmProvider` trait.
     pub fn provider(&self) -> &VertexProvider {
         &self.provider
     }
 
-    /// Create a VertexProvider for a specific model, sharing the token cache
-    /// and live region handle. The reqwest builder can theoretically fail —
-    /// callers propagate via `?` so the panic doesn't land deep inside an
-    /// unrelated call stack.
+    /// Build the provider for a background-task model, routed by model id:
+    /// `gpt-*` → OpenAI (requires [`Self::with_openai_key`]); everything else →
+    /// Vertex (Gemini / Vertex-served Claude), preserving the prior behavior.
+    /// Empty / `"default"` returns the shared default-model Vertex provider. The
+    /// reqwest builder can fail — callers propagate via `?`.
+    ///
+    /// Only the `gpt-*`-vs-Vertex split is handled because those are the only
+    /// providers a background-task model can name: the picker offers Gemini
+    /// Flash, Vertex-served Haiku, and GPT-5.4. Direct-Anthropic models (Fable)
+    /// are deliberately never offered as background options.
     pub fn provider_for_model(
         &self,
         model: &str,
-    ) -> Result<VertexProvider, Box<dyn std::error::Error + Send + Sync>> {
-        if model.is_empty() || model == "default" {
-            Ok(self.provider.clone())
+    ) -> Result<Arc<dyn LlmProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        if model.starts_with("gpt-") {
+            let key = self.openai_api_key.clone().ok_or_else(|| {
+                format!(
+                    "OpenAI background model '{model}' selected but no OpenAI key is configured (Settings → Providers or OPENAI_API_KEY)"
+                )
+            })?;
+            Ok(Arc::new(OpenAiProvider::new(key, model.to_string())?))
+        } else if model.is_empty() || model == "default" {
+            Ok(Arc::new(self.provider.clone()))
         } else {
-            VertexProvider::with_location_handle(
+            Ok(Arc::new(VertexProvider::with_location_handle(
                 self.project_id.clone(),
                 self.location.clone(),
                 model.to_string(),
                 self.token_cache.clone(),
-            )
+            )?))
         }
     }
 
-    /// Single-shot LLM call with optional model override.
+    /// Single-shot LLM call against a routed provider.
     async fn chat_with_provider(
         &self,
-        provider: &VertexProvider,
+        provider: &dyn LlmProvider,
         system: &str,
         user_content: &str,
         reasoning_effort: Option<&str>,
@@ -247,7 +278,7 @@ impl MemoryExtractor {
         };
         let provider = self.provider_for_model(model.unwrap_or_default())?;
         let response = self
-            .chat_with_provider(&provider, &system, content, Some("none"))
+            .chat_with_provider(provider.as_ref(), &system, content, Some("none"))
             .await?;
 
         let raw = response.content.unwrap_or_default();
@@ -303,7 +334,7 @@ impl MemoryExtractor {
         };
         let provider = self.provider_for_model(model.unwrap_or_default())?;
         let response = self
-            .chat_with_provider(&provider, &system, query, Some("none"))
+            .chat_with_provider(provider.as_ref(), &system, query, Some("none"))
             .await?;
 
         let raw = response.content.unwrap_or_default();
@@ -337,7 +368,7 @@ impl MemoryExtractor {
             Write concise flowing prose, no bullet points.";
         let provider = self.provider_for_model(model.unwrap_or_default())?;
         let response = self
-            .chat_with_provider(&provider, system, turns, Some("low"))
+            .chat_with_provider(provider.as_ref(), system, turns, Some("low"))
             .await?;
         let summary = response.content.unwrap_or_default().trim().to_string();
         Ok(summary)
@@ -432,6 +463,46 @@ fn strip_code_fences(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `gpt-*` background-task model routes to OpenAI (with the key attached)
+    /// — the model is baked into the returned provider.
+    #[test]
+    fn provider_for_model_routes_gpt_to_openai() {
+        let ext = MemoryExtractor::new("proj".into(), "europe-west1".into())
+            .expect("extractor builds")
+            .with_openai_key(Some("sk-test".into()));
+        let provider = ext.provider_for_model("gpt-5.4").expect("openai provider builds");
+        assert_eq!(provider.default_model(), "gpt-5.4");
+    }
+
+    /// A `gpt-*` model without an OpenAI key errors clearly rather than silently
+    /// falling through to Vertex (which can't serve it).
+    #[test]
+    fn provider_for_model_gpt_without_key_errors() {
+        let ext = MemoryExtractor::new("proj".into(), "europe-west1".into()).expect("extractor builds");
+        assert!(ext.provider_for_model("gpt-5.4").is_err());
+    }
+
+    /// Non-`gpt-*` models stay on Vertex even when an OpenAI key is present.
+    #[test]
+    fn provider_for_model_routes_non_gpt_to_vertex() {
+        let ext = MemoryExtractor::new("proj".into(), "europe-west1".into())
+            .expect("extractor builds")
+            .with_openai_key(Some("sk-test".into()));
+        let provider = ext
+            .provider_for_model("gemini-3-flash-preview")
+            .expect("vertex provider builds");
+        assert_eq!(provider.default_model(), "gemini-3-flash-preview");
+    }
+
+    /// Empty / "default" returns the shared extractor base provider (the default
+    /// extraction model on Vertex), unchanged from the pre-routing behavior.
+    #[test]
+    fn provider_for_model_default_uses_base_model() {
+        let ext = MemoryExtractor::new("proj".into(), "europe-west1".into()).expect("extractor builds");
+        let provider = ext.provider_for_model("").expect("base provider");
+        assert_eq!(provider.default_model(), default_extraction_model());
+    }
 
     #[test]
     fn test_strip_code_fences_json() {

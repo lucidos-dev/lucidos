@@ -55,6 +55,39 @@ describe('repoFilterOptions — only repos with CC sessions', () => {
     expect(opt[0]).toMatchObject({ id: 'gone', label: 'Gone Repo', deleted: true });
   });
 
+  it('labels a deleted repo from the facet name (no loaded thread)', () => {
+    // The repo is gone from the live registry and has no thread in threadMap,
+    // so only the facet supplies it. The server-resolved facet.name (from the
+    // repo_names projection) must surface as the label — not the raw UUID.
+    repositories.value = { status: 'loaded', data: [] };
+    filterFacets.value = {
+      status: 'loaded',
+      data: {
+        triggers: [],
+        repos: [{ id: 'dead-uuid', name: 'Historical Repo', last_activity: '2026-04-01T00:00:00Z' }],
+        apps: [],
+      },
+    };
+    const opt = repoFilterOptions.value;
+    expect(opt).toHaveLength(1);
+    expect(opt[0]).toMatchObject({ id: 'dead-uuid', label: 'Historical Repo', deleted: true });
+  });
+
+  it('falls back to the UUID when a deleted repo has no recorded name', () => {
+    repositories.value = { status: 'loaded', data: [] };
+    filterFacets.value = {
+      status: 'loaded',
+      data: {
+        triggers: [],
+        repos: [{ id: 'orphan-uuid', name: null, last_activity: '2026-04-01T00:00:00Z' }],
+        apps: [],
+      },
+    };
+    const opt = repoFilterOptions.value;
+    expect(opt).toHaveLength(1);
+    expect(opt[0]).toMatchObject({ id: 'orphan-uuid', label: 'orphan-uuid', deleted: true });
+  });
+
   it('keeps a selected repo even with no session so it stays clearable', () => {
     repositories.value = { status: 'loaded', data: [{ id: 'r1', name: 'Repo 1', path: '/r1' }] };
     threadMap.value = new Map();

@@ -4,6 +4,8 @@ import {
   archivingThreadIds,
   discardingCCThreadIds,
   changes,
+  markThreadAnswering,
+  clearThreadAnswering,
 } from '../store';
 import { loadedOr } from '../types';
 import { applyNow, applyChange, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
@@ -125,9 +127,18 @@ export async function answerThreadQuestion(
   // its answered (height-shrunk) form — otherwise ResizeObserver flips
   // scrolledUp=true and the streaming continuation never auto-scrolls.
   scrollToBottom();
+  // Optimistically mark the thread as resuming so the answered question-divider
+  // doesn't flash "Aborted" while the client's status still reads
+  // `waiting_for_user_answer` (see `isRenderedThreadIdle`). Cleared by the
+  // PromptInput effect once the real status leaves that state, or below on a
+  // 409 / failure (no resume is coming).
+  markThreadAnswering(threadId);
   try {
-    return await apiAnswerThreadQuestion(threadId, toolUseId, answer);
+    const ok = await apiAnswerThreadQuestion(threadId, toolUseId, answer);
+    if (!ok) clearThreadAnswering(threadId); // 409 — stale/duplicate, no resume
+    return ok;
   } catch (err) {
+    clearThreadAnswering(threadId);
     const detail = err instanceof ApiError ? err.reason : 'unknown error';
     showToast(`Failed to send answer: ${detail}`, 'error');
     return false;
@@ -141,7 +152,7 @@ export async function answerThreadQuestion(
  *    'pending' — 404 (no live session, caller falls back to pending preference);
  *                no toast shown so a benign race doesn't look like a UX error
  *    'error'   — hard failure (toast already shown) */
-export async function sendCCControl(threadId: string, request: Record<string, string>): Promise<'ok' | 'pending' | 'error'> {
+export async function sendCodingAgentControl(threadId: string, request: Record<string, string>): Promise<'ok' | 'pending' | 'error'> {
   try {
     await sendControlRequest(threadId, request);
     return 'ok';

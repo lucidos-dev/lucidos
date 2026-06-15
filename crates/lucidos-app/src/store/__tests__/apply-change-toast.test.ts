@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { toasts, applyingChangeIds, threadMap } from '../store';
+import { toasts, applyingChangeIds, applyAllInProgress, threadMap } from '../store';
 
 // Mock the API module before importing the action
 vi.mock('../../api/client', () => ({
   applyChange: vi.fn(),
   applyAllChanges: vi.fn(),
+  cancelApplyAllChanges: vi.fn(),
 }));
 
 // focusThread imports React/Preact-coupled modules (scrollState, navigation) that
@@ -13,21 +14,27 @@ vi.mock('../actions/threads', () => ({
   focusThread: vi.fn(),
 }));
 
-import { applySingleChange, applyAllChanges } from '../actions/chat-changes';
-import { applyChange as apiApply, applyAllChanges as apiApplyAll } from '../../api/client';
+import { applySingleChange, applyAllChanges, cancelApplyAllBatch } from '../actions/chat-changes';
+import { applyChange as apiApply, applyAllChanges as apiApplyAll, cancelApplyAllChanges as apiCancelApplyAll } from '../../api/client';
 
 const mockedApply = vi.mocked(apiApply);
 const mockedApplyAll = vi.mocked(apiApplyAll);
+const mockedCancelApplyAll = vi.mocked(apiCancelApplyAll);
 
 beforeEach(() => {
   toasts.value = [];
   applyingChangeIds.value = new Set();
+  applyAllInProgress.value = false;
   threadMap.value = new Map();
   vi.clearAllMocks();
 });
 
 describe('applySingleChange feedback', () => {
-  it('shows hardening-in-progress toast when status is hardening', async () => {
+  it('does NOT show an HTTP-response toast on hardening — SSE handler covers it (but tracks applying)', async () => {
+    // Apply Now hardening is surfaced by the MissingHardeningDetected SSE
+    // handler (see missing-hardening-toast.test.ts), not by this HTTP path —
+    // mirroring merge conflict. Toasting here too would double-fire whenever
+    // the user is on the hardening thread.
     mockedApply.mockResolvedValue({
       status: 'hardening',
       change_id: 'change-1',
@@ -41,12 +48,11 @@ describe('applySingleChange feedback', () => {
 
     await applySingleChange('change-1');
 
-    // Should show a toast informing the user that hardening is in progress
-    const toast = toasts.value.find(t => t.message.toLowerCase().includes('harden'));
-    expect(toast).toBeTruthy();
-    expect(toast!.type).toBe('info');
+    // No HTTP-response toast — the SSE event owns the user-facing cue.
+    expect(toasts.value.find(t => t.message.toLowerCase().includes('harden'))).toBeUndefined();
 
-    // Should also track the change as applying
+    // Still tracks the change as applying so ChangesPanel shows persistent state
+    // (the SSE event carries no change_id, so this stays on the HTTP path).
     expect(applyingChangeIds.value.has('change-1')).toBe(true);
   });
 
@@ -117,6 +123,55 @@ describe('applySingleChange feedback', () => {
     expect(toast).toBeTruthy();
     expect(toast!.message).not.toBe('timeout');
     expect(toast!.message).toContain('timed out');
+  });
+
+  it('applyAllChanges sets in-progress optimistically on hardening (toast comes from SSE)', async () => {
+    mockedApplyAll.mockResolvedValue({
+      message: 'Started Apply All — hardening the first change.',
+      status: 'hardening',
+      batch_id: 'batch-1',
+      review_thread_id: 'thread-h',
+    });
+
+    await applyAllChanges();
+
+    // Stays "in progress" — only ApplyAllBatchCompleted (SSE) clears it, so the
+    // bulk button keeps showing "Applying..." through the multi-minute harden.
+    expect(applyAllInProgress.value).toBe(true);
+    // No HTTP-response toast — the MissingHardeningDetected SSE handler fires it,
+    // uniform with merge conflict and single Apply (see missing-hardening-toast.test.ts).
+    expect(toasts.value.find(t => t.message.toLowerCase().includes('harden'))).toBeUndefined();
+  });
+
+  it('cancelApplyAllBatch swaps the toast to "Canceling..." and calls the cancel API', async () => {
+    mockedCancelApplyAll.mockResolvedValue({ canceled_batches: 1 });
+
+    await cancelApplyAllBatch();
+
+    expect(mockedCancelApplyAll).toHaveBeenCalledOnce();
+    const toast = toasts.value.find((t) => t.key === 'apply-all-batch');
+    expect(toast?.message.toLowerCase()).toContain('cancel');
+    expect(toast?.spinning).toBe(true);
+    // Action is dropped on the optimistic "Canceling..." toast so a second
+    // click can't fire a second cancel.
+    expect(toast?.action).toBeUndefined();
+  });
+
+  it('cancelApplyAllBatch surfaces an error toast when the cancel request fails', async () => {
+    mockedCancelApplyAll.mockRejectedValue(new Error('No Apply All batch is running'));
+
+    await cancelApplyAllBatch();
+
+    expect(toasts.value.some((t) => t.type === 'error')).toBe(true);
+  });
+
+  it('applyAllChanges clears the in-progress flag when the request errors', async () => {
+    mockedApplyAll.mockRejectedValue(new Error('No pending changes'));
+
+    await applyAllChanges();
+
+    expect(applyAllInProgress.value).toBe(false);
+    expect(toasts.value.find(t => t.type === 'error')).toBeTruthy();
   });
 
   it('applyAllChanges shows a toast when the batch stops at a conflict', async () => {

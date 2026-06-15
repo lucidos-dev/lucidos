@@ -1,5 +1,5 @@
 import { test, expect, Page } from '@playwright/test';
-import { assertHealthy, waitForVisibleInput, isMobileViewport, blurActiveElement, ensureOnThreadPane, openFilesPanel } from './helpers';
+import { assertHealthy, waitForVisibleInput, isMobileViewport, blurActiveElement, ensureOnThreadPane, openFilesPanel, gotoWithRetry } from './helpers';
 
 /** Open file search — tap on mobile, click on desktop. Waits for the
  *  signal-driven Preact render to apply the open state before returning,
@@ -32,11 +32,11 @@ async function isSearchOpen(page: Page): Promise<boolean> {
 test.describe('File search', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // domcontentloaded (vs default 'load') skips waiting on sub-resources
-    // (iframe-loaded SDK apps, images) that occasionally push the goto past
-    // the 120s test timeout on mobile-webkit. Hydration is checked explicitly
-    // below — the explicit #app check is what guarantees the SPA is ready.
-    await page.goto('/', { waitUntil: 'domcontentloaded' });
+    // gotoWithRetry: a bare page.goto can hang the whole 120s test budget on
+    // mobile-webkit when the app-root navigation wedges (see gotoWithRetry).
+    // Hydration is checked explicitly below — the #app check is what guarantees
+    // the SPA is ready.
+    await gotoWithRetry(page, '/');
     await page.waitForFunction(() =>
       document.querySelector('#app')?.childElementCount! > 0,
       undefined, { timeout: 30_000 },

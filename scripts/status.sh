@@ -28,6 +28,28 @@ _inspect_workspace_dir() {
     fi
 }
 
+# Probe the engine /health endpoint for a workspace's API port. Echoes the
+# raw JSON body and returns 0 when the engine answers; returns non-zero when
+# unreachable (or no port given). This is the reachability source of truth
+# that reconciles a stale .lucidos/engine.pid against an engine that is in
+# fact serving — the pidfile only tracks whether THIS host's supervised
+# process is alive, which goes stale across a restart (old PID dead in the
+# file for a beat, or an engine (re)started by a path that didn't refresh it).
+# See the callers in show_workspace_status / json_workspace_status.
+_engine_health_json() {
+    local port="$1" out
+    [ -z "$port" ] && return 1
+    if out=$(curl -sk --connect-timeout 2 --max-time 3 "https://localhost:$port/api/v1/health" 2>/dev/null); then
+        printf '%s' "$out"
+        return 0
+    fi
+    if out=$(curl -s --connect-timeout 2 --max-time 3 "http://localhost:$port/api/v1/health" 2>/dev/null); then
+        printf '%s' "$out"
+        return 0
+    fi
+    return 1
+}
+
 # Parse arguments
 WORKSPACE=""
 JSON_MODE=""
@@ -77,15 +99,29 @@ show_workspace_status() {
         echo "  Ports:     API=$api_port  Vite=$vite_port  PG=${pg_port:-?}"
     fi
 
-    # Engine status
+    # Probe /health once, up front — both the Engine line and the API line
+    # below read this. A responding /health is the truth for "is it serving";
+    # the pidfile only tracks this host's supervised process, which goes stale
+    # across a restart. Reconciling the two stops a serving engine from
+    # reading "STOPPED" directly above an "API: ... (healthy)" line.
+    local api_healthy=""
+    if [ -n "$api_port" ] && _engine_health_json "$api_port" >/dev/null; then
+        api_healthy="1"
+    fi
+
+    # Engine status — pidfile liveness reconciled against reachability.
     if [ -f "$engine_pid_file" ]; then
         local pid
         pid="$(cat "$engine_pid_file")"
         if kill -0 "$pid" 2>/dev/null; then
             echo "  Engine:    RUNNING (PID $pid)"
+        elif [ -n "$api_healthy" ]; then
+            echo "  Engine:    RUNNING (serving on $api_port; pidfile PID $pid is stale)"
         else
             echo "  Engine:    STOPPED (stale pidfile, PID $pid)"
         fi
+    elif [ -n "$api_healthy" ]; then
+        echo "  Engine:    RUNNING (serving on $api_port; no pidfile)"
     else
         echo "  Engine:    STOPPED"
     fi
@@ -142,9 +178,9 @@ show_workspace_status() {
         echo "  PostgreSQL: no container"
     fi
 
-    # API health
+    # API health — reuse the single probe from the top of this function.
     if [ -n "$api_port" ]; then
-        if curl -sk "https://localhost:$api_port/api/v1/health" >/dev/null 2>&1 || curl -s "http://localhost:$api_port/api/v1/health" >/dev/null 2>&1; then
+        if [ -n "$api_healthy" ]; then
             echo "  API:       localhost:$api_port (healthy)"
         else
             echo "  API:       not responding"
@@ -190,12 +226,15 @@ json_workspace_status() {
     pg_name=$(printf '%s' "$ws" | cksum | awk '{print $1}')
     pg_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "lucidos-pg-$pg_name" 2>/dev/null || echo "")
 
-    # Engine running?
+    # Engine running? Pidfile liveness OR a responding /health. Consumers of
+    # this field (cross-workspace open, the control-panel status dot) hit the
+    # port directly, so reachability is the truth they need — a stale pidfile
+    # on a serving engine must not read as "not running".
     local engine_running="false"
     if [ -f "$engine_pid_file" ]; then
         local pid
         pid="$(cat "$engine_pid_file")"
-        if kill -0 "$pid" 2>/dev/null; then
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             engine_running="true"
         fi
     fi
@@ -204,10 +243,12 @@ json_workspace_status() {
     local name
     name=$(basename "$ws")
 
-    # Engine version from health endpoint
-    local engine_version=""
-    if [ "$engine_running" = "true" ] && [ -n "$api_port" ]; then
-        engine_version=$(curl -sk --connect-timeout 2 --max-time 3 "https://localhost:$api_port/api/v1/health" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('engine_version',''))" 2>/dev/null || echo "")
+    # One health probe: confirms reachability (overrides a stale pidfile) and
+    # yields the engine version in the same call.
+    local engine_version="" health_body=""
+    if [ -n "$api_port" ] && health_body=$(_engine_health_json "$api_port"); then
+        engine_running="true"
+        engine_version=$(printf '%s' "$health_body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('engine_version',''))" 2>/dev/null || echo "")
     fi
 
     # Build JSON — use jq for safe escaping of paths/names

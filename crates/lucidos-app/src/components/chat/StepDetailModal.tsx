@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { stepDetailModal } from '../../store/store';
-import { ModalOverlay } from '../shared/ModalOverlay';
+import { Overlay } from '../shared/Overlay';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { stepStatus } from '../../store/thread-events';
 import type { ContextSection, ContextCapture, Loadable } from '../../store/types';
@@ -103,6 +103,10 @@ function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
     needsLazyFetch(snap) ? { status: 'loading' } : inlineLoadable,
   );
 
+  // Deps include `inlineLoadable` (a useMemo keyed on `snap`, already in deps):
+  // its identity is stable across the in-flight fetch, and the `cancelled` flag
+  // guards the async write so a late resolve can't clobber a newer snapshot.
+  // Keep both invariants if you ever refactor this dependency list.
   useEffect(() => {
     if (!needsLazyFetch(snap)) {
       setLoadable(inlineLoadable);
@@ -146,7 +150,7 @@ function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
     <>
       <div class="step-detail-context-meta">
         <code>{hydrated.model || '(unknown model)'}</code>
-        <span> · {hydrated.producer === 'claude_code' ? 'Claude Code' : 'Main LLM'}</span>
+        <span> · {hydrated.producer === 'claude_code' ? 'Claude Code' : hydrated.producer === 'codex' ? 'Codex' : 'Main LLM'}</span>
         <span> · {hydrated.tools.length} tools</span>
         {hydrated.legacy && <span class="context-legacy-badge" data-tooltip="Synthesized from legacy events">legacy capture</span>}
       </div>
@@ -183,6 +187,10 @@ function ResultArea({
     resultStripped ? { status: 'loading' } : inlineLoadable,
   );
 
+  // Deps include `inlineLoadable` (a useMemo keyed on `inlineResult`): its
+  // identity is stable across the in-flight fetch, and the `cancelled` flag
+  // guards the async write so a late resolve can't clobber a newer result.
+  // Keep both invariants if you ever refactor this dependency list.
   useEffect(() => {
     if (!resultStripped) {
       setLoadable(inlineLoadable);
@@ -286,8 +294,15 @@ export function StepDetailModal() {
   const snap = step.contextCapture;
 
   return (
-    <ModalOverlay onClose={close} class="step-detail-overlay">
-      <div class="step-detail-modal" role="dialog" aria-modal="true" data-role="context-captured-modal" onClick={(e) => e.stopPropagation()}>
+    <Overlay
+      open
+      onClose={close}
+      overlayClass="step-detail-overlay"
+      panelClass="step-detail-modal"
+      panelRole="dialog"
+      ariaModal
+      dataRole="context-captured-modal"
+    >
         <div class="step-detail-header">
           <span class={`step-detail-status ${status.className}`}>{status.label}</span>
           {step.created && (
@@ -306,7 +321,6 @@ export function StepDetailModal() {
           ? <ContextCapturePanel snap={snap} />
           : <div class="step-detail-empty">No context snapshot captured for this step.</div>}
         <button class="action-btn step-detail-close" onClick={close}>Close</button>
-      </div>
-    </ModalOverlay>
+    </Overlay>
   );
 }

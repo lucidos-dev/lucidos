@@ -10,6 +10,9 @@ pub(crate) mod cc_settings;
 mod change_ops;
 mod chat;
 pub(crate) mod claude_code;
+pub(crate) mod command_guard;
+pub(crate) mod command_judge;
+pub mod command_permission;
 mod context;
 pub mod event_bus;
 pub(crate) mod loaded_knowhow;
@@ -23,6 +26,7 @@ mod session_seed;
 pub mod supervisor_respawn_sidecar;
 pub mod thread_events;
 pub mod thread_lifecycle;
+pub mod thread_queue;
 pub mod thread_state;
 pub mod todo_consumer;
 pub(crate) mod tools;
@@ -50,8 +54,8 @@ use crate::core::{
 use crate::llm::LlmProvider;
 use crate::memory::{FastEmbedProvider, MemoryExtractor, PgVectorIndex};
 use crate::runtime::{
-    CodingAgent, AgentRuntime, BrowserLogins, BrowserRuntime, ClaudeCodeRuntime, HeadlessBlocklist,
-    PythonRuntime,
+    CodingAgent, AgentRuntime, BrowserLogins, BrowserRuntime, ClaudeCodeRuntime, CodexRuntime,
+    HeadlessBlocklist, PythonRuntime,
 };
 use git_ops::{auto_commit_safe_files_if_dirty, git_cmd};
 use std::collections::HashMap;
@@ -280,7 +284,12 @@ pub struct LucidosEngine {
     /// Pending CC permission prompts, deduped by `(thread, tool, input)` so
     /// CC's parallel/repeat tool calls collapse onto one card. See
     /// `cc_permission` module docs.
-    pub pending_cc_permission: Arc<std::sync::Mutex<cc_permission::CcPermissionState>>,
+    pub pending_cc_permission: Arc<std::sync::Mutex<cc_permission::PermissionState>>,
+    /// Pending command-guard permission prompts (ADR 0002) — the chat mirror of
+    /// `pending_cc_permission`, using the same dedup / session-allow mechanism.
+    /// The chat agent's loop blocks in-process on the entry's broadcast rather
+    /// than over MCP. See `command_permission` + `command_guard`.
+    pub pending_command_permission: Arc<std::sync::Mutex<cc_permission::PermissionState>>,
     /// Rendezvous map for the AskUserQuestion PreToolUse hook — the hook's
     /// long-poll handler waits on a receiver here; `answer_pending_question`
     /// notifies it when the user picks an answer. See `cc_question_wait` docs.
@@ -358,6 +367,12 @@ pub struct LucidosEngine {
     /// events stream as `BackgroundBashCompleted` and evicted. See
     /// `tools/bash_background.rs`.
     pub(crate) bash_background: tools::bash_background::BackgroundBashRegistry,
+    /// The *Thread Queue* — system-wide admission control for background
+    /// spawns (event-trigger fires, cron fires, agent-driven sub-thread /
+    /// coding-agent spawns). User-initiated chat never routes through it.
+    /// In-memory queue/active state mirrors the `thread_queue` projection
+    /// and is rebuilt from it at boot (`recover_persisted_entries`).
+    pub thread_queue: Arc<thread_queue::ThreadQueue>,
 }
 
 /// RAII guard that removes a thread from active_threads when dropped.
@@ -451,6 +466,58 @@ fn spawn_vertex_region_subscriber(
                     log!("[Preferences] vertex_region updated live: {} → {}", old, new_region);
                 }
                 Err(e) => log!("[Preferences] vertex_region update skipped (lock poisoned): {}", e),
+            }
+        }
+    });
+}
+
+/// Keep the in-memory model→provider [`ModelRegistry`] in sync with the `models`
+/// table. On any `Model{Created,Updated,Deleted}` event the whole table is
+/// re-queried and the map swapped wholesale — the table is tiny, and a wholesale
+/// swap avoids incremental-update drift. Mirrors `spawn_vertex_region_subscriber`.
+fn spawn_models_registry_subscriber(
+    mut rx: tokio::sync::broadcast::Receiver<event_bus::EmittedEvent>,
+    registry: crate::llm::model_registry::ModelRegistry,
+    pool: sqlx::PgPool,
+) {
+    tokio::spawn(async move {
+        use event_bus::{BusEvent, SystemEvent};
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            let emitted = match rx.recv().await {
+                Ok(e) => e,
+                // Lag = subscriber fell behind. Skip the dropped events but keep
+                // listening, so a single lag doesn't stop tracking model changes
+                // for the rest of the engine's lifetime.
+                Err(RecvError::Lagged(n)) => {
+                    log!(
+                        "[ModelRegistry] registry subscriber lagged by {} events — continuing",
+                        n
+                    );
+                    continue;
+                }
+                Err(RecvError::Closed) => break,
+            };
+            if !matches!(
+                &emitted.typed,
+                BusEvent::System(
+                    SystemEvent::ModelCreated { .. }
+                        | SystemEvent::ModelUpdated { .. }
+                        | SystemEvent::ModelDeleted { .. }
+                )
+            ) {
+                continue;
+            }
+            let fresh = crate::llm::model_registry::load_from_db(&pool).await;
+            match registry.write() {
+                Ok(mut guard) => {
+                    *guard = fresh;
+                    log!(
+                        "[ModelRegistry] reloaded model→provider map ({} entries)",
+                        guard.len()
+                    );
+                }
+                Err(e) => log!("[ModelRegistry] reload skipped (lock poisoned): {}", e),
             }
         }
     });

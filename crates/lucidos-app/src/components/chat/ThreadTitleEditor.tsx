@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { renameThread, suggestTitle } from '../../api/threads';
 import { showToast } from '../../store/store';
-import { autoResizeTextarea } from '../../utils/dom';
 import { errorDetail } from '../../utils/errorDetail';
+import { viewportIsMobile } from '../../utils/viewport';
+import { autoResizeTextarea } from '../../utils/dom';
 
 interface Props {
   threadId: string;
@@ -29,8 +30,12 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
   const [editValue, setEditValue] = useState(title);
   const [suggestion, setSuggestion] = useState<string | null>(null);
   const [suggesting, setSuggesting] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const displayRef = useRef<HTMLTextAreaElement>(null);
+  // Mobile renders a <textarea> (multi-line wrap), desktop an <input> (single-line
+  // hug) — both share this ref via the setInputEl callback below.
+  const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
+  const setInputEl = useCallback((el: HTMLInputElement | HTMLTextAreaElement | null) => {
+    inputRef.current = el;
+  }, []);
   const abortRef = useRef<AbortController | null>(null);
   // Guards against double-save when blur races with an in-flight rename.
   const savingRef = useRef(false);
@@ -46,42 +51,25 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
     if (!editing) setEditValue(title);
   }, [title, editing]);
 
-  // Deps are [title, editing] — autoresizing on editValue would churn the iOS
-  // textarea layout per keystroke and clobber cursor/selection. The editing
-  // gate skips the call while the display textarea is display:none (its
-  // scrollHeight reads 0 → height collapses to ~2px and stays there once the
-  // editor closes). Re-running on the editing→false transition refits height
-  // to the latest title delivered by SSE during the save.
-  useEffect(() => {
-    if (!editing) autoResizeTextarea(displayRef.current);
-  }, [title, editing]);
-
-  // Container width changes (drawer toggle, divider drag, window resize) don't
-  // fire the [title, editing] effect — without this observer, scrollHeight set
-  // at a narrow width (where the title wrapped to multiple lines) stays pinned
-  // as inline style.height after the container widens, ballooning the header
-  // until rename or reload. Width-only guard ignores the height churn from our
-  // own style.height writes, which would otherwise cause a feedback loop.
-  useEffect(() => {
-    const el = displayRef.current;
-    if (!el || editing) return;
-    let lastWidth = el.clientWidth;
-    const observer = new ResizeObserver(() => {
-      const newWidth = el.clientWidth;
-      if (newWidth === lastWidth) return;
-      lastWidth = newWidth;
-      autoResizeTextarea(el);
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [editing]);
-
   // The overlay input keeps DOM focus after save/escape, so onFocus won't
   // re-fire on the next click — blur explicitly so editing can be re-entered
   // without clicking elsewhere first.
   useEffect(() => {
     if (!editing) inputRef.current?.blur();
   }, [editing]);
+
+  const isMobile = viewportIsMobile.value;
+
+  // The mobile <textarea> grows to fit the wrapped title while editing so the
+  // whole text stays visible across multiple lines. When not editing it returns
+  // to the inset:0 overlay, so the inline height is cleared to let inset govern.
+  useEffect(() => {
+    if (!isMobile) return;
+    const el = inputRef.current as HTMLTextAreaElement | null;
+    if (!el) return;
+    if (editing) autoResizeTextarea(el);
+    else el.style.height = '';
+  }, [editValue, editing, isMobile]);
 
   useEffect(() => () => { abortRef.current?.abort(); }, []);
 
@@ -152,39 +140,72 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
     void save(suggestion);
   }, [suggestion, save]);
 
+  // Shared by the desktop <input> and mobile <textarea> edit fields. Collapse
+  // any newline (a paste can introduce one into the <textarea>) to a space — a
+  // title is a single logical line, which a desktop <input> enforces natively.
+  const handleInput = useCallback((e: Event) => {
+    const value = (e.target as HTMLInputElement | HTMLTextAreaElement).value.replace(/\r?\n/g, ' ');
+    setEditValue(value);
+    editValueRef.current = value;
+    dirtyRef.current = true;
+  }, []);
+
+  const handleBlur = useCallback(() => void save(editValueRef.current), [save]);
+
   return (
     <div class={`thread-title-edit${editing ? ' is-editing' : ''}`}>
-      <textarea
-        ref={displayRef}
+      {/* Read-only display is a div element, deliberately not a textarea: in the
+          desktop header CSS gives it white-space:nowrap + width:max-content so it
+          hugs the title on one line (a textarea would size to its cols attribute
+          and wrap early; nowrap is what lets max-content survive the flex
+          max-width cap without collapsing). A title too long for the row is
+          clipped at the row's right edge by the wrapper. */}
+      <div
         class="thread-title-input thread-title-display"
-        rows={1}
-        value={title}
-        readOnly
-        tabIndex={-1}
         onClick={startEditing}
         data-tooltip="Click to rename"
-      />
-      <input
-        ref={inputRef}
-        type="text"
-        class="thread-title-input thread-title-edit-input"
-        value={editValue}
-        onFocus={startEditing}
-        onInput={(e) => {
-          const value = (e.target as HTMLInputElement).value;
-          setEditValue(value);
-          editValueRef.current = value;
-          dirtyRef.current = true;
-        }}
-        onKeyDown={handleKeyDown}
-        onBlur={editing ? () => void save(editValueRef.current) : undefined}
-        // Opt out of the global "Esc defocuses" gesture (dispatchEscape): a
-        // blur here commits the rename, so letting the central policy blur on
-        // Escape would SAVE instead of cancel. With this marker, focus stays
-        // put and handleKeyDown's Escape branch reverts the edit.
-        data-escape-self
-        tabIndex={editing ? 0 : -1}
-      />
+      >{title}</div>
+      {/* Mobile: a <textarea> so a long title wraps to multiple lines and the
+          whole text stays visible while editing (autoResizeTextarea grows it to
+          fit). Desktop: an <input> that hugs its value via the size attr so the
+          action icons sit right beside the title on one line. Both opt out of the
+          global "Esc defocuses" gesture (data-escape-self): a blur here commits
+          the rename, so letting the central policy blur on Escape would SAVE
+          instead of cancel — handleKeyDown's Escape branch reverts instead. */}
+      {isMobile ? (
+        <textarea
+          ref={setInputEl}
+          class="thread-title-input thread-title-edit-input"
+          value={editValue}
+          rows={1}
+          onFocus={startEditing}
+          onInput={handleInput}
+          onKeyDown={handleKeyDown}
+          onBlur={editing ? handleBlur : undefined}
+          data-escape-self
+          tabIndex={editing ? 0 : -1}
+        />
+      ) : (
+        <input
+          ref={setInputEl}
+          type="text"
+          class="thread-title-input thread-title-edit-input"
+          value={editValue}
+          // Hug the value while editing (override the base width:100% with width:auto
+          // in CSS). size is universal, unlike field-sizing which isn't everywhere yet.
+          size={Math.max(4, editValue.length)}
+          onFocus={startEditing}
+          onInput={handleInput}
+          onKeyDown={handleKeyDown}
+          onBlur={editing ? handleBlur : undefined}
+          data-escape-self
+          tabIndex={editing ? 0 : -1}
+        />
+      )}
+      {/* Suggestion sits below the input but is taken out of flow (absolute, see
+          CSS) so it doesn't make .thread-title-edit taller — otherwise the
+          header's align-items:center would drop the action icons to the middle
+          of input+suggestion instead of keeping them centered on the input. */}
       {editing && (
         <div class="thread-title-suggestion">
           {suggesting ? (

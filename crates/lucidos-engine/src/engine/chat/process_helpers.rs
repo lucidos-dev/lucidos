@@ -24,6 +24,10 @@ pub(super) struct TriggerContext {
     pub slug: String,
     pub invocation: TriggerInvocation,
     pub go_to_review: bool,
+    /// The trigger's declared **side-effect grant** (ADR 0002, Phase 5). The
+    /// command guard consults it to decide whether an `IrreversibleDanger`
+    /// command may run unattended; an ungranted side-effect fails the trigger.
+    pub side_effect_grant: Vec<crate::engine::command_guard::SideEffectCategory>,
 }
 
 /// What restarts actually do to a chat thread, written as the chat-system

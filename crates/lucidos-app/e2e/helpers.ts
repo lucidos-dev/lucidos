@@ -74,8 +74,63 @@ export async function waitForVisibleInput(page: Page, timeout = 30_000): Promise
   return page.locator('[data-role="prompt-input"]:visible').first();
 }
 
+/** Navigate to `url` (DOMContentLoaded) with a BOUNDED per-attempt timeout and a
+ *  retry. THE canonical way to load the app in e2e — specs should route their
+ *  `page.goto` through this rather than calling `page.goto` directly.
+ *
+ *  THE WEDGE IT GUARDS. On the `mobile-webkit` project (WebKit engine) the FIRST
+ *  navigation in a fresh context intermittently wedged — `page.goto('/')` hung
+ *  until its 30s timeout, DOMContentLoaded never fired, a (random) test failed,
+ *  and it passed only on Playwright's fresh-context retry. WebKit-only. Two
+ *  distinct causes were identified (2026-06 — see docs/e2e-test-decisions.md
+ *  "mobile-webkit navigation wedge"); neither is the dev server, engine,
+ *  reverse-proxy, transport, or product code (all ruled out: reproduces against
+ *  bundled `dist`, over HTTP/1.1 + HTTP/2, over IPv4 + IPv6, engine never sees
+ *  the `/` request):
+ *
+ *  1. PRIMARY — macOS system proxy / PAC (WPAD) auto-discovery, which WebKit's
+ *     network process runs synchronously when it initialises a fresh network
+ *     session (per context). On a managed/MDM Mac on a corp network that does a
+ *     DNS/captive-portal/PAC round trip that stalls for tens of seconds, so the
+ *     `/` request queues *behind* proxy resolution and never reaches the engine.
+ *     FIXED AT THE SOURCE in playwright.config.ts: the `mobile-webkit` project
+ *     sets an explicit `proxy` (inert server + localhost `bypass`) so WebKit
+ *     skips system proxy discovery and connects to our localhost-only suite
+ *     DIRECT. Deterministic; needs no retry.
+ *  2. RESIDUAL — a WebContent cold-start / load stall under heavy host
+ *     contention, seen even on a no-proxy host. There is no reliable in-helper
+ *     prevention (an `about:blank` warmup was tried and did NOT prevent it — the
+ *     stall is in the real document load, which a blank nav doesn't warm); a
+ *     fresh browser context clears it, i.e. the whole-test `retries: 1` plus the
+ *     WebKit RSS reaper, the standard mitigation for browser-infra flakes.
+ *
+ *  What this helper does for the residual case: CAP the hang (fail at
+ *  ATTEMPTS*timeout instead of the full 120s test budget) and re-navigate once.
+ *  Callers assert real readiness explicitly afterwards (waitForVisibleInput, an
+ *  :visible iframe/#ask, etc.). */
+export async function gotoWithRetry(page: Page, url = '/'): Promise<void> {
+  const ATTEMPTS = 2;
+  const PER_ATTEMPT_TIMEOUT_MS = 30_000;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PER_ATTEMPT_TIMEOUT_MS });
+      return;
+    } catch (err) {
+      lastErr = err;
+      // Stalled (DCL never fired). Re-navigate — recovers a transient stall; a
+      // sticky freeze falls through to the whole-test fresh-context retry.
+    }
+  }
+  throw lastErr;
+}
+
 export async function navigateToApp(page: Page): Promise<void> {
-  await page.goto('/');
+  // gotoWithRetry: a bare page.goto can hang the whole 120s test budget on
+  // mobile-webkit when the app-root navigation wedges (see gotoWithRetry).
+  // SPA readiness is asserted explicitly below via waitForVisibleInput — that is
+  // what guarantees the app is interactive.
+  await gotoWithRetry(page, '/');
   await ensureOnThreadPane(page);
   await waitForVisibleInput(page);
 }
@@ -193,15 +248,32 @@ export async function openThreadDrawer(page: Page): Promise<void> {
     });
   });
   if (!isOpen) {
-    await page.locator('button[aria-label="Toggle thread drawer"]').first().click();
-    await page.waitForFunction(() => {
-      const drawers = document.querySelectorAll('.thread-drawer:not(.thread-drawer-collapsed)');
-      return Array.from(drawers).some(el => {
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-      });
-    }, undefined, { timeout: 5_000 });
+    // Several ThreadToggleButton instances exist (drawer header,
+    // collapsed-thread-actions, thread pane), and the drawer-header copy
+    // stays mounted through its exit transition — target the
+    // collapsed-thread-actions one explicitly: it is the interactable
+    // opener whenever the drawer is closed.
+    await page.locator('.collapsed-thread-actions button[aria-label="Toggle thread drawer"]').click();
   }
+  // Wait for the drawer's open width-transition (`width var(--duration-slow)`)
+  // to SETTLE — not merely to be non-zero. Returning at width > 0 catches the
+  // drawer mid-slide, where the still-narrow title column wraps a long title to
+  // one character per line; geometry assertions then read a degenerate layout
+  // (the drawer-family-collapse title/badge overlap flake). Poll until the width
+  // is stable across two frames and past the collapsed strip.
+  await page.waitForFunction(() => {
+    const drawer = Array.from(document.querySelectorAll('.thread-drawer:not(.thread-drawer-collapsed)'))
+      .find(el => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+    if (!drawer) return false;
+    const w = drawer.getBoundingClientRect().width;
+    const win = window as unknown as { __luDrawerW?: number };
+    const prev = win.__luDrawerW;
+    win.__luDrawerW = w;
+    return w > 100 && prev !== undefined && Math.abs(prev - w) < 0.5;
+  }, undefined, { timeout: 5_000 });
 }
 
 export function uniqueMessage(prefix = 'e2e-test'): string {
@@ -223,6 +295,35 @@ export async function getHeaderTop(page: Page): Promise<number> {
   });
 }
 
+/** Opt out of the default-ON "Keep header visible" mobile preference so the
+ *  header's hide-on-scroll / hide-on-keyboard-open behavior becomes
+ *  exercisable. `currentMobileHeaderSticky()` defaults to ON (commit fd16089cf,
+ *  "default Keep header visible to on"), which pins the header — with it on, the
+ *  header never slides off and the hide assertions time out. Set the GLOBAL pref
+ *  to 'false' BEFORE navigating so the page boots with hide enabled (device_id
+ *  omitted → the app's device-scoped preference load merges the global value).
+ *  Must be called before `navigateToApp`. */
+export async function disableMobileHeaderSticky(page: Page): Promise<void> {
+  const res = await page.request.put('/api/v1/preferences?key=mobile_header_sticky', {
+    data: { value: 'false' },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/** Force-ON the default "Keep header visible" pin. `mobile_header_sticky` is a
+ *  GLOBAL preference and the e2e DB is reset only between projects, not between
+ *  tests — so a test that called `disableMobileHeaderSticky` leaks the off state
+ *  into later tests that assume the pinned default (the header then slides off on
+ *  any input focus and header controls land outside the viewport). A test that
+ *  depends on the pinned header calls this in its beforeEach BEFORE navigating,
+ *  so it boots pinned regardless of order. Pairs with `disableMobileHeaderSticky`. */
+export async function enableMobileHeaderSticky(page: Page): Promise<void> {
+  const res = await page.request.put('/api/v1/preferences?key=mobile_header_sticky', {
+    data: { value: 'true' },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
 export async function assertHealthy(page: Page): Promise<void> {
   const response = await page.request.get('/api/v1/health');
   expect(response.ok()).toBeTruthy();
@@ -230,19 +331,42 @@ export async function assertHealthy(page: Page): Promise<void> {
   expect(body.status).toBe('ok');
 }
 
-/** Switch the input mode to "Claude" (Claude Code) — dual-layout safe */
-export async function switchToClaudeMode(page: Page): Promise<void> {
+/** Drive a shared `Dropdown` (components/shared/Dropdown.tsx): open the
+ *  trigger inside `rootSelector`, click the option containing `optionLabel`,
+ *  and wait for the menu to close. Failures throw at the pick — silently
+ *  proceeding with the previous value sends the test down a minutes-long
+ *  wrong-path timeout instead. Waiting on menu CLOSE (not on the trigger
+ *  label) is deliberate: the trigger's hidden .dropdown-sizer spans contain
+ *  EVERY option label, so a label assertion would always pass. */
+export async function pickDropdownOption(page: Page, rootSelector: string, optionLabel: string): Promise<void> {
+  const opened = await clickVisibleElement(page, `${rootSelector} .dropdown-trigger`);
+  if (!opened) throw new Error(`pickDropdownOption: no visible ${rootSelector} .dropdown-trigger`);
+  // The menu renders on the next Preact commit — wait for the option to land.
+  await page.waitForFunction(({ sel, label }) => {
+    const opts = document.querySelectorAll(`${sel} .dropdown-option`);
+    return Array.from(opts).some(el => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').includes(label);
+    });
+  }, { sel: rootSelector, label: optionLabel }, { timeout: 5_000 });
+  const picked = await clickVisibleElement(page, `${rootSelector} .dropdown-option`, optionLabel);
+  if (!picked) throw new Error(`pickDropdownOption: option "${optionLabel}" not clickable in ${rootSelector}`);
+  await page.waitForFunction((sel) => {
+    const opts = document.querySelectorAll(`${sel} .dropdown-option`);
+    return !Array.from(opts).some(el => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+  }, rootSelector, { timeout: 3_000 });
+}
+
+/** Pick an option in the compose destination picker — dual-layout safe.
+ *  Defaults to 'Lucidos source' (spawns a Lucidos-internal coding-agent
+ *  thread on the next send); pass another option label (e.g. 'Lucidos Agent'
+ *  or 'my-app · app') to target it instead. */
+export async function pickComposeDestination(page: Page, optionLabel = 'Lucidos source'): Promise<void> {
   await ensureOnThreadPane(page);
-  const clicked = await clickVisibleElement(page, 'button.segmented-btn', 'Claude');
-  if (clicked) {
-    await page.waitForFunction(() => {
-      const btns = document.querySelectorAll('button.segmented-btn.active');
-      return Array.from(btns).some(el => {
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').includes('Claude');
-      });
-    }, undefined, { timeout: 3_000 }).catch(() => {});
-  }
+  await pickDropdownOption(page, '.compose-destination-picker', optionLabel);
 }
 
 /** Send a follow-up message in an existing thread */
@@ -416,13 +540,18 @@ export async function countVisibleThreadRows(page: Page): Promise<number> {
   });
 }
 
-/** Wait for the prompt-area Cancel button, click it, wait for Canceled status.
+/** Wait for the prompt-area Cancel button, click it, confirm the guard dialog,
+ *  then wait for Canceled status.
  *  Works for both chat and Claude Code threads (single hard-cancel path).
  *  Identify the Send→Cancel morph by its post-morph class — the disabled
  *  `Cancel...` state shares the same aria-label, so :not(:disabled) is
  *  load-bearing. */
 export async function cancelStreamingResponse(page: Page): Promise<void> {
   await waitAndClick(page, 'button.send-cancel-morph.action-btn-danger:not(:disabled)', undefined, 30_000);
+
+  // Cancel is guarded by a confirm dialog — accept it to actually cancel.
+  await page.locator('.confirm-dialog').waitFor({ state: 'visible', timeout: 10_000 });
+  await page.locator('.confirm-dialog .confirm-btn-ok:visible').first().click();
 
   await page.waitForFunction(() => {
     const labels = document.querySelectorAll('.exchange-status-label');
@@ -474,14 +603,14 @@ export async function dismissCCSession(page: Page): Promise<void> {
   }
 }
 
-/** Wait for a visible `.thread-title-display` (read-only <textarea>) with a
- *  non-empty value (dual-layout safe). */
+/** Wait for a visible `.thread-title-display` (read-only <div>) with non-empty
+ *  text (dual-layout safe). */
 export async function waitForThreadTitle(page: Page, timeout = 30_000): Promise<void> {
   await page.waitForFunction(() => {
     const els = document.querySelectorAll('.thread-title-display');
     return Array.from(els).some(el => {
       const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0 && ((el as HTMLTextAreaElement).value ?? '').trim().length > 0;
+      return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim().length > 0;
     });
   }, undefined, { timeout });
 }
@@ -499,16 +628,7 @@ export async function waitForTitleInput(page: Page, timeout = 5_000) {
   return page.locator('.thread-title-edit.is-editing .thread-title-edit-input').first();
 }
 
-/** Height (px) of the desktop `.thread-view-header` title display textarea.
- *  Returns 0 if not rendered. */
-export async function getDesktopTitleHeight(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const el = document.querySelector('.thread-view-header .thread-title-display') as HTMLTextAreaElement | null;
-    return el ? el.getBoundingClientRect().height : 0;
-  });
-}
-
-/** Height (px) of the visible mobile thread-title-display textarea, ignoring
+/** Height (px) of the visible mobile thread-title-display div, ignoring
  *  the desktop copy. Returns 0 if neither layout's display is rendered. */
 export async function getMobileTitleHeight(page: Page): Promise<number> {
   return page.evaluate(() => {
@@ -521,7 +641,7 @@ export async function getMobileTitleHeight(page: Page): Promise<number> {
   });
 }
 
-/** Visible thread title text from whichever layout's display textarea is
+/** Visible thread title text from whichever layout's display div is
  *  currently rendered (dual-layout safe). */
 export async function getVisibleTitleText(page: Page): Promise<string> {
   return page.evaluate(() => {
@@ -529,7 +649,7 @@ export async function getVisibleTitleText(page: Page): Promise<string> {
     for (const el of els) {
       const rect = el.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) {
-        return ((el as HTMLTextAreaElement).value ?? '').trim();
+        return (el.textContent ?? '').trim();
       }
     }
     return '';

@@ -26,6 +26,11 @@ export interface Change {
    * `WaitingBanner` reads this to confirm before Apply so the user knows
    * they're about to land partial changes from a failed run. */
   incomplete: boolean;
+  /** True when the originating thread is mid-turn (the coding agent is Running
+   * or WaitingForUserAnswer). Applying then races the session's next proposal,
+   * so the changes view disables Apply and drops it from Apply All. Defaults to
+   * false (absent on non-pending changes and older payloads). */
+  thread_active?: boolean;
 }
 
 /** One thread's contribution to the current restart-required toast: derived
@@ -94,15 +99,32 @@ export async function discardChange(id: string): Promise<{ message: string }> {
 
 export interface ApplyAllResult {
   message: string;
-  restart_required: boolean;
-  /** Set when the batch stopped at a conflict — same shape as ApplyChangeResult. */
+  restart_required?: boolean;
+  /** Status of the FIRST change (applied synchronously so the HTTP response
+   *  carries an immediate result). The remaining members are driven in the
+   *  background — watch the ApplyAllBatch* SSE events for their resolution.
+   *  Absent on the early-error branch. */
+  status?: ApplyStatus;
+  /** Engine-assigned batch id, present whenever a batch was started. */
+  batch_id?: string;
+  /** Set when the first change stopped at a conflict — same shape as ApplyChangeResult. */
   conflict_thread_id?: string;
+  /** Set when the first change needs hardening — the recovery thread that will
+   *  auto-apply it once `/harden` completes. */
+  review_thread_id?: string;
   applied?: number;
   failed?: number;
 }
 
 export async function applyAllChanges(): Promise<ApplyAllResult> {
   return json(`${API}/changes/apply-all`, { method: 'POST' }, APPLY_TIMEOUT_MS);
+}
+
+/** Cancel the running Apply All batch — stops the driver, interrupts the
+ *  in-flight hardening/merge, and leaves not-yet-applied changes pending. The
+ *  resulting ApplyAllBatchCompleted SSE clears the in-progress state. */
+export async function cancelApplyAllChanges(): Promise<{ canceled_batches: number }> {
+  return json(`${API}/changes/apply-all/cancel`, { method: 'POST' });
 }
 
 export async function discardAllChanges(): Promise<{ discarded: number; failed: number; errors: string[] }> {

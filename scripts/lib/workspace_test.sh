@@ -22,15 +22,17 @@ source "$SCRIPT_DIR/workspace.sh"
 
 # ── fixture helpers ────────────────────────────────────────────────────
 make_pkg_dir() {
-    # Creates a package dir with a package.json and (optionally) a node_modules
-    # whose dir mtime is newer than package.json (so install is NOT needed).
+    # Creates a package dir with a package.json and (optionally) a node_modules.
+    # Install-detection is content-based now (see _deps_fingerprint), so what
+    # matters is whether node_modules exists, not relative mtimes: fresh=1 →
+    # node_modules present (no install needed, self-heals a stamp), fresh=0 →
+    # node_modules absent (install needed).
     local dir="$1"
-    local fresh="${2:-1}"   # 1 = node_modules newer than package.json
+    local fresh="${2:-1}"   # 1 = node_modules present
     mkdir -p "$dir"
     echo '{"name":"x"}' > "$dir/package.json"
     if [ "$fresh" = "1" ]; then
         mkdir -p "$dir/node_modules"
-        # Adding a file bumps the directory's mtime — same effect npm install has.
         echo '{}' > "$dir/node_modules/.marker"
     fi
 }
@@ -87,6 +89,61 @@ test_refuses_install_when_same_project_frontend_running() {
         pass "error message names the running workspace"
     else
         fail "error message did not mention 'other-ws': $out"
+    fi
+}
+
+# ── Test 1a: ENGINE_ONLY restart skips (does not abort) when frontend running ──
+# The engine-only restart (CC Apply) deliberately keeps this checkout's frontend
+# alive. When the applied change bumped a dependency, installing would corrupt
+# that Vite — but aborting would leave the workspace with no engine at all
+# (build_sdk runs before the ENGINE_ONLY early-exit). So ENGINE_ONLY must skip
+# the install, warn, and return 0 so the engine still comes up.
+test_engine_only_skips_install_when_frontend_running() {
+    echo "test: ENGINE_ONLY restart skips install (no abort) when frontend running"
+
+    local PROJECT_DIR="$SANDBOX/proj-engine-only"
+    local pkg="$PROJECT_DIR"
+    make_pkg_dir "$pkg" 0       # no node_modules → install IS needed
+    # Dynamic scoping makes this visible to ensure_npm_deps, like PROJECT_DIR.
+    local ENGINE_ONLY=1
+
+    mkdir -p "$PROJECT_DIR/crates/lucidos-app"
+    ( cd "$PROJECT_DIR/crates/lucidos-app" && exec sleep 30 ) &
+    local fake_pid=$!
+    disown "$fake_pid" 2>/dev/null || true
+    write_pid_for_workspace "dev" "$fake_pid"
+
+    npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
+    export -f npm
+
+    local out rc
+    out="$(ensure_npm_deps "$pkg" "workspace dependencies" 2>&1)"
+    rc=$?
+
+    kill "$fake_pid" 2>/dev/null || true
+    unset -f npm
+
+    if [ $rc -eq 0 ]; then
+        pass "exited 0 (engine restart not aborted)"
+    else
+        fail "expected exit 0, got $rc; output: $out"
+    fi
+    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
+        fail "npm install ran despite running frontend"
+    else
+        pass "npm install did NOT run (frontend preserved)"
+    fi
+    if echo "$out" | grep -q "WARNING"; then
+        pass "warned that deps changed"
+    else
+        fail "expected a WARNING about deferred deps; output: $out"
+    fi
+    # Exact bullet-line match — a loose "dev" would also hit "web-dev.sh" in the
+    # warning text, so assert the listed-workspace line specifically.
+    if echo "$out" | grep -qx "  - dev"; then
+        pass "warning names the running workspace"
+    else
+        fail "warning did not list '  - dev': $out"
     fi
 }
 
@@ -194,7 +251,7 @@ test_no_install_needed_skips_check() {
     rm -rf "$HOME/workspaces"
 
     local pkg="$SANDBOX/pkg-fresh"
-    make_pkg_dir "$pkg" 1       # lock newer than package.json → no install needed
+    make_pkg_dir "$pkg" 1       # node_modules present → no install needed
 
     # Even with a running frontend, we should not fail because no install runs.
     sleep 30 &
@@ -323,8 +380,6 @@ test_workspace_member_with_root_deps_skips_install() {
 {"private":true,"workspaces":["pkg-member"]}
 EOF
     echo '{"name":"pkg-member"}' > "$root/pkg-member/package.json"
-    # Backdate package.json so node_modules mtime is newer (no install needed).
-    touch -t 202001010000 "$root/pkg-member/package.json"
 
     # Pin a running frontend for another workspace — if the function decides
     # install IS needed, this would make it exit 1.
@@ -355,11 +410,11 @@ EOF
     fi
 }
 
-# ── Test: workspace member install still triggers on package.json bump ──
-# When the workspace member's own package.json is newer than the root
-# node_modules (i.e. someone added a dep), install must still fire.
+# ── Test: workspace member install triggers when package.json content changes ──
+# Once a stamp exists, a genuine content change (someone added a dep) must
+# still fire an install. Detection is by content fingerprint, not mtime.
 test_workspace_member_install_when_package_json_bumped() {
-    echo "test: workspace member triggers install when its package.json bumped"
+    echo "test: workspace member triggers install when its package.json content changes"
 
     rm -rf "$HOME/workspaces"
 
@@ -368,13 +423,16 @@ test_workspace_member_install_when_package_json_bumped() {
     cat > "$root/package.json" <<'EOF'
 {"private":true,"workspaces":["pkg-member"]}
 EOF
-    # Backdate root node_modules, then write member package.json as "fresh"
-    # so it's newer than the install marker.
-    touch -t 202001010000 "$root/node_modules"
-    echo '{"name":"pkg-member","dependencies":{"new":"^1"}}' > "$root/pkg-member/package.json"
+    echo '{"name":"pkg-member"}' > "$root/pkg-member/package.json"
 
     npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
     export -f npm
+
+    # First call self-heals the stamp from the original content (no install).
+    ensure_npm_deps "$root/pkg-member" "frontend deps" >/dev/null 2>&1
+
+    # Now genuinely change the dependency set.
+    echo '{"name":"pkg-member","dependencies":{"new":"^1"}}' > "$root/pkg-member/package.json"
 
     local out rc
     out="$(ensure_npm_deps "$root/pkg-member" "frontend deps" 2>&1)"
@@ -387,9 +445,62 @@ EOF
         pass "exited 0"
     fi
     if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
-        pass "npm install ran on package.json bump"
+        pass "npm install ran on dependency change"
     else
         fail "npm install did not run; output: $out"
+    fi
+}
+
+# ── Test: no-op rewrite (mtime bump, identical content) does NOT reinstall ──
+# THE regression: a git checkout / worktree add / CC change apply rewrites
+# package.json, bumping its mtime without changing a byte. The old mtime check
+# read that as "package.json changed" and — with a frontend running — aborted
+# the engine-only restart, leaving the engine down. Content-based detection
+# must see an identical fingerprint and do nothing.
+test_noop_rewrite_does_not_trigger_install() {
+    echo "test: no-op rewrite (mtime bump, same content) does not reinstall"
+
+    rm -rf "$HOME/workspaces"
+
+    local PROJECT_DIR="$SANDBOX/proj-noop"
+    local pkg="$PROJECT_DIR"
+    mkdir -p "$pkg/node_modules"
+    echo '{"name":"x"}' > "$pkg/package.json"
+
+    npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
+    export -f npm
+
+    # Establish the stamp from the original content.
+    ensure_npm_deps "$pkg" "test deps" >/dev/null 2>&1
+
+    # Simulate a running frontend in THIS project — would force exit 1 if the
+    # function wrongly decided an install was needed.
+    mkdir -p "$PROJECT_DIR/crates/lucidos-app"
+    ( cd "$PROJECT_DIR/crates/lucidos-app" && exec sleep 30 ) &
+    local fake_pid=$!
+    disown "$fake_pid" 2>/dev/null || true
+    write_pid_for_workspace "live-ws" "$fake_pid"
+
+    # No-op rewrite: identical bytes, fresh mtime (what `git checkout` does).
+    echo '{"name":"x"}' > "$pkg/package.json"
+    touch "$pkg/package.json"
+
+    local out rc
+    out="$(ensure_npm_deps "$pkg" "test deps" 2>&1)"
+    rc=$?
+
+    kill "$fake_pid" 2>/dev/null || true
+    unset -f npm
+
+    if [ $rc -ne 0 ]; then
+        fail "no-op rewrite aborted (rc=$rc); output: $out"
+    else
+        pass "no-op rewrite exited 0"
+    fi
+    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
+        fail "npm install ran on a no-op rewrite"
+    else
+        pass "npm install did not run"
     fi
 }
 
@@ -427,18 +538,90 @@ EOF
     fi
 }
 
+# ── Shared build-watch teardown (checkout-level singleton, ref-counted) ──
+# teardown_shared_build_watch_if_idle must keep the shared `vite build --watch`
+# alive while ANY workspace of the checkout is still serving the frontend, and
+# only kill it when the last one is gone. Mirrors how cleanup_processes / stop.sh
+# tear it down. The ref-count reuses running_frontend_workspaces_in_project, so a
+# fake Vite preview with cwd inside the project stands in for "still serving".
+test_keeps_shared_build_watch_when_a_workspace_still_serves() {
+    echo "test: shared build-watch survives while another workspace still serves"
+
+    local PROJECT_DIR="$SANDBOX/proj-bw-keep"
+    mkdir -p "$PROJECT_DIR/crates/lucidos-app/.build-watch"
+
+    # Fake shared build-watch process + its checkout-level pidfile.
+    ( exec sleep 30 ) & local bw_pid=$!
+    disown "$bw_pid" 2>/dev/null || true
+    echo "$bw_pid" > "$(build_watch_pidfile)"
+
+    # A sibling workspace's Vite preview, cwd inside the project → "still serving".
+    ( cd "$PROJECT_DIR/crates/lucidos-app" && exec sleep 30 ) & local fe_pid=$!
+    disown "$fe_pid" 2>/dev/null || true
+    write_pid_for_workspace "sibling-ws" "$fe_pid"
+
+    teardown_shared_build_watch_if_idle >/dev/null 2>&1
+
+    if kill -0 "$bw_pid" 2>/dev/null; then
+        pass "build-watch left running while a workspace still serves"
+    else
+        fail "build-watch was killed despite a serving workspace"
+    fi
+    if [ -f "$(build_watch_pidfile)" ]; then
+        pass "build-watch pidfile preserved"
+    else
+        fail "build-watch pidfile was removed"
+    fi
+
+    kill "$bw_pid" "$fe_pid" 2>/dev/null || true
+}
+
+test_kills_shared_build_watch_when_no_workspace_serves() {
+    echo "test: shared build-watch torn down when the last workspace stops"
+
+    local PROJECT_DIR="$SANDBOX/proj-bw-kill"
+    mkdir -p "$PROJECT_DIR/crates/lucidos-app/.build-watch"
+    rm -rf "$HOME/workspaces"   # no workspace serving this checkout
+
+    ( exec sleep 30 ) & local bw_pid=$!
+    disown "$bw_pid" 2>/dev/null || true
+    echo "$bw_pid" > "$(build_watch_pidfile)"
+
+    teardown_shared_build_watch_if_idle >/dev/null 2>&1
+
+    # Give the kill a beat to land.
+    local waited=0
+    while kill -0 "$bw_pid" 2>/dev/null && [ "$waited" -lt 20 ]; do sleep 0.1; waited=$((waited+1)); done
+
+    if kill -0 "$bw_pid" 2>/dev/null; then
+        fail "build-watch still running with no serving workspace"
+        kill "$bw_pid" 2>/dev/null || true
+    else
+        pass "build-watch killed when no workspace serves"
+    fi
+    if [ -f "$(build_watch_pidfile)" ]; then
+        fail "build-watch pidfile not removed"
+    else
+        pass "build-watch pidfile removed"
+    fi
+}
+
 test_refuses_install_when_same_project_frontend_running
+test_engine_only_skips_install_when_frontend_running
 test_allows_install_when_other_checkout_frontend_running
 test_installs_when_no_frontend_running
 test_stale_pidfile_does_not_block
 test_no_install_needed_skips_check
 test_workspace_member_with_root_deps_skips_install
 test_workspace_member_install_when_package_json_bumped
+test_noop_rewrite_does_not_trigger_install
 test_workspace_member_install_when_root_node_modules_missing
 test_resolves_bare_name_to_home_workspaces
 test_resolves_absolute_path_unchanged
 test_errors_on_missing_workspace
 test_does_not_create_directories
+test_keeps_shared_build_watch_when_a_workspace_still_serves
+test_kills_shared_build_watch_when_no_workspace_serves
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

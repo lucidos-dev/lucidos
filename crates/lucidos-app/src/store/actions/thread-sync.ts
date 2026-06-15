@@ -1,6 +1,6 @@
 import { API, postMcpConsent } from '../../api/client';
 import type { Change } from '../../api/client';
-import { threadMap, focusedThreadId, changes, appliedChanges, changesHasMore, updateAvailable, applyingChangeIds, applyingNowThreadIds, generatedTitleIds, ccSessionVersion, setFocusedThread, archivingThreadIds } from '../store';
+import { threadMap, focusedThreadId, changes, appliedChanges, changesHasMore, updateAvailable, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds } from '../store';
 import { memoryRebuildProgress, backupProgress, restoreState, backupListVersion, backupStatusVersion, recoveryProgress, showConfirm, showToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
@@ -11,6 +11,10 @@ import {
   handleNotificationToastRequested,
   type NotificationToastRequestedPayload,
 } from './in-app-notification-toast';
+import {
+  handleNativePushRequested,
+  type NativePushRequestedPayload,
+} from './native-push';
 import { addRestartGroup, appliedToastRefreshAction } from './chat-changes';
 import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
 import { loadPreferences } from './preferences';
@@ -448,11 +452,11 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // ThreadArchived deliberately does NOT touch `meta.state`: the compose
   // state machine is orthogonal to archive routing (an archived thread
   // stays at state='active' and only flips `archive_state` / `meta.section`).
-  // The section flip is handled by the aggregate path above (line 383-386)
+  // The section flip is handled by the "Archive race guard" block above
   // for cascade members and by `applyAggregateToMeta` for direct archives,
   // both keyed off `archive_state` not `state`.
 
-  // Bump Claude Code session version so CCControlMenu re-fetches commands.
+  // Bump Claude Code session version so CodingAgentControlMenu re-fetches commands.
   // CodingAgentUserMessageSent covers follow-ups to idle Claude Code sessions
   // (no SessionStarted fires for those — the existing process resumes).
   // CodingAgentIdled guarantees CC binary is initialized — retry from
@@ -460,7 +464,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   if (event.type === 'SessionStarted' || event.type === 'ContinuationStarted'
       || event.type === 'SessionEnded' || event.type === 'CodingAgentUserMessageSent'
       || event.type === 'CodingAgentIdled' || event.type === 'CodingAgentSettingsChanged') {
-    ccSessionVersion.value++;
+    codingAgentSessionVersion.value++;
   }
 
   // No auto-read on focus — user must explicitly click Archive, Apply, or Discard.
@@ -587,6 +591,22 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     });
   }
 
+  // Event-driven toast so every path that auto-spawns a hardening session
+  // (Apply Now, Apply All, and the recovery sweep when a CC session ended
+  // without /harden) notifies uniformly — mirrors MergeConflictDetected above.
+  // The change applies automatically once hardening finishes; the toast is the
+  // system-level "this is happening" cue, the in-thread initiator panel is the
+  // local context. Keyed by thread (the event carries no change_id, and a
+  // thread hardens one change at a time) so a re-emit refreshes one toast
+  // instead of stacking.
+  if (event.type === 'MissingHardeningDetected') {
+    const label = formatThreadLabel(threadId);
+    showToast(`Hardening required in ${label} — change will apply automatically after hardening.`, 'warning', {
+      key: `missing-hardening-${threadId}`,
+      onClick: () => focusThread(threadId),
+    });
+  }
+
   // Per-thread "events arrived" bell — fires for every event so subscribers
   // to this specific thread (focused ChatExchange / ThreadView /
   // activeStreamingBuffer) recompute. Streaming tokens land here exclusively
@@ -631,6 +651,14 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       handleNotificationToastRequested(data as unknown as NotificationToastRequestedPayload);
       break;
 
+    case 'NativePushRequested':
+      // Engine allowed the OS push (no active device) and is asking a connected
+      // Tauri desktop app to render a NATIVE macOS banner — the WKWebView can't
+      // receive the web push. Browser / PWA pages ignore it (handleNativePush-
+      // Requested gates on isTauri). See system-knowhow/notifications.md §4.
+      handleNativePushRequested(data as unknown as NativePushRequestedPayload);
+      break;
+
     case 'PreferencesChanged':
     // `set_language` / `set_timezone` (chat-agent tools) write the preference
     // and emit LanguageSet / TimezoneSet but NOT PreferencesChanged, so without
@@ -663,6 +691,41 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       if (processed >= total && total > 0) {
         setTimeout(() => { memoryRebuildProgress.value = null; }, 2000);
       }
+      break;
+    }
+
+    case 'ApplyAllBatchStarted': {
+      // An Apply All batch started (possibly on another device). Reflect
+      // "in progress" on the bulk buttons and mark every member as applying so
+      // each pending row shows "Applying..." for the whole batch — not just the
+      // one being merged right now. ChangeApplied/ChangeApplyFailed clear each
+      // member id; ApplyAllBatchCompleted drops the bulk flag.
+      applyAllInProgress.value = true;
+      const changeIds = (data.change_ids ?? []) as string[];
+      if (changeIds.length > 0) {
+        applyingChangeIds.value = new Set([...applyingChangeIds.value, ...changeIds]);
+      }
+      break;
+    }
+
+    case 'ApplyAllBatchCompleted': {
+      // Batch finished or was canceled — every member resolved as applied or
+      // failed (a cancel marks the in-flight + queued members failed with
+      // "Apply All canceled"). The per-change ChangeApplied/ChangeApplyFailed
+      // handlers clear ids for members that emitted a thread event, but a
+      // canceled batch's queued members never do — so clear the full
+      // applied∪failed set here to drop any "Applying..." stragglers, then drop
+      // the bulk in-progress flag.
+      const applied = (data.applied ?? []) as string[];
+      const failed = ((data.failed ?? []) as Array<{ change_id?: string }>)
+        .map((f) => f.change_id)
+        .filter((id): id is string => typeof id === 'string');
+      const resolved = new Set<string>([...applied, ...failed]);
+      if (resolved.size > 0 && applyingChangeIds.value.size > 0) {
+        const next = new Set([...applyingChangeIds.value].filter((id) => !resolved.has(id)));
+        if (next.size !== applyingChangeIds.value.size) applyingChangeIds.value = next;
+      }
+      applyAllInProgress.value = false;
       break;
     }
 
@@ -887,7 +950,7 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent): void {
     case 'McpConsentPromptRequested':
       void (async () => {
         try {
-          const { request_id, server_name, tool_name, arguments_summary } = JSON.parse((event as { data: string }).data);
+          const { request_id, server_name, tool_name, arguments_summary } = JSON.parse((event as { payload: string }).payload);
           const msg = `**${server_name}** wants to call **${tool_name}**\n\n\`\`\`json\n${arguments_summary}\n\`\`\``;
           const ok = await showConfirm(msg, 'Allow', { variant: 'default' });
           await postMcpConsent(request_id, ok);

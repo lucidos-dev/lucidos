@@ -2,22 +2,23 @@ import type { ComponentType } from 'preact';
 import { ConnectionStatus } from './ConnectionStatus';
 import { unfocusThread } from '../../store/actions/threads';
 import { composeHandlers } from '../chat/promptFocus';
-import { ComposeIcon, GridIcon, SearchIcon, FilterIcon, DraftsIcon } from '../shared/icons';
+import { scrolledFromTop } from '../chat/scrollState';
+import { ComposeIcon, SearchIcon, FilterIcon } from '../shared/icons';
+import { AltViewToggles } from '../shared/AltViewToggles';
 import { CopyThreadRefButton } from '../shared/CopyThreadRefButton';
 import { ExportThreadButton } from '../shared/ExportThreadButton';
 import { ThreadNav } from '../shared/ThreadNav';
-import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
 import { ControlPanel, controlPanelOpen, controlPanelAnchor, controlPanelBadgeCount, controlPanelBadgeTooltip } from './ControlPanel';
 import { ThreadFilterDropdown } from './ThreadFilterDropdown';
 import { getContentTitle, getDiffDescription } from './headerHelpers';
-import { threadSearchQuery, mobileView, MOBILE_VIEWS, unreadCount, focusedThreadId, threadMap, effectiveThreadStatus, draftsViewActive, type MobileView } from '../../store/store';
+import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, draftsViewActive, attentionViewActive, type MobileView } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
 import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
 import { ThreadTitleEditor } from '../chat/ThreadTitleEditor';
-import { ThreadStatusIcon, resolveVisualStatus } from '../shared/ThreadStatusIcon';
+import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { MobileThreadsPane } from './MobileThreadsPane';
 import { ThreadPane } from './ThreadPane';
@@ -44,6 +45,10 @@ function MobileThreadsHeader() {
   const { filterOpen, setFilterOpen, toggleRef, closeFilter, filterActive,
           searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
 
+  // The channel/trigger/repo filter is unavailable while an alternate filter
+  // view (drafts or attention) is running — both deliberately bypass it.
+  const altViewActive = draftsViewActive.value || attentionViewActive.value;
+
   return (
     <div class={`mobile-threads-header${searchOpen ? ' search-active' : ''}`}>
       <div class="mobile-header-row">
@@ -69,16 +74,20 @@ function MobileThreadsHeader() {
             ref={toggleRef}
             class={`icon-btn header-icon${filterActive ? ' filter-active' : ''}`}
             onClick={() => setFilterOpen(!filterOpen)}
-            disabled={draftsViewActive.value}
+            disabled={altViewActive}
             aria-label="Filter threads"
-            data-tooltip={draftsViewActive.value ? 'Filter unavailable in drafts view' : 'Filter threads'}
-            style={draftsViewActive.value ? 'pointer-events: auto;' : undefined}
+            data-tooltip={altViewActive ? 'Filter unavailable in this view' : 'Filter threads'}
+            style={altViewActive ? 'pointer-events: auto;' : undefined}
           >
             <FilterIcon />
           </button>
-          {filterOpen && !draftsViewActive.value && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
+          {filterOpen && !altViewActive && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
         </div>
-        <div class="mobile-nav-slot"><ThreadNav keepCurrentPane /></div>
+        {/* Needs-attention + drafts toggles, in the slot the prev/next thread
+            arrows used to occupy. Shared scheme with desktop (see
+            AltViewToggles): shown only when non-empty, packed left, attention
+            first. */}
+        <AltViewToggles />
         <span class="pane-header-title mobile-header-title">Threads</span>
         <div class="pane-header-spacer" />
         <button
@@ -87,13 +96,6 @@ function MobileThreadsHeader() {
           aria-label="New thread"
         >
           <ComposeIcon />
-        </button>
-        <button
-          class={`icon-btn header-icon${draftsViewActive.value ? ' drafts-active' : ''}`}
-          onClick={() => { draftsViewActive.value = !draftsViewActive.value; }}
-          aria-label="Toggle drafts view"
-        >
-          <DraftsIcon />
         </button>
         <button
           class="icon-btn header-icon"
@@ -107,14 +109,14 @@ function MobileThreadsHeader() {
   );
 }
 
-/** Mobile thread header — brand mode with thread grid icon to navigate to threads pane */
+/** Mobile thread header — brand mode. Pane navigation is swipe-only (no
+ *  threads/content toggle icons); the dot indicator remains as a tappable cue. */
 function MobileThreadHeader() {
   const badgeCount = controlPanelBadgeCount();
 
   return (
     <div class="mobile-thread-header">
       <div class="mobile-header-row">
-        <ThreadToggleButton ariaLabel="Show threads" />
         <div class="mobile-nav-slot"><ThreadNav /></div>
         <span class="pane-header-brand mobile-header-title">
           <span
@@ -126,7 +128,7 @@ function MobileThreadHeader() {
               controlPanelOpen.value = !controlPanelOpen.value;
             }}
           >
-            <span class="pane-header-title">lucidos</span>
+            <span class="pane-header-title">Lucidos</span>
             {badgeCount > 0 && <span class="badge brand-badge" data-tooltip={controlPanelBadgeTooltip()}>{badgeCount}</span>}
             <ConnectionStatus />
           </span>
@@ -141,16 +143,6 @@ function MobileThreadHeader() {
           <ComposeIcon />
         </button>
         <SearchEverywhereButton />
-        <button
-          class="icon-btn header-icon"
-          onClick={() => navigateToPane('content')}
-          aria-label="Show content"
-        >
-          <GridIcon />
-          {unreadCount.value > 0 && (
-            <span class="badge">{unreadCount.value > 99 ? '99+' : unreadCount.value}</span>
-          )}
-        </button>
       </div>
     </div>
   );
@@ -205,14 +197,10 @@ export function MobileThreadTitleBar() {
   if (!threadId || !eventThread) return null;
 
   const threadTitle = threadDisplayTitle(eventThread);
-  const visualStatus = resolveVisualStatus(
-    effectiveThreadStatus(eventThread),
-    eventThread.meta.activeChildrenCount > 0,
-    eventThread.meta.codingAgentProposed,
-  );
+  const visualStatus = threadVisualStatus(eventThread);
 
   return (
-    <div class="mobile-thread-title-row">
+    <div class={`mobile-thread-title-row${scrolledFromTop.value ? ' scrolled' : ''}`}>
       <ThreadStatusIcon status={visualStatus} />
       <ThreadTitleEditor threadId={threadId} title={threadTitle} />
       <span class="thread-view-header-actions">

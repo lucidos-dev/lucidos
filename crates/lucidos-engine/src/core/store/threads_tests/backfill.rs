@@ -222,3 +222,94 @@ async fn both_backfills_compose_legacy_task_id_to_config_id() {
 
     teardown_test_db(&db).await;
 }
+
+/// The bug fix for repos that predate the `RepositoryAdded` event: their name
+/// is in neither the live `repositories` registry (once removed) nor the event
+/// log, so the filter showed the raw UUID. Their path survives in
+/// `changes.repo_root`, and the backfill scavenges its basename into
+/// `repo_names` — so the deleted repo lists as `cognos`, not a UUID, AND the
+/// projection-backed names already present are left untouched.
+#[tokio::test]
+async fn backfill_repo_names_from_changes_recovers_basename() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    // A removed pre-event repo: a CC thread references it and a change recorded
+    // its path, but it's in neither `repositories` nor `repo_names`.
+    let deleted_repo = Uuid::new_v4();
+    let cc = insert_cc_repo_thread(&pool, &deleted_repo.to_string(), 60).await;
+    insert_change(&pool, cc, "/Users/dev/IdeaProjects/cognos").await;
+
+    // A repo already named in the projection (registry / RepositoryAdded) must
+    // NOT be clobbered by the path basename.
+    let named_repo = Uuid::new_v4();
+    insert_repo_name(&pool, named_repo, "Canonical Name").await;
+    let named_cc = insert_cc_repo_thread(&pool, &named_repo.to_string(), 50).await;
+    insert_change(&pool, named_cc, "/Users/dev/projects/lowercase").await;
+
+    // A repo with no change: nothing to scavenge — stays absent (NULL name).
+    let nameless_repo = Uuid::new_v4();
+    insert_cc_repo_thread(&pool, &nameless_repo.to_string(), 40).await;
+
+    // App coding-agent threads record a *workspace* root in repo_root (basename
+    // = workspace, not a repo). They have no cc_repo_id today, but the guard is
+    // belt-and-suspenders for the documented footgun — pin it with an artificial
+    // app row that DOES carry a cc_repo_id.
+    let app_repo = Uuid::new_v4();
+    let app = insert_cc_repo_thread(&pool, &app_repo.to_string(), 30).await;
+    sqlx::query("UPDATE thread_summaries SET coding_agent_kind = 'app' WHERE thread_id = $1")
+        .bind(app)
+        .execute(&pool)
+        .await
+        .expect("mark app thread");
+    insert_change(&pool, app, "/Users/dev/workspaces/my-workspace").await;
+
+    let inserted = store
+        .backfill_repo_names_from_changes()
+        .await
+        .expect("backfill_repo_names_from_changes");
+    assert_eq!(inserted, 1, "only the deleted pre-event repo gets a scavenged name");
+
+    async fn name_of(pool: &PgPool, id: Uuid) -> Option<String> {
+        sqlx::query_scalar::<_, String>("SELECT name FROM repo_names WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .expect("fetch repo_name")
+    }
+
+    assert_eq!(
+        name_of(&pool, deleted_repo).await.as_deref(),
+        Some("cognos"),
+        "deleted pre-event repo recovers its name from changes.repo_root basename"
+    );
+    assert_eq!(
+        name_of(&pool, named_repo).await.as_deref(),
+        Some("Canonical Name"),
+        "a repo already in repo_names is never clobbered by the path basename"
+    );
+    assert_eq!(name_of(&pool, nameless_repo).await, None, "no change = no name invented");
+    assert_eq!(
+        name_of(&pool, app_repo).await,
+        None,
+        "app thread's workspace-root basename must not be scavenged as a repo name"
+    );
+
+    // The user-visible surface: the repos filter facet now labels the deleted
+    // repo with its recovered name instead of the UUID.
+    let facets = store.get_filter_facets().await.expect("get_filter_facets");
+    let deleted_facet = facets
+        .repos
+        .iter()
+        .find(|f| f.id.as_deref() == Some(deleted_repo.to_string().as_str()))
+        .expect("deleted repo is a facet");
+    assert_eq!(deleted_facet.name.as_deref(), Some("cognos"));
+
+    let second = store
+        .backfill_repo_names_from_changes()
+        .await
+        .expect("idempotent");
+    assert_eq!(second, 0, "second run touches nothing (marker set)");
+
+    teardown_test_db(&db).await;
+}

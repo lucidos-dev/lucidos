@@ -5,6 +5,16 @@ use std::collections::HashMap;
 pub const PREF_MODEL_TITLE: &str = "model_title";
 pub const PREF_MODEL_IMAGE_DESCRIPTION: &str = "model_image_description";
 pub const PREF_MODEL_MEMORY: &str = "model_memory";
+/// Model the *command guard*'s LLM *judge* uses to classify the ambiguous
+/// middle (ADR 0002, Phase 3). Configurable so a workspace can trade
+/// accuracy/cost; defaults to [`DEFAULT_COMMAND_JUDGE_MODEL`] when unset.
+pub const PREF_MODEL_COMMAND_JUDGE: &str = "model_command_judge";
+
+/// Default model for the command-guard judge — a cheap, fast model (Haiku) per
+/// ADR 0002. Mirrored on the frontend in
+/// `crates/lucidos-app/src/store/actions/preferences.ts`
+/// (`DEFAULT_COMMAND_JUDGE_MODEL`).
+pub const DEFAULT_COMMAND_JUDGE_MODEL: &str = "claude-haiku-4-5";
 
 // Chat preference keys (also written by frontend Settings UI)
 pub const PREF_CHAT_MODEL: &str = "chat_model";
@@ -24,6 +34,19 @@ pub const PREF_IMAGE_MODEL: &str = "image_model";
 // bodies are dropped — only the name + char_count survives. Defaults
 // to "true" to preserve historical behavior.
 pub(crate) const PREF_CAPTURE_CONTEXT: &str = "capture_context";
+
+// Master toggle for the *command guard* (ADR 0002): the pre-dispatch safety
+// gate over the Lucidos Agent's bash/python tools. Off by default — the feature
+// ships dark and is enabled per-workspace. See `engine::command_guard`.
+pub(crate) const PREF_COMMAND_GUARD: &str = "command_guard";
+
+// Sub-toggle for the command-guard *judge* (ADR 0002, Phase 3). When the guard
+// is on, the LLM judge classifies the ambiguous middle (everything the static
+// fast-path doesn't settle). Default on; set to "false" to fall back to the
+// static "dangerous" list for the ask lane (the documented reopen path — accept
+// more misses, pay no per-command LLM cost/latency). Only consulted when the
+// master `command_guard` toggle is on.
+pub(crate) const PREF_COMMAND_GUARD_JUDGE: &str = "command_guard_judge";
 
 /// Store for managing user preferences in the database
 pub struct PreferenceStore;
@@ -191,6 +214,47 @@ impl PreferenceStore {
         Self::get(pool, PREF_CAPTURE_CONTEXT)
             .await
             .map(|opt| opt.map(|v| v != "false").unwrap_or(true))
+    }
+
+    /// Read the *command guard* toggle (ADR 0002). The command guard is a
+    /// pre-dispatch safety gate over the Lucidos Agent's bash/python tools.
+    /// Returns `Ok(false)` when unset — the feature ships dark and is enabled
+    /// per-workspace. DB errors propagate as `Err` so a real failure surfaces
+    /// rather than silently disabling the guard.
+    pub async fn command_guard(pool: &PgPool) -> Result<bool, sqlx::Error> {
+        Self::get(pool, PREF_COMMAND_GUARD)
+            .await
+            .map(|opt| opt.map(|v| v == "true").unwrap_or(false))
+    }
+
+    /// Read the command-guard *judge* sub-toggle (ADR 0002, Phase 3). Returns
+    /// `Ok(true)` when unset — when the master guard is on, the judge is the
+    /// real classifier by default; set the preference to `"false"` to fall back
+    /// to the static dangerous list. DB errors propagate as `Err`. Only
+    /// meaningful when [`command_guard`](Self::command_guard) is on.
+    pub async fn command_guard_judge(pool: &PgPool) -> Result<bool, sqlx::Error> {
+        Self::get(pool, PREF_COMMAND_GUARD_JUDGE)
+            .await
+            .map(|opt| opt.map(|v| v != "false").unwrap_or(true))
+    }
+
+    /// The model the command-guard judge runs on, defaulting to
+    /// [`DEFAULT_COMMAND_JUDGE_MODEL`] (Haiku) when unset. DB errors are logged
+    /// and treated as unset — the judge falls back to the default model rather
+    /// than failing the whole classification.
+    pub async fn command_judge_model(pool: &PgPool) -> String {
+        match Self::get(pool, PREF_MODEL_COMMAND_JUDGE).await {
+            Ok(Some(m)) if !m.trim().is_empty() => m,
+            Ok(_) => DEFAULT_COMMAND_JUDGE_MODEL.to_string(),
+            Err(e) => {
+                log!(
+                    "[Preferences] Failed to read {}: {} — using default judge model",
+                    PREF_MODEL_COMMAND_JUDGE,
+                    e
+                );
+                DEFAULT_COMMAND_JUDGE_MODEL.to_string()
+            }
+        }
     }
 
     /// Read the user's chat model + reasoning effort preferences for code

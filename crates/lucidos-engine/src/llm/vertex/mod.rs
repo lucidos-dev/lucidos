@@ -23,22 +23,6 @@ use tokio::process::Command;
 mod claude;
 mod gemini;
 
-/// Map a unified `reasoning_effort` string to the thinking-budget token count
-/// shared by the Claude `budget_tokens` field and Gemini-3
-/// `thinkingConfig.thinkingBudget`. Unknown values fall back to the "high"
-/// budget — the same default both call sites picked independently before
-/// this was DRYed up.
-fn thinking_budget_for_effort(effort: &str) -> u32 {
-    match effort {
-        "low" => 4096,
-        "medium" => 8192,
-        "high" => 16384,
-        "xhigh" => 24576,
-        "max" => 32768,
-        _ => 16384,
-    }
-}
-
 /// Shared access token cache for all VertexProvider instances in the same project.
 /// gcloud tokens are project-scoped, so one cache serves all models.
 pub type TokenCache = Arc<std::sync::Mutex<Option<(String, std::time::Instant)>>>;
@@ -175,29 +159,6 @@ impl VertexProvider {
 
     fn is_claude_model(model: &str) -> bool {
         model.starts_with("claude")
-    }
-
-    /// Strip `[1m]` suffix from model ID, returning (base_model, is_1m_context).
-    fn parse_context_suffix(model: &str) -> (&str, bool) {
-        if let Some(base) = model.strip_suffix("[1m]") {
-            (base, true)
-        } else {
-            (model, false)
-        }
-    }
-
-    /// Models that support extended thinking (reasoning goes to dedicated blocks
-    /// instead of polluting the text response).
-    fn supports_extended_thinking(model: &str) -> bool {
-        model.contains("claude-3-7-sonnet")
-            || model.contains("claude-sonnet-4")
-            || model.contains("claude-opus-4")
-    }
-
-    /// Opus 4.7+ only supports adaptive thinking (no budget_tokens, no
-    /// temperature/top_p/top_k). Effort is controlled via output_config.effort.
-    fn requires_adaptive_thinking(model: &str) -> bool {
-        model.contains("claude-opus-4-7") || model.contains("claude-opus-4-8")
     }
 
     fn endpoint_for_model(&self, model: &str) -> String {
@@ -428,30 +389,6 @@ mod tests {
             url.contains("/locations/global/"),
             "gemini-3 always uses locations/global: {}",
             url
-        );
-    }
-
-    #[test]
-    fn parse_context_suffix_strips_1m() {
-        assert_eq!(
-            VertexProvider::parse_context_suffix("claude-opus-4-6[1m]"),
-            ("claude-opus-4-6", true)
-        );
-        assert_eq!(
-            VertexProvider::parse_context_suffix("claude-sonnet-4-6[1m]"),
-            ("claude-sonnet-4-6", true)
-        );
-    }
-
-    #[test]
-    fn parse_context_suffix_preserves_base_model() {
-        assert_eq!(
-            VertexProvider::parse_context_suffix("claude-opus-4-6"),
-            ("claude-opus-4-6", false)
-        );
-        assert_eq!(
-            VertexProvider::parse_context_suffix("gemini-2.5-pro"),
-            ("gemini-2.5-pro", false)
         );
     }
 

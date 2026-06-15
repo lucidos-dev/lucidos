@@ -32,7 +32,7 @@ import { type ThreadState } from '../thread-events';
 import { fetchThreads } from '../../api/threads';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { archivingThreadIds, focusedThreadId, generatedTitleIds, mobileView, resetCCPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts } from '../store';
+import { archivingThreadIds, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts } from '../store';
 import { ensureThreadByIdInMap, ensureThreadInMap, loadAllThreads, upsertThread } from './thread-loading';
 import { focusThread } from './threads';
 
@@ -77,7 +77,7 @@ beforeEach(() => {
   mobileView.value = 'thread';
   threadDrawerOpen.value = false;
   drawerOpen.value = false;
-  resetCCPendingPreferences();
+  resetCodingAgentPendingPreferences();
   generatedTitleIds.clear();
   archivingThreadIds.value = new Set();
   localStorage.removeItem('lucidos-focused-thread');
@@ -511,18 +511,21 @@ describe('event replay must not override API status', () => {
 });
 
 // ---------------------------------------------------------------------------
-// refreshThreadEvents — retry once on transient DOMException
+// refreshThreadEvents — retry once on transient DOMException / transport error
 // ---------------------------------------------------------------------------
 // The runResumeSync / resyncLoadedThreads paths fire Promise.all of
 // refreshThreadEvents for every loaded thread on SSE reconnect, iOS PWA wake,
-// or backend Lagged events. On iOS Safari, the browser frequently cancels
-// in-flight fetches mid-flight (suspend/resume, lifecycle, network change),
-// surfacing as AbortError. A single retry covers the transient case — without
-// it the user gets one "Failed to refresh thread events" toast per cancelled
-// thread, which can mean dozens of toasts in a single wake cycle. Mirrors the
-// retry-on-TimeoutError pattern in refreshChangesState.
+// or right after an engine restart. On iOS Safari, the browser cancels
+// in-flight fetches mid-flight (suspend/resume, lifecycle, network change) —
+// surfacing as AbortError — and fails the first request on a stale HTTP/2
+// connection — surfacing as TypeError "Load failed". A single retry covers the
+// transient case; if both attempts still fail transiently we stay silent
+// because SSE recovers. Without this the user gets one "Failed to refresh
+// thread events" toast per affected thread, which can mean dozens of toasts in
+// a single wake cycle. Mirrors the retry-on-TimeoutError pattern in
+// refreshChangesState.
 
-describe('refreshThreadEvents — retry on transient DOMException', () => {
+describe('refreshThreadEvents — retry on transient DOMException / transport error', () => {
   beforeEach(() => {
     toasts.value = [];
   });
@@ -590,6 +593,42 @@ describe('refreshThreadEvents — retry on transient DOMException', () => {
     // on wake / SSE reconnect) and SSE recovers any missed events. Toasting
     // surfaced a dozen errors per wake cycle on iOS PWA — visible noise
     // the user couldn't act on.
+    expect(toasts.value.find(t => t.message?.startsWith('Failed to refresh thread events'))).toBeUndefined();
+  });
+
+  it('retries silently when the first fetch fails with a transport error (iOS stale connection) and second succeeds', async () => {
+    setupLoadedThread();
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockResolvedValueOnce(noNewEventsSnapshot());
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    await refreshThreadEvents('t1');
+
+    expect(mock).toHaveBeenCalledTimes(2);
+    expect(toasts.value.find(t => t.message?.startsWith('Failed to refresh thread events'))).toBeUndefined();
+  });
+
+  it('silences both-transport-error (iOS PWA wake / post-restart stale HTTP/2) per the carve-out', async () => {
+    setupLoadedThread();
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockRejectedValueOnce(new TypeError('Load failed'));
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    await refreshThreadEvents('t1');
+
+    expect(mock).toHaveBeenCalledTimes(2);
+    // No toast — this is the exact pile the user reported after returning to a
+    // backgrounded iOS PWA once the engine had restarted: the resync's fetches
+    // hit a stale connection (TypeError "Load failed"). SSE recovers any missed
+    // events; the refresh is background (runResumeSync), not user-initiated.
     expect(toasts.value.find(t => t.message?.startsWith('Failed to refresh thread events'))).toBeUndefined();
   });
 

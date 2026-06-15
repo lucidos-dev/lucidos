@@ -9,7 +9,7 @@ export type ExchangeStatus =
   | 'pending'          // Created, waiting for first SSE event
   | 'queued'           // Waiting for a prior active exchange to finish
   | 'streaming'        // SSE events flowing (text/tools)
-  | 'cc-working'       // Claude Code actively working
+  | 'coding-agent-working'       // Claude Code actively working
   | 'awaiting-answer'  // CC paused on a question or permission prompt — user's turn
   | 'done'             // Response complete
   | 'interrupted'      // User sent follow-up while streaming
@@ -17,7 +17,7 @@ export type ExchangeStatus =
   | 'error'            // Request failed
   | 'aborted';         // System interrupted (engine restart/crash mid-response)
 
-export const ACTIVE_STATUSES: Set<ExchangeStatus> = new Set(['pending', 'streaming', 'cc-working']);
+export const ACTIVE_STATUSES: Set<ExchangeStatus> = new Set(['pending', 'streaming', 'coding-agent-working']);
 
 export function isActive(status: ExchangeStatus): boolean {
   return ACTIVE_STATUSES.has(status);
@@ -51,14 +51,14 @@ export function statusLabel(
       return hasSteps
         ? { label: 'Working', className: 'working' }
         : { label: 'Requesting', className: 'working' };
-    case 'cc-working':
+    case 'coding-agent-working':
       return { label: 'Working', className: 'working' };
     case 'awaiting-answer':
-      return { label: 'Awaiting answer', className: 'awaiting' };
+      return { label: 'Needs your answer', className: 'awaiting' };
     case 'done':
       return { label: 'Done', className: 'done' };
     case 'interrupted':
-      return { label: 'Continued below', className: 'done' };
+      return { label: 'Done', className: 'done' };
     case 'canceled':
       return { label: 'Canceled', className: 'canceled' };
     case 'error':

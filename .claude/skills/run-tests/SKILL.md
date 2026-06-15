@@ -1,6 +1,6 @@
 ---
 name: run-tests
-description: Use when asked to "run tests", "build & test", "check the engine builds", or any variant — runs `cargo build --release && cargo test -p lucidos-engine` plus the frontend Vitest suite (`cd crates/lucidos-app && npx tsc --noEmit && npm test`), fixes failures at root cause, never bypasses with #[ignore], reports exact pass/fail counts.
+description: Use when asked to "run tests", "build & test", "check the engine builds", or any variant — builds the engine (`cargo build -p lucidos-engine --release`) and runs the full engine suite via `./scripts/test-engine.sh --full` (which provisions a disposable Postgres — bare `cargo test -p lucidos-engine` panics every DB-backed integration test), plus the frontend Vitest suite (`cd crates/lucidos-app && npx tsc --noEmit && npm test`). Fixes failures at root cause, never bypasses with #[ignore], reports exact pass/fail counts.
 ---
 
 # Run tests (engine + frontend unit)
@@ -13,7 +13,27 @@ comment out a failing test.
 
 Run both phases. If either fails, the whole skill FAILED.
 
-1. **Rust engine.** `cargo build --release` then `cargo test -p lucidos-engine`.
+1. **Rust engine.** Two steps:
+   1. **Build:** `cargo build -p lucidos-engine --release` — verifies the engine
+      compiles in the profile it ships in (a separate compilation from the test
+      build below, which is debug + `cfg(test)`).
+   2. **Test:** `./scripts/test-engine.sh --full` (equivalently `make test-full`).
+      Runs the whole crate — lib + integration + doctests.
+      **Do NOT run bare `cargo test -p lucidos-engine`.** The engine's
+      integration tests (`setup_test_db` in `src/test_support.rs`) need a real
+      Postgres: each `CREATE`s a throwaway `lucidos_test_*` database, migrates,
+      and drops it, reading the connection from `TEST_DATABASE_URL`. With no
+      `TEST_DATABASE_URL` and no PG up, every DB-backed test panics on connect
+      (`.expect("admin connect")`) — that's *hundreds of false failures*, not
+      regressions, and it has blocked this skill before. `test-engine.sh`
+      provisions a dedicated, disposable `lucidos-pg-test` container (pgvector,
+      port `LUCIDOS_TEST_PG_PORT` / default 5510), exports `TEST_DATABASE_URL`,
+      then runs `cargo test`. It is isolated from every workspace's PG and never
+      broad-kills (touches only its own container by exact name). Requires Docker
+      running — if Docker is down the script exits 1 before any test; report that
+      as FAILED (infra), not green. To narrow to a filter while iterating a fix:
+      `./scripts/test-engine.sh -- -- <test_name>` (the double `--` is required so
+      the names reach the test binary, not cargo).
 2. **Frontend unit (Vitest + tsc).** `cd crates/lucidos-app && npx tsc --noEmit && npm test`.
    - `npm test` runs `vitest run` (single pass, no watch).
    - `npx tsc --noEmit` catches type regressions that Vitest alone misses.
@@ -29,12 +49,16 @@ failing test — every test must run and pass.
 
 Do NOT run the test commands through `| tail`, `| head`, `| grep`, or
 any other pipe to trim output. Under zsh / bash a pipeline reports the
-exit code of the *last* command, not `cargo`/`npm` — so
-`cargo test -p lucidos-engine | tail` exits 0 (tail's success) even when
-a Rust test failed, and the skill silently reports PASSED on a red run.
-This false-green has actually shipped a failing nightly. The sibling
+exit code of the *last* command, not `cargo`/`npm`/the script — so
+`./scripts/test-engine.sh --full | tail` exits 0 (tail's success) even
+when a Rust test failed, and the skill silently reports PASSED on a red
+run. This false-green has actually shipped a failing nightly. The sibling
 `/clean-build` skill documents the full mechanism under "Reading exit
 codes honestly — beware piped output".
+
+`test-engine.sh` is safe to capture from directly: it runs `set -euo
+pipefail` and its *last* command is the `cargo test`, so the script's
+own exit code IS cargo's exit code — no wrapper masks it.
 
 The rule: run each phase un-piped and read its real exit code. If the
 output is too large, redirect to a log file and capture `$?` directly,
@@ -42,16 +66,19 @@ then grep the log — never let a pipe stand between you and the exit
 status:
 
 ```sh
-cargo test -p lucidos-engine > /tmp/cargo-test.log 2>&1; echo "EXIT: $?"
-tail -100 /tmp/cargo-test.log   # inspect AFTER capturing the real exit
+./scripts/test-engine.sh --full > /tmp/engine-test.log 2>&1; echo "EXIT: $?"
+tail -100 /tmp/engine-test.log   # inspect AFTER capturing the real exit
 ```
 
 A "PASSED" claim requires the echoed `EXIT: 0` you printed yourself AND
-the `test result: ok.` line with `0 failed` — a trimmed tail alone can lie.
+the `test result: ok.` line with `0 failed` — a trimmed tail alone can
+lie. Cross-check both: a non-zero exit with no `test result:` line at all
+usually means the *infra* failed (Docker down, port in use), not a test —
+report that distinctly.
 
 ## Documented #[ignore] exceptions
 
-Two tests in `crates/lucidos-engine/src/engine/thread_lifecycle_tests/tests.rs`
+Two tests in `crates/lucidos-engine/src/engine/thread_lifecycle_tests/contract.rs`
 are intentionally `#[ignore]`d as contract-artifact generators
 (`generate_typescript_file` and `generate_cross_validation_fixture_file`).
 Running them rewrites generated source files; sibling non-ignored tests

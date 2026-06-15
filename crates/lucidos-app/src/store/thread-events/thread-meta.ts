@@ -16,6 +16,13 @@ export type ThreadAggregate = {
   initiator: ThreadInitiator;
   createdAt: string;
   lastActivity: string;
+  /** When the user last drove this thread forward — the drawer sort key. The
+   *  backend always sends it; optional only so test fixtures needn't set a
+   *  recency they don't assert on (consumers fall back to `lastActivity`). */
+  lastUserAction?: string;
+  /** When the agent (or trigger) last did something — the tooltip's Agent line.
+   *  Optional for the same reason as `lastUserAction`. */
+  lastAgentAction?: string;
   messageCount: number;
   section: ThreadSection;
   status: ThreadStatus;
@@ -66,6 +73,9 @@ export type ThreadAggregate = {
   /** Canonical folder the coding agent operates on (`<ws>/data/apps/<id>/`
    *  for app threads). Absent for non-CC threads and legacy rows. */
   codingAgentFolder?: string;
+  /** Which backend drives this thread — 'claude-code' | 'codex'. Absent for
+   *  non-CC threads and legacy rows (consumers default to 'claude-code'). */
+  codingAgent?: 'claude-code' | 'codex';
   state: ThreadComposeState;
 };
 
@@ -96,6 +106,14 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   // updatedAt / messageCount: overlay unconditionally, do NOT mark changed
   meta.messageCount = agg.messageCount;
   meta.updatedAt = agg.lastActivity;
+  // lastUserAction is the drawer SORT key — mark changed so a user action
+  // re-sorts the list immediately. lastAgentAction is tooltip-only, so overlay
+  // it like updatedAt (no `changed`) — it moves on every agent event and would
+  // otherwise defeat the fan-out gate in thread-sync.ts. Only overlay when the
+  // aggregate carries them (it always does in prod) so a field-less test
+  // aggregate can't blank a previously-set value.
+  if (agg.lastUserAction !== undefined && meta.lastUserAction !== agg.lastUserAction) { meta.lastUserAction = agg.lastUserAction; changed = true; }
+  if (agg.lastAgentAction !== undefined) meta.lastAgentAction = agg.lastAgentAction;
   const nextLastRevived = agg.lastRevivedAt ?? '';
   if (meta.lastRevivedAt !== nextLastRevived) { meta.lastRevivedAt = nextLastRevived; changed = true; }
   if (meta.state !== agg.state) { meta.state = agg.state; changed = true; }
@@ -115,6 +133,10 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
     meta.codingAgentFolder = agg.codingAgentFolder;
     changed = true;
   }
+  if (agg.codingAgent && meta.codingAgent !== agg.codingAgent) {
+    meta.codingAgent = agg.codingAgent;
+    changed = true;
+  }
   return changed;
 }
 
@@ -130,6 +152,18 @@ export type ThreadMeta = {
   saved: boolean;
   createdAt: string;
   updatedAt: string;
+  /** When the user last drove this thread forward (message sent, question
+   *  answered, permission resolved, change applied/discarded). The drawer SORTS
+   *  by this — agent streaming/idle does NOT bump it — so background agent churn
+   *  no longer reshuffles the list. Optional only for test ergonomics; every
+   *  production path (API load, optimistic insert, aggregate overlay) sets it,
+   *  and `recencyKey` falls back to `updatedAt` if it's somehow absent. */
+  lastUserAction?: string;
+  /** When the agent (or trigger) last did something — streaming, a terminal
+   *  response, an idle, a trigger fire/complete, or asking the user. Drives the
+   *  thread-row tooltip's "Agent ·" line, distinct from `lastUserAction` so the
+   *  tooltip stays accurate even right after the user acts. */
+  lastAgentAction?: string;
   /** Thread status computed by the backend: 'idle', 'running', or 'waiting'. */
   status: ThreadStatus;
   /** Server-computed exchange count (MESSAGE_COUNT_EVENTS in thread_lifecycle.rs). */
@@ -185,6 +219,10 @@ export type ThreadMeta = {
   /** Canonical folder the coding agent operates on. For app threads,
    *  `<ws>/data/apps/<id>/` — the last path segment is the app id. */
   codingAgentFolder?: string;
+  /** Which backend drives this thread — 'claude-code' | 'codex'. Bound at
+   *  compose promotion (sendCompose) for new threads; loaded from the
+   *  thread summary afterwards. Absent = legacy / 'claude-code'. */
+  codingAgent?: 'claude-code' | 'codex';
   /** Compose state machine. Server is the source of truth; events flow via
    *  ThreadStarted, MessageReceived, ThreadDiscarded, ThreadArchived.
    *
@@ -250,6 +288,7 @@ export function makeOptimisticThreadState(opts: {
   repoName?: string;
   codingAgentKind?: 'lucidos' | 'app' | 'external';
   codingAgentFolder?: string;
+  codingAgent?: 'claude-code' | 'codex';
   /** Override compose state — defaults to 'active'. Set 'composing' for
    *  optimistic draft creation (compose.ts, ThreadStarted SSE). */
   state?: ThreadComposeState;
@@ -266,6 +305,8 @@ export function makeOptimisticThreadState(opts: {
       saved: false,
       createdAt: ts,
       updatedAt: ts,
+      lastUserAction: ts,
+      lastAgentAction: ts,
       status: opts.status ?? 'running',
       messageCount: 0,
       section: 'archived',
@@ -285,6 +326,7 @@ export function makeOptimisticThreadState(opts: {
       repoName: opts.repoName,
       codingAgentKind: opts.codingAgentKind,
       codingAgentFolder: opts.codingAgentFolder,
+      codingAgent: opts.codingAgent,
       state: opts.state ?? 'active',
       latestTodoList: null,
     },
@@ -297,9 +339,17 @@ export function makeOptimisticThreadState(opts: {
   };
 }
 
-/** Sort threads by updatedAt descending (most recent first). */
+/** Recency key for drawer ordering: when the USER last acted on the thread, so
+ *  background agent churn (streaming, idle) doesn't reshuffle the list. Falls
+ *  back to `updatedAt` (last activity) only if `lastUserAction` is absent — the
+ *  backend always sends it, so the fallback just keeps older test fixtures and
+ *  any pre-field skeleton sane. */
+export const recencyKey = (t: ThreadState): string =>
+  t.meta.lastUserAction || t.meta.updatedAt;
+
+/** Sort threads by last user action descending (most recent first). */
 export const byRecent = (a: ThreadState, b: ThreadState): number =>
-  b.meta.updatedAt.localeCompare(a.meta.updatedAt);
+  recencyKey(b).localeCompare(recencyKey(a));
 
 /** Threads whose compose state hides them from every drawer section: composing
  *  drafts live in the compose pane / Drafts surface, and discarded threads
@@ -309,27 +359,25 @@ export const byRecent = (a: ThreadState, b: ThreadState): number =>
 export const isExcludedFromSections = (t: ThreadState): boolean =>
   t.meta.state === 'composing' || t.meta.state === 'discarded';
 
-/** Review-section tier for a thread under a given status: 0 (Tier 1) when the
- *  system has identified a CTA (codingAgentProposed, WaitingForUserAnswer, or
- *  Failed), 1 (Tier 2) otherwise. Caller picks which status to consult — the
- *  drawer's family-aware sort uses `effectiveThreadStatus` (which honors
- *  optimistic archiving + pending sends), `byReviewOrder` consults raw
- *  `meta.status` to preserve historical behavior. */
-export function reviewTier(t: ThreadState, status: ThreadStatus): 0 | 1 {
-  return t.meta.codingAgentProposed
-    || status === 'waiting_for_user_answer'
-    || status === 'failed'
-    ? 0
-    : 1;
+/** Review-section sort tier for a thread under a given status — lower sorts
+ *  higher. Three tiers:
+ *    0 — WaitingForUserAnswer: a user question or permission request is
+ *        blocking the agent. Most critical (nothing progresses until the user
+ *        answers), so these float to the very top.
+ *    1 — other CTA: codingAgentProposed (a change is ready to review) or Failed
+ *        (the last response errored). The user should act, but no agent is
+ *        stalled waiting on them.
+ *    2 — no CTA: running, idle, etc.
+ *  Tiers 0 and 1 together are "needs attention" (the count badges); tier 0 is
+ *  the most-critical subset. The caller passes the status to consult — every
+ *  caller (the drawer's family-aware sort via `computeFamilyKeys`, the attention
+ *  view, and the post-archive focus picker) uses `effectiveThreadStatus`, which
+ *  honors optimistic archiving + pending sends. */
+export function reviewTier(t: ThreadState, status: ThreadStatus): 0 | 1 | 2 {
+  if (status === 'waiting_for_user_answer') return 0;
+  if (t.meta.codingAgentProposed || status === 'failed') return 1;
+  return 2;
 }
-
-/** Sort review threads in two tiers, then by recency within each tier. */
-export const byReviewOrder = (a: ThreadState, b: ThreadState): number => {
-  const ta = reviewTier(a, a.meta.status);
-  const tb = reviewTier(b, b.meta.status);
-  if (ta !== tb) return ta - tb;
-  return byRecent(a, b);
-};
 
 /** Whether this event type updates the thread's last_activity in the backend
  *  projection (event_bus.rs). Generated from thread_lifecycle.rs. */

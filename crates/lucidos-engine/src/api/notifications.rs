@@ -30,14 +30,6 @@ pub(super) struct CreateNotificationRequest {
     pub tap: Option<Tap>,
 }
 
-fn bad_request(msg: impl Into<String>) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({ "error": msg.into() })),
-    )
-        .into_response()
-}
-
 /// `POST /api/v1/notifications` — script-facing endpoint that produces the
 /// same notification a `send_notification` LLM tool call would: persisted
 /// to the inbox AND pushed to subscribed devices, with the same `app_id`
@@ -47,12 +39,12 @@ pub(super) async fn create_notification(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CreateNotificationRequest>,
-) -> Response {
+) -> Result<Json<serde_json::Value>, ApiError> {
     if body.title.trim().is_empty() {
-        return bad_request("title is required");
+        return Err(ApiError::bad_request("title is required"));
     }
     if body.message.trim().is_empty() {
-        return bad_request("message is required");
+        return Err(ApiError::bad_request("message is required"));
     }
 
     let app_id = body
@@ -61,15 +53,11 @@ pub(super) async fn create_notification(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let link_thread_id = match super::parse_optional_uuid_trimmed(body.thread_id.as_deref()) {
-        Ok(v) => v,
-        Err(raw) => return bad_request(format!("invalid thread_id: {raw}")),
-    };
+    let link_thread_id = super::parse_optional_uuid_trimmed(body.thread_id.as_deref())
+        .map_err(|raw| ApiError::bad_request(format!("invalid thread_id: {raw}")))?;
 
-    let link_event_id = match super::parse_optional_uuid_trimmed(body.event_id.as_deref()) {
-        Ok(v) => v,
-        Err(raw) => return bad_request(format!("invalid event_id: {raw}")),
-    };
+    let link_event_id = super::parse_optional_uuid_trimmed(body.event_id.as_deref())
+        .map_err(|raw| ApiError::bad_request(format!("invalid event_id: {raw}")))?;
 
     // Structured tap — `to.target`-specific required fields (e.g. `app_id`
     // for `target=app`) are enforced by the page-side router, not here.
@@ -78,7 +66,7 @@ pub(super) async fn create_notification(
 
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
-    match state
+    let id = state
         .engine
         .create_notification(
             &body.title,
@@ -90,18 +78,12 @@ pub(super) async fn create_notification(
             actor,
         )
         .await
-    {
-        Ok(id) => Json(serde_json::json!({
-            "success": true,
-            "notification_id": id.to_string(),
-        }))
-        .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "notification_id": id.to_string(),
+    })))
 }
 
 // ===== Notification Endpoints =====
@@ -113,10 +95,9 @@ pub(super) async fn get_notifications(
     let filter = query.filter.as_deref().unwrap_or("all");
     // Clamp upper bound so a misconfigured client can't ask for an unbounded
     // page; sibling list endpoints (changes, applied changes) cap at 100 too.
-    // Lower bound is 0 — `refreshUnreadCount` deliberately passes limit=0 to
-    // fetch only the unread_count without items, so we honor it explicitly
-    // below instead of bumping it to 1 (which would waste one DB row per call
-    // and the caller would discard it anyway).
+    // Lower bound is 0 — a caller wanting only `unread_count` (a count-only
+    // probe) passes limit=0, so we honor it explicitly below instead of bumping
+    // it to 1 (which would waste one DB row per call the caller would discard).
     let limit = query.limit.clamp(0, 100);
 
     let before_ts = query.before.map(super::parse_unix_ts);
@@ -392,3 +373,37 @@ pub(super) async fn get_push_log(
     Ok(Json(rows))
 }
 
+
+/// Routes for the `/notifications*`, `/notification*`, and `/push/*`
+/// surfaces (push subscriptions are part of the notification fan-out and
+/// their handlers live here).
+pub(super) fn router() -> Router<AppState> {
+    let router = Router::new()
+        .route("/notifications", get(get_notifications))
+        .route("/notifications", post(create_notification))
+        .route(
+            "/notifications/before",
+            get(get_notifications_at_timestamp),
+        )
+        .route(
+            "/notifications/read-all",
+            post(mark_all_notifications_read),
+        )
+        .route("/notification", get(get_notification))
+        .route(
+            "/notification/read",
+            post(mark_notification_read),
+        )
+        // Push notification endpoints
+        .route("/push/vapid-key", get(get_vapid_key))
+        .route("/push/subscribe", post(push_subscribe))
+        .route("/push/unsubscribe", post(push_unsubscribe));
+
+    // Test-only push assertion endpoint. Compiled in only with the
+    // `e2e-test-hooks` cargo feature so production binaries don't expose
+    // the push_log to the network at all.
+    #[cfg(feature = "e2e-test-hooks")]
+    let router = router.route("/_test/push-log", get(get_push_log));
+
+    router
+}

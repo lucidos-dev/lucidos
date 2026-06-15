@@ -57,6 +57,13 @@ fn write_from_worktree_lands_in_parent_workspace_data_dir() {
     );
     assert_eq!(fs::read(&landed).unwrap(), b"hello world");
 
+    // stdout carries the ready-to-paste clickable chat link: basename label,
+    // bare store-path target (no scheme — a scheme would dead-end on click).
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "[test.txt](artifacts/ua/test.txt)"
+    );
+
     // And specifically — must NOT have landed in the worktree.
     let in_worktree = worktree.join("artifacts/ua/test.txt");
     assert!(

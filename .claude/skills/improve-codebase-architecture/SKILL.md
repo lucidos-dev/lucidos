@@ -32,7 +32,7 @@ This skill is _informed_ by the project's domain model. The domain language give
 
 ### 1. Explore
 
-Read the project's domain glossary and any ADRs in the area you're touching first.
+Read the project's domain glossary, any ADRs in the area you're touching, and `docs/code-review-priors.md` (the ledger of patterns past reviews flagged and dismissed with evidence) first. Pass the priors file to every explorer agent — a finding that matches a prior is dead on arrival unless the explorer shows the guard or contract has since changed.
 
 Then use the Agent tool with `subagent_type=Explore` to walk the codebase. Don't follow rigid heuristics — explore organically and note where you experience friction:
 
@@ -43,6 +43,10 @@ Then use the Agent tool with `subagent_type=Explore` to walk the codebase. Don't
 - Which parts of the codebase are untested, or hard to test through their current interface?
 
 Apply the **deletion test** to anything you suspect is shallow: would deleting it concentrate complexity, or just move it? A "yes, concentrates" is the signal you want.
+
+### 1.5. Verify before reporting
+
+Explorer agents locate friction; they don't prove it. Before a finding goes in the report, **read the cited lines yourself** and confirm the claim survives contact with the source — guards, locks, documented carve-outs, and read-once contracts kill most "obvious" bugs here (a 2026-06 review dismissed 12 of ~30 high-severity agent findings this way). Findings that die get two outcomes: a pattern-shaped one becomes an entry in `docs/code-review-priors.md` (same change), and a deliberate-design one gets checked against `docs/adr/` (and proposed as a new ADR if the rationale isn't recorded anywhere). Report only what you verified; the report should say findings were source-verified and list what was dismissed.
 
 ### 2. Present candidates as an HTML report
 

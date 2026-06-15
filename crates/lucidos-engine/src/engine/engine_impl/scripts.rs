@@ -1,15 +1,13 @@
-//! User-profile probe, conversation lookup, script env/exec, dirty-commit helper.
+//! Conversation lookup, script env/exec, dirty-commit helper.
 //!
 //! Part of the `LucidosEngine` inherent impl, split from engine_impl.rs.
 
 use super::super::*;
 
-impl LucidosEngine {
-    /// Check if user profile exists
-    pub async fn has_user_profile(&self) -> bool {
-        !self.user_profile.read().await.is_empty()
-    }
+/// Wall-clock budget for a scheduled `.sh` task before its child is killed.
+const SHELL_SCRIPT_TIMEOUT_SECS: u64 = 300;
 
+impl LucidosEngine {
     /// Record a trigger completion.
     /// LLM triggers have a real thread_id and go through EventBus as a thread event.
     /// Script triggers have no thread — they use a system event.
@@ -20,6 +18,14 @@ impl LucidosEngine {
         result_summary: &str,
         thread_id: Option<Uuid>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Engine-level guarantee: a trigger run's summary is never empty. The
+        // script/intent call sites supply a kind-specific fallback, but this is
+        // the single choke point both run kinds (and any future caller) pass
+        // through, so the guarantee holds regardless — a blank summary never
+        // reads as a no-op fire to the learning/audit sweeps. See
+        // `crate::triggers::summary`.
+        let result_summary =
+            crate::triggers::ensure_non_empty_summary(result_summary, trigger_name);
         if let Some(tid) = thread_id {
             self.event_bus
                 .emit(event_bus::BusEvent::Thread {
@@ -27,7 +33,7 @@ impl LucidosEngine {
                     event: thread_events::ThreadEvent::TriggerCompleted {
                         trigger_id: trigger_id.to_string(),
                         trigger_name: Some(trigger_name.to_string()),
-                        result_summary: Some(result_summary.to_string()),
+                        result_summary: Some(result_summary),
                     },
                     meta: thread_events::EventMeta {
                         channel: Some(crate::engine::thread_events::EventChannel::Trigger),
@@ -41,7 +47,7 @@ impl LucidosEngine {
                     crate::engine::event_bus::SystemEvent::TriggerCompleted {
                         trigger_id: trigger_id.to_string(),
                         trigger_name: trigger_name.to_string(),
-                        result_summary: result_summary.to_string(),
+                        result_summary,
                     },
                 ))
                 .await?;
@@ -146,10 +152,7 @@ impl LucidosEngine {
         args: &[String],
         extra_env: &[(String, String)],
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        if script_path.contains("..")
-            || script_path.starts_with('/')
-            || script_path.starts_with('\\')
-        {
+        if crate::core::is_path_traversal(script_path) {
             return Err("Invalid script path: must be relative, no '..'".into());
         }
 
@@ -212,31 +215,13 @@ impl LucidosEngine {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         use crate::core::sanitize_for_jsonb;
 
-        let mut cmd = tokio::process::Command::new("/bin/sh");
-        cmd.arg(script_path)
-            .current_dir(self.workspace_path())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        for (key, value) in &env_vars {
-            cmd.env(key, value);
-        }
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn shell script: {}", e))?;
-
-        let output = match tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            child.wait_with_output(),
+        let output = run_shell_script_with_timeout(
+            script_path,
+            self.workspace_path(),
+            &env_vars,
+            std::time::Duration::from_secs(SHELL_SCRIPT_TIMEOUT_SECS),
         )
-        .await
-        {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(format!("Error executing shell script: {}", e).into()),
-            Err(_) => return Err("Shell script timed out after 300s".into()),
-        };
+        .await?;
 
         let stdout = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stdout));
         let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stderr));
@@ -284,5 +269,78 @@ impl LucidosEngine {
             }
             Ok(Ok(None)) => {}
         }
+    }
+}
+
+/// Spawn `/bin/sh <script>` in `workspace_dir` with `env_vars`, waiting up to
+/// `timeout` for it to finish. `kill_on_drop(true)` is the load-bearing part:
+/// on timeout the `wait_with_output` future is dropped, taking the owned child
+/// with it, and the OS sends SIGKILL — so a hung scheduled script can't leak an
+/// orphaned process. Mirrors `execute_bash_tool` (tools/bash.rs).
+async fn run_shell_script_with_timeout(
+    script_path: &std::path::Path,
+    workspace_dir: &std::path::Path,
+    env_vars: &[(String, String)],
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, Box<dyn std::error::Error + Send + Sync>> {
+    let mut cmd = tokio::process::Command::new("/bin/sh");
+    cmd.arg(script_path)
+        .current_dir(workspace_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn shell script: {}", e))?;
+
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(format!("Error executing shell script: {}", e).into()),
+        Err(_) => Err(format!("Shell script timed out after {}s", timeout.as_secs()).into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shell_script_timeout_kills_child() {
+        // A script that sleeps then writes a sentinel. With kill_on_drop the
+        // timeout SIGKILLs the shell mid-sleep, so the sentinel is never
+        // written. Without it, the orphaned child would finish the sleep and
+        // touch the sentinel after the future was dropped.
+        let dir = std::env::temp_dir().join("lucidos_test_shell_kill_on_drop");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sentinel = dir.join("sentinel");
+        let script = dir.join("slow.sh");
+        std::fs::write(&script, format!("sleep 3\ntouch '{}'\n", sentinel.display())).unwrap();
+
+        let err = run_shell_script_with_timeout(
+            &script,
+            &dir,
+            &[],
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .expect_err("script should time out");
+        assert!(err.to_string().contains("timed out"), "got: {}", err);
+
+        // Wait past the script's sleep; a leaked child would have touched the
+        // sentinel by now.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(
+            !sentinel.exists(),
+            "sentinel was created — the timed-out shell child leaked (kill_on_drop missing)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

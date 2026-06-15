@@ -1,3 +1,6 @@
+import { effect } from '@preact/signals';
+import { engineRestarting } from '../../store/store';
+
 export const API_BASE = '';
 // Single source of truth for the HTTP API prefix. Every fetch in this file
 // builds onto `${API}/…` so the version is stamped exactly once.
@@ -24,6 +27,37 @@ function deviceIdHeader(): Record<string, string> {
   if (typeof localStorage === 'undefined') return {};
   const id = localStorage.getItem('lucidos-device-id');
   return id ? { 'x-lucidos-device-id': id } : {};
+}
+
+/** The engine drops every connection while it restarts (Apply & Restart). A
+ *  GET issued in that window hits the dead socket and surfaces as
+ *  `TypeError: Load failed`, flipping whatever `Loadable` it feeds to `failed`
+ *  — so the page sitting behind the "Restarting engine…" overlay paints a
+ *  spurious "Failed to load…" error (and `loadMoreChanges`, infinite-scroll
+ *  observers, and resume refetches all fire blind). Hold reads until the
+ *  restart completes instead: the connection watchdog flips `engineRestarting`
+ *  back to false on reconnect (or the 300s safety timeout), and the queued read
+ *  then runs against the live engine — resolving normally with no error and no
+ *  manual refresh. The health probe MUST bypass this (see `fetchWithDefaults`):
+ *  it is the very signal the watchdog polls to notice the engine came back, so
+ *  gating it would deadlock the gate. */
+function awaitEngineReady(): Promise<void> {
+  if (!engineRestarting.value) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const dispose = effect(() => {
+      if (!engineRestarting.value) {
+        dispose();
+        resolve();
+      }
+    });
+  });
+}
+
+/** True for the `/api/v1/health` probe — the one read that must never be gated
+ *  by `awaitEngineReady`, because it's how the connection watchdog detects the
+ *  engine is back. */
+function isHealthProbe(url: string): boolean {
+  return url.endsWith('/health');
 }
 
 /** `fetch` wrapped to always send `x-lucidos-device-id` so the engine can
@@ -85,8 +119,15 @@ export async function throwIfNotOk(res: Response): Promise<void> {
 /** AbortSignal.timeout fires with a TimeoutError DOMException, so errorDetail
  *  can distinguish it from a manual AbortError. When the caller supplies its
  *  own `init.signal` (e.g. for cancellable searches), it's composed with the
- *  timeout signal via AbortSignal.any so either path can abort the fetch. */
-function fetchWithDefaults(url: string, init: RequestInit | undefined, timeoutMs: number): Promise<Response> {
+ *  timeout signal via AbortSignal.any so either path can abort the fetch.
+ *
+ *  GET reads are held by `awaitEngineReady` while the engine is mid-restart so
+ *  they don't paint spurious "Failed to load…" errors on the page behind the
+ *  restart overlay; mutations (which never reach here — they go through
+ *  `mutatingFetch`) and the health probe are exempt. */
+async function fetchWithDefaults(url: string, init: RequestInit | undefined, timeoutMs: number): Promise<Response> {
+  const method = (init?.method ?? 'GET').toUpperCase();
+  if (method === 'GET' && !isHealthProbe(url)) await awaitEngineReady();
   const headers = { ...deviceIdHeader(), ...(init?.headers as Record<string, string> | undefined) };
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;

@@ -5,10 +5,13 @@ mod artifacts;
 pub(crate) mod backup;
 mod blobs;
 mod changes;
-mod chat;
+pub(crate) mod chat;
 mod claude_code;
+mod command_checkpoint;
+mod command_permission;
 mod data_api;
 mod disk_usage;
+mod error;
 mod history;
 mod images;
 pub(crate) mod internal;
@@ -39,6 +42,7 @@ mod sdk_prefs;
 mod search;
 mod settings;
 pub mod sse_connections;
+mod thread_queue;
 mod threads;
 mod threads_compose;
 mod trigger_groups;
@@ -72,12 +76,14 @@ use uuid::Uuid;
 
 use crate::core::oauth::OAuthFlowResult;
 use crate::core::{
-    AppManager, ArtifactManager, ConversationSnapshot, CredentialInfo, EventStore,
+    AppManager, ArtifactManager, ConversationSnapshot, CredentialInfo, EventStore, Model,
     OAuthAccountInfo, SessionMessage, Step,
 };
 use crate::engine::{CaptureResult, LucidosEngine};
 use crate::memory::{FastEmbedProvider, PgVectorIndex};
 use crate::scheduler::{Notification, PushSubscription, SchedulerManager};
+
+pub(crate) use error::ApiError;
 
 pub type SharedEngine = Arc<LucidosEngine>;
 
@@ -221,7 +227,7 @@ pub struct ChatImage {
 
 /// Maximum base64-encoded image size accepted by LLM APIs (Claude: 5 MB).
 /// We target 4.5 MB to leave margin for encoding overhead.
-const MAX_IMAGE_BASE64_BYTES: usize = 4_500_000;
+pub(crate) const MAX_IMAGE_BASE64_BYTES: usize = 4_500_000;
 
 /// Maximum dimension (width or height) for images sent to LLMs.
 /// Larger images waste tokens without improving understanding.
@@ -308,11 +314,26 @@ impl ChatImage {
             mime_type: "image/jpeg".to_string(),
         }
     }
-}
 
-/// Compress all images for LLM consumption — reduces size and normalizes format.
-pub fn compress_images(images: Vec<ChatImage>) -> Vec<ChatImage> {
-    images.into_iter().map(|img| img.compress()).collect()
+    /// Ensure this image's base64 payload fits the LLM's per-image size target,
+    /// compressing (JPEG re-encode + downscale via [`compress`]) only when it's
+    /// over. Images already within budget pass through untouched — no re-encode,
+    /// no quality loss, original format preserved.
+    ///
+    /// This is the single decision point for "is this image small enough to send
+    /// to a model". Every LLM-bound image path routes through it — chat message
+    /// blocks, the image-description pass, and `read_file` — so the
+    /// compress-or-skip rule lives in exactly one place and an oversized photo
+    /// can't reach a provider's hard limit (Claude rejects images over 5 MB).
+    ///
+    /// [`compress`]: ChatImage::compress
+    pub(crate) fn fit_for_llm(self) -> Self {
+        if self.base64.len() <= MAX_IMAGE_BASE64_BYTES {
+            self
+        } else {
+            self.compress()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,6 +379,12 @@ pub struct ChatRequest {
     pub use_claude_code: Option<bool>,
     #[serde(default)]
     pub cc_model: Option<String>,
+    /// Which coding-agent backend a NEW coding-agent thread should run on
+    /// (`claude-code` | `codex`). Requires `use_claude_code: true`; ignored
+    /// on follow-ups — the thread's stored backend wins (locked at first
+    /// SessionStarted).
+    #[serde(default)]
+    pub coding_agent: Option<crate::runtime::CodingAgent>,
     #[serde(default, alias = "message_id")]
     pub event_id: Option<String>,
     #[serde(default)]
@@ -484,6 +511,37 @@ pub struct EmailAccountSettings {
     pub username: String,
     pub use_tls: bool,
     pub require_send_confirmation: bool,
+}
+
+// Model registry types
+#[derive(Serialize)]
+pub struct ModelsListResponse {
+    pub models: Vec<Model>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateModelRequest {
+    pub id: String,
+    pub label: String,
+    /// Backend that serves the model: "vertex" | "anthropic" | "openai".
+    pub provider: String,
+    /// Display order; omitted user models sort after the builtins.
+    #[serde(default)]
+    pub sort_order: Option<i32>,
+}
+
+/// PUT body for a model. For builtin rows only `enabled` is applied (disable-only);
+/// for user rows any provided field is updated, omitted fields keep their value.
+#[derive(Deserialize)]
+pub struct UpdateModelRequest {
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub sort_order: Option<i32>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// Generic success/error response used by credential, preference, and trigger endpoints.
@@ -641,6 +699,14 @@ struct ProviderQuery {
     provider: String,
 }
 
+/// `?id=<model-id>` for the model-registry PUT/DELETE routes. The id is the
+/// model string (e.g. `claude-fable-5`), not a UUID — distinct from
+/// `NotificationQuery`.
+#[derive(Deserialize)]
+pub(super) struct ModelIdQuery {
+    pub id: String,
+}
+
 #[derive(Deserialize)]
 struct NotificationQuery {
     id: Uuid,
@@ -776,411 +842,66 @@ pub fn create_router(
     // Serve static files from data/ tree — single mount covers all subdirectories
     let serve_data = ServeDir::new(workspace_path.join(crate::core::DATA_DIR));
 
-    // Clone state for the SDK-shaped slice (added below to the same router) and
-    // the app-UI router. The main `legacy_routes` block consumes `state` directly.
-    let v1_state = state.clone();
+    // Clone for the top-level app-UI router; the /api/v1 router below
+    // consumes `state` directly.
     let app_ui_state = state.clone();
 
     // ALL routes live under `/api/v1/` — see CLAUDE.md "API URL Conventions".
     // Convention: query params for identifiers, path segments only for file paths.
-    // This block defines the engine-side ("legacy") slice; the SDK-shaped slice
-    // is defined below as `sdk_v1_routes` and merged in before mounting.
-    let legacy_routes = Router::new()
-        .route("/health", get(history::health))
-        .route("/restart", post(history::restart_engine))
-        .route("/workspaces", get(history::list_workspaces))
-        .route("/events", get(history::global_events))
-        .route("/chat", post(chat::chat))
-        .route("/chat/stream", post(chat::chat_submit))
-        .route("/chat/cancel", post(chat::cancel_chat))
-        .route("/claude-code/stop", post(claude_code::claude_code_stop))
-        .route(
-            "/claude-code/interrupt",
-            post(claude_code::claude_code_interrupt),
-        )
-        .route(
-            "/claude-code/control",
-            post(claude_code::claude_code_control),
-        )
-        .route(
-            "/claude-code/commands",
-            get(claude_code::claude_code_commands),
-        )
-        .route(
-            "/claude-code/apply-now",
-            post(claude_code::claude_code_apply_now),
-        )
-        .route(
-            "/claude-code/discard",
-            post(claude_code::claude_code_discard),
-        )
-        .route(
-            "/threads/:thread_id/answer-question",
-            post(threads::answer_thread_question),
-        )
-        .route("/changes", get(changes::list_changes))
-        .route("/changes/applied", get(changes::list_applied_changes))
-        .route("/changes/apply-all", post(changes::apply_all_changes))
-        .route("/changes/discard-all", post(changes::discard_all_changes))
-        .route(
-            "/changes/for-repo/:repo_id",
-            get(changes::list_changes_for_repo),
-        )
-        .route("/changes/:id/apply", post(changes::apply_change))
-        .route("/changes/:id/discard", post(changes::discard_change))
-        .route("/changes/:id/revert", post(changes::revert_change))
-        .route("/changes/:id/diff", get(repositories::get_change_diff))
-        .route("/changes/:id/file", get(repositories::get_change_file))
-        .route(
-            "/threads/:thread_id/cc-diff",
-            get(repositories::get_thread_cc_diff),
-        )
-        .route("/changes/:id", get(changes::get_change))
-        .route("/notifications", get(notifications::get_notifications))
-        .route(
-            "/notifications/before",
-            get(notifications::get_notifications_at_timestamp),
-        )
-        .route(
-            "/notifications/read-all",
-            post(notifications::mark_all_notifications_read),
-        )
-        .route("/notification", get(notifications::get_notification))
-        .route(
-            "/notification/read",
-            post(notifications::mark_notification_read),
-        )
-        .route("/history", get(history::get_history))
-        .route("/messages", get(history::get_recent_messages))
-        .route("/session/messages", get(history::get_session_messages))
-        .route("/commits", get(artifacts::list_commits))
-        .route("/commits/before", get(artifacts::get_commit_at_timestamp))
-        // Events
-        .route("/events/query", get(history::query_events))
-        .route("/events/count", get(history::count_events))
-        .route("/events/types", get(history::event_types))
-        .route("/events/emit", post(history::emit_event))
-        // Credentials endpoints
-        .route(
-            "/credentials",
-            get(settings::list_credentials)
-                .post(settings::create_credential)
-                .put(settings::update_credential)
-                .delete(settings::delete_credential),
-        )
-        .route("/credential-value", get(settings::get_credential_value))
-        .route("/email-account", get(settings::get_email_account))
-        // OAuth account endpoints
-        .route(
-            "/oauth/accounts",
-            get(settings::list_oauth_accounts).delete(settings::delete_oauth_account),
-        )
-        .route("/oauth/reauthorize", post(settings::reauthorize_oauth))
-        .route("/oauth/complete", post(settings::complete_oauth))
-        // Triggers
-        .route(
-            "/triggers",
-            get(triggers::list_triggers)
-                .post(triggers::create_trigger)
-                .put(triggers::update_trigger)
-                .delete(triggers::delete_trigger),
-        )
-        .route(
-            "/triggers/historical",
-            get(triggers::list_historical_triggers),
-        )
-        // Trigger groups — user-visible folders that organize triggers in the
-        // panel. Pure label, no firing. The reorder endpoint is a batch op so
-        // the panel can persist a drag-to-reorder with one round-trip.
-        .route(
-            "/trigger-groups",
-            get(trigger_groups::list_trigger_groups)
-                .post(trigger_groups::create_trigger_group)
-                .put(trigger_groups::update_trigger_group)
-                .delete(trigger_groups::delete_trigger_group),
-        )
-        .route(
-            "/trigger-groups/reorder",
-            post(trigger_groups::reorder_trigger_groups),
-        )
-        .route("/knowhow", get(knowhow::list_knowhow))
-        // Preferences endpoints
-        .route(
-            "/preferences",
-            get(settings::get_preferences)
-                .put(settings::set_preference)
-                .delete(settings::delete_preference),
-        )
-        // CC tool-permission allowlist (~/.lucidos/cc-allowed-tools)
-        .route(
-            "/cc-allowed-tools",
-            get(settings::get_cc_allowed_tools).put(settings::put_cc_allowed_tools),
-        )
-        // Push notification endpoints
-        .route("/push/vapid-key", get(notifications::get_vapid_key))
-        .route("/push/subscribe", post(notifications::push_subscribe))
-        .route("/push/unsubscribe", post(notifications::push_unsubscribe));
-
-    // Test-only push assertion endpoint. Compiled in only with the
-    // `e2e-test-hooks` cargo feature so production binaries don't expose
-    // the push_log to the network at all.
-    #[cfg(feature = "e2e-test-hooks")]
-    let legacy_routes =
-        legacy_routes.route("/_test/push-log", get(notifications::get_push_log));
-
-    let legacy_routes = legacy_routes
-        // Device presence (any visible tab → PresenceCheck candidate)
-        .route("/device-presence", post(presence::update_device_presence))
-        // PresenceCheck pong inbox (system-knowhow/notifications.md §3)
-        .route("/presence-pong", post(presence_pong::presence_pong))
-        // Device endpoints
-        .route("/devices/register", post(settings::register_device))
-        .route("/devices", get(settings::list_devices))
-        .route("/devices/:device_id/name", put(settings::rename_device))
-        .route("/devices/:device_id/push", put(settings::set_device_push))
-        .route(
-            "/devices/:device_id",
-            axum::routing::delete(settings::delete_device),
-        )
-        // Memory endpoints
-        .route("/memory/stats", get(memory::get_memory_stats))
-        .route("/memory/entries", get(memory::get_memory_entries))
-        .route("/memory/source", get(memory::get_memory_source))
-        .route(
-            "/memory/rebuild",
-            post(memory::rebuild_memory).delete(memory::cancel_rebuild_memory),
-        )
-        // Apps endpoints
-        .route(
-            "/pinned-apps",
-            get(settings::get_pinned_apps)
-                .post(settings::pin_app)
-                .delete(settings::unpin_app),
-        )
-        .route("/apps", get(apps::list_apps))
-        .route(
-            "/app",
-            get(apps::get_app)
-                .put(apps::update_app)
-                .delete(apps::delete_app),
-        )
-        .route(
-            "/app/:app_id/source",
-            get(apps::read_app_source).put(apps::write_app_source),
-        )
-        .route("/app/versions", get(apps::get_app_versions))
-        .route("/app/restore", post(apps::restore_app_version))
-        // Email endpoints
-        .route("/email/send", post(settings::send_email_confirmed))
-        // MCP endpoints
-        .route("/mcp/consent", post(mcp::submit_mcp_consent))
-        .route("/mcp/auto-approve", put(mcp::set_mcp_auto_approve))
-        .route("/mcp/servers", get(mcp::list_mcp_servers))
-        .route(
-            "/internal/permission-prompt",
-            post(internal::permission_prompt),
-        )
-        .route(
-            "/internal/ask-user-question",
-            post(internal::ask_user_question),
-        )
-        .route("/internal/mark-hardened", post(internal::mark_hardened))
-        .route("/internal/hardened-state", get(internal::query_hardened))
-        .route(
-            "/internal/cc-edit-preread",
-            get(internal::cc_edit_preread_check),
-        )
-        .route("/internal/client-log", post(internal::client_log))
-        .route(
-            "/internal/seed-change-for-test",
-            post(internal::seed_change_for_test),
-        )
-        // App capture endpoints
-        .route("/app-capture", post(apps::submit_app_capture))
-        .route("/static/html2canvas.min.js", get(apps::serve_html2canvas))
-        // Backup endpoints
-        .route("/backup", post(backup::create_backup))
-        .route("/backup/list", get(backup::list_backups))
-        .route("/backup/status", get(backup::get_backup_status))
-        .route("/backup/restore", post(backup::restore_backup))
-        .route(
-            "/backup/restore-status",
-            get(backup::get_restore_status).delete(backup::clear_restore_status),
-        )
-        .route(
-            "/backup/key",
-            get(backup::get_backup_key).post(backup::generate_backup_key),
-        )
-        .route("/backup/key/exists", get(backup::backup_key_exists))
-        .route("/backup/providers", get(backup::list_providers))
-        .route(
-            "/backup/schedule",
-            get(backup::get_schedule).put(backup::set_schedule),
-        )
-        .route(
-            "/backup/retention",
-            get(backup::get_retention).put(backup::set_retention),
-        )
-        .route(
-            "/backup/validate-workspace-name",
-            get(backup::validate_workspace_name),
-        )
-        .route("/backup/start-workspace", post(backup::start_workspace))
-        // Thread endpoints
-        .route("/threads", get(threads::list_threads))
-        .route("/threads/list", get(threads::list_thread_summaries))
-        .route("/threads/count", get(threads::count_thread_summaries))
-        .route("/threads/search", get(threads::search_threads))
-        .route("/threads/save", post(threads::save_thread))
-        .route("/threads/unsave", post(threads::unsave_thread))
-        .route("/threads/rename", post(threads::rename_thread))
-        .route("/threads/archive", post(threads::archive_thread))
-        .route("/threads/suggest-title", post(threads::suggest_title))
-        .route(
-            "/threads/:thread_id/messages",
-            get(threads::get_thread_messages),
-        )
-        .route(
-            "/threads/:thread_id/events",
-            get(threads::get_thread_events_snapshot),
-        )
-        .route(
-            "/events/:event_id/context",
-            get(threads::get_context_capture),
-        )
-        .route(
-            "/events/:event_id/tool-result",
-            get(threads::get_tool_result),
-        )
-        .route(
-            "/threads/:thread_id/continue",
-            post(threads::continue_thread),
-        )
-        .route("/disk-usage/summary", get(disk_usage::summary))
-        .route("/disk-usage/worktrees", get(disk_usage::list_worktrees))
-        .route(
-            "/disk-usage/worktrees/:thread_id/cleanup",
-            post(disk_usage::cleanup_worktree),
-        )
-        .route(
-            "/threads/:thread_id/images",
-            get(images::list_thread_images),
-        )
-        .route(
-            "/threads/:thread_id/images/:index",
-            get(images::get_thread_image),
-        )
-        .route("/threads/older", get(threads::get_older_threads))
-        .route("/threads/filter-facets", get(threads::get_filter_facets))
-        .route("/search", get(search::search))
-        .route(
-            "/repositories",
-            get(repositories::list_repositories).post(repositories::add_repository),
-        )
-        .route("/browse-directories", get(repositories::browse_directories))
-        .route(
-            "/repositories/:id",
-            axum::routing::delete(repositories::remove_repository),
-        )
-        .route(
-            "/repositories/:id/files",
-            get(repositories::list_repo_files),
-        )
-        .route("/repositories/:id/file", get(repositories::get_repo_file))
-        .route("/repositories/:id/diff", get(repositories::get_repo_diff))
+    //
+    // Route registration lives with the domain module that owns each URL
+    // surface (`<module>::router()`); this merge is the single mount point.
+    // Routes whose handler lives in a different module than their path prefix
+    // (e.g. `/changes/:id/diff` → `repositories::get_change_diff`) register in
+    // the router of the module that owns the path, so a reader looking for a
+    // path finds it under the path's domain.
+    //
+    // The fallback is load-bearing: without it, an unmatched `/api/v1/*`
+    // request would fall through the nest to the outer router's dev-proxy
+    // fallback instead of returning 404.
+    let api_routes = Router::new()
+        .merge(history::router())
+        .merge(chat::router())
+        .merge(claude_code::router())
+        .merge(threads::router())
+        .merge(changes::router())
+        .merge(notifications::router())
+        .merge(artifacts::router())
+        .merge(settings::router())
+        .merge(triggers::router())
+        .merge(trigger_groups::router())
+        .merge(thread_queue::router())
+        .merge(knowhow::router())
+        .merge(presence::router())
+        .merge(presence_pong::router())
+        .merge(memory::router())
+        .merge(apps::router())
+        .merge(command_permission::router())
+        .merge(command_checkpoint::router())
+        .merge(mcp::router())
+        .merge(internal::router())
+        .merge(backup::router())
+        .merge(disk_usage::router())
+        .merge(search::router())
+        .merge(repositories::router())
+        .merge(sdk::router())
+        .merge(sdk_prefs::router())
+        .merge(data_api::router())
+        .merge(blobs::router())
+        .merge(plugins::router())
+        .merge(proxy::router())
         .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
         // Axum's 2 MiB default rejects mobile screenshots in chat/app-capture
-        // bodies with "Failed to buffer the request body". Match the v1 cap.
+        // bodies — and large `PUT /api/v1/data/*path` binary writes — with
+        // "Failed to buffer the request body". `Router::layer` only covers
+        // routes registered before the call, so this is applied after every
+        // domain merge to guarantee it reaches all routes.
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .with_state(state);
 
-    // SDK-shaped slice of the /api/v1/ surface (proxy, blobs, data, plugins,
-    // SDK static assets). Defined separately for clarity; merged with
-    // `legacy_routes` below so a single router mounts at `/api/v1/`.
-    let sdk_v1_routes = Router::new()
-        .route("/sdk.js", get(sdk::serve_sdk_js))
-        .route("/sdk-iframe.css", get(sdk::serve_sdk_iframe_css))
-        .route("/sdk-iframe-audio.js", get(sdk::serve_sdk_iframe_audio_js))
-        .route("/sdk-prefs.js", get(sdk_prefs::serve_sdk_prefs_js))
-        // Short-lived OAuth access-token for in-browser SDKs (e.g. Spotify
-        // Web Playback SDK). Refresh token never leaves the engine.
-        .route(
-            "/oauth/:provider/access-token",
-            get(settings::get_oauth_access_token),
-        )
-        .route("/ui/navigate", post(sdk::ui_navigate))
-        .route("/notifications", post(notifications::create_notification))
-        .route("/data", get(data_api::list_data))
-        .route("/data/edit", post(data_api::edit_data))
-        .route("/data/upload", post(data_api::upload_data))
-        .route("/threads", post(threads_compose::post_thread))
-        // By-id summary GET shares the `/threads/:id` leaf with delete_thread.
-        // It MUST use the `:id` param name and live here (not in legacy_routes,
-        // which uses `:thread_id`): a second bare `/threads/<param>` leaf with a
-        // different param name would make matchit panic when the two routers
-        // merge. Same path + non-overlapping methods → axum merges GET+DELETE.
-        .route(
-            "/threads/:id",
-            get(threads::get_thread_summary).delete(threads_compose::delete_thread),
-        )
-        .route("/threads/:id/compose", put(threads_compose::put_compose))
-        .route("/threads/:id/blobs", post(blobs::post_blob))
-        .route("/blobs/:hash", get(blobs::get_blob))
-        .route("/blobs/:hash/preview", get(blobs::get_blob_preview))
-        .route(
-            "/plugins/upload-archive",
-            post(plugins::upload_archive).layer(DefaultBodyLimit::max(plugins::MAX_ARCHIVE_BYTES)),
-        )
-        .route(
-            "/plugins/install/:install_id/confirm",
-            post(plugins::confirm_install),
-        )
-        .route(
-            "/plugins/install/:install_id/cancel",
-            post(plugins::cancel_install),
-        )
-        .route(
-            "/plugins/uninstall/:uninstall_id/confirm",
-            post(plugins::confirm_uninstall),
-        )
-        .route(
-            "/plugins/uninstall/:uninstall_id/cancel",
-            post(plugins::cancel_uninstall),
-        )
-        // Generic API proxy — forwards to a backend configured in
-        // `data/config/apis.json`. Two routes so callers can hit
-        // `/proxy/sonos` (no trailing path) as well as `/proxy/sonos/play/2`.
-        .route("/proxy/:name", any(proxy::proxy_handler_root))
-        .route("/proxy/:name/", any(proxy::proxy_handler_root))
-        .route("/proxy/:name/*path", any(proxy::proxy_handler))
-        .route("/proxy-modules/reload", post(proxy::proxy_modules_reload))
-        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
-        .route(
-            "/data/*path",
-            get(data_api::read_data)
-                .put(data_api::write_data)
-                .delete(data_api::delete_data),
-        )
-        .with_state(v1_state);
-
-    // App UI routes under /app/* — file serving must be path-shaped (relative
-    // URLs in app HTML resolve against the document path), so this lives at
-    // the top level rather than under /api/v1/.
-    let app_ui_routes = Router::new()
-        .route("/:app_id/", get(apps::serve_app_ui))
-        .route("/:app_id/artifacts/*path", get(apps::serve_app_artifact))
-        .route("/:app_id/*path", get(apps::serve_app_file))
-        .with_state(app_ui_state);
-
-    // All HTTP API lives under `/api/v1/`. The two router slices (engine-side
-    // "legacy" + SDK-shaped) are merged so axum sees them as one mount point,
-    // and so paths shared between them (e.g. `GET /threads` + `POST /threads`)
-    // collapse into a single method router instead of conflicting at startup.
-    let api_routes = sdk_v1_routes.merge(legacy_routes);
-
     let router = Router::new()
         .nest("/api/v1", api_routes)
-        .nest("/app", app_ui_routes)
+        .nest("/app", apps::ui_router().with_state(app_ui_state))
         .nest_service("/data", serve_data);
 
     // In dev mode, reverse-proxy unmatched requests to Vite so the browser
@@ -1337,12 +1058,52 @@ mod tests {
     }
 
     #[test]
-    fn compress_images_applies_to_all() {
-        let images = vec![make_test_image(100, 100), make_test_image(200, 200)];
-        let result = compress_images(images);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].mime_type, "image/jpeg");
-        assert_eq!(result[1].mime_type, "image/jpeg");
+    fn fit_for_llm_passes_small_image_through_untouched() {
+        // Under the per-image target → no re-encode, original bytes + mime kept.
+        let img = ChatImage {
+            base64: "AAAA".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+        let result = img.fit_for_llm();
+        assert_eq!(result.base64, "AAAA");
+        assert_eq!(result.mime_type, "image/png");
+    }
+
+    #[test]
+    fn fit_for_llm_compresses_oversized_image() {
+        // A large image (base64 over the target) is downscaled + JPEG-re-encoded
+        // until it fits, so it can never reach a provider's hard size limit.
+        // Noise resists PNG compression (a smooth gradient would shrink below the
+        // target and not exercise the compress path), so paint per-pixel from a
+        // coordinate hash to keep the encoded payload large.
+        let img_buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(1400, 1400, |x, y| {
+            let mut h = x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(2_246_822_519);
+            h ^= h >> 15;
+            h = h.wrapping_mul(0x85EB_CA6B);
+            h ^= h >> 13;
+            let b = h.to_le_bytes();
+            Rgba([b[0], b[1], b[2], 255])
+        });
+        let mut png_buf = std::io::Cursor::new(Vec::new());
+        img_buf
+            .write_to(&mut png_buf, image::ImageFormat::Png)
+            .unwrap();
+        let img = ChatImage {
+            base64: base64::engine::general_purpose::STANDARD.encode(png_buf.into_inner()),
+            mime_type: "image/png".to_string(),
+        };
+        assert!(
+            img.base64.len() > MAX_IMAGE_BASE64_BYTES,
+            "fixture must start over the target, got {} bytes",
+            img.base64.len()
+        );
+        let result = img.fit_for_llm();
+        assert!(
+            result.base64.len() <= MAX_IMAGE_BASE64_BYTES,
+            "fitted payload must be within target, got {} bytes",
+            result.base64.len()
+        );
+        assert_eq!(result.mime_type, "image/jpeg");
     }
 
     /// Build a minimal JPEG with an EXIF APP1 segment containing the given

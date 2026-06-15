@@ -49,6 +49,13 @@ workspaces/
 # Node.js
 node_modules/
 dist/
+# Atomic-dist-publish staging dir (vite build.outDir under LUCIDOS_ATOMIC_DIST,
+# renamed onto dist/ in closeBundle — ephemeral build output, never committed)
+dist.staging/
+dist.prev/
+# Checkout-level shared build-watch state (pid + log) for --built dev mode —
+# the singleton `vite build --watch` lives here, see scripts/lib/workspace.sh
+.build-watch/
 .env
 
 # Compiled JS next to TS sources (Vite serves .js over .ts, breaking the app)

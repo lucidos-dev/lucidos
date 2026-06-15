@@ -109,6 +109,10 @@ fn reset_per_turn_flags_clears_all_flags() {
     let mut emitted_terminal_event = true;
     let mut user_hit_stop = true;
     let mut last_terminal_kind = Some(TerminalKind::Generated);
+    let mut cancel_actor = Some(crate::engine::thread_events::MessageOrigin::Device {
+        device_id: "ios-1".into(),
+        label: "Kenneth's iPhone".into(),
+    });
 
     reset_per_turn_flags(
         &mut is_waiting,
@@ -116,6 +120,7 @@ fn reset_per_turn_flags_clears_all_flags() {
         &mut emitted_terminal_event,
         &mut user_hit_stop,
         &mut last_terminal_kind,
+        &mut cancel_actor,
     );
 
     assert!(!is_waiting, "CC is no longer waiting — a new turn began");
@@ -134,6 +139,12 @@ fn reset_per_turn_flags_clears_all_flags() {
         "must clear so the new turn's cleanup decision reflects THIS turn, \
          not the previous one — otherwise a Generated turn followed by a \
          safety-net abort would still auto-commit on cleanup"
+    );
+    assert!(
+        cancel_actor.is_none(),
+        "must clear in lockstep with user_hit_stop — else a follow-up arriving \
+         during the cancel race leaks the prior turn's cancelling device onto \
+         the follow-up's events"
     );
 }
 

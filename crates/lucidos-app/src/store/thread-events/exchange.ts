@@ -1,4 +1,5 @@
 import { MODELS, REASONING_LEVELS } from '../models';
+import { chatModels } from '../store';
 import { ENGINE_LABEL, RESPONSE_CANCELED_SUMMARY, originMode, responseAbortedSummary } from './thread-event-types';
 import { CC_ACTIVITY_EVENTS } from './thread-meta';
 import type { ActorMode, SequencedEvent, StoredEvent, ThreadEvent, ThreadInitiator } from './thread-event-types';
@@ -13,6 +14,17 @@ export type Exchange = {
    *  non-divider exchanges and on divider exchanges that have neither
    *  progression nor a matching answer yet. */
   questionOvertaken?: boolean;
+  /** Mutation counter for the incremental grouping cache. The cached fold
+   *  mutates Exchange objects IN PLACE on later appends (steps push,
+   *  questionOvertaken flip, absorb re-anchor), so a memo comparing
+   *  `prev.exchange` against `next.exchange` would compare the same mutated
+   *  object with itself and never detect a change. Render sites capture this
+   *  number as a primitive prop at render time (`revision={ex.revision ?? 0}`)
+   *  and the memo compares the captured values. Bumped by
+   *  `groupIntoExchangesCached` for every exchange an appended event touched;
+   *  undefined on exchanges from a from-scratch fold (fresh objects — the
+   *  captured 0 plus the field-level fingerprint covers those). */
+  revision?: number;
 };
 
 /** The narrowed `UserQuestionAnswered` variant — exposed so call sites that
@@ -23,6 +35,10 @@ export type AnsweredQuestion = Extract<ThreadEvent, { type: 'UserQuestionAnswere
 /** The narrowed `CodingAgentPermissionResolved` variant — same purpose as
  *  `AnsweredQuestion`, for permission-prompt resolutions. */
 export type ResolvedPermission = Extract<ThreadEvent, { type: 'CodingAgentPermissionResolved' }>;
+
+/** The narrowed `CommandPermissionResolved` variant (ADR 0002) — the chat
+ *  command-guard counterpart of `ResolvedPermission`. */
+export type ResolvedCommandPermission = Extract<ThreadEvent, { type: 'CommandPermissionResolved' }>;
 
 /** Find the matching `UserQuestionAnswered` step in a divider exchange.
  *  Returns the typed event (with `answer` narrowed and the optional `actor`
@@ -40,6 +56,19 @@ export function findQuestionAnswer(exchange: Exchange, toolUseId: string): Answe
 export function findPermissionResolution(exchange: Exchange, requestId: string): ResolvedPermission | undefined {
   for (const { event } of exchange.steps) {
     if (event.type === 'CodingAgentPermissionResolved' && event.request_id === requestId) return event;
+  }
+  return undefined;
+}
+
+/** Find the matching `CommandPermissionResolved` step in a command-guard
+ *  permission divider exchange (ADR 0002). Returns the typed event or
+ *  undefined when the request is still pending. */
+export function findCommandPermissionResolution(
+  exchange: Exchange,
+  requestId: string,
+): ResolvedCommandPermission | undefined {
+  for (const { event } of exchange.steps) {
+    if (event.type === 'CommandPermissionResolved' && event.request_id === requestId) return event;
   }
   return undefined;
 }
@@ -188,14 +217,24 @@ export function exchangeReasoningEffort(exchange: Exchange): string | undefined 
   return extractResponseField(exchange, 'reasoning_effort');
 }
 
-const MODEL_LABELS: Record<string, string> = Object.fromEntries([
+// Static fallback labels: the `MODELS` fallback list plus legacy model strings
+// and Claude Code session short aliases (`CodingAgentSettingsChanged.model`
+// carries these verbatim, so without an explicit label the popover renders the
+// bare alias, e.g. `opus[1m]`). The loaded registry takes precedence in
+// `displayModelName` so user-added models render their chosen label.
+const STATIC_MODEL_LABELS: Record<string, string> = Object.fromEntries([
   ...MODELS.map(m => [m.value, m.label]),
+  // Models pruned from the picker (disabled in the registry) but still present
+  // in historical exchanges — keep their labels so old threads don't render a
+  // bare id.
+  ['claude-opus-4-6', 'Opus 4.6'],
+  ['claude-opus-4-6[1m]', 'Opus 4.6 (1M)'],
+  ['claude-opus-4-5@20251101', 'Opus 4.5'],
+  ['gpt-5.2-codex', 'GPT-5.2 Codex'],
+  ['gpt-5.3-codex-spark', 'Codex Spark'],
   ['claude-opus-4-1', 'Opus 4.1'],
   ['claude-haiku-4-5-20251001', 'Haiku 4.5'],
   ['claude-haiku-4-5@20251001', 'Haiku 4.5'],
-  // Claude Code session short aliases — `CodingAgentSettingsChanged.model` carries
-  // these verbatim, so without an explicit label the popover renders the bare
-  // alias (e.g. `opus[1m]`).
   ['opus', 'Opus 4.6'],
   ['opus[1m]', 'Opus 4.6 (1M)'],
   ['sonnet', 'Sonnet 4.6'],
@@ -204,7 +243,12 @@ const MODEL_LABELS: Record<string, string> = Object.fromEntries([
 ]);
 
 export function displayModelName(modelId: string): string {
-  return MODEL_LABELS[modelId] ?? modelId;
+  const loaded = chatModels.value;
+  if (loaded.status === 'loaded') {
+    const m = loaded.data.find(x => x.id === modelId);
+    if (m) return m.label;
+  }
+  return STATIC_MODEL_LABELS[modelId] ?? modelId;
 }
 
 const EFFORT_LABELS: Record<string, string> = Object.fromEntries(

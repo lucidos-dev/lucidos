@@ -5,6 +5,7 @@ import {
   computePinchUpdate,
   clampPanTransform,
   computeZoomAt,
+  naturalImageLayout,
   type PinchInitial,
 } from './pinchGesture';
 
@@ -155,6 +156,129 @@ describe('clampPanTransform', () => {
     // Y: imgH * scale = 900 → overflow (900-600)/2 = 150.
     const u = clampPanTransform(1.5, 200, 200, 1000, 600, 800, 600);
     expect(u).toEqual({ tx: 100, ty: 150 });
+  });
+});
+
+describe('naturalImageLayout', () => {
+  it('returns the rect geometry unchanged when the image is not transformed', () => {
+    const layout = naturalImageLayout(
+      { width: 800, height: 600 },
+      { left: 100, top: 50, width: 400, height: 300 },
+      1, 0, 0,
+    );
+    expect(layout).toEqual({
+      containerW: 800,
+      containerH: 600,
+      imgW: 400,
+      imgH: 300,
+      natCenterX: 300, // 100 + 400/2
+      natCenterY: 200, // 50 + 300/2
+    });
+  });
+
+  it('divides out an active scale so imgW/imgH are the natural (scale-1) size', () => {
+    // getBoundingClientRect reports the *scaled* rect. A natural 400x300 image
+    // rendered at scale 2 measures 800x600 — naturalImageLayout must recover 400x300.
+    const layout = naturalImageLayout(
+      { width: 800, height: 600 },
+      { left: 0, top: 0, width: 800, height: 600 },
+      2, 0, 0,
+    );
+    expect(layout.imgW).toBe(400);
+    expect(layout.imgH).toBe(300);
+  });
+
+  it('subtracts the active translation so natCenter is the untransformed center', () => {
+    // The natural center must be independent of the current pan. The rect
+    // center is shifted by (tx, ty) = (120, -40); dividing it back out recovers
+    // the real anchor point the pinch math expects.
+    const layout = naturalImageLayout(
+      { width: 800, height: 600 },
+      { left: 220, top: 110, width: 400, height: 300 }, // center (420, 260)
+      1, 120, -40,
+    );
+    expect(layout.natCenterX).toBe(300); // 420 - 120
+    expect(layout.natCenterY).toBe(300); // 260 - (-40)
+  });
+
+  it('guards against a zero scale (treats it as 1)', () => {
+    const layout = naturalImageLayout(
+      { width: 800, height: 600 },
+      { left: 0, top: 0, width: 400, height: 300 },
+      0, 0, 0,
+    );
+    expect(layout.imgW).toBe(400);
+    expect(layout.imgH).toBe(300);
+  });
+
+  // Regression: a gesture (second pinch, or one-finger pan) that starts while
+  // the image is already zoomed must still clamp pan to the *real* image
+  // bounds. Previously captureLayout read the live (scaled) rect, inflating
+  // the clamp band so the image could be dragged outside its own edges.
+  it('keeps pan bounded when a gesture starts on an already-zoomed image', () => {
+    // Image fills an 800x600 slide; a prior gesture left it at scale 2, panned
+    // tx=300. getBoundingClientRect therefore reports the scaled 1600x1200 rect:
+    // center (400,300) -> +scale (unchanged) -> +translate (700,300);
+    // left = 700 - 1600/2 = -100, top = 300 - 1200/2 = -300.
+    const liveRect = { left: -100, top: -300, width: 1600, height: 1200 };
+    const layout = naturalImageLayout({ width: 800, height: 600 }, liveRect, 2, 300, 0);
+    expect(layout.imgW).toBe(800);
+    expect(layout.imgH).toBe(600);
+    expect(layout.natCenterX).toBe(400);
+    expect(layout.natCenterY).toBe(300);
+
+    // A far-out pan now clamps to the real overflow ((800*2-800)/2 = 400), not
+    // the inflated bound a naive scaled capture (imgW=1600 -> overflow 1200)
+    // would have allowed.
+    const clamped = clampPanTransform(
+      2, 1000, 0,
+      layout.containerW, layout.containerH, layout.imgW, layout.imgH,
+    );
+    expect(clamped.tx).toBe(400);
+  });
+
+  // Regression: rotating the device while zoomed must re-clamp the existing
+  // pan to the new viewport. The image still carries its old transform when the
+  // resize fires, so naturalImageLayout has to recover the *new* natural bounds
+  // (from the new slide size) before clamping pulls an out-of-bounds pan back in.
+  it('re-clamps an out-of-bounds pan after the viewport changes (rotation)', () => {
+    // Before: scale 2, tx=400 (the max for an 800-wide slide). Device rotates to
+    // a 400-wide / 600-tall slide; the image (landscape, object-fit contain)
+    // now renders 400x300 at scale 1. With the old transform still applied its
+    // live rect is 800x600 centered at (200+400, 300) -> left 200, top 0.
+    const liveRect = { left: 200, top: 0, width: 800, height: 600 };
+    const layout = naturalImageLayout({ width: 400, height: 600 }, liveRect, 2, 400, 0);
+    expect(layout.imgW).toBe(400);
+    expect(layout.imgH).toBe(300);
+    expect(layout.natCenterX).toBe(200); // new slide centre
+    const clamped = clampPanTransform(
+      2, 400, 0,
+      layout.containerW, layout.containerH, layout.imgW, layout.imgH,
+    );
+    // New overflow is (400*2-400)/2 = 200, so tx=400 is pulled in to 200.
+    expect(clamped).toEqual({ tx: 200, ty: 0 });
+  });
+
+  // Regression: unzooming a panned image with the fingers held over its centre
+  // recenters cleanly instead of drifting sideways. The drift came from a
+  // natCenter polluted by the prior pan (off by tx).
+  it('recenters without drift when unzooming a panned image in place', () => {
+    const liveRect = { left: -100, top: -300, width: 1600, height: 1200 };
+    const layout = naturalImageLayout({ width: 800, height: 600 }, liveRect, 2, 300, 0);
+    const initial: PinchInitial = {
+      scale: 2, tx: 300, ty: 0,
+      midX: layout.natCenterX, midY: layout.natCenterY, // fingers on the real centre
+      dist: 200,
+      natCenterX: layout.natCenterX, natCenterY: layout.natCenterY,
+    };
+    // Pinch the fingers to half distance (scale -> 1), midpoint unchanged.
+    const u = computePinchUpdate(initial, layout.natCenterX, layout.natCenterY, 100, 1, 10);
+    const c = clampPanTransform(
+      u.scale, u.tx, u.ty,
+      layout.containerW, layout.containerH, layout.imgW, layout.imgH,
+    );
+    expect(u.scale).toBeCloseTo(1, 5);
+    expect(c).toEqual({ tx: 0, ty: 0 });
   });
 });
 

@@ -97,7 +97,7 @@ impl LucidosEngine {
                                         .and_then(|(_, desc, _)| desc);
                                     emit_generated_title(
                                         &bus,
-                                        &provider,
+                                        provider.as_ref(),
                                         thread_id,
                                         &msg,
                                         image_desc.as_deref(),

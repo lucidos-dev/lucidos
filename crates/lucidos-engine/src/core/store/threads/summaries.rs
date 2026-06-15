@@ -6,7 +6,7 @@ impl EventStore {
         &self,
     ) -> Result<Vec<ThreadSummary>, Box<dyn std::error::Error + Send + Sync>> {
         let sql = format!(
-            "SELECT {} FROM thread_summaries t WHERE t.is_saved = TRUE ORDER BY t.last_activity DESC",
+            "SELECT {} FROM thread_summaries t WHERE t.is_saved = TRUE ORDER BY t.last_user_action DESC",
             THREAD_COLS.as_str(),
         );
         let rows = sqlx::query_as::<_, ThreadRow>(&sql)
@@ -22,7 +22,7 @@ impl EventStore {
     /// top `per_source` archived threads per source (the Archive pile). Inbox
     /// is unbounded by design: an inbox row is one the user hasn't dismissed,
     /// so capping it would silently hide work the user expects to see —
-    /// crashed Claude Code sessions, idle chats they meant to come back to, and so on.
+    /// crashed coding-agent sessions, idle chats they meant to come back to, and so on.
     /// Archive is capped because old archived threads aren't time-sensitive;
     /// the user can page back via `get_older_threads`.
     ///
@@ -43,7 +43,7 @@ impl EventStore {
         ];
         let sql = format!(
             "SELECT {} FROM (\
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY source ORDER BY last_activity DESC) AS rn \
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY source ORDER BY last_user_action DESC) AS rn \
                 FROM thread_summaries \
                 WHERE has_response = TRUE OR status = ANY($1) OR coding_agent_proposed = TRUE\
             ) t \
@@ -51,7 +51,7 @@ impl EventStore {
                OR t.rn <= $2 \
                OR t.coding_agent_proposed = TRUE \
                OR t.status = ANY($3) \
-            ORDER BY t.last_activity DESC",
+            ORDER BY t.last_user_action DESC",
             THREAD_COLS.as_str(),
             ArchiveState::Inbox.as_str(),
         );
@@ -65,16 +65,27 @@ impl EventStore {
         Self::rows_to_thread_summaries(rows)
     }
 
-    /// Older threads for infinite scroll. When `trigger_ids`, `repo_ids`, or
-    /// `app_ids` is provided the SQL collapses to a narrowing branch keyed on
-    /// those columns plus the pagination cursor — the dropdown advertises every
-    /// trigger / repo / app that ever stamped a row (no `has_response` /
-    /// `source` gate), so the filter must match the same set or the dropdown
-    /// lies. The three ID arrays compose with OR so a user can expand Trigger,
-    /// Repos, and Apps in the dropdown and see all narrowings together. App ids
-    /// are extracted from `coding_agent_folder` via `app_id_sql_expr` (the
-    /// segment after `/data/apps/`). Without any of the three the normal history
-    /// view applies (`has_response = TRUE` + optional channel filter).
+    /// Older threads for infinite scroll, newest-first below the `before` cursor.
+    /// `before` is a `last_user_action` timestamp — the drawer sorts by that
+    /// column, so the cursor must page through the same axis (the frontend sends
+    /// the oldest loaded thread's `last_user_action`). The channel / facet
+    /// predicate is `channel_facet_filter_sql` — the exact
+    /// mirror of the frontend `threadPassesChannelFilter`, so pagination surfaces
+    /// precisely the rows the drawer shows (and `count_archived_threads` counts):
+    /// a `sources` channel gate, then per-channel narrowing by `trigger_ids`
+    /// (trigger rows) and `repo_ids`/`app_ids` (coding-agent rows, persisted as
+    /// `claude_code`, unioned). Whole channels and a facet COMPOSE — a user can
+    /// keep chat + coding-agent on AND
+    /// sub-select one trigger and see the union. The old two-branch form got this
+    /// wrong: any facet selection silently dropped the whole-channel rows.
+    ///
+    /// The substantive `has_response = TRUE` history gate is relaxed whenever ANY
+    /// facet axis is sub-selected: the dropdown (`get_filter_facets`) advertises
+    /// every trigger / repo / app that ever stamped a row with no `has_response`
+    /// gate, so selecting one must surface its threads even if they never produced
+    /// a response (a crashed coding-agent session, an errored trigger run) — else the
+    /// dropdown lies. With no facet axis active this reduces to the plain
+    /// `has_response = TRUE` channel view.
     pub async fn get_older_threads(
         &self,
         before: chrono::DateTime<chrono::Utc>,
@@ -84,42 +95,30 @@ impl EventStore {
         repo_ids: Option<&[String]>,
         app_ids: Option<&[String]>,
     ) -> Result<Vec<ThreadSummary>, Box<dyn std::error::Error + Send + Sync>> {
-        let rows = if trigger_ids.is_some() || repo_ids.is_some() || app_ids.is_some() {
-            let trigger_ids_slice = trigger_ids.unwrap_or(&[]);
-            let repo_ids_slice = repo_ids.unwrap_or(&[]);
-            let app_ids_slice = app_ids.unwrap_or(&[]);
-            let sql = format!(
-                "SELECT {} FROM thread_summaries t \
-                 WHERE (t.trigger_id = ANY($1) OR t.cc_repo_id = ANY($2) \
-                        OR (t.coding_agent_kind = 'app' AND {APP_ID_EXPR} = ANY($3))) \
-                   AND t.last_activity < $4 \
-                 ORDER BY t.last_activity DESC LIMIT $5",
-                THREAD_COLS.as_str(),
-                APP_ID_EXPR = app_id_sql_expr("t"),
-            );
-            sqlx::query_as::<_, ThreadRow>(&sql)
-                .bind(trigger_ids_slice)
-                .bind(repo_ids_slice)
-                .bind(app_ids_slice)
-                .bind(before)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?
-        } else {
-            let sql = format!(
-                "SELECT {} FROM thread_summaries t \
-                 WHERE t.has_response = TRUE AND t.last_activity < $1 \
-                 AND ($2::text[] IS NULL OR t.source = ANY($2)) \
-                 ORDER BY t.last_activity DESC LIMIT $3",
-                THREAD_COLS.as_str(),
-            );
-            sqlx::query_as::<_, ThreadRow>(&sql)
-                .bind(before)
-                .bind(sources)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?
-        };
+        // Binds: before($1), sources($2), trigger_ids($3), repo_ids($4),
+        // app_ids($5), limit($6) — the facet positions 2..=5 match the shared
+        // filter helper and the has_response relaxation below.
+        let sql = format!(
+            "SELECT {cols} FROM thread_summaries t \
+             WHERE t.last_user_action < $1 \
+               AND (t.has_response = TRUE \
+                    OR array_length($3::text[], 1) IS NOT NULL \
+                    OR array_length($4::text[], 1) IS NOT NULL \
+                    OR array_length($5::text[], 1) IS NOT NULL) \
+               AND {filter} \
+             ORDER BY t.last_user_action DESC LIMIT $6",
+            cols = THREAD_COLS.as_str(),
+            filter = channel_facet_filter_sql("t", 2, 3, 4, 5),
+        );
+        let rows = sqlx::query_as::<_, ThreadRow>(&sql)
+            .bind(before)
+            .bind(sources)
+            .bind(trigger_ids)
+            .bind(repo_ids)
+            .bind(app_ids)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
 
         Self::rows_to_thread_summaries(rows)
     }
@@ -133,8 +132,10 @@ impl EventStore {
     pub async fn get_filter_facets(
         &self,
     ) -> Result<FilterFacets, Box<dyn std::error::Error + Send + Sync>> {
+        // Trigger / app labels are resolved client-side, so `name` is NULL
+        // here (the column must still exist for `FilterFacet`'s FromRow).
         let triggers = sqlx::query_as::<_, FilterFacet>(
-            "SELECT trigger_id AS id, MAX(last_activity) AS last_activity \
+            "SELECT trigger_id AS id, NULL::text AS name, MAX(last_activity) AS last_activity \
              FROM thread_summaries \
              WHERE source = 'trigger' AND trigger_id IS NOT NULL \
              GROUP BY trigger_id",
@@ -147,20 +148,30 @@ impl EventStore {
         // keeps the facet set identical to the `cc_repo_id = ANY(...)`
         // predicate in `get_older_threads`, which has no source gate either
         // (facet and filter must advertise the same set).
-        let repos = sqlx::query_as::<_, FilterFacet>(
-            "SELECT cc_repo_id AS id, MAX(last_activity) AS last_activity \
-             FROM thread_summaries \
-             WHERE cc_repo_id IS NOT NULL \
-             GROUP BY cc_repo_id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        //
+        // Group first, then resolve `name` per distinct id in the outer query
+        // (live registry → `repo_names` projection) so a removed repo lists
+        // under its historical name instead of its UUID — keeping the resolution
+        // out of the GROUP BY.
+        let repos_sql = format!(
+            "SELECT sub.id AS id, {repo_name} AS name, sub.last_activity AS last_activity \
+             FROM ( \
+                SELECT cc_repo_id AS id, MAX(last_activity) AS last_activity \
+                FROM thread_summaries \
+                WHERE cc_repo_id IS NOT NULL \
+                GROUP BY cc_repo_id \
+             ) sub",
+            repo_name = repo_name_expr("sub.id"),
+        );
+        let repos = sqlx::query_as::<_, FilterFacet>(&repos_sql)
+            .fetch_all(&self.pool)
+            .await?;
 
         // The `LIKE` guard drops any malformed `coding_agent_kind='app'` row
         // whose folder isn't under `data/apps/` — without it `split_part`
         // would yield an empty-string facet id.
         let apps_sql = format!(
-            "SELECT {APP_ID_EXPR} AS id, MAX(last_activity) AS last_activity \
+            "SELECT {APP_ID_EXPR} AS id, NULL::text AS name, MAX(last_activity) AS last_activity \
              FROM thread_summaries \
              WHERE coding_agent_kind = 'app' AND coding_agent_folder LIKE '%/data/apps/%' \
              GROUP BY {APP_ID_EXPR}",
@@ -179,19 +190,22 @@ impl EventStore {
 
     /// Load every family member (ancestor + descendant via `parent_thread_id`)
     /// of the given base set that isn't already in the base. Drives the
-    /// drawer's family-aware rendering: pagination is per-thread by
-    /// `last_activity DESC`, but `ThreadDrawer.tsx → categorizeThreads`
+    /// drawer's family-aware rendering: base pagination is per-thread by
+    /// `last_user_action DESC`, but `ThreadDrawer.tsx → categorizeThreads`
     /// lifts a whole family up to the freshest member's recency. Without
-    /// this helper, a family member whose own `last_activity` falls below
+    /// this helper, a family member whose own recency falls below
     /// the loaded window would silently vanish — the parent's badge would
     /// say "N/N done" but `nestByParent` would only render the in-window
-    /// children. UNION (not UNION ALL) terminates the recursive walk even
+    /// children. This extension is deliberately capped by `last_activity`
+    /// (not `last_user_action`): an actively-streaming agent sub-thread whose
+    /// last user action is old must still be retained under the cap. UNION
+    /// (not UNION ALL) terminates the recursive walk even
     /// on a corrupted parent cycle; the single walk uses an OR join to
     /// climb to ancestors AND descend to children in one pass.
     ///
     /// `max_family` caps the result count after ORDER BY last_activity DESC —
     /// a workspace with a pathological fan-out (one root that spawned hundreds
-    /// of sub-threads via triggers / Claude Code sessions) would otherwise pull every
+    /// of sub-threads via triggers / coding-agent sessions) would otherwise pull every
     /// descendant into the initial /api/v1/threads payload, ballooning the
     /// frontend's threadMap and re-render cost. The newest members are kept;
     /// any visibly-old descendant that falls below the cap only matters when
@@ -368,6 +382,59 @@ impl EventStore {
         .bind(filters.sources)
         .fetch_one(&self.pool)
         .await?;
+        Ok(count)
+    }
+
+    /// Total threads in the Archive pile **matching the active drawer filter** —
+    /// `archive_state='archived'` and not saved (a saved+archived thread routes
+    /// to the Saved section, not Archive). Drives the collapsed Archive
+    /// section's count badge, which would otherwise show only the loaded window
+    /// (`get_recent_threads`'s 15 per source + scroll-paginated rows) — a gross
+    /// undercount on workspaces with hundreds of archived threads.
+    ///
+    /// The filter is `channel_facet_filter_sql`, shared verbatim with
+    /// [`Self::get_older_threads`] so the badge total stays in lockstep with what
+    /// scroll-pagination surfaces: a `sources` channel gate ANDed with per-channel
+    /// facet narrowing (`trigger_ids` on trigger rows; `repo_ids`/`app_ids` on
+    /// coding-agent rows, persisted as `claude_code`, unioned). Pass `None` for
+    /// all four to count the whole pile. Whole channels and a facet COMPOSE —
+    /// chat + coding-agent + one trigger counts every archived chat and
+    /// coding-agent thread PLUS that trigger's, not
+    /// the trigger's alone (the pre-fix bug, where the facet branch ignored
+    /// `sources`). A server-sourced count is what keeps the badge stable: it does
+    /// not drift as rows page in or as the section is collapsed/expanded.
+    ///
+    /// Intentionally a flat count of the archived pile, NOT a per-thread replay
+    /// of `displaySection`'s family routing. The handful of edge cases it
+    /// glosses over (an archived thread with a still-active descendant routes
+    /// to Review/Active) move at most a few rows, and the badge is a
+    /// collapsed-section indicator that is never rendered alongside the actual
+    /// rows — so duplicating the routing logic in SQL isn't worth the drift
+    /// against the `thread_lifecycle.rs` source of truth.
+    pub async fn count_archived_threads(
+        &self,
+        sources: Option<&[String]>,
+        trigger_ids: Option<&[String]>,
+        repo_ids: Option<&[String]>,
+        app_ids: Option<&[String]>,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let archived = ArchiveState::Archived.as_str();
+        // Binds: archived($1), sources($2), trigger_ids($3), repo_ids($4),
+        // app_ids($5) — facet positions 2..=5 match the shared filter helper.
+        let sql = format!(
+            "SELECT COUNT(*)::bigint FROM thread_summaries t \
+             WHERE t.archive_state = $1 AND t.is_saved = FALSE \
+               AND {filter}",
+            filter = channel_facet_filter_sql("t", 2, 3, 4, 5),
+        );
+        let (count,): (i64,) = sqlx::query_as(&sql)
+            .bind(archived)
+            .bind(sources)
+            .bind(trigger_ids)
+            .bind(repo_ids)
+            .bind(app_ids)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(count)
     }
 }

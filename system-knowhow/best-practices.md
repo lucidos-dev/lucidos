@@ -12,7 +12,7 @@ How files and data are organized in a Lucidos workspace.
 ### Fixed directories
 | Path | Purpose |
 |------|---------|
-| `user_profile.md` | Learned facts about the user (auto-maintained) |
+| `user_profile.md` | Learned facts about the user — maintained explicitly by the agent on the user's behalf (write confirmed facts the user shares); never auto-appended by background memory extraction |
 | `imported/{service}/` | Data from APIs or local filesystem (e.g., `imported/oura/`, `imported/weather/`) |
 | `projects/{name}/` | Major project folders — each has `notes.md` and related files |
 | `screenshots/` | Browser screenshots (auto-named with timestamp) |
@@ -79,13 +79,32 @@ Engine-read JSON files. Currently:
 
 **This is the preferred way for scripts and apps to call external APIs.** Add an entry here once, then call the backend by name everywhere — the credential never appears in script source, args, env vars, log lines, or LLM tool transcripts. The pre-proxy pattern (`curl -H "Authorization: Bearer $CRED_..."` in scripts; `fetch` with the credential pasted into the iframe) is drift — see the workspace audit.
 
+## Every subprocess call is a fresh process
+
+`run_bash`, `run_bash_background`, `run_python`, and `run_python_background` each spawn a **brand-new process** (bash runs via `/bin/sh -c`). **No shell state carries over between calls** — an `export VAR=…`, a `cd somewhere`, and any shell functions you set in one call are gone by the next.
+
+```bash
+# call 1
+export GWS_CONFIG_DIR=/Users/me/.config/gws-work   # set in this process only
+
+# call 2 — fresh process, the export above never happened
+gws calendar list        # GWS_CONFIG_DIR is empty → wrong/no account
+```
+
+Fixes, in order of preference:
+
+1. **Inline the env var on the same line as the command**: `GWS_CONFIG_DIR=/Users/me/.config/gws-work gws calendar list`. For `cd`, chain in one call: `cd /some/dir && ./run.sh`.
+2. **Same value across ALL calls in the workspace?** Put it in `data/.env` (see the section right below) so every subprocess inherits it without any export.
+
+Exception: `CRED_*`, `OAUTH_*_ACCESS_TOKEN`, and `LUCIDOS_WORKSPACE` **are** injected into every subprocess by the engine, so those appear in each fresh call with no export needed.
+
 ## data/.env — Per-Workspace Environment Overrides
 
 Optional file at `data/.env` (gitignored — safe for secrets, never committed to the artifacts repo). On startup the engine loads it with **override** semantics *after* the global `.env`, so values here win over the global `.env` and the inherited process env. The loaded variables land in the engine's process env, so **every subprocess inherits them** — `run_bash`, `run_python`, scheduled scripts, and Claude Code sessions.
 
 > ⚠️ **The engine reads `data/.env` only once, at startup. After you create or edit it, the engine must be restarted for the new values to take effect** — there is no live reload.
 
-Use it for per-workspace environment that must differ from other workspaces on the same machine. The motivating case is a **per-workspace GitHub account**, so `gh` / `git push` run from agent subprocesses authenticate as the right identity:
+Use `data/.env` for environment that must be the **SAME for every subprocess in this workspace** and **differ from other workspaces** on the same machine — per-workspace identity: a `gh` config dir, a Google `gws` config dir + project id, an SSH key. The motivating case is a **per-workspace GitHub account**, so `gh` / `git push` run from agent subprocesses authenticate as the right identity:
 
 ```dotenv
 # Point gh at a config dir already authenticated to THIS workspace's account
@@ -102,6 +121,8 @@ Setup is **partly interactive** — you (the agent) can write `data/.env`, but t
 4. **Restart the engine** — `data/.env` is read once at startup, so new or edited values only take effect after a restart.
 
 Verify it loaded: the startup log shows `[Startup] Loaded per-workspace .env from <path>`.
+
+> ⚠️ **`write_file` can't write to the `data/` root** — it writes git-tracked content into typed subdirs and defaults untyped paths under `artifacts/`. An explicit `data/<x>` that isn't a typed subdir (e.g. `data/.env`) is **rejected** rather than silently committed to `artifacts/.env`. To write a loose data-root file like `data/.env` (gitignored config), use `run_python` (its cwd is the workspace root): `open('data/.env', 'w').write(...)`.
 
 ## Key Rules
 

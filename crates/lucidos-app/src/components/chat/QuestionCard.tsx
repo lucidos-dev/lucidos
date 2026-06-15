@@ -68,42 +68,6 @@ export function clearPendingAnswer(toolUseId: string): void {
   pendingAnswerByToolUse.value = next;
 }
 
-/** Up-front text label for the card — "Pick one" vs "Pick one or more", or
- *  "Suggested" for the *wake question* shape (single-option ask used to step
- *  aside and let the user tap-to-continue; see system-knowhow/glossary.md).
- *  Without this, single-select cards (which commit on click) look identical
- *  to multi-select cards (which require Submit), so users discover the mode
- *  only after acting. */
-export function questionModeLabel(
-  multiSelect: boolean | undefined,
-  optionCount?: number,
-): string {
-  if (optionCount === 1) return 'Suggested';
-  return multiSelect ? 'Pick one or more' : 'Pick one';
-}
-
-/** Mode pill at the top of the question body. Pure render so the unit test
- *  can walk the vnode tree without a DOM. For wake questions (optionCount=1)
- *  the radio dot is omitted — the lone button is its own affordance and a
- *  fake indicator implies a choice that isn't there. */
-export function ModeBadge({
-  multiSelect,
-  optionCount,
-}: {
-  multiSelect: boolean | undefined;
-  optionCount?: number;
-}) {
-  const variant = optionCount === 1
-    ? 'cc-question-mode-badge-suggested'
-    : multiSelect ? 'cc-question-mode-badge-multi' : 'cc-question-mode-badge-single';
-  return (
-    <div class={`cc-question-mode-badge ${variant}`}>
-      {optionCount !== 1 && <OptionIndicator multiSelect={!!multiSelect} selected={false} />}
-      <span>{questionModeLabel(multiSelect, optionCount)}</span>
-    </div>
-  );
-}
-
 /** Radio (single) vs checkbox (multi) shape on each option, distinct from the
  *  start so the user can tell the mode apart before any click. The selected
  *  state is also rendered visually so the same component works for the live
@@ -115,15 +79,15 @@ export function OptionIndicator({
   multiSelect: boolean;
   selected: boolean;
 }) {
-  const shape = multiSelect ? 'cc-question-option-indicator-checkbox' : 'cc-question-option-indicator-radio';
-  const sel = selected ? ' cc-question-option-indicator-selected' : '';
-  return <span class={`cc-question-option-indicator ${shape}${sel}`} aria-hidden="true" />;
+  const shape = multiSelect ? 'question-option-indicator-checkbox' : 'question-option-indicator-radio';
+  const sel = selected ? ' question-option-indicator-selected' : '';
+  return <span class={`question-option-indicator ${shape}${sel}`} aria-hidden="true" />;
 }
 
 /** Shared indicator + label/desc layout used by both the live OptionButton
  *  and the AnsweredBody static row. Keeps the two surfaces visually identical
  *  so resolving a question doesn't reflow. The flat fragment relies on the
- *  parent grid (`.cc-question-option` / `.cc-question-option-static`) to place
+ *  parent grid (`.question-option` / `.question-option-static`) to place
  *  desc on its own row spanning both columns. */
 function OptionContent({
   option,
@@ -137,10 +101,10 @@ function OptionContent({
   return (
     <>
       <OptionIndicator multiSelect={multiSelect} selected={selected} />
-      <span class="cc-question-option-label">{option.label}</span>
+      <span class="question-option-label">{option.label}</span>
       {option.description && (
         <span
-          class="cc-question-option-desc"
+          class="question-option-desc"
           dangerouslySetInnerHTML={{ __html: renderMarkdownInline(option.description) }}
         />
       )}
@@ -157,7 +121,7 @@ function OptionContent({
 function QuestionText({ question }: { question: string }) {
   return (
     <div
-      class="cc-question-text"
+      class="question-text"
       dangerouslySetInnerHTML={{ __html: renderMarkdownInlineWithLinks(question) }}
     />
   );
@@ -192,11 +156,10 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
   if (multiSelect) {
     const selected = multiSelectedByToolUse.value.get(toolUseId) ?? [];
     return (
-      <div class="cc-question-body" data-tool-use-id={toolUseId}>
-        {options.length > 0 && <ModeBadge multiSelect={true} optionCount={options.length} />}
+      <div class="question-body" data-tool-use-id={toolUseId}>
         <QuestionText question={question} />
         {options.length > 0 && (
-          <div class="cc-question-options">
+          <div class="question-options">
             {options.map(opt => (
               <OptionButton
                 key={opt.id}
@@ -221,18 +184,17 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
   };
 
   return (
-    <div class="cc-question-body" data-tool-use-id={toolUseId}>
-      {options.length > 0 && <ModeBadge multiSelect={false} optionCount={options.length} />}
+    <div class="question-body" data-tool-use-id={toolUseId}>
       <QuestionText question={question} />
       {options.length > 0 && (
-        <div class="cc-question-options">
+        <div class="question-options">
           {options.map(opt => (
             <OptionButton key={opt.id} option={opt} onActivate={onPick} />
           ))}
         </div>
       )}
       {options.length === 0 && (
-        <div class="cc-question-hint">Type your answer in the prompt below.</div>
+        <div class="question-hint">Type your answer in the prompt below.</div>
       )}
     </div>
   );
@@ -260,7 +222,7 @@ function OptionButton({
   return (
     <button
       type="button"
-      class="cc-question-option"
+      class="question-option"
       aria-pressed={isToggle ? pressed : undefined}
       onPointerDown={e => gate.down(e.clientX, e.clientY)}
       onPointerMove={e => gate.move(e.clientX, e.clientY)}
@@ -300,15 +262,14 @@ export function AnsweredBody({
     : resolved.kind === 'MultiSelected' ? resolved.text
     : undefined;
   return (
-    <div class="cc-question-body cc-question-body-answered">
-      {options.length > 0 && <ModeBadge multiSelect={multiSelect} optionCount={options.length} />}
+    <div class="question-body question-body-answered">
       <QuestionText question={question} />
       {options.length > 0 && (
-        <div class="cc-question-options">
+        <div class="question-options">
           {options.map(opt => (
             <div
               key={opt.id}
-              class={`cc-question-option-static${isSelected(opt.id) ? ' cc-question-option-selected' : ' cc-question-option-dimmed'}`}
+              class={`question-option-static${isSelected(opt.id) ? ' question-option-selected' : ' question-option-dimmed'}`}
             >
               <OptionContent option={opt} multiSelect={!!multiSelect} selected={isSelected(opt.id)} />
             </div>
@@ -316,18 +277,18 @@ export function AnsweredBody({
         </div>
       )}
       {customText && customText.length > 0 && (
-        <div class="cc-question-freetext">
-          <span class="cc-question-freetext-label">Custom answer</span>
-          <span class="cc-question-freetext-text">{customText}</span>
+        <div class="question-freetext">
+          <span class="question-freetext-label">Custom answer</span>
+          <span class="question-freetext-text">{customText}</span>
         </div>
       )}
       {resolved.kind === 'Canceled' && (
         <button
           type="button"
-          class="action-btn action-btn-danger cc-permission-btn-picked cc-question-cancel-picked"
+          class="action-btn action-btn-danger permission-btn-picked question-cancel-picked"
           disabled
         >
-          <span class="cc-permission-btn-check" aria-hidden="true">✓ </span>
+          <span class="permission-btn-check" aria-hidden="true">✓ </span>
           Cancel
         </button>
       )}
@@ -348,13 +309,12 @@ export function TerminatedQuestionBody({
   multiSelect: boolean | undefined;
 }) {
   return (
-    <div class="cc-question-body cc-question-body-terminated">
-      {options.length > 0 && <ModeBadge multiSelect={multiSelect} optionCount={options.length} />}
+    <div class="question-body question-body-terminated">
       <QuestionText question={question} />
       {options.length > 0 && (
-        <div class="cc-question-options">
+        <div class="question-options">
           {options.map(opt => (
-            <button key={opt.id} type="button" class="cc-question-option" disabled>
+            <button key={opt.id} type="button" class="question-option" disabled>
               <OptionContent option={opt} multiSelect={!!multiSelect} selected={false} />
             </button>
           ))}

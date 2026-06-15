@@ -18,8 +18,8 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
             "properties": {
                 "target": {
                     "type": "string",
-                    "enum": ["files", "apps", "triggers", "changes", "notifications", "settings", "app", "file", "trigger", "thread", "new-app", "new-trigger", "new-chat", "url"],
-                    "description": "Navigation target. Use 'files', 'apps', 'triggers', 'changes', 'notifications', 'settings' for panels. Use 'app' to open an app by ID. Use 'file' to preview a file. Use 'trigger' to focus a trigger by ID. Use 'thread' to focus a thread by ID. Use 'new-app', 'new-trigger', or 'new-chat' to open the creation form. Use 'url' to open a URL in the internal browser panel."
+                    "enum": ["files", "apps", "triggers", "thread-queue", "changes", "notifications", "settings", "app", "file", "trigger", "thread", "new-app", "new-trigger", "new-chat", "url"],
+                    "description": "Navigation target. Use 'files', 'apps', 'triggers', 'thread-queue', 'changes', 'notifications', 'settings' for panels. Use 'app' to open an app by ID. Use 'file' to preview a file. Use 'trigger' to focus a trigger by ID. Use 'thread' to focus a thread by ID. Use 'new-app', 'new-trigger', or 'new-chat' to open the creation form. Use 'url' to open a URL in the internal browser panel."
                 },
                 "settings_view": {
                     "type": "string",
@@ -271,7 +271,7 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::ASK_USER_QUESTION.to_string(),
-            description: "Ask the user a multiple-choice question and wait for their pick. The Lucidos UI renders each question as a card with the options as clickable buttons, so the user can answer with a tap instead of typing. Use whenever the answer is a yes/no decision, a pick from 2–4 named choices, or a confirmation step before doing something significant — anywhere a button would beat a typed reply. Single-question is the common case; pass up to 4 questions in one call only when they are a tight batch the user should answer in sequence (each question renders one card at a time). Always include an option that lets the user opt out (e.g. \"Cancel\" / \"None of these\") so the conversation has a clear way forward; users can always type a freeform reply too. Returns a JSON object mapping each question text to the chosen option label (or the user's typed text when they answer freeform).".to_string(),
+            description: "Ask the user a multiple-choice question and wait for their pick. The Lucidos UI renders each question as a card with the options as clickable buttons, so the user can answer with a tap instead of typing. Use whenever the answer is a yes/no decision, a pick from 2–4 named choices, or a confirmation step before doing something significant — anywhere a button would beat a typed reply. Single-question is the common case; pass up to 4 questions in one call only when they are a tight batch the user should answer in sequence (each question renders one card at a time). Every question object MUST carry a non-empty `question` (the full question text the user reads on the card); the short `header` chip-label is NEVER a substitute, and the engine rejects — and forces you to re-ask — any call that leaves `question` empty, so fill it the first time. Always include an option that lets the user opt out (e.g. \"Cancel\" / \"None of these\") so the conversation has a clear way forward; users can always type a freeform reply too. Returns a JSON object mapping each question text to the chosen option label (or the user's typed text when they answer freeform).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

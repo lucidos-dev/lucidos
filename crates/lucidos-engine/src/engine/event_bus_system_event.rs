@@ -332,6 +332,35 @@ pub enum SystemEvent {
         tap: Tap,
         sent_at_ms: i64,
     },
+    /// SSE-only, never persisted. The desktop counterpart of the OS push:
+    /// emitted on the *push-allowed* branch (the complement of
+    /// [`Self::NotificationToastRequested`]) so a connected Tauri desktop app —
+    /// which embeds a WKWebView and can NOT receive Web Push / service-worker
+    /// pushes — renders a NATIVE macOS notification via
+    /// `tauri-plugin-notification`. Broadcast: browser / PWA clients ignore it
+    /// (they already get, or are getting, the real web push), and only a Tauri
+    /// client that is not currently active acts on it. Because it lives on the
+    /// same branch as the web-push fan-out and the opposite branch from the
+    /// in-app toast, a device can never receive both a native banner and a
+    /// toast for one notification — the engine's single `push_allowed` decision
+    /// keeps them mutually exclusive (see `system-knowhow/notifications.md`
+    /// §1, §4). Carries the same content as the toast event so the page renders
+    /// without a re-fetch; `sent_at_ms` drives the page-side freshness gate.
+    NativePushRequested {
+        notification_id: Uuid,
+        title: String,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_id: Option<String>,
+        /// Defaults to `Tap::Modal` (open inbox) so omitting it stays safe.
+        #[serde(default)]
+        tap: Tap,
+        sent_at_ms: i64,
+    },
     /// A plugin was installed (or updated — overwrite=true reuses this variant).
     /// `manifest` carries the full parsed manifest so future fields are additive.
     /// `files` are paths under `data/` so a future tracked-uninstall can derive
@@ -382,12 +411,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// Compose state on a thread changed (text, images, or mode). Broadcast
-    /// to SSE for cross-device sync; intentionally NOT persisted to the events
-    /// table — the `thread_summaries` row holds the current state, and
-    /// keystroke history isn't audit-worthy. Receivers reconcile via the
-    /// `origin_device_id` echo check + "don't clobber my focused textarea"
-    /// guard described in `docs/plans/2026-05-03-threads-as-drafts-design.md`.
     /// A device pinned an app to its home / dock surface. Audit-worthy because
     /// the pinned set is what powers the app launcher on that device.
     PinnedAppPinned {
@@ -468,6 +491,30 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A chat-model registry entry was created (user-added via Settings →
+    /// Models). The id is the request value (e.g. `claude-fable-5`); `provider`
+    /// is the backend that serves it (`vertex` / `anthropic` / `openai`).
+    ModelCreated {
+        id: String,
+        label: String,
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A model registry entry was edited (label/provider/sort/enabled, or a
+    /// builtin toggled enabled/disabled). Drives the model-registry reload.
+    ModelUpdated {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A user-added model registry entry was removed (builtins are not
+    /// deletable, only disable-able).
+    ModelDeleted {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// An OAuth account row was removed (revoke / delete from settings).
     OAuthAccountDeleted {
         account_id: String,
@@ -504,6 +551,12 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// Compose state on a thread changed (text, images, or mode). Broadcast
+    /// to SSE for cross-device sync; intentionally NOT persisted to the events
+    /// table — the `thread_summaries` row holds the current state, and
+    /// keystroke history isn't audit-worthy. Receivers reconcile via the
+    /// `origin_device_id` echo check + "don't clobber my focused textarea"
+    /// guard described in `docs/plans/2026-05-03-threads-as-drafts-design.md`.
     ThreadComposeChanged {
         id: Uuid,
         text: String,
@@ -598,6 +651,72 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A background spawn entered the *Thread Queue* (admission control).
+    /// Emitted for EVERY background spawn — entries that fit capacity are
+    /// admitted immediately (a `ThreadQueueAdmitted` follows in the same
+    /// breath), entries over capacity wait in the queue. `requeued: true`
+    /// marks the boot sweep re-queuing an `admitted` entry whose work died
+    /// with the previous engine process. Projection: `thread_queue` row
+    /// upserted with status `'queued'`.
+    ThreadQueued {
+        entry_id: Uuid,
+        /// Capacity bucket: `event-trigger` | `cron` | `sub-thread` | `coding-agent`.
+        kind: crate::engine::thread_queue::ThreadQueueKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_name: Option<String>,
+        /// Bound thread for sub-thread / coding-agent spawns (pre-allocated id).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<Uuid>,
+        /// Human preview for the Thread Queue panel.
+        summary: String,
+        /// Full re-executable spawn request (`ThreadQueueRequest` JSON).
+        request: serde_json::Value,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        requeued: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A Thread Queue entry was admitted — capacity allowed it (or the user
+    /// clicked Run now; that path carries the `actor`). The entry's work is
+    /// now executing; the `thread_queue` row flips to `'admitted'` and is the
+    /// persisted active-session record until `ThreadQueueCompleted`.
+    ThreadQueueAdmitted {
+        entry_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A Thread Queue entry was dropped without running — user clicked Drop,
+    /// the per-trigger queue cap overflowed (capacity policy `drop-oldest`),
+    /// or the entry's trigger no longer exists. Projection: row deleted.
+    ThreadQueueDropped {
+        entry_id: Uuid,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// An admitted Thread Queue entry's work finished (any outcome — the
+    /// thread's own terminal events carry success/failure). Frees the
+    /// capacity slot; projection deletes the row.
+    ThreadQueueCompleted { entry_id: Uuid },
+    /// Transient panel-refresh signal — broadcast, never persisted, no
+    /// projection. Emitted when only the in-memory user-initiated occupants of
+    /// the shared pool change (a user response admitted / queued / released);
+    /// those are not persisted as `thread_queue` rows, so the panel refetches
+    /// and merges them on this. Background changes already fire the persisted
+    /// `ThreadQueue*` events.
+    ThreadQueueChanged {},
+    /// The *capacity policy* governing the Thread Queue changed. Persisted —
+    /// the latest event IS the stored policy (reconstructed at boot); no
+    /// separate config table.
+    CapacityPolicyChanged {
+        policy: crate::engine::thread_queue::CapacityPolicy,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
 }
 
 impl SystemEvent {
@@ -665,6 +784,9 @@ impl SystemEvent {
                 | Self::CredentialCreated { .. }
                 | Self::CredentialUpdated { .. }
                 | Self::CredentialDeleted { .. }
+                | Self::ModelCreated { .. }
+                | Self::ModelUpdated { .. }
+                | Self::ModelDeleted { .. }
                 | Self::OAuthAccountDeleted { .. }
                 | Self::DataFileWritten { .. }
                 | Self::DataFileDeleted { .. }
@@ -674,6 +796,11 @@ impl SystemEvent {
                 | Self::EngineSupervisorRespawned { .. }
                 | Self::EmailSent { .. }
                 | Self::ProxyModulesReloaded { .. }
+                | Self::ThreadQueued { .. }
+                | Self::ThreadQueueAdmitted { .. }
+                | Self::ThreadQueueDropped { .. }
+                | Self::ThreadQueueCompleted { .. }
+                | Self::CapacityPolicyChanged { .. }
         )
     }
 
@@ -721,6 +848,7 @@ impl SystemEvent {
             Self::DeviceHidden { .. } => "DeviceHidden",
             Self::PresenceCheck { .. } => "PresenceCheck",
             Self::NotificationToastRequested { .. } => "NotificationToastRequested",
+            Self::NativePushRequested { .. } => "NativePushRequested",
             Self::PluginInstalled { .. } => "PluginInstalled",
             Self::PluginUninstalled { .. } => "PluginUninstalled",
             Self::PluginInstallCanceled { .. } => "PluginInstallCanceled",
@@ -737,6 +865,9 @@ impl SystemEvent {
             Self::CredentialCreated { .. } => "CredentialCreated",
             Self::CredentialUpdated { .. } => "CredentialUpdated",
             Self::CredentialDeleted { .. } => "CredentialDeleted",
+            Self::ModelCreated { .. } => "ModelCreated",
+            Self::ModelUpdated { .. } => "ModelUpdated",
+            Self::ModelDeleted { .. } => "ModelDeleted",
             Self::OAuthAccountDeleted { .. } => "OAuthAccountDeleted",
             Self::DataFileWritten { .. } => "DataFileWritten",
             Self::DataFileDeleted { .. } => "DataFileDeleted",
@@ -746,6 +877,12 @@ impl SystemEvent {
             Self::EngineSupervisorRespawned { .. } => "EngineSupervisorRespawned",
             Self::EmailSent { .. } => "EmailSent",
             Self::ProxyModulesReloaded { .. } => "ProxyModulesReloaded",
+            Self::ThreadQueued { .. } => "ThreadQueued",
+            Self::ThreadQueueAdmitted { .. } => "ThreadQueueAdmitted",
+            Self::ThreadQueueDropped { .. } => "ThreadQueueDropped",
+            Self::ThreadQueueCompleted { .. } => "ThreadQueueCompleted",
+            Self::ThreadQueueChanged {} => "ThreadQueueChanged",
+            Self::CapacityPolicyChanged { .. } => "CapacityPolicyChanged",
         }
     }
 
@@ -798,6 +935,7 @@ impl SystemEvent {
         "DeviceHidden",
         "PresenceCheck",
         "NotificationToastRequested",
+        "NativePushRequested",
         "PluginInstalled",
         "PluginUninstalled",
         "PluginInstallCanceled",
@@ -814,6 +952,9 @@ impl SystemEvent {
         "CredentialCreated",
         "CredentialUpdated",
         "CredentialDeleted",
+        "ModelCreated",
+        "ModelUpdated",
+        "ModelDeleted",
         "OAuthAccountDeleted",
         "DataFileWritten",
         "DataFileDeleted",
@@ -823,6 +964,12 @@ impl SystemEvent {
         "EngineSupervisorRespawned",
         "EmailSent",
         "ProxyModulesReloaded",
+        "ThreadQueued",
+        "ThreadQueueAdmitted",
+        "ThreadQueueDropped",
+        "ThreadQueueCompleted",
+        "ThreadQueueChanged",
+        "CapacityPolicyChanged",
         "ThreadEvent",
     ];
 
@@ -835,7 +982,8 @@ impl SystemEvent {
             Self::NotificationCreated { .. }
             | Self::NotificationRead { .. }
             | Self::NotificationsAllRead { .. }
-            | Self::NotificationToastRequested { .. } => "notification",
+            | Self::NotificationToastRequested { .. }
+            | Self::NativePushRequested { .. } => "notification",
             Self::PreferencesChanged { .. }
             | Self::LanguageSet { .. }
             | Self::TimezoneSet { .. } => "preference",
@@ -886,6 +1034,9 @@ impl SystemEvent {
             Self::CredentialCreated { .. }
             | Self::CredentialUpdated { .. }
             | Self::CredentialDeleted { .. } => "credential",
+            Self::ModelCreated { .. } | Self::ModelUpdated { .. } | Self::ModelDeleted { .. } => {
+                "model"
+            }
             Self::OAuthAccountDeleted { .. } => "oauth_account",
             Self::DataFileWritten { .. }
             | Self::DataFileDeleted { .. }
@@ -896,6 +1047,12 @@ impl SystemEvent {
             Self::EngineSupervisorRespawned { .. } => "engine",
             Self::EmailSent { .. } => "email",
             Self::ProxyModulesReloaded { .. } => "proxy_modules",
+            Self::ThreadQueued { .. }
+            | Self::ThreadQueueAdmitted { .. }
+            | Self::ThreadQueueDropped { .. }
+            | Self::ThreadQueueCompleted { .. }
+            | Self::ThreadQueueChanged {} => "thread_queue",
+            Self::CapacityPolicyChanged { .. } => "capacity_policy",
         }
     }
 
@@ -932,6 +1089,9 @@ impl SystemEvent {
             }
             | Self::NotificationToastRequested {
                 notification_id, ..
+            }
+            | Self::NativePushRequested {
+                notification_id, ..
             } => notification_id.to_string(),
             // Raw manifest is nested one layer in — see `InstalledRecord` for the path.
             Self::PluginInstalled { manifest, .. } => manifest
@@ -965,6 +1125,9 @@ impl SystemEvent {
             Self::CredentialCreated { service_name, .. }
             | Self::CredentialUpdated { service_name, .. }
             | Self::CredentialDeleted { service_name, .. } => service_name.clone(),
+            Self::ModelCreated { id, .. }
+            | Self::ModelUpdated { id, .. }
+            | Self::ModelDeleted { id, .. } => id.clone(),
             Self::OAuthAccountDeleted { account_id, .. } => account_id.clone(),
             Self::DataFileWritten { path, .. }
             | Self::DataFileDeleted { path, .. }
@@ -973,6 +1136,10 @@ impl SystemEvent {
             | Self::ApplyAllBatchCompleted { batch_id, .. } => batch_id.to_string(),
             Self::EngineSupervisorRespawned { supervisor_pid, .. } => supervisor_pid.to_string(),
             Self::EmailSent { account, .. } => account.clone(),
+            Self::ThreadQueued { entry_id, .. }
+            | Self::ThreadQueueAdmitted { entry_id, .. }
+            | Self::ThreadQueueDropped { entry_id, .. }
+            | Self::ThreadQueueCompleted { entry_id } => entry_id.to_string(),
             _ => "global".into(),
         }
     }

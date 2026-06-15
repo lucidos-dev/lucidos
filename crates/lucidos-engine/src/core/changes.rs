@@ -30,6 +30,16 @@ pub struct Change {
     /// completion. The frontend reads this to surface a confirm-before-Apply
     /// warning so the user knows they're about to land partial changes.
     pub incomplete: bool,
+    /// `true` when the originating thread is mid-turn — `Running` or
+    /// `WaitingForUserAnswer`, the two states where `available_thread_actions`
+    /// withholds Apply. Applying then races the session's next proposal (real
+    /// thread 76b4ee76). NOT a DB column — populated by `enrich_thread_active`
+    /// at serialize time (defaults to `false` for direct DB loads). The
+    /// frontend disables Apply for these and Apply All filters them out; the
+    /// per-change Apply endpoint already 409s via `guard_change_action`.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub thread_active: bool,
 }
 
 /// One thread's contribution to the current restart-required toast: the
@@ -51,6 +61,77 @@ pub async fn enrich_thread_titles(
     changes: &mut [Change],
 ) -> Result<(), sqlx::Error> {
     enrich_titles(pool, changes, |c| c.thread_id, |c, t| c.thread_title = Some(t)).await
+}
+
+/// The two thread statuses in which the coding agent is mid-turn, so Apply must
+/// be withheld (mirrors the `live` clause in `available_thread_actions`).
+const LIVE_THREAD_STATUSES: [&str; 2] = ["running", "waiting_for_user_answer"];
+
+/// Of the given thread ids, return the subset whose `thread_summaries.status`
+/// is mid-turn (`running` / `waiting_for_user_answer`). Single batch query.
+/// Apply All filters its batch with this so it never applies a change whose
+/// session is still working — the gate the per-change endpoint already enforces
+/// via `guard_change_action`.
+pub async fn live_thread_ids(
+    pool: &PgPool,
+    thread_ids: impl Iterator<Item = Uuid>,
+) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+    let ids: Vec<Uuid> = thread_ids.collect();
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT thread_id FROM thread_summaries \
+         WHERE thread_id = ANY($1) AND status = ANY($2)",
+    )
+    .bind(&ids)
+    .bind(&LIVE_THREAD_STATUSES[..])
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Return the subset of `changes` whose thread is NOT mid-turn — the ones
+/// Apply All / Discard All may act on. Filters out Running /
+/// WaitingForUserAnswer threads: the per-change endpoints already 409 those via
+/// `guard_change_action`, and acting on them in bulk would merge (or delete the
+/// worktree of) a branch the coding agent is still working on. One batch query.
+pub async fn drop_live_thread_changes(
+    pool: &PgPool,
+    changes: Vec<Change>,
+) -> Result<Vec<Change>, sqlx::Error> {
+    let live = live_thread_ids(pool, changes.iter().filter_map(|c| c.thread_id)).await?;
+    Ok(changes
+        .into_iter()
+        .filter(|c| !c.thread_id.is_some_and(|tid| live.contains(&tid)))
+        .collect())
+}
+
+/// Set `thread_active` on each pending Change by batch-loading thread run-state.
+/// Applied changes are left alone (their thread state no longer gates Apply).
+/// Single batch query, no N+1 — the serialize-time companion to
+/// `enrich_thread_titles`.
+pub async fn enrich_thread_active(
+    pool: &PgPool,
+    changes: &mut [Change],
+) -> Result<(), sqlx::Error> {
+    let live = live_thread_ids(
+        pool,
+        changes
+            .iter()
+            .filter(|c| c.status == "pending")
+            .filter_map(|c| c.thread_id),
+    )
+    .await?;
+    if live.is_empty() {
+        return Ok(());
+    }
+    for change in changes.iter_mut() {
+        if let Some(tid) = change.thread_id {
+            change.thread_active = change.status == "pending" && live.contains(&tid);
+        }
+    }
+    Ok(())
 }
 
 /// Same as `enrich_thread_titles` but for `RestartGroup`.
@@ -137,7 +218,69 @@ mod tests {
             thread_title: None,
             commits: vec![],
             incomplete: false,
+            thread_active: false,
         }
+    }
+
+    async fn insert_thread_summary_with_status(
+        pool: &PgPool,
+        thread_id: Uuid,
+        status: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO thread_summaries (thread_id, title, source, message_count, last_activity, has_response, is_saved, status) \
+             VALUES ($1, 'T', 'chat', 0, NOW(), false, false, $2)",
+        )
+        .bind(thread_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert thread_summary with status");
+    }
+
+    /// `enrich_thread_active` flags a pending change whose thread is mid-turn
+    /// (`running` / `waiting_for_user_answer`), leaves idle-thread changes
+    /// false, and never flags an already-applied change (its thread state no
+    /// longer gates Apply).
+    #[tokio::test]
+    async fn enrich_thread_active_flags_only_live_pending() {
+        let (pool, db) = setup_test_db().await;
+
+        let running = Uuid::new_v4();
+        let waiting_answer = Uuid::new_v4();
+        let idle = Uuid::new_v4();
+        let running_but_applied = Uuid::new_v4();
+        insert_thread_summary_with_status(&pool, running, "running").await;
+        insert_thread_summary_with_status(&pool, waiting_answer, "waiting_for_user_answer").await;
+        insert_thread_summary_with_status(&pool, idle, "idle").await;
+        insert_thread_summary_with_status(&pool, running_but_applied, "running").await;
+
+        let mut changes = vec![
+            make_change(Some(running)),
+            make_change(Some(waiting_answer)),
+            make_change(Some(idle)),
+            make_change(None),
+            {
+                let mut c = make_change(Some(running_but_applied));
+                c.status = "applied".into();
+                c
+            },
+        ];
+
+        enrich_thread_active(&pool, &mut changes)
+            .await
+            .expect("enrich");
+
+        assert!(changes[0].thread_active, "running thread blocks apply");
+        assert!(changes[1].thread_active, "waiting-for-answer thread blocks apply");
+        assert!(!changes[2].thread_active, "idle thread allows apply");
+        assert!(!changes[3].thread_active, "no thread_id stays false");
+        assert!(
+            !changes[4].thread_active,
+            "already-applied change is never flagged even if its thread is running"
+        );
+
+        teardown_test_db(&db).await;
     }
 
     /// `enrich_thread_titles` populates `thread_title` from `thread_summaries`

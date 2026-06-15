@@ -34,7 +34,7 @@ import { getResizeMode, notAtTop, scrolledUp } from '../../components/chat/scrol
 import { drawerOpen } from '../../components/layout/Drawer';
 import { threadScrollKey } from '../../hooks/useScrollMemory';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
-import { archivingThreadIds, ccPendingModel, ccPendingReasoningEffort, focusedThreadId, generatedTitleIds, mobileView, resetCCPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded } from '../store';
+import { archiveThreadCount, archivingThreadIds, codingAgentPendingModel, codingAgentPendingReasoningEffort, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded } from '../store';
 import { loadAllThreads } from './thread-loading';
 import { focusThread, handleSaveThread, unfocusThread } from './threads';
 
@@ -79,7 +79,7 @@ beforeEach(() => {
   mobileView.value = 'thread';
   threadDrawerOpen.value = false;
   drawerOpen.value = false;
-  resetCCPendingPreferences();
+  resetCodingAgentPendingPreferences();
   generatedTitleIds.clear();
   archivingThreadIds.value = new Set();
   localStorage.removeItem('lucidos-focused-thread');
@@ -196,21 +196,6 @@ describe('focusThread', () => {
     }
   });
 
-  it('skipPaneNav keeps the user on the threads pane on mobile', () => {
-    // History chevrons in the threads-list header walk the nav stack while
-    // keeping the user on the list — they preview where they've been instead
-    // of jumping into the thread chat view.
-    const origWidth = globalThis.innerWidth;
-    (globalThis as any).innerWidth = 375;
-    try {
-      mobileView.value = 'threads';
-      focusThread('t1', { skipPaneNav: true });
-      expect(focusedThreadId.value).toBe('t1');
-      expect(mobileView.value).toBe('threads');
-    } finally {
-      (globalThis as any).innerWidth = origWidth;
-    }
-  });
 });
 
 describe('unfocusThread', () => {
@@ -227,34 +212,34 @@ describe('unfocusThread', () => {
 
 describe('CC pending preferences reset on thread switch', () => {
   it('focusThread resets pending CC model and reasoning effort', () => {
-    ccPendingModel.value = 'opus';
-    ccPendingReasoningEffort.value = 'max';
+    codingAgentPendingModel.value = 'opus';
+    codingAgentPendingReasoningEffort.value = 'max';
 
     focusThread('t1');
 
-    expect(ccPendingModel.value).toBeNull();
-    expect(ccPendingReasoningEffort.value).toBeNull();
+    expect(codingAgentPendingModel.value).toBeNull();
+    expect(codingAgentPendingReasoningEffort.value).toBeNull();
   });
 
   it('switching between threads resets pending preferences', () => {
     focusThread('t1');
-    ccPendingModel.value = 'sonnet';
-    ccPendingReasoningEffort.value = 'low';
+    codingAgentPendingModel.value = 'sonnet';
+    codingAgentPendingReasoningEffort.value = 'low';
 
     focusThread('t2');
 
-    expect(ccPendingModel.value).toBeNull();
-    expect(ccPendingReasoningEffort.value).toBeNull();
+    expect(codingAgentPendingModel.value).toBeNull();
+    expect(codingAgentPendingReasoningEffort.value).toBeNull();
   });
 
   it('unfocusThread resets pending CC preferences (compose view starts fresh)', () => {
-    ccPendingModel.value = 'opus';
-    ccPendingReasoningEffort.value = 'max';
+    codingAgentPendingModel.value = 'opus';
+    codingAgentPendingReasoningEffort.value = 'max';
 
     unfocusThread();
 
-    expect(ccPendingModel.value).toBeNull();
-    expect(ccPendingReasoningEffort.value).toBeNull();
+    expect(codingAgentPendingModel.value).toBeNull();
+    expect(codingAgentPendingReasoningEffort.value).toBeNull();
   });
 });
 
@@ -342,6 +327,31 @@ describe('loadAllThreads', () => {
       })),
     });
   }
+
+  it('stores the backend archive_count for the collapsed Archive badge', async () => {
+    archiveThreadCount.value = 0;
+    (fetchThreads as any).mockResolvedValue({
+      saved: [], active_threads: [], composing: [], family_threads: [], active: [],
+      archive: [],
+      archive_count: 247,
+    });
+
+    await loadAllThreads();
+
+    expect(archiveThreadCount.value).toBe(247);
+  });
+
+  it('falls back to 0 when archive_count is omitted (older engine / mock)', async () => {
+    archiveThreadCount.value = 99;
+    (fetchThreads as any).mockResolvedValue({
+      saved: [], active_threads: [], composing: [], family_threads: [], active: [],
+      archive: [],
+    });
+
+    await loadAllThreads();
+
+    expect(archiveThreadCount.value).toBe(0);
+  });
 
   it('updates metadata for threads already in map (SSE skeletons)', async () => {
     // SSE skeleton has stale title but newer updatedAt from live events

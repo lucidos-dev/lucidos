@@ -13,6 +13,7 @@ import './styles/settings.css';
 import './styles/components.css';
 import './styles/pages.css';
 import './styles/skills.css';
+import './styles/thread-queue.css';
 import './styles/mobile.css';
 import './styles/drawer.css';
 import './store/effects';

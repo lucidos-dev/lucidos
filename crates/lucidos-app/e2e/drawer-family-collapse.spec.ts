@@ -15,23 +15,6 @@ function seedParentChild(parentTitle: string, childTitle: string): { parentId: s
     return { parentId, childId };
 }
 
-/** Seed a 3-level chain (grandparent → parent → child) directly in
- *  `thread_summaries`. Renders two family-toggle headers (one under each
- *  ancestor) — the canonical fixture for depth-related geometry tests. */
-function seedGrandparentParentChild(): { grandparentId: string; parentId: string; childId: string } {
-    const grandparentId = randomUUID();
-    const parentId = randomUUID();
-    const childId = randomUUID();
-    const now = new Date().toISOString();
-    const stamp = Date.now();
-    psql([
-        seedThreadRow({ id: grandparentId, title: `grand-${stamp}`, totalChildren: 1, now }),
-        seedThreadRow({ id: parentId, title: `parent-${stamp}`, parentId: grandparentId, totalChildren: 1, now }),
-        seedThreadRow({ id: childId, title: `child-${stamp}`, parentId, now }),
-    ].join(';\n'));
-    return { grandparentId, parentId, childId };
-}
-
 test.describe('Drawer family collapse', () => {
     test.beforeEach(async ({ page, context }) => {
         await assertHealthy(page);
@@ -64,198 +47,90 @@ test.describe('Drawer family collapse', () => {
         await expect(parentRow.first()).toBeVisible();
         await expect(childRow.first()).toBeVisible();
 
-        // Family toggle row appears under the parent (one per family head).
-        // The toggle button carries aria-expanded so we can probe state.
-        const toggle = page.locator(`.family-toggle[aria-label*="sub-thread"]`).first();
+        // The disclosure control sits on the parent row (one per family head).
+        // The button carries aria-expanded so we can probe state.
+        const toggle = page.locator(`.family-disclosure[aria-label*="sub-thread"]`).first();
         await expect(toggle).toBeVisible();
         await expect(toggle).toHaveAttribute('aria-expanded', 'true');
 
-        // Click the toggle — child hides; parent stays.
+        // Expanded = chevron only: the ▾ glyph shows, the count badge is absent
+        // (children are inline, so the number would be redundant).
+        await expect(toggle.locator('.family-disclosure-glyph')).toBeVisible();
+        await expect(page.locator(`.family-disclosure .collapse-count-badge:visible`)).toHaveCount(0);
+
+        // Click the control — child hides; parent stays.
         await toggle.click();
         await expect(childRow.first()).toBeHidden();
         await expect(parentRow.first()).toBeVisible();
         await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+
+        // Collapsed = badge only: the count badge reports the one hidden
+        // sub-thread, and the chevron glyph is gone.
+        const badge = page.locator(`.family-disclosure .collapse-count-badge:visible`).first();
+        await expect(badge).toBeVisible();
+        await expect(badge).toHaveText('1');
+        await expect(toggle.locator('.family-disclosure-glyph')).toHaveCount(0);
 
         // Reload — collapsed state survives via localStorage.
         await page.reload();
         await openThreadDrawer(page);
         await expect(parentRow.first()).toBeVisible();
         await expect(childRow.first()).toBeHidden();
-        const toggleAfterReload = page.locator(`.family-toggle[aria-label*="sub-thread"]`).first();
+        const toggleAfterReload = page.locator(`.family-disclosure[aria-label*="sub-thread"]`).first();
         await expect(toggleAfterReload).toHaveAttribute('aria-expanded', 'false');
+        // Still badge-only after reload: badge present, chevron absent.
+        await expect(toggleAfterReload.locator('.collapse-count-badge')).toBeVisible();
+        await expect(toggleAfterReload.locator('.family-disclosure-glyph')).toHaveCount(0);
 
-        // Re-expand — child returns.
+        // Re-expand via the badge — child returns, badge disappears, chevron back.
         await toggleAfterReload.click();
         await expect(childRow.first()).toBeVisible();
         await expect(toggleAfterReload).toHaveAttribute('aria-expanded', 'true');
+        await expect(page.locator(`.family-disclosure .collapse-count-badge:visible`)).toHaveCount(0);
+        await expect(toggleAfterReload.locator('.family-disclosure-glyph')).toBeVisible();
     });
 
-    test('family-toggle row indents to match its children', async ({ page }) => {
-        // Header's wrap starts at the same x as the children's visible (clip-
-        // path) left edge below — the tinted band reads as the children's
-        // header, not the parent's. Anchored to the children themselves (via
-        // their rail-x ::before) so no rem-to-px hardcoding is needed.
-        // Seed 3 levels so both depth=1 and depth=2 toggles are present.
-        const { childId } = seedGrandparentParentChild();
+    test('long parent title pushes the disclosure badge clear of the title', async ({ page }) => {
+        // A multi-line title used to grow DOWN into the bottom-centered
+        // disclosure badge (absolutely positioned), so the count badge / chevron
+        // overlapped the title's last line. The fix reserves bottom room in the
+        // title column. Seed a deliberately long title so it wraps at every
+        // project width.
+        const longTitle = `Diagnosing Interrupted Response and Memory Issues Across Long Running Sessions ${Date.now()}`;
+        const childTitle = `child-${Date.now()}`;
+        const { parentId } = seedParentChild(longTitle, childTitle);
 
         await navigateToApp(page);
         await openThreadDrawer(page);
 
-        // Anchor on the deepest descendant — if depth=2 rendered, every
-        // ancestor + both family-toggle rows are guaranteed in the DOM too.
-        // `:visible` scopes to the active layout (desktop or mobile copy).
-        const childRow = page.locator(`.thread-row[data-thread-nav="${childId}"]:visible`).first();
-        await expect(childRow).toBeVisible();
+        const parentRow = page.locator(`.thread-row[data-thread-nav="${parentId}"]`).first();
+        await expect(parentRow).toBeVisible();
 
-        const wraps = page.locator(`.family-toggle-wrap:visible`);
-        await expect(wraps).toHaveCount(2);
+        // Collapse to the count badge — the taller of the two disclosure states
+        // and the one in the bug report.
+        const toggle = parentRow.locator('.family-disclosure');
+        await toggle.click();
+        await expect(parentRow.locator('.family-disclosure .collapse-count-badge')).toBeVisible();
 
-        // For each header, read its viewport-left and the absolute x of its
-        // OWN first child's rail (`::before` left on the row inside the next
-        // sibling wrap) — they must match. Walking via nextElementSibling
-        // pairs each header with the wrap it actually heads, regardless of
-        // DOM order between sections.
-        const readPair = (el: ReturnType<typeof page.locator>) =>
-            el.evaluate(node => {
-                const nextWrap = node.nextElementSibling as HTMLElement | null;
-                const firstChild = nextWrap?.querySelector<HTMLElement>('.thread-row');
-                if (!firstChild) throw new Error('header has no following child row');
-                const rowBefore = getComputedStyle(firstChild, '::before');
-                return {
-                    wrapLeft: node.getBoundingClientRect().left,
-                    childRailLeft: firstChild.getBoundingClientRect().left + parseFloat(rowBefore.left),
-                };
-            });
+        const titleBox = await parentRow.locator('.thread-row-title').boundingBox();
+        const badgeBox = await toggle.boundingBox();
+        expect(titleBox).not.toBeNull();
+        expect(badgeBox).not.toBeNull();
 
-        const [first, second] = await Promise.all([readPair(wraps.nth(0)), readPair(wraps.nth(1))]);
+        // The title actually wrapped (more than one line) — otherwise the test
+        // isn't exercising the overlap case.
+        expect(titleBox!.height).toBeGreaterThan(30);
 
-        // Tolerance 0 (0.5px) accommodates cross-viewport sub-pixel rounding
-        // — the bug we guard against is whole-step offsets (8–16px), not
-        // fractional pixel drift.
-        expect(first.wrapLeft).toBeCloseTo(first.childRailLeft, 0);
-        expect(second.wrapLeft).toBeCloseTo(second.childRailLeft, 0);
+        // No overlap: the two rectangles must not intersect.
+        const overlaps =
+            titleBox!.x < badgeBox!.x + badgeBox!.width &&
+            titleBox!.x + titleBox!.width > badgeBox!.x &&
+            titleBox!.y < badgeBox!.y + badgeBox!.height &&
+            titleBox!.y + titleBox!.height > badgeBox!.y;
+        expect(overlaps).toBe(false);
     });
 
-    test('family-toggle header has no vertical rail and the bottom divider matches the header width', async ({ page }) => {
-        // Two asserted properties of the family-toggle row's geometry:
-        //  1. The header has NO vertical rail on its left edge — the spine
-        //     starts at the first child row below, not on the header itself.
-        //  2. The horizontal divider below the header starts at the header's
-        //     own left edge (not full-width drawer-left).
-        const { parentId, childId } = seedGrandparentParentChild();
-
-        await navigateToApp(page);
-        await openThreadDrawer(page);
-
-        const childRow = page.locator(`.thread-row[data-thread-nav="${childId}"]:visible`).first();
-        const parentRow = page.locator(`.thread-row[data-thread-nav="${parentId}"]:visible`).first();
-        await expect(childRow).toBeVisible();
-
-        // Top-level header is the first .family-toggle-wrap (under grandparent
-        // at depth 0); nested header is the second (under parent at depth 1).
-        const headers = page.locator(`.family-toggle-wrap:visible`);
-        await expect(headers).toHaveCount(2);
-        const topHeader = headers.nth(0);
-        const nestedHeader = headers.nth(1);
-
-        // One CDP round-trip per header reads ::after's computed `content`
-        // and the wrap's viewport-left.
-        const readHeader = (el: ReturnType<typeof page.locator>) =>
-            el.evaluate(node => {
-                const after = getComputedStyle(node, '::after');
-                return {
-                    railContent: after.content,
-                    wrapLeft: node.getBoundingClientRect().left,
-                };
-            });
-        // One CDP round-trip per child row reads the divider above its wrap
-        // (::before on the wrap) — the wrap divider is what visually delimits
-        // the toggle header above.
-        const readChildWrap = (el: ReturnType<typeof page.locator>) =>
-            el.evaluate(node => {
-                const wrap = node.parentElement!;
-                const wrapBefore = getComputedStyle(wrap, '::before');
-                return {
-                    wrapLeft: wrap.getBoundingClientRect().left,
-                    dividerLeftPx: parseFloat(wrapBefore.left),
-                };
-            });
-
-        const [top, nested, parent, child] = await Promise.all([
-            readHeader(topHeader),
-            readHeader(nestedHeader),
-            readChildWrap(parentRow),
-            readChildWrap(childRow),
-        ]);
-
-        // (1) No rail on the header: assert on `content` (not width/left) so
-        // a stray `content: ''` declaration fails here even if width happens
-        // to be 0. `none` and `normal` both mean the pseudo did not render.
-        expect(['none', 'normal']).toContain(top.railContent);
-        expect(['none', 'normal']).toContain(nested.railContent);
-
-        // (2) Divider below header = header width: absolute divider start of
-        // the first child wrap equals the header wrap's left.
-        expect(parent.wrapLeft + parent.dividerLeftPx).toBeCloseTo(top.wrapLeft, 1);
-        expect(child.wrapLeft + child.dividerLeftPx).toBeCloseTo(nested.wrapLeft, 1);
-    });
-
-    test('shallower-nested row after deeper family draws its own top divider (no horizontal gap)', async ({ page }) => {
-        // Repro of the divider-gap bug: a depth-1 parent that itself has
-        // children, followed by a depth-1 sibling. With the previous
-        // "wrapper draws bottom divider at its own rail-x" model, the
-        // divider between the deeper (depth-2) last child and the depth-1
-        // sibling was inset to depth-2's rail-x, leaving a horizontal gap
-        // between depth-1's content edge and the divider. Each row owning
-        // the divider ABOVE itself, drawn at its own depth's rail-x, kills
-        // the gap.
-        const grandparentId = randomUUID();
-        const parent1Id = randomUUID();
-        const childId = randomUUID();
-        const parent2Id = randomUUID();
-        const now = new Date().toISOString();
-        const stamp = Date.now();
-        psql([
-            seedThreadRow({ id: grandparentId, title: `grand-${stamp}`, totalChildren: 2, now }),
-            seedThreadRow({ id: parent1Id, title: `p1-${stamp}`, parentId: grandparentId, totalChildren: 1, now }),
-            seedThreadRow({ id: childId, title: `child-${stamp}`, parentId: parent1Id, now }),
-            seedThreadRow({ id: parent2Id, title: `p2-${stamp}`, parentId: grandparentId, now }),
-        ].join(';\n'));
-
-        await navigateToApp(page);
-        await openThreadDrawer(page);
-
-        const parent2Row = page.locator(`.thread-row[data-thread-nav="${parent2Id}"]:visible`).first();
-        await expect(parent2Row).toBeVisible();
-
-        // parent2's wrapper owns the divider above itself via ::before. Read
-        // the pseudo's geometry and parent2's own padding-left to verify the
-        // divider doesn't begin past parent2's content edge.
-        const divider = await parent2Row.evaluate(rowEl => {
-            const wrap = rowEl.parentElement!;
-            const before = getComputedStyle(wrap, '::before');
-            return {
-                content: before.content,
-                heightPx: parseFloat(before.height),
-                topPx: parseFloat(before.top),
-                leftPx: parseFloat(before.left),
-                rowPaddingLeftPx: parseFloat(getComputedStyle(rowEl).paddingLeft),
-            };
-        });
-
-        // ::before exists and is 1px tall at the wrapper's top edge.
-        expect(divider.content).not.toBe('none');
-        expect(divider.content).not.toBe('normal');
-        expect(divider.heightPx).toBe(1);
-        expect(divider.topPx).toBe(0);
-        // Critical: the divider must start at or before parent2's content
-        // edge. Before the fix there was no ::before on parent2's wrapper at
-        // all — the previous (depth-2) wrapper's divider, inset to depth-2's
-        // rail-x, was the only line between the rows.
-        expect(divider.leftPx).toBeLessThanOrEqual(divider.rowPaddingLeftPx);
-    });
-
-    test('toggle-row click does not focus the parent thread; row-body click does', async ({ page }) => {
+    test('chevron click does not focus the parent thread; row-body click does', async ({ page }) => {
         const parentTitle = `body-parent-${Date.now()}`;
         const childTitle = `body-child-${Date.now()}`;
         const { parentId } = seedParentChild(parentTitle, childTitle);
@@ -266,10 +141,10 @@ test.describe('Drawer family collapse', () => {
         const parentRow = page.locator(`.thread-row[data-thread-nav="${parentId}"]`).first();
         await expect(parentRow).toBeVisible();
 
-        // Toggle-row click leaves focus alone — the parent doesn't gain the
-        // focused class because the toggle row is a sibling, not part of the
-        // parent's onClick.
-        const toggle = page.locator(`.family-toggle[aria-label*="sub-thread"]`).first();
+        // Chevron click leaves focus alone — the disclosure button lives inside
+        // the parent row but stopPropagation()s the click, so the row's own
+        // onClick (focusThread) never fires.
+        const toggle = page.locator(`.family-disclosure[aria-label*="sub-thread"]`).first();
         await toggle.click();
         await expect(parentRow).not.toHaveClass(/thread-row-focused/);
 

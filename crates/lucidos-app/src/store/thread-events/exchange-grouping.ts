@@ -10,10 +10,14 @@ import type { ThreadAggregate, ThreadState } from './thread-meta';
 // ---------------------------------------------------------------------------
 
 /** Compute exchanges for a thread, merging any pending user messages as
- *  synthetic MessageReceived events. Pure function — no signal dependencies. */
+ *  synthetic MessageReceived events. No signal dependencies. Memoized per
+ *  thread via `groupIntoExchangesCached` — a streaming token extends the
+ *  fold instead of re-sorting and re-walking the whole event history every
+ *  frame. The pending-message path bypasses the cache (it folds an augmented
+ *  COPY of the events map, so the cache never sees synthetic seqs). */
 export function computeExchanges(thread: ThreadState): Exchange[] {
   if (thread.pendingUserMessages.length === 0) {
-    return groupIntoExchanges(thread.events);
+    return groupIntoExchangesCached(thread.events);
   }
   // Merge pending messages as synthetic MessageReceived events so they act as
   // proper exchange boundaries. MAX_SAFE_INTEGER seqs sort them after all real events.
@@ -65,6 +69,7 @@ const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'ChangeApplyFailed',
   'UserQuestionAsked',
   'CodingAgentPermissionRequest',
+  'CommandPermissionRequested',
   'CredentialRequested',
   'McpConsentRequested',
   'ChildThreadCompleted',
@@ -147,12 +152,18 @@ function findAbsorbTarget(
  *  appear here — anything missing falls through to the `current` pointer in
  *  `groupIntoExchanges` and silently leaks into a follow-up MR's empty
  *  exchange when the loop's events arrive after the follow-up was emitted.
- *  That leak flipped `exchangeStatus` to 'aborted' for the follow-up via the
+ *  That leak flips `exchangeStatus` to 'aborted' for the follow-up via the
  *  `threadIdle && hasSteps && !isComplete` branch — observed on real thread
- *  9b5a05aa where a stray ContextAssembled landed in the empty MR exchange. */
+ *  9b5a05aa (a stray ContextAssembled) and again on ad178d6a where the current
+ *  `ContextCaptured` landed in the empty follow-up exchange, flashing 'Aborted'
+ *  before the follow-up's own events arrived and flipped it to 'Working'.
+ *  `ContextCaptured` is the live event; `ContextAssembled` /
+ *  `ContextTokensMeasured` are its retired predecessors, kept here so legacy
+ *  DB rows route the same way (the render switch still handles all three). */
 const REQUEST_ID_ROUTED_TYPES: ReadonlySet<string> = new Set([
   'ThoughtStreamed',
   'MemorySearched',
+  'ContextCaptured',
   'ContextAssembled',
   'ContextTokensMeasured',
   'ToolCalled',
@@ -162,12 +173,28 @@ const REQUEST_ID_ROUTED_TYPES: ReadonlySet<string> = new Set([
   'ResponseCanceled',
   'ResponseAborted',
   'ResponseFailed',
+  // Command-guard checkpoint (ADR 0002, Phase 4). Both carry the turn's
+  // request_event_id — the checkpoint is emitted mid-turn; the revert is
+  // emitted later (at undo time) but is stamped with the ORIGINAL turn's
+  // request_event_id, so routing by it lands the revert back in the
+  // checkpoint's exchange (the card then renders reverted, live and on reload).
+  // Without this it would leak into the latest exchange via the `current`
+  // pointer and the card would never flip.
+  'CommandCheckpointed',
+  'CommandCheckpointReverted',
 ]);
 
-/** Skip req_id routing for Response* terminals when their channel is CC: the
- *  session's persistent meta carries the original MR's req_id for the entire
- *  session, so routing back by id would push a mid-flight cancel/abort to the
- *  original exchange instead of terminating the active follow-up. */
+/** Skip req_id routing for Response* terminals AND context snapshots when their
+ *  channel is CC: the session's persistent meta carries the original MR's
+ *  req_id for the entire session. Routing Response* back by id would push a
+ *  mid-flight cancel/abort to the original exchange instead of terminating the
+ *  active follow-up. Routing context snapshots (ContextCaptured and its retired
+ *  predecessors) back by id pulls a post-apply continuation's snapshots out
+ *  from between the change banners and up to the first message — the same
+ *  reason CodingAgent* events are excluded from the routed set entirely (real
+ *  thread 76b4ee76: a CC session applied a change, kept working under the same
+ *  req_id, and its second turn vanished from the timeline). Keep them
+ *  chronological (folded into `current`) on CC threads. */
 function shouldRouteByRequestId(event: StoredEvent): boolean {
   if (!REQUEST_ID_ROUTED_TYPES.has(event.type)) return false;
   switch (event.type) {
@@ -175,7 +202,12 @@ function shouldRouteByRequestId(event: StoredEvent): boolean {
     case 'ResponseCanceled':
     case 'ResponseAborted':
     case 'ResponseFailed':
-      return event.channel !== 'claude_code';
+    case 'ContextCaptured':
+    case 'ContextAssembled':
+    case 'ContextTokensMeasured':
+      // The context-snapshot variants don't declare `channel` in their TS type
+      // (the wire payload carries it via EventMeta), so read it through a cast.
+      return (event as { channel?: string }).channel !== 'claude_code';
     default:
       return true;
   }
@@ -206,18 +238,16 @@ function findExchangeByAnchorId(exchanges: Exchange[], anchorId: string): Exchan
 
 /** Sort events chronologically by `created` timestamp, falling back to seq for events
  *  missing timestamps. The fallback exists because the global BIGSERIAL sequence is
- *  not guaranteed to match wall-clock order across concurrent writes. */
+ *  not guaranteed to match wall-clock order across concurrent writes.
+ *  Delegates to `compareSortKeys` — the incremental cache's append-only check
+ *  must agree with this ordering, so there is exactly one comparator. */
 export function sortEventsChronologically(
   events: Map<number, StoredEvent>,
 ): SequencedEvent[] {
   return [...events.entries()]
-    .sort(([aSeq, aEvt], [bSeq, bEvt]) => {
-      if (aEvt.created && bEvt.created) {
-        const cmp = aEvt.created.localeCompare(bEvt.created);
-        if (cmp !== 0) return cmp;
-      }
-      return aSeq - bSeq;
-    })
+    .sort(([aSeq, aEvt], [bSeq, bEvt]) =>
+      compareSortKeys(aEvt.created, aSeq, bEvt.created ?? null, bSeq),
+    )
     .map(([seq, event]) => ({ seq, event }));
 }
 
@@ -248,21 +278,244 @@ const QUESTION_OVERTAKEN_STEP_TYPES: ReadonlySet<string> = new Set([
 
 function markOvertakenQuestionDividers(exchanges: Exchange[]): void {
   for (const exchange of exchanges) {
-    if (exchange.userEvent.type !== 'UserQuestionAsked') continue;
-    const toolUseId = exchange.userEvent.tool_use_id;
-    if (findQuestionAnswer(exchange, toolUseId)) {
-      exchange.questionOvertaken = false;
-      continue;
-    }
-    exchange.questionOvertaken = exchange.steps.some(s =>
-      QUESTION_OVERTAKEN_STEP_TYPES.has(s.event.type),
-    );
+    markOvertakenForExchange(exchange);
   }
 }
 
-export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[] {
-  const sorted = sortEventsChronologically(events);
+/** Per-exchange half of `markOvertakenQuestionDividers`. The flag depends
+ *  only on the exchange's OWN steps, so the incremental path re-runs this on
+ *  exactly the exchanges an appended event touched — full-pass equivalent
+ *  without walking every exchange per frame. */
+function markOvertakenForExchange(exchange: Exchange): void {
+  if (exchange.userEvent.type !== 'UserQuestionAsked') return;
+  const toolUseId = exchange.userEvent.tool_use_id;
+  if (findQuestionAnswer(exchange, toolUseId)) {
+    exchange.questionOvertaken = false;
+    return;
+  }
+  exchange.questionOvertaken = exchange.steps.some(s =>
+    QUESTION_OVERTAKEN_STEP_TYPES.has(s.event.type),
+  );
+}
 
+/** Resumable fold state behind `groupIntoExchanges` / the incremental cache.
+ *  Everything the per-event walk reads or writes lives here so the fold can
+ *  stop after any event and continue later with appended events — the basis
+ *  of the per-thread memoization in `computeExchanges` that keeps a
+ *  streaming token from re-sorting and re-walking the whole history every
+ *  frame. */
+interface GroupFoldState {
+  exchanges: Exchange[];
+  current: Exchange | null;
+  // tool_use_id → exchange that owns the matching CodingAgentToolCalled step.
+  // Populated as calls are appended (always via the default `current.steps.push`
+  // branch — CodingAgent* events aren't absorbed or request-id routed) and
+  // queried when a CodingAgentToolResult lands so we can re-route it to the
+  // call's exchange even if a permission request boundary intervened.
+  toolCallOwners: Map<string, Exchange>;
+  // Chat ToolCalled.event_id → owner exchange. The chat agentic loop stamps
+  // `tool_called_event_id` on every live `ToolResult` (and the post-restart
+  // recovery sweep does the same on synthetic backfills), so this map is the
+  // primary routing path for chat ToolResults. Required because an
+  // `ask_user_question` call is followed by a `UserQuestionAsked` divider
+  // exchange: the request-id redirect moves to the divider, and the live
+  // post-answer `ToolResult` (sharing the originating MR's req_id) would
+  // otherwise follow the redirect into the divider — leaving the original
+  // call's "Executing …" spinner pending forever. Legacy DB rows without the
+  // field fall through to the request-id / `current` routing.
+  chatToolCallOwners: Map<string, Exchange>;
+  // tool_use_id → the UserQuestionAsked divider exchange that owns it, and
+  // request_id → the CodingAgentPermissionRequest divider. A UserQuestionAnswered
+  // / CodingAgentPermissionResolved is neither request-id routed nor an exchange
+  // boundary, so by default it follows the `current` pointer. When a boundary
+  // (e.g. ChildThreadCompleted from a spawned CC sub-thread finishing while the
+  // question was on screen) lands between the divider and its answer, `current`
+  // is that boundary — the answer strands there and the divider stays stuck on
+  // 'awaiting-answer' forever (real thread 3e54cacb). Route the resolution back
+  // to its divider by id, mirroring the CodingAgentToolResult re-routing.
+  questionDividerOwners: Map<string, Exchange>;
+  permissionDividerOwners: Map<string, Exchange>;
+  // request_event_id → redirect target exchange. Set when a UPI is absorbed
+  // mid-flight: the loop emits the UPI when it actually ingests the queued
+  // follow-up, so every event after that point is part of the answer to the
+  // absorbed prompt — not the original request. Without redirecting, the
+  // post-injection tools and the final ResponseGenerated all stay in the
+  // original exchange and the follow-up panel renders as an empty stub.
+  reqIdRedirect: Map<string, Exchange>;
+  /** request_event_ids of every ResponseGenerated / ResponseFailed folded so
+   *  far. The incremental path uses it to classify a late-arriving abort as
+   *  legacy-superseded (terminal-before-abort direction). */
+  resolvedReqIds: Set<string>;
+  /** request_event_ids of every ResponseAborted folded so far. A terminal
+   *  arriving later with a matching id retro-classifies that abort
+   *  (abort-before-terminal direction) — the incremental path detects it and
+   *  falls back to a full rebuild. */
+  abortReqIds: Set<string>;
+}
+
+function newFoldState(): GroupFoldState {
+  return {
+    exchanges: [],
+    current: null,
+    toolCallOwners: new Map(),
+    chatToolCallOwners: new Map(),
+    questionDividerOwners: new Map(),
+    permissionDividerOwners: new Map(),
+    reqIdRedirect: new Map(),
+    resolvedReqIds: new Set(),
+    abortReqIds: new Set(),
+  };
+}
+
+export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[] {
+  return foldSorted(sortEventsChronologically(events)).exchanges;
+}
+
+/** Incremental memo entry for one thread's events map. Valid only while the
+ *  events arrive append-only in sort order — the validation pass in
+ *  `groupIntoExchangesCached` falls back to a full rebuild the moment that
+ *  contract breaks. Keyed by the Map OBJECT in a WeakMap: handleEvent never
+ *  re-sets an existing seq, and the wholesale-rebuild paths
+ *  (`rebuildCorruptedThreadEvents`) replace the Map, which naturally misses
+ *  here and discards the stale entry. */
+interface IncrementalCache {
+  fold: GroupFoldState;
+  /** Entries folded so far. New events are exactly the iteration-order
+   *  suffix past this count (Map preserves insertion order). */
+  processedCount: number;
+  /** Sort key (created, seq) of the last folded event — appended events must
+   *  not sort before it. */
+  lastCreated: string | null;
+  lastSeq: number;
+  /** Flipped false when an event lacks `created` (legacy rows): the sort
+   *  comparator is no longer a total order we can do append-checks against,
+   *  so this map full-computes on every call — exactly the pre-cache
+   *  behavior. */
+  cacheable: boolean;
+}
+
+const incrementalCache = new WeakMap<Map<number, StoredEvent>, IncrementalCache>();
+
+/** The sort comparator of `sortEventsChronologically`, as a key compare:
+ *  created (when both present) with seq as tiebreak, else seq. */
+function compareSortKeys(
+  aCreated: string | undefined,
+  aSeq: number,
+  bCreated: string | null,
+  bSeq: number,
+): number {
+  if (aCreated && bCreated) {
+    const cmp = aCreated.localeCompare(bCreated);
+    if (cmp !== 0) return cmp;
+  }
+  return aSeq - bSeq;
+}
+
+/** Full rebuild: run the one-shot fold and store its state for continuation. */
+function rebuildIncrementalCache(events: Map<number, StoredEvent>): Exchange[] {
+  const sorted = sortEventsChronologically(events);
+  let cacheable = true;
+  for (const { event } of sorted) {
+    if (!event.created) {
+      cacheable = false;
+      break;
+    }
+  }
+  const fold = foldSorted(sorted);
+  const last = sorted.length > 0 ? sorted[sorted.length - 1] : null;
+  incrementalCache.set(events, {
+    fold,
+    processedCount: events.size,
+    lastCreated: last?.event.created ?? null,
+    lastSeq: last?.seq ?? Number.MIN_SAFE_INTEGER,
+    cacheable,
+  });
+  return [...fold.exchanges];
+}
+
+/** Memoized `groupIntoExchanges`. Result is always deep-equal to the
+ *  from-scratch pass (pinned by incremental-grouping.test.ts); the returned
+ *  array is a fresh copy each call (so signal subscribers fire on identity)
+ *  while the Exchange objects inside stay identity-stable across appends
+ *  (so per-exchange memoization holds). */
+function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] {
+  const cache = incrementalCache.get(events);
+  if (!cache) return rebuildIncrementalCache(events);
+  if (!cache.cacheable) return groupIntoExchanges(events);
+  if (events.size === cache.processedCount) return [...cache.fold.exchanges];
+  if (events.size < cache.processedCount) return rebuildIncrementalCache(events);
+
+  // New events are the insertion-order suffix. Sort the batch with the full
+  // comparator so two events arriving in one frame fold in sorted order.
+  const appended: SequencedEvent[] = [];
+  let i = 0;
+  for (const [seq, event] of events) {
+    if (i++ < cache.processedCount) continue;
+    appended.push({ seq, event });
+  }
+  appended.sort((a, b) => compareSortKeys(a.event.created, a.seq, b.event.created ?? null, b.seq));
+
+  // Validation pass — every appended event must keep the fold resumable.
+  // `batchAbortReqIds` covers the abort-then-terminal pair arriving INSIDE
+  // one batch: the abort isn't in `cache.fold.abortReqIds` yet (that set is
+  // only fed by foldEvent), so checking the cache set alone would miss the
+  // retro-classification and fold the abort as a real boundary where the
+  // from-scratch pass marks it superseded.
+  let prevCreated = cache.lastCreated;
+  let prevSeq = cache.lastSeq;
+  const batchAbortReqIds = new Set<string>();
+  for (const { seq, event } of appended) {
+    if (!event.created) {
+      // Legacy row without a timestamp — give up on caching this map.
+      cache.cacheable = false;
+      return groupIntoExchanges(events);
+    }
+    if (compareSortKeys(event.created, seq, prevCreated, prevSeq) < 0) {
+      // Out-of-order arrival (e.g. a refresh replay delivering a missed
+      // event): its sorted position is in the middle, not the end.
+      return rebuildIncrementalCache(events);
+    }
+    const reqId = requestEventIdOf(event);
+    if (event.type === 'ResponseAborted' && reqId) {
+      batchAbortReqIds.add(reqId);
+    }
+    if (
+      (event.type === 'ResponseGenerated' || event.type === 'ResponseFailed') &&
+      reqId &&
+      (cache.fold.abortReqIds.has(reqId) || batchAbortReqIds.has(reqId))
+    ) {
+      // Legacy rerun-in-place: this terminal retro-classifies an
+      // already-folded (or same-batch) ResponseAborted as a superseded step.
+      return rebuildIncrementalCache(events);
+    }
+    prevCreated = event.created;
+    prevSeq = seq;
+  }
+
+  const touched = new Set<Exchange>();
+  for (const { seq, event } of appended) {
+    const reqId = requestEventIdOf(event);
+    const superseded =
+      event.type === 'ResponseAborted' && !!reqId && cache.fold.resolvedReqIds.has(reqId);
+    foldEvent(cache.fold, seq, event, superseded, touched);
+  }
+  for (const exchange of touched) {
+    markOvertakenForExchange(exchange);
+    // In-place mutation is invisible to identity-based memo comparison —
+    // bump the captured-at-render revision so memoized components re-render.
+    exchange.revision = (exchange.revision ?? 0) + 1;
+  }
+  cache.processedCount = events.size;
+  cache.lastCreated = prevCreated;
+  cache.lastSeq = prevSeq;
+  return [...cache.fold.exchanges];
+}
+
+/** One-shot fold over an already-sorted event list. Runs the legacy
+ *  rerun-in-place pre-pass, folds every event, and applies the
+ *  question-divider marking — the from-scratch path `groupIntoExchanges` and
+ *  the cache rebuild both go through here. */
+function foldSorted(sorted: SequencedEvent[]): GroupFoldState {
   // Legacy rerun-in-place: when a ResponseAborted shares request_event_id
   // with a later ResponseGenerated/ResponseFailed in the same thread, the
   // rerun re-used the original exchange (pre-Phase-5.3 behavior). Don't split
@@ -284,53 +537,43 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
     if (reqId && resolvedReqIds.has(reqId)) legacySupersededAbortSeqs.add(seq);
   }
 
-  const exchanges: Exchange[] = [];
-  let current: Exchange | null = null;
-  // tool_use_id → exchange that owns the matching CodingAgentToolCalled step.
-  // Populated as calls are appended (always via the default `current.steps.push`
-  // branch — CodingAgent* events aren't absorbed or request-id routed) and
-  // queried when a CodingAgentToolResult lands so we can re-route it to the
-  // call's exchange even if a permission request boundary intervened.
-  const toolCallOwners = new Map<string, Exchange>();
-  // Chat ToolCalled.event_id → owner exchange. The chat agentic loop stamps
-  // `tool_called_event_id` on every live `ToolResult` (and the post-restart
-  // recovery sweep does the same on synthetic backfills), so this map is the
-  // primary routing path for chat ToolResults. Required because an
-  // `ask_user_question` call is followed by a `UserQuestionAsked` divider
-  // exchange: the request-id redirect moves to the divider, and the live
-  // post-answer `ToolResult` (sharing the originating MR's req_id) would
-  // otherwise follow the redirect into the divider — leaving the original
-  // call's "Executing …" spinner pending forever. Legacy DB rows without the
-  // field fall through to the request-id / `current` routing below.
-  const chatToolCallOwners = new Map<string, Exchange>();
-  // tool_use_id → the UserQuestionAsked divider exchange that owns it, and
-  // request_id → the CodingAgentPermissionRequest divider. A UserQuestionAnswered
-  // / CodingAgentPermissionResolved is neither request-id routed nor an exchange
-  // boundary, so by default it follows the `current` pointer. When a boundary
-  // (e.g. ChildThreadCompleted from a spawned CC sub-thread finishing while the
-  // question was on screen) lands between the divider and its answer, `current`
-  // is that boundary — the answer strands there and the divider stays stuck on
-  // 'awaiting-answer' forever (real thread 3e54cacb). Route the resolution back
-  // to its divider by id, mirroring the CodingAgentToolResult re-routing below.
-  const questionDividerOwners = new Map<string, Exchange>();
-  const permissionDividerOwners = new Map<string, Exchange>();
-  // request_event_id → redirect target exchange. Set when a UPI is absorbed
-  // mid-flight: the loop emits the UPI when it actually ingests the queued
-  // follow-up, so every event after that point is part of the answer to the
-  // absorbed prompt — not the original request. Without redirecting, the
-  // post-injection tools and the final ResponseGenerated all stay in the
-  // original exchange and the follow-up panel renders as an empty stub.
-  const reqIdRedirect = new Map<string, Exchange>();
-
+  const state = newFoldState();
   for (const { seq, event } of sorted) {
-    if (THREAD_LEVEL_METADATA_EVENTS.has(event.type)) continue;
+    foldEvent(state, seq, event, legacySupersededAbortSeqs.has(seq), null);
+  }
+  markOvertakenQuestionDividers(state.exchanges);
+  return state;
+}
 
-    // Legacy rerun-in-place aborts stay in the originating exchange as a
-    // step so supersededAbortIndices in exchangeStatus can deflate the
-    // verdict and the rerun's TextStreamed/ResponseGenerated render in
-    // the same response panel — never split, never start a fresh boundary.
-    const isLegacySupersededAbort =
-      event.type === 'ResponseAborted' && legacySupersededAbortSeqs.has(seq);
+/** Fold one event into the state. `isLegacySupersededAbort` is decided by
+ *  the caller (the one-shot path precomputes it positionally-blind over the
+ *  whole array; the incremental path derives the terminal-before-abort
+ *  direction from `resolvedReqIds`-so-far and full-rebuilds on the other
+ *  direction). `touched` collects every exchange this event mutated or
+ *  created so the incremental path can re-run the question-divider marking
+ *  on exactly those. */
+function foldEvent(
+  state: GroupFoldState,
+  seq: number,
+  event: StoredEvent,
+  isLegacySupersededAbort: boolean,
+  touched: Set<Exchange> | null,
+): void {
+  const { exchanges, toolCallOwners, chatToolCallOwners, questionDividerOwners, permissionDividerOwners, reqIdRedirect } = state;
+  let current = state.current;
+  {
+    const reqId = requestEventIdOf(event);
+    if ((event.type === 'ResponseGenerated' || event.type === 'ResponseFailed') && reqId) {
+      state.resolvedReqIds.add(reqId);
+    }
+    if (event.type === 'ResponseAborted' && reqId) {
+      state.abortReqIds.add(reqId);
+    }
+  }
+  // The walk body runs as a closure so its many early exits all funnel
+  // through the single `state.current = current` sync below.
+  const step = (): void => {
+    if (THREAD_LEVEL_METADATA_EVENTS.has(event.type)) return;
 
     const reqId = shouldRouteByRequestId(event) ? requestEventIdOf(event) : undefined;
     const owner = reqId
@@ -346,15 +589,17 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
       const target = owner ?? current;
       if (target && target.userEvent.type !== 'ResponseAborted') {
         target.steps.push({ seq, event });
+        touched?.add(target);
         current = { userEvent: event, userSeq: seq, steps: [] };
         exchanges.push(current);
-        continue;
+        touched?.add(current);
+        return;
       }
     }
     // ResponseCanceled mirrors the abort dual-purpose pattern: keep the
     // cancel as a step on the originating exchange (so its response panel
     // reads 'Canceled ✕') AND open a new boundary exchange so a separate
-    // 'You — Canceled the response' panel renders below the truncated reply.
+    // 'Response canceled' panel renders below the truncated reply.
     // Skip the boundary only when the question card already carries the
     // cancel attribution via its Cancel-as-picked button — i.e. the question
     // resolved as Canceled. Any non-Canceled resolution leaves the picked
@@ -363,15 +608,17 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
       const target = owner ?? current;
       if (target && target.userEvent.type !== 'ResponseCanceled') {
         target.steps.push({ seq, event });
+        touched?.add(target);
         if (target.userEvent.type === 'UserQuestionAsked') {
           const answered = findQuestionAnswer(target, target.userEvent.tool_use_id);
           if (answered?.answer.kind === 'Canceled') {
-            continue;
+            return;
           }
         }
         current = { userEvent: event, userSeq: seq, steps: [] };
         exchanges.push(current);
-        continue;
+        touched?.add(current);
+        return;
       }
     }
     // Re-route ToolResult by tool_use_id when a permission boundary stranded
@@ -381,7 +628,8 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
       const callOwner = id ? toolCallOwners.get(id) : undefined;
       if (callOwner && callOwner !== current) {
         callOwner.steps.push({ seq, event });
-        continue;
+        touched?.add(callOwner);
+        return;
       }
     }
     // Chat ToolResult routing. The chat agentic loop stamps
@@ -403,7 +651,8 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
       const callOwner = tcId ? chatToolCallOwners.get(tcId) : undefined;
       if (callOwner) {
         callOwner.steps.push({ seq, event });
-        continue;
+        touched?.add(callOwner);
+        return;
       }
     }
     // Route a question answer / permission resolution back to its divider by
@@ -415,14 +664,16 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
       const dividerOwner = questionDividerOwners.get(event.tool_use_id);
       if (dividerOwner) {
         dividerOwner.steps.push({ seq, event });
-        continue;
+        touched?.add(dividerOwner);
+        return;
       }
     }
-    if (event.type === 'CodingAgentPermissionResolved') {
+    if (event.type === 'CodingAgentPermissionResolved' || event.type === 'CommandPermissionResolved') {
       const dividerOwner = permissionDividerOwners.get(event.request_id);
       if (dividerOwner) {
         dividerOwner.steps.push({ seq, event });
-        continue;
+        touched?.add(dividerOwner);
+        return;
       }
     }
     const absorbTarget = findAbsorbTarget(current, exchanges, event);
@@ -442,6 +693,7 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
         exchanges.push(absorbTarget);
       }
       absorbTarget.steps.push({ seq, event });
+      touched?.add(absorbTarget);
       current = absorbTarget;
       if (event.type === 'UserPromptInjected') {
         const absorbedReqId = requestEventIdOf(event);
@@ -451,23 +703,36 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
       const previousCurrent = current;
       current = { userEvent: event, userSeq: seq, steps: [] };
       exchanges.push(current);
+      touched?.add(current);
       // Register divider exchanges so their resolution can route back here by
       // id even if a boundary intervenes before the answer lands.
       if (event.type === 'UserQuestionAsked' && event.tool_use_id) {
         questionDividerOwners.set(event.tool_use_id, current);
-      } else if (event.type === 'CodingAgentPermissionRequest' && event.request_id) {
+      } else if (
+        (event.type === 'CodingAgentPermissionRequest'
+          || event.type === 'CommandPermissionRequested')
+        && event.request_id
+      ) {
         permissionDividerOwners.set(event.request_id, current);
       }
-      // Chat agent's `ask_user_question` runs in-process inside the agentic
-      // loop: every event in the turn carries the originating MR's req_id.
-      // Without a redirect here, post-answer TextStreamed / ResponseGenerated
-      // / ToolResult / ThoughtStreamed route back to the MR exchange via
-      // shouldRouteByRequestId and the agent's reply text renders ABOVE the
-      // question card instead of below it. Move any existing redirect that
-      // targets the previous current to the new exchange; bootstrap from the
-      // previous current's anchor _eventId (the turn's req_id for an MR) when
-      // no redirect existed yet — the first interruption of this turn.
-      if (event.type === 'UserQuestionAsked' && previousCurrent) {
+      // Chat agent's `ask_user_question` AND the chat command guard's
+      // `IrreversibleDanger` permission prompt both run in-process inside the
+      // agentic loop: every event in the turn carries the originating MR's
+      // req_id, and the turn RESUMES (more thinking + the reply) after the
+      // user answers / grants. Without a redirect here, those post-resolution
+      // TextStreamed / ResponseGenerated / ToolResult / ThoughtStreamed route
+      // back to the MR exchange via shouldRouteByRequestId and the agent's
+      // reply renders ABOVE the question / permission card instead of below it
+      // (the gated tool call + its result still re-route to the MR exchange by
+      // tool_called_event_id, so the "Running …" step stays merged above the
+      // card — only the genuine continuation moves below). Move any existing
+      // redirect that targets the previous current to the new exchange;
+      // bootstrap from the previous current's anchor _eventId (the turn's
+      // req_id for an MR) when no redirect existed yet — the first interruption
+      // of this turn. CC's `CodingAgentPermissionRequest` is deliberately
+      // excluded: CC events are never request-id routed, so it needs no redirect
+      // (its resolution + resumption route by `current` / tool_use_id instead).
+      if ((event.type === 'UserQuestionAsked' || event.type === 'CommandPermissionRequested') && previousCurrent) {
         let updatedExisting = false;
         for (const [reqId, exchange] of reqIdRedirect.entries()) {
           if (exchange === previousCurrent) {
@@ -486,11 +751,12 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
       // user message — skip creating a duplicate exchange if one already exists.
       if (current && current.userEvent.type === 'MessageReceived' && current.steps.length === 0) {
         // MessageReceived already started this exchange — skip the duplicate
-        continue;
+        return;
       }
       const text = (event as { text: string }).text;
       current = { userEvent: { type: 'MessageReceived', text } as StoredEvent, userSeq: seq, steps: [] };
       exchanges.push(current);
+      touched?.add(current);
     } else if (event.type === 'CodingAgentPromptSent' && !current) {
       // Legacy engine-spawned CC threads (merge-conflict, hardening) created
       // before MergeConflictDetected/MissingHardeningDetected boundary events
@@ -502,13 +768,16 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
       // to the step branch below.
       current = { userEvent: event, userSeq: seq, steps: [] };
       exchanges.push(current);
+      touched?.add(current);
     } else if (owner) {
       owner.steps.push({ seq, event });
+      touched?.add(owner);
       if (event.type === 'ToolCalled' && event._eventId) {
         chatToolCallOwners.set(event._eventId, owner);
       }
     } else if (current) {
       current.steps.push({ seq, event });
+      touched?.add(current);
       if (event.type === 'CodingAgentToolCalled') {
         const id = toolUseIdOf(event);
         if (id) toolCallOwners.set(id, current);
@@ -517,9 +786,9 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
         chatToolCallOwners.set(event._eventId, current);
       }
     }
-  }
-  markOvertakenQuestionDividers(exchanges);
-  return exchanges;
+  };
+  step();
+  state.current = current;
 }
 
 export interface HandleEventResult {
@@ -569,6 +838,15 @@ export function handleEvent(
       console.warn(`[handleEvent] persisted event ${event.type} (seq=${seq}) missing created timestamp — this indicates a backend bug`);
     }
     const stored: StoredEvent = { ...(event as ThreadEvent), created, ...(eventId ? { _eventId: eventId } : {}) };
+    // CONTRACT: `thread.events` is append-only with deduped seqs — the
+    // `has(seq)` guard above is load-bearing. The incremental grouping
+    // cache (`groupIntoExchangesCached`) keys its memo on this Map object
+    // and detects new work by size + insertion-order suffix; an in-place
+    // re-set of an existing seq, a delete(), or a clear() would serve
+    // STALE exchanges with no failure signal. To rewrite a thread's
+    // events wholesale, replace the Map object instead (see
+    // `rebuildCorruptedThreadEvents`) — a new Map misses the WeakMap and
+    // triggers a clean rebuild.
     thread.events.set(seq, stored);
     thread.streamingBuffer = '';
     // Update updatedAt only for events that the backend updates last_activity for.

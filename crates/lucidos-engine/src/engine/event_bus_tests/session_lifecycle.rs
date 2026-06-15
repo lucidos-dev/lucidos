@@ -49,6 +49,7 @@ async fn test_session_started_updates_source_in_projection() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: String::new(),
             repo_id: None,
@@ -75,6 +76,90 @@ async fn test_session_started_updates_source_in_projection() {
         source.as_deref(),
         Some("claude_code"),
         "source should be updated to claude_code after SessionStarted"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// `last_user_action` and `last_agent_action` are attributed independently: a
+/// user-typed message bumps ONLY the user column; agent streaming bumps ONLY the
+/// agent column. The unchanged-column equality checks are the load-bearing ones —
+/// they prove the drawer's sort key (last_user_action) does not move on agent
+/// churn, which is the whole point of the split.
+#[tokio::test]
+async fn test_last_user_and_agent_action_attributed_separately() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+
+    let fetch = |pool: PgPool| async move {
+        sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+            "SELECT last_user_action, last_agent_action FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+
+    let human_message = || BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "do the thing".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    };
+
+    // 1. User message creates the row — both columns seed to ~now.
+    bus.emit(human_message()).await.unwrap();
+    let (u1, _a1) = fetch(pool.clone()).await;
+
+    // 2. Agent streams text — bumps last_agent_action ONLY.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::TextStreamed {
+            text: "working...".into(),
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    let (u2, a2) = fetch(pool.clone()).await;
+    assert_eq!(
+        u2, u1,
+        "agent streaming must NOT bump last_user_action (the drawer sort key)"
+    );
+
+    // 3. User follow-up — bumps last_user_action ONLY.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    bus.emit(human_message()).await.unwrap();
+    let (u3, a3) = fetch(pool.clone()).await;
+    assert!(
+        u3 > u2,
+        "a human follow-up must bump last_user_action (u3={u3} u2={u2})"
+    );
+    assert_eq!(
+        a3, a2,
+        "a user action must NOT bump last_agent_action"
     );
 
     pool.close().await;
@@ -127,6 +212,7 @@ async fn test_session_started_does_not_update_last_activity() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: String::new(),
             repo_id: None,
@@ -275,6 +361,7 @@ async fn test_session_ended_stale_resume_keeps_status_running() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "stale-sid".into(),
             branch: "claude-code/stale".into(),
             repo_id: None,
@@ -370,6 +457,7 @@ async fn test_permission_request_transitions_status_to_waiting_for_user_answer()
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sess-1".into(),
             branch: "claude-code/branch".into(),
             repo_id: None,
@@ -488,6 +576,7 @@ async fn test_session_started_stores_repo_id() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "s1".into(),
             branch: "claude-code/test".into(),
             repo_id: Some(repo_uuid.into()),
@@ -520,6 +609,7 @@ async fn test_session_started_stores_repo_id() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "s2".into(),
             branch: "claude-code/followup".into(),
             repo_id: None,
@@ -629,6 +719,74 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
     );
     assert_eq!(callbacks[0].parent_thread_id, parent_id);
     assert_eq!(callbacks[0].child_thread_id, child_id);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn session_started_locks_coding_agent_backend_in_projection() {
+    // First SessionStarted stamps `thread_summaries.coding_agent`; any later
+    // SessionStarted (resume, replay, drift) must NOT flip it — the other
+    // backend has no session to resume, so a flip silently loses context.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let session_started = |agent: crate::runtime::CodingAgent| ThreadEvent::SessionStarted {
+        coding_agent: agent,
+        session_id: "s".into(),
+        branch: String::new(),
+        repo_id: None,
+        coding_agent_kind: Default::default(),
+        coding_agent_folder: String::new(),
+        app_id: None,
+    };
+    let meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: session_started(crate::runtime::CodingAgent::Codex),
+        meta: meta.clone(),
+    })
+    .await
+    .unwrap();
+
+    let agent: Option<String> =
+        sqlx::query_scalar("SELECT coding_agent FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        agent.as_deref(),
+        Some("codex"),
+        "first SessionStarted must stamp the backend"
+    );
+
+    // A later SessionStarted claiming ClaudeCode must not overwrite.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: session_started(crate::runtime::CodingAgent::ClaudeCode),
+        meta,
+    })
+    .await
+    .unwrap();
+
+    let agent: Option<String> =
+        sqlx::query_scalar("SELECT coding_agent FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        agent.as_deref(),
+        Some("codex"),
+        "backend is locked at first SessionStarted (COALESCE keeps existing)"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;

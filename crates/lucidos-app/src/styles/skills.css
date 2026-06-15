@@ -1,9 +1,35 @@
 /* ===== Triggers ===== */
 
-.trigger-row .list-row-name {
+.trigger-row .list-row-name,
+.app-row .list-row-name {
     white-space: normal;
     overflow-wrap: break-word;
     word-break: break-word;
+}
+
+/* App and trigger rows can grow tall (description, cron/event lists); the row
+ * top-aligns its children, so pin the action buttons to the bottom edge. */
+.app-row .list-row-actions,
+.trigger-row .list-row-actions {
+    align-self: flex-end;
+}
+
+/* Change rows carry up to four actions (Thread, Diff, Discard, Apply) — too
+ * wide to sit beside the description without squeezing it into a narrow,
+ * heavily-wrapped column. Stack like apps/triggers do on mobile: the
+ * description (and details/label) span the full row width, with the actions
+ * on their own bottom-right row below. */
+.change-row {
+    flex-direction: column;
+    align-items: flex-start;
+}
+
+.change-row .list-row-info {
+    width: 100%;
+}
+
+.change-row .list-row-actions {
+    align-self: flex-end;
 }
 
 .trigger-disabled > .list-row-info {
@@ -113,7 +139,6 @@
        per-section actions. Give it a quieter background so it visually
        reads as a separator rather than a real group. */
     background: transparent;
-    border-top: 1px solid var(--border-color);
     border-radius: 0;
     padding-left: 0.25rem;
     margin-top: 0.75rem;
@@ -372,7 +397,6 @@
     flex-direction: column;
     gap: 0.125rem;
     padding-top: 0.25rem;
-    border-top: 1px solid var(--border-color);
     margin-top: 0.25rem;
 }
 

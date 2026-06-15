@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::cc_permission::{CcPermissionEntry, DENIAL_REASON};
+use crate::engine::cc_permission::{PermissionEntry, DENIAL_REASON};
 use crate::engine::claude_code::{append_allowed_tool_pattern, derive_allow_pattern, AllowScope};
 use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
@@ -9,7 +9,7 @@ use crate::engine::thread_events::{EventMeta, ThreadEvent};
 /// `Session` records into the per-thread in-memory allow set the engine
 /// checks before each prompt. Returns silently for tools whose scope yields
 /// no derivable pattern (e.g. `Edit` with `Broad` — `BROAD_ALLOW_INEFFECTIVE`).
-fn record_allow_grant(state: &AppState, entry: &CcPermissionEntry, scope: AllowScope) {
+fn record_allow_grant(state: &AppState, entry: &PermissionEntry, scope: AllowScope) {
     let Some(pattern) = derive_allow_pattern(&entry.tool_name, &entry.input, scope) else {
         return;
     };
@@ -144,6 +144,14 @@ pub(super) async fn list_mcp_servers(State(state): State<AppState>) -> impl Into
         Ok(servers) => Json(serde_json::json!({ "servers": servers })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed: {}", e)).into_response(),
     }
+}
+
+/// Routes for the `/mcp/*` surface.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/mcp/consent", post(submit_mcp_consent))
+        .route("/mcp/auto-approve", put(set_mcp_auto_approve))
+        .route("/mcp/servers", get(list_mcp_servers))
 }
 
 #[cfg(test)]

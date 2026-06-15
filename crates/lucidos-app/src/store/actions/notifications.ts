@@ -1,7 +1,7 @@
 import {
   notifications,
+  unreadNotifications,
   showToast,
-  unreadCount,
   notificationsFilter,
   notificationsHasMore,
   notificationsLoadingMore,
@@ -22,7 +22,69 @@ import { createFailureCounter } from '../../utils/failureCounter';
 
 const PAGE_SIZE = 15;
 
-/** Load the first page of notifications using the current filter. */
+/** Cap for the unread-set load. Unread is naturally small, and the API clamps
+ *  `limit` to 100 — so this is the most we pull in one go. A backlog larger than
+ *  this renders as "99+" on the badge: accurate enough, and far past any
+ *  realistic unread count. */
+const UNREAD_LOAD_LIMIT = 100;
+
+/** Monotonic guard over `unreadNotifications` — the single source of truth the
+ *  bell badge projects (the `unreadCount` computed is just its length). An async
+ *  load applies its result only if no newer operation has claimed since it
+ *  started, and every local optimistic mutation (`markReadOptimistic` /
+ *  `navigateToNotification` / `markAllRead`) invalidates any in-flight load
+ *  before it writes. This is the guard the old per-`unreadCount`-number version
+ *  had, except it now protects the notifications THEMSELVES rather than a
+ *  separately-fetched count — so the badge can never disagree with the unread
+ *  set, and an out-of-order load can't resurrect a stale one. It still covers
+ *  the in-app auto-read sequence (notifications.md §4 Row 1): looking at a
+ *  source event fires NotificationCreated then NotificationRead back-to-back;
+ *  the optimistic mark-read invalidates the created-reload, so the later state
+ *  wins regardless of response order. */
+let unreadSeq = 0;
+function claimUnreadSeq(): number {
+  return ++unreadSeq;
+}
+function isCurrentUnread(seq: number): boolean {
+  return seq === unreadSeq;
+}
+/** Invalidate any in-flight unread load ahead of a local optimistic mutation. */
+function invalidateUnreadLoad(): void {
+  unreadSeq++;
+}
+
+/** Drop one notification from the unread set — the badge falls with it. No-op
+ *  on the set's contents if it isn't loaded or the row isn't in it (idempotent).
+ *
+ *  Invalidates any in-flight load BEFORE the membership check, not after: on the
+ *  §4 Row 1 auto-read path the created-reload is still in flight when the row is
+ *  marked read, so the row isn't in the set yet. Without superseding that load
+ *  here, it would land a beat later and re-add the just-read notification — a
+ *  transient badge bump that breaks the §2 Row 1 "no bell badge" contract. */
+function removeFromUnread(id: string): void {
+  const set = unreadNotifications.value;
+  if (set.status !== 'loaded') return;
+  invalidateUnreadLoad();
+  if (!set.data.some((n) => n.id === id)) return;
+  unreadNotifications.value = { status: 'loaded', data: set.data.filter((n) => n.id !== id) };
+}
+
+/** Flip a single row to read in the inbox browse list (display only — the badge
+ *  is driven by the unread set, not this list). No-op if absent / already read. */
+function markBrowseRowRead(id: string): void {
+  const browse = notifications.value;
+  if (browse.status !== 'loaded') return;
+  const row = browse.data.find((n) => n.id === id);
+  if (!row || row.read) return;
+  notifications.value = {
+    status: 'loaded',
+    data: browse.data.map((n) => (n.id === id ? { ...n, read: true } : n)),
+  };
+}
+
+/** Load the first page of notifications using the current filter. This populates
+ *  the inbox browse list only; the bell badge derives from the unread set
+ *  (`loadUnreadNotifications`), so opening the inbox never reaches for a count. */
 export async function loadNotifications(): Promise<void> {
   setLoadingIfFresh(notifications);
   try {
@@ -31,7 +93,6 @@ export async function loadNotifications(): Promise<void> {
       filter: notificationsFilter.value,
     });
     notifications.value = { status: 'loaded', data: data.notifications || [] };
-    unreadCount.value = data.unread_count;
     notificationsHasMore.value = data.has_more;
   } catch (error) {
     notifications.value = toFailed(error);
@@ -59,7 +120,6 @@ export async function loadMoreNotifications(): Promise<void> {
       status: 'loaded',
       data: [...current.data, ...(data.notifications || [])],
     };
-    unreadCount.value = data.unread_count;
     notificationsHasMore.value = data.has_more;
   } catch (error) {
     showToast(`Failed to load more notifications: ${errorDetail(error)}`, 'error');
@@ -77,41 +137,44 @@ export function setNotificationsFilter(filter: 'all' | 'unread'): void {
   void savePreference('notifications_filter', filter);
 }
 
-/** Threshold for the refresh-unread escalation toast. Three consecutive
- *  poll failures before we bother the user — a single transient failure
- *  shouldn't surface, but a sustained outage should so the user knows the
- *  badge is stale. Reset on the next success. */
-const REFRESH_UNREAD_TOAST_THRESHOLD = 3;
-const refreshUnreadFailures = createFailureCounter(REFRESH_UNREAD_TOAST_THRESHOLD, () => {
+/** Threshold for the unread-load escalation toast. Three consecutive failures
+ *  before we bother the user — a single transient failure shouldn't surface,
+ *  but a sustained outage should so the user knows the badge is stale. Reset on
+ *  the next success. */
+const UNREAD_LOAD_TOAST_THRESHOLD = 3;
+const unreadLoadFailures = createFailureCounter(UNREAD_LOAD_TOAST_THRESHOLD, () => {
   showToast(
-    `Unread count is stale — couldn't reach the engine after ${REFRESH_UNREAD_TOAST_THRESHOLD} tries`,
+    `Unread count is stale — couldn't reach the engine after ${UNREAD_LOAD_TOAST_THRESHOLD} tries`,
     'error',
     { key: 'refresh-unread-count' },
   );
 });
 
-/** Lightweight fetch: just refresh the unread count without loading items.
- *  Called by SSE handlers + page-resume — runs without user intent, so we
- *  swallow individual failures (best-effort telemetry, see
- *  `.claude/rules/frontend.md` § "Carve-out: best-effort telemetry") and
- *  escalate via a single toast only after `REFRESH_UNREAD_TOAST_THRESHOLD`
- *  consecutive failures. */
-export async function refreshUnreadCount(): Promise<void> {
+/** Load the unread set — the single source the bell badge derives from. Called
+ *  on startup / resume / notification SSE; runs without user intent, so it's
+ *  best-effort: individual failures are swallowed (see `.claude/rules/frontend.md`
+ *  § "Carve-out: best-effort telemetry") and escalated via a single toast only
+ *  after `UNREAD_LOAD_TOAST_THRESHOLD` consecutive failures. */
+export async function loadUnreadNotifications(): Promise<void> {
+  const seq = claimUnreadSeq();
   try {
-    const data = await getNotifications({ limit: 0 });
-    unreadCount.value = data.unread_count;
-    refreshUnreadFailures.recordSuccess();
+    const data = await getNotifications({ limit: UNREAD_LOAD_LIMIT, filter: 'unread' });
+    if (isCurrentUnread(seq)) {
+      unreadNotifications.value = { status: 'loaded', data: data.notifications || [] };
+    }
+    unreadLoadFailures.recordSuccess();
   } catch {
-    refreshUnreadFailures.recordFailure();
+    unreadLoadFailures.recordFailure();
   }
 }
 
-/** Handle notification SSE events (NotificationCreated/Read/AllRead).
- *  Skips full reload when the detail modal is open — the user is navigating
- *  through the list and a reload with `filter: 'unread'` would remove the
- *  currently-viewed item, breaking prev/next navigation. */
+/** Handle notification SSE events (NotificationCreated/Read/AllRead). Reloads
+ *  the unread set so the badge tracks the server, and reloads the inbox browse
+ *  list when it's open. Skips the browse reload when the detail modal is open —
+ *  the user is navigating through the list and a reload with `filter: 'unread'`
+ *  would remove the currently-viewed item, breaking prev/next navigation. */
 export function handleNotificationSSE(): void {
-  void refreshUnreadCount();
+  void loadUnreadNotifications();
   if (activeMenuItem.value === 'notifications' && !notificationsModalOpen.value) {
     void loadNotifications();
   }
@@ -128,19 +191,12 @@ export function resetViewDedup(): void {
 }
 
 /** Mark a notification read on tap: optimistic local cache update + best-effort
- *  API call. Idempotent — safe to call on already-read rows. */
+ *  API call. Idempotent — safe to call on already-read rows. Dropping the row
+ *  from the unread set makes the badge fall immediately; the server's
+ *  NotificationRead broadcast triggers a confirming reload. */
 export function markReadOptimistic(id: string): void {
-  const current = notifications.value;
-  if (current.status === 'loaded') {
-    const cached = current.data.find((n) => n.id === id);
-    if (cached && !cached.read) {
-      notifications.value = {
-        status: 'loaded',
-        data: current.data.map((n) => (n.id === id ? { ...n, read: true } : n)),
-      };
-      if (unreadCount.value > 0) unreadCount.value -= 1;
-    }
-  }
+  markBrowseRowRead(id);
+  removeFromUnread(id);
   markNotificationRead(id).catch(() => { /* row stays unread; user sees it next visit */ });
 }
 
@@ -184,14 +240,8 @@ export async function navigateToNotification(targetId: string): Promise<string |
 
     notificationModalDetail.value = full;
     if (!target.read) {
-      const after = notifications.value;
-      if (after.status === 'loaded') {
-        notifications.value = {
-          status: 'loaded',
-          data: after.data.map((n) => n.id === target.id ? { ...n, read: true } : n),
-        };
-      }
-      if (unreadCount.value > 0) unreadCount.value -= 1;
+      markBrowseRowRead(target.id);
+      removeFromUnread(target.id);
     }
     return full.id;
   } catch (error) {
@@ -213,7 +263,7 @@ export async function markAllRead(): Promise<void> {
   try {
     await markAllNotificationsRead();
 
-    // Optimistic update: mark all items read and zero out the count
+    // Optimistic update: flip every loaded browse row to read...
     const current = notifications.value;
     if (current.status === 'loaded') {
       notifications.value = {
@@ -221,7 +271,10 @@ export async function markAllRead(): Promise<void> {
         data: current.data.map((n) => ({ ...n, read: true })),
       };
     }
-    unreadCount.value = 0;
+    // ...and empty the unread set, which drops the badge to zero. Invalidate
+    // any in-flight load first so a stale reload can't resurrect the count.
+    invalidateUnreadLoad();
+    unreadNotifications.value = { status: 'loaded', data: [] };
   } catch (error) {
     showToast('Failed to mark all as read: ' + errorDetail(error), 'error');
   }

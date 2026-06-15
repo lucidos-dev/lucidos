@@ -41,6 +41,7 @@ fn make_test_session(process_exited: bool) -> AgentSession {
         has_changes: false,
         requires_restart: false,
         pending_stop: None,
+        cancel_actor: None,
         stop: Arc::new(Notify::new()),
         interrupt: Arc::new(Notify::new()),
         idle_notify: Arc::new(Notify::new()),

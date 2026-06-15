@@ -76,6 +76,18 @@ impl DropboxBackupProvider {
     }
 }
 
+/// Build the Dropbox web URL for the backups folder. The Dropbox web app
+/// addresses folders by path under `/home`; the folder path is fixed, so this is
+/// always a real deep link (no id lookup needed). Pure for unit-testability.
+fn dropbox_folder_url() -> String {
+    let mut url =
+        reqwest::Url::parse("https://www.dropbox.com/home").expect("static base URL is valid");
+    url.path_segments_mut()
+        .expect("base URL is a base")
+        .extend(BACKUP_FOLDER.split('/').filter(|s| !s.is_empty()));
+    url.to_string()
+}
+
 #[async_trait]
 impl BackupProvider for DropboxBackupProvider {
     fn name(&self) -> &str {
@@ -88,6 +100,10 @@ impl BackupProvider for DropboxBackupProvider {
 
     fn oauth_provider(&self) -> &str {
         "dropbox"
+    }
+
+    async fn folder_url(&self) -> Option<String> {
+        Some(dropbox_folder_url())
     }
 
     async fn preflight(&self, _estimated_upload_bytes: u64) -> Result<(), BoxError> {
@@ -230,5 +246,20 @@ impl BackupProvider for DropboxBackupProvider {
             .error_for_status()?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropbox_folder_url_deep_links_to_home_path() {
+        // The space in "Lucidos Backups" must be percent-encoded, never raw.
+        let url = dropbox_folder_url();
+        assert!(url.starts_with("https://www.dropbox.com/home/"));
+        assert!(url.contains("Lucidos"));
+        assert!(!url.contains(' '));
+        assert_eq!(url, "https://www.dropbox.com/home/Lucidos%20Backups");
     }
 }

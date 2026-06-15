@@ -307,16 +307,18 @@ impl GoogleDriveBackupProvider {
         quota_check(limit, usage, estimated_upload_bytes).map_err(BoxError::from)
     }
 
-    async fn get_or_create_folder(&self, token: &str) -> Result<String, BoxError> {
-        // Check cache first
+    /// Look up the existing backups folder id WITHOUT creating it. Checks the
+    /// in-memory cache first, then searches Drive by folder name. Returns `None`
+    /// when no such folder exists yet (e.g. before the first backup). Used by the
+    /// Settings page to deep-link the folder, and by `get_or_create_folder`.
+    async fn find_folder(&self, token: &str) -> Result<Option<String>, BoxError> {
         {
             let cache = self.folder_id_cache.lock().await;
             if let Some(ref id) = *cache {
-                return Ok(id.clone());
+                return Ok(Some(id.clone()));
             }
         }
 
-        // Search for existing folder
         let query = format!(
             "name = '{}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
             FOLDER_NAME
@@ -331,29 +333,37 @@ impl GoogleDriveBackupProvider {
         let resp = check_drive_status(resp).await?;
 
         let list: DriveFileList = resp.json().await?;
-        let folder_id = if let Some(folder) = list.files.into_iter().next() {
-            folder.id
-        } else {
-            // Create the folder
-            let metadata = serde_json::json!({
-                "name": FOLDER_NAME,
-                "mimeType": "application/vnd.google-apps.folder",
-            });
-            let resp = check_drive_status(
-                self.client
-                    .post(DRIVE_FILES_URL)
-                    .bearer_auth(token)
-                    .json(&metadata)
-                    .send()
-                    .await?,
-            )
-            .await?;
+        let folder_id = list.files.into_iter().next().map(|f| f.id);
+        if let Some(ref id) = folder_id {
+            let mut cache = self.folder_id_cache.lock().await;
+            *cache = Some(id.clone());
+        }
+        Ok(folder_id)
+    }
 
-            let created: DriveCreateResponse = resp.json().await?;
-            created.id
-        };
+    async fn get_or_create_folder(&self, token: &str) -> Result<String, BoxError> {
+        if let Some(id) = self.find_folder(token).await? {
+            return Ok(id);
+        }
 
-        // Cache the folder ID
+        // Create the folder
+        let metadata = serde_json::json!({
+            "name": FOLDER_NAME,
+            "mimeType": "application/vnd.google-apps.folder",
+        });
+        let resp = check_drive_status(
+            self.client
+                .post(DRIVE_FILES_URL)
+                .bearer_auth(token)
+                .json(&metadata)
+                .send()
+                .await?,
+        )
+        .await?;
+        let created: DriveCreateResponse = resp.json().await?;
+        let folder_id = created.id;
+
+        // Cache the newly-created folder ID
         {
             let mut cache = self.folder_id_cache.lock().await;
             *cache = Some(folder_id.clone());
@@ -635,6 +645,15 @@ impl BackupProvider for GoogleDriveBackupProvider {
 
     fn oauth_provider(&self) -> &str {
         "google"
+    }
+
+    async fn folder_url(&self) -> Option<String> {
+        // Resolve the real folder id live — no persisted, workspace-global state.
+        // Best-effort: with no token or no folder yet (before the first backup),
+        // omit the link rather than point at a search the user didn't ask for.
+        let token = self.get_token().await.ok()?;
+        let folder_id = self.find_folder(&token).await.ok()??;
+        Some(format!("https://drive.google.com/drive/folders/{folder_id}"))
     }
 
     async fn preflight(&self, estimated_upload_bytes: u64) -> Result<(), BoxError> {

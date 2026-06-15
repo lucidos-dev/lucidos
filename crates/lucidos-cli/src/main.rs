@@ -27,6 +27,7 @@ mod data_store;
 mod events;
 mod hardened;
 mod http;
+mod knowhow;
 mod mcp_permission_server;
 mod notify;
 mod proxy;
@@ -156,6 +157,33 @@ enum Command {
         #[command(subcommand)]
         action: ChangesCmd,
     },
+    /// Read the engine-shipped system-knowhow corpus (and any user knowhow):
+    /// `list` the catalog, `read <id>` one doc's full content. The authoritative
+    /// guides for building Lucidos apps (`system-knowhow/building-an-app`,
+    /// `system-knowhow/js-sdk`, `system-knowhow/best-practices`, …) live in the
+    /// engine, NOT in an app coding-agent thread's sparse-checkout worktree — so
+    /// this is how a session pulls them on demand. Mirrors the chat agent's
+    /// `load_knowhow` tool over HTTP.
+    Knowhow {
+        #[command(subcommand)]
+        action: KnowhowCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum KnowhowCmd {
+    /// List the merged user + system knowhow catalog as JSON
+    /// (`{ knowhow: [{ id, name, description }] }`). Read `.knowhow[].id` to
+    /// find the id to pass to `read`.
+    List,
+    /// Read one knowhow doc's full content by id. Pass an id from `list` —
+    /// e.g. `lucidos knowhow read system-knowhow/building-an-app`. Exit
+    /// non-zero if the id resolves to nothing.
+    Read {
+        /// Knowhow id, exactly as it appears in `list` (e.g.
+        /// `system-knowhow/building-an-app` or a user knowhow id).
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -184,13 +212,13 @@ enum ThreadsCmd {
     ///
     /// `--active` restricts to threads where the agentic loop is mid-flow
     /// (`status` of `running` or `waiting_for_user_answer`). Status
-    /// `waiting` is *not* active — it means CC has stopped and proposed
+    /// `waiting` is *not* active — it means the coding agent has stopped and proposed
     /// changes the user must act on; the loop has paused.
     List {
         /// Restrict to active threads only.
         #[arg(long)]
         active: bool,
-        /// Comma-separated source filter (`chat`, `trigger`, `claude_code`).
+        /// Comma-separated source filter (`chat`, `trigger`, `coding-agent`; legacy `claude_code` also accepted).
         #[arg(long)]
         source: Option<String>,
         /// Max rows to return. Server clamps to 1..=1000 (default 100).
@@ -203,7 +231,7 @@ enum ThreadsCmd {
         /// Restrict to active threads only.
         #[arg(long)]
         active: bool,
-        /// Comma-separated source filter (`chat`, `trigger`, `claude_code`).
+        /// Comma-separated source filter (`chat`, `trigger`, `coding-agent`; legacy `claude_code` also accepted).
         #[arg(long)]
         source: Option<String>,
     },
@@ -407,6 +435,8 @@ enum DataCmd {
         mkdir: bool,
     },
     /// Write content to the resolved absolute path. Creates parent dirs.
+    /// Prints a clickable chat link (bare store path, no scheme) on stdout and
+    /// the absolute path on stderr.
     Write(WriteArgs),
 }
 
@@ -648,6 +678,14 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             match action {
                 ChangesCmd::List => changes::cmd_list(&ws)?,
                 ChangesCmd::Apply { change_id } => changes::cmd_apply(&ws, &change_id)?,
+            }
+            Ok(0)
+        }
+        Command::Knowhow { action } => {
+            let ws = resolve_from_env()?;
+            match action {
+                KnowhowCmd::List => knowhow::cmd_list(&ws)?,
+                KnowhowCmd::Read { id } => knowhow::cmd_read(&ws, &id)?,
             }
             Ok(0)
         }

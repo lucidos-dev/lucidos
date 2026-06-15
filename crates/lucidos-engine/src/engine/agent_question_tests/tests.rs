@@ -255,7 +255,14 @@ async fn emit_resume_marker_skips_emit_for_canceled_answer() {
     seed_cc_thread(&bus, thread_id).await;
 
     let emitted =
-        emit_resume_marker_for_cc_answer(&bus, thread_id, &AnswerKind::Canceled, None).await;
+        emit_resume_marker_for_cc_answer(
+            &bus,
+            thread_id,
+            &AnswerKind::Canceled,
+            None,
+            crate::runtime::CodingAgent::ClaudeCode,
+        )
+        .await;
     assert!(
         !emitted,
         "Canceled answer must not emit a resume marker — no CC turn follows"
@@ -285,6 +292,7 @@ async fn emit_resume_marker_emits_for_selected_answer() {
             option_id: "opt-0".into(),
         },
         None,
+        crate::runtime::CodingAgent::ClaudeCode,
     )
     .await;
     assert!(emitted, "active answers must emit the Thinking placeholder");
@@ -309,6 +317,7 @@ async fn emit_resume_marker_emits_for_free_text_answer() {
             text: "purple".into(),
         },
         None,
+        crate::runtime::CodingAgent::ClaudeCode,
     )
     .await;
     assert!(emitted, "FreeText answer must keep the marker");

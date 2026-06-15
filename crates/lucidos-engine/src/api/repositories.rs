@@ -2,7 +2,8 @@ use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    routing::get,
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -882,6 +883,29 @@ pub async fn browse_directories(
         directories,
         is_git_repo,
     }))
+}
+
+/// Routes for the `/repositories*` and `/browse-directories` surfaces. The
+/// change- and thread-shaped diff routes this module also implements
+/// register under `changes::router()` / `threads::router()` — grouped by
+/// URL surface, not handler location.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/repositories",
+            get(list_repositories).post(add_repository),
+        )
+        .route("/browse-directories", get(browse_directories))
+        .route(
+            "/repositories/:id",
+            axum::routing::delete(remove_repository),
+        )
+        .route(
+            "/repositories/:id/files",
+            get(list_repo_files),
+        )
+        .route("/repositories/:id/file", get(get_repo_file))
+        .route("/repositories/:id/diff", get(get_repo_diff))
 }
 
 #[cfg(test)]

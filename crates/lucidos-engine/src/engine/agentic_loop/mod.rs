@@ -28,6 +28,10 @@ mod call_key_unit_tests;
 mod serialize_unit_tests;
 
 #[cfg(test)]
+#[path = "../agentic_loop_unit_tests/tool_turn_text.rs"]
+mod tool_turn_text_unit_tests;
+
+#[cfg(test)]
 #[path = "../agentic_loop_unit_tests/sentinel.rs"]
 mod sentinel_unit_tests;
 

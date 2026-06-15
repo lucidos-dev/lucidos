@@ -1,12 +1,12 @@
 import type { ComponentChildren } from 'preact';
-import { threadMap, focusedThreadId, applyingNowThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn } from '../../store/store';
+import { threadMap, focusedThreadId, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn } from '../../store/store';
 import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 
-/** The close-set kinds the banner renders. Discard-draft (rendered by
- *  PromptInput's "Discard draft" button) and the Save/Unsave toggle (rendered
- *  by PromptInput's section buttons) are excluded — they come from the same
- *  selector but live in a different slot. */
+/** The close-set kinds the banner renders. Discard-draft (a compose-draft
+ *  action resolved by the close-cascade shortcut, not the banner) and the
+ *  Save/Unsave toggle (rendered by PromptInput's section buttons) are excluded —
+ *  they come from the same selector but live in a different slot. */
 const BANNER_CLOSE_KINDS: ReadonlySet<string> = new Set(['discard', 'apply', 'archive']);
 
 type WaitingState =
@@ -28,10 +28,12 @@ export function getWaitingState(): WaitingState | null {
   const thread = threadMap.value.get(focused);
   if (!thread) return null;
 
-  // Applying in progress — show "Apply..." and block all other actions.
-  // The Archive button must never render while apply is active. The actions
-  // (handleArchiveThread / endClaudeCodeAndApply) enforce mutual exclusivity,
-  // so applying, dismissing, and discarding can't coexist for the same thread.
+  // Apply Now in progress — show disabled "Apply...". This flow stops the
+  // session and commits the change; there's no interruptible turn, so it stays
+  // non-cancelable (unlike the harden/merge sessions handled by the mid-turn
+  // branch below). The Archive button must never render while apply is active;
+  // the actions (handleArchiveThread / endClaudeCodeAndApply) enforce mutual
+  // exclusivity, so applying, dismissing, and discarding can't coexist.
   if (applyingNowThreadIds.value.has(focused)) return { type: 'applying' };
 
   // Discarding in progress — show "Discard..." and block all other actions.
@@ -48,22 +50,31 @@ export function getWaitingState(): WaitingState | null {
   const status = effectiveThreadStatus(thread);
 
   // Mid-turn states get Cancel. Must come before the selector, which returns no
-  // close actions for both and would otherwise drop us into the "no banner"
-  // branch. Excludes 'waiting' (CC has changes — needs Apply/Discard, not Cancel).
+  // close actions and would otherwise drop us into the "no banner" branch.
+  // Excludes 'waiting' (CC has changes — needs Apply/Discard, not Cancel).
+  //
+  // This now also covers an apply that woke a live Claude Code session — a
+  // `/harden` run (codingAgentApplying false, status running) or a merge-conflict
+  // resolution (codingAgentApplying true, status running). Both run as a real CC
+  // turn, so the user can interrupt them. Cancel is best-effort for a merge: if
+  // the merge already landed before the interrupt processes, the engine still
+  // emits ChangeApplied; otherwise the change returns to pending. (Previously a
+  // merge showed a disabled "Apply..." here, leaving no way to stop a long-
+  // running merge — that's the regression this branch fixes.)
   if (isMidTurn(status)) {
-    // codingAgentApplying = MergeConflictDetected fired and the apply task is
-    // driving the Claude Code session through a merge. The 'running' status reflects
-    // that engine-pushed merge prompt, not a user turn. Cancel here would only
-    // interrupt CC mid-merge — the apply task in the engine continues, sees
-    // CC went idle, and emits ChangeApplied if the merge had already landed.
-    // Show "Apply..." instead so the user can't trigger a no-op cancel.
-    if (thread.meta.codingAgentApplying) return { type: 'applying' };
     return {
       type: 'canceling',
       threadId: focused,
       isCanceling: cancelingThreadIds.value.has(focused),
     };
   }
+
+  // Applying but NOT mid-turn — a queued Apply All member waiting its turn: its
+  // change is marked applying (reverse-mapped via applyingChangeThreadIds) but no
+  // live session is running yet, so there's nothing to interrupt. Show disabled
+  // "Apply...". The actively-hardening/merging member hits the mid-turn Cancel
+  // branch above instead.
+  if (applyingChangeThreadIds.value.has(focused)) return { type: 'applying' };
 
   // Close-set buttons come straight from the action-availability selector, so
   // their labels, confirms, handlers, the external-repo carve-out, and the

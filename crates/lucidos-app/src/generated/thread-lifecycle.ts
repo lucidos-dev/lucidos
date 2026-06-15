@@ -7,7 +7,7 @@ export type SessionEndReason = 'shutdown' | 'panic' | 'closed' | 'stale_resume' 
 export const SESSION_END_REASONS: readonly SessionEndReason[] = ['shutdown', 'panic', 'closed', 'stale_resume', 'legacy_non_terminal'] as const;
 export type ThreadType = 'chat' | 'claude_code';
 export type ArchiveState = 'archived' | 'inbox';
-export type DisplaySection = 'active' | 'saved' | 'review' | 'archive';
+export type DisplaySection = 'saved' | 'current' | 'archive';
 export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'failed';
 export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';
 export type Action = 'discard_draft' | 'discard' | 'apply' | 'archive' | 'save' | 'unsave';
@@ -69,6 +69,8 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   UserQuestionAnswered: 'activity',
   CodingAgentPermissionRequest: 'action_required',
   CodingAgentPermissionResolved: 'activity',
+  CommandPermissionRequested: 'action_required',
+  CommandPermissionResolved: 'activity',
   WorktreeCleaned: 'metadata',
   ChildThreadCompleted: 'start',
   ContextDismissed: 'metadata',
@@ -108,6 +110,8 @@ export const LAST_ACTIVITY_EVENTS: ReadonlySet<string> = new Set([
   'UserQuestionAnswered',
   'CodingAgentPermissionRequest',
   'CodingAgentPermissionResolved',
+  'CommandPermissionRequested',
+  'CommandPermissionResolved',
   'ContinuationRequested',
   'ToolCalled',
   'ToolResult',
@@ -132,11 +136,9 @@ export function displaySection(
   hasAttentionDescendants: boolean,
 ): DisplaySection {
   if (isSaved) return 'saved';
-  if (hasAttentionDescendants) return 'review';
-  if (status === 'running' || hasActiveChildren) return 'active';
-  if (hasPendingChanges) return 'review';
-  if (stored === 'archived') return 'archive';
-  return 'review';
+  const demandsSurface = status === 'running' || hasActiveChildren || hasPendingChanges || hasAttentionDescendants;
+  if (stored === 'archived' && !demandsSurface) return 'archive';
+  return 'current';
 }
 
 export function isCcOnlyEvent(eventType: string): boolean {
@@ -154,10 +156,10 @@ export function availableThreadActions(
 ): Action[] {
   const actions: Action[] = [];
   const live = status === 'running' || status === 'waiting_for_user_answer';
-  const ccPending = hasPendingChanges && threadType === 'claude_code';
+  const codingAgentPending = hasPendingChanges && threadType === 'claude_code';
   if (hasUnsentDraft) actions.push('discard_draft');
   if (!live) {
-    if (ccPending) {
+    if (codingAgentPending) {
       actions.push('discard', 'apply');
     } else if (storedSection === 'inbox' && !descendantsBlockArchive) {
       actions.push('archive');

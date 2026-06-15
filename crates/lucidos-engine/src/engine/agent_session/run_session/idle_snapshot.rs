@@ -8,6 +8,7 @@ impl LucidosEngine {
         thread_id: Uuid,
         snapshot: CodingAgentIdleSnapshot<'_>,
         meta: &crate::engine::thread_events::EventMeta,
+        coding_agent: crate::runtime::CodingAgent,
     ) {
         let cc_session_id = {
             let guard = self.agent_sessions.lock().await;
@@ -30,7 +31,7 @@ impl LucidosEngine {
                         is_external_repo: snapshot.is_external_repo,
                         requires_restart: snapshot.requires_restart,
                         cc_session_id,
-                        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                        coding_agent,
                         reason: None,
                         worktree_path: snapshot.worktree_path
                             .map(|p| p.to_string_lossy().into_owned()),

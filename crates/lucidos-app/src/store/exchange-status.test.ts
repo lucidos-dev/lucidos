@@ -11,7 +11,7 @@ import {
 describe('isActive', () => {
   it('pending is active', () => expect(isActive('pending')).toBe(true));
   it('streaming is active', () => expect(isActive('streaming')).toBe(true));
-  it('cc-working is active', () => expect(isActive('cc-working')).toBe(true));
+  it('coding-agent-working is active', () => expect(isActive('coding-agent-working')).toBe(true));
   it('done is NOT active', () => expect(isActive('done')).toBe(false));
   it('interrupted is NOT active', () => expect(isActive('interrupted')).toBe(false));
   it('canceled is NOT active', () => expect(isActive('canceled')).toBe(false));
@@ -22,8 +22,8 @@ describe('isActive', () => {
 });
 
 describe('ACTIVE_STATUSES', () => {
-  it('contains exactly pending, streaming, cc-working', () => {
-    expect(ACTIVE_STATUSES).toEqual(new Set(['pending', 'streaming', 'cc-working']));
+  it('contains exactly pending, streaming, coding-agent-working', () => {
+    expect(ACTIVE_STATUSES).toEqual(new Set(['pending', 'streaming', 'coding-agent-working']));
   });
 });
 
@@ -55,8 +55,8 @@ describe('statusLabel', () => {
     expect(result.className).toBe('working');
   });
 
-  it('cc-working → Working', () => {
-    const result = statusLabel('cc-working', false);
+  it('coding-agent-working → Working', () => {
+    const result = statusLabel('coding-agent-working', false);
     expect(result.label).toBe('Working');
     expect(result.className).toBe('working');
   });
@@ -67,9 +67,9 @@ describe('statusLabel', () => {
     expect(result.className).toBe('done');
   });
 
-  it('interrupted → Continued below', () => {
+  it('interrupted → Done', () => {
     const result = statusLabel('interrupted', false);
-    expect(result.label).toBe('Continued below');
+    expect(result.label).toBe('Done');
     expect(result.className).toBe('done');
   });
 
@@ -97,9 +97,9 @@ describe('statusLabel', () => {
     expect(result.className).toBe('aborted');
   });
 
-  it('awaiting-answer → Awaiting answer (distinct from Done)', () => {
+  it('awaiting-answer → Needs your answer (distinct from Done)', () => {
     const result = statusLabel('awaiting-answer', false);
-    expect(result.label).toBe('Awaiting answer');
+    expect(result.label).toBe('Needs your answer');
     expect(result.className).toBe('awaiting');
   });
 });

@@ -102,6 +102,24 @@ describe('backupHealthCard', () => {
     expect(text).toContain('failed');
     // The error text must render in the red error span, not primary color.
     expect(text).toMatch(/backup-health-error">[^<]*pg_dump failed/);
+    // A failed last run escalates the whole card to the error (red) hue.
+    expect(text).toMatch(/data-state="error"/);
+  });
+
+  it('a failed last run wins over staleness — the card is error, not stale', () => {
+    // The user-visible scenario: the last attempt failed AND there's no recent
+    // good backup. The card must read as an error (red), never sit inside the
+    // soft-yellow stale box.
+    const status = loaded({
+      ...BASE,
+      last_run: { status: 'failure', at: new Date().toISOString(), filename: null, size_bytes: null, error: 'Drive is full' },
+      latest_backup: recentBackup(30 * 3600),
+      age_seconds: 30 * 3600,
+      stale: true,
+    });
+    const text = vnodeToText(backupHealthCard({ status, liveProgress: null, providerName: 'Google Drive' }));
+    expect(text).toMatch(/data-state="error"/);
+    expect(text).not.toMatch(/data-state="stale"/);
   });
 
   it('last-run success shows a succeeded line', () => {

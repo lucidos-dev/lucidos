@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { ConnectionStatus } from './ConnectionStatus';
-import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView, recoveryProgress, draftsViewActive } from '../../store/store';
+import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView, recoveryProgress, draftsViewActive, attentionViewActive } from '../../store/store';
 import { useHideOnScroll } from '../../hooks/useHideOnScroll';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
-import { ComposeIcon, SearchIcon, FilterIcon, DraftsIcon } from '../shared/icons';
+import { ComposeIcon, SearchIcon, FilterIcon } from '../shared/icons';
+import { AltViewToggles } from '../shared/AltViewToggles';
 import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { unfocusThread } from '../../store/actions/threads';
@@ -26,6 +27,10 @@ import { tooltipWithShortcut } from '../../store/actions/keybindings';
 function ThreadsHeader() {
   const { filterOpen, setFilterOpen, toggleRef, closeFilter, filterActive,
           searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
+
+  // The channel/trigger/repo filter is unavailable while an alternate filter
+  // view (drafts or attention) is running — both deliberately bypass it.
+  const altViewActive = draftsViewActive.value || attentionViewActive.value;
 
   return (
     <div class={`threads-header${searchOpen ? ' search-active' : ''}`}>
@@ -52,24 +57,17 @@ function ThreadsHeader() {
           ref={toggleRef}
           class={`icon-btn header-icon threads-header-btn${filterActive ? ' filter-active' : ''}`}
           onClick={() => setFilterOpen(!filterOpen)}
-          disabled={draftsViewActive.value}
+          disabled={altViewActive}
           aria-label="Filter threads"
-          data-tooltip={draftsViewActive.value ? 'Filter unavailable in drafts view' : 'Filter threads'}
-          style={draftsViewActive.value ? 'pointer-events: auto;' : undefined}
+          data-tooltip={altViewActive ? 'Filter unavailable in this view' : 'Filter threads'}
+          style={altViewActive ? 'pointer-events: auto;' : undefined}
         >
           <FilterIcon />
         </button>
-        {filterOpen && !draftsViewActive.value && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
+        {filterOpen && !altViewActive && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
       </div>
+      <AltViewToggles showTooltip />
       <span class="threads-header-title">Threads</span>
-      <button
-        class={`icon-btn header-icon threads-header-btn${draftsViewActive.value ? ' drafts-active' : ''}`}
-        onClick={() => { draftsViewActive.value = !draftsViewActive.value; }}
-        aria-label="Toggle drafts view"
-        data-tooltip="Drafts"
-      >
-        <DraftsIcon />
-      </button>
       <button
         class="icon-btn header-icon threads-header-btn"
         {...openSearchHandlers}
@@ -216,22 +214,24 @@ export function AppHeader() {
 
         {/* ─── Desktop: full header ─── */}
         <div class="desktop-header">
+          {/* Both nav-icon hosts stay mounted; CSS keyed on
+              data-thread-drawer-open fades between them so the drawer
+              toggle animates instead of popping (mount/unmount can't
+              transition). */}
           <div class="thread-header-elements">
-            {threadDrawerOpen.value && <ThreadsHeader />}
-            {!threadDrawerOpen.value && (
-              <div class="collapsed-thread-actions">
-                <ThreadToggleButton />
-                <ThreadNav showTooltip />
-                <button
-                  class="icon-btn header-icon"
-                  onClick={() => unfocusThread()}
-                  aria-label="New thread"
-                  data-tooltip={tooltipWithShortcut('New thread', 'newThread')}
-                >
-                  <ComposeIcon />
-                </button>
-              </div>
-            )}
+            <ThreadsHeader />
+            <div class="collapsed-thread-actions">
+              <ThreadToggleButton />
+              <ThreadNav showTooltip />
+              <button
+                class="icon-btn header-icon"
+                onClick={() => unfocusThread()}
+                aria-label="New thread"
+                data-tooltip={tooltipWithShortcut('New thread', 'newThread')}
+              >
+                <ComposeIcon />
+              </button>
+            </div>
             <span class="pane-header-brand">
               <div class="thread-nav-group">
                 <ThreadNav showTooltip />
@@ -255,7 +255,7 @@ export function AppHeader() {
                   controlPanelOpen.value = !controlPanelOpen.value;
                 }}
               >
-                <span class="pane-header-title">lucidos</span>
+                <span class="pane-header-title">Lucidos</span>
                 {badgeCount > 0 && <span class="badge brand-badge" data-tooltip={controlPanelBadgeTooltip()}>{badgeCount}</span>}
                 <ConnectionStatus />
               </span>
@@ -303,7 +303,6 @@ export function AppHeader() {
                 )
               )}
             </span>
-            <div class="pane-header-spacer" />
             <ContentHeaderActions />
           </div>
         </div>

@@ -371,3 +371,22 @@ pub(super) async fn reorder_trigger_groups(
 
     (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
 }
+
+/// Routes for the `/trigger-groups*` surface — user-visible folders that
+/// organize triggers in the panel. Pure label, no firing. The reorder
+/// endpoint is a batch op so the panel can persist a drag-to-reorder with
+/// one round-trip.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/trigger-groups",
+            get(list_trigger_groups)
+                .post(create_trigger_group)
+                .put(update_trigger_group)
+                .delete(delete_trigger_group),
+        )
+        .route(
+            "/trigger-groups/reorder",
+            post(reorder_trigger_groups),
+        )
+}

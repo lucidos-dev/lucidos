@@ -12,7 +12,8 @@ description: Use when fixing any bug — enforces test-first approach with integ
 1. **Reproduce** — understand exactly what's wrong
 2. **Write a failing test** — if you can't write a test that fails, you don't understand the bug
 3. **Fix the code** — make the test pass
-4. **Verify** — run full test suite, check for regressions
+4. **Sweep for siblings** — a bug is usually a *pattern*, not a site. Grep for the same shape elsewhere before declaring done (same helper misused, same unconditional cleanup, same guard missing). Real case: the destructive spawn-failure cleanup existed at THREE sites in one file; the first fix shipped covering only one, and the other two were caught a review-round later (2026-06-12). One grep would have found all three up front.
+5. **Verify** — run full test suite, check for regressions
 
 ## Integration Tests Over Unit Tests
 

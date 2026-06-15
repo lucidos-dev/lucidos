@@ -5,7 +5,8 @@ pub(crate) struct ListFilters<'a> {
     /// `Some(true)` → only `running` / `waiting_for_user_answer` (agentic loop
     /// mid-flow). `Some(false)` → invert. `None` → no filter.
     pub active: Option<bool>,
-    /// Comma-separated source list (`chat`, `trigger`, `claude_code`).
+    /// Comma-separated source list (`chat`, `trigger`, `coding-agent`).
+    /// Legacy `claude_code` is also accepted by the engine.
     pub source: Option<&'a str>,
     /// Server clamps to 1..=1000 (default 100).
     pub limit: Option<u32>,

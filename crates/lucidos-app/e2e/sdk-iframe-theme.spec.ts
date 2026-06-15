@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { appPath, createIframeAppFixture, psql } from './db-helpers';
+import { gotoWithRetry } from './helpers';
 
 // Verifies that an app iframe receives live theme updates via the SDK's
 // `lucidos.ui.watchPreferences()` SSE subscription.
@@ -56,7 +57,7 @@ waitForLucidos();
   test('app inside Lucidos iframe receives live PreferencesChanged via SSE', async ({ page, request }) => {
     // Establish a known device id and seed initial theme (matches the parent's
     // localStorage; iframe shares same origin so it reads the same id).
-    await page.goto('/');
+    await gotoWithRetry(page, '/');
     const deviceId = 'e2e-device-' + Date.now();
     await page.evaluate((id) => localStorage.setItem('lucidos-device-id', id), deviceId);
     await request.put(`/api/v1/preferences?key=theme`, {
@@ -204,7 +205,7 @@ waitForLucidos();
     // Cold reload — the auto-restore path mounts the iframe via
     // panelOverlay → AppUiInline. No `?app=` deep-link (its 500ms timeout
     // hides the bug behind a delay).
-    await page.goto('/');
+    await gotoWithRetry(page, '/');
 
     const iframeLoc = page.locator('iframe[data-role="app-ui-frame"]:visible');
     await expect(iframeLoc).toBeVisible({ timeout: 10_000 });
@@ -286,7 +287,7 @@ test.describe('SDK iframe theme — opt-in only', () => {
 
   test('app served without sdk-prefs.js does NOT receive data-theme on <html>', async ({ page, request }) => {
     // Origin matters — the iframe URL is path-relative.
-    await page.goto('/');
+    await gotoWithRetry(page, '/');
     await page.setContent(`<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"></head>

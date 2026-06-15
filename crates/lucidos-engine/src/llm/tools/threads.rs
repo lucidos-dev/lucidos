@@ -90,17 +90,17 @@ pub(super) fn list_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::LIST_THREADS.to_string(),
-            description: "List thread summaries from the workspace's projection. Returns a newest-first JSON array of `ThreadSummary` rows (one per thread) — the same shape returned by `GET /api/v1/threads/list` and the `lucidos threads list` CLI. Use this instead of `query_events` when you want to know what threads exist (and their status / source / age) — `query_events` over `MessageReceived`/`ResponseGenerated` pairs would be much more expensive. Each ThreadSummary includes thread_id, title, channel ('chat'|'claude_code'|'trigger'), status ('idle'|'running'|'waiting'|'failed'|'waiting_for_user_answer'), last_activity, parent_thread_id, trigger_id, and the full projection field set.".to_string(),
+            description: "List thread summaries from the workspace's projection. Returns a newest-first JSON array of `ThreadSummary` rows (one per thread) — the same shape returned by `GET /api/v1/threads/list` and the `lucidos threads list` CLI. Use this instead of `query_events` when you want to know what threads exist (and their status / source / age) — `query_events` over `MessageReceived`/`ResponseGenerated` pairs would be much more expensive. Each ThreadSummary includes thread_id, title, channel ('chat'|'claude_code'|'trigger'; coding-agent threads currently retain the legacy 'claude_code' channel value), status ('idle'|'running'|'waiting'|'failed'|'waiting_for_user_answer'), last_activity, parent_thread_id, trigger_id, and the full projection field set.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "active": {
                         "type": "boolean",
-                        "description": "When true, restricts to threads where the agentic loop is mid-flow (status running or waiting_for_user_answer). When false, inverts. Omit for no filter. Note: 'waiting' is NOT active — it means CC has stopped and proposed changes the user must act on; the loop has paused."
+                        "description": "When true, restricts to threads where the agentic loop is mid-flow (status running or waiting_for_user_answer). When false, inverts. Omit for no filter. Note: 'waiting' is NOT active — it means the coding agent has stopped and proposed changes the user must act on; the loop has paused."
                     },
                     "source": {
                         "type": "string",
-                        "description": "Filter by source. Comma-separated list of 'chat', 'trigger', 'claude_code'. Omit for all."
+                        "description": "Filter by source. Comma-separated list of 'chat', 'trigger', 'coding-agent'. Legacy 'claude_code' is also accepted. Omit for all."
                     },
                     "limit": {
                         "type": "integer",
@@ -121,7 +121,7 @@ pub(super) fn list_tools() -> Vec<ToolDefinition> {
                     },
                     "source": {
                         "type": "string",
-                        "description": "Filter by source. Comma-separated list of 'chat', 'trigger', 'claude_code'. Omit for all."
+                        "description": "Filter by source. Comma-separated list of 'chat', 'trigger', 'coding-agent'. Legacy 'claude_code' is also accepted. Omit for all."
                     }
                 }
             }),

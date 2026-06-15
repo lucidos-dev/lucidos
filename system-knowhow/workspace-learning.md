@@ -50,7 +50,7 @@ Friction signals to pull:
 | Circuit-breaker trips | LLM force-broken on the same target ≥3 times in one thread (see `.claude/rules/frontend.md` § Circuit Breakers) |
 | Failed responses | `ResponseFailed` payloads — model errors, timeouts, parsing failures. Group by error reason. |
 | Aborts / cancels | `ResponseAborted` (system) and `ResponseCanceled` (user) — both worth grouping. |
-| Trigger failures | `TriggerCompleted` payloads with errors, or triggers that ran but produced no useful output |
+| Trigger failures | `TriggerCompleted` payloads whose `result_summary` carries an error. Note: the engine guarantees a non-empty `result_summary` — a run that produced nothing falls back to `"<name> completed (no output)"` or `"<name> completed (exit <code>, no output)"`. Those deterministic no-op lines are an **expected** idle-detector outcome (broad subscription + cheap internal gate), **not** friction — do not flag them as "produced no useful output". |
 | Dead triggers | `TriggerCreated` with zero matching `TriggerCompleted` since creation |
 | App errors | App emits its own error events, or `ToolResult` errors in app-spawned threads |
 | User corrections in chats | `MessageReceived` immediately following a `ResponseGenerated` / `ResponseAborted` / `ToolResult` whose text reads like a correction ("no", "don't", "stop", "actually", "that's wrong", "instead", "you misunderstood") |

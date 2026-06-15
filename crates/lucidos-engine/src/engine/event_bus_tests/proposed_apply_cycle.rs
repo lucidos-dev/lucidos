@@ -248,6 +248,7 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
     let events = vec![
         (
             ThreadEvent::SessionStarted {
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: "s1".into(),
                 branch: "claude-code/fix".into(),
                 repo_id: None,
@@ -442,6 +443,181 @@ async fn change_applied_persists_device_actor_in_payload() {
         Some("Test MacBook"),
         "actor.label must round-trip so the chip renders the user's device name, \
          got: {actor_json:?}"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Seed a real pending `changes` row by replaying the production CC lifecycle
+/// (session → aggregate `ChangeProposed`) with a valid-UUID change_id so the
+/// projection's `write_proposed_aggregate` actually inserts the row. The
+/// shared `emit_change_proposed` helper builds a non-UUID id that
+/// `parse_change_id` rejects, so it can't be used when a test needs a real
+/// row to claim. Returns the change_id.
+async fn seed_pending_change(bus: &EventBus, thread_id: Uuid, branch: &str) -> Uuid {
+    start_cc_session(bus, thread_id, branch, None).await;
+    let change_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ChangeProposed {
+            change_id: change_id.to_string(),
+            description: Some("Fix".into()),
+            files: vec!["src/main.rs".into()],
+            requires_restart: false,
+            origin: None,
+            commit_sha: None,
+            branch_name: branch.into(),
+            repo_root: "/tmp".into(),
+            hardened: false,
+            incomplete: false,
+            path: String::new(),
+            diff: String::new(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    change_id
+}
+
+fn change_applied_event(change_id: Uuid) -> ThreadEvent {
+    ThreadEvent::ChangeApplied {
+        change_id: change_id.to_string(),
+        requires_restart: false,
+        client_update: false,
+        commits: vec![],
+        thread_title: None,
+        actor: None,
+        pre_merge_sha: None,
+        post_merge_sha: None,
+        path: String::new(),
+    }
+}
+
+async fn count_change_applied(pool: &PgPool, change_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE event_type = 'ChangeApplied' AND payload->>'change_id' = $1",
+    )
+    .bind(change_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Bug: one logical apply must emit `ChangeApplied` at most once per change_id.
+/// A sequential re-apply — an HTTP retry, the Apply-All driver re-firing, or a
+/// post-restart recovery path re-emitting minutes later (the observed
+/// 4-minute-gap, no-actor second emit) — used to persist a SECOND
+/// `ChangeApplied`, rendering two "Change applied" timeline entries with no
+/// input/output between them. The EventBus single-fire guard claims the
+/// change row and suppresses the duplicate.
+#[tokio::test]
+async fn change_applied_emits_once_on_sequential_reapply() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let change_id = seed_pending_change(&bus, thread_id, "claude-code/once-seq").await;
+
+    // First apply persists the event and flips the change row to applied.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: change_applied_event(change_id),
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    // Second apply (re-emit) of the same change_id must be suppressed.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: change_applied_event(change_id),
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        count_change_applied(&pool, change_id).await,
+        1,
+        "ChangeApplied must be persisted at most once per change_id — a sequential \
+         re-apply must not produce a second 'Change applied' timeline entry"
+    );
+
+    let status: String = sqlx::query_scalar("SELECT status FROM changes WHERE id = $1")
+        .bind(change_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "applied", "the change row is applied after the first emit");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Bug: two concurrent applies of one pending change (an Apply double-click, a
+/// client retry, or the user racing the Apply-All driver) both read
+/// status='pending' and both used to emit `ChangeApplied` (~0.6s apart, the
+/// classic double-fire). The `FOR UPDATE` claim in the single-fire guard
+/// serializes them so exactly one event persists.
+#[tokio::test]
+async fn change_applied_emits_once_under_concurrent_apply() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let change_id = seed_pending_change(&bus, thread_id, "claude-code/once-conc").await;
+
+    let (r1, r2) = tokio::join!(
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: change_applied_event(change_id),
+            meta: EventMeta::NONE,
+        }),
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: change_applied_event(change_id),
+            meta: EventMeta::NONE,
+        }),
+    );
+    r1.unwrap();
+    r2.unwrap();
+
+    assert_eq!(
+        count_change_applied(&pool, change_id).await,
+        1,
+        "concurrent applies of one change must collapse to exactly one ChangeApplied"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Guard must NOT suppress legitimate single emits whose change_id has no
+/// `changes` row to claim (a throwaway/test id, or a row whose
+/// `ChangeProposed` never landed — e.g. the external-repo archive carve-out
+/// and the Tier-3 stash→take slow path both emit `ChangeApplied` for a
+/// change with no aggregate row). These must still emit exactly once.
+#[tokio::test]
+async fn change_applied_without_changes_row_still_emits_once() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/no-row", None).await;
+
+    // Valid UUID, but no ChangeProposed was emitted → no `changes` row exists.
+    let change_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: change_applied_event(change_id),
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        count_change_applied(&pool, change_id).await,
+        1,
+        "a ChangeApplied with no changes row to dedup against must still emit once"
     );
 
     pool.close().await;

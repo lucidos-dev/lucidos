@@ -76,6 +76,28 @@ describe('formatBinding', () => {
     expect(formatBinding(shortcutDef('newThread').defaultBinding, false)).toBe('Ctrl+Shift+O');
     expect(formatBinding(shortcutDef('searchEverywhere').defaultBinding, false)).toBe('Ctrl+Shift+S');
   });
+  it('Mac shows ⌃⇧3 for a mod+shift+digit pane toggle (Cmd+Shift+digit hits the screenshot chords)', () => {
+    expect(formatBinding(shortcutDef('toggleContentPane').defaultBinding, true)).toBe('⌃⇧3');
+    expect(formatBinding(shortcutDef('toggleContentPane').defaultBinding, false)).toBe('Ctrl+Shift+3');
+  });
+  it('renders arrow keys as glyphs on both platforms', () => {
+    expect(formatBinding(shortcutDef('widenThreadPane').defaultBinding, true)).toBe('⌘⌥→');
+    expect(formatBinding(shortcutDef('narrowThreadPane').defaultBinding, false)).toBe('Ctrl+Alt+←');
+    expect(formatBinding(shortcutDef('previousThread').defaultBinding, true)).toBe('⌘⌥↑');
+    expect(formatBinding(shortcutDef('narrowThreadDrawer').defaultBinding, false)).toBe('Ctrl+Alt+Shift+←');
+  });
+});
+
+describe('SHORTCUT_DEFS registry invariants', () => {
+  it('no two shortcuts share a default binding', () => {
+    const serialized = SHORTCUT_DEFS.map((d) => serializeBinding(d.defaultBinding));
+    expect(new Set(serialized).size).toBe(SHORTCUT_DEFS.length);
+  });
+  it('every default binding is a bindable chord', () => {
+    for (const def of SHORTCUT_DEFS) {
+      expect(isBindableChord(def.defaultBinding), def.id).toBe(true);
+    }
+  });
 });
 
 describe('isBindableChord', () => {

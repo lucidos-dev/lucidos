@@ -546,6 +546,7 @@ async fn test_cc_child_stale_resume_does_not_decrement_parent() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "stale-sid".into(),
             branch: "claude-code/stale".into(),
             repo_id: None,

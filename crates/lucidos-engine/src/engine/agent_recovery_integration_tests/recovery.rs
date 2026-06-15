@@ -36,6 +36,7 @@ async fn recovery_marks_pending_change_incomplete_for_mid_turn_branch() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-midturn".into(),
             branch: branch.into(),
             repo_id: None,
@@ -168,6 +169,7 @@ async fn apply_now_no_live_session_fast_path_preserves_clean_pending_change() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-fastpath".into(),
             branch: branch.into(),
             repo_id: None,
@@ -279,6 +281,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: no_terminal,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-noterm".into(),
             branch: "claude-code/noterm".into(),
             repo_id: None,
@@ -305,6 +308,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: clean,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-clean".into(),
             branch: "claude-code/clean".into(),
             repo_id: None,
@@ -362,6 +366,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: aborted,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-abort".into(),
             branch: "claude-code/abort".into(),
             repo_id: None,
@@ -399,6 +404,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: canceled,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-cancel".into(),
             branch: "claude-code/cancel".into(),
             repo_id: None,
@@ -436,6 +442,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: failed,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-fail".into(),
             branch: "claude-code/fail".into(),
             repo_id: None,
@@ -471,6 +478,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: clean_then_aborted,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-mixed".into(),
             branch: "claude-code/mixed".into(),
             repo_id: None,
@@ -530,6 +538,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: cross_channel,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-xchan".into(),
             branch: "claude-code/xchan".into(),
             repo_id: None,

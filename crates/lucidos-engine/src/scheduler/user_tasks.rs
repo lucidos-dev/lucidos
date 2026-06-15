@@ -175,7 +175,14 @@ async fn execute_script_task(
         .await
     {
         Ok(output) => {
-            let summary = if output.len() > 500 {
+            // Existing behavior for non-empty stdout: the whole output is the
+            // summary (truncated). When the script exits 0 with no stdout, the
+            // engine substitutes a meaningful one-liner instead of a blank
+            // summary — exit is 0 here (execute_script returns Err on any
+            // non-zero exit). See `crate::triggers::summary`.
+            let summary = if output.trim().is_empty() {
+                crate::triggers::script_fallback_summary(&output, &config.name, 0)
+            } else if output.len() > 500 {
                 format!("{}...", output.chars().take(497).collect::<String>())
             } else {
                 output
@@ -188,7 +195,12 @@ async fn execute_script_task(
         }
         Err(e) => {
             let title = format!("{}{}", config.name, ERROR_TITLE_SUFFIX);
-            let message = format!("[trigger: {}] {}", config.id, e);
+            // Normalize the error reason so a failed run never surfaces a blank
+            // message (the "[trigger: id]" prefix keeps the line non-empty even
+            // if the reason were empty, but normalize the reason for parity with
+            // the intent path).
+            let reason = crate::triggers::ensure_non_empty_error(&e.to_string(), &config.name);
+            let message = format!("[trigger: {}] {}", config.id, reason);
             emit_failure_notification(&engine, config, title, message).await;
             Err(e)
         }
@@ -237,6 +249,7 @@ async fn execute_llm_task(
         &user_message,
         invocation,
         config.go_to_review,
+        config.side_effect_grant.clone(),
         external_cancel,
     );
     let result = ACTIVE_TRIGGER_ID
@@ -285,10 +298,11 @@ async fn execute_llm_task(
             }
 
             let title = format!("{}{}", config.name, ERROR_TITLE_SUFFIX);
+            let reason = crate::triggers::ensure_non_empty_error(&err_str, &config.name);
             let message = if is_transient {
-                format!("Transient error (will retry on next schedule): {}", err_str)
+                format!("Transient error (will retry on next schedule): {}", reason)
             } else {
-                err_str
+                reason
             };
             emit_failure_notification(&engine, config, title, message).await;
             return Err(e);
@@ -374,7 +388,7 @@ pub(crate) fn build_trigger_user_message(
 }
 
 /// Static system-prompt addendum applied to every LLM trigger fire. Carries
-/// the framing rules (you ARE the fire; do NOT re-schedule; self-pause /
+/// the trigger-fire framing rules (do not re-schedule; self-pause /
 /// self-delete only on the id named in the user header). Kept 100% static —
 /// no per-trigger interpolation — so the system-prompt prefix cache stays hot
 /// across fires. Per-trigger id and name travel in the user header built by
@@ -382,12 +396,12 @@ pub(crate) fn build_trigger_user_message(
 /// `engine/tools/scheduler.rs` is the second line of defense; this is the
 /// soft, in-prompt one.
 pub const TRIGGER_SYSTEM_ADDENDUM: &str = "\n\n## Scheduled Trigger Execution\n\
-When the user message starts with `[SCHEDULED TRIGGER FIRE — ...]`, you ARE \
-the scheduled execution of that trigger. Execute the intent in this turn. \
-Do NOT call create_trigger, update_trigger, or any scheduling tool — you ARE \
-the schedule firing. The only scheduling calls allowed are pause_trigger / \
-delete_trigger on the trigger id named in the header, and only if the intent \
-explicitly says to self-pause/delete.\n\n\
+When the user message starts with `[SCHEDULED TRIGGER FIRE — ...]`, treat it \
+as a trigger firing request and fulfill the intent for this firing. Do not \
+call create_trigger, update_trigger, or other scheduling tools from inside a \
+firing. The only scheduling calls available during a firing are pause_trigger \
+/ delete_trigger for the trigger id named in the header, and only if the \
+intent explicitly says to self-pause/delete.\n\n\
 If the intent is procedural (multi-step, uses subprocesses, follows a known \
 recipe), and your system prompt includes a `Trigger Know-how` section, items \
 listed there belong to THIS trigger and are likely relevant. Use \
@@ -606,7 +620,7 @@ mod tests {
     //
     // The fire-time prompt is split across two surfaces:
     //  (1) a per-fire user message — header (id + name) + verbatim intent body
-    //  (2) a static system-prompt addendum — the rules ("you ARE the fire,
+    //  (2) a static system-prompt addendum — the rules (trigger firing,
     //      don't call create_trigger…")
     //
     // Splitting this way (a) puts the rules in the system prompt where they
@@ -774,11 +788,23 @@ mod tests {
 
     #[test]
     fn trigger_system_addendum_warns_against_scheduling_tools() {
-        // The static addendum carries the "you ARE the fire" rules and the
-        // explicit ban on create_trigger / update_trigger that would otherwise
-        // produce infinite-creation loops.
+        // The static addendum carries the trigger-fire rules and the explicit
+        // ban on create_trigger / update_trigger that would otherwise produce
+        // infinite-creation loops.
         assert!(TRIGGER_SYSTEM_ADDENDUM.contains("create_trigger"));
         assert!(TRIGGER_SYSTEM_ADDENDUM.contains("update_trigger"));
+    }
+
+    #[test]
+    fn trigger_system_addendum_avoids_echo_prone_slogans() {
+        assert!(
+            !TRIGGER_SYSTEM_ADDENDUM.contains("you ARE"),
+            "trigger addendum should not use slogans Gemini may echo"
+        );
+        assert!(
+            !TRIGGER_SYSTEM_ADDENDUM.contains("Execute the intent in this turn"),
+            "trigger addendum should avoid imperative meta-preamble wording"
+        );
     }
 
     #[test]

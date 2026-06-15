@@ -235,27 +235,35 @@ fn watchdog_diag_log_threshold_is_half_the_fire_limit() {
 
 // ─── safety_net_action decision tree ──────────────────────────────────
 //
-// Pin the four input combinations so a refactor of `run_session.rs`
-// cleanup can't silently drop a branch (e.g. forget the
-// `ContinuationRequested` emit on watchdog fire, leaving threads stuck at
-// "running" when the network dies mid-call).
+// Pin the input combinations so a refactor of `run_session.rs` cleanup
+// can't silently drop a branch (e.g. forget the `ContinuationRequested`
+// emit on watchdog fire, leaving threads stuck at "running" when the
+// network dies mid-call, or forget the stray-signal auto-resume).
+//
+// Args: (safety_net_fired, watchdog_fired, external_already,
+//        killed_by_signal, engine_cancelled).
 
 #[test]
 fn safety_net_action_nothing_when_loop_ended_naturally() {
     // Loop emitted a natural terminator (Generated, Failed, Canceled,
     // Aborted) — no safety net needed. The other inputs are irrelevant.
     assert_eq!(
-        safety_net_action(false, false, false),
+        safety_net_action(false, false, false, false, false),
         SafetyNetAction::Nothing,
     );
     assert_eq!(
-        safety_net_action(false, true, false),
+        safety_net_action(false, true, false, false, false),
         SafetyNetAction::Nothing,
         "watchdog flag is irrelevant when the natural terminator already landed",
     );
     assert_eq!(
-        safety_net_action(false, false, true),
+        safety_net_action(false, false, true, false, false),
         SafetyNetAction::Nothing,
+    );
+    assert_eq!(
+        safety_net_action(false, false, false, true, false),
+        SafetyNetAction::Nothing,
+        "a signal kill is irrelevant when the natural terminator already landed",
     );
 }
 
@@ -264,14 +272,19 @@ fn safety_net_action_skip_when_external_terminal_already_emitted() {
     // The engine-restart fast-path landed a terminal before reaching
     // cleanup — a second terminal would relabel the closed turn.
     assert_eq!(
-        safety_net_action(true, false, true),
+        safety_net_action(true, false, true, false, false),
         SafetyNetAction::Skip,
     );
     assert_eq!(
-        safety_net_action(true, true, true),
+        safety_net_action(true, true, true, false, false),
         SafetyNetAction::Skip,
         "external terminal wins over the watchdog too — no recovery, no abort \
          once a real terminal already closed the turn",
+    );
+    assert_eq!(
+        safety_net_action(true, false, true, true, false),
+        SafetyNetAction::Skip,
+        "external terminal wins over a stray signal-kill too",
     );
 }
 
@@ -281,20 +294,45 @@ fn safety_net_action_continuation_requested_on_watchdog_fire() {
     // auto-recovery, not abort, so the user never sees a spurious
     // failure state.
     assert_eq!(
-        safety_net_action(true, true, false),
+        safety_net_action(true, true, false, false, false),
         SafetyNetAction::EmitContinuationRequested,
         "watchdog fire MUST route to auto-recovery, not abort",
     );
 }
 
 #[test]
+fn safety_net_action_continuation_requested_on_stray_signal_kill() {
+    // The exit=143 bug: CC died from a stray external SIGTERM that the
+    // engine did NOT initiate — auto-resume instead of a red-dot abort.
+    assert_eq!(
+        safety_net_action(true, false, false, true, false),
+        SafetyNetAction::EmitContinuationRequested,
+        "a stray signal-kill with no engine cancel MUST auto-resume",
+    );
+}
+
+#[test]
+fn safety_net_action_aborted_when_engine_cancelled_the_signal_kill() {
+    // A deliberate engine teardown (user Stop, shutdown, restart, eviction)
+    // SIGKILLs the child — that is killed_by_signal, but engine_cancelled
+    // gates it OUT of auto-resume. (In practice a deliberate cancel also
+    // emits its own terminal so the safety net wouldn't fire; this pins the
+    // gate regardless.)
+    assert_eq!(
+        safety_net_action(true, false, false, true, true),
+        SafetyNetAction::EmitAbortedSafetyNet,
+        "engine-initiated signal kill MUST NOT auto-resume",
+    );
+}
+
+#[test]
 fn safety_net_action_aborted_when_no_watchdog_no_external_terminal() {
-    // Driver crash / EOF / parser glitch — emit the red-dot abort so
-    // the UI flips out of "running" and the user knows the work
+    // Driver crash / EOF / parser glitch (no signal) — emit the red-dot
+    // abort so the UI flips out of "running" and the user knows the work
     // didn't complete.
     assert_eq!(
-        safety_net_action(true, false, false),
+        safety_net_action(true, false, false, false, false),
         SafetyNetAction::EmitAbortedSafetyNet,
-        "non-watchdog safety net MUST emit ResponseAborted",
+        "non-watchdog non-signal safety net MUST emit ResponseAborted",
     );
 }

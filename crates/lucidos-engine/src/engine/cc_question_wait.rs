@@ -1,8 +1,9 @@
 //! Rendezvous between a blocked agent waiting for the user's answer and
 //! the answer-submission API (POST /api/v1/threads/{thread_id}/answer-question).
 //! One broadcast channel per pending tool_use_id: the waiter subscribes;
-//! the answer handler sends. Two waiters today: CC's PreToolUse hook
-//! (waiting on POST /api/v1/internal/ask-user-question) and the chat agent's
+//! the answer handler sends. Three waiters today: CC's PreToolUse hook and
+//! Codex's `ask_user_question` MCP tool (both waiting on
+//! POST /api/v1/internal/ask-user-question) and the chat agent's
 //! in-process `ask_user_question` tool (waiting inside the agentic loop).
 //!
 //! In-memory only. On engine restart, both kinds of waiters die — CC

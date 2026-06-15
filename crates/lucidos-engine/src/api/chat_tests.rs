@@ -134,6 +134,7 @@ fn base_req(mode: ActorMode) -> ChatRequest {
         image_hashes: None,
         device_id: None,
         use_claude_code: None,
+        coding_agent: None,
         cc_model: None,
         event_id: None,
         thread_id: None,
@@ -311,20 +312,20 @@ fn caller_workspace_with_all_three_fields_is_valid() {
 #[test]
 fn continuity_new_thread_is_always_ok() {
     // No existing summary => new thread, anything goes
-    assert!(validate_thread_continuity(None, None, None, None).is_ok());
-    assert!(validate_thread_continuity(None, None, Some(true), Some("repo-a")).is_ok());
+    assert!(validate_thread_continuity(None, None, None, None, None, None).is_ok());
+    assert!(validate_thread_continuity(None, None, None, Some(true), Some("repo-a"), None).is_ok());
 }
 
 #[test]
 fn continuity_chat_thread_with_chat_followup_is_ok() {
-    assert!(validate_thread_continuity(Some("chat"), None, None, None).is_ok());
-    assert!(validate_thread_continuity(Some("chat"), None, Some(false), None).is_ok());
+    assert!(validate_thread_continuity(Some("chat"), None, None, None, None, None).is_ok());
+    assert!(validate_thread_continuity(Some("chat"), None, None, Some(false), None, None).is_ok());
 }
 
 #[test]
 fn continuity_chat_thread_rejects_cc_followup() {
     let err =
-        validate_thread_continuity(Some("chat"), None, Some(true), Some("repo-a")).unwrap_err();
+        validate_thread_continuity(Some("chat"), None, None, Some(true), Some("repo-a"), None).unwrap_err();
     assert_eq!(err.0, StatusCode::CONFLICT);
     assert!(err.1.contains("Lucidos"));
     assert!(err.1.contains("Claude Code"));
@@ -332,11 +333,11 @@ fn continuity_chat_thread_rejects_cc_followup() {
 
 #[test]
 fn continuity_cc_thread_rejects_chat_followup() {
-    let err = validate_thread_continuity(Some("claude_code"), Some("repo-a"), None, None)
+    let err = validate_thread_continuity(Some("claude_code"), Some("repo-a"), None, None, None, None)
         .unwrap_err();
     assert_eq!(err.0, StatusCode::CONFLICT);
     let err =
-        validate_thread_continuity(Some("claude_code"), Some("repo-a"), Some(false), None)
+        validate_thread_continuity(Some("claude_code"), Some("repo-a"), None, Some(false), None, None)
             .unwrap_err();
     assert_eq!(err.0, StatusCode::CONFLICT);
 }
@@ -346,8 +347,10 @@ fn continuity_cc_thread_with_matching_repo_is_ok() {
     assert!(validate_thread_continuity(
         Some("claude_code"),
         Some("repo-a"),
+        None,
         Some(true),
         Some("repo-a"),
+        None,
     )
     .is_ok());
 }
@@ -357,8 +360,10 @@ fn continuity_cc_thread_rejects_different_repo() {
     let err = validate_thread_continuity(
         Some("claude_code"),
         Some("repo-a"),
+        None,
         Some(true),
         Some("repo-b"),
+        None,
     )
     .unwrap_err();
     assert_eq!(err.0, StatusCode::CONFLICT);
@@ -371,7 +376,7 @@ fn continuity_cc_thread_with_no_request_repo_is_ok() {
     // Request omits repo_id => frontend will inherit from the thread.
     // Don't 409 just because the field is missing.
     assert!(
-        validate_thread_continuity(Some("claude_code"), Some("repo-a"), Some(true), None,)
+        validate_thread_continuity(Some("claude_code"), Some("repo-a"), None, Some(true), None, None)
             .is_ok()
     );
 }
@@ -382,16 +387,69 @@ fn continuity_cc_thread_with_no_existing_repo_is_ok() {
     // event before SessionStarted carried repo_id). Don't gate on a
     // missing existing value — just let the request through.
     assert!(
-        validate_thread_continuity(Some("claude_code"), None, Some(true), Some("repo-b"),)
+        validate_thread_continuity(Some("claude_code"), None, None, Some(true), Some("repo-b"), None)
             .is_ok()
     );
+}
+
+#[test]
+fn continuity_cc_thread_rejects_backend_flip() {
+    // Thread locked to claude-code (explicit) — requesting codex must 409.
+    let err = validate_thread_continuity(
+        Some("claude_code"),
+        None,
+        Some("claude-code"),
+        Some(true),
+        None,
+        Some(crate::runtime::CodingAgent::Codex),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    assert!(err.1.contains("codex"));
+    assert!(err.1.contains("claude-code"));
+
+    // Legacy row (NULL stored backend) is a claude-code thread — same 409.
+    let err = validate_thread_continuity(
+        Some("claude_code"),
+        None,
+        None,
+        Some(true),
+        None,
+        Some(crate::runtime::CodingAgent::Codex),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, StatusCode::CONFLICT);
+}
+
+#[test]
+fn continuity_cc_thread_accepts_matching_backend() {
+    assert!(validate_thread_continuity(
+        Some("claude_code"),
+        None,
+        Some("codex"),
+        Some(true),
+        None,
+        Some(crate::runtime::CodingAgent::Codex),
+    )
+    .is_ok());
+    // Omitted request backend always passes — the engine resolves from the
+    // stored value.
+    assert!(validate_thread_continuity(
+        Some("claude_code"),
+        None,
+        Some("codex"),
+        Some(true),
+        None,
+        None,
+    )
+    .is_ok());
 }
 
 #[test]
 fn continuity_trigger_thread_treated_as_chat() {
     // Trigger threads aren't claude_code, so use_claude_code=true is a
     // mode switch and must be rejected.
-    let err = validate_thread_continuity(Some("trigger"), None, Some(true), None).unwrap_err();
+    let err = validate_thread_continuity(Some("trigger"), None, None, Some(true), None, None).unwrap_err();
         assert_eq!(err.0, StatusCode::CONFLICT);
     }
 

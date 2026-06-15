@@ -26,6 +26,7 @@ SCRIPT_NAME="e2e"
 source "$_E2E_LIB_DIR/ports.sh"
 source "$_E2E_LIB_DIR/workspace.sh"
 source "$_E2E_LIB_DIR/e2e_lock.sh"
+source "$_E2E_LIB_DIR/webkit_reaper.sh"
 
 # ── ensure_workspace_running ────────────────────────────────────────────
 # Starts the e2e workspace if not running. Ensures both engine AND Vite are up.
@@ -146,27 +147,46 @@ cleanup_e2e_worktrees() {
     git branch --list 'e2e-test/*' 'claude-code/*' 'merge-tmp/*' 2>/dev/null | xargs -r git branch -D 2>/dev/null
 
     # CC test worktrees are physically inside this workspace but registered in
-    # the lucidos repo (where `git worktree add` was run). Without this the
-    # lucidos repo accumulates stale entries every test run; engine recovery
-    # then iterates over hundreds of dead worktrees on next startup and
-    # exceeds its 30s API readiness budget.
+    # the canonical lucidos repo (where `git worktree add` ran). Without this the
+    # repo accumulates stale entries every test run; engine recovery then iterates
+    # over hundreds of dead worktrees on next startup and exceeds its 30s API
+    # readiness budget.
+    #
+    # SAFETY — this repo is SHARED with every real CC session: dev/personal
+    # worktrees and their `claude-code/*` branches all live here, and
+    # `$_E2E_PROJECT_DIR` is whichever checkout invoked the script — frequently a
+    # CC worktree of this same repo. So the ONLY safe discriminator for "created
+    # by an e2e run" is the worktree path living under $E2E_WORKSPACE. NEVER
+    # delete branches by name (`claude-code/*`) or by ancestry: a just-started
+    # real session has no commits ahead of main yet, so an ancestry sweep deletes
+    # live user work — this force-deleted an active session's branch and wiped its
+    # worktree on 2026-06-13. Delete ONLY the branch each removed e2e worktree was
+    # checked out on, captured from the same `git worktree list` record.
     cd "$_E2E_PROJECT_DIR" 2>/dev/null || { cd "$original_dir"; return; }
     git worktree prune 2>/dev/null
+    local wt_path="" cur_branch=""
+    local -a e2e_branches=()
     while IFS= read -r line; do
-        local wt_path
-        wt_path=$(echo "$line" | awk '{print $1}')
-        case "$wt_path" in
-            "$E2E_WORKSPACE"/*) git worktree remove --force "$wt_path" 2>/dev/null && removed=$((removed + 1)) ;;
+        case "$line" in
+            "worktree "*) wt_path="${line#worktree }" ;;
+            "branch "*)   cur_branch="${line#branch refs/heads/}" ;;
+            "")
+                case "$wt_path" in
+                    "$E2E_WORKSPACE"/*)
+                        git worktree remove --force "$wt_path" 2>/dev/null && removed=$((removed + 1))
+                        [ -n "$cur_branch" ] && e2e_branches+=("$cur_branch")
+                        ;;
+                esac
+                wt_path=""; cur_branch=""
+                ;;
         esac
-    done < <(git worktree list 2>/dev/null)
-    # Delete claude-code/* branches whose tip is already an ancestor of main
-    # (no unique work). Active CC sessions have commits ahead of main and
-    # branches checked out by other worktrees aren't deletable, so this is safe.
-    git for-each-ref --format='%(refname:short)' refs/heads/claude-code/ 2>/dev/null | while IFS= read -r br; do
-        if git merge-base --is-ancestor "$br" main 2>/dev/null; then
+    done < <(git worktree list --porcelain 2>/dev/null; printf '\n')
+    if [ "${#e2e_branches[@]}" -gt 0 ]; then
+        local br
+        for br in "${e2e_branches[@]}"; do
             git branch -D "$br" 2>/dev/null || true
-        fi
-    done
+        done
+    fi
 
     cd "$original_dir"
     [ "$removed" -gt 0 ] && echo "Removed $removed worktree(s)" || true
@@ -219,18 +239,23 @@ setup_e2e_session() {
     kill_orphan_simulator
     ensure_workspace_running
 
+    # stop_webkit_reaper leads every branch so the host-memory guard started by
+    # e2e-browser.sh dies with the session. It's idempotent and a no-op when no
+    # reaper was started (e.g. e2e-api.sh), so it's safe in all branches.
     if [ -n "${NO_RESET:-}" ]; then
         # Leave the workspace running so the next invocation starts immediately
         # instead of paying the boot cost again.
-        teardown_e2e() { release_e2e_lock; }
+        teardown_e2e() { stop_webkit_reaper; release_e2e_lock; }
     elif [ -n "$cleanup_on_teardown" ]; then
         teardown_e2e() {
+            stop_webkit_reaper
             cleanup_e2e_worktrees
             stop_e2e_workspace
             release_e2e_lock
         }
     else
         teardown_e2e() {
+            stop_webkit_reaper
             stop_e2e_workspace
             release_e2e_lock
         }

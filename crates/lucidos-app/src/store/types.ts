@@ -35,7 +35,7 @@ export function setLoadingIfFresh<T>(signal: { value: Loadable<T> }): void {
 }
 
 // Menu item names (drawer navigation)
-export const MENU_ITEMS = ['files', 'apps', 'triggers', 'settings', 'changes', 'notifications'] as const;
+export const MENU_ITEMS = ['files', 'apps', 'triggers', 'thread-queue', 'settings', 'changes', 'notifications'] as const;
 export type MenuItem = typeof MENU_ITEMS[number];
 
 // Connection status
@@ -90,7 +90,7 @@ export interface ApiUsage {
   cache_creation_tokens: number;
 }
 
-export type ContextProducer = 'main_llm' | 'claude_code';
+export type ContextProducer = 'main_llm' | 'claude_code' | 'codex';
 
 /** Mirrors the Rust `ContextCaptured` ThreadEvent. `usage` is absent on
  *  pre-call snapshots and on providers that don't report it (OpenAI,
@@ -181,6 +181,25 @@ export type ResponseEvent =
       input: Record<string, unknown>;
       summary: string;
       resolved?: { allowed: boolean; reason?: string };
+    }
+  | {
+      /** The command guard checkpointed the workspace before a ReversibleDanger
+       *  command (ADR 0002, Phase 4). Renders inline with a one-click Undo;
+       *  `reverted` flips true once the paired CommandCheckpointReverted event
+       *  lands in this exchange. */
+      type: 'checkpoint';
+      checkpoint_id: string;
+      command: string;
+      summary: string;
+      reverted: boolean;
+    }
+  | {
+      /** The model ended its turn cleanly but produced no text (a benign empty
+       *  completion — emitted as an empty `ResponseGenerated`). Rendered as a
+       *  neutral note so the exchange clearly states what happened instead of
+       *  showing a blank body or a red error. Synthesised by
+       *  `exchangeResponseEvents`, never sent by the backend. */
+      type: 'empty';
     };
 
 import type { Tap } from '@lucidos/sdk';
@@ -210,6 +229,18 @@ export interface Notification {
 export type TriggerRun =
   | { type: 'intent'; intent: string }
   | { type: 'script'; path: string };
+
+/** An irreversible-side-effect category a trigger can be granted (ADR 0002,
+ *  Phase 5). Wire form is snake_case, matching the Rust `SideEffectCategory`
+ *  enum. Used by the *command guard* to decide whether an unattended trigger
+ *  may run an `IrreversibleDanger` command. Keep in sync with
+ *  `SIDE_EFFECT_CATEGORIES` (the labelled UI list) and the Rust enum. */
+export type SideEffectCategory =
+  | 'email'
+  | 'external_api'
+  | 'cloud_cli'
+  | 'out_of_workspace_destruction'
+  | 'other';
 
 /** One event a trigger listens for, with an optional payload filter scoped
  *  to that event. A trigger fires when an incoming event matches any entry's
@@ -245,6 +276,10 @@ export interface TriggerInfo {
   /** Owning *trigger group* id; absent renders the trigger under the implicit
    *  "Ungrouped" section in the panel. Orthogonal to `app_id`. */
   group_id?: string;
+  /** The trigger's *side-effect grant* (ADR 0002, Phase 5) — the irreversible
+   *  side-effect categories it may perform unattended. Engine omits the field
+   *  when empty, so readers must tolerate absence (= no grant). */
+  side_effect_grant?: SideEffectCategory[];
 }
 
 /** A user-visible folder that organizes triggers in the panel. Pure label —
@@ -259,6 +294,47 @@ export interface TriggerGroup {
   /** Number of triggers whose `group_id` references this group at fetch time.
    *  Used by the panel to render the "(N)" badge on the section header. */
   member_count: number;
+}
+
+// --- Thread Queue (admission control for the shared thread pool) ---
+
+/** One occupant of the shared pool — waiting for capacity (`queued`) or
+ *  actively running (`admitted`). Background kinds come from the
+ *  `thread_queue` projection; `user-chat` is user-initiated work merged from
+ *  the engine's in-memory state (it shares the pool but isn't persisted).
+ *  Mirrors the Rust `ThreadQueueEntry` wire struct. */
+export interface ThreadQueueEntry {
+  id: string;
+  kind: 'event-trigger' | 'cron' | 'sub-thread' | 'coding-agent' | 'user-chat';
+  trigger_id?: string;
+  trigger_name?: string;
+  thread_id?: string;
+  summary: string;
+  status: 'queued' | 'admitted';
+  queued_at: string;
+  admitted_at?: string;
+}
+
+/** The *capacity policy* governing the Thread Queue. Mirrors the Rust
+ *  `CapacityPolicy`. Concurrency caps of 0 mean "hold" (pause admission). */
+export interface CapacityPolicy {
+  max_concurrent_total: number;
+  max_concurrent_event_trigger: number;
+  max_concurrent_cron: number;
+  max_concurrent_sub_thread: number;
+  max_concurrent_coding_agent: number;
+  max_concurrent_per_trigger: number;
+  max_queued_per_trigger: number;
+  /** Slots background work can always reclaim ahead of user-initiated work,
+   *  so user priority can't starve triggers/cron. */
+  reserved_background: number;
+  overflow: 'drop-oldest' | 'pause-trigger';
+}
+
+/** GET /api/v1/thread-queue response. */
+export interface ThreadQueueResponse {
+  entries: ThreadQueueEntry[];
+  policy: CapacityPolicy;
 }
 
 /** An active (non-paused) trigger has no more runs when it has no next_run and no event subscriptions.
@@ -332,7 +408,6 @@ export interface App {
   name: string;
   description: string;
   icon?: string;
-  knowhow: string[];
 }
 
 // A pinned app entry

@@ -194,7 +194,10 @@ const BUS_CAPACITY: usize = 4096;
 ///
 /// 1. **Validate** — pre-INSERT checks (e.g. `request_event_id` existence) that
 ///    read the same tx snapshot the upcoming Persist will use. May short-circuit
-///    with `Err` before any events row is written.
+///    with `Err` before any events row is written, or with `Ok(None)` for the
+///    `ChangeApplied` single-fire guard, which `FOR UPDATE`-locks the change row
+///    and drops a duplicate apply so one change can't emit two `ChangeApplied`
+///    events.
 /// 2. **Persist** — INSERT into the `events` table. Assigns the bigserial
 ///    sequence that drives every downstream consumer's ordering.
 /// 3. **Project** — update derived state (`thread_summaries` and friends) in
@@ -516,8 +519,10 @@ impl EventBus {
                     // === Phase: Validate ===
                     // Pre-INSERT checks that read the same tx snapshot the upcoming
                     // Persist will use. May short-circuit with Err before any events
-                    // row is written. See the EventBus struct doc-comment for the
-                    // full phase contract.
+                    // row is written, or with Ok(None) for the ChangeApplied
+                    // single-fire guard (a recognized duplicate is dropped, not an
+                    // error). See the EventBus struct doc-comment for the full phase
+                    // contract.
                     //
                     // Validate request_event_id exists in the DB. Orphaned references
                     // cause stuck threads when the frontend can't group events into
@@ -535,6 +540,35 @@ impl EventBus {
                                  (event_type={}, thread_id={}). This causes orphaned event references.",
                                 req_id, te.event_type(), thread_id
                             );
+                        }
+                    }
+
+                    // Single-fire guard for ChangeApplied: claim the change row
+                    // (`FOR UPDATE`) and suppress the emit if a ChangeApplied was
+                    // already recorded for this change_id. Every apply path funnels
+                    // its ChangeApplied through this one chokepoint, so the guard
+                    // makes the event idempotent across concurrent double-fires
+                    // (the ~0.6s race), HTTP/Apply-All retries, conflict-recovery
+                    // cleanup, and post-restart recovery re-emits (the 4-minute-gap
+                    // case) — fixing two "Change applied" timeline entries for one
+                    // change. The lock is held until this tx commits and Phase
+                    // Project's `write_applied` flips the row to `applied`, so a
+                    // racing emit blocks, then reads `applied` and is suppressed.
+                    // Legitimate single emits (recovery no-ops, rows with no
+                    // aggregate) run while the row is still pending or absent and
+                    // therefore `Proceed`, emitting exactly once.
+                    if let ThreadEvent::ChangeApplied { change_id, .. } = te {
+                        use crate::core::changes_projection::{ChangeApplyDedup, ChangesProjection};
+                        if ChangesProjection::change_apply_dedup(&mut tx, change_id).await?
+                            == ChangeApplyDedup::Suppress
+                        {
+                            tx.rollback().await?;
+                            crate::log!(
+                                "[EventBus] ChangeApplied suppressed for {} — already applied \
+                                 (duplicate apply path)",
+                                change_id
+                            );
+                            return Ok(None);
                         }
                     }
 

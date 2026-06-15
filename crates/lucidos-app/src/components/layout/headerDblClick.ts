@@ -1,9 +1,7 @@
-import { setSplitRatio, DEFAULT_SPLIT_RATIO } from './splitHelpers';
+import { setSplitRatio, toggleContentPaneRatio, toggleThreadPaneRatio } from './splitHelpers';
 
+/** Double-clicking the thread-side header maximizes the thread pane (toggles
+ *  the content pane collapsed); the content-side header does the reverse. */
 export function resolveHeaderDblClick({ clickedThreadSide, ratio }: { clickedThreadSide: boolean; ratio: number }) {
-  if (clickedThreadSide) {
-    setSplitRatio(ratio >= 1 ? DEFAULT_SPLIT_RATIO : 1);
-  } else {
-    setSplitRatio(ratio === 0 ? DEFAULT_SPLIT_RATIO : 0);
-  }
+  setSplitRatio(clickedThreadSide ? toggleContentPaneRatio(ratio) : toggleThreadPaneRatio(ratio));
 }

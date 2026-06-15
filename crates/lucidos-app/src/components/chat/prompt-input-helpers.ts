@@ -14,6 +14,57 @@ import type { BannerState } from './WaitingBanner';
  *  on send failure (via the catch handler in submit). */
 export const submittingThreadIds = signal<Set<string>>(new Set());
 
+export interface UploadSendIntent<TContext = unknown> {
+  useClaudeCode: boolean;
+  context: TContext | null;
+}
+
+/** Thread sends the user clicked while an attached image was still uploading.
+ *  The draft stays intact and the actual send is retried once the pending
+ *  upload entries settle into confirmed draft hashes. While queued, the same
+ *  optimistic submitting signal as a normal send drives the Send→Cancel morph. */
+export const queuedUploadSends = signal<Map<string, UploadSendIntent>>(new Map());
+
+export function queueUploadSend<TContext>(
+  threadId: string,
+  intent: UploadSendIntent<TContext>,
+): void {
+  const next = new Map(queuedUploadSends.value);
+  next.set(threadId, intent as UploadSendIntent);
+  queuedUploadSends.value = next;
+  markSubmittingThread(threadId);
+}
+
+export function takeQueuedUploadSend(threadId: string): UploadSendIntent | null {
+  const intent = queuedUploadSends.value.get(threadId);
+  if (!intent) return null;
+  const next = new Map(queuedUploadSends.value);
+  next.delete(threadId);
+  queuedUploadSends.value = next;
+  return intent;
+}
+
+export function clearQueuedUploadSend(threadId: string): void {
+  if (!queuedUploadSends.value.has(threadId)) return;
+  const next = new Map(queuedUploadSends.value);
+  next.delete(threadId);
+  queuedUploadSends.value = next;
+  clearSubmittingThread(threadId);
+}
+
+function markSubmittingThread(threadId: string): void {
+  const next = new Set(submittingThreadIds.value);
+  next.add(threadId);
+  submittingThreadIds.value = next;
+}
+
+export function clearSubmittingThread(threadId: string): void {
+  if (!submittingThreadIds.value.has(threadId)) return;
+  const next = new Set(submittingThreadIds.value);
+  next.delete(threadId);
+  submittingThreadIds.value = next;
+}
+
 /** For a thread whose Cancel was clicked while a question was on screen, the
  *  `tool_use_id` of the question that was pending at click time. The cleanup
  *  effect (PromptInput) keys the optimistic `cancelingThreadIds` release off
@@ -79,16 +130,12 @@ export function dispatchSend(
   send: () => Promise<void>,
 ): { promise: Promise<void>; submittedId: string | null } {
   if (threadId) {
-    const next = new Set(submittingThreadIds.value);
-    next.add(threadId);
-    submittingThreadIds.value = next;
+    markSubmittingThread(threadId);
   }
   const promise = send();
   const submittedId = threadId ?? focusedThreadId.value;
   if (!threadId && submittedId) {
-    const next = new Set(submittingThreadIds.value);
-    next.add(submittedId);
-    submittingThreadIds.value = next;
+    markSubmittingThread(submittedId);
   }
   return { promise, submittedId };
 }

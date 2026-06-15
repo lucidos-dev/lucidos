@@ -17,14 +17,14 @@ use axum::{
     extract::{Multipart, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    routing::get,
+    Json, Router,
 };
 use serde::Serialize;
-use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::api::actor::user_actor_resolved;
-use crate::api::AppState;
+use crate::api::{ApiError, AppState};
 use crate::core::blobs::{
     get_or_create_preview, resolve_blob, write_blob, BlobError, PREVIEW_MAX_EDGE,
 };
@@ -37,17 +37,6 @@ pub(super) struct BlobUploadResponse {
     pub hash: String,
     pub mime: String,
     pub byte_size: u64,
-}
-
-fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<JsonValue>) {
-    (code, Json(serde_json::json!({ "error": msg })))
-}
-
-fn internal_err<E: std::fmt::Display>(e: E) -> (StatusCode, Json<JsonValue>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": e.to_string() })),
-    )
 }
 
 /// POST /api/v1/threads/:id/blobs — content-addressed image upload.
@@ -63,7 +52,7 @@ pub(super) async fn post_blob(
     Path(thread_id): Path<Uuid>,
     headers: HeaderMap,
     mut multipart: Multipart,
-) -> Result<(StatusCode, Json<BlobUploadResponse>), (StatusCode, Json<JsonValue>)> {
+) -> Result<(StatusCode, Json<BlobUploadResponse>), ApiError> {
     // Verify thread state before reading the upload body — fail fast on
     // 404/410 without spending bandwidth on the file.
     let lookup: Option<(String,)> =
@@ -71,15 +60,15 @@ pub(super) async fn post_blob(
             .bind(thread_id)
             .fetch_optional(state.engine.pool())
             .await
-            .map_err(internal_err)?;
+            .map_err(|e| ApiError::internal(e.to_string()))?;
     let current_state = lookup
         .map(|(s,)| ThreadState::from_db_str(&s))
         .transpose()
-        .map_err(internal_err)?;
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     match current_state {
-        None => return Err(err(StatusCode::NOT_FOUND, "thread not found")),
+        None => return Err(ApiError::not_found("thread not found")),
         Some(ThreadState::Discarded) => {
-            return Err(err(StatusCode::GONE, "thread discarded"))
+            return Err(ApiError::new(StatusCode::GONE, "thread discarded"))
         }
         Some(ThreadState::Composing | ThreadState::Active) => {}
     }
@@ -90,24 +79,24 @@ pub(super) async fn post_blob(
     let field = multipart
         .next_field()
         .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("multipart read: {e}")))?
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing 'file' part"))?;
+        .map_err(|e| ApiError::bad_request(format!("multipart read: {e}")))?
+        .ok_or_else(|| ApiError::bad_request("missing 'file' part"))?;
     let bytes = field
         .bytes()
         .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("read body: {e}")))?;
+        .map_err(|e| ApiError::bad_request(format!("read body: {e}")))?;
 
     // write_blob sniffs the mime against the allowlist; on rejection
     // it returns BlobError::UnsupportedMime → 415 with no disk write.
     let resolved = match write_blob(&state.workspace_path, &bytes) {
         Ok(r) => r,
         Err(BlobError::UnsupportedMime) => {
-            return Err(err(
+            return Err(ApiError::new(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported image mime (allowed: jpeg, png, webp, gif, heic)",
             ));
         }
-        Err(BlobError::Io(e)) => return Err(internal_err(e)),
+        Err(BlobError::Io(e)) => return Err(ApiError::internal(e.to_string())),
         // write_blob never returns BadEncoding (it takes raw bytes); the
         // variant only fires through write_blob_from_base64.
         Err(BlobError::BadEncoding(_)) => unreachable!(),
@@ -132,7 +121,7 @@ pub(super) async fn post_blob(
         .event_bus
         .emit(event)
         .await
-        .map_err(internal_err)?;
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     // Pre-generate the browser-display preview off the request path so the
     // first GET /blobs/:hash/preview always hits the warm cache. Lazy
@@ -163,13 +152,15 @@ pub(super) async fn post_blob(
 async fn stream_immutable(
     path: std::path::PathBuf,
     mime: String,
-) -> Result<Response, (StatusCode, Json<JsonValue>)> {
-    let file = tokio::fs::File::open(&path).await.map_err(internal_err)?;
+) -> Result<Response, ApiError> {
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let stream = tokio_util::io::ReaderStream::new(file);
     let mut response = Response::new(Body::from_stream(stream));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_str(&mime).map_err(internal_err)?,
+        HeaderValue::from_str(&mime).map_err(|e| ApiError::internal(e.to_string()))?,
     );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -184,10 +175,10 @@ async fn stream_immutable(
 pub(super) async fn get_blob(
     State(state): State<AppState>,
     Path(hash): Path<String>,
-) -> Result<Response, (StatusCode, Json<JsonValue>)> {
+) -> Result<Response, ApiError> {
     let resolved = match resolve_blob(&state.workspace_path, &hash) {
         Some(r) => r,
-        None => return Err(err(StatusCode::NOT_FOUND, "blob not found")),
+        None => return Err(ApiError::not_found("blob not found")),
     };
     stream_immutable(resolved.path, resolved.mime).await
 }
@@ -200,17 +191,26 @@ pub(super) async fn get_blob(
 pub(super) async fn get_blob_preview(
     State(state): State<AppState>,
     Path(hash): Path<String>,
-) -> Result<Response, (StatusCode, Json<JsonValue>)> {
+) -> Result<Response, ApiError> {
     let workspace = state.workspace_path.clone();
     let resolved = tokio::task::spawn_blocking(move || {
         get_or_create_preview(&workspace, &hash, PREVIEW_MAX_EDGE)
     })
     .await
-    .map_err(internal_err)?
-    .map_err(internal_err)?;
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     let resolved = match resolved {
         Some(r) => r,
-        None => return Err(err(StatusCode::NOT_FOUND, "blob not found")),
+        None => return Err(ApiError::not_found("blob not found")),
     };
     stream_immutable(resolved.path, resolved.mime).await
+}
+
+/// Routes for the `/blobs/*` read surface. The upload route is
+/// thread-shaped (`POST /api/v1/threads/:id/blobs`) and registers under
+/// `threads::router()`.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/blobs/:hash", get(get_blob))
+        .route("/blobs/:hash/preview", get(get_blob_preview))
 }

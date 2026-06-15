@@ -67,6 +67,7 @@ async fn emit_cc_session_started(bus: &EventBus, child_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: "claude-code/test".into(),
             repo_id: None,
@@ -415,4 +416,6 @@ mod thread_state_and_eviction;
 mod has_diff_and_actor;
 mod blocking_attention_counts;
 mod ancestor_rebroadcast;
+mod command_permission;
 mod recovery_and_pipeline;
+mod repo_names_projection;

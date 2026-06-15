@@ -112,6 +112,89 @@ impl LucidosEngine {
         batch_id
     }
 
+    /// Cancel every in-flight Apply All batch — the user clicked Cancel on the
+    /// batch toast. For each batch: remove it from the registry first (so the
+    /// driver stops advancing to the next member), interrupt the in-flight
+    /// member's live coding-agent session (the one currently hardening or
+    /// merging), mark every still-pending member canceled so the batch reads as
+    /// complete, then emit `ApplyAllBatchCompleted`.
+    ///
+    /// Semantics: already-applied members stay applied; the in-flight apply
+    /// aborts back to pending (best-effort — a merge that already landed before
+    /// the interrupt processes still lands and emits `ChangeApplied`, which the
+    /// now-removed batch ignores); queued members are left untouched as pending.
+    /// Returns the number of batches canceled (0 = nothing was running).
+    pub(crate) async fn cancel_apply_all_batches(&self, actor: Option<MessageOrigin>) -> usize {
+        // Snapshot pending members and remove the batches under ONE lock so the
+        // driver can't spawn a new member's apply between the snapshot and the
+        // removal. `get_by_id` / `interrupt_agent` run after the lock is dropped.
+        let (pending_by_batch, finals): (Vec<Vec<Uuid>>, Vec<BatchProgress>) = {
+            let mut reg = self.apply_all_batches.lock().await;
+            let mut pendings = Vec::new();
+            let mut finals = Vec::new();
+            for batch_id in reg.batch_ids() {
+                if let Some(batch) = reg.get_mut(batch_id) {
+                    let pending = batch.pending_members();
+                    for change_id in &pending {
+                        batch.record_failed(*change_id, "Apply All canceled".into());
+                    }
+                    pendings.push(pending);
+                }
+                if let Some(final_state) = reg.remove(batch_id) {
+                    finals.push(final_state);
+                }
+            }
+            (pendings, finals)
+        };
+        if finals.is_empty() {
+            return 0;
+        }
+        // Interrupt the in-flight coding-agent session — the one pending member
+        // whose thread is mid-harden/merge. The queued members have no live
+        // session (interrupt is a lookup miss for them), so this only touches
+        // the apply that's actually running.
+        for pending in &pending_by_batch {
+            for &change_id in pending {
+                let thread_id = match self.changes().get_by_id(change_id).await {
+                    Ok(Some(c)) => c.thread_id,
+                    _ => None,
+                };
+                if let Some(thread_id) = thread_id {
+                    if self.is_agent_running_for(thread_id).await {
+                        if let Err(e) = self.interrupt_agent(Some(thread_id), actor.clone()).await {
+                            log!(
+                                "[ApplyAll] cancel: interrupt_agent({}) failed: {}",
+                                thread_id,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let count = finals.len();
+        for final_state in finals {
+            log!(
+                "[ApplyAll] batch {} canceled — applied={}, canceled/failed={}",
+                final_state.batch_id(),
+                final_state.applied_ids().len(),
+                final_state.failures().len()
+            );
+            self.event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::ApplyAllBatchCompleted {
+                        batch_id: final_state.batch_id(),
+                        applied: final_state.applied_ids(),
+                        failed: final_state.failures(),
+                    }),
+                    "[ApplyAll] ApplyAllBatchCompleted (canceled)",
+                )
+                .await;
+        }
+        self.broadcast_changes_updated().await;
+        count
+    }
+
     /// Update the registry for one resolved change and decide what to do
     /// next. Called only from the driver task. Holds the registry lock just
     /// long enough to inspect + mutate, then releases before emitting the

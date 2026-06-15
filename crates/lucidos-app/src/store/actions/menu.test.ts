@@ -47,7 +47,6 @@ const fakeApp: App = {
   id: 'trip-planner',
   name: 'Trip Planner 2026',
   description: 'Trip planner',
-  knowhow: [],
 };
 
 describe('switchMenuItem', () => {
@@ -132,6 +131,15 @@ describe('switchMenuItem', () => {
     // while looking at a thread must STILL swipe to content.
     activeMenuItem.value = 'notifications';
     switchMenuItem('notifications');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+  });
+
+  it('navigates to the Thread Queue panel like any other menu item', () => {
+    // Mirror entry for the Thread Queue navigation point (frontend.md: new
+    // navigation entry points get pinned here). The panel rides the standard
+    // switchMenuItem path — active item set + content pane revealed.
+    switchMenuItem('thread-queue');
+    expect(activeMenuItem.value).toBe('thread-queue');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 });

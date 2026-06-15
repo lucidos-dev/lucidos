@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
-import { searchEverywhereOpen, showToast, appsList, artifacts, triggers, threadMap, settingsScrollTarget } from '../../store/store';
-import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
+import { searchEverywhereOpen, searchEverywhereAnchor, showToast, appsList, artifacts, triggers, threadMap, settingsScrollTarget } from '../../store/store';
+import { Overlay } from '../shared/Overlay';
 import { searchEverywhere, type SearchCategory, type SearchResultItem } from '../../api/client';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { openFilePreview } from '../../store/actions/artifacts';
@@ -17,10 +17,10 @@ import './SearchEverywhere.css';
 const CATEGORIES: { id: SearchCategory; label: string }[] = [
   { id: 'all', label: 'All' },
   { id: 'apps', label: 'Apps' },
-  { id: 'threads', label: 'Threads' },
   { id: 'files', label: 'Files' },
-  { id: 'triggers', label: 'Triggers' },
   { id: 'settings', label: 'Settings' },
+  { id: 'threads', label: 'Threads' },
+  { id: 'triggers', label: 'Triggers' },
   { id: 'changes', label: 'Changes' },
 ];
 
@@ -72,7 +72,7 @@ function validateRecents(recents: SearchResultItem[]): SearchResultItem[] {
   return validated;
 }
 
-const SECTION_ORDER = ['apps', 'threads', 'files', 'triggers', 'settings', 'changes'];
+const SECTION_ORDER = ['apps', 'files', 'settings', 'threads', 'triggers', 'changes'];
 
 /** Category-specific SVG icons rendered inline to avoid pulling in all of icons.tsx. */
 function CategoryIcon({ category }: { category: string }) {
@@ -162,7 +162,6 @@ export function SearchEverywhere() {
   const [loading, setLoading] = useState(false);
   const [recents, setRecents] = useState<SearchResultItem[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
-  const modalRef = useRef<HTMLDivElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -243,10 +242,6 @@ export function SearchEverywhere() {
     }
   }, [isOpen]);
 
-  // anchor=null: re-clicking the toggle while open dismisses + swallows
-  // (instead of letting its onClick re-flip the signal back to open).
-  useDismissOnOutside(isOpen, modalRef, null, close);
-
   // Scroll selected result into view
   useEffect(() => {
     if (selectedIndex >= 0 && resultsRef.current) {
@@ -319,17 +314,23 @@ export function SearchEverywhere() {
     }
   }
 
-  // iOS Safari PWA: never unmount — toggle visibility via CSS to avoid
-  // ghost pixels from will-change:transform compositing layer.
-  if (!isOpen) {
-    return <div class="modal-overlay search-everywhere-overlay search-everywhere-hidden" aria-hidden="true" />;
-  }
-
   const hasResults = flat.length > 0;
 
+  // keepMounted: iOS Safari PWA never unmounts the overlay — it toggles
+  // visibility via CSS to avoid ghost pixels from the will-change compositing
+  // layer. anchor: the search toggle, exempt from outside-dismiss so re-tapping
+  // it closes (never reopens). Both contracts live in <Overlay>.
   return (
-    <div class="modal-overlay search-everywhere-overlay">
-      <div ref={modalRef} class="search-everywhere-modal">
+    <Overlay
+      open={isOpen}
+      onClose={close}
+      anchor={searchEverywhereAnchor.value}
+      overlayClass="search-everywhere-overlay"
+      panelClass="search-everywhere-modal"
+      panelRole="dialog"
+      keepMounted
+      hiddenClass="search-everywhere-hidden"
+    >
         <div class="search-everywhere-header">
           <span class="search-everywhere-header-icon"><SearchIcon /></span>
           <input
@@ -423,7 +424,6 @@ export function SearchEverywhere() {
             ))
           )}
         </div>
-      </div>
-    </div>
+    </Overlay>
   );
 }

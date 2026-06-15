@@ -6,14 +6,15 @@ import { MOBILE_PANE_CONFIGS, type MobilePaneConfig } from '../MobileAppHeader';
 // ─────────────────────────────────────────────────────────────────────────────
 // Mobile pane / dot indicator sync tests
 //
-// The bug: on mobile, clicking the ThreadsIcon button in MobileThreadHeader
-// toggled `threadDrawerOpen` instead of navigating to the threads pane.
-// This showed threads via drawer overlay while dots still indicated "thread"
-// pane — a visible desync.
+// The bug: on mobile, toggleThreads() (bound to the toggleThreadDrawer
+// keyboard shortcut; mobile pane nav is otherwise swipe-only) toggled
+// `threadDrawerOpen` instead of navigating to the threads pane. This showed
+// threads via drawer overlay while dots still indicated "thread" pane — a
+// visible desync.
 //
-// The fix: on mobile, ThreadsIcon calls toggleThreads() which navigates to
-// pane 0 (threads). The thread drawer overlay is a desktop-only concept.
-// threadDrawerOpen must never be the mechanism to show threads on mobile.
+// The fix: on mobile, toggleThreads() navigates to pane 0 (threads). The
+// thread drawer overlay is a desktop-only concept. threadDrawerOpen must
+// never be the mechanism to show threads on mobile.
 //
 // Structural guarantees:
 //   1. MobileView, MOBILE_VIEWS, PANE_INDEX, PANE_COUNT all derive from

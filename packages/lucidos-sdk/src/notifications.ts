@@ -7,6 +7,7 @@ export type NavigateTarget =
   | 'files'
   | 'apps'
   | 'triggers'
+  | 'thread-queue'
   | 'changes'
   | 'notifications'
   | 'settings'

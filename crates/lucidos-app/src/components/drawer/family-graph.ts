@@ -1,5 +1,6 @@
-import { effectiveThreadStatus, getThreadDisplaySection } from '../../store/store';
-import { byRecent, reviewTier, isExcludedFromSections } from '../../store/thread-events';
+import { computed } from '@preact/signals';
+import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadNeedsAttention } from '../../store/store';
+import { byRecent, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
 import type { ThreadState } from '../../store/thread-events';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
 import type { ThreadStatus } from '../../store/thread-events';
@@ -9,10 +10,9 @@ import { draftPresentThreadIds } from '../../store/composeDrafts';
 // from ThreadDrawer.tsx (re-exported there); imported by drawer/*.test.ts.
 
 const SECTION_PRIORITY: Record<DisplaySection, number> = {
-    active: 0,
-    review: 1,
-    saved: 2,
-    archive: 3,
+    current: 0,
+    saved: 1,
+    archive: 2,
 };
 
 /** Walk parentThreadId up to the topmost ancestor present in `byId`. Stops at
@@ -65,7 +65,7 @@ export function computeFamilyGraph(threads: ThreadState[]): FamilyGraph {
  *  top-thread (the family root) passes `passesFilter`; every descendant
  *  inherits visibility from the root regardless of its own channel. This is
  *  what stops the family-row count from diverging from the rendered children
- *  — a per-thread filter would drop a CC sub-thread under a chat top-thread
+ *  — a per-thread filter would drop a coding-agent sub-thread under a chat top-thread
  *  while the parent still claimed "1/1 sub-thread done" via
  *  meta.totalChildrenCount. Orphans (parent paginated out, so the rootByThread
  *  walk lands on the thread itself) are judged as their own top-thread.
@@ -73,13 +73,13 @@ export function computeFamilyGraph(threads: ThreadState[]): FamilyGraph {
  *  `matchAnyMember` flips the gate from root-only to any-member: a family is
  *  included if ANY of its threads passes the filter. This is required when a
  *  trigger/repo/app SUB-selection is active, because the repo/app/trigger is a
- *  property of a specific Claude Code thread, not of its (often chat/trigger)
- *  top-thread — so a CC thread in the selected repo/app must surface, with its
+ *  property of a specific coding-agent thread, not of its (often chat/trigger)
+ *  top-thread — so a coding-agent thread in the selected repo/app must surface, with its
  *  parent kept for context, even when the root's channel is filtered out. The
  *  whole family still renders (matched + sibling threads) so the family-row
  *  count stays honest. For a plain channel filter (no sub-selection) the
  *  root-only gate stands: channel-only filtering deliberately does NOT surface
- *  a CC sub-thread buried under a chat top-thread (that's search's job). */
+ *  a coding-agent sub-thread buried under a chat top-thread (that's search's job). */
 export function filterByTopThread(
     threads: ThreadState[],
     graph: FamilyGraph,
@@ -109,8 +109,8 @@ export type FamilyDecorations = {
 };
 
 /** Map of family root id → the display section the family renders in. Default
- *  rule: the highest-priority section reached by any family member (active >
- *  review > saved > archive). Override: a saved root pins the family to
+ *  rule: the highest-priority section reached by any family member (current >
+ *  saved > archive). Override: a saved root pins the family to
  *  Saved regardless of descendant status — save is an explicit user pin, same
  *  rule as the leaf-thread isSaved check in `displaySection`. Drives both
  *  routing (categorizeThreads picks this section for every member of the
@@ -196,16 +196,15 @@ export function hasCollapsedAncestor(
 /** Group threads into drawer sections. A thread's section is determined by its
  *  *family* — the thread plus every transitive descendant reachable via
  *  parentThreadId — taking the highest-priority section reached by any member
- *  (active > review > saved > archive). This keeps a family rendered together
+ *  (current > saved > archive). This keeps a family rendered together
  *  so nestByParent can put children directly under their parent even when the
- *  child intrinsically belongs to a different section. Running anywhere wins,
- *  so a parent with one still-working CC child and two completed siblings
- *  stays under Active instead of being dragged into Review by the completed
- *  siblings' fall-through. One override beats the priority order: a saved
+ *  child intrinsically belongs to a different section. Live work anywhere keeps the
+ *  family together: a parent with one still-working coding-agent child and two completed
+ *  siblings stays in Current as one unit instead of any member splitting off. One override beats the priority order: a saved
  *  root pins the family to Saved regardless of descendant status — save is
  *  an explicit user pin, same rule as for leaf threads. Composing and
- *  discarded threads stay excluded; the caller surfaces composing threads in
- *  the New section.
+ *  discarded threads stay excluded; the caller surfaces composing threads at
+ *  the top of the Current section.
  *
  *  Pass an existing `graph` to skip the parent-walk pass when the caller has
  *  already built one (see `computeFamilyGraph`). */
@@ -218,15 +217,9 @@ export function categorizeThreads(
     const { rootByThread } = familyGraph;
     const familySection = familySections ?? computeFamilySections(threads, familyGraph);
     const out: ThreadSections = {
-        review: [], active: [], saved: [], archive: [],
+        current: [], saved: [], archive: [],
         statusMap: new Map(),
-        savedAttentionCount: 0,
     };
-    const ownSection = new Map<string, DisplaySection>();
-    for (const t of threads) {
-        if (isExcludedFromSections(t)) continue;
-        ownSection.set(t.meta.id, getThreadDisplaySection(t));
-    }
 
     for (const t of threads) {
         if (isExcludedFromSections(t)) continue;
@@ -234,16 +227,9 @@ export function categorizeThreads(
         out.statusMap.set(t.meta.id, status);
         const display = familySection.get(rootByThread.get(t.meta.id)!)!;
         switch (display) {
-            case 'active': out.active.push(t); break;
-            case 'review': out.review.push(t); break;
+            case 'current': out.current.push(t); break;
             case 'saved': out.saved.push(t); break;
             case 'archive': out.archive.push(t); break;
-        }
-        // savedAttentionCount tracks intrinsic state, not family routing — the
-        // saved-section badge surfaces CTAs the saved override would hide.
-        // "Needs attention" = same CTA set as the Review tier-1 sort.
-        if (ownSection.get(t.meta.id) === 'saved' && reviewTier(t, status) === 0) {
-            out.savedAttentionCount++;
         }
     }
     return out;
@@ -253,19 +239,54 @@ export function categorizeThreads(
  *  the freshest / highest-priority signal from any descendant, so the family
  *  rises together. Every member of one family resolves to the same record. */
 export type FamilyKeys = {
-    /** Max `lastRevivedAt || createdAt` across the family. Drives the Active sort. */
-    revivedKey: string;
-    /** Max `updatedAt` across the family. Drives Saved / Archive / Review recency. */
+    /** Max last-user-action across the family (see `recencyKey`). Drives
+     *  Current / Saved / Archive recency — the family rises to its freshest
+     *  USER touch, not the agent's last churn. */
     recentKey: string;
-    /** Min review-tier across the family: 0 if any member has a CTA
-     *  (codingAgentProposed / waiting_for_user_answer / failed), else 1. */
-    reviewTier: 0 | 1;
+    /** Min review-tier across the family (see `reviewTier`): 0 if any member is
+     *  awaiting a user answer/permission, else 1 if any member has another CTA
+     *  (codingAgentProposed / failed), else 2. */
+    reviewTier: 0 | 1 | 2;
 };
+
+/** Family-aware review comparator: order by the family's review tier (its most
+ *  urgent member), then by the family's most-recent user action — every member
+ *  of a family resolves to the same `FamilyKeys` record, so families sort as a
+ *  unit. Shared by the drawer's Current sort and the post-archive focus picker
+ *  so the two orderings can never drift (the divergence between this and an
+ *  earlier per-thread review order is what let archiving a parent jump focus
+ *  into an unrelated family's sub-thread). */
+export function makeByFamilyReview(
+    familyKeys: ReadonlyMap<string, FamilyKeys>,
+): (a: ThreadState, b: ThreadState) => number {
+    return (a, b) => {
+        const ka = familyKeys.get(a.meta.id)!;
+        const kb = familyKeys.get(b.meta.id)!;
+        if (ka.reviewTier !== kb.reviewTier) return ka.reviewTier - kb.reviewTier;
+        return kb.recentKey.localeCompare(ka.recentKey);
+    };
+}
+
+/** The Current-section rows in the exact order the thread drawer renders them:
+ *  family-review sorted (see `makeByFamilyReview`), then nested so each
+ *  sub-thread follows its parent (see `nestByParent`). The post-archive focus
+ *  picker walks THIS order so "next in queue" is the next *visible row* —
+ *  landing on the next family's parent rather than a sub-thread that merely
+ *  sorts high by its own per-thread review tier. `visible` must already be
+ *  top-thread filtered; `graph` is built over the full thread set so the parent
+ *  walks resolve. */
+export function orderedCurrentForReview(
+    visible: ThreadState[],
+    graph: FamilyGraph,
+): ThreadState[] {
+    const current = categorizeThreads(visible, graph).current;
+    current.sort(makeByFamilyReview(computeFamilyKeys(visible, graph)));
+    return nestByParent(current).map(n => n.thread);
+}
 
 /** Compute family-aware sort keys for every non-composing/non-discarded thread.
  *  Returns a Map keyed by thread id; every member of the same family maps to
- *  the same record. Sites pass the relevant key (revivedKey / recentKey /
- *  reviewTier) to their existing comparator. Accepts an optional pre-built
+ *  the same record. Sites pass the relevant key (recentKey / reviewTier) to their existing comparator. Accepts an optional pre-built
  *  graph (see `computeFamilyGraph`) to share the parent walk with
  *  `categorizeThreads`. */
 export function computeFamilyKeys(
@@ -278,14 +299,12 @@ export function computeFamilyKeys(
         const root = rootByThread.get(t.meta.id);
         if (root === undefined) continue;
         const status = effectiveThreadStatus(t);
-        const revived = t.meta.lastRevivedAt || t.meta.createdAt;
-        const recent = t.meta.updatedAt;
+        const recent = recencyKey(t);
         const tier = reviewTier(t, status);
         const cur = perRoot.get(root);
         if (!cur) {
-            perRoot.set(root, { revivedKey: revived, recentKey: recent, reviewTier: tier });
+            perRoot.set(root, { recentKey: recent, reviewTier: tier });
         } else {
-            if (revived > cur.revivedKey) cur.revivedKey = revived;
             if (recent > cur.recentKey) cur.recentKey = recent;
             if (tier < cur.reviewTier) cur.reviewTier = tier;
         }
@@ -305,7 +324,8 @@ export function computeFamilyKeys(
     return out;
 }
 
-/** New section rows. Empty composing rows are filtered out — POST/DELETE
+/** Composing-draft rows, surfaced at the top of the Current section. Empty
+ *  composing rows are filtered out — POST/DELETE
  *  races, SSE skeletons from a peer's ThreadStarted with no follow-up
  *  compose change, and failed local discards leave server-side rows whose
  *  only UI surface would be a placeholder "Empty draft" title. */
@@ -314,16 +334,17 @@ export function composingThreads(threads: ReadonlyMap<string, ThreadState>): Thr
     for (const t of threads.values()) {
         if (t.meta.state === 'composing' && threadHasUnsentDraft(t)) out.push(t);
     }
-    out.sort((a, b) => b.meta.updatedAt.localeCompare(a.meta.updatedAt));
+    out.sort(byRecent);
     return out;
 }
 
 export type NestedThread = { thread: ThreadState; depth: number };
 
-/** CSS-variable style for a row wrapper. Inherits down to `.thread-row`,
- *  which uses it to widen its left padding (and shift the absolutely-
- *  positioned status icon). Typed as a string-keyed map so TypeScript accepts
- *  the custom property — CSSProperties doesn't model `--*` keys. */
+/** CSS-variable style for a row wrapper. Inherits down to `.thread-row`, which
+ *  uses it to widen its left padding and to inset the nested-row clip-path one
+ *  step per level. (The status icon is pinned to a fixed left column and does
+ *  NOT shift with depth.) Typed as a string-keyed map so TypeScript accepts the
+ *  custom property — CSSProperties doesn't model `--*` keys. */
 export function depthStyle(depth: number): { [key: string]: string } {
     return { '--thread-depth': String(depth) };
 }
@@ -380,20 +401,60 @@ export function draftThreads(threads: ReadonlyMap<string, ThreadState>): ThreadS
     return out;
 }
 
+/** Attention-filter view rows: every Current/Saved thread that needs the user
+ *  (awaiting answer/permission, failed, or a change ready to apply; see
+ *  `threadNeedsAttention`). Mirrors `draftThreads`: bypasses the
+ *  channel/trigger/repo filters and the lifecycle section grouping. Ordered by
+ *  `reviewTier` first — a User Q / permission request (tier 0, the agent is
+ *  stalled until the user answers) floats above a change ready to apply or a
+ *  failed turn (tier 1) — then most-recent-first within each tier. The tier is
+ *  read with `effectiveThreadStatus` to match the `threadNeedsAttention`
+ *  predicate that selected these rows. Shares that predicate with the
+ *  filter-badge count (`attentionThreadCount`) so the two can never disagree. */
+export function attentionThreads(threads: ReadonlyMap<string, ThreadState>): ThreadState[] {
+    const out: ThreadState[] = [];
+    for (const t of threads.values()) {
+        if (threadNeedsAttention(t)) out.push(t);
+    }
+    out.sort((a, b) => {
+        const ta = reviewTier(a, effectiveThreadStatus(a));
+        const tb = reviewTier(b, effectiveThreadStatus(b));
+        if (ta !== tb) return ta - tb;
+        return byRecent(a, b);
+    });
+    return out;
+}
+
 export type ThreadSections = {
-    review: ThreadState[];
-    active: ThreadState[];
+    current: ThreadState[];
     saved: ThreadState[];
     archive: ThreadState[];
     statusMap: Map<string, ThreadStatus>;
-    /** Saved threads that need attention — pending change, awaiting user
-     *  answer, or failed (the Review tier-1 CTA set). Powers the saved-section
-     *  badge so the user notices CTAs that the saved override would otherwise
-     *  hide. */
-    savedAttentionCount: number;
 };
 
 export function threadHasUnsentDraft(thread: ThreadState | undefined): boolean {
     if (!thread) return false;
     return draftPresentThreadIds.value.has(thread.meta.id);
 }
+
+/** Number of rows the drafts view would render — i.e. non-discarded threads
+ *  carrying an unsent draft. Same predicate as `draftThreads`, but avoids
+ *  building/sorting an array. Drives the drafts-icon badge in the thread
+ *  headers. Memoized; recomputes only when `threadMap` or
+ *  `draftPresentThreadIds` change. The empty-presence-set fast path keeps the
+ *  common (no-drafts) case O(1). */
+export const draftThreadCount = computed<number>(() => {
+    const draftIds = draftPresentThreadIds.value;
+    if (draftIds.size === 0) return 0;
+    const threads = threadMap.value;
+    let count = 0;
+    for (const id of draftIds) {
+        const t = threads.get(id);
+        if (t && t.meta.state !== 'discarded') count += 1;
+    }
+    return count;
+});
+
+/** Whether the drafts view would render at least one row. Drives drafts-icon
+ *  visibility in the thread headers: no drafts → no icon. */
+export const hasDrafts = computed<boolean>(() => draftThreadCount.value > 0);

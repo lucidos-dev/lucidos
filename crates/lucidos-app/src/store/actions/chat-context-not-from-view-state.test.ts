@@ -19,7 +19,7 @@ vi.mock('../../api/client', async () => {
 import { sendMessage } from './chat';
 import { submitChat } from '../../api/client';
 
-const testApp: App = { id: 'habit-tracker', name: 'Habit Tracker', description: '', knowhow: [] };
+const testApp: App = { id: 'habit-tracker', name: 'Habit Tracker', description: '' };
 
 describe('sendMessage does not derive context from view-state', () => {
   beforeEach(() => {

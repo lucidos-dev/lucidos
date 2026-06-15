@@ -1,5 +1,36 @@
 use super::super::LucidosEngine;
 
+/// Maximum nesting depth for `execute_intent`. A healthy run never nests at
+/// all: the intent sub-loop's tool set (`build_intent_tools`) deliberately
+/// excludes `execute_intent`. This is a hard backstop — if that exclusion ever
+/// regresses, or a future nested-loop tool re-enters here, we return a clear
+/// error instead of recursing until the worker thread's stack overflows and the
+/// engine aborts (SIGABRT). The actual headroom for the *legitimate* (bounded)
+/// agentic-loop → intent-sub-loop chain comes from the enlarged worker stack
+/// (`WORKER_THREAD_STACK_SIZE` in `main.rs`); this guard exists so a *runaway*
+/// can never silently turn into a stack overflow again.
+const MAX_INTENT_DEPTH: u32 = 4;
+
+const INTENT_EXECUTION_RULES: &str = "\
+[EXECUTION RULES]
+- Fulfill the intent in this run. If a tool is needed, call the tool instead of explaining a future plan.
+- Use cached data in artifacts before making fresh API calls.
+- Emit events for outcomes via emit_event tool. Query past events via query_events tool.
+- Show errors to the user. Never swallow errors silently.
+[END EXECUTION RULES]";
+
+tokio::task_local! {
+    /// Current `execute_intent` nesting depth on this task. Read at the top of
+    /// `handle_execute_intent`; the inner sub-loop runs scoped to `depth + 1`.
+    static INTENT_DEPTH: u32;
+}
+
+/// True when an `execute_intent` call at `current_depth` must be refused to
+/// avoid unbounded intent nesting (and the stack overflow it would cause).
+fn intent_nesting_exceeded(current_depth: u32) -> bool {
+    current_depth >= MAX_INTENT_DEPTH
+}
+
 impl LucidosEngine {
     pub(crate) async fn execute_app_tool(
         &self,
@@ -22,17 +53,6 @@ impl LucidosEngine {
                     .create_app(id, name, description, html_content)
                 {
                     Ok((path, commit)) => {
-                        // Stamp know-how references into the new app's manifest
-                        let kh_dirs = self.knowhow_dirs();
-                        let knowhow_summaries =
-                            crate::core::KnowhowStore::load_merged_summaries(&kh_dirs);
-                        if let Err(e) = self
-                            .app_manager
-                            .stamp_knowhow(id, &knowhow_summaries, &[], self.embedder.as_ref())
-                            .await
-                        {
-                            log!("[Apps] Failed to stamp know-how for {}: {}", id, e);
-                        }
                         if let Err(e) = self
                             .event_bus
                             .emit(crate::engine::event_bus::BusEvent::System(
@@ -103,6 +123,27 @@ impl LucidosEngine {
             .ok_or("intent_id is required")?;
         let task = args["task"].as_str().unwrap_or("");
 
+        // Hard depth guard: refuse before recursing far enough to overflow the
+        // worker stack. `execute_intent` is excluded from the intent sub-loop's
+        // tools, so this should never trip in practice — it's the backstop that
+        // turns a regression into a clear, logged error instead of a SIGABRT.
+        let depth = INTENT_DEPTH.try_with(|d| *d).unwrap_or(0);
+        if intent_nesting_exceeded(depth) {
+            log!(
+                "[Intents] Refusing to execute '{}' — intent nesting depth {} reached limit {}",
+                intent_id,
+                depth,
+                MAX_INTENT_DEPTH
+            );
+            return Err(format!(
+                "Error: refusing to execute intent '{}' — intent execution is already nested {} \
+                 levels deep (limit {}). An intent must not recursively execute intents; this \
+                 limit prevents a stack overflow.",
+                intent_id, depth, MAX_INTENT_DEPTH
+            )
+            .into());
+        }
+
         // Load from IntentStore (app-scoped + standalone triggers)
         let data_dir = self.workspace_path.join(crate::core::DATA_DIR);
         let intent = crate::core::IntentStore::load(&data_dir, intent_id)
@@ -127,31 +168,25 @@ impl LucidosEngine {
             }
         }
 
-        // Build execution rules
-        let rules = "\
-[EXECUTION RULES]
-- ALWAYS EXECUTE, NEVER DESCRIBE. Call tools, don't describe what you would do. \
-If you catch yourself writing \"I'll do X\" without a tool call, STOP.
-- Use cached data in artifacts before making fresh API calls.
-- Emit events for outcomes via emit_event tool. Query past events via query_events tool.
-- Show errors to the user. Never swallow errors silently.
-[END EXECUTION RULES]";
-
         let system_prompt = format!(
             "{}\n\n[INTENT — {}]\n{}\n[END INTENT]{}",
-            rules, intent_id, intent.content, knowhow_context
+            INTENT_EXECUTION_RULES, intent_id, intent.content, knowhow_context
         );
 
-        // Run isolated sub-loop
-        let result = self
-            .run_intent_loop(
-                &system_prompt,
-                task,
-                request_id,
-                extraction_ctx,
-                device_id,
-                cancel_token,
-                thread_id,
+        // Run isolated sub-loop, scoped one level deeper so a (mis)nested
+        // execute_intent inside it is caught by the depth guard above.
+        let result = INTENT_DEPTH
+            .scope(
+                depth + 1,
+                self.run_intent_loop(
+                    &system_prompt,
+                    task,
+                    request_id,
+                    extraction_ctx,
+                    device_id,
+                    cancel_token,
+                    thread_id,
+                ),
             )
             .await?;
 
@@ -205,6 +240,40 @@ mod tests {
     use crate::engine::loaded_knowhow::LoadedKnowhowStore;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn intent_nesting_guard_boundary() {
+        // The guard must allow normal (un-nested / shallowly nested) execution
+        // and refuse once the nesting reaches the cap — that refusal is what
+        // turns a runaway into a clean error instead of a stack-overflow abort.
+        assert!(!intent_nesting_exceeded(0), "top-level execute_intent allowed");
+        assert!(
+            !intent_nesting_exceeded(MAX_INTENT_DEPTH - 1),
+            "one below the cap still allowed"
+        );
+        assert!(
+            intent_nesting_exceeded(MAX_INTENT_DEPTH),
+            "at the cap must be refused"
+        );
+        assert!(
+            intent_nesting_exceeded(MAX_INTENT_DEPTH + 1),
+            "above the cap must be refused"
+        );
+    }
+
+    #[test]
+    fn intent_execution_rules_avoid_echo_prone_slogans() {
+        assert!(
+            !INTENT_EXECUTION_RULES.contains("ALWAYS EXECUTE, NEVER DESCRIBE"),
+            "intent execution rules should avoid slogans Gemini may echo"
+        );
+        assert!(
+            !INTENT_EXECUTION_RULES.contains("If you catch yourself"),
+            "intent execution rules should avoid self-referential meta-instructions"
+        );
+        assert!(INTENT_EXECUTION_RULES.contains("emit_event"));
+        assert!(INTENT_EXECUTION_RULES.contains("query_events"));
+    }
 
     fn dirs(local: &std::path::Path) -> KnowhowDirs {
         KnowhowDirs {

@@ -86,7 +86,7 @@ describe('threadFilterActive', () => {
     expect(threadFilterActive.value).toBe(false);
   });
 
-  it('is true when the claude_code channel is on but only a subset of repos is selected', () => {
+  it('is true when the coding-agent channel is on but only a subset of repos is selected', () => {
     repositories.value = {
       status: 'loaded',
       data: [
@@ -98,10 +98,10 @@ describe('threadFilterActive', () => {
     expect(threadFilterActive.value).toBe(true);
   });
 
-  it('is true even with every repo selected — app CC threads are still excluded because CC is two-axis', () => {
-    // CC has two cross-axis sub-selections (repos + apps).
+  it('is true even with every repo selected — app coding-agent threads are still excluded because the filter is two-axis', () => {
+    // Coding Agent has two cross-axis sub-selections (repos + apps).
     // threadPassesChannelFilter unions repoOk || appOk under the
-    // claude_code branch, so picking "every repo" still drops every app CC
+    // coding-agent branch, so picking "every repo" still drops every app coding-agent
     // thread from the drawer — the filter IS narrowing. The per-axis
     // "selected === total" shortcut from triggers doesn't apply.
     repositories.value = {
@@ -115,18 +115,18 @@ describe('threadFilterActive', () => {
     expect(threadFilterActive.value).toBe(true);
   });
 
-  it('is true when the claude_code channel is on and any app is selected', () => {
+  it('is true when the coding-agent channel is on and any app is selected', () => {
     selectedAppIds.value = new Set(['momentum']);
     expect(threadFilterActive.value).toBe(true);
   });
 
-  it('is true when both a repo and an app are selected under claude_code', () => {
+  it('is true when both a repo and an app are selected under Coding Agent', () => {
     selectedRepoIds.value = new Set(['r1']);
     selectedAppIds.value = new Set(['momentum']);
     expect(threadFilterActive.value).toBe(true);
   });
 
-  it('is false when claude_code channel is on with no per-target selection (= all CC threads)', () => {
+  it('is false when the coding-agent channel is on with no per-target selection (= all coding-agent threads)', () => {
     expect(threadFilterActive.value).toBe(false);
   });
 

@@ -218,11 +218,12 @@ async fn s3_notification_with_connected_sse_but_no_candidate_runs_presence_check
         loop {
             tokio::select! {
                 line = lines.next_line() => match line {
-                    Ok(Some(line)) => {
-                        let saw_check = line.contains("\"type\":\"PresenceCheck\"");
-                        collected.push(line);
-                        if saw_check { break; }
-                    }
+                    // Collect for the full window — do NOT break on the first
+                    // PresenceCheck. The SSE stream is global, so the first frame
+                    // may belong to another notification (a sibling fan-out test
+                    // whose async PresenceCheck lands here). The assertion below
+                    // selects the frame carrying THIS notification's id.
+                    Ok(Some(line)) => collected.push(line),
                     Ok(None) | Err(_) => break,
                 },
                 _ = &mut deadline => break,
@@ -248,24 +249,22 @@ async fn s3_notification_with_connected_sse_but_no_candidate_runs_presence_check
 
     let lines = sse_handle.await.expect("SSE task panicked");
 
-    let presence_check_line = lines
+    // Select the PresenceCheck for THIS notification specifically — the global
+    // SSE stream may also carry a sibling notification's frame.
+    lines
         .iter()
-        .find(|l| l.contains("\"type\":\"PresenceCheck\""))
+        .find(|l| {
+            l.contains("\"type\":\"PresenceCheck\"") && l.contains(&notification_id)
+        })
         .unwrap_or_else(|| {
             panic!(
-                "Expected a PresenceCheck SSE event for {} from a connected page with NO \
-                 device_presence candidate; got {} lines, last 5: {:?}",
+                "Expected a PresenceCheck SSE event carrying notification_id={} from a connected \
+                 page with NO device_presence candidate; got {} lines, last 5: {:?}",
                 notification_id,
                 lines.len(),
                 lines.iter().rev().take(5).collect::<Vec<_>>(),
             )
         });
-    assert!(
-        presence_check_line.contains(&notification_id),
-        "PresenceCheck event must carry notification_id={}; line was: {}",
-        notification_id,
-        presence_check_line,
-    );
 }
 
 #[tokio::test]
@@ -303,11 +302,12 @@ async fn s3_notification_with_visible_device_emits_presence_check_sse() {
         loop {
             tokio::select! {
                 line = lines.next_line() => match line {
-                    Ok(Some(line)) => {
-                        let saw_check = line.contains("\"type\":\"PresenceCheck\"");
-                        collected.push(line);
-                        if saw_check { break; }
-                    }
+                    // Collect for the full window — do NOT break on the first
+                    // PresenceCheck. The SSE stream is global, so the first frame
+                    // may belong to another notification (a sibling fan-out test
+                    // whose async PresenceCheck lands here). The assertion below
+                    // selects the frame carrying THIS notification's id.
+                    Ok(Some(line)) => collected.push(line),
                     Ok(None) | Err(_) => break,
                 },
                 _ = &mut deadline => break,
@@ -344,25 +344,21 @@ async fn s3_notification_with_visible_device_emits_presence_check_sse() {
 
     let lines = sse_handle.await.expect("SSE task panicked");
 
-    // Find the PresenceCheck frame and verify it carries this
-    // notification's id.
+    // Find the PresenceCheck frame for THIS notification — the global SSE
+    // stream may also carry a sibling notification's frame, so match by id.
     let presence_check_line = lines
         .iter()
-        .find(|l| l.contains("\"type\":\"PresenceCheck\""))
+        .find(|l| {
+            l.contains("\"type\":\"PresenceCheck\"") && l.contains(&notification_id)
+        })
         .unwrap_or_else(|| {
             panic!(
-                "Expected a PresenceCheck SSE event after notification {}; got {} lines, last 5: {:?}",
+                "Expected a PresenceCheck SSE event carrying notification_id={}; got {} lines, last 5: {:?}",
                 notification_id,
                 lines.len(),
                 lines.iter().rev().take(5).collect::<Vec<_>>(),
             )
         });
-    assert!(
-        presence_check_line.contains(&notification_id),
-        "PresenceCheck event must carry notification_id={}; line was: {}",
-        notification_id,
-        presence_check_line,
-    );
     let expected_deadline = format!(
         "\"deadline_ms\":{}",
         lucidos_engine::scheduler::push::DEADLINE_MS
@@ -504,6 +500,95 @@ async fn s4_active_pong_emits_toast_request_and_suppresses_push() {
         "an active device must NOT receive an OS push (got {} push_log rows for notification={} device={})",
         push_count, notification_id, device_id,
     );
+}
+
+#[tokio::test]
+async fn s4_push_allowed_emits_native_push_requested_sse_with_no_web_subscription() {
+    let _guard = fan_out_test_lock().lock().await;
+
+    // Spec §1/§4 — the native desktop surface. On the push-ALLOWED branch (no
+    // active device pong'd in) the engine emits a NativePushRequested SSE so a
+    // connected Tauri app can render a native macOS banner — it can't receive
+    // the web push (WKWebView has no service-worker push).
+    //
+    // This test deliberately registers NO push subscription: it pins the
+    // relaxed early-return. Pre-change, `send_push_to_all_with_app` bailed the
+    // instant `push_subscriptions` was empty, so a desktop-only workspace got
+    // neither the decision nor any SSE — the connected page's only signal was a
+    // silent bell-badge bump. Now an open SSE connection alone keeps the
+    // decision alive, and push-allowed broadcasts NativePushRequested.
+    //
+    // The SSE reader never pongs, so it counts toward `expected_pongs` but
+    // reports no `is_active` → after DEADLINE_MS the engine decides
+    // push_allowed=true and emits the native frame.
+    reset_presence_state().await;
+    let suffix = unique_marker("native-push");
+    // The reader breaks only on OUR notification's frame, matched by the unique
+    // suffix carried in its title. A sibling fan-out test emits its own
+    // NativePushRequested ~DEADLINE_MS after it releases the shared lock — i.e.
+    // after this test has already started — so a stale frame for a different
+    // notification can land on this stream first; matching the suffix ignores it.
+    let reader_suffix = suffix.clone();
+
+    let sse_handle: tokio::task::JoinHandle<Vec<String>> = tokio::spawn(async move {
+        let resp = http_client()
+            .get(format!("{}/api/v1/events", base_url()))
+            .header("Accept", "text/event-stream")
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .expect("SSE connect");
+        let byte_stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(std::io::Error::other));
+        let reader = StreamReader::new(byte_stream);
+        let mut lines = BufReader::new(reader).lines();
+
+        let mut collected = Vec::new();
+        let deadline = tokio::time::sleep(Duration::from_secs(8));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                line = lines.next_line() => match line {
+                    Ok(Some(line)) => {
+                        let is_my_native = line.contains("\"type\":\"NativePushRequested\"")
+                            && line.contains(&reader_suffix);
+                        collected.push(line);
+                        if is_my_native { break; }
+                    }
+                    Ok(None) | Err(_) => break,
+                },
+                _ = &mut deadline => break,
+            }
+        }
+        collected
+    });
+
+    // Let the SSE subscriber register so the live-connection gate is non-zero.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let notification_id = create_notification(
+        &format!("Test native-push {}", suffix),
+        "no web sub, connected desktop page",
+    )
+    .await;
+
+    let lines = sse_handle.await.expect("SSE task panicked");
+
+    // Match OUR notification's native frame specifically — a stale sibling frame
+    // may also sit in `collected` (see reader_suffix above), so filter by id.
+    lines
+        .iter()
+        .find(|l| l.contains("\"type\":\"NativePushRequested\"") && l.contains(&notification_id))
+        .unwrap_or_else(|| {
+            panic!(
+                "Expected a NativePushRequested SSE event for {} from a connected page with NO \
+                 web-push subscription; got {} lines, last 5: {:?}",
+                notification_id,
+                lines.len(),
+                lines.iter().rev().take(5).collect::<Vec<_>>(),
+            )
+        });
 }
 
 /// Pull `data.notification_id` out of an SSE `data: {json}` line. Returns None

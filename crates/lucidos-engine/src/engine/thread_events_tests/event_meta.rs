@@ -153,6 +153,7 @@ fn indexable_text_returns_none_for_non_chat_events() {
     .indexable_text()
     .is_none());
     assert!(ThreadEvent::SessionStarted {
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         session_id: "s".into(),
         branch: String::new(),
         repo_id: None,

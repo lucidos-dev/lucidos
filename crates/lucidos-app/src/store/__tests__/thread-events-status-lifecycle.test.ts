@@ -17,7 +17,7 @@ describe('exchangeStatus — CC follow-up in-progress states', () => {
     expect(statuses[1]).toBe('pending');
   });
 
-  it('follow-up with CC tool calls in progress = cc-working', () => {
+  it('follow-up with CC tool calls in progress = coding-agent-working', () => {
     const { statuses } = buildCCThread([
       { seq: 1, event: { type: 'MessageReceived', text: 'fix', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:00:00Z' },
       { seq: 2, event: { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, created: '2026-04-12T10:00:01Z' },
@@ -26,10 +26,10 @@ describe('exchangeStatus — CC follow-up in-progress states', () => {
       { seq: 4, event: { type: 'MessageReceived', text: 'follow-up', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 5, event: { type: 'CodingAgentToolCalled', name: 'Read', args: {} } as ThreadEvent, created: '2026-04-12T10:01:01Z' },
     ]);
-    expect(statuses[1]).toBe('cc-working');
+    expect(statuses[1]).toBe('coding-agent-working');
   });
 
-  it('follow-up mid-streaming (text arrived, no completion) = cc-working', () => {
+  it('follow-up mid-streaming (text arrived, no completion) = coding-agent-working', () => {
     const { statuses } = buildCCThread([
       { seq: 1, event: { type: 'MessageReceived', text: 'fix', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:00:00Z' },
       { seq: 2, event: { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, created: '2026-04-12T10:00:01Z' },
@@ -37,7 +37,7 @@ describe('exchangeStatus — CC follow-up in-progress states', () => {
       { seq: 4, event: { type: 'MessageReceived', text: 'follow-up', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 5, event: { type: 'CodingAgentTextStreamed', text: 'Working on it...' } as ThreadEvent, created: '2026-04-12T10:01:01Z' },
     ]);
-    expect(statuses[1]).toBe('cc-working');
+    expect(statuses[1]).toBe('coding-agent-working');
   });
 });
 
@@ -77,7 +77,7 @@ describe('exchangeStatus — CC follow-up edge cases', () => {
     expect(statuses[0]).toBe('done');
   });
 
-  it('follow-up sent while CC is actively working (not idle) = cc-working for exchange 1', () => {
+  it('follow-up sent while CC is actively working (not idle) = coding-agent-working for exchange 1', () => {
     // This tests the scenario where exchange 1 has CC activity, then a follow-up
     // creates exchange 2. Exchange 1 should be 'interrupted' since it had steps
     // but no completion event, and exchange 2 should be the active one.

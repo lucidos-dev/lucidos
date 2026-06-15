@@ -33,14 +33,29 @@
     font-size: 0.6875rem;
 }
 
-/* Stale / no-backup warning — escalates the whole card so it can't be missed. */
+/* Severity tints — a subtle accent wash over the card surface, with the neutral
+   border kept (matches the rest of Lucidos's inline notices, e.g.
+   .control-panel-notice / .rendered-diff-deletions). No heavy colored border. */
+
+/* No recent good backup, but the last run didn't fail — a soft warning. */
 .backup-health-card[data-state="stale"] {
-    border-color: color-mix(in srgb, var(--accent-yellow) 50%, var(--border-color));
-    background: color-mix(in srgb, var(--accent-yellow) 10%, transparent);
+    background: color-mix(in srgb, var(--accent-yellow) 8%, var(--bg-primary));
+}
+
+/* Last run failed — escalate the whole card to the error hue so a failure never
+   sits inside a cheerful yellow box. */
+.backup-health-card[data-state="error"] {
+    background: color-mix(in srgb, var(--accent-red) 8%, var(--bg-primary));
 }
 
 .backup-health-warn {
     color: var(--accent-yellow);
     font-weight: 600;
+}
+
+/* "View backups folder" deep link under the provider row. */
+.backup-folder-link-row {
+    margin-bottom: 0.75rem;
+    font-size: 0.6875rem;
 }
 

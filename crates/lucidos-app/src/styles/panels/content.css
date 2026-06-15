@@ -8,7 +8,6 @@
     justify-content: space-between;
     align-items: center;
     padding: 0.375rem 1rem 0.375rem 0.625rem;
-    border-bottom: 1px solid var(--border-color);
 }
 
 .mark-all-read {
@@ -35,7 +34,6 @@
     width: 100%;
     padding: 0.75rem 1rem;
     border: none;
-    border-bottom: 1px solid var(--border-color);
     background: none;
     color: inherit;
     font: inherit;
@@ -144,7 +142,6 @@
     display: flex;
     gap: 0.5rem;
     padding: 0.75rem 1rem;
-    border-top: 1px solid var(--border-color);
 }
 
 /* ─── Notifications modal ─── */
@@ -184,7 +181,6 @@
     align-items: center;
     gap: 0.5rem;
     padding: 0.75rem 1rem;
-    border-bottom: 1px solid var(--border-color);
     -webkit-user-select: none;
     user-select: none;
 }
@@ -270,10 +266,6 @@
     align-items: center;
     gap: 0.5rem;
     padding: 0.5rem;
-}
-
-.files-toolbar-bordered {
-    border-bottom: 1px solid var(--border-color);
 }
 
 /* --- Repo view toggle --- */
@@ -407,7 +399,6 @@
     gap: 0.5rem;
     padding: 0.5rem;
     background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border-color);
     font-weight: 600;
 }
 
@@ -538,7 +529,6 @@
 .rendered-diff-deletions > pre {
     margin: 0;
     padding: 0.5rem 0.75rem;
-    border-top: 1px solid var(--border-color);
     font-family: var(--font-mono);
     font-size: 0.75rem;
     white-space: pre-wrap;
@@ -572,7 +562,6 @@
     display: flex;
     justify-content: flex-end;
     padding: 0.375rem 0.5rem;
-    border-bottom: 1px solid var(--border-color);
 }
 
 /* --- Line numbers in file preview --- */
@@ -658,7 +647,6 @@
     align-items: center;
     gap: 0.5rem;
     padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid var(--border-color);
 }
 
 .file-search-icon {

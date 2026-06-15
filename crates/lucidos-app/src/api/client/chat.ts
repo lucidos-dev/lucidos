@@ -2,7 +2,7 @@ import { toFailed } from '../../store/types';
 import { API, json, mutatingFetch, mutatingFetchIdempotent, throwIfNotOk } from './_core';
 import type { AnswerKind, PersistScope } from '../../store/thread-events';
 import type { Loadable } from '../../store/types';
-import type { ChatRequestBody } from '../types';
+import type { ChatRequestBody, CodingAgent } from '../types';
 
 // --- Health ---
 export interface HealthInfo {
@@ -67,27 +67,27 @@ export async function sendControlRequest(threadId: string, request: Record<strin
   });
 }
 
-export interface CCCommandOption {
+export interface CodingAgentCommandOption {
   value: string;
   label: string;
   description: string;
 }
 
-export interface CCCommandParam {
+export interface CodingAgentCommandParam {
   key: string;
   label?: string;
   placeholder?: string;
-  options?: CCCommandOption[];
+  options?: CodingAgentCommandOption[];
 }
 
-export interface CCCommandDef {
+export interface CodingAgentCommandDef {
   subtype: string;
   label: string;
-  params: CCCommandParam[];
+  params: CodingAgentCommandParam[];
 }
 
-export interface CCCommandsResponse {
-  control_commands: CCCommandDef[];
+export interface CodingAgentCommandsResponse {
+  control_commands: CodingAgentCommandDef[];
   builtin_commands: string[];
   skill_commands: string[];
   current_model: string | null;
@@ -96,22 +96,28 @@ export interface CCCommandsResponse {
 }
 
 /** Model aliases mirroring the `models` list in crates/lucidos-engine/src/runtime/cc_menu_options.json. */
-export type CCModelValue = 'default' | 'sonnet' | 'sonnet[1m]' | 'claude-opus-4-8@default' | 'claude-opus-4-8[1m]' | 'claude-opus-4-7' | 'claude-opus-4-1' | 'opus' | 'opus[1m]' | 'haiku';
+export type CodingAgentModelValue = 'default' | 'claude-fable-5' | 'claude-fable-5[1m]' | 'sonnet' | 'sonnet[1m]' | 'claude-opus-4-8@default' | 'claude-opus-4-8[1m]' | 'claude-opus-4-7' | 'claude-opus-4-1' | 'opus' | 'opus[1m]' | 'haiku';
 
 /** Reasoning effort levels mirroring the `reasoning_efforts` list in crates/lucidos-engine/src/runtime/cc_menu_options.json. */
-export type CCReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type CodingAgentReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
-export async function fetchCCCommands(
+export async function fetchCodingAgentCommands(
   threadId?: string,
   repoId?: string,
-): Promise<CCCommandsResponse> {
+  codingAgent?: CodingAgent,
+): Promise<CodingAgentCommandsResponse> {
   const params = new URLSearchParams();
   if (threadId) params.set('thread_id', threadId);
   // Pass empty string explicitly so the backend resolves to the default
   // "Lucidos" repo rather than the legacy no-repo fallback.
   if (repoId !== undefined) params.set('repo_id', repoId);
+  // Compose-view only: an existing thread's backend comes from its
+  // thread_summaries row server-side, not the client.
+  if (!threadId && codingAgent && codingAgent !== 'claude-code') {
+    params.set('coding_agent', codingAgent);
+  }
   const qs = params.toString();
-  return json<CCCommandsResponse>(`${API}/claude-code/commands${qs ? `?${qs}` : ''}`);
+  return json<CodingAgentCommandsResponse>(`${API}/claude-code/commands${qs ? `?${qs}` : ''}`);
 }
 
 /** Stop a running Claude Code session.
@@ -189,6 +195,34 @@ export async function postMcpConsent(
   await throwIfNotOk(resp);
 }
 
+// --- Command-guard consent (ADR 0002) — chat mirror of MCP consent ---
+
+export async function postCommandConsent(
+  requestId: string,
+  allowed: boolean,
+  persistScope?: PersistScope,
+): Promise<void> {
+  const body: Record<string, unknown> = { request_id: requestId, allowed };
+  if (persistScope) body.persist_scope = persistScope;
+  const resp = await mutatingFetch(`${API}/command-permission/consent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  await throwIfNotOk(resp);
+}
+
+// --- Command-guard checkpoint undo (ADR 0002, Phase 4) ---
+
+export async function postCommandCheckpointUndo(checkpointId: string): Promise<void> {
+  const resp = await mutatingFetch(`${API}/command-checkpoint/undo`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ checkpoint_id: checkpointId }),
+  });
+  await throwIfNotOk(resp);
+}
+
 // --- CC allowed tools (~/.lucidos/cc-allowed-tools) ---
 export async function getCcAllowedTools(): Promise<string> {
   const body = await json<{ contents: string }>(`${API}/cc-allowed-tools`);
@@ -197,6 +231,21 @@ export async function getCcAllowedTools(): Promise<string> {
 
 export async function putCcAllowedTools(contents: string): Promise<void> {
   const resp = await mutatingFetch(`${API}/cc-allowed-tools`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents }),
+  });
+  await throwIfNotOk(resp);
+}
+
+// --- Lucidos Agent command allowlist (~/.lucidos/agent-allowed-commands, ADR 0002) ---
+export async function getAgentAllowedCommands(): Promise<string> {
+  const body = await json<{ contents: string }>(`${API}/agent-allowed-commands`);
+  return body.contents;
+}
+
+export async function putAgentAllowedCommands(contents: string): Promise<void> {
+  const resp = await mutatingFetch(`${API}/agent-allowed-commands`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ contents }),

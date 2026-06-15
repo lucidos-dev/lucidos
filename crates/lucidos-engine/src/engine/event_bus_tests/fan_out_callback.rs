@@ -554,6 +554,7 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "cc-session-1".into(),
             branch: String::new(),
             repo_id: None,
@@ -677,6 +678,7 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "cc-session-2".into(),
             branch: String::new(),
             repo_id: None,
@@ -762,6 +764,65 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
     .await;
 
     // Cleanup
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression for the parent-callback duplicate window: the
+/// `parent_callback_sent` marker must be written by the projection of the
+/// `ChildThreadCompleted` emit itself — in the same transaction as the event
+/// INSERT — not by a separate post-emit UPDATE. The old shape (emit, then a
+/// standalone `mark_parent_callback_sent`) left a crash window where the
+/// typed event committed but the marker didn't; the next terminal event then
+/// re-fired the whole fan-in and handed the parent a duplicate completion
+/// card. Emitting the typed event (exactly as `notify_parent_if_child` does)
+/// must therefore be sufficient on its own to flip the marker.
+#[tokio::test]
+async fn test_child_thread_completed_projection_marks_callback_sent_in_tx() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+
+    let sent: bool = sqlx::query_scalar(
+        "SELECT parent_callback_sent FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(child_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!sent, "baseline: parent_callback_sent starts FALSE");
+
+    // Emit the typed fan-in event onto the parent thread, exactly as
+    // notify_parent_if_child does after a child terminal event.
+    bus.emit(BusEvent::Thread {
+        thread_id: parent_id,
+        event: ThreadEvent::ChildThreadCompleted {
+            child_thread_id: child_id,
+            child_thread_title: Some("child task".into()),
+            status: crate::engine::thread_events::ChildCompletionStatus::Success,
+            summary: "done".into(),
+            pending_change_ids: vec![],
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let sent: bool = sqlx::query_scalar(
+        "SELECT parent_callback_sent FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(child_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        sent,
+        "ChildThreadCompleted projection must set parent_callback_sent=TRUE \
+         in the same tx as the event insert — a post-emit UPDATE leaves a \
+         crash window that duplicates the parent's completion card"
+    );
+
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

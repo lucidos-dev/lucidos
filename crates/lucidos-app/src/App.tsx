@@ -10,7 +10,7 @@ import { LandscapeLock } from './components/shared/LandscapeLock';
 import { ThreadDrawer } from './components/drawer/ThreadDrawer';
 import { DrawerDivider } from './components/layout/DrawerDivider';
 import { DropZone } from './components/files/DropZone';
-import { RestartOverlay } from './components/layout/RestartOverlay';
+import { UiBlockingOverlay } from './components/layout/UiBlockingOverlay';
 import { Toast } from './components/shared/Toast';
 import { useStartup } from './hooks/useStartup';
 import { useTooltip } from './hooks/useTooltip';
@@ -99,7 +99,7 @@ export function App() {
       <ScaleModalSlot />
       <NotificationsModalSlot />
       <SearchEverywhereSlot />
-      <RestartOverlay />
+      <UiBlockingOverlay />
     </>
   );
 }

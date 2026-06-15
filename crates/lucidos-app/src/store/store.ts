@@ -1,6 +1,7 @@
 import { signal, computed } from '@preact/signals';
 import { hydratePinnedAppsFromStorage } from './actions/pinnedApps';
 import type {
+  ThreadQueueResponse,
   MenuItem,
   ConnectionStatus,
   Loadable,
@@ -23,13 +24,14 @@ import type {
 } from './types';
 import { MENU_ITEMS } from './types';
 import type { ThreadState, ThreadStatus, Exchange } from './thread-events';
-import { computeExchanges, isExcludedFromSections } from './thread-events';
+import { computeExchanges, isExcludedFromSections, reviewTier } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import { resetContentScroll } from '../hooks/useScrollMemory';
-import type { Change, CCModelValue, CCReasoningEffort, RestoreState } from '../api/client';
+import type { Change, CodingAgentModelValue, CodingAgentReasoningEffort, RestoreState } from '../api/client';
+import type { ModelInfo } from '../api/types';
 import { markSwUpdateDismissed } from '../hooks/sw-update';
 
 /** localStorage key holding the focused thread id across reloads. Focus is
@@ -105,7 +107,7 @@ export function closeInlineForm(): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'disk-usage' | 'tool-permissions' | 'keyboard-shortcuts';
+export type SettingsSubview = 'main' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts';
 export const settingsSubview = signal<SettingsSubview>('main');
 /** Anchor to scroll/highlight after navigating from Search Everywhere. SettingsView clears it after applying. */
 export const settingsScrollTarget = signal<string | null>(null);
@@ -118,7 +120,7 @@ export const SETTINGS_NAV_ITEMS: Array<{ key: Exclude<SettingsSubview, 'main'>; 
   { key: 'repositories', label: 'Repositories' },
   { key: 'backup', label: 'Backup' },
   { key: 'memory', label: 'Memory' },
-  { key: 'tool-permissions', label: 'Tool permissions' },
+  { key: 'permissions', label: 'Permissions' },
   { key: 'keyboard-shortcuts', label: 'Keyboard Shortcuts' },
   { key: 'disk-usage', label: 'Disk Usage' },
 ];
@@ -168,15 +170,81 @@ export const isProcessing = computed(() => {
 export const threadDrawerOpen = signal(
   localStorage.getItem('lucidos-thread-drawer-open') === 'true'
 );
+/** The active alternate drawer view, persisted across reloads. The toggle icons
+ *  and their badge counts are already backend-derived (recomputed from the
+ *  rehydrated `threadMap`), so they reappear on their own — only this *active
+ *  selection* (being filtered into the view) was session-only and dropped on
+ *  reload. At most one alternate view is active (the toggles are mutually
+ *  exclusive), so a single tri-state key both persists the choice and encodes
+ *  that invariant. */
+const ALT_VIEW_KEY = 'lucidos-alt-view';
+type AltView = 'none' | 'attention' | 'drafts';
+
+function restoreAltView(): AltView {
+  const saved = localStorage.getItem(ALT_VIEW_KEY);
+  return saved === 'attention' || saved === 'drafts' ? saved : 'none';
+}
+
+const initialAltView = restoreAltView();
+
 /** Drawer-as-drafts-filter toggle. When true, the thread list collapses to a
  *  single "Drafts" section showing every thread with an unsent draft (composing
- *  threads + existing threads with composeText/composeImages). Session-only —
- *  always starts off; the user opts in. */
-export const draftsViewActive = signal(false);
+ *  threads + existing threads with composeText/composeImages). Persisted via
+ *  `ALT_VIEW_KEY` — restored on reload so the user lands back in the view they
+ *  left (an empty restored view shows its own empty-state, with the toggle right
+ *  there to exit — same as when the view empties mid-session). */
+export const draftsViewActive = signal(initialAltView === 'drafts');
+/** Drawer-as-attention-filter toggle. When true, the thread list collapses to a
+ *  single "Needs attention" section showing every Current/Saved thread that
+ *  needs the user — awaiting an answer/permission, a failed turn, or a change
+ *  ready to apply (see `threadNeedsAttention`). Mirrors `draftsViewActive`:
+ *  persisted across reload, opt-in, and mutually exclusive with it (one
+ *  alternate filter view at a time). */
+export const attentionViewActive = signal(initialAltView === 'attention');
+
+/** Persist whichever alternate view is active (or clear the key when none is) so
+ *  the next reload restores it. Called from the two toggles — the only mutators
+ *  of these signals. */
+function persistAltView(): void {
+  const view: AltView = attentionViewActive.value
+    ? 'attention'
+    : draftsViewActive.value
+      ? 'drafts'
+      : 'none';
+  if (view === 'none') localStorage.removeItem(ALT_VIEW_KEY);
+  else localStorage.setItem(ALT_VIEW_KEY, view);
+}
+
+/** Toggle the drafts filter view. Mutually exclusive with the attention view —
+ *  turning drafts on clears attention so the drawer only ever runs one alternate
+ *  filter at a time. Shared by the desktop and mobile threads headers. */
+export function toggleDraftsView(): void {
+  const next = !draftsViewActive.value;
+  draftsViewActive.value = next;
+  if (next) attentionViewActive.value = false;
+  persistAltView();
+}
+
+/** Toggle the needs-attention filter view. Mutually exclusive with drafts. */
+export function toggleAttentionView(): void {
+  const next = !attentionViewActive.value;
+  attentionViewActive.value = next;
+  if (next) draftsViewActive.value = false;
+  persistAltView();
+}
 export const DEFAULT_DRAWER_WIDTH = 300;
-export const MIN_DRAWER_WIDTH = 200;
+// Floor: the drawer header's icon row needs 216px (5 × 2.25rem buttons +
+// 5 × 0.25rem gaps + 1rem padding at 16px/rem). 260 keeps the row intact
+// plus enough of the centered title to stay readable.
+export const MIN_DRAWER_WIDTH = 260;
+export const THREAD_DRAWER_WIDTH_KEY = 'lucidos-thread-drawer-width';
+// Clamp at load: widths persisted under an older, smaller minimum would
+// otherwise render an overflowing header until the next drag snaps them up.
 export const threadDrawerWidth = signal(
-  Number(localStorage.getItem('lucidos-thread-drawer-width')) || DEFAULT_DRAWER_WIDTH
+  Math.max(
+    MIN_DRAWER_WIDTH,
+    Number(localStorage.getItem(THREAD_DRAWER_WIDTH_KEY)) || DEFAULT_DRAWER_WIDTH,
+  )
 );
 export const focusedThreadId = signal<string | null>(
   localStorage.getItem(FOCUSED_THREAD_KEY)
@@ -210,6 +278,9 @@ export const revealOnFocus = signal(false);
 // --- Thread channel filter ---
 export type ThreadChannel = EventChannel;
 export const ALL_CHANNELS: ThreadChannel[] = [...EVENT_CHANNELS];
+export const CODING_AGENT_CHANNEL = 'claude_code' satisfies ThreadChannel;
+export const CODING_AGENT_SOURCE_FILTER = 'coding-agent';
+export type ThreadFilterSource = 'chat' | 'trigger' | typeof CODING_AGENT_SOURCE_FILTER;
 
 export const THREAD_CHANNEL_FILTER_KEY = 'lucidos-thread-channel-filter';
 
@@ -226,6 +297,17 @@ function restoreThreadChannelFilter(): Set<ThreadChannel> {
 }
 
 export const threadChannelFilter = signal<Set<ThreadChannel>>(restoreThreadChannelFilter());
+
+export function threadChannelToFilterSource(channel: ThreadChannel): ThreadFilterSource {
+  switch (channel) {
+    case CODING_AGENT_CHANNEL:
+      return CODING_AGENT_SOURCE_FILTER;
+    case 'chat':
+      return 'chat';
+    case 'trigger':
+      return 'trigger';
+  }
+}
 
 // Empty set = "all triggers". Non-empty = filter to those trigger_ids only.
 const SELECTED_TRIGGER_IDS_KEY = 'lucidos-selected-trigger-ids';
@@ -247,9 +329,9 @@ export function setSelectedTriggerIds(next: Set<string>): void {
   localStorage.setItem(SELECTED_TRIGGER_IDS_KEY, JSON.stringify([...next]));
 }
 
-// Empty set = "all repos". Non-empty = filter Claude Code threads to those
+// Empty set = "all repos". Non-empty = filter coding-agent threads to those
 // cc_repo_ids only. Mirrors `selectedTriggerIds` exactly — the dropdown turns
-// the Claude Code parent indeterminate when this set is non-empty.
+// the Coding Agent parent indeterminate when this set is non-empty.
 const SELECTED_REPO_IDS_KEY = 'lucidos-selected-repo-ids';
 
 function restoreSelectedRepoIds(): Set<string> {
@@ -270,7 +352,7 @@ export function setSelectedRepoIds(next: Set<string>): void {
 }
 
 // Mirrors selectedRepoIds for app coding-agent threads. Apps live alongside
-// repos under the Claude Code parent in the filter dropdown; their selection
+// repos under the Coding Agent parent in the filter dropdown; their selection
 // set is independent so a user can pick "this repo OR this app".
 const SELECTED_APP_IDS_KEY = 'lucidos-selected-app-ids';
 
@@ -311,6 +393,13 @@ export const generatedTitleIds = new Set<string>();
 export const threadHasMore = signal(true);
 /** Whether a load-more request is currently in flight. */
 export const threadLoadingMore = signal(false);
+/** Total size of the archived pile from the backend (`archive_state='archived'`,
+ *  unsaved) — refreshed by every `loadAllThreads` (startup / resume / reconnect).
+ *  Drives the collapsed Archive section's count badge so it shows the true total
+ *  rather than the loaded window. Plain signal (not `Loadable`) to match its
+ *  sibling `threadMap` / `threadsLoaded`, which the same fetch populates; the
+ *  badge falls back to the loaded count until this lands. */
+export const archiveThreadCount = signal(0);
 /** Derive effective thread status, accounting for in-progress apply operations and pending messages. */
 export function effectiveThreadStatus(thread: ThreadState): ThreadStatus {
   // Archive = user acknowledged any prior failed/aborted state. Drop the red
@@ -346,6 +435,31 @@ export function isThreadQuiescent(status: ThreadStatus | undefined): boolean {
   return status === 'idle' || status === 'waiting_for_user_answer';
 }
 
+/** Whether the chat render should treat this thread as quiescent for the
+ *  `exchangeStatus` stale-detector / trailing-spinner cleanup (the `threadIdle`
+ *  prop lifted in `renderExchanges`). Quiescent by raw status, UNLESS an
+ *  optimistic resume is in flight: the user just answered a pending question
+ *  (`answeringThreadIds`) or typed a follow-up not yet ingested
+ *  (`pendingUserMessages`).
+ *
+ *  Without this carve-out the answer→resume gap mislabels the answered turn as
+ *  aborted: the backend flips the projection to `running` on
+ *  `UserQuestionAnswered`, but the client's `meta.status` only advances when a
+ *  per-event aggregate carrying `running` arrives — and the resume's first
+ *  events can land while the snapshot still reads `waiting_for_user_answer`
+ *  (quiescent). The answered question-divider then has steps + no terminal +
+ *  `threadIdle`, and the stale-detector in `exchange-render.ts` flashes
+ *  "Aborted ⚠" until the `running` aggregate finally lands (observed as an ~8s
+ *  flash spanning the model's first post-answer LLM call). Mirrors the
+ *  `?.status` → `undefined` → `false` (treat-as-active) fallback of the prior
+ *  inline `isThreadQuiescent(threadMeta?.status)`. */
+export function isRenderedThreadIdle(thread: ThreadState | undefined): boolean {
+  if (!thread) return false;
+  if (answeringThreadIds.value.has(thread.meta.id)) return false;
+  if (thread.pendingUserMessages.length > 0) return false;
+  return isThreadQuiescent(thread.meta.status);
+}
+
 export function getThreadDisplaySection(thread: ThreadState): DisplaySection {
   return displaySection(
     thread.meta.section as ArchiveState,
@@ -357,20 +471,55 @@ export function getThreadDisplaySection(thread: ThreadState): DisplaySection {
   );
 }
 
-/** Threads visible in the REVIEW drawer section. `displaySection` ignores
- *  `meta.state`, so the drawer-hidden carve-out is applied here too — the
- *  picker and attention badge must agree with what the user can see. */
-export function getReviewThreads(): ThreadState[] {
+/** Threads in the Current drawer section, ignoring the active channel/trigger/
+ *  repo/app filter. `displaySection` ignores `meta.state`, so the drawer-hidden
+ *  carve-out is applied here too. This is the unfiltered section membership; the
+ *  archive-next-focus picker walks the drawer's filter-aware render order
+ *  (`orderedCurrentForReview`) so it only lands on a thread the user can
+ *  actually see. */
+export function getCurrentThreads(): ThreadState[] {
   const result: ThreadState[] = [];
   for (const thread of threadMap.value.values()) {
     if (isExcludedFromSections(thread)) continue;
-    if (getThreadDisplaySection(thread) === 'review') result.push(thread);
+    if (getThreadDisplaySection(thread) === 'current') result.push(thread);
   }
   return result;
 }
 
-/** Count of threads that actually display in the REVIEW section. */
-export const attentionThreadCount = computed(() => getReviewThreads().length);
+/** Whether a thread needs the user's attention: it sits in the Current or Saved
+ *  section AND the user must actively respond or fix something — answer a
+ *  question or grant permission (both surface as `waiting_for_user_answer`),
+ *  address a failed turn, or apply/discard a change ready to apply
+ *  (`codingAgentProposed`). A mid-turn (`running`) thread is the agent's turn,
+ *  not the user's: a proposed change whose follow-up turn is still in flight is
+ *  not yet *ready* to apply (its WaitingBanner shows Cancel, not Apply), so it
+ *  is excluded — mirroring `getCodingAgentWaitingInfo`'s running guard so the
+ *  badge can't claim a thread whose Apply button isn't even showing. Otherwise
+ *  this is `reviewTier < 2` — tier 0 (awaiting answer) plus tier 1 (failed OR
+ *  proposed change). Composing/discarded threads never qualify. Shared by
+ *  `attentionThreadCount` (the needs-attention filter badge) and
+ *  `attentionThreads` (the filter view), so the count and the filtered list can
+ *  never disagree. */
+export function threadNeedsAttention(thread: ThreadState): boolean {
+  if (isExcludedFromSections(thread)) return false;
+  const section = getThreadDisplaySection(thread);
+  if (section !== 'current' && section !== 'saved') return false;
+  const status = effectiveThreadStatus(thread);
+  if (status === 'running') return false;
+  return reviewTier(thread, status) < 2;
+}
+
+/** Count of threads needing the user's attention — awaiting answer/permission,
+ *  failed, or carrying a change ready to apply (see `threadNeedsAttention`) —
+ *  across the Current and Saved sections. Drives the badge on the needs-attention
+ *  filter toggle: the global "you have N to handle". */
+export const attentionThreadCount = computed(() => {
+  let count = 0;
+  for (const thread of threadMap.value.values()) {
+    if (threadNeedsAttention(thread)) count++;
+  }
+  return count;
+});
 
 export const activeExchanges = computed<Exchange[]>(() => {
   const id = focusedThreadId.value;
@@ -412,9 +561,25 @@ export const activeThreadIsComposing = computed(() => {
   return threadMap.value.get(id)?.meta.state === 'composing';
 });
 
+/** True once the workspace holds any real conversation history — any thread
+ *  that isn't a transient composing draft or a discarded one. Drives the
+ *  new-workspace welcome + starter-suggestions gate: a pristine workspace (no
+ *  history) shows the welcome; the moment one real thread exists it's retired.
+ *  Deliberately keyed on threads, NOT on `data/` files: a stray config/script
+ *  is not "conversation history", and the old artifact-presence gate wrongly
+ *  suppressed the welcome on a freshly-made workspace that had any such file. */
+export const workspaceHasHistory = computed(() => {
+  for (const thread of threadMap.value.values()) {
+    const state = thread.meta.state;
+    if (state !== 'composing' && state !== 'discarded') return true;
+  }
+  return false;
+});
+
 // --- Split layout ---
+export const SPLIT_RATIO_KEY = 'lucidos-split-ratio';
 export const splitRatio = signal(
-  parseFloat(localStorage.getItem('lucidos-split-ratio') || '0.4')
+  parseFloat(localStorage.getItem(SPLIT_RATIO_KEY) || '0.4')
 );
 // --- Mobile view ---
 // Single source of truth for mobile pane definitions.
@@ -482,38 +647,60 @@ export interface Repository {
 
 export const repositories = signal<Loadable<Repository[]>>({ status: 'not-loaded' });
 
-// --- Compose-view scope picker ---
-// Discriminated union of where a CC coding-agent thread should run. The
-// compose-view dropdown writes here; chat.ts resolves it to the engine's
-// `folder` request field; compose.ts binds the resolved values onto the
-// promoted thread's `meta` (codingAgentKind / codingAgentFolder / repoId).
+// --- Compose destination: coding target ---
+// Discriminated union of where a coding-agent thread should run — the coding
+// half of the compose destination (see store/composeDestination.ts). The
+// destination picker writes here via `applyDestination`; chat.ts resolves it
+// to the engine's `folder` request field; compose.ts binds the resolved values
+// onto the promoted thread's `meta` (codingAgentKind / codingAgentFolder /
+// repoId).
 export type Scope =
   | { kind: 'lucidos' }
   | { kind: 'external'; repoId: string }
   | { kind: 'app'; appId: string };
 
-const SCOPE_STORAGE_KEY = 'lucidos-cc-last-scope';
+const SCOPE_STORAGE_KEY = 'lucidos-coding-agent-last-scope';
+// Pre coding-agent-rename key name — read once, migrated to SCOPE_STORAGE_KEY,
+// then deleted so a long-lived PWA keeps the user's compose destination.
+const LEGACY_SCOPE_STORAGE_KEY = 'lucidos-cc-last-scope';
 const LEGACY_REPO_STORAGE_KEY = 'lucidos-cc-last-repo';
 
-function restoreScope(): Scope {
-  const raw = localStorage.getItem(SCOPE_STORAGE_KEY);
-  if (raw) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object') {
-        if (parsed.kind === 'lucidos') return { kind: 'lucidos' };
-        if (parsed.kind === 'external' && typeof parsed.repoId === 'string' && parsed.repoId) {
-          return { kind: 'external', repoId: parsed.repoId };
-        }
-        if (parsed.kind === 'app' && typeof parsed.appId === 'string' && parsed.appId) {
-          return { kind: 'app', appId: parsed.appId };
-        }
+function parseStoredScope(raw: string | null): Scope | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.kind === 'lucidos') return { kind: 'lucidos' };
+      if (parsed.kind === 'external' && typeof parsed.repoId === 'string' && parsed.repoId) {
+        return { kind: 'external', repoId: parsed.repoId };
       }
-    } catch {
-      // Corrupt value — drop and fall through to legacy migration / default.
+      if (parsed.kind === 'app' && typeof parsed.appId === 'string' && parsed.appId) {
+        return { kind: 'app', appId: parsed.appId };
+      }
+    }
+  } catch {
+    // Corrupt value — fall through to migration / default.
+  }
+  return null;
+}
+
+function restoreScope(): Scope {
+  const current = parseStoredScope(localStorage.getItem(SCOPE_STORAGE_KEY));
+  if (current) return current;
+
+  // One-time migration from the pre-rename `lucidos-cc-last-scope` key: read it,
+  // rewrite under the new key, and delete the old one so the next reload reads
+  // the new shape directly.
+  if (localStorage.getItem(LEGACY_SCOPE_STORAGE_KEY) !== null) {
+    const renamed = parseStoredScope(localStorage.getItem(LEGACY_SCOPE_STORAGE_KEY));
+    localStorage.removeItem(LEGACY_SCOPE_STORAGE_KEY);
+    if (renamed) {
+      localStorage.setItem(SCOPE_STORAGE_KEY, JSON.stringify(renamed));
+      return renamed;
     }
   }
-  // One-time migration from the legacy `lucidos-cc-last-repo` string ('' meant
+
+  // Older one-time migration from the legacy `lucidos-cc-last-repo` string ('' meant
   // Lucidos, any other value was an external repo UUID). Migrate once at
   // startup and delete the legacy key so the next reload reads the new shape.
   const legacy = localStorage.getItem(LEGACY_REPO_STORAGE_KEY);
@@ -530,6 +717,14 @@ function restoreScope(): Scope {
 
 export const selectedScope = signal<Scope>(restoreScope());
 
+/** The compose destination picker's coding-agent chip (Claude Code | Codex).
+ *  Bound onto the thread's meta at compose promotion (`sendCompose`) —
+ *  afterwards the thread is locked to that backend server-side. Remembered
+ *  per workspace: seeded from the `coding_agent_default` preference by
+ *  `loadPreferences`, written back via `setCodingAgentDefault` on chip change.
+ *  (Reverses the earlier session-only default — see ADR 0006.) */
+export const selectedCodingAgent = signal<import('../api/types').CodingAgent>('claude-code');
+
 /** Translate a Scope into the engine's `folder` request field. Lucidos →
  *  empty string (engine defaults to Lucidos when both folder and repo_id are
  *  empty). External → the repo UUID (engine's `resolve_folder_input` looks
@@ -544,7 +739,7 @@ export function scopeToFolder(scope: Scope): string {
 }
 
 /** Read the repo UUID out of a Scope when one applies — used by code paths
- *  that still need to surface the bound repo (e.g. CCControlMenu's
+ *  that still need to surface the bound repo (e.g. CodingAgentControlMenu's
  *  per-repo command listing). App + Lucidos return undefined; the menu
  *  falls back to its default Lucidos resolution. */
 export function scopeToRepoId(scope: Scope): string | undefined {
@@ -641,6 +836,15 @@ export const applyingChangeIds = signal<Set<string>>(new Set());
  *  Tracks the phase: 'requesting' (waiting for backend) → 'applying' (ChangeProposed arrived).
  *  Cleared when the apply completes, fails, or the backend takes over. */
 export const applyingNowThreadIds = signal<Map<string, 'requesting' | 'applying'>>(new Map());
+/** Whether an "Apply All" batch is currently running. Drives the busy state of
+ *  the bulk Apply All / Discard All buttons. Set optimistically when the user
+ *  clicks Apply All (and by the ApplyAllBatchStarted SSE event — so a batch
+ *  started on another device disables the buttons here too), cleared by
+ *  ApplyAllBatchCompleted (or an immediate HTTP error). The batch applies the
+ *  first change synchronously and drives the rest in the background — including
+ *  a multi-minute wait while it hardens an unhardened member — so without this
+ *  the button looked dead the whole time. */
+export const applyAllInProgress = signal(false);
 /** Thread IDs where archive is in progress (prevents duplicate API calls). */
 export const archivingThreadIds = signal<Set<string>>(new Set());
 /** Thread IDs where CC changes discard is in progress (hides Apply, shows "Discard..."). */
@@ -649,6 +853,29 @@ export const discardingCCThreadIds = signal<Set<string>>(new Set());
  *  the Cancel button (shows "Cancel...") and drives the spinner status label.
  *  Cleared when the thread leaves active status (via PromptInput effect). */
 export const cancelingThreadIds = signal<Set<string>>(new Set());
+/** Thread IDs where a pending question was just answered and the agent's resume
+ *  hasn't yet advanced the client's `meta.status` off `waiting_for_user_answer`.
+ *  Read by `isRenderedThreadIdle` to suppress the answer→resume "Aborted" flash
+ *  (see that function). Set in the `answerThreadQuestion` action; cleared once
+ *  the real status leaves `waiting_for_user_answer` (PromptInput effect) or on
+ *  answer failure (the action's 409/catch paths). */
+export const answeringThreadIds = signal<Set<string>>(new Set());
+
+/** Stamp a thread as awaiting question-answer resume (optimistic). */
+export function markThreadAnswering(threadId: string): void {
+  if (answeringThreadIds.value.has(threadId)) return;
+  const next = new Set(answeringThreadIds.value);
+  next.add(threadId);
+  answeringThreadIds.value = next;
+}
+
+/** Drop the optimistic answering flag for a thread (resume confirmed or failed). */
+export function clearThreadAnswering(threadId: string): void {
+  if (!answeringThreadIds.value.has(threadId)) return;
+  const next = new Set(answeringThreadIds.value);
+  next.delete(threadId);
+  answeringThreadIds.value = next;
+}
 /** Pending changes from Claude Code sessions. `Loadable<Change[]>` so a backend
  *  failure surfaces as `failed` instead of looking like "no changes" —
  *  consumers branch on all four states per `.claude/rules/frontend.md`. */
@@ -685,6 +912,22 @@ export const busyChangeIds = computed(() => {
     }
   }
   return ids;
+});
+/** Thread IDs that own a pending change currently being applied — the reverse
+ *  of busyChangeIds, mapping change-level apply tracking (applyingChangeIds: an
+ *  Apply All batch member, hardening revival, or conflict resolution) back onto
+ *  its originating thread. Lets the focused thread's WaitingBanner show
+ *  "Apply..." when its change is applied from the Changes panel, mirroring the
+ *  in-thread Apply Now path (applyingNowThreadIds) which is tracked thread-side
+ *  to begin with. */
+export const applyingChangeThreadIds = computed(() => {
+  const result = new Set<string>();
+  const ids = applyingChangeIds.value;
+  if (ids.size === 0 || changes.value.status !== 'loaded') return result;
+  for (const c of changes.value.data) {
+    if (c.thread_id && ids.has(c.id)) result.add(c.thread_id);
+  }
+  return result;
 });
 /** Whether more applied changes are available for pagination. */
 export const changesHasMore = signal(false);
@@ -746,9 +989,17 @@ export const panelTitle = signal<string | null>(null);
  *  Used to detect whether the user has navigated within the webview. */
 export const webviewInitialUrl = signal<string | null>(null);
 export const fileSearchOpen = signal(false);
+/** The toggle button that opened the file-search modal — passed to `<Overlay>`
+ *  as the dismiss anchor (exempt from outside-pointerdown dismiss). */
+export const fileSearchAnchor = signal<HTMLElement | null>(null);
 
 // --- Search Everywhere ---
 export const searchEverywhereOpen = signal(false);
+
+/** The toggle button that opened the modal. Passed to the dismiss hook as the
+ *  anchor so re-tapping the toggle closes via its own handler instead of the
+ *  outside-pointerdown dismiss racing the touch toggle (which reopened it). */
+export const searchEverywhereAnchor = signal<HTMLElement | null>(null);
 
 export const expandedFolders = signal<Set<string>>(
   (() => {
@@ -763,7 +1014,20 @@ export const expandedFolders = signal<Set<string>>(
 
 // --- Notifications ---
 export const notifications = signal<Loadable<Notification[]>>({ status: 'not-loaded' });
-export const unreadCount = signal(parseInt(localStorage.getItem('lucidos-unread-count') || '0', 10) || 0);
+/** Single source of truth for unread notifications. The bell badge is a pure
+ *  projection of this set — there is NO separately-fetched unread count to
+ *  drift from it (the old `unreadCount` number could, which is how the badge
+ *  came to show unread when the inbox held none). Maintained by
+ *  actions/notifications.ts: loaded on startup / resume / notification SSE, with
+ *  optimistic removal on mark-read. Bounded — unread is naturally small and the
+ *  load is capped — so a pathological backlog simply renders as "99+". */
+export const unreadNotifications = signal<Loadable<Notification[]>>({ status: 'not-loaded' });
+/** Bell-badge count — DERIVED from the unread set, never independently fetched.
+ *  Because the count IS the set's length, the badge can never contradict the
+ *  notifications themselves. */
+export const unreadCount = computed(() =>
+  unreadNotifications.value.status === 'loaded' ? unreadNotifications.value.data.length : 0,
+);
 const cachedFilter = localStorage.getItem('lucidos-notifications-filter');
 export const notificationsFilter = signal<'all' | 'unread'>(
   cachedFilter === 'unread' ? 'unread' : 'all',
@@ -778,11 +1042,18 @@ export const pageTitle = computed(() =>
 // --- Credentials ---
 export const credentials = signal<Loadable<CredentialInfo[]>>({ status: 'not-loaded' });
 
+// --- Chat model registry (Settings → Models; drives the Lucidos Agent picker) ---
+export const chatModels = signal<Loadable<ModelInfo[]>>({ status: 'not-loaded' });
+
 // --- OAuth Accounts ---
 export const oauthAccounts = signal<Loadable<OAuthAccountInfo[]>>({ status: 'not-loaded' });
 
 // --- Triggers ---
 export const triggers = signal<Loadable<TriggerInfo[]>>({ status: 'not-loaded' });
+
+/** Thread Queue panel state — queued + running background spawns plus the
+ *  capacity policy. Refreshed on ThreadQueue* / CapacityPolicyChanged SSE. */
+export const threadQueue = signal<Loadable<ThreadQueueResponse>>({ status: 'not-loaded' });
 
 export const historicalTriggers = signal<Loadable<HistoricalTriggerInfo[]>>({ status: 'not-loaded' });
 
@@ -821,16 +1092,16 @@ export function toggleTriggerGroupCollapsed(groupId: string): void {
 export const pendingChatMessage = signal<string | null>(null);
 
 // --- Claude Code session version — bumped when a Claude Code session starts/resumes so components can re-fetch commands ---
-export const ccSessionVersion = signal(0);
+export const codingAgentSessionVersion = signal(0);
 
 // --- CC pending preferences — set from compose view before a session starts, consumed on first CC message ---
-export const ccPendingModel = signal<CCModelValue | null>(null);
-export const ccPendingReasoningEffort = signal<CCReasoningEffort | null>(null);
+export const codingAgentPendingModel = signal<CodingAgentModelValue | null>(null);
+export const codingAgentPendingReasoningEffort = signal<CodingAgentReasoningEffort | null>(null);
 
 /** Reset pending CC preferences to defaults. Called on thread switch and after sending. */
-export function resetCCPendingPreferences(): void {
-  ccPendingModel.value = null;
-  ccPendingReasoningEffort.value = null;
+export function resetCodingAgentPendingPreferences(): void {
+  codingAgentPendingModel.value = null;
+  codingAgentPendingReasoningEffort.value = null;
 }
 
 // --- Apps ---
@@ -880,8 +1151,18 @@ export const TOAST_AUTO_DISMISS_MS = 5_000;
  *  Map entry would survive until the setTimeout fires. */
 const keyedDismissTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; autoDismissMs?: number; dismissable?: boolean }) {
-  const { key, action, secondaryAction, onClick, spinning, autoDismissMs, dismissable } = opts ?? {};
+export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; autoDismissMs?: number; dismissable?: boolean; showDuringRestart?: boolean }) {
+  const { key, action, secondaryAction, onClick, spinning, autoDismissMs, dismissable, showDuringRestart } = opts ?? {};
+  // While the engine is restarting the UiBlockingOverlay covers the screen and
+  // every in-flight request fails as the engine goes down (changes fetch, SSE,
+  // health poll). Suppress the resulting failure/info toasts — including the
+  // service-worker "New version available" prompt the post-restart frontend
+  // rebuild triggers — so the only thing on screen is the "Restarting engine..."
+  // status (which opts in via showDuringRestart). Toasts emitted once the
+  // restart completes (engineRestarting flips back to false — e.g. the "Engine
+  // restarted" / "Restart failed" / "Engine restart timed out" toasts, each set
+  // after clearing the flag) show normally.
+  if (engineRestarting.value && !showDuringRestart) return;
   // If a key is provided, update an existing toast with the same key instead of creating a new one
   if (key) {
     const existing = toasts.value.find((t) => t.key === key);
@@ -931,6 +1212,17 @@ export function dismissToast(idOrKey: number | string) {
     updateAvailable.value = false;
     markSwUpdateDismissed();
   }
+}
+
+/** True when a toast already on screen offers the user a way to pick up a new
+ *  build — i.e. it carries an action button. Every action-bearing toast in the
+ *  app is a refresh/restart prompt ("Applied …"/"Engine restarted" with a
+ *  Refresh button, "Engine restart required" with a Restart button, or the
+ *  "New version available" toast itself), so the presence of `action` is a
+ *  sufficient signal. Used to suppress the redundant "New version available"
+ *  toast when one of those is already visible. */
+export function hasRefreshToast(): boolean {
+  return toasts.value.some((t) => t.action !== undefined);
 }
 
 export function showConfirm(
@@ -1012,4 +1304,3 @@ export const updateAvailable = signal(false);
  *  updated. `null` until the SW answers; the live dev server reports the
  *  un-stamped `__LUCIDOS_BUILD_ID__` placeholder (shown as "dev"). */
 export const serviceWorkerBuildId = signal<string | null>(null);
-

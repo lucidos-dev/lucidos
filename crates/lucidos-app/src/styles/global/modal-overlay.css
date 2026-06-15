@@ -10,12 +10,13 @@
     animation: modal-in var(--duration-fast) ease;
 }
 
-/* Restart overlay — blocks interaction while engine restarts.
+/* UI-blocking overlay — blocks interaction while the engine restarts or the
+   client refreshes.
    z-index above --z-control-panel so the header (.pane-header-brand,
    .collapsed-thread-actions, .message-route-panel all sit at 2200) is
    covered by the dim overlay and its buttons aren't clickable through.
    .toast-container sits a step higher so the restart toast stays visible. */
-.restart-overlay {
+.ui-blocking-overlay {
     position: fixed;
     inset: 0;
     z-index: calc(var(--z-control-panel) + 100);
@@ -29,26 +30,54 @@
     animation: modal-in var(--duration-normal) ease-out;
 }
 
-/* During a restart, nothing may float above the dim blocker except the toast
-   container (--z-toast). The elements that outrank the overlay in normal use
-   all sit at the tooltip layer (--z-tooltip = 10000, kept that high so a modal
-   never clips them): the JS tooltip, a pseudo-fullscreen app iframe, and the
-   landscape-rotate lock. RestartOverlay flags :root[data-restarting] so they
-   step aside while restarting. */
+/* While the UI is blocked, nothing may float above the dim blocker except the
+   toast container (--z-toast). The elements that outrank the overlay in normal
+   use all sit at the tooltip layer (--z-tooltip = 10000, kept that high so a
+   modal never clips them): the JS tooltip, a pseudo-fullscreen app iframe, and
+   the landscape-rotate lock. UiBlockingOverlay flags :root[data-ui-blocked] so
+   they step aside while blocked. */
 
 /* Tooltip is transient — hide it outright (a ghost behind the 50% scrim would
    look broken). inert already stops new tooltips firing (the hover targets are
-   inert), so this only clears one already on screen when the restart began. */
-:root[data-restarting] #tooltip {
+   inert), so this only clears one already on screen when the block began. */
+:root[data-ui-blocked] #tooltip {
     display: none !important;
 }
 
 /* Full-screen opaque panels: drop below the overlay (don't hide) so the dim
-   "restarting" scrim covers them and the restart toast stays visible, then they
-   pop back to the top when the restart ends. */
-:root[data-restarting] .app-ui-inline.app-ui-fullscreen,
-:root[data-restarting] .landscape-lock {
+   scrim covers them and the toast stays visible, then they pop back to the top
+   when the block ends. */
+:root[data-ui-blocked] .app-ui-inline.app-ui-fullscreen,
+:root[data-ui-blocked] .landscape-lock {
     z-index: calc(var(--z-modal) - 1) !important;
+}
+
+/* While any <Overlay> is open, the main UI behind it goes inert — no hover
+   highlight, no activation; a click just lands on `.app-shell` (which the dismiss
+   contract treats as outside → dismiss). The hover analog of the outside-click
+   swallow. `Toast` and the modal scrims render OUTSIDE `.app-shell`, so they stay
+   interactive. The overlay panels themselves (incl. the inline popovers like the
+   control panel / dropdowns, which DO render inside `.app-shell`) are re-enabled
+   via `[data-overlay-panel]`, and the toggle that opened the overlay via
+   `[data-overlay-anchor]` (set in `Overlay.tsx`) — the anchor MUST stay clickable
+   so re-activating it closes via its OWN handler (the documented anchor
+   exemption), not by being routed through the outside-dismiss path.
+   `pointer-events` is used (not `inert`) precisely because a descendant can
+   override an inert ancestor, which `inert` can't.
+
+   The inert is applied to `.app-shell`'s CHILDREN (`.app-shell > *`), not
+   `.app-shell` itself: `.app-shell` must remain a real hit target so an outside
+   click LANDS ON IT (a backdrop-less popover has no scrim of its own — the click
+   would otherwise fall through to `#app` and the dismiss-via-outside-click path
+   couldn't resolve a target inside the app). `pointer-events` inherits, so every
+   descendant of an inert child is inert too; panels/anchors re-set it to `auto`.
+   Driven by `data-overlay-open` on <html>, ref-counted in `Overlay.tsx`. */
+:root[data-overlay-open] .app-shell > * {
+    pointer-events: none;
+}
+:root[data-overlay-open] [data-overlay-panel],
+:root[data-overlay-open] [data-overlay-anchor] {
+    pointer-events: auto;
 }
 
 /* Reduced motion: disable non-essential transitions globally */

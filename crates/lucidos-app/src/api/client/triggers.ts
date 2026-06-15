@@ -1,6 +1,12 @@
 import { API, json, mutatingFetch, throwIfNotOk } from './_core';
 import { lucidos } from '@lucidos/sdk';
-import type { EventSubscription, HistoricalTriggerInfo, TriggerGroup, TriggerRun } from '../../store/types';
+import type {
+  EventSubscription,
+  HistoricalTriggerInfo,
+  SideEffectCategory,
+  TriggerGroup,
+  TriggerRun,
+} from '../../store/types';
 import type { ApiResult, TriggersListResponse } from '../types';
 
 // --- Triggers (SDK delegation) ---
@@ -16,6 +22,9 @@ export function createTrigger(body: {
   go_to_review?: boolean;
   /** Optional *trigger group* id (UUID string). Omit for ungrouped. */
   group_id?: string;
+  /** Side-effect grant (ADR 0002, Phase 5) — irreversible categories this
+   *  trigger may perform unattended. Omit/[] = none granted. */
+  side_effect_grant?: SideEffectCategory[];
 }): Promise<ApiResult> {
   return lucidos.triggers.create(body) as Promise<ApiResult>;
 }
@@ -33,6 +42,8 @@ export function updateTrigger(
     /** Move into a *trigger group* (string id) or out of any group (null).
      *  Absent leaves membership unchanged. */
     group_id?: string | null;
+    /** Full replacement for the side-effect grant; send [] to clear all. */
+    side_effect_grant?: SideEffectCategory[];
   }
 ): Promise<ApiResult> {
   return lucidos.triggers.update(id, body) as Promise<ApiResult>;

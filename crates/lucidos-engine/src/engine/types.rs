@@ -106,6 +106,17 @@ mod tests {
 pub enum ContextProducer {
     MainLlm,
     ClaudeCode,
+    Codex,
+}
+
+impl ContextProducer {
+    /// Producer for a `ContextCaptured` emitted from a coding-agent session.
+    pub fn from_coding_agent(agent: crate::runtime::CodingAgent) -> Self {
+        match agent {
+            crate::runtime::CodingAgent::ClaudeCode => Self::ClaudeCode,
+            crate::runtime::CodingAgent::Codex => Self::Codex,
+        }
+    }
 }
 
 /// `cache_*_tokens` are Anthropic-only (zero elsewhere). `output_tokens`
@@ -225,6 +236,16 @@ pub struct AgentSession {
     /// drift apart and the `auto_apply || discard || archiving` shape was a
     /// repeated source of bugs.
     pub pending_stop: Option<StopReason>,
+    /// Device that clicked **Cancel** on a live (non-waiting) session, stamped
+    /// by `interrupt_agent` before it fires the `interrupt` notify. The
+    /// run_session interrupt arm drains it (`take_session_cancel_actor`) and
+    /// merges it into the emitted `ResponseCanceled.actor` so the Initiator
+    /// popover shows which device cancelled — the live-interrupt analog of the
+    /// chat path's `ThreadHandle.cancel_actor` slot. `None` for engine-internal
+    /// interrupts (those pre-emit their own boundary events with an explicit
+    /// actor upstream). Drained on read so a stale device can't carry into the
+    /// next turn on a resumed session.
+    pub cancel_actor: Option<crate::engine::thread_events::MessageOrigin>,
     /// Generic stop signal for the run_session loop. Fired by `stop_agent` for
     /// every user-driven termination (Cancel, Apply, Discard, Archive) and by
     /// the engine shutdown timeout. The stop arm reads `pending_stop` and

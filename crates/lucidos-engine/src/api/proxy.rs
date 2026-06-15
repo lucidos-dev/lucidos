@@ -695,6 +695,17 @@ fn merge_query_params(url: &str, pairs: &[(String, String)]) -> String {
     out
 }
 
+/// Routes for the generic API proxy — forwards to a backend configured in
+/// `data/config/apis.json`. Two root routes so callers can hit
+/// `/proxy/sonos` (no trailing path) as well as `/proxy/sonos/play/2`.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/proxy/:name", any(proxy_handler_root))
+        .route("/proxy/:name/", any(proxy_handler_root))
+        .route("/proxy/:name/*path", any(proxy_handler))
+        .route("/proxy-modules/reload", post(proxy_modules_reload))
+}
+
 #[cfg(test)]
 #[path = "proxy_tests.rs"]
 mod tests;

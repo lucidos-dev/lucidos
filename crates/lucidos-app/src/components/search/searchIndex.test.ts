@@ -35,3 +35,29 @@ describe('settings search — keyboard shortcuts', () => {
     expect(getSettingsSearchResults('ctrl shift s', 20).some((r) => r.id === 'shortcut:searchEverywhere')).toBe(false);
   });
 });
+
+describe('settings search — Permissions section', () => {
+  it('finds the Command Safety rows by name', () => {
+    const guard = getSettingsSearchResults('command guard', 20);
+    expect(guard.some((r) => r.id === 'command-safety:guard')).toBe(true);
+    const judge = getSettingsSearchResults('judge model', 20);
+    expect(judge.some((r) => r.id === 'command-safety:judge-model')).toBe(true);
+  });
+
+  it('finds both allowlist editors by name', () => {
+    expect(getSettingsSearchResults('lucidos agent permissions', 20).some((r) => r.id === 'permissions:lucidos')).toBe(true);
+    expect(getSettingsSearchResults('claude code permissions', 20).some((r) => r.id === 'permissions:claude-code')).toBe(true);
+  });
+
+  it('resolves a Command Safety entry to the permissions subview with its anchor', () => {
+    const entry = findSettingsEntry('command-safety:guard');
+    expect(entry?.subview).toBe('permissions');
+    expect(entry?.anchor).toBe('command-safety:guard');
+  });
+
+  it('resolves the allowlist editors to their anchors under the permissions subview', () => {
+    expect(findSettingsEntry('permissions:lucidos')?.subview).toBe('permissions');
+    expect(findSettingsEntry('permissions:lucidos')?.anchor).toBe('permissions:lucidos');
+    expect(findSettingsEntry('permissions:claude-code')?.anchor).toBe('permissions:claude-code');
+  });
+});

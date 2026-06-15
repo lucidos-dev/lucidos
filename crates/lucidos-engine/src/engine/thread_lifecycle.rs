@@ -40,17 +40,18 @@ impl ArchiveState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisplaySection {
-    /// Local work in progress OR waiting on active children. Combines what was
-    /// previously `Running` and `Waiting` — the user doesn't care whether the
-    /// thread is doing the work itself or waiting on a delegated child.
-    Active,
     /// Saved threads stay here regardless of any other state. Highest-priority
-    /// route. The saved-section header carries a CTA badge so unaddressed
+    /// route. The saved-section header carries an attention badge so unaddressed
     /// changes/questions/errors aren't lost.
     Saved,
-    /// Anything that needs the user's attention to progress and isn't saved
-    /// or archived.
-    Review,
+    /// The live working set: everything that isn't saved or archived. Replaces
+    /// the former `Active` + `Review` split — a thread no longer hops sections
+    /// when it starts or stops running. It holds threads the user is actively
+    /// engaged with, in either direction: running (the system's turn), awaiting
+    /// the user (their turn), or recently idle. The row's status icon carries
+    /// the running ("Active") signal in place, and attention-needing threads
+    /// sort to the top under a header attention badge.
+    Current,
     /// User-archived threads — long-term storage.
     Archive,
 }
@@ -200,7 +201,8 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         | "CodingAgentIdled"
         | "ChangeProposed"
         | "UserQuestionAsked"
-        | "CodingAgentPermissionRequest" => EventClass::ActionRequired,
+        | "CodingAgentPermissionRequest"
+        | "CommandPermissionRequested" => EventClass::ActionRequired,
         // ContinuationRequested — a continuation request, classified as Start so
         // the recipient thread surfaces the spawn as the beginning of a
         // new exchange. Emitted by Phase 5.3 recovery paths; the spawn
@@ -210,7 +212,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // UserQuestionAnswered is a step inside the same exchange as the
         // question — Activity, not Start. The status transition still moves
         // to Running so the resumed CC turn shows as in-progress.
-        "UserQuestionAnswered" | "CodingAgentPermissionResolved" => EventClass::Activity,
+        "UserQuestionAnswered" | "CodingAgentPermissionResolved" | "CommandPermissionResolved" => {
+            EventClass::Activity
+        }
         // WorktreeCleaned — passive bookkeeping for the background cleanup
         // worker (Phase 10.2). Classified as Metadata so it doesn't disturb
         // the thread's display section or activity timestamps.
@@ -292,6 +296,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "UserQuestionAnswered",
         "CodingAgentPermissionRequest",
         "CodingAgentPermissionResolved",
+        "CommandPermissionRequested",
+        "CommandPermissionResolved",
         "WorktreeCleaned",
         // Phase 4 fan-in / resume bookkeeping.
         "ChildThreadCompleted",
@@ -432,6 +438,20 @@ pub fn resolve_transition(
             ThreadType::CodingAgent => no_change,
             ThreadType::Chat => violation("CodingAgentPermissionResolved is CC-only"),
         },
+        // Command guard permission request (ADR 0002) — the chat mirror of
+        // `CodingAgentPermissionRequest`. Surfaces the thread in REVIEW so the
+        // user sees the PermissionCard. Emitted by the Lucidos Agent on a Chat
+        // thread, never by CC, so the thread-type split is the inverse.
+        "CommandPermissionRequested" => match thread_type {
+            ThreadType::Chat => to_inbox,
+            ThreadType::CodingAgent => violation("CommandPermissionRequested is chat-only"),
+        },
+        // CommandPermissionResolved is a step inside the same exchange — the
+        // chat agent's tool call runs (or is refused) once the answer arrives.
+        "CommandPermissionResolved" => match thread_type {
+            ThreadType::Chat => no_change,
+            ThreadType::CodingAgent => violation("CommandPermissionResolved is chat-only"),
+        },
         // Events legal for both, no section change
         "MessageReceived"
         | "TextStreamed"
@@ -522,35 +542,32 @@ pub fn resolve_transition(
 
 /// Resolution order:
 ///   1. is_saved                                        → Saved
-///   2. has_attention_descendants                       → Review
-///   3. status == Running OR has_active_children        → Active
-///   4. has_pending_changes                             → Review
-///   5. archive_state == Archived                       → Archive
-///   6. otherwise                                       → Review
+///   2. archive_state == Archived AND nothing still
+///      demands surfacing                               → Archive
+///   3. otherwise                                       → Current
 ///
 /// Saved is the strongest claim — saving is the user's "I'll manage this
 /// manually" gesture and overrides every other route.
 ///
-/// `has_attention_descendants` (clause 2) bubbles transitively from any
-/// descendant in `is_attention_needing` state — WaitingForUserAnswer or
-/// an in-workspace CC thread with pending changes. It outranks the local
-/// "Active" clause: if any descendant is paused on a user question /
-/// permission or has pending CC changes, the parent surfaces in Review
-/// so the user can find the attention card by walking down — even if a
-/// sibling descendant is still actively running.
+/// Everything that isn't saved or archived lands in Current — the live
+/// working set. The former `Active` (running / waiting-on-a-child) and
+/// `Review` (your-turn / recently-idle) sections are merged: a thread no
+/// longer changes section when it starts or stops running. The running
+/// state is carried in place by the row's status icon, and attention-
+/// needing threads sort to the top of Current under a header attention
+/// badge instead of living in a separate section.
 ///
-/// `has_pending_changes` on SELF (clause 4) stays AFTER Running, not
-/// merged with attention-descendants. Rationale: when the thread itself
-/// is mid-turn, a pending change is typically about to be resolved by
-/// the live work — surfacing it as Review would mask the live activity.
-/// (See test `running_overrides_pending`.) An attention-needing
-/// DESCENDANT, by contrast, resolves independently of the parent's
-/// run state, so it bubbles past Running.
-///
-/// Pending changes still outrank Archive (clause 4 before clause 5) so
-/// the user can never lose unresolved work behind the archive curtain:
-/// a thread the user archived while changes are still pending stays
-/// surfaced in Review until they explicitly Apply or Discard each one.
+/// An archived thread still surfaces in Current — never silently dropped
+/// to Archive — while it `demands_surface`: it is running, waiting on a
+/// delegated child, carries its own pending changes, or carries an
+/// attention descendant (bubbled transitively from any descendant in
+/// `is_attention_needing` state — WaitingForUserAnswer or an in-workspace
+/// CC thread with pending changes). This guarantees the user can never
+/// lose unresolved work behind the archive curtain: a thread archived
+/// while changes are still pending stays in Current until they explicitly
+/// Apply or Discard each one. (See tests
+/// `archived_with_pending_changes_routes_to_current`,
+/// `attention_descendant_overrides_archive`.)
 pub fn display_section(
     stored: ArchiveState,
     status: ThreadStatus,
@@ -562,19 +579,19 @@ pub fn display_section(
     if is_saved {
         return DisplaySection::Saved;
     }
-    if has_attention_descendants {
-        return DisplaySection::Review;
-    }
-    if status == ThreadStatus::Running || has_active_children {
-        return DisplaySection::Active;
-    }
-    if has_pending_changes {
-        return DisplaySection::Review;
-    }
-    if stored == ArchiveState::Archived {
+    // Archived threads drop to Archive UNLESS they still demand surfacing —
+    // running, waiting on a delegated child, carrying their own pending
+    // changes, or carrying an attention descendant — in which case they stay
+    // in Current alongside the rest of the live working set so unresolved
+    // work can't hide behind the archive curtain.
+    let demands_surface = status == ThreadStatus::Running
+        || has_active_children
+        || has_pending_changes
+        || has_attention_descendants;
+    if stored == ArchiveState::Archived && !demands_surface {
         return DisplaySection::Archive;
     }
-    DisplaySection::Review
+    DisplaySection::Current
 }
 
 /// A thread is "blocking" iff archiving its ancestor would silently strand
@@ -703,7 +720,7 @@ pub fn available_thread_actions(
     let mut actions = Vec::new();
     let live =
         status == ThreadStatus::Running || status == ThreadStatus::WaitingForUserAnswer;
-    let cc_pending = has_pending_changes && thread_type == ThreadType::CodingAgent;
+    let coding_agent_pending = has_pending_changes && thread_type == ThreadType::CodingAgent;
 
     // Layer 1 — draft discard. Orthogonal to run state: an unsent draft can be
     // discarded whether or not the thread is live.
@@ -714,7 +731,7 @@ pub fn available_thread_actions(
     // the thread is live (mid-turn). A pending change outranks archive: the
     // user must Apply or Discard before the thread can be archived.
     if !live {
-        if cc_pending {
+        if coding_agent_pending {
             actions.push(Action::Discard);
             actions.push(Action::Apply);
         } else if stored_section == ArchiveState::Inbox && !descendants_block_archive {
@@ -752,6 +769,8 @@ pub const LAST_ACTIVITY_EVENTS: &[&str] = &[
     "UserQuestionAnswered",
     "CodingAgentPermissionRequest",
     "CodingAgentPermissionResolved",
+    "CommandPermissionRequested",
+    "CommandPermissionResolved",
     // ContinuationRequested — start event for a CC continuation. Bumps last_activity
     // so the thread surfaces in the recents list as soon as the recovery
     // dispatcher emits one.
@@ -915,7 +934,13 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
-        // CC lifecycle
+        // CC lifecycle. The projection SQL also preserves a pre-existing
+        // 'failed' status (`CASE WHEN status='failed' THEN 'failed' ELSE …`):
+        // a failed CC turn emits `ResponseFailed` then this idle in the same
+        // turn, and the idle must not downgrade the red error dot. The coarse
+        // `ConditionalCc` model can't express "preserve failed", but the
+        // `terminal_events_never_set_running` invariant still holds — see the
+        // CodingAgentIdled arm in `event_bus_projection_thread.rs`.
         (
             "CodingAgentIdled",
             StatusTransition {
@@ -996,6 +1021,24 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         ),
         (
             "CodingAgentPermissionResolved",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        // Command guard permission prompt (ADR 0002) — pauses the chat agent's
+        // bash/python tool call, surfaces a PermissionCard. Mirrors
+        // CodingAgentPermission*: the agent loop blocks in-process, so the
+        // resolution transitions back to Running to resume the loop.
+        (
+            "CommandPermissionRequested",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::WaitingForUserAnswer),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        (
+            "CommandPermissionResolved",
             StatusTransition {
                 status: StatusRule::Set(ThreadStatus::Running),
                 cc_flags: CcFlagRule::None,

@@ -1,21 +1,13 @@
-/* --- Response panel — bordered card wrapping the executor's reply. Header
-   carries executor + status + timestamp + (optional) stop button + collapse
-   toggle. Body collapses when the user clicks the header. */
-.response-panel {
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    margin: 0.5rem 0 0.25rem 0;
-    background: var(--bg-primary);
-    overflow: hidden;
-}
-
+/* --- Response turn — flat, card-less. The executor's reply: a header row
+   (executor chip + status + timestamp) over a flush body. Inter-turn feed
+   padding comes from the shared `.initiator-panel, .response-panel` rule in
+   input-messages.css (no divider line). Body collapses on header click. */
 .response-header {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    padding: 0.5rem 0.75rem;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border-color);
+    margin-bottom: 0.7rem;
+    min-height: 1.2rem;
     font-size: 0.75rem;
     color: var(--text-secondary);
     flex-wrap: wrap;
@@ -32,11 +24,11 @@
 .response-executor-icon svg {
     width: var(--icon-size-sm);
     height: var(--icon-size-sm);
-    color: var(--initiator-cc);
+    color: var(--initiator-coding-agent);
 }
 
 .response-executor-label {
-    font-weight: 500;
+    font-weight: 600;
     color: var(--text-primary);
     flex-shrink: 0;
 }
@@ -56,13 +48,8 @@
     color: var(--text-muted);
 }
 
-.response-panel-collapsed .response-header,
-.response-panel-bodyless .response-header {
-    border-bottom: none;
-}
-
 .response-body {
-    padding: 0.75rem 1rem;
+    padding: 0;
 }
 
 /* ContinuationStarted engine note — collapsed by default, expands inline when
@@ -96,9 +83,10 @@
     color: var(--text-secondary);
 }
 
-/* Engine reason badges — every engine panel inherits the teal border + tinted
-   header from .initiator-panel-system; only the summary line color differs to
-   convey *why* the engine spoke (trigger fired, change applied/failed/...). */
+/* Reason colors — the ONLY surviving variant color on a flat turn. The name is
+   now plain; only the summary line is tinted to convey *why* the engine spoke
+   (trigger fired, change applied/failed/discarded/reverted). Applies whether the
+   summary is a plain <div> or the clickable .initiator-summary-link button. */
 .initiator-panel-trigger          .initiator-summary { color: var(--reason-trigger); }
 .initiator-panel-change-applied   .initiator-summary { color: var(--reason-applied); }
 .initiator-panel-change-failed    .initiator-summary { color: var(--reason-failed); }
@@ -106,13 +94,12 @@
 .initiator-panel-change-reverted  .initiator-summary { color: var(--reason-muted); }
 
 /* Action buttons (Diff/Revert) render in a footer at the bottom-right of the
-   panel — keeps the timestamp alone in the header's top-right slot. */
+   turn — keeps the timestamp alone in the header's top-right slot. */
 .initiator-footer {
     display: flex;
     justify-content: flex-end;
     gap: 0.5rem;
-    padding: 0.5rem 0.875rem;
-    border-top: 1px solid var(--border-color);
+    padding: 0.5rem 0;
 }
 
 /* --- Change body — surfaces description, file count, and error message
@@ -171,9 +158,11 @@
     clear: both;
 }
 
-/* Chat exchange wrapper (initiator + response panels) */
+/* Chat exchange wrapper (initiator + response turns). Inter-turn spacing now
+   comes from each turn's own feed padding (no divider line), so no bottom
+   margin. */
 .chat-exchange {
-    margin-bottom: 0.75rem;
+    margin-bottom: 0;
     padding: 0;
 }
 
@@ -181,22 +170,39 @@
     margin-bottom: 0;
 }
 
-/* scrollToEventAndPulse uses scrollIntoView, which would otherwise land
-   exchanges under the sticky .mobile-thread-title-row inside the same
-   scroll container. --mobile-thread-title-height tracks the bar's live
-   height so a wrapped title still clears. */
+/* scrollToEventAndPulse uses scrollIntoView, which ignores the fixed/sticky
+   chrome stacked at the top of the scroll container — so the landed event would
+   sit behind it ("covered a bit"). scroll-margin-top adds back the three opaque
+   layers above the transcript on mobile:
+     1. the fixed app header — --mobile-header-height, pinned fully visible for
+        the duration of the deep-link scroll (scrollState.isHeaderPinnedForScroll
+        + useHideOnScroll.onScroll) so this static offset is exact;
+     2. the sticky .mobile-thread-title-row — --mobile-thread-title-height tracks
+        the bar's live height so a wrapped title still clears;
+     3. the 1rem fade overlay below the title row (.mobile-thread-title-row.scrolled
+        ::after), opaque at its top edge while the transcript is scrolled.
+   The event lands flush below all three, exactly under the thread title header. */
 @media (max-width: 768px) {
     .chat-exchange {
-        scroll-margin-top: calc(var(--mobile-thread-title-height, 2.75rem) + 0.5rem);
+        scroll-margin-top: calc(
+            var(--mobile-header-height, 3rem)
+            + var(--mobile-thread-title-height, 2.75rem)
+            + 1rem
+        );
     }
 }
 
-/* Brief highlight applied by scrollToEventAndPulse when a notification deep-link
-   lands on a specific event (e.g. a UserQuestionAsked tapped from a push).
-   Class is removed after ~1.8s by the same scroll helper. Tracks --accent so
-   theme changes carry through; matches the settings-search-highlight-pulse
-   pattern (settings.css) with a slightly longer dwell. */
-.chat-exchange.event-pulse {
+/* Brief highlight applied when a deep-link lands on a specific event or change.
+   The class rides the deep-link's pulse element, which is NOT always the whole
+   exchange: scrollToEventAndPulse scopes it to the matched exchange's
+   `.initiator-panel` (the event itself, e.g. a UserQuestionAsked tapped from a
+   push) so the agent response below the event isn't highlighted too, while
+   scrollToChangeAndPulse leaves it on the whole `.chat-exchange` turn. The
+   bare-class selector matches either host. Class is removed after ~1.8s by the
+   same scroll helper. Tracks --accent so theme changes carry through; matches
+   the settings-search-highlight-pulse pattern (settings.css) with a slightly
+   longer dwell. */
+.event-pulse {
     animation: chat-exchange-pulse 1.8s ease-out 1;
     border-radius: 0.375rem;
 }
@@ -220,7 +226,7 @@
 .response-content {
     line-height: 1.6;
     font-size: 0.75rem;
-    padding-left: 0.4rem;
+    padding-left: var(--turn-body-inset);
     white-space: normal;
     word-wrap: break-word;
     overflow-wrap: break-word;
@@ -265,33 +271,75 @@
     margin: 0.75rem 0;
 }
 
-.welcome-message .workspace-info,
-.welcome-message .getting-started {
-    background: var(--bg-tertiary);
-    border-left: 0.1875rem solid var(--accent);
-    padding: 0.75rem 1rem;
-    margin: 1rem 0;
-    border-radius: 0 0.375rem 0.375rem 0;
-}
-
-.welcome-message .getting-started {
-    border-left-color: var(--accent-green);
-}
-
-.welcome-message ul {
-    margin: 0.5rem 0;
-    padding-left: 1.25rem;
-}
-
-.welcome-message li {
-    margin: 0.375rem 0;
-}
-
 .welcome-message .disclaimer {
     margin: 1.5rem 0 0 0;
     color: var(--text-muted);
     font-size: 0.75rem;
     line-height: 1.5;
+}
+
+/* New-workspace starter suggestions */
+.welcome-suggestions {
+    margin: 1rem 0;
+}
+
+.welcome-suggestions-label {
+    margin: 0 0 0.5rem 0;
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+}
+
+.welcome-suggestion-chips {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.welcome-suggestion-chip {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+    width: 100%;
+    text-align: left;
+    padding: 0.625rem 0.875rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    cursor: pointer;
+    transition: border-color var(--duration-fast) ease, background var(--duration-fast) ease;
+}
+
+.welcome-suggestion-chip:hover {
+    border-color: var(--accent);
+    background: var(--bg-tertiary);
+}
+
+.welcome-suggestion-chip-label {
+    font-weight: 600;
+    color: var(--text-primary);
+    font-size: 0.875rem;
+}
+
+.welcome-suggestion-chip-prompt {
+    color: var(--text-secondary);
+    font-size: 0.8125rem;
+    line-height: 1.4;
+}
+
+.welcome-dismiss {
+    margin-top: 1rem;
+    padding: 0;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 0.8125rem;
+    text-decoration: underline;
+    cursor: pointer;
+    transition: color var(--duration-fast) ease;
+}
+
+.welcome-dismiss:hover {
+    color: var(--text-secondary);
 }
 
 /* Error state */
@@ -305,8 +353,10 @@
 }
 
 
-/* Thread empty state — always-visible fallback when no exchanges render.
-   Every path uses real text content so iOS Safari can never show blank. */
+/* Thread empty state — fallback when no exchanges render. The error/empty
+   paths use real text content so iOS Safari can't show blank; the loading
+   path is deliberately blank for the first SPINNER_DELAY_MS (DelayedSpinner)
+   so fast loads never flash a spinner. */
 .thread-empty-state {
     display: flex;
     flex-direction: column;
@@ -377,13 +427,13 @@
    surrounding .initiator-body provides padding/border/background, so the
    body itself is just a vertical stack of the question text, options, and
    (in answered state) the resolution block. */
-.cc-question-body {
+.question-body {
     display: flex;
     flex-direction: column;
     gap: 0.75rem;
 }
 
-.cc-question-text {
+.question-text {
     color: var(--text-primary);
     font-weight: 600;
     line-height: 1.5;
@@ -392,7 +442,7 @@
 /* Links the LLM pastes into a question (e.g. a PR URL) — styled like the
    standard markdown-content anchor. word-break keeps a long URL from
    overflowing the card. */
-.cc-question-text a {
+.question-text a {
     color: var(--accent);
     text-decoration: underline;
     text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
@@ -401,40 +451,16 @@
 }
 
 @media (hover: hover) {
-    .cc-question-text a:hover {
+    .question-text a:hover {
         text-decoration-color: var(--accent);
     }
-}
-
-/* Mode pill — sits above the question text. Single-select cards commit on
-   click; multi-select cards need explicit Submit. Without this label the user
-   can't tell the two apart before acting. */
-.cc-question-mode-badge {
-    display: inline-flex;
-    align-self: flex-start;
-    align-items: center;
-    gap: 0.375rem;
-    padding: 0.125rem 0.5rem 0.125rem 0.375rem;
-    border: 1px solid var(--border-color);
-    border-radius: 1rem;
-    background: var(--bg-tertiary);
-    color: var(--text-secondary);
-    font-size: 0.6875rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-}
-
-.cc-question-mode-badge .cc-question-option-indicator {
-    width: 0.625rem;
-    height: 0.625rem;
 }
 
 /* Option indicator — radio circle (single-select) or checkbox box (multi-
    select). Distinct shape from the start so the user can tell the mode apart
    before any click. Selected state echoes the accent tint already used on
-   .cc-question-option[aria-pressed="true"] and .cc-question-option-selected. */
-.cc-question-option-indicator {
+   .question-option[aria-pressed="true"] and .question-option-selected. */
+.question-option-indicator {
     display: inline-block;
     flex-shrink: 0;
     width: 0.875rem;
@@ -446,15 +472,15 @@
         border-color var(--duration-normal);
 }
 
-.cc-question-option-indicator-radio {
+.question-option-indicator-radio {
     border-radius: 50%;
 }
 
-.cc-question-option-indicator-checkbox {
+.question-option-indicator-checkbox {
     border-radius: 0.1875rem;
 }
 
-.cc-question-option-indicator-selected {
+.question-option-indicator-selected {
     border-color: var(--accent);
     background:
         radial-gradient(circle, var(--accent) 35%, transparent 38%);
@@ -462,12 +488,12 @@
 
 /* The row already shows the accent tint via [aria-pressed="true"], so the
    indicator only needs the check glyph itself — no fill on top of the tint. */
-.cc-question-option-indicator-checkbox.cc-question-option-indicator-selected {
+.question-option-indicator-checkbox.question-option-indicator-selected {
     position: relative;
     background: transparent;
 }
 
-.cc-question-option-indicator-checkbox.cc-question-option-indicator-selected::after {
+.question-option-indicator-checkbox.question-option-indicator-selected::after {
     content: "";
     position: absolute;
     left: 50%;
@@ -479,20 +505,20 @@
     transform: translate(-55%, -65%) rotate(45deg);
 }
 
-.cc-question-options {
+.question-options {
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
 }
 
 /* Two-column grid shared by the live button and the resolved-state row.
-   Indicator + label sit on row 1; .cc-question-option-desc spans both columns
+   Indicator + label sit on row 1; .question-option-desc spans both columns
    on row 2 so the description can use the full card width on mobile instead
    of squeezing into the narrow column to the right of the checkbox. The
    surfaces share the layout block so OptionContent's flat fragment can't
    silently break in one and not the other. */
-.cc-question-option,
-.cc-question-option-static {
+.question-option,
+.question-option-static {
     display: grid;
     grid-template-columns: auto 1fr;
     column-gap: 0.625rem;
@@ -508,7 +534,14 @@
     white-space: normal;
 }
 
-.cc-question-option {
+/* Answered recap rows are borderless, like the user message bubble — the picked
+   one carries the accent tint, the rest read as dimmed. (Live options keep their
+   border for tap affordance.) */
+.question-option-static {
+    border-color: transparent;
+}
+
+.question-option {
     cursor: pointer;
     font-family: inherit;
     transition:
@@ -517,37 +550,37 @@
         transform var(--duration-fast);
 }
 
-.cc-question-option .cc-question-option-indicator,
-.cc-question-option-static .cc-question-option-indicator {
+.question-option .question-option-indicator,
+.question-option-static .question-option-indicator {
     /* Match the cap height of the option label so the dot aligns with the
        first line of text rather than floating above it. */
     margin-top: 0.1875rem;
 }
 
-.cc-question-option:focus-visible {
+.question-option:focus-visible {
     outline: 0.125rem solid var(--accent);
     outline-offset: 0.125rem;
 }
 
 @media (hover: hover) {
-    .cc-question-option:hover {
-        background: color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary));
+    .question-option:hover {
+        background: var(--picked-surface);
         border-color: color-mix(in srgb, var(--accent) 50%, var(--border-color));
     }
 }
 
-.cc-question-option:active {
+.question-option:active {
     transform: scale(0.99);
 }
 
-.cc-question-option-label {
+.question-option-label {
     font-weight: 500;
     font-size: 0.875rem;
     line-height: 1.4;
     word-break: break-word;
 }
 
-.cc-question-option-desc {
+.question-option-desc {
     grid-column: 1 / -1;
     color: var(--text-secondary);
     font-size: 0.8125rem;
@@ -555,28 +588,28 @@
     word-break: break-word;
 }
 
-.cc-question-hint {
+.question-hint {
     color: var(--text-muted);
     font-size: 0.8125rem;
     font-style: italic;
 }
 
-/* Highlighted: the picked option in Selected answers — accent border + tint.
-   Same treatment for live multi-select toggles via aria-pressed, so changing
-   the accent recipe touches one block. */
-.cc-question-option-selected,
-.cc-question-option[aria-pressed="true"] {
-    border-color: color-mix(in srgb, var(--accent) 50%, var(--border-color));
-    background: color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary));
+/* Highlighted: the picked option in Selected answers — accent tint, no border
+   (matches the user message bubble). Same treatment for live multi-select
+   toggles via aria-pressed, so changing the accent recipe touches one block. */
+.question-option-selected,
+.question-option[aria-pressed="true"] {
+    border-color: transparent;
+    background: var(--picked-surface);
 }
 
 /* Dimmed: non-chosen options after resolution. Muted color, subdued surface. */
-.cc-question-option-dimmed {
+.question-option-dimmed {
     opacity: 0.55;
     color: var(--text-muted);
 }
 
-.cc-question-option-dimmed .cc-question-option-label {
+.question-option-dimmed .question-option-label {
     text-decoration: line-through;
     text-decoration-color: var(--text-muted);
 }
@@ -584,40 +617,40 @@
 /* Terminated: the surrounding response was canceled / aborted / failed /
    overtaken before any answer landed. TerminatedQuestionBody sets `disabled`
    on every option so taps can't land — these rules make that state visible.
-   Same recipe as `cc-question-option-dimmed`, applied to every option in the
+   Same recipe as `question-option-dimmed`, applied to every option in the
    card, plus `not-allowed` cursor and a hover override so the accent tint
    from the live hover rule doesn't bleed in. */
-.cc-question-body-terminated .cc-question-option:disabled {
+.question-body-terminated .question-option:disabled {
     opacity: 0.55;
     color: var(--text-muted);
     cursor: not-allowed;
 }
 
-.cc-question-body-terminated .cc-question-option:disabled .cc-question-option-label {
+.question-body-terminated .question-option:disabled .question-option-label {
     text-decoration: line-through;
     text-decoration-color: var(--text-muted);
 }
 
 @media (hover: hover) {
-    .cc-question-body-terminated .cc-question-option:disabled:hover {
+    .question-body-terminated .question-option:disabled:hover {
         background: var(--bg-tertiary);
         border-color: var(--border-color);
     }
 }
 
-/* FreeText resolution block — highlighted box echoing the selected-option
-   tint so the user's typed answer reads as the equivalent "picked" surface. */
-.cc-question-freetext {
+/* FreeText resolution block — borderless accent tint echoing the selected-option
+   surface and the user message bubble, so the user's typed answer reads as the
+   equivalent "picked" surface rather than a separate outlined card. */
+.question-freetext {
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
     padding: 0.5rem 0.75rem;
-    border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--border-color));
     border-radius: 0.375rem;
-    background: color-mix(in srgb, var(--accent) 10%, var(--bg-tertiary));
+    background: var(--picked-surface);
 }
 
-.cc-question-freetext-label {
+.question-freetext-label {
     font-size: 0.6875rem;
     font-weight: 600;
     color: var(--text-secondary);
@@ -625,51 +658,51 @@
     letter-spacing: 0.03em;
 }
 
-.cc-question-freetext-text {
+.question-freetext-text {
     color: var(--text-primary);
     line-height: 1.5;
     word-break: break-word;
     white-space: pre-wrap;
 }
 
-/* Right-align inside the .cc-question-body flex column. The full-opacity
-   "this is the picked affordance" rule comes from .cc-permission-btn-picked,
+/* Right-align inside the .question-body flex column. The full-opacity
+   "this is the picked affordance" rule comes from .permission-btn-picked,
    stacked alongside on the same button. */
-.cc-question-cancel-picked.action-btn:disabled {
+.question-cancel-picked.action-btn:disabled {
     align-self: flex-end;
 }
 
 /* CC permission divider — body of a CodingAgentPermissionRequest initiator
-   panel. Like .cc-question-body, the .initiator-body wrapper provides chrome;
+   panel. Like .question-body, the .initiator-body wrapper provides chrome;
    the body is just a vertical stack of the prompt text and action rows. After
    the user resolves the request the same buttons stay rendered (disabled, with
    the picked one marked and the rest struck through) so layout doesn't jump
    and history reads at a glance. */
-.cc-permission-body {
+.permission-body {
     display: flex;
     flex-direction: column;
     gap: 0.875rem;
 }
 
-.cc-permission-text {
+.permission-text {
     color: var(--text-primary);
     font-weight: 500;
     line-height: 1.5;
     word-break: break-word;
 }
 
-.cc-permission-actions {
+.permission-actions {
     display: flex;
     gap: 0.5rem;
     flex-wrap: wrap;
     justify-content: flex-end;
 }
 
-.cc-permission-actions-secondary {
+.permission-actions-secondary {
     margin-top: -0.375rem;
 }
 
-.cc-permission-actions-secondary code {
+.permission-actions-secondary code {
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
     font-size: 0.875em;
 }
@@ -678,7 +711,7 @@
    default .action-btn:disabled fades to 40%, which would visually demote the
    choice). Used by permission picked scope AND question card cancel; the name
    lives in the permission-card namespace for historical reasons. */
-.cc-permission-btn-picked.action-btn:disabled {
+.permission-btn-picked.action-btn:disabled {
     opacity: 1;
 }
 
@@ -686,7 +719,7 @@
    through and drop them to a muted slate. The default .action-btn:disabled
    opacity (0.4) already greys the colour; the line-through tells the user
    these buttons WERE on offer but were not chosen. */
-.cc-permission-btn-rejected.action-btn:disabled {
+.permission-btn-rejected.action-btn:disabled {
     background-color: var(--bg-tertiary);
     color: var(--text-muted);
     text-decoration: line-through;
@@ -694,7 +727,7 @@
     opacity: 0.7;
 }
 
-.cc-permission-btn-rejected.action-btn:disabled code {
+.permission-btn-rejected.action-btn:disabled code {
     text-decoration: line-through;
 }
 
@@ -702,30 +735,54 @@
    answered timeline card — permission picked, question canceled. The class
    name lives in the permission-card namespace for historical reasons but the
    visual is generic. */
-.cc-permission-btn-check {
+.permission-btn-check {
     margin-right: 0.125rem;
 }
 
-/* Tool-permissions settings section: full-width monospace textarea + action row */
-.cc-allowed-tools-editor {
-    width: 100%;
+/* Permissions settings: per-row editable allowlist (cc-allowed-tools and
+   agent-allowed-commands). Each pattern is a monospace input + Delete button. */
+.allowlist-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+.allowlist-empty {
+    color: var(--text-muted);
+    font-size: 0.875rem;
+    padding: 0.25rem 0;
+}
+
+.allowlist-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+.allowlist-row-input {
+    flex: 1;
+    min-width: 0;
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
     font-size: 0.875rem;
     line-height: 1.5;
-    padding: 0.625rem 0.75rem;
+    padding: 0.375rem 0.625rem;
     border: 1px solid var(--border-color);
     border-radius: 0.375rem;
     background: var(--bg-primary);
     color: var(--text-primary);
-    resize: vertical;
     box-sizing: border-box;
 }
 
-.cc-allowed-tools-actions {
+.allowlist-actions {
     display: flex;
     gap: 0.5rem;
-    justify-content: flex-end;
+    align-items: center;
     margin-top: 0.625rem;
+}
+
+/* Pushes Revert/Save to the right, leaving "Add pattern" on the left. */
+.allowlist-actions-spacer {
+    flex: 1;
 }
 
 /* Copyable blocks — <copy>...</copy> rendered by renderMarkdown */
@@ -931,5 +988,14 @@ body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
 .child-completion-summary {
     margin-top: 0.375rem;
     color: var(--text-secondary);
+}
+
+/* Benign empty completion: the model ended its turn cleanly with no text.
+   A neutral, muted note — deliberately NOT error styling (that's reserved for
+   a real ResponseFailed). States what happened instead of a blank body. */
+.response-empty-note {
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 0.85rem;
 }
 

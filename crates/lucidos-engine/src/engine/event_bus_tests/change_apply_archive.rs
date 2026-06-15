@@ -495,7 +495,7 @@ async fn startup_skips_already_resolved_permission_requests() {
 #[tokio::test]
 async fn typed_message_supersedes_pending_permission() {
     use crate::engine::cc_permission::{
-        resolve_pending_permissions_as_superseded, CcPermissionEntry, CcPermissionState,
+        resolve_pending_permissions_as_superseded, PermissionEntry, PermissionState,
         SUPERSEDED_REASON,
     };
     use std::sync::Mutex;
@@ -533,14 +533,14 @@ async fn typed_message_supersedes_pending_permission() {
 
     // Seed a live in-memory waiter for this request so we can assert the deny
     // fan-out reaches it (the still-blocked MCP handler).
-    let pending = Mutex::new(CcPermissionState::default());
+    let pending = Mutex::new(PermissionState::default());
     let mut rx = {
         let mut state = pending.lock().unwrap();
         let (tx, rx) = tokio::sync::broadcast::channel(1);
         let key = (thread_id, "Bash".to_string(), "{\"command\":\"ls\"}".to_string());
         state.by_dedup_key.insert(
             key.clone(),
-            CcPermissionEntry {
+            PermissionEntry {
                 thread_id,
                 request_id: "req-super".into(),
                 tool_name: "Bash".into(),
@@ -596,7 +596,7 @@ async fn typed_message_supersedes_pending_permission() {
 /// amplify the event log with spurious Resolved rows.
 #[tokio::test]
 async fn supersede_is_noop_when_no_pending_permission() {
-    use crate::engine::cc_permission::{resolve_pending_permissions_as_superseded, CcPermissionState};
+    use crate::engine::cc_permission::{resolve_pending_permissions_as_superseded, PermissionState};
     use std::sync::Mutex;
 
     let (pool, db_name) = setup_test_db().await;
@@ -638,7 +638,7 @@ async fn supersede_is_noop_when_no_pending_permission() {
     .await
     .unwrap();
 
-    let pending = Mutex::new(CcPermissionState::default());
+    let pending = Mutex::new(PermissionState::default());
     resolve_pending_permissions_as_superseded(&pool, &bus, &pending, thread_id, None).await;
 
     let resolved_count: i64 = sqlx::query_scalar(
@@ -889,7 +889,7 @@ async fn thread_archived_clears_is_saved() {
 /// ThreadArchived must NOT zero the children counters. The counters are a
 /// cache derived from real child events; the children still exist after
 /// archive, and family-lift routing surfaces the parent again whenever any
-/// child is still active. Zeroing makes the parent's `FamilyToggleRow`
+/// child is still active. Zeroing makes the parent's disclosure chevron
 /// disappear (it's gated on `totalChildrenCount > 0`), so the user sees the
 /// nested children but can't collapse them.
 #[tokio::test]

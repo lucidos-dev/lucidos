@@ -301,6 +301,13 @@ pub enum ThreadEvent {
         /// App id when `coding_agent_kind == "app"`; `None` otherwise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_id: Option<String>,
+        /// Which backend drives this thread (`claude-code` | `codex`).
+        /// Locked in at first SessionStarted via the thread_summaries
+        /// projection (COALESCE keeps the existing value) so follow-ups and
+        /// recovery resume on the same backend. Default covers legacy rows —
+        /// all Claude Code.
+        #[serde(default = "default_coding_agent_claude_code")]
+        coding_agent: CodingAgent,
     },
     SessionEnded {
         /// Why the session ended. Always serialized — the frontend reads
@@ -808,6 +815,55 @@ pub enum ThreadEvent {
         persist_scope: Option<crate::engine::claude_code::AllowScope>,
     },
 
+    /// The Lucidos Agent's command guard (ADR 0002) paused a bash/python tool
+    /// call to ask the user for permission — the `IrreversibleDanger` lane on a
+    /// `Chat` channel. The chat counterpart of `CodingAgentPermissionRequest`:
+    /// it renders the same `PermissionCard`, but the agent loop blocks
+    /// in-process on `Engine.pending_command_permission` (no MCP subprocess).
+    /// `tool_name` is one of the bash/python tools; `command` is the inspected
+    /// command text (the bash `command` or python `code`); `summary` is the
+    /// card's one-line description. Persisted so the card survives reload.
+    CommandPermissionRequested {
+        request_id: String,
+        tool_use_id: String,
+        tool_name: String,
+        command: String,
+        summary: String,
+    },
+    /// User resolved a `CommandPermissionRequested` (or the engine resolved it
+    /// as superseded / orphaned). Chat counterpart of
+    /// `CodingAgentPermissionResolved`; `persist_scope` records the
+    /// "Always allow" / "Allow for this thread" scope the user picked so reload
+    /// reproduces the answered card. `None` covers Allow-once, Deny, and the
+    /// engine-emitted superseded/orphan resolutions.
+    CommandPermissionResolved {
+        request_id: String,
+        allowed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persist_scope: Option<crate::engine::claude_code::AllowScope>,
+    },
+
+    /// The command guard snapshotted the workspace's git-tracked `data/` before
+    /// running a `ReversibleDanger` command (in-workspace destruction) — ADR
+    /// 0002, Phase 4. The snapshot lives on the safety ref
+    /// `refs/lucidos/command-checkpoints/<checkpoint_id>`; `command` is the
+    /// command about to run and `summary` is the one-line card text. Persisted
+    /// so the one-click Undo affordance survives reload. Emitted only after the
+    /// snapshot succeeds (a failed snapshot lets the command run unguarded, no
+    /// event — same as the pre-Phase-4 behavior).
+    CommandCheckpointed {
+        checkpoint_id: String,
+        command: String,
+        summary: String,
+    },
+    /// The user clicked Undo on a `CommandCheckpointed` card (or the engine
+    /// resolved it). The workspace working tree was restored from the checkpoint
+    /// ref and the ref deleted; the frontend renders the card as reverted.
+    /// Persisted so the reverted state survives reload.
+    CommandCheckpointReverted { checkpoint_id: String },
+
     /// Background worktree cleanup happened on this thread (Phase 10.2).
     /// `tier=1` means build artifacts (`target/`, `node_modules/`,
     /// `.lucidos/cache/`) were stripped from a long-idle worktree; the
@@ -932,7 +988,12 @@ pub enum ThreadEvent {
     PushNotificationRequested,
     #[serde(alias = "McpConsentRequest")]
     McpConsentPromptRequested {
-        data: String,
+        // Field is `payload` to match the sibling request events
+        // (CredentialPromptRequested / PluginInstallRequested /
+        // EmailConfirmRequested / NavigationRequested). `data` alias kept for
+        // any pre-rename row, though this transient event is never persisted.
+        #[serde(alias = "data")]
+        payload: String,
     },
     #[serde(alias = "RefreshFile")]
     FileRefreshRequested {

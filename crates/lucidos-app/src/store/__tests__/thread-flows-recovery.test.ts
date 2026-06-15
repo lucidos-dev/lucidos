@@ -6,7 +6,7 @@ import { getEventToggleState } from '../event-rendering';
 beforeEach(resetSeqCounter);
 
 describe('Flow: Interrupted exchanges', () => {
-  it('CC exchange followed by another shows "Continued below"', () => {
+  it('CC exchange followed by another shows "Done"', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
@@ -22,7 +22,7 @@ describe('Flow: Interrupted exchanges', () => {
     expect(exchanges).toHaveLength(2);
     // First exchange (CC, not last) → interrupted
     expect(exchangeStatus(exchanges[0], '', false)).toBe('interrupted');
-    expect(getLabel(exchanges[0], '', false)).toBe('Continued below');
+    expect(getLabel(exchanges[0], '', false)).toBe('Done');
     // Second exchange (last, completed) → done
     expect(exchangeStatus(exchanges[1], '', true)).toBe('done');
   });
@@ -69,7 +69,7 @@ describe('Flow: Interrupted exchanges', () => {
     expect(getLabel(exchanges[0], '', false)).toBe('Done');
   });
 
-  it('CC follow-up exchange (no own SessionStarted) interrupted shows "Continued below"', () => {
+  it('CC follow-up exchange (no own SessionStarted) interrupted shows "Done"', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
@@ -103,7 +103,7 @@ describe('Flow: Interrupted exchanges', () => {
     // but produces no tool calls or text before the user fires off another
     // message. The middle exchange is 'interrupted' with hasSteps=true but
     // exchangeResponseEvents=[] — ChatExchange must hide the empty
-    // "Continued below ↳" header, same as it does for empty 'done' exchanges.
+    // "Done ↳" header, same as it does for empty 'done' exchanges.
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
@@ -116,7 +116,7 @@ describe('Flow: Interrupted exchanges', () => {
     expect(exchanges).toHaveLength(2);
     // Middle exchange has only SessionStarted as a step → status 'interrupted'…
     expect(exchangeStatus(exchanges[0], '', false, false, true)).toBe('interrupted');
-    expect(getLabel(exchanges[0], '', false, false, true)).toBe('Continued below');
+    expect(getLabel(exchanges[0], '', false, false, true)).toBe('Done');
     // …but exchangeResponseEvents emits nothing (SessionStarted alone produces
     // no section_break — hasCCContent is false), so the response panel body
     // would be empty. The visible-noise placeholder must be hidden.
@@ -229,10 +229,10 @@ describe('Flow: Interrupted exchanges', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
     // E1 (not last) should NOT be 'streaming' / Working — the user has moved on.
-    // It should be 'interrupted' (label "Continued below ↳") matching the
+    // It should be 'interrupted' (label "Done ↳") matching the
     // existing CC pattern for mid-work interruptions.
     expect(exchangeStatus(exchanges[0], '', false)).toBe('interrupted');
-    expect(getLabel(exchanges[0], '', false)).toBe('Continued below');
+    expect(getLabel(exchanges[0], '', false)).toBe('Done');
     // E2 (last) — still actively processing → Working
     expect(exchangeStatus(exchanges[1], '', true)).toBe('streaming');
     expect(getLabel(exchanges[1], '', true)).toBe('Working');

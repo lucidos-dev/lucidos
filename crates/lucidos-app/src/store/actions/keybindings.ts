@@ -68,9 +68,12 @@ export function isCustomized(id: ShortcutId): boolean {
  *  skips one id — used by the recorder to detect a conflict with a DIFFERENT
  *  shortcut while ignoring the one being rebound. */
 export function matchShortcut(e: EventLike, exclude?: ShortcutId): ShortcutId | null {
+  // Parse the override map once per event, not once per def — this runs on
+  // EVERY keydown (including plain typing), and the registry is 16 entries.
+  const o = overrides();
   for (const def of SHORTCUT_DEFS) {
     if (def.id === exclude) continue;
-    if (matchesEvent(e, bindingFor(def.id))) return def.id;
+    if (matchesEvent(e, o[def.id] ?? def.defaultBinding)) return def.id;
   }
   return null;
 }

@@ -73,17 +73,22 @@ stop_workspace() {
         rm -f "$frontend_pid_file"
     fi
 
-    # Stop the --built mode `vite build --watch` companion, if running.
+    # The --built mode `vite build --watch` is a checkout-level singleton shared
+    # by every workspace of this checkout (see build_watch_pidfile in
+    # workspace.sh). Clean up a legacy per-workspace build-watch.pid from
+    # pre-singleton runs, then tear down the shared build-watch only if THIS was
+    # the last workspace serving the frontend (frontend.pid removed above).
     if [ -f "$build_watch_pid_file" ]; then
         local pid
         pid="$(cat "$build_watch_pid_file")"
         if kill -0 "$pid" 2>/dev/null; then
-            echo "Stopping frontend build-watch (PID $pid) for $ws"
+            echo "Stopping legacy per-workspace build-watch (PID $pid) for $ws"
             kill "$pid" 2>/dev/null || true
             stopped="1"
         fi
         rm -f "$build_watch_pid_file"
     fi
+    teardown_shared_build_watch_if_idle
 
     # Stop PostgreSQL container if --force
     if [ -n "$FORCE" ]; then

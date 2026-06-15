@@ -5,13 +5,12 @@
 // but only during development — in production SW updates are rare.
 self.addEventListener('install', (event) => {
   self.skipWaiting();
-  // Warm the navigation shell so the FIRST controlled reload paints from disk
-  // instead of paying an HTML round trip. The iOS notification-tap is always a
-  // full cross-document reload (system-knowhow/notifications.md §4.5), so on a
-  // slow link that one uncached HTML fetch is visible blank time. Best-effort:
-  // if this misses (engine down at install), the fetch handler's cache-first
-  // populates the shell on the first navigation instead. Built mode only —
-  // `cache: 'reload'` bypasses the HTTP cache so we store the CURRENT build's
+  // Warm the navigation shell into SHELL_CACHE so an OFFLINE first navigation
+  // (engine unreachable) still has an index.html to fall back to. The shell is
+  // served network-first now (see networkFirstShell), so this is the offline
+  // safety net — NOT the hot path. Best-effort: a miss is fine, the network-first
+  // handler caches the shell on the first successful navigation. Built mode only
+  // — `cache: 'reload'` bypasses the HTTP cache so we store the CURRENT build's
   // shell, and SHELL_CACHE is build-id-keyed so activate() purges it on a bump.
   if (IS_BUILT) {
     event.waitUntil((async () => {
@@ -131,24 +130,28 @@ self.addEventListener('fetch', (event) => {
   }
 
   // Content-hashed app bundles — no-op in dev (Vite never serves /assets/*).
+  // Refuse to cache an HTML response here (see isHtmlResponse): a bundle deleted
+  // by a later build resolves through the server's SPA fallback to index.html,
+  // and caching that under the bundle URL poisons the entry permanently.
   if (path.startsWith('/assets/')) {
-    event.respondWith(cacheFirst(event.request, SHELL_CACHE));
+    event.respondWith(
+      cacheFirst(event.request, SHELL_CACHE, (r) => !!r && r.ok && !isHtmlResponse(r)),
+    );
     return;
   }
 
   // Navigation shell (index.html). Every top-level navigation lands here: the
   // PWA start URL and — the case that matters — every notification-tap reload,
   // which arrives as a cross-document `/?notification=…&thread=…` load (the
-  // WebKit constraint in system-knowhow/notifications.md §4.5). Serving the
-  // cached shell turns that reload's HTML fetch into a disk read; combined with
-  // the cached /assets/* graph above, the app boots with zero network on the
-  // critical path and only the data GETs still round-trip. The `path === '/'`
-  // gate is load-bearing: app-UI iframes (`/app/<id>/`) and skill UIs are ALSO
-  // `mode: 'navigate'` requests but are NOT the SPA shell — they must reach
-  // their own server-rendered HTML, never index.html. Built mode only
-  // (IS_BUILT) so the dev server keeps serving a network-fresh shell.
+  // WebKit constraint in system-knowhow/notifications.md §4.5). Served
+  // network-first (see networkFirstShell) so the shell always matches the
+  // server's current /assets/* bundles; the cache is the offline fallback only.
+  // The `path === '/'` gate is load-bearing: app-UI iframes (`/app/<id>/`) and
+  // skill UIs are ALSO `mode: 'navigate'` requests but are NOT the SPA shell —
+  // they must reach their own server-rendered HTML, never index.html. Built mode
+  // only (IS_BUILT) so the dev server keeps serving a network-fresh shell.
   if (IS_BUILT && event.request.mode === 'navigate' && path === '/') {
-    event.respondWith(cacheFirstShell(event.request));
+    event.respondWith(networkFirstShell(event.request));
     return;
   }
 });
@@ -161,42 +164,74 @@ async function fetchWithRetry(request) {
   }
 }
 
+// True if a response is an HTML document. A content-hashed /assets/* URL must
+// resolve to its JS/CSS bundle or to nothing — but the dev server's SPA fallback
+// answers a bundle deleted by a later `vite build --watch` rebuild with
+// index.html (200 text/html), not a 404. Caching that HTML under the bundle's
+// URL poisons the entry forever: the page then loads an HTML document as a module
+// script, no JS runs, and the PWA paints a black #app. So the asset branch
+// refuses to cache an HTML response — it's a stale-bundle miss, not the asset.
+function isHtmlResponse(response) {
+  const ct = response && response.headers && response.headers.get('content-type');
+  return typeof ct === 'string' && ct.includes('text/html');
+}
+
 // Cache-first for immutable content (content-addressed blobs, content-hashed app
 // bundles): serve from the Cache API on a hit with no network, otherwise fetch
 // (with the iOS SW-restart retry) and populate the cache off the response path.
-// Only successful responses are cached, so a transient 404/5xx during a deploy
-// swap is never pinned.
-async function cacheFirst(request, cacheName) {
+// `isCacheable(response)` decides what's worth storing — defaults to "any 2xx"
+// so a transient 404/5xx during a deploy swap is never pinned; the asset branch
+// passes a stricter predicate that also rejects an HTML SPA-fallback body.
+async function cacheFirst(request, cacheName, isCacheable) {
   const cache = await caches.open(cacheName);
   const cached = await cache.match(request);
   if (cached) return cached;
   const response = await fetchWithRetry(request);
-  if (response && response.ok) {
+  const cacheable = isCacheable ? isCacheable(response) : (response && response.ok);
+  if (cacheable) {
     // Clone off the response path so delivery isn't blocked on the cache write.
     cache.put(request, response.clone()).catch(() => {});
   }
   return response;
 }
 
-// Cache-first for the navigation shell (index.html). Unlike cacheFirst, the
-// entry is keyed by a NORMALIZED `/` request (no query string) so every
-// `/?notification=…` deep-link variant collapses onto one shell entry — read
-// and write both use `shellKey`, never the query-bearing `request`. Lives in
-// SHELL_CACHE so a new build's activate() purges it alongside the stale
-// /assets graph. A redirected or non-2xx response is never cached: a redirected
-// Response replayed for a navigation throws ("response served by service worker
-// has redirections"), and a transient error page during an engine restart must
-// not be pinned. On a miss the live network response is returned as-is.
-async function cacheFirstShell(request) {
+// Network-FIRST for the navigation shell (index.html). The shell must stay in
+// lockstep with the content-hashed /assets/* bundles the server CURRENTLY has:
+// every `vite build --watch` rebuild emits new bundle hashes and deletes the old
+// ones, so a shell cached from an earlier build references bundles that are gone.
+// The server's SPA fallback then answers those deleted bundles with index.html
+// (200 text/html), the page loads HTML as its entry module script, no JS runs,
+// and the PWA is a black #app — and with nothing loaded, nothing can self-heal.
+// (That is why a long-lived iOS PWA went black while a frequently-reloaded
+// desktop tab stayed fine: same SW, but the desktop tab kept fetching fresh
+// shells.) Fetching the shell fresh when online keeps it matched to the server's
+// assets; the cache is only the OFFLINE fallback. The heavy JS/CSS graph stays
+// cache-first (immutable by hash), so only the ~9 KB HTML round-trips — and on a
+// notification tap the engine just pushed, so it's reachable and that fetch is
+// fast. Keyed by a NORMALIZED `/` request (no query string) so every
+// `/?notification=…` deep-link variant shares one cached entry. A redirected or
+// non-2xx response is never cached (a redirected Response replayed for a
+// navigation throws; a 502 mid engine-restart must not be pinned) and falls back
+// to the last good cached shell.
+async function networkFirstShell(request) {
   const cache = await caches.open(SHELL_CACHE);
   const shellKey = new Request(self.location.origin + '/');
-  const cached = await cache.match(shellKey);
-  if (cached) return cached;
-  const response = await fetchWithRetry(request);
+  let response;
+  try {
+    response = await fetchWithRetry(request);
+  } catch (err) {
+    // Offline / engine down — serve the last good shell if install precached one.
+    const cached = await cache.match(shellKey);
+    if (cached) return cached;
+    throw err;
+  }
   if (response && response.ok && !response.redirected) {
     cache.put(shellKey, response.clone()).catch(() => {});
+    return response;
   }
-  return response;
+  // Non-ok (e.g. 502 during a restart) — prefer a cached good shell over the error.
+  const cached = await cache.match(shellKey);
+  return cached || response;
 }
 
 // Notification tag — used so a repeat push for the same notification_id

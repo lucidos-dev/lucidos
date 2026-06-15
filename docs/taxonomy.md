@@ -55,7 +55,7 @@ When Lucidos discovers something new during execution (a quirk, a better approac
 
 ## Ownership Principle
 
-**Everything lives with its consumer.** Intents, knowhow, and scripts are always scoped to the thing that uses them — an app, a trigger, or a knowhow domain.
+**Everything lives with its consumer.** Intents, knowhow, and scripts are always scoped to the thing that uses them — an app, a trigger, or a knowhow domain. The exception is a script shared across *several* consumers, which goes in the top-level `data/scripts/` rather than being duplicated into each (see Rules below).
 
 **Survivability test:** "Does this survive if I delete the app?" If yes, it belongs at the top level (e.g., Google Calendar sync). If it only makes sense in the context of the app (e.g., a per-app scoring heuristic), it belongs inside the app.
 
@@ -89,6 +89,9 @@ data/
       <descriptive>.md      ← Trigger intent definition
       scripts/              ← Trigger-specific scripts
 
+  scripts/                  ← Shared scripts NOT tied to one consumer
+    <name>/run.py           ← Invoked by intents, knowhow, or proxy auth handshakes across apps/triggers
+
   postgres/                 ← Event store — gitignored
 ```
 
@@ -98,7 +101,7 @@ data/
 - **Everything under `data/` is git-tracked** — files persist and have version history — **except** the engine-managed gitignored paths `postgres/` (event store), `blobs/` (binary cache), and `.env` (per-workspace env overrides; secret-bearing, loaded on startup).
 - **`.lucidos/`** is ephemeral (runtime cache, temp files). Can be rebuilt. Not under `data/`.
 - **Manifest vs knowhow:** `manifest.json` is for the user (UI display). Knowhow and intents are for the engine (LLM context). Don't put operational knowledge in manifests.
-- **Scripts belong with their consumer** — if only one trigger uses a script, it goes in that trigger's `scripts/`. If only one app uses it, it goes in that app's `scripts/`.
+- **Scripts belong with their consumer** — if only one trigger uses a script, it goes in that trigger's `scripts/`. If only one app uses it, it goes in that app's `scripts/`. A script genuinely shared across multiple consumers (apps/triggers/intents) — or invoked by a proxy auth handshake — goes in the top-level `data/scripts/<name>/` (see `system-knowhow/best-practices.md` § "scripts/ — Shared Scripts"); don't duplicate it into each consumer.
 
 ## Apps
 
@@ -106,8 +109,6 @@ Apps have two layers of metadata:
 
 - **`manifest.json`** — user-facing: name, description, icon. Displayed in the app list UI. The LLM does NOT see this in its context.
 - **`knowhow/` + `intents/`** — engine-facing: injected into LLM context when the app is active. This is how the LLM knows what the user wants and how to achieve it.
-
-Optional `knowhow` field in manifest references general knowhow (from `data/knowhow/`) that the app also needs.
 
 Data storage: pick artifacts (git) OR events (postgres), not both.
 

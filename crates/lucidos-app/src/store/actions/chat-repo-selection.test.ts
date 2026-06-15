@@ -64,6 +64,7 @@ import {
   focusedThreadId,
   threadMap,
   selectedScope,
+  selectedCodingAgent,
   connectionStatus,
 } from '../store';
 import { sendMessage } from './chat';
@@ -79,6 +80,7 @@ beforeEach(() => {
   threadMap.value = new Map();
   focusedThreadId.value = null;
   selectedScope.value = { kind: 'lucidos' };
+  selectedCodingAgent.value = 'claude-code';
   connectionStatus.value = 'connected';
   mockedSubmitChat.mockClear();
   _resetComposeDraftsForTesting();
@@ -241,6 +243,23 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     const body = lastBody();
     expect(body.use_claude_code).toBe(true);
     expect(body.folder).toBe('data/apps/momentum');
+    expect(body.repo_id).toBeUndefined();
+  });
+
+  it('promoting a Lucidos-source Codex draft sends coding_agent=codex', async () => {
+    const draftId = 'codex-draft';
+    focusedThreadId.value = draftId;
+    putThread(draftId, { state: 'composing', channel: 'claude_code' });
+    setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
+    selectedScope.value = { kind: 'lucidos' };
+    selectedCodingAgent.value = 'codex';
+
+    await sendCompose(draftId, { useClaudeCode: true });
+
+    const body = lastBody();
+    expect(body.use_claude_code).toBe(true);
+    expect(body.coding_agent).toBe('codex');
+    expect(body.folder).toBeUndefined();
     expect(body.repo_id).toBeUndefined();
   });
 

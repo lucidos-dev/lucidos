@@ -55,7 +55,7 @@ function getNavStack(): { stack: Array<Record<string, unknown>>; cursor: number 
   return raw ? JSON.parse(raw) : null;
 }
 
-const testApp: App = { id: 'habit-tracker', name: 'Habit Tracker', description: '', knowhow: [] };
+const testApp: App = { id: 'habit-tracker', name: 'Habit Tracker', description: '' };
 
 describe('processSSEForReferences', () => {
   beforeEach(() => {

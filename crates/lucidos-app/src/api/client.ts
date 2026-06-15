@@ -8,5 +8,7 @@ export * from './client/changes';
 export * from './client/apps';
 export * from './client/data';
 export * from './client/triggers';
+export * from './client/threadQueue';
 export * from './client/threads';
 export * from './client/settings';
+export * from './client/models';

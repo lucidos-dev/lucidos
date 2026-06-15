@@ -18,6 +18,11 @@ import { signal } from '@preact/signals';
 export const scrolledUp = signal(false);
 export const awayFromBottom = signal(false);
 export const notAtTop = signal(false);
+/** True once the transcript is scrolled even slightly from the very top (2px
+ *  subpixel slack). Drives the mobile thread-title fade overlay so it eases in
+ *  the moment content slides under the sticky title — unlike `notAtTop`, whose
+ *  80px chevron threshold left the fade absent until a clear scroll. */
+export const scrolledFromTop = signal(false);
 
 /** The currently-active scroll container element.
  *
@@ -134,6 +139,13 @@ let _scrollTimer: ReturnType<typeof setTimeout> | null = null;
  *  suppression window, re-reading scrollHeight each time so layout
  *  changes (keyboard close, content render) are always caught. */
 export function scrollToBottom() {
+  // An explicit go-to-bottom supersedes any in-flight notification deep-link
+  // claim — e.g. answering a deep-linked question (addPendingMessage →
+  // scrollToBottom) within the ~4s claim window should let the streamed
+  // response tail again. Safe because the deep-link's OWN landing never routes
+  // through here: focusThread skips scrollToBottom when targetEventId is set,
+  // and scrollToEventAndPulse never calls it.
+  clearPendingEventScroll();
   scrolledUp.value = false;
   awayFromBottom.value = false;
   _resizeMode = 'scroll';
@@ -175,11 +187,15 @@ export function scrollToBottom() {
 }
 
 /** Re-pin the user to the bottom across a layout shift the user just caused —
- *  typing in the prompt (action buttons grow), clicking a question option
- *  (card transitions to the answered state), clicking a permission button
- *  (card grows the picked/rejected styling). If they were at the bottom,
- *  engage scroll mode so the upcoming ResizeObserver fire is suppressed; if
- *  they had scrolled up, no-op so we don't override their intent.
+ *  typing in the prompt (action buttons grow) or toggling a multi-select
+ *  question option (card grows a row). If they were at the bottom, engage
+ *  scroll mode so the upcoming ResizeObserver fire is suppressed; if they had
+ *  scrolled up, no-op so we don't override their intent.
+ *
+ *  Note: ANSWERING a question or resolving a permission card instead force-pins
+ *  via scrollToBottom() (see answerThreadQuestion / resolveCodingAgentPermission)
+ *  — those resume the agent's stream, so we re-activate auto-scroll even when the
+ *  user had scrolled up.
  *
  *  Must NOT call scrollToBottom(): handleInput fires this on every keystroke,
  *  and scrollToBottom's 16ms re-pinning loop — sized for async streaming —
@@ -219,29 +235,107 @@ export function pinToBottomNow() {
   extendSuppression();
 }
 
-/** Scroll the chat exchange whose `data-event-id` matches `eventId` into view
- *  and briefly pulse-highlight it. Used by notification deep-links so a push
- *  for a `UserQuestionAsked` lands on that exact question instead of the
- *  bottom of the thread or the user's last saved scroll.
+/** Scroll the chat exchange matching a CSS `selector` into view and briefly
+ *  pulse-highlight it. Two public wrappers feed this: `scrollToEventAndPulse`
+ *  targets by `data-event-id` (notification deep-links → a specific event) and
+ *  `scrollToChangeAndPulse` targets by `data-change-id` (the Changes panel → the
+ *  turn that produced a change, which isn't necessarily the thread's last turn).
  *
- *  Events may not be in the DOM yet (the thread is lazy-loading), so a
+ *  The target may not be in the DOM yet (the thread is lazy-loading), so a
  *  MutationObserver retries until either the element appears or the deadline
- *  fires. Both layout copies (desktop + mobile) carry the same data-event-id,
- *  so we filter to the visible one before scrolling and pulsing — otherwise
- *  the pulse runs invisibly on the hidden copy. */
+ *  fires. Both layout copies (desktop + mobile) carry the same attributes, so
+ *  we filter to the visible one before scrolling and pulsing — otherwise the
+ *  pulse runs invisibly on the hidden copy. */
 const EVENT_PULSE_CLASS = 'event-pulse';
 const EVENT_PULSE_MS = 1800;
 const EVENT_RESOLVE_DEADLINE_MS = 4000;
 
-export function scrollToEventAndPulse(eventId: string): void {
-  if (!eventId || typeof document === 'undefined' || !document.querySelectorAll) return;
+/** The event id a notification deep-link is currently resolving a scroll to,
+ *  or null when no deep-link scroll is in flight.
+ *
+ *  Plain mutable variable (not a signal) like `_resizeMode` / `_activeScrollElement`:
+ *  it's read imperatively inside ThreadView's events-load effect and
+ *  useAutoScroll's layout snap, both of which already re-run on the same
+ *  eventsLoaded / eventCount changes — nothing needs to react to it changing.
+ *
+ *  Why it exists: focusing an UNfocused thread lazily loads its events, and the
+ *  scroll-to-bottom that fires on the `eventsLoaded` false→true transition would
+ *  otherwise override scrollToEventAndPulse's scrollIntoView the instant the
+ *  events render — so the deep-link landed at the bottom instead of the event.
+ *  (When the thread is already focused the events are already in the DOM,
+ *  tryResolve() succeeds synchronously, and no eventsLoaded transition fires —
+ *  which is why the bug only showed for unfocused threads.) Mirrors how a saved
+ *  scroll position suppresses the same auto-scroll via `hasSavedScroll`. */
+let _pendingEventScrollTarget: string | null = null;
 
-  const selector = `[data-event-id="${CSS.escape(eventId)}"]`;
+/** True while a notification deep-link is waiting for its target event to
+ *  render (or to scroll to it). Auto-scroll-to-bottom callers defer to it so
+ *  they don't override the deep-link's scrollIntoView. */
+export function hasPendingEventScroll(): boolean {
+  return _pendingEventScrollTarget !== null;
+}
+
+/** While true, the mobile hide-on-scroll header stays pinned fully visible (see
+ *  useHideOnScroll.onScroll). A deep-link `scrollIntoView` ignores the fixed app
+ *  header and the sticky thread-title row, so `.chat-exchange`'s scroll-margin-top
+ *  adds them back as a STATIC value — which is only correct if the header's
+ *  visible portion is deterministic. Without the pin the smooth scroll-down would
+ *  half-hide the header mid-flight, leaving the landed event partly covered. The
+ *  pin is held for a short window covering the smooth scroll, not the full ~4s
+ *  deep-link claim, so normal hide-on-scroll resumes the moment the user reads on.
+ *  Desktop ignores this — its thread-title header is a sibling above the scroll
+ *  container, so scrollIntoView already lands cleanly there. */
+let _headerPinnedForScroll = false;
+let _headerPinTimer: ReturnType<typeof setTimeout> | null = null;
+const HEADER_PIN_MS = 800;
+
+export function isHeaderPinnedForScroll(): boolean {
+  return _headerPinnedForScroll;
+}
+
+/** Pin the mobile header visible across the next deep-link smooth scroll.
+ *  Re-armable: a second deep-link mid-flight extends the window. */
+function pinHeaderForScroll(): void {
+  _headerPinnedForScroll = true;
+  if (_headerPinTimer) clearTimeout(_headerPinTimer);
+  _headerPinTimer = setTimeout(() => {
+    _headerPinnedForScroll = false;
+    _headerPinTimer = null;
+  }, HEADER_PIN_MS);
+}
+
+/** `selector` resolves the SCROLL target (the `.chat-exchange`, which carries
+ *  the scroll-margin-top). `pulseChildSelector`, when given, narrows the PULSE
+ *  highlight to a descendant of that target — an event deep-link scopes it to
+ *  `.initiator-panel` (the event itself) so the highlight stays on the event and
+ *  not the agent response rendered below it in the same exchange. Omitted for a
+ *  change deep-link, which highlights the whole turn. */
+function scrollToSelectorAndPulse(selector: string, preferLast = false, pulseChildSelector?: string): void {
+  if (!selector || typeof document === 'undefined' || !document.querySelectorAll) return;
+
   let resolved = false;
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   let observer: MutationObserver | null = null;
 
-  const cleanup = () => {
+  // Claim the deep-link scroll so the auto-scroll-to-bottom paths defer (see
+  // _pendingEventScrollTarget). The claim is held until the deadline below —
+  // NOT released the instant the scroll lands — because the same render that
+  // finally shows the event also re-fires ThreadView's events-load effect (on
+  // the hasExchanges 0→N flip) and a late ResizeObserver pin, both of which
+  // would snap to the bottom a beat after scrollIntoView. Gating those on the
+  // claim (not on scrolledUp) is what lets the events-load effect keep its
+  // separate slow-load scrolledUp recovery.
+  _pendingEventScrollTarget = selector;
+
+  // Release this call's claim — but only if it's still ours. A second deep-link
+  // started mid-flight has overwritten the slot with its own target; its own
+  // release handles that one. Without the guard, this call's deadline would
+  // clear the newer claim and let an auto-scroll-to-bottom override it.
+  const releaseClaim = () => {
+    if (_pendingEventScrollTarget === selector) _pendingEventScrollTarget = null;
+  };
+
+  const stopWatching = () => {
     if (observer) {
       observer.disconnect();
       observer = null;
@@ -259,20 +353,54 @@ export function scrollToEventAndPulse(eventId: string): void {
     for (const el of matches) {
       if (isElementVisible(el)) {
         target = el;
-        break;
+        // An event id has one visible copy (dual-mount aside), so first wins.
+        // A change id can match BOTH the proposing CC turn (earlier) and its
+        // later Applied/Reverted resolution card — preferLast lands on that
+        // card, which is the turn the user means when reopening the change.
+        if (!preferLast) break;
       }
     }
     if (!target) return;
     resolved = true;
-    cleanup();
+    // Stop watching the DOM, but keep the pending claim alive until the deadline
+    // so the post-resolve re-renders stay suppressed (see the claim comment).
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
 
+    // The user is now parked on a mid-thread event, not the bottom — pin that
+    // so the next render's auto-scroll defers instead of snapping back down.
+    // (If the event happens to sit at the bottom, the post-scroll onScroll
+    // reconciles scrolledUp against the real position.)
+    scrolledUp.value = true;
+    // Mobile only: reveal the app header now and keep it pinned visible through
+    // the smooth scroll below, so the event lands under the header + sticky
+    // title row (matching .chat-exchange's scroll-margin-top) instead of behind
+    // a half-hidden header. No-op on desktop. See useHideOnScroll.onScroll.
+    pinHeaderForScroll();
+    if (typeof document !== 'undefined' && document.dispatchEvent) {
+      document.dispatchEvent(new Event('reveal-mobile-header'));
+    }
     target.scrollIntoView({ block: 'start', behavior: 'smooth' });
-    target.classList.add(EVENT_PULSE_CLASS);
-    setTimeout(() => target?.classList.remove(EVENT_PULSE_CLASS), EVENT_PULSE_MS);
+    // Highlight only the event, not the response below it: pulse the requested
+    // descendant when present, else the whole target. (`?.` so the jsdom test
+    // fakes that lack querySelector fall back cleanly.)
+    const pulseEl = pulseChildSelector
+      ? (target.querySelector?.(pulseChildSelector) as HTMLElement | null) ?? target
+      : target;
+    pulseEl.classList.add(EVENT_PULSE_CLASS);
+    setTimeout(() => pulseEl.classList.remove(EVENT_PULSE_CLASS), EVENT_PULSE_MS);
   };
 
   tryResolve();
-  if (resolved) return;
+  if (resolved) {
+    // Synchronous resolve — the thread's events were already in the DOM (it was
+    // already focused), so no async load follows and nothing will try to snap to
+    // the bottom. Release the claim immediately; no deadline was scheduled.
+    releaseClaim();
+    return;
+  }
 
   // body, not .thread-content: Preact's positional diff can't preserve the
   // loading-branch .thread-content across ThreadView's loading→loaded swap
@@ -293,7 +421,44 @@ export function scrollToEventAndPulse(eventId: string): void {
     }
   });
   observer.observe(document.body, { childList: true, subtree: true });
-  deadlineTimer = setTimeout(cleanup, EVENT_RESOLVE_DEADLINE_MS);
+  // Deadline: the event resolved a moment ago (load settled) or never rendered
+  // (e.g. the source event isn't a rendered chat exchange). Either way, stop
+  // watching and release the claim. Bookkeeping only — it deliberately does NOT
+  // force a scroll-to-bottom: the auto-scroll paths were suppressed during the
+  // wait, so the thread stays where the load (or scrollIntoView) left it. A late
+  // snap here would yank a user who scrolled to read history during the window.
+  deadlineTimer = setTimeout(() => {
+    stopWatching();
+    releaseClaim();
+  }, EVENT_RESOLVE_DEADLINE_MS);
+}
+
+/** Land on the chat exchange carrying `data-event-id` — a notification deep-link
+ *  scrolling to the exact event that raised it (e.g. a `UserQuestionAsked`). The
+ *  pulse is scoped to the exchange's `.initiator-panel` (the event itself), not
+ *  the whole `.chat-exchange`, so the agent response rendered below the event in
+ *  the same exchange isn't highlighted too. */
+export function scrollToEventAndPulse(eventId: string): void {
+  if (!eventId) return;
+  scrollToSelectorAndPulse(`[data-event-id="${CSS.escape(eventId)}"]`, false, '.initiator-panel');
+}
+
+/** Land on the chat exchange carrying `data-change-id` — the Changes panel
+ *  deep-linking a row to its change. `ChatExchange` stamps both the proposing CC
+ *  turn (the `ChangeProposed` rides it as a non-rendered step) and any later
+ *  Applied/Reverted resolution card with the same id; `preferLast` resolves to
+ *  that resolution card when present, and to the proposing turn for a pending
+ *  change (its only match) — so the user lands on the change wherever it sits. */
+export function scrollToChangeAndPulse(changeId: string): void {
+  if (!changeId) return;
+  scrollToSelectorAndPulse(`[data-change-id="${CSS.escape(changeId)}"]`, true);
+}
+
+/** Cancel any in-flight notification deep-link scroll claim. A plain thread
+ *  focus (no target event) calls this so the prior deep-link's suppression
+ *  can't leak onto the newly-focused thread's load. */
+export function clearPendingEventScroll(): void {
+  _pendingEventScrollTarget = null;
 }
 
 /** True when the chat exchange with the given `data-event-id` is currently
@@ -411,11 +576,20 @@ export function makeScrollObservers(el: HTMLElement) {
   function isAtTop() {
     return el.scrollTop <= 80;
   }
+  // Tighter "at the very top" check than isAtTop's 80px chevron window — the
+  // title fade should ease in as soon as content slides under the bar. 2px
+  // slack absorbs subpixel rounding / iOS overscroll bounce at the top.
+  function isVisuallyAtTop() {
+    return el.scrollTop <= 2;
+  }
   function isScrollable() {
     return el.scrollHeight > el.clientHeight + 10;
   }
   function syncNotAtTop() {
     notAtTop.value = isScrollable() && !isAtTop();
+  }
+  function syncScrolledFromTop() {
+    scrolledFromTop.value = isScrollable() && !isVisuallyAtTop();
   }
   // Scroll events: can both set and clear scrolledUp (user gesture or
   // programmatic scrollTop assignment — both produce real scroll events).
@@ -434,6 +608,7 @@ export function makeScrollObservers(el: HTMLElement) {
   function onScroll() {
     if (!isElementVisible(el)) return;
     syncNotAtTop();
+    syncScrolledFromTop();
     awayFromBottom.value = !isVisuallyAtBottom();
     if (getResizeMode() === 'scroll') return; // only scrolledUp is suppressed
     scrolledUp.value = !isAtBottom();
@@ -454,7 +629,16 @@ export function makeScrollObservers(el: HTMLElement) {
     // Sync on resize too — if content shrinks below the viewport,
     // clear the chevron even if no scroll event fires.
     syncNotAtTop();
-    if (getResizeMode() === 'scroll') {
+    syncScrolledFromTop();
+    // Suppress the force-pin while a notification deep-link owns the scroll.
+    // Without this, the 'scroll'-mode snap — kept alive across the thread load
+    // by its own extendSuppression() — slams the freshly-loaded thread to the
+    // bottom a beat after scrollToEventAndPulse landed on the event. The claim
+    // is held until that call's deadline, so this stays suppressed for the whole
+    // settle window; a normal scrollToBottom() flow has no claim, so the pin
+    // still works (and skipping extendSuppression here lets the mode decay to
+    // 'ignore' on its own once the deep-link has landed).
+    if (getResizeMode() === 'scroll' && !hasPendingEventScroll()) {
       el.scrollTop = el.scrollHeight;
       extendSuppression();
       return;

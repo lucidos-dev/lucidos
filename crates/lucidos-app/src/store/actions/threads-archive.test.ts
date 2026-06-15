@@ -33,7 +33,7 @@ import { archiveThread } from '../../api/threads';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { archivingThreadIds, focusedThreadId, generatedTitleIds, getReviewThreads, mobileView, resetCCPendingPreferences, threadDrawerOpen, threadMap, toasts } from '../store';
+import { ALL_CHANNELS, archivingThreadIds, focusedThreadId, generatedTitleIds, getCurrentThreads, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, toasts } from '../store';
 import { upsertThread } from './thread-loading';
 import { handleThreadEvent } from './thread-sync';
 import { focusThread, handleArchiveThread } from './threads';
@@ -79,9 +79,15 @@ beforeEach(() => {
   mobileView.value = 'thread';
   threadDrawerOpen.value = false;
   drawerOpen.value = false;
-  resetCCPendingPreferences();
+  resetCodingAgentPendingPreferences();
   generatedTitleIds.clear();
   archivingThreadIds.value = new Set();
+  // Reset the thread filter to its neutral "show everything" state so one
+  // test's narrowed filter can't leak into the next.
+  threadChannelFilter.value = new Set(ALL_CHANNELS);
+  selectedTriggerIds.value = new Set();
+  selectedRepoIds.value = new Set();
+  selectedAppIds.value = new Set();
   localStorage.removeItem('lucidos-focused-thread');
 });
 
@@ -155,6 +161,31 @@ describe('handleArchiveThread', () => {
 
     await handleArchiveThread('t2');
 
+    expect(focusedThreadId.value).toBe('t3');
+  });
+
+  it('skips threads hidden by the active channel filter when picking the next focus', async () => {
+    // Bug: archiving jumped to the next Current thread regardless of the active
+    // filter, landing the user on a thread that isn't even in their drawer view.
+    // With the channel filter narrowed to claude_code, archiving t1 must skip
+    // the chat thread t2 (filtered out) and land on the next claude_code thread.
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', {
+      meta: { id: 't1', title: 'CC t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+    }));
+    map.set('t2', makeThreadState('t2', {
+      meta: { id: 't2', title: 'Chat t2', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'failed', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+    }));
+    map.set('t3', makeThreadState('t3', {
+      meta: { id: 't3', title: 'CC t3', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+    }));
+    threadMap.value = map;
+    threadChannelFilter.value = new Set(['claude_code']);
+    focusThread('t1');
+
+    await handleArchiveThread('t1');
+
+    // t2 (chat) is hidden by the filter, so next focus is t3, not t2.
     expect(focusedThreadId.value).toBe('t3');
   });
 
@@ -240,6 +271,38 @@ describe('handleArchiveThread', () => {
 
     // Must land on the unrelated sibling — not on the cascade-archived child.
     expect(focusedThreadId.value).toBe('sibling');
+  });
+
+  it('lands on the next family parent, not a sub-thread that sorts high by its own review tier', async () => {
+    // Bug: the post-archive focus picker ordered candidates with a per-thread
+    // review order instead of the drawer's family-aware order. A sub-thread with
+    // a high per-thread tier (e.g. a proposed change) could sort adjacent to the
+    // archived parent and steal focus — landing the user inside an unrelated
+    // family's child instead of on the next family's parent row.
+    //
+    // Family A: pA (focused/archived) — proposed (tier 1), newest.
+    // Family B: pB (parent — running, no CTA = tier 2, oldest) with sub-thread
+    //           cB (proposed = tier 1, middle). Family routing pulls the whole
+    //           family into Current; the drawer renders pB above its nested cB.
+    // Per-thread review order would be [pA(t1), cB(t1), pB(t2)] → archiving pA
+    // jumps to cB. The drawer's family order is [pA, pB, cB] → next row is pB.
+    const map = new Map<string, ThreadState>();
+    map.set('pA', makeThreadState('pA', {
+      meta: { id: 'pA', title: 'Family A parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:03Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+    }));
+    map.set('pB', makeThreadState('pB', {
+      meta: { id: 'pB', title: 'Family B parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'running', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 1 },
+    }));
+    map.set('cB', makeThreadState('cB', {
+      meta: { id: 'cB', title: 'Family B sub-thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'pB' },
+    }));
+    threadMap.value = map;
+    focusThread('pA');
+
+    await handleArchiveThread('pA');
+
+    // Next visible row after family A is family B's PARENT, not its sub-thread.
+    expect(focusedThreadId.value).toBe('pB');
   });
 
   it('skips discarded inbox orphans when picking the next focus', async () => {
@@ -348,7 +411,7 @@ describe('handleArchiveThread — optimistic UI', () => {
     // Don't await — verify mid-flight (API has not resolved).
     const pending = handleArchiveThread('parent');
 
-    expect(getReviewThreads().some(t => t.meta.id === 'parent')).toBe(false);
+    expect(getCurrentThreads().some(t => t.meta.id === 'parent')).toBe(false);
     expect(focusedThreadId.value).toBe('sibling');
 
     resolveApi({ archived: ['parent'] });
@@ -376,8 +439,8 @@ describe('handleArchiveThread — optimistic UI', () => {
 
     const pending = handleArchiveThread('parent');
 
-    // The whole family must vanish from review before the API resolves.
-    const ids = getReviewThreads().map(t => t.meta.id);
+    // The whole family must vanish from Current before the API resolves.
+    const ids = getCurrentThreads().map(t => t.meta.id);
     expect(ids).not.toContain('parent');
     expect(ids).not.toContain('child');
     expect(ids).not.toContain('grandchild');

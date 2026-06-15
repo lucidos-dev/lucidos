@@ -1,11 +1,15 @@
 import { test, expect } from '@playwright/test';
-import { assertHealthy, navigateToApp, waitForVisibleInput, blurActiveElement, getHeaderTop } from './helpers';
+import { assertHealthy, navigateToApp, waitForVisibleInput, blurActiveElement, getHeaderTop, disableMobileHeaderSticky } from './helpers';
 
 test.describe('Mobile header in compose view', () => {
   test.use({ viewport: { width: 375, height: 812 } });
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
+    // "Keep header visible" defaults ON, which pins the header. These tests
+    // assert the header hides on prompt focus / stays out of the way, so opt
+    // out of the sticky pin before the page boots.
+    await disableMobileHeaderSticky(page);
   });
 
   test('prompt is not auto-focused and header is visible after reload in compose view', async ({ page }) => {

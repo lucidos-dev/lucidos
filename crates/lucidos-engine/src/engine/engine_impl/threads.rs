@@ -239,6 +239,7 @@ impl LucidosEngine {
             None,
             thread_events::ActorMode::Agent,
             None,
+            None,
             Some(child_completed_event_id),
             None,
             callback_origin,
@@ -318,7 +319,7 @@ impl LucidosEngine {
 
                 chat::emit_generated_title(
                     &bus,
-                    &provider,
+                    provider.as_ref(),
                     tid_uuid,
                     &first_msg,
                     image_desc.as_deref(),

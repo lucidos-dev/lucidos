@@ -91,6 +91,7 @@ pub enum NavigateTarget {
     Files,
     Apps,
     Triggers,
+    ThreadQueue,
     Changes,
     Notifications,
     Settings,
@@ -468,11 +469,13 @@ mod tests {
 
     #[test]
     fn tap_navigate_kebab_case_targets() {
-        // new-app / new-trigger / new-chat all serialize kebab-case on the wire.
+        // new-app / new-trigger / new-chat / thread-queue all serialize
+        // kebab-case on the wire.
         for (target, wire) in [
             (NavigateTarget::NewApp, "new-app"),
             (NavigateTarget::NewTrigger, "new-trigger"),
             (NavigateTarget::NewChat, "new-chat"),
+            (NavigateTarget::ThreadQueue, "thread-queue"),
         ] {
             let v = serde_json::to_value(target).unwrap();
             assert_eq!(v, serde_json::Value::String(wire.into()));

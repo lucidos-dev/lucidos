@@ -145,11 +145,13 @@ async fn get_older_threads_filters_by_repo_ids() {
     teardown_test_db(&db).await;
 }
 
-/// When the registered repo is later deleted, threads bound to its UUID
-/// keep `cc_repo_id` but `cc_repo_name` resolves to NULL — the frontend
-/// uses that absence to render the row as `(deleted)`.
+/// When a repo's name was never recorded anywhere — not in the live
+/// `repositories` registry and not in the durable `repo_names` projection —
+/// `cc_repo_name` resolves to NULL. The frontend's deleted-vs-live decision is
+/// keyed off the live registry, not this absence, so a NULL name just means
+/// "truly unknown" (an orphan UUID with no provenance).
 #[tokio::test]
-async fn get_older_threads_returns_null_repo_name_for_deleted_repo() {
+async fn get_older_threads_returns_null_repo_name_for_unknown_repo() {
     let (pool, db) = setup_test_db().await;
     let store = EventStore::new(pool.clone());
 
@@ -169,7 +171,38 @@ async fn get_older_threads_returns_null_repo_name_for_deleted_repo() {
     );
     assert_eq!(
         hits[0].cc_repo_name, None,
-        "deleted repo must yield NULL name"
+        "repo with no recorded name yields NULL"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The bug fix: a repo that WAS registered (so its name lives in the durable
+/// `repo_names` projection) and is later removed from the live `repositories`
+/// registry still resolves its historical `cc_repo_name` — the filter and
+/// thread rows show "Apple", not the raw UUID.
+#[tokio::test]
+async fn get_older_threads_resolves_deleted_repo_name_from_projection() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let repo = Uuid::new_v4();
+    insert_repository(&pool, repo, "Apple", "/tmp/apple").await;
+    insert_repo_name(&pool, repo, "Apple").await; // what RepositoryAdded persists
+    insert_cc_repo_thread(&pool, &repo.to_string(), 60).await;
+    delete_repository(&pool, repo).await; // RepositoryRemoved — projection retained
+
+    let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
+    let hits = store
+        .get_older_threads(cutoff, 10, None, None, Some(&[repo.to_string()]), None)
+        .await
+        .expect("get_older_threads filtered");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].cc_repo_name.as_deref(),
+        Some("Apple"),
+        "deleted repo keeps its historical name via repo_names"
     );
 
     teardown_test_db(&db).await;
@@ -209,6 +242,46 @@ async fn get_older_threads_combines_trigger_and_repo_ids_with_or() {
     let trig = trig_thread.to_string();
     assert!(returned.contains(cc.as_str()));
     assert!(returned.contains(trig.as_str()));
+
+    teardown_test_db(&db).await;
+}
+
+/// Pagination companion to `count_archived_threads_channels_plus_facet_counts_union`:
+/// the rows `get_older_threads` returns must be the SAME union the badge counts.
+/// With whole channels active (`sources = None`) plus one trigger sub-selected,
+/// the pre-fix facet branch ignored the channel selection and returned ONLY the
+/// trigger's threads — so the (fixed) badge total and the scrolled rows would
+/// disagree, and the user could never scroll to the chat / claude_code archive.
+/// The unified predicate mirrors `threadPassesChannelFilter`: chat + claude_code
+/// + the selected trigger, minus the unselected trigger.
+#[tokio::test]
+async fn get_older_threads_channels_plus_facet_returns_union() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let chat = Uuid::new_v4();
+    insert_thread(&pool, chat, "Chat").await;
+    let repo = Uuid::new_v4();
+    let cc = insert_cc_repo_thread(&pool, &repo.to_string(), 30).await;
+    let trig_keep = insert_trigger_thread(&pool, "trig-keep", "Keep", 60).await;
+    insert_trigger_thread(&pool, "trig-drop", "Drop", 90).await;
+
+    let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
+    let hits = store
+        .get_older_threads(cutoff, 10, None, Some(&["trig-keep".to_string()]), None, None)
+        .await
+        .expect("get_older_threads channels + facet");
+
+    let returned: std::collections::HashSet<&str> =
+        hits.iter().map(|t| t.thread_id.as_str()).collect();
+    assert_eq!(
+        hits.len(),
+        3,
+        "chat + claude_code + trig-keep — NOT just the trigger (pre-fix bug)"
+    );
+    assert!(returned.contains(chat.to_string().as_str()), "chat thread must page in");
+    assert!(returned.contains(cc.to_string().as_str()), "claude_code thread must page in");
+    assert!(returned.contains(trig_keep.to_string().as_str()), "selected trigger pages in");
 
     teardown_test_db(&db).await;
 }
@@ -300,6 +373,45 @@ async fn get_filter_facets_returns_distinct_sessions() {
         "archived-only app must still be a facet"
     );
     assert!(app_ids.contains("momentum-autoresearch"));
+
+    teardown_test_db(&db).await;
+}
+
+/// The repos facet resolves a `name`: the live registry for a registered repo,
+/// the durable `repo_names` projection for a removed one — so the dropdown lists
+/// a deleted repo under its historical name instead of its UUID. Trigger/app
+/// facets carry NULL names (resolved client-side).
+#[tokio::test]
+async fn get_filter_facets_resolves_repo_names_including_deleted() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let live_repo = Uuid::new_v4();
+    insert_repository(&pool, live_repo, "Live Repo", "/tmp/live").await;
+    insert_repo_name(&pool, live_repo, "Live Repo").await;
+    insert_cc_repo_thread(&pool, &live_repo.to_string(), 30).await;
+
+    let dead_repo = Uuid::new_v4();
+    insert_repo_name(&pool, dead_repo, "Dead Repo").await; // registered then removed
+    insert_cc_repo_thread(&pool, &dead_repo.to_string(), 60).await;
+
+    let facets = store.get_filter_facets().await.expect("get_filter_facets");
+
+    let by_id: std::collections::HashMap<&str, Option<&str>> = facets
+        .repos
+        .iter()
+        .filter_map(|f| f.id.as_deref().map(|id| (id, f.name.as_deref())))
+        .collect();
+    assert_eq!(
+        by_id.get(live_repo.to_string().as_str()),
+        Some(&Some("Live Repo")),
+        "live repo resolves from the registry"
+    );
+    assert_eq!(
+        by_id.get(dead_repo.to_string().as_str()),
+        Some(&Some("Dead Repo")),
+        "removed repo resolves its historical name from repo_names"
+    );
 
     teardown_test_db(&db).await;
 }

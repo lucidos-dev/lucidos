@@ -8,7 +8,7 @@ use crate::llm::provider::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use super::{thinking_budget_for_effort, VertexProvider};
+use super::VertexProvider;
 
 impl VertexProvider {
     /// Search the web using Gemini's Google Search grounding.
@@ -132,7 +132,7 @@ impl VertexProvider {
                     thinking_config: VertexThinkingConfig { thinking_budget: 0 },
                 })
             } else {
-                let budget = thinking_budget_for_effort(effort);
+                let budget = crate::llm::thinking_budget_for_effort(effort);
                 Some(VertexGenerationConfig {
                     thinking_config: VertexThinkingConfig {
                         thinking_budget: budget,
@@ -180,13 +180,27 @@ impl VertexProvider {
 
         let response = build_gemini_llm_response(parsed);
 
-        // Gemini uses non-streaming requests, so emit the full text at once
-        if let (Some(cb), Some(text)) = (&on_token, &response.content) {
-            cb(text);
+        // Gemini uses non-streaming requests, so emit the full final-answer
+        // text at once. If the same response also contains function calls, the
+        // text is a model/tool-turn preamble and the agentic loop suppresses it
+        // before writing conversation history. Do not surface it as streamed
+        // assistant prose first; that made prompt echoes visible in trigger runs.
+        if should_emit_gemini_text_delta(&response) {
+            if let (Some(cb), Some(text)) = (&on_token, response.content.as_ref()) {
+                cb(text);
+            }
         }
 
         Ok(response)
     }
+}
+
+fn should_emit_gemini_text_delta(response: &LlmResponse) -> bool {
+    response.tool_calls.is_empty()
+        && response
+            .content
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
 }
 
 /// Translate a parsed `VertexResponse` (Gemini non-streaming reply) into
@@ -776,6 +790,43 @@ mod tests {
         assert_eq!(resp.stop_reason.as_deref(), Some("STOP"));
         assert_eq!(resp.input_tokens, Some(42));
         assert_eq!(resp.output_tokens, Some(7));
+        assert!(
+            should_emit_gemini_text_delta(&resp),
+            "text-only Gemini responses should still stream their final answer"
+        );
+    }
+
+    #[test]
+    fn gemini_text_delta_is_suppressed_when_function_call_is_present() {
+        let body = r#"{
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "No introductory transition, no \"Okay, I see\". Just act."},
+                    {"functionCall": {
+                        "name": "read_file",
+                        "args": {"path": "notes.md"}
+                    }}
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 42,
+                "candidatesTokenCount": 11,
+                "totalTokenCount": 53
+            }
+        }"#;
+        let parsed: VertexResponse = serde_json::from_str(body).unwrap();
+        let resp = build_gemini_llm_response(parsed);
+
+        assert_eq!(
+            resp.content.as_deref(),
+            Some("No introductory transition, no \"Okay, I see\". Just act.")
+        );
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert!(
+            !should_emit_gemini_text_delta(&resp),
+            "Gemini tool-call preambles must not be surfaced as streamed assistant prose"
+        );
     }
 
     /// MAX_TOKENS truncation: model spent the whole budget without ending

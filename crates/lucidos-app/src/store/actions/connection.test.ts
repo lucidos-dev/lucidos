@@ -24,7 +24,7 @@ vi.mock('./chat-changes', () => ({
   RESTART_LS_KEY: 'restart-required',
 }));
 vi.mock('./notifications', () => ({
-  refreshUnreadCount: vi.fn(),
+  loadUnreadNotifications: vi.fn(),
 }));
 
 // Import after mocks are set up

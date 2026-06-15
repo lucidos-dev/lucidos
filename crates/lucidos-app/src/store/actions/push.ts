@@ -136,8 +136,15 @@ export async function recoverServiceWorker(): Promise<void> {
  */
 export async function initPushSubscription(): Promise<boolean> {
   if (isTauri()) {
-    showToast('Push notifications are not available in the desktop app', 'error');
-    return false;
+    // Desktop gets NATIVE macOS notifications driven by the engine's
+    // `NativePushRequested` SSE (rendered + tap-routed via the
+    // `show_native_notification` command). There's no web-push subscription to
+    // create — the WKWebView can't subscribe — and the macOS notification path
+    // has no JS-queryable permission (banners follow the user's System Settings,
+    // and macOS prompts on first delivery), so enabling is a no-op success.
+    // See system-knowhow/notifications.md §4.
+    showToast('Notifications enabled', 'success');
+    return true;
   }
 
   if (isIOS() && !isStandalone()) {

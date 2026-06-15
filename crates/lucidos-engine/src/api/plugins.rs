@@ -9,9 +9,10 @@
 //! and the LLM calls `install_plugin` with that path.
 
 use axum::{
-    extract::{Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::{HeaderMap, StatusCode},
-    Json,
+    routing::post,
+    Json, Router,
 };
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -200,3 +201,28 @@ pub(super) async fn cancel_uninstall(
     }
 }
 
+
+/// Routes for the `/plugins/*` surface.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/plugins/upload-archive",
+            post(upload_archive).layer(DefaultBodyLimit::max(MAX_ARCHIVE_BYTES)),
+        )
+        .route(
+            "/plugins/install/:install_id/confirm",
+            post(confirm_install),
+        )
+        .route(
+            "/plugins/install/:install_id/cancel",
+            post(cancel_install),
+        )
+        .route(
+            "/plugins/uninstall/:uninstall_id/confirm",
+            post(confirm_uninstall),
+        )
+        .route(
+            "/plugins/uninstall/:uninstall_id/cancel",
+            post(cancel_uninstall),
+        )
+}

@@ -1,14 +1,16 @@
 import { useRef, useEffect, useLayoutEffect, useState } from 'preact/hooks';
 import { popupImage } from '../../store/store';
 import { CloseIcon, ChevronLeftIcon, ChevronRightIcon } from './icons';
-import { ModalOverlay } from './ModalOverlay';
+import { Overlay } from './Overlay';
 import {
   fingerDistance,
   fingerMidpoint,
   computePinchUpdate,
   clampPanTransform,
   computeZoomAt,
+  naturalImageLayout,
   type PinchInitial,
+  type ImageLayout,
 } from '../../utils/pinchGesture';
 import { SwipeTouch } from '../../utils/swipe';
 
@@ -45,15 +47,6 @@ function step(delta: -1 | 1) {
   popupImage.value = { images: s.images, index: next };
 }
 
-interface LayoutCache {
-  containerW: number;
-  containerH: number;
-  imgW: number;
-  imgH: number;
-  natCenterX: number;
-  natCenterY: number;
-}
-
 function parseTranslateX(el: HTMLElement): number {
   const t = getComputedStyle(el).transform;
   if (!t || t === 'none') return 0;
@@ -80,7 +73,7 @@ export function ImagePopup() {
   // mid-animation), and width. Slide positions are computed from the live
   // signal index, so we don't need to remember the start index.
   const dragStartRef = useRef<{ offset: number; w: number } | null>(null);
-  const layoutRef = useRef<LayoutCache | null>(null);
+  const layoutRef = useRef<ImageLayout | null>(null);
   const rafRef = useRef<number | null>(null);
   // Cleanup for the in-flight commit/snap-back transitionend listener.
   const transitionCleanupRef = useRef<(() => void) | null>(null);
@@ -144,23 +137,23 @@ export function ImagePopup() {
       return slide?.querySelector<HTMLImageElement>('img') ?? null;
     }
 
-    function captureLayout(): LayoutCache | null {
+    function captureLayout(): ImageLayout | null {
       const img = getCurrentImg();
       if (!img) return null;
       const slide = img.parentElement;
       if (!slide) return null;
-      const slideRect = slide.getBoundingClientRect();
-      const imgRect = img.getBoundingClientRect();
-      return {
-        containerW: slideRect.width,
-        containerH: slideRect.height,
-        imgW: imgRect.width,
-        imgH: imgRect.height,
-        natCenterX: imgRect.left + imgRect.width / 2,
-        natCenterY: imgRect.top + imgRect.height / 2,
-      };
+      // imgRect reflects the live transform; naturalImageLayout divides the
+      // current zoom (read from zoomRef, the source of truth we apply) back out
+      // so the captured geometry is always the natural scale-1 layout — even
+      // when a gesture starts on an already-zoomed image.
+      const z = zoomRef.current;
+      return naturalImageLayout(
+        slide.getBoundingClientRect(),
+        img.getBoundingClientRect(),
+        z.scale, z.tx, z.ty,
+      );
     }
-    function ensureLayout(): LayoutCache | null {
+    function ensureLayout(): ImageLayout | null {
       if (!layoutRef.current) layoutRef.current = captureLayout();
       return layoutRef.current;
     }
@@ -498,6 +491,22 @@ export function ImagePopup() {
       }
     }
 
+    // Viewport resize / orientation change. Snap the strip back to rest
+    // (slides reposition via render) and, if zoomed, drop the now-stale cached
+    // layout and re-clamp the current zoom against the fresh bounds — otherwise
+    // rotating the device while zoomed would leave the image panned outside its
+    // new edges. Skipped mid-gesture so it can't fight an in-flight pinch/swipe.
+    function handleResize() {
+      if (touchActiveRef.current) return;
+      strip.style.transition = 'none';
+      strip.style.transform = STRIP_REST_TRANSFORM;
+      layoutRef.current = null;
+      if (zoomRef.current.scale > 1) {
+        clamp();
+        applyZoom();
+      }
+    }
+
     strip.addEventListener('wheel', handleWheel, { passive: false });
     strip.addEventListener('touchstart', handleTouchStart, { passive: false });
     strip.addEventListener('touchmove', handleTouchMove, { passive: false });
@@ -509,6 +518,8 @@ export function ImagePopup() {
     strip.addEventListener('pointercancel', onPointerUp);
     strip.addEventListener('dblclick', onDoubleClick);
     strip.addEventListener('click', onClick);
+    window.addEventListener('resize', handleResize);
+    window.addEventListener('orientationchange', handleResize);
     return () => {
       strip.removeEventListener('wheel', handleWheel);
       strip.removeEventListener('touchstart', handleTouchStart);
@@ -521,6 +532,8 @@ export function ImagePopup() {
       strip.removeEventListener('pointercancel', onPointerUp);
       strip.removeEventListener('dblclick', onDoubleClick);
       strip.removeEventListener('click', onClick);
+      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('orientationchange', handleResize);
       cancelSwipeRaf();
       cancelTransition();
       pinchRef.current = null;
@@ -542,24 +555,6 @@ export function ImagePopup() {
     return () => window.removeEventListener('keydown', onKey);
   }, [hasNav]);
 
-  // Recompute strip transform on viewport resize / orientation change.
-  // Slides reposition automatically via render; we just need to stay at rest.
-  useEffect(() => {
-    if (!state) return;
-    function onResize() {
-      const strip = stripRef.current;
-      if (!strip || touchActiveRef.current) return;
-      strip.style.transition = 'none';
-      strip.style.transform = STRIP_REST_TRANSFORM;
-    }
-    window.addEventListener('resize', onResize);
-    window.addEventListener('orientationchange', onResize);
-    return () => {
-      window.removeEventListener('resize', onResize);
-      window.removeEventListener('orientationchange', onResize);
-    };
-  }, [state !== null]);
-
   if (!state) return null;
 
   function close() {
@@ -567,8 +562,17 @@ export function ImagePopup() {
   }
 
   return (
-    <ModalOverlay onClose={zoomRef.current.scale > 1 ? undefined : close} class="image-popup">
-      <div class={`image-popup-content${chromeHidden ? ' chrome-hidden' : ''}`}>
+    // While zoomed (scale>1) the backdrop tap pans, so onClose returns false —
+    // the dismiss hook then neither closes nor swallows, and Escape (routed via
+    // the overlay stack) is a no-op too. Matches the old `onClose={undefined}`
+    // gate. The strip's own click handler still closes / toggles chrome for
+    // clicks inside the panel.
+    <Overlay
+      open
+      onClose={() => { if (zoomRef.current.scale > 1) return false; close(); }}
+      overlayClass="image-popup"
+      panelClass={`image-popup-content${chromeHidden ? ' chrome-hidden' : ''}`}
+    >
         <button class="image-popup-close icon-btn" onClick={close} aria-label="Close" data-tooltip="Close">
           <CloseIcon />
         </button>
@@ -615,7 +619,6 @@ export function ImagePopup() {
             </div>
           )}
         </div>
-      </div>
-    </ModalOverlay>
+    </Overlay>
   );
 }

@@ -28,7 +28,7 @@ describe('composeHasContent', () => {
 
   // Regression — pasting an image must immediately count as content so the
   // Save button (review-section default) yields to Send during the upload
-  // window. Send is then disabled by `uploadsBlocking` until the hash lands.
+  // window. Clicking Send now queues the send until the hash lands.
   it('true while an image upload is pending — Save must yield to Send', () => {
     expect(composeHasContent(false, 0, 1)).toBe(true);
   });

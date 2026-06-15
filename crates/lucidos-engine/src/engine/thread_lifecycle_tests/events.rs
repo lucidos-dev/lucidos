@@ -165,9 +165,9 @@ fn memory_searched_bumps_status_to_running() {
 }
 
 #[test]
-fn waiting_for_user_answer_routes_to_review_when_inbox() {
+fn waiting_for_user_answer_routes_to_current_when_inbox() {
     // The transition contract guarantees `UserQuestionAsked` stamps
-    // archive_state = Inbox, so the typical WFUA thread routes to Review.
+    // archive_state = Inbox, so the typical WFUA thread routes to Current.
     assert_eq!(
         display_section(
             ArchiveState::Inbox,
@@ -177,7 +177,7 @@ fn waiting_for_user_answer_routes_to_review_when_inbox() {
             false,
             false,
         ),
-        DisplaySection::Review
+        DisplaySection::Current
     );
     // An archived legacy WFUA row routes to Archive (no special case anymore).
     // The transition contract enforces Inbox so this state shouldn't occur
@@ -205,7 +205,7 @@ fn waiting_for_user_answer_routes_to_review_when_inbox() {
         ),
         DisplaySection::Saved
     );
-    // Active children turn it Active (which already reads as work-in-progress).
+    // Active children keep it in Current (still live work).
     assert_eq!(
         display_section(
             ArchiveState::Inbox,
@@ -215,7 +215,7 @@ fn waiting_for_user_answer_routes_to_review_when_inbox() {
             false,
             false,
         ),
-        DisplaySection::Active
+        DisplaySection::Current
     );
 }
 

@@ -13,6 +13,10 @@ const BACKFILL_TRIGGER_ID_V5_MARKER: &str = "backfill_trigger_id_v5_to_config_id
 /// successfully so subsequent boots skip the events scan.
 const BACKFILL_TRIGGER_ID_FROM_EVENTS_MARKER: &str = "backfill_trigger_id_from_events_done";
 
+/// Preference marker: set after `backfill_repo_names_from_changes` runs
+/// successfully so subsequent boots skip the `changes` scan.
+const BACKFILL_REPO_NAMES_FROM_CHANGES_MARKER: &str = "backfill_repo_names_from_changes_done";
+
 /// Two-state initiator stored in the `thread_summaries.initiator` text column
 /// and exposed on `ThreadSummary` for the frontend (`'user' | 'system'`).
 ///
@@ -76,6 +80,16 @@ pub struct ThreadSummary {
     pub initiator: LegacyInitiator,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_activity: chrono::DateTime<chrono::Utc>,
+    /// When the USER last drove this thread forward (message sent, question
+    /// answered, permission resolved, change applied/discarded). The drawer
+    /// sorts by this so background agent churn no longer reshuffles the list.
+    /// NOT NULL — defaults to the row's creation time for never-acted threads.
+    pub last_user_action: chrono::DateTime<chrono::Utc>,
+    /// When the AGENT (or trigger) last did something — streaming, a terminal
+    /// response, an idle, a trigger fire/complete, or asking the user. Drives
+    /// the thread-row tooltip's "Agent ·" line, distinct from `last_user_action`
+    /// so the tooltip is accurate even right after the user acts.
+    pub last_agent_action: chrono::DateTime<chrono::Utc>,
     pub message_count: i64,
     /// Thread section: "archived" (history/saved), "inbox" (needs user attention).
     /// Stored in `thread_summaries.archive_state` column; aliased to `section` in
@@ -93,28 +107,28 @@ pub struct ThreadSummary {
     pub blocking_descendant_count: i64,
     /// Count of descendants (transitive) currently in a state that needs user
     /// attention (per `is_attention_needing` in `thread_lifecycle.rs`):
-    /// WaitingForUserAnswer, or an in-workspace CC thread with pending changes.
+    /// WaitingForUserAnswer, or an in-workspace coding-agent thread with pending changes.
     /// Strict subset of `blocking_descendant_count` — drops the `Running` case.
-    /// Consumed by `display_section` via `count > 0` to bubble REVIEW to the
+    /// Consumed by `display_section` via `count > 0` to bubble Current to the
     /// ancestor chain even when sibling descendants are still running.
     pub attention_descendant_count: i64,
     /// Thread status: "idle", "running", or "waiting". Computed by the backend.
     pub status: String,
-    /// Whether the CC branch has any diff against main on disk — pure git
+    /// Whether the coding-agent branch has any diff against main on disk — pure git
     /// truth. Set by the projection on `ChangeProposed`, cleared on
     /// `ChangeApplied` / `ChangeDiscarded` / `ThreadArchived`, seeded at
     /// session bootstrap, and reconciled by the startup sweep against on-disk
     /// git state. Drives the WaitingBanner Diff button.
     pub coding_agent_has_diff: bool,
-    /// CC's formal "ready for review" offer — set only by `ChangeProposed`,
+    /// Coding-agent thread's formal "ready for review" offer — set only by `ChangeProposed`,
     /// cleared on Apply/Discard/Archive. Drives the Apply / Discard buttons.
     /// Distinct from `coding_agent_has_diff` (the git fact): a thread can have
-    /// a diff mid-session before CC has formally proposed.
+    /// a diff mid-session before the coding agent has formally proposed.
     pub coding_agent_proposed: bool,
     /// Whether the proposed change requires an engine restart. Only meaningful
     /// when `coding_agent_proposed = true`; cleared together with it.
     pub coding_agent_requires_restart: bool,
-    /// Whether the Claude Code session is bound to an external repo. External repos
+    /// Whether the coding-agent thread is bound to an external repo. External repos
     /// can't be Applied via the engine merge flow — the WaitingBanner shows
     /// Done/Archive instead, and `archive_thread` marks pending changes as
     /// applied so they don't sit forever.
@@ -136,7 +150,7 @@ pub struct ThreadSummary {
     /// later renamed or deleted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_name: Option<String>,
-    /// Repository the Claude Code session bound to (only for `channel == "claude_code"`
+    /// Repository the coding-agent thread bound to (only for `channel == "claude_code"`
     /// threads). Stored as TEXT on `thread_summaries.cc_repo_id`; matches a
     /// `repositories.id` UUID.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,17 +160,22 @@ pub struct ThreadSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cc_repo_name: Option<String>,
     /// Coding-agent thread flavor — `'lucidos' | 'app' | 'external'`. Stored
-    /// on `thread_summaries.coding_agent_kind`. NULL for non-CC threads and
-    /// legacy CC rows (consumers default NULL → `'lucidos'`). Frontend reads
+    /// on `thread_summaries.coding_agent_kind`. NULL for non-coding-agent threads and
+    /// legacy coding-agent rows (consumers default NULL → `'lucidos'`). Frontend reads
     /// this to render the app-thread affordances (branch chip, WIP preview).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent_kind: Option<String>,
     /// Canonical folder the coding agent operates on — `<ws>/data/apps/<id>/`
     /// for App, the repo root for Lucidos and External. Stored on
-    /// `thread_summaries.coding_agent_folder`. NULL for non-CC threads and
+    /// `thread_summaries.coding_agent_folder`. NULL for non-coding-agent threads and
     /// legacy rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent_folder: Option<String>,
+    /// Which backend drives this thread — `'claude-code' | 'codex'`. Stored on
+    /// `thread_summaries.coding_agent`. NULL for non-coding-agent threads and legacy coding-agent
+    /// rows (consumers default NULL → `'claude-code'` via `CodingAgent::parse`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coding_agent: Option<String>,
     /// Compose state machine (`composing` | `active` | `discarded`). Orthogonal
     /// to the archive flag (`archive_state` / wire field `section`): an archived
     /// thread carries `state='active'` plus `archive_state='archived'`.
@@ -184,12 +203,53 @@ fn app_id_sql_expr(alias: &str) -> String {
     format!("split_part(split_part({alias}.coding_agent_folder, '/data/apps/', 2), '/', 1)")
 }
 
+/// SQL boolean mirroring the frontend `threadPassesChannelFilter` — the single
+/// source of truth for "does this thread match the active drawer filter". A
+/// channel gate (`sources`) ANDed with per-channel facet narrowing: `trigger`
+/// rows by `trigger_ids`, coding-agent rows (persisted as source `claude_code`)
+/// by `repo_ids`/`app_ids` (the two unioned). A `chat` row — or any `trigger` /
+/// coding-agent row whose facet axis isn't sub-selected — passes on the
+/// channel gate alone.
+///
+/// `s` / `t` / `r` / `a` are the 1-based bind positions of the `sources`,
+/// `trigger_ids`, `repo_ids`, `app_ids` params (each `text[]`, bound as
+/// `Option<&[String]>`). A NULL or empty array on an axis means "no narrowing
+/// there": `array_length(.., 1) IS NULL` is true for both NULL and `'{}'`, so an
+/// empty selection is a no-op instead of `= ANY('{}')`, which would match
+/// nothing. (The `sources` gate uses `IS NULL` directly — the frontend sends it
+/// absent, never empty, when every channel is on.)
+///
+/// Shared verbatim by `count_archived_threads` (the collapsed Archive badge) and
+/// `get_older_threads` (scroll pagination) so the badge total and the rows it
+/// scrolls through can never disagree — the drift that made the badge undercount
+/// when whole channels were combined with one facet (chat + coding-agent + a
+/// single trigger counted only the trigger's threads, dropping the rest).
+fn channel_facet_filter_sql(alias: &str, s: usize, t: usize, r: usize, a: usize) -> String {
+    let app = app_id_sql_expr(alias);
+    format!(
+        "(${s}::text[] IS NULL OR {alias}.source = ANY(${s})) \
+         AND ({alias}.source <> 'trigger' \
+              OR array_length(${t}::text[], 1) IS NULL \
+              OR {alias}.trigger_id = ANY(${t})) \
+         AND ({alias}.source <> 'claude_code' \
+              OR (array_length(${r}::text[], 1) IS NULL AND array_length(${a}::text[], 1) IS NULL) \
+              OR {alias}.cc_repo_id = ANY(${r}) \
+              OR ({alias}.coding_agent_kind = 'app' AND {app} = ANY(${a})))"
+    )
+}
+
 /// One selectable filter facet (trigger / repo / app) with the timestamp of its
 /// most-recent thread. `id` is non-null in practice (the queries filter
 /// `… IS NOT NULL`) but stays `Option` to match the nullable columns.
+///
+/// `name` is the resolved label, populated for the repos facet (live registry →
+/// `repo_names` projection) so a removed repo lists under its historical name
+/// rather than its raw UUID. NULL for trigger / app facets, whose labels the
+/// frontend resolves from its own registries.
 #[derive(Serialize, sqlx::FromRow)]
 pub struct FilterFacet {
     pub id: Option<String>,
+    pub name: Option<String>,
     pub last_activity: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -213,6 +273,8 @@ struct ThreadRow {
     initiator: String,
     created_at: chrono::DateTime<chrono::Utc>,
     last_activity: chrono::DateTime<chrono::Utc>,
+    last_user_action: chrono::DateTime<chrono::Utc>,
+    last_agent_action: chrono::DateTime<chrono::Utc>,
     message_count: i64,
     section: String,
     active_children_count: i64,
@@ -222,7 +284,7 @@ struct ThreadRow {
     status: String,
     /// Pure git truth — `git diff main..branch` is non-empty.
     coding_agent_has_diff: bool,
-    /// CC's formal "ready for review" — set by `ChangeProposed` only.
+    /// Coding-agent thread's formal "ready for review" — set by `ChangeProposed` only.
     coding_agent_proposed: bool,
     /// Only meaningful when `coding_agent_proposed = true`.
     coding_agent_requires_restart: bool,
@@ -239,6 +301,7 @@ struct ThreadRow {
     cc_repo_name: Option<String>,
     coding_agent_kind: Option<String>,
     coding_agent_folder: Option<String>,
+    coding_agent: Option<String>,
     state: String,
     compose_text: String,
     compose_images: serde_json::Value,
@@ -264,6 +327,12 @@ pub struct ThreadAggregate {
     pub initiator: LegacyInitiator,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_activity: chrono::DateTime<chrono::Utc>,
+    /// See `ThreadSummary::last_user_action`. Carried on the per-event SSE
+    /// aggregate so the drawer's sort key stays live without a refetch.
+    pub last_user_action: chrono::DateTime<chrono::Utc>,
+    /// See `ThreadSummary::last_agent_action`. Carried on the per-event SSE
+    /// aggregate so the row tooltip's "Agent ·" line stays current.
+    pub last_agent_action: chrono::DateTime<chrono::Utc>,
     pub message_count: i64,
     pub section: String,
     pub status: String,
@@ -276,14 +345,14 @@ pub struct ThreadAggregate {
     pub blocking_descendant_count: i64,
     /// Count of descendants (transitive) currently in a state that needs user
     /// attention. See `ThreadSummary::attention_descendant_count`. Drives the
-    /// REVIEW-bubble rule in `display_section`. Strict subset of
+    /// Current-bubble rule in `display_section`. Strict subset of
     /// `blocking_descendant_count` (drops the Running case). Carried on the
     /// per-event SSE aggregate alongside `blocking_descendant_count` so the
     /// frontend can recompute section without a refetch.
     pub attention_descendant_count: i64,
     /// Pure git truth — drives the Diff button. See `ThreadSummary::coding_agent_has_diff`.
     pub coding_agent_has_diff: bool,
-    /// CC's formal "ready for review" offer — set by `ChangeProposed` only.
+    /// Coding-agent thread's formal "ready for review" offer — set by `ChangeProposed` only.
     /// Drives the Apply / Discard buttons.
     pub coding_agent_proposed: bool,
     /// Only meaningful when `coding_agent_proposed = true`.
@@ -311,6 +380,9 @@ pub struct ThreadAggregate {
     /// Wire field: `codingAgentFolder` (camelCase via the struct-level rename).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent_folder: Option<String>,
+    /// Backend — see `ThreadSummary::coding_agent`. Wire field: `codingAgent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coding_agent: Option<String>,
     pub state: String,
 }
 
@@ -347,6 +419,8 @@ fn row_to_thread_aggregate(
         initiator,
         created_at: r.created_at,
         last_activity: r.last_activity,
+        last_user_action: r.last_user_action,
+        last_agent_action: r.last_agent_action,
         message_count: r.message_count,
         section: r.section,
         status: r.status,
@@ -370,6 +444,7 @@ fn row_to_thread_aggregate(
         cc_repo_name: r.cc_repo_name,
         coding_agent_kind: r.coding_agent_kind,
         coding_agent_folder: r.coding_agent_folder,
+        coding_agent: r.coding_agent,
         state: r.state,
     })
 }
@@ -379,15 +454,21 @@ fn row_to_thread_aggregate(
 /// `t` (the default — `THREAD_COLS` below) or `s` (the search query that
 /// joins `best_scores b` against `thread_summaries s`).
 ///
-/// Both correlated subqueries hit a PK b-tree (`thread_summaries.thread_id`,
-/// `repositories.id`) and short-circuit when the source FK is NULL. The cast
-/// is on the FK side (`{alias}.cc_repo_id::uuid`) — casting `r.id::text`
-/// instead would prevent index use. Rows whose `cc_repo_id` no longer matches
-/// a row in `repositories` get NULL `cc_repo_name` and the frontend renders
-/// them as `(deleted)`.
+/// All correlated subqueries hit a PK b-tree (`thread_summaries.thread_id`,
+/// `repositories.id`, `repo_names.id`) and short-circuit when the source FK is
+/// NULL. The cast is on the FK side (`{alias}.cc_repo_id::uuid`) — casting
+/// `r.id::text` instead would prevent index use.
+///
+/// `cc_repo_name` resolves the live registry first, then the durable
+/// `repo_names` projection (`repo_name_expr`): a registered repo shows its
+/// current name; a removed repo falls back to its last recorded name instead of
+/// going NULL. NULL survives only for a repo whose name was never recorded
+/// anywhere — the frontend keys deleted-vs-live off the live registry, not off
+/// this absence.
 fn thread_cols(alias: &str) -> String {
     format!(
         "{a}.thread_id::text, {a}.title, {a}.first_message, {a}.source, {a}.initiator, {a}.created_at, {a}.last_activity, \
+        {a}.last_user_action, {a}.last_agent_action, \
         {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.total_children_count::bigint, \
         {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, \
         {a}.status, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, \
@@ -397,10 +478,26 @@ fn thread_cols(alias: &str) -> String {
         (SELECT p.title FROM thread_summaries p WHERE p.thread_id = {a}.parent_thread_id) AS parent_thread_title, \
         {a}.trigger_id, {a}.trigger_name, \
         {a}.cc_repo_id, \
-        (SELECT r.name FROM repositories r WHERE r.id = {a}.cc_repo_id::uuid) AS cc_repo_name, \
-        {a}.coding_agent_kind, {a}.coding_agent_folder, \
+        {repo_name} AS cc_repo_name, \
+        {a}.coding_agent_kind, {a}.coding_agent_folder, {a}.coding_agent, \
         {a}.state, {a}.compose_text, {a}.compose_images, {a}.compose_mode",
         a = alias,
+        repo_name = repo_name_expr(&format!("{alias}.cc_repo_id")),
+    )
+}
+
+/// SQL scalar expression resolving a repo name from a `cc_repo_id` text
+/// expression: the live `repositories` registry wins (current name, including
+/// renames), falling back to the durable `repo_names` projection (last recorded
+/// name for a removed repo). `id_text_expr` is the text-typed UUID source —
+/// e.g. `t.cc_repo_id` or a subquery alias — cast on the FK side so both PK
+/// indexes stay usable.
+fn repo_name_expr(id_text_expr: &str) -> String {
+    format!(
+        "COALESCE(\
+            (SELECT r.name FROM repositories r WHERE r.id = ({id})::uuid), \
+            (SELECT rn.name FROM repo_names rn WHERE rn.id = ({id})::uuid))",
+        id = id_text_expr,
     )
 }
 
@@ -422,6 +519,8 @@ impl EventStore {
                     initiator: LegacyInitiator::from_db_str(r.initiator.as_str())?,
                     created_at: r.created_at,
                     last_activity: r.last_activity,
+                    last_user_action: r.last_user_action,
+                    last_agent_action: r.last_agent_action,
                     message_count: r.message_count,
                     section: r.section,
                     active_children_count: r.active_children_count,
@@ -443,6 +542,7 @@ impl EventStore {
                     cc_repo_name: r.cc_repo_name,
                     coding_agent_kind: r.coding_agent_kind,
                     coding_agent_folder: r.coding_agent_folder,
+                    coding_agent: r.coding_agent,
                     state: r.state,
                     compose_text: r.compose_text,
                     compose_images: r.compose_images,
@@ -467,7 +567,7 @@ pub struct ThreadSearchResult {
 ///
 /// `active` semantics — when `Some(true)`, restricts to statuses where
 /// the agentic loop is mid-flow (`running`, `waiting_for_user_answer`).
-/// `waiting` is *not* included: it means CC has stopped and proposed
+/// `waiting` is *not* included: it means the coding agent has stopped and proposed
 /// changes the user must act on — work has paused, the loop isn't
 /// running. `failed` is also excluded — the response is over.
 /// `Some(false)` inverts; `None` is no filter.

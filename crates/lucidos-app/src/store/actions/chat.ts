@@ -8,9 +8,10 @@ import {
   focusedThreadId,
   threadMap,
   selectedScope,
+  selectedCodingAgent,
   scopeToFolder,
-  ccPendingModel,
-  ccPendingReasoningEffort,
+  codingAgentPendingModel,
+  codingAgentPendingReasoningEffort,
   cancelingThreadIds,
   setFocusedThread,
 } from '../store';
@@ -122,7 +123,7 @@ function addPendingMessage(
       created: new Date().toISOString(),
       image_hashes: imageHashes,
     });
-    scrollToBottom();
+    if (focusedThreadId.value === threadId) scrollToBottom();
     threadMap.value = new Map(map);
     // `computeExchanges` reads `thread.pendingUserMessages` to synthesize the
     // optimistic user-message row, but `activeExchanges` no longer subscribes
@@ -148,15 +149,19 @@ export { loadRepositories } from './repositoriesLoader';
 export async function sendMessage(
   message: string,
   imageHashes?: string[],
-  options?: { useClaudeCode?: boolean; context?: ChatContext | null },
+  options?: { useClaudeCode?: boolean; context?: ChatContext | null; threadId?: string; focus?: boolean },
 ): Promise<void> {
   threadsLoaded.value = true;
   const eventId = crypto.randomUUID();
-  const isNewThread = focusedThreadId.value === null;
-  const threadId = focusedThreadId.value || eventId;
+  const explicitThreadId = options?.threadId;
+  const shouldFocus = options?.focus ?? true;
+  const isNewThread = explicitThreadId === undefined && focusedThreadId.value === null;
+  const threadId = explicitThreadId || focusedThreadId.value || eventId;
 
-  setFocusedThread(threadId);
-  if (isNewThread) pushThreadNavState({ type: 'thread', id: threadId });
+  if (shouldFocus) {
+    setFocusedThread(threadId);
+    if (isNewThread) pushThreadNavState({ type: 'thread', id: threadId });
+  }
 
   // Snapshot the thread BEFORE the optimistic insert below — the insert
   // creates a state='active' thread for raw new threads, which would
@@ -201,6 +206,17 @@ export async function sendMessage(
     : !!options?.useClaudeCode;
   if (isCcThread) {
     body.use_claude_code = true;
+    // Backend selection. Compose-promoted threads carry the binding on meta
+    // (set in sendCompose); loaded follow-ups carry the server's stored value
+    // (thread summary `coding_agent`); raw-new sends read the picker signal
+    // directly (no thread to carry the binding). Omitting the field is always
+    // safe — the engine resolves from `thread_summaries.coding_agent`.
+    const requestedAgent = threadBeforeSend
+      ? threadBeforeSend.meta.codingAgent
+      : selectedCodingAgent.value;
+    if (requestedAgent && requestedAgent !== 'claude-code') {
+      body.coding_agent = requestedAgent;
+    }
     // First send from compose-view: derive `folder` from the scope picker so
     // the engine routes via `coding_agent_kind` (Lucidos / app / external).
     // Follow-up on an existing thread: prefer the bound `codingAgentFolder`
@@ -225,11 +241,14 @@ export async function sendMessage(
     // race: loadCommands() fires before the session exists, gets stale cache
     // values, and with pending gone the UI shows the previous session's
     // effort/model instead of the user's selection.
-    if (ccPendingModel.value !== null) {
-      body.cc_model = ccPendingModel.value;
+    // Consumption: a compose first-send spawn is one-shot — sendCompose clears
+    // the pick after this await so it can't leak onto the next new thread.
+    // Follow-ups keep the pick until loadCommands reconciles it per-thread.
+    if (codingAgentPendingModel.value !== null) {
+      body.cc_model = codingAgentPendingModel.value;
     }
-    if (ccPendingReasoningEffort.value !== null) {
-      body.reasoning_effort = ccPendingReasoningEffort.value;
+    if (codingAgentPendingReasoningEffort.value !== null) {
+      body.reasoning_effort = codingAgentPendingReasoningEffort.value;
     }
     // No CC pending and a CC thread → omit reasoning_effort entirely so the
     // backend falls through cc_reasoning_effort → prev_effort (live session)

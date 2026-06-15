@@ -1,18 +1,20 @@
 import { useEffect } from 'preact/hooks';
 import { checkConnection, handleResume } from '../store/actions/connection';
 import { loadArtifacts, openUrl } from '../store/actions/artifacts';
-import { refreshUnreadCount, loadNotifications } from '../store/actions/notifications';
+import { loadUnreadNotifications, loadNotifications } from '../store/actions/notifications';
 import { loadApps } from '../store/actions/apps';
 import { loadCredentials } from '../store/actions/credentials';
 import { loadDevices, registerCurrentDevice } from '../store/actions/devices';
 import { loadTriggers, loadHistoricalTriggers } from '../store/actions/triggers';
 import { loadTriggerGroups } from '../store/actions/triggerGroups';
+import { loadThreadQueue } from '../store/actions/threadQueue';
 import { loadRepositories } from '../store/actions/chat';
 import { loadPreferences } from '../store/actions/preferences';
 import { loadPinnedApps } from '../store/actions/pinnedApps';
 import { connectThreadEvents, disconnectThreadEvents } from '../store/actions/thread-sync';
 import { loadAllThreads, loadFilterFacets } from '../store/actions/thread-loading';
 import { refreshPushSubscription, recoverServiceWorker } from '../store/actions/push';
+import { setupNativePushTapRouting } from '../store/actions/native-push';
 import { startDevicePresenceTracking } from '../store/actions/device-presence';
 import { startScrollVisibilityHandler } from '../components/chat/scrollState';
 import { isTauri } from '../utils/platform';
@@ -21,8 +23,9 @@ import { refreshChangesState, restoreRestartToast } from '../store/actions/chat-
 import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { openThreadAcrossWorkspaces } from '../store/actions/cross-workspace';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
-import { activeMenuItem, settingsSubview, updateAvailable, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
-import { shouldShowSwUpdateToast, markSwUpdateDismissed, requestServiceWorkerBuildId } from './sw-update';
+import { activeMenuItem, settingsSubview, updateAvailable, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, hasRefreshToast, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
+import { shouldShowSwUpdateToast, markSwUpdateDismissed, requestServiceWorkerBuildId, refreshClient } from './sw-update';
+import { syncClientUpdateFromBuild } from '../store/actions/client-update';
 import {
   parseDeepLinkFromSwMessage,
   hasDeepLinkParams,
@@ -59,7 +62,7 @@ export function useStartup(): void {
         connectThreadEvents();
       }
     }).catch(() => { /* checkConnection swallows internally; satisfy fail-fast rule */ });
-    refreshUnreadCount();
+    loadUnreadNotifications();
     loadPreferences().then(() => {
       // Notifications must load after preferences so the persisted filter is applied
       if (activeMenuItem.value === 'notifications') loadNotifications();
@@ -76,6 +79,16 @@ export function useStartup(): void {
     // Device-presence still pings so the engine knows which devices count
     // as candidates for the PresenceCheck broadcast.
     const stopDevicePresence = startDevicePresenceTracking();
+    // Route native macOS notification taps (Tauri only) through the same
+    // dispatchDeepLink the web-push tap uses. No-op listener off-Tauri.
+    let stopNativeTap: (() => void) | null = null;
+    let nativeTapCanceled = false;
+    setupNativePushTapRouting()
+      .then((un) => {
+        if (nativeTapCanceled) un();
+        else stopNativeTap = un;
+      })
+      .catch(() => { /* best-effort: tap routing is additive; banners still show */ });
     // Capture wasAtBottom on tab-hide so we can re-pin to the new bottom on
     // return — covers the streaming-while-tabbed-away → frozen-scroll bug.
     const stopScrollVisibility = startScrollVisibilityHandler();
@@ -154,6 +167,7 @@ export function useStartup(): void {
     // registry is empty. Same shape as loadApps above.
     loadTriggers();
     loadHistoricalTriggers();
+    loadThreadQueue();
     // Trigger groups are tiny and pre-loading them avoids the panel painting
     // every trigger under "Ungrouped" while it waits for the group list to
     // arrive. Same eager-load reasoning as triggers.
@@ -202,13 +216,23 @@ export function useStartup(): void {
         newWorker.addEventListener('statechange', () => {
           if (newWorker.state === 'activated' && shouldShowSwUpdateToast(hadController)) {
             updateAvailable.value = true;
+            // Don't stack a second refresh prompt. After a frontend-affecting
+            // apply the user already sees the "Applied …"/"Engine restarted"
+            // (Refresh) or "Engine restart required" (Restart) toast — each is
+            // a way to pick up this exact build, so the "New version available"
+            // toast would be a redundant duplicate. `updateAvailable` stays set
+            // so the ControlPanel badge still reflects the available update.
+            if (hasRefreshToast()) return;
             showToast('New version available', 'info', {
               key: 'update-available',
               action: {
                 label: 'Refresh',
                 onClick: () => {
                   markSwUpdateDismissed();
-                  window.location.reload();
+                  // SW-aware: a bare reload keeps the current service worker, so
+                  // it won't pick up the new sw.js. refreshClient swaps to the new
+                  // worker (or busts the shell cache if it won't), so the badge clears.
+                  refreshClient();
                 },
               },
             });
@@ -230,6 +254,12 @@ export function useStartup(): void {
       // SW claims the page so the shown id tracks the live worker.
       requestServiceWorkerBuildId();
       navigator.serviceWorker.addEventListener('controllerchange', requestServiceWorkerBuildId);
+
+      // Light/clear the update badge for THIS load by comparing the running
+      // bundle's build id against the served sw.js. Independent of the SW
+      // build-id reply above (that drives the "Build" debug row) — this is the
+      // honest "is my loaded code stale?" check, also re-run on resume.
+      void syncClientUpdateFromBuild();
     }
 
     // Closure-local so a hot-reload remount starts fresh.
@@ -260,7 +290,13 @@ export function useStartup(): void {
         return;
       }
       if (data.type === 'lucidos:build-id') {
-        if (typeof data.buildId === 'string') serviceWorkerBuildId.value = data.buildId;
+        if (typeof data.buildId === 'string') {
+          serviceWorkerBuildId.value = data.buildId; // control-panel "Build" row
+          // A reply also arrives on controllerchange (a SW swap), so re-check
+          // whether the running bundle is now stale vs the served build. The
+          // check itself reads CLIENT_BUILD_ID, not this controller id.
+          void syncClientUpdateFromBuild();
+        }
         return;
       }
     }
@@ -356,6 +392,10 @@ export function useStartup(): void {
       // Check for SW updates on resume — iOS PWA never reloads, so this is the
       // only chance to detect new versions after the initial page load.
       navigator.serviceWorker?.getRegistration().then(reg => reg?.update()).catch(() => {});
+      // Also re-check the BUILD_ID directly: a newer frontend build that landed
+      // while we were backgrounded lights the update badge even if the browser's
+      // own SW update check is slow/wedged on iOS.
+      void syncClientUpdateFromBuild();
       // Probe the SW for liveness too — a wedged SW won't accept update()
       // either, so resume is the natural moment to detect and recover.
       checkSwHealth().catch(() => { /* best-effort recovery; next probe retries */ });
@@ -415,6 +455,8 @@ export function useStartup(): void {
       navigator.serviceWorker?.removeEventListener('controllerchange', requestServiceWorkerBuildId);
       disconnectThreadEvents();
       stopDevicePresence();
+      nativeTapCanceled = true;
+      stopNativeTap?.();
       stopScrollVisibility();
       document.removeEventListener('click', onGlobalClick);
       document.removeEventListener('visibilitychange', handleVisibilityChange);

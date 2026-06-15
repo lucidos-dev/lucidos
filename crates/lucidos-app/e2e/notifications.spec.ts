@@ -1,5 +1,6 @@
 import { test, expect, Page } from '@playwright/test';
-import { assertHealthy, clickVisibleElement, ensureMobileView, expectPushSent, navigateToApp, waitForVisibleInput } from './helpers';
+import { randomUUID } from 'crypto';
+import { assertHealthy, clickVisibleElement, ensureMobileView, expectPushSent, navigateToApp, waitForVisibleInput, waitForVisibleElement, waitForExchangeCount, gotoWithRetry } from './helpers';
 import { clearNotifications, psql } from './db-helpers';
 
 /** Send a notification through the script-facing endpoint that powers the
@@ -26,6 +27,48 @@ async function postNotification(
     data: body,
   });
   expect(res.ok(), `POST /api/v1/notifications -> ${res.status()}`).toBeTruthy();
+}
+
+/** Seed a chat thread with `exchanges` message/response pairs, with USER
+ *  messages long enough that the thread overflows the viewport (a seeded chat
+ *  response body doesn't render — chat response text comes from streamed
+ *  events, not a bare ResponseGenerated — so height has to come from the
+ *  messages, which always render). Inserts directly into the event store +
+ *  projection (no LLM round-trips), so the test is deterministic. Returns the
+ *  thread id and the FIRST MessageReceived event id — the deep-link target. The
+ *  thread is loaded LAZILY by the frontend (events fetched on focus), which is
+ *  precisely the path the deep-link bug bit. */
+function seedTallChatThread(exchanges: number): { threadId: string; firstEventId: string; lastEventId: string } {
+  const threadId = randomUUID();
+  const base = Date.now();
+  // ~1 KB of wrapped text per message → each exchange is a few hundred px, so a
+  // handful of them push the first exchange far above the fold when at-bottom.
+  const longText = 'This is seeded message text used to make the thread tall. '.repeat(16);
+  const stmts: string[] = [];
+  let firstEventId = '';
+  let lastEventId = '';
+  let lastCreated = '';
+  let k = 0;
+  for (let i = 1; i <= exchanges; i++) {
+    const msgId = randomUUID();
+    if (i === 1) firstEventId = msgId;
+    lastEventId = msgId; // ends as the LAST exchange's MessageReceived (near the bottom)
+    const respId = randomUUID();
+    const msgCreated = new Date(base + k++ * 1000).toISOString();
+    const respCreated = new Date(base + k++ * 1000).toISOString();
+    lastCreated = respCreated;
+    const msgPayload = JSON.stringify({ text: `Message ${i}: ${longText}`, channel: 'chat' }).replace(/'/g, "''");
+    const respPayload = JSON.stringify({ text: 'Response.', images: [] }).replace(/'/g, "''");
+    stmts.push(
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${msgId}', 'MessageReceived', '${msgPayload}'::jsonb, '${msgCreated}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${respId}', 'ResponseGenerated', '${respPayload}'::jsonb, '${respCreated}', 'thread', '${threadId}', '${threadId}')`,
+    );
+  }
+  stmts.unshift(
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Deep-link target thread', 'chat', '${lastCreated}', ${exchanges}, false, true, 'idle', 'inbox', 'active', false, 0, 0, false, false, false)`,
+  );
+  psql(stmts.join(';\n'));
+  return { threadId, firstEventId, lastEventId };
 }
 
 test.describe('Notifications modal does not auto-open', () => {
@@ -152,6 +195,147 @@ test.describe('Notifications infinite scroll', () => {
         { timeout: 15_000, intervals: [200, 300, 500, 1000] },
       )
       .toBe(TOTAL);
+  });
+});
+
+test.describe('Notification deep-link to an event in an unfocused thread', () => {
+  let seeded: { threadId: string; firstEventId: string; lastEventId: string } | null = null;
+
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+    clearNotifications();
+  });
+
+  test.afterEach(() => {
+    if (!seeded) return;
+    psql([
+      `DELETE FROM events WHERE aggregate_id = '${seeded.threadId}'`,
+      `DELETE FROM thread_summaries WHERE thread_id = '${seeded.threadId}'`,
+    ].join(';\n'));
+    seeded = null;
+  });
+
+  test('Open thread from the notifications panel lands on the source event, not the thread bottom', async ({ page }) => {
+    // Regression: from the in-app notifications panel, opening a notification's
+    // thread used to scroll to the BOTTOM instead of the deep-linked event when
+    // the thread was not already focused. Focusing an unfocused thread lazily
+    // loads its events; the scroll-to-bottom that fires on the eventsLoaded
+    // transition overrode the deep-link's scrollIntoView.
+    seeded = seedTallChatThread(8);
+    const { threadId, firstEventId } = seeded;
+
+    // Load the app with NO thread focused — the broken path. (Already-focused
+    // threads have their events in the DOM, so the deep-link scroll resolves
+    // synchronously and the bug never bit them.)
+    await navigateToApp(page);
+
+    await postNotification(page, {
+      title: 'Jump to first message',
+      message: 'tap to open the source event',
+      thread_id: threadId,
+      event_id: firstEventId,
+    });
+
+    // The reported surface: the in-app notifications panel → the notification's
+    // modal → its "Open thread" action.
+    await ensureMobileView(page, 'content');
+    await clickVisibleElement(page, '.notifications-bell');
+    await waitForVisibleElement(page, '.notification-item', 10_000);
+    await clickVisibleElement(page, '.notification-item', 'Jump to first message');
+    await waitForVisibleElement(page, '.notification-detail-actions button.action-btn', 10_000);
+    await clickVisibleElement(page, '.notification-detail-actions button.action-btn', 'Open thread');
+
+    // The thread lazy-loads; wait for its exchanges to render.
+    await ensureMobileView(page, 'thread');
+    await waitForExchangeCount(page, 8, 15_000);
+
+    // Precondition: the seeded thread must overflow the viewport, otherwise the
+    // assertion below can't distinguish "scrolled to the event" from "scrolled
+    // to the bottom" (a short thread shows the first event either way).
+    const scrollable = await page.evaluate(() => {
+      const els = document.querySelectorAll('.thread-content');
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) return el.scrollHeight > el.clientHeight + 100;
+      }
+      return false;
+    });
+    expect(scrollable, 'seeded thread must overflow the viewport for this test to discriminate').toBeTruthy();
+
+    // The fix: the FIRST exchange (the deep-link target) is scrolled into view.
+    // Pre-fix this never became true — the events-load scroll-to-bottom left the
+    // first exchange above the fold.
+    await page.waitForFunction((eid) => {
+      const els = document.querySelectorAll(`[data-event-id="${eid}"]`);
+      const vh = window.innerHeight || document.documentElement.clientHeight;
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue; // skip the dual-layout hidden copy
+        if (r.bottom > 0 && r.top < vh) return true; // visible somewhere in the viewport
+      }
+      return false;
+    }, firstEventId, { timeout: 10_000 });
+  });
+
+  test('deep-link overrides a saved scroll position on an unfocused thread', async ({ page }) => {
+    // Regression (the reported "toast opens the thread but doesn't scroll to the
+    // event unless it's already focused" bug): a deep-link to a thread that has
+    // a SAVED scroll position used to land on the saved offset instead of the
+    // source event whenever the thread was not already focused. Focusing an
+    // unfocused thread re-runs useScrollMemory, whose restore observer (created
+    // AFTER scrollToEventAndPulse's) fired last and snapped back to the saved
+    // offset. Already-focused threads don't re-run useScrollMemory — which is
+    // exactly why the scroll worked when the thread was already focused and not
+    // otherwise. The path is shared by every surface (inbox modal, in-app toast,
+    // push), so the inbox modal reproduces it deterministically.
+    seeded = seedTallChatThread(16);
+    const { threadId, lastEventId } = seeded;
+
+    await navigateToApp(page);
+
+    // Pre-seed a saved scroll near the TOP (a small positive offset — "user
+    // scrolled up to read history last time"). A POSITIVE offset is what
+    // exercises the bug: useScrollMemory restores it via a MutationObserver
+    // created AFTER scrollToEventAndPulse's, so its restore fires LAST and snaps
+    // back over the deep-link's scroll. (A saved offset of exactly 0 restores
+    // synchronously and loses the race, so it doesn't reproduce — the bug is the
+    // observer-driven restore.) Without the fix the bottom-most deep-link target
+    // never enters the viewport.
+    await page.evaluate((tid) => {
+      localStorage.setItem(`lucidos-scroll-thread-${tid}`, '100');
+    }, threadId);
+
+    await postNotification(page, {
+      title: 'Jump to last message',
+      message: 'tap to open the source event near the bottom',
+      thread_id: threadId,
+      event_id: lastEventId,
+    });
+
+    await ensureMobileView(page, 'content');
+    await clickVisibleElement(page, '.notifications-bell');
+    await waitForVisibleElement(page, '.notification-item', 10_000);
+    await clickVisibleElement(page, '.notification-item', 'Jump to last message');
+    await waitForVisibleElement(page, '.notification-detail-actions button.action-btn', 10_000);
+    await clickVisibleElement(page, '.notification-detail-actions button.action-btn', 'Open thread');
+
+    await ensureMobileView(page, 'thread');
+    await waitForExchangeCount(page, 16, 15_000);
+
+    // The deep-link target (last exchange, near the bottom) is scrolled into
+    // view, NOT the restored saved offset (top). Pre-fix this stayed false: the
+    // saved-scroll restore set scrollTop=0 a beat after scrollToEventAndPulse,
+    // leaving the last exchange far below the fold.
+    await page.waitForFunction((eid) => {
+      const els = document.querySelectorAll(`[data-event-id="${eid}"]`);
+      const vh = window.innerHeight || document.documentElement.clientHeight;
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue; // skip the dual-layout hidden copy
+        if (r.bottom > 0 && r.top < vh) return true; // visible somewhere in the viewport
+      }
+      return false;
+    }, lastEventId, { timeout: 10_000 });
   });
 });
 
@@ -288,7 +472,7 @@ test.describe('Declarative Web Push payload', () => {
     //     URL Safari would land on. (We deferred navigation until now so the
     //     test browser didn't count as an active device during the
     //     PresenceCheck above.)
-    await page.goto(navigateUrl);
+    await gotoWithRetry(page, navigateUrl);
     // Confirm the SPA actually mounted (so useStartup's cold-start hash router
     // runs and reads the query params). The deep-link targets a fake thread, so
     // a "Thread not found" toast is expected — but mark-read fires regardless.

@@ -8,6 +8,7 @@ import {
   setSelectedAppIds,
   threadChannelFilter,
   filterFacets,
+  CODING_AGENT_CHANNEL,
 } from './store';
 import { toggleChannel } from './triggerFilters';
 import { appFilterOptions } from './appFilters';
@@ -25,14 +26,17 @@ export type RepoFilterOption = {
   lastActivity?: string;
 };
 
-/** Lists every repo that has a Claude Code thread (session). Completeness comes
+/** Lists every repo that has a coding-agent thread. Completeness comes
  *  from the backend `filterFacets` (all session-having repos, even those whose
  *  threads aren't in the loaded window); the loaded `threadMap` adds
  *  just-created threads immediately; `selectedRepoIds` is always included so a
  *  filter restored from localStorage stays clearable. The repositories registry
- *  supplies live-vs-`(deleted)` labels. A repo registered solely for file
- *  browsing, with no CC session, does not clutter the filter. Returns [] until
- *  the registry loads — without it every repo would mis-label as "(deleted)". */
+ *  decides live-vs-`(deleted)`; the label for a deleted repo comes from the
+ *  server-resolved `facet.name` (live registry → `repo_names` projection) or the
+ *  thread's `meta.repoName`, falling back to the UUID only when no name was ever
+ *  recorded. A repo registered solely for file browsing, with no coding-agent
+ *  session, does not clutter the filter. Returns [] until the registry loads —
+ *  without it every repo would mis-label as "(deleted)". */
 export const repoFilterOptions = computed<RepoFilterOption[]>(() => {
   if (repositories.value.status !== 'loaded') return [];
   const liveById = new Map(repositories.value.data.map(r => [r.id, r]));
@@ -51,10 +55,13 @@ export const repoFilterOptions = computed<RepoFilterOption[]>(() => {
   };
 
   for (const facet of loadedOr(filterFacets.value, undefined)?.repos ?? []) {
-    if (facet.id) push(facet.id, undefined, facet.last_activity ?? undefined);
+    // `facet.name` carries the server-resolved label (live registry →
+    // `repo_names` projection), so a removed repo shows its historical name
+    // here rather than falling through to its raw UUID.
+    if (facet.id) push(facet.id, facet.name ?? undefined, facet.last_activity ?? undefined);
   }
   for (const entry of threadMap.value.values()) {
-    if (entry.meta.channel !== 'claude_code') continue;
+    if (entry.meta.channel !== CODING_AGENT_CHANNEL) continue;
     const id = entry.meta.repoId;
     if (!id) continue;
     push(id, entry.meta.repoName, entry.meta.updatedAt);
@@ -78,14 +85,14 @@ export function toggleRepoId(id: string): void {
   setSelectedRepoIds(next);
 }
 
-/** Tri-state click handler for the Claude Code parent row. Indeterminate
- *  clears per-repo AND per-app selection (= "all CC threads"); fully checked
+/** Tri-state click handler for the Coding Agent parent row. Indeterminate
+ *  clears per-repo AND per-app selection (= "all coding-agent threads"); fully checked
  *  turns the channel off and clears both selections; unchecked turns the
- *  channel on. With a single CC target across both groups, "all" and "just
+ *  channel on. With a single coding target across both groups, "all" and "just
  *  this one" are identical results, so the indeterminate state is meaningless
  *  and the click toggles the channel. */
-export function toggleClaudeCodeChannel(): void {
-  const channelOn = threadChannelFilter.value.has('claude_code');
+export function toggleCodingAgentChannel(): void {
+  const channelOn = threadChannelFilter.value.has(CODING_AGENT_CHANNEL);
   const hasSelection = selectedRepoIds.value.size + selectedAppIds.value.size > 0;
   const lockstep = repoFilterOptions.value.length + appFilterOptions.value.length === 1;
   if (channelOn && hasSelection && !lockstep) {
@@ -97,5 +104,5 @@ export function toggleClaudeCodeChannel(): void {
     setSelectedRepoIds(new Set());
     setSelectedAppIds(new Set());
   }
-  toggleChannel('claude_code');
+  toggleChannel(CODING_AGENT_CHANNEL);
 }

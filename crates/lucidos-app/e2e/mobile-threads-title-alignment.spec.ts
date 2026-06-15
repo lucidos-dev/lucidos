@@ -1,6 +1,6 @@
 /**
  * The "Threads" title in MobileThreadsHeader must start at the same x-position
- * as the "lucidos" title in MobileThreadHeader, and must not ellipsis-truncate
+ * as the "Lucidos" title in MobileThreadHeader, and must not ellipsis-truncate
  * within the constrained mobile header row.
  */
 import { test, expect, Page } from '@playwright/test';
@@ -29,11 +29,11 @@ test.describe('Mobile threads title alignment', () => {
     await assertHealthy(page);
   });
 
-  test('Threads title aligns with lucidos title and is not truncated', async ({ page }) => {
+  test('Threads title aligns with Lucidos title and is not truncated', async ({ page }) => {
     await navigateToApp(page);
 
-    const lucidos = await getTitleMetrics(page, '.mobile-thread-header', 'lucidos');
-    expect(lucidos, 'lucidos title not found').not.toBeNull();
+    const lucidos = await getTitleMetrics(page, '.mobile-thread-header', 'Lucidos');
+    expect(lucidos, 'Lucidos title not found').not.toBeNull();
 
     await openThreadDrawer(page);
     const threads = await getTitleMetrics(page, '.mobile-threads-header', 'Threads');
@@ -41,7 +41,7 @@ test.describe('Mobile threads title alignment', () => {
 
     // Subpixel rounding tolerance.
     expect(Math.abs(threads!.left - lucidos!.left),
-      `Threads title left=${threads!.left} vs lucidos title left=${lucidos!.left}`)
+      `Threads title left=${threads!.left} vs Lucidos title left=${lucidos!.left}`)
       .toBeLessThan(1);
 
     // clientWidth < scrollWidth would mean the title is ellipsis-truncated.

@@ -212,7 +212,6 @@
 .slides-pv-deck-header {
     padding: 1rem;
     margin-bottom: 0.75rem;
-    border-bottom: 1px solid var(--border-color);
 }
 
 .slides-pv-deck-title {
@@ -247,7 +246,6 @@
     align-items: center;
     gap: 0.5rem;
     padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid var(--border-color);
     flex-wrap: wrap;
 }
 
@@ -708,7 +706,6 @@
 .message-route-panel .route-section + .route-section {
     margin-top: 0.625rem;
     padding-top: 0.625rem;
-    border-top: 1px solid var(--border-color);
 }
 
 .message-route-panel h4 {
@@ -792,7 +789,6 @@
 .message-route-panel .route-explainer {
     margin-top: 0.5rem;
     padding-top: 0.5rem;
-    border-top: 1px solid var(--border-color);
 }
 
 .message-route-panel .route-explainer p {

@@ -6,18 +6,30 @@ import {
 } from '../../store/actions/triggers';
 import { createTriggerGroup } from '../../store/actions/triggerGroups';
 import { deriveTriggerType, toFailed } from '../../store/types';
-import type { EventSubscription, TriggerInfo, TriggerRun, Loadable } from '../../store/types';
+import type { EventSubscription, SideEffectCategory, TriggerInfo, TriggerRun, Loadable } from '../../store/types';
 import { describeCron, validateCron } from '../../utils/describeCron';
 import { Dropdown } from '../shared/Dropdown';
 import { fetchEventTypes } from '../../api/client';
 import { resizeTextarea, useFontMetricsResize } from '../chat/promptResize';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
+import { DelayedSpinner } from '../shared/DelayedSpinner';
 
 const NEW_GROUP_SENTINEL = '__new_group__';
 
 type TriggerFormType = 'schedule' | 'event' | 'both';
 type RunType = 'intent' | 'script';
+
+/** The grantable irreversible side-effect categories, with their user-facing
+ *  labels (ADR 0002, Phase 5). Kept in sync with the Rust `SideEffectCategory`
+ *  enum's `label()` and the `SideEffectCategory` wire type. */
+const SIDE_EFFECT_CATEGORIES: { value: SideEffectCategory; label: string }[] = [
+  { value: 'email', label: 'Send email or messages' },
+  { value: 'external_api', label: 'Call external APIs (mutating HTTP)' },
+  { value: 'cloud_cli', label: 'Cloud CLI mutations (gh / aws / gcloud)' },
+  { value: 'out_of_workspace_destruction', label: 'Destroy files outside the workspace' },
+  { value: 'other', label: 'Other irreversible side-effects' },
+];
 
 // Module-level cache: shared across all TriggerFormInner mounts (open/reopen
 // the form without refetching). Loadable so consumers see all 4 states.
@@ -39,7 +51,7 @@ export function TriggerDetails() {
       );
     }
     if (triggers.value.status !== 'loaded') {
-      return <div class="inline-form"><div class="loading-spinner" /></div>;
+      return <div class="inline-form"><DelayedSpinner /></div>;
     }
     const trigger = triggers.value.data.find((t) => t.id === editingId);
     if (!trigger) {
@@ -130,6 +142,14 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   })();
 
   const [goToReview, setGoToReview] = useState(existingTrigger?.go_to_review ?? false);
+  const [sideEffectGrant, setSideEffectGrant] = useState<SideEffectCategory[]>(
+    existingTrigger?.side_effect_grant ?? []
+  );
+  const toggleSideEffect = (cat: SideEffectCategory, on: boolean) => {
+    setSideEffectGrant(prev =>
+      on ? [...prev.filter(c => c !== cat), cat] : prev.filter(c => c !== cat)
+    );
+  };
   const [groupId, setGroupId] = useState<string>(existingTrigger?.group_id ?? '');
   // null = inline-create field hidden; string = visible with current draft.
   const [newGroupDraft, setNewGroupDraft] = useState<string | null>(null);
@@ -235,6 +255,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
       name, run, cronExpressions: finalCrons, triggerId: editingId,
       on, showEvent, goToReview,
       groupId: groupId || null,
+      sideEffectGrant,
     });
   }
 
@@ -540,6 +561,27 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
             </label>
             <div class="form-hint">
               By default, runs land in Archive. Turn this on for triggers whose output you're meant to read — daily summaries, alerts, scheduled reports.
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Allowed side-effects</label>
+            <div class="form-checkbox-list">
+              {SIDE_EFFECT_CATEGORIES.map((cat) => (
+                <label class="form-checkbox-row" key={cat.value}>
+                  <input
+                    type="checkbox"
+                    checked={sideEffectGrant.includes(cat.value)}
+                    onChange={(e) =>
+                      toggleSideEffect(cat.value, (e.target as HTMLInputElement).checked)
+                    }
+                  />
+                  <span>{cat.label}</span>
+                </label>
+              ))}
+            </div>
+            <div class="form-hint">
+              Only used when Command Safety is on (Settings → Permissions). This trigger runs unattended, so it can't be asked to approve a risky command. Grant only the irreversible side-effects its intent genuinely needs — anything else is blocked and the run fails. Leave all off if it only reads, computes, or writes inside the workspace.
             </div>
           </div>
 

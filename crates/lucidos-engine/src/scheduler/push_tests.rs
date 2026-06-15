@@ -523,6 +523,40 @@ fn s4_5_pick_wake_targets_dedupes_multi_tab() {
     assert_eq!(targets, vec!["dev-chrome".to_string()]);
 }
 
+#[test]
+fn s4_5_wake_skipped_when_notification_already_read() {
+    // The resurrect-after-read bug: the wake fires MAC_CHROMIUM_WAKE_DELAY
+    // after the real push, but the user may tap the original banner inside
+    // that window — `notificationclick` closes it and marks it read. If the
+    // wake still fired it would re-pop the already-handled notification as a
+    // fresh unread banner (the user-reported "same push twice"). A read
+    // notification means the tap landed (SW wasn't wedged), so the wake has
+    // no job. `send_wake_push_to_device` re-fetches the live read state at
+    // fire time and gates on this predicate.
+    use crate::scheduler::notifications::Notification;
+    let mut n = Notification {
+        id: uuid::Uuid::new_v4(),
+        task_id: None,
+        app_id: None,
+        thread_id: Some(uuid::Uuid::new_v4()),
+        event_id: None,
+        title: "Claude is asking".into(),
+        message: "Pick one".into(),
+        read: false,
+        created_at: chrono::Utc::now(),
+        tap: Tap::Modal,
+    };
+    assert!(
+        wake_still_needed(&n),
+        "an unread notification still needs the wake — the tap may have been swallowed by a wedged SW"
+    );
+    n.read = true;
+    assert!(
+        !wake_still_needed(&n),
+        "a read notification means the tap already drained — skip the wake so it isn't resurrected"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn s3_deadline_long_enough_for_realistic_ios_cellular_pong() {
     // Regression for "iOS PWA push fires alongside the in-app toast":

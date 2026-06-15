@@ -30,30 +30,12 @@ impl LucidosEngine {
     }
 
     /// Resolve a data-relative path, returning both the normalized data-relative path and
-    /// the absolute filesystem path. Paths without a known prefix are assumed to be under artifacts/.
+    /// the absolute filesystem path. Normalization rules live in [`normalize_data_path`].
     pub(crate) fn resolve_data_path(
         &self,
         relative_path: &str,
     ) -> Result<(String, std::path::PathBuf), String> {
-        if crate::api::is_path_traversal(relative_path) {
-            return Err("Path traversal not allowed".to_string());
-        }
-        // Strip leading "data/" if the LLM included the full workspace-relative path
-        let relative_path = relative_path.strip_prefix("data/").unwrap_or(relative_path);
-        let known_prefixes = [
-            "artifacts/",
-            "apps/",
-            "knowhow/",
-            "triggers/",
-            "config/",
-            "auth-modules/",
-            "system-knowhow/",
-        ];
-        let normalized = if known_prefixes.iter().any(|p| relative_path.starts_with(p)) {
-            relative_path.to_string()
-        } else {
-            format!("artifacts/{}", relative_path)
-        };
+        let normalized = normalize_data_path(relative_path)?;
 
         // System knowhow lives in the engine repo, not the workspace.
         if let Some(rel) = normalized.strip_prefix("system-knowhow/") {
@@ -83,6 +65,10 @@ impl LucidosEngine {
     /// Set the self-reference after wrapping in Arc. Must be called once after Arc::new.
     pub fn set_self_arc(&self, arc: &Arc<LucidosEngine>) {
         self.self_arc.set(Arc::downgrade(arc)).ok();
+        // The Thread Queue executes admitted entries through the engine —
+        // wire it the moment the Arc exists so no submission can race a
+        // missing executor.
+        self.thread_queue.attach_engine(arc);
     }
 
     /// Clone the Arc<Self> for spawning background tasks.
@@ -263,4 +249,131 @@ impl LucidosEngine {
         self.event_bus.changes_projection()
     }
 
+}
+
+/// Typed `data/` subdirectories the file tools write into. Anything else under
+/// the `data/` root (`.env`, `postgres/`, …) is gitignored config the tools must
+/// not touch — see [`normalize_data_path`].
+const KNOWN_DATA_PREFIXES: [&str; 8] = [
+    "artifacts/",
+    "apps/",
+    "knowhow/",
+    "triggers/",
+    "scripts/",
+    "config/",
+    "auth-modules/",
+    "system-knowhow/",
+];
+
+/// Normalize an LLM-supplied path to a workspace `data/`-relative path, or reject
+/// it. Pure string logic (no filesystem); callers join the result onto the
+/// workspace `data/` dir. Rules:
+///
+/// - `..` / absolute paths are rejected (path traversal).
+/// - A leading `data/` is stripped — LLMs often pass the full workspace-relative path.
+/// - A known typed prefix ([`KNOWN_DATA_PREFIXES`]) is kept as-is.
+/// - An *untyped* bare path (no `data/` prefix) defaults under `artifacts/`, the
+///   catch-all content store — so `write_file('report.md')` lands sensibly at
+///   `artifacts/report.md`.
+/// - But an explicit `data/<x>` whose `<x>` is not a typed subdirectory is
+///   **rejected**: the `data/` root holds only the typed subdirs plus gitignored
+///   config (`.env`, `postgres/`), and the file tools git-commit everything they
+///   write. Silently routing `data/.env` to `artifacts/.env` would commit a
+///   secret into the tracked artifacts repo. Loose data-root files are written
+///   with `run_python` instead.
+///
+/// The typed set matches `api/data_api.rs`'s `MUTABLE_PREFIXES` (the HTTP data
+/// surface) plus `system-knowhow/` (engine-repo, read-only): both must recognize
+/// the same `data/` subdirs or the file tools and the HTTP API disagree on where
+/// `scripts/` etc. land.
+fn normalize_data_path(relative_path: &str) -> Result<String, String> {
+    if crate::api::is_path_traversal(relative_path) {
+        return Err("Path traversal not allowed".to_string());
+    }
+    let had_data_prefix = relative_path.starts_with("data/");
+    let stripped = relative_path.strip_prefix("data/").unwrap_or(relative_path);
+
+    if KNOWN_DATA_PREFIXES.iter().any(|p| stripped.starts_with(p)) {
+        return Ok(stripped.to_string());
+    }
+    if had_data_prefix {
+        return Err(format!(
+            "'data/{stripped}' is not writable by file tools — the data/ root holds only typed \
+             subdirectories (artifacts/, apps/, knowhow/, triggers/, scripts/, config/, auth-modules/). \
+             For a loose data-root file like data/.env (gitignored config), use run_python: \
+             open('data/.env', 'w'). For content, target a typed subdir, e.g. artifacts/{stripped}."
+        ));
+    }
+    Ok(format!("artifacts/{stripped}"))
+}
+
+#[cfg(test)]
+mod normalize_data_path_tests {
+    use super::normalize_data_path;
+
+    #[test]
+    fn keeps_typed_prefixes_as_is() {
+        for p in [
+            "artifacts/report.md",
+            "apps/x/index.html",
+            "knowhow/foo.md",
+            "triggers/t.md",
+            "scripts/shared/run.py",
+            "config/apis.json",
+            "auth-modules/m.wasm",
+            "system-knowhow/best-practices.md",
+        ] {
+            assert_eq!(normalize_data_path(p).unwrap(), p);
+        }
+    }
+
+    #[test]
+    fn strips_leading_data_prefix_for_typed_paths() {
+        assert_eq!(
+            normalize_data_path("data/artifacts/report.md").unwrap(),
+            "artifacts/report.md"
+        );
+        assert_eq!(
+            normalize_data_path("data/knowhow/foo.md").unwrap(),
+            "knowhow/foo.md"
+        );
+        // Top-level shared scripts are a typed subdir, so the explicit
+        // data/scripts/ form succeeds rather than misrouting to artifacts/.
+        assert_eq!(
+            normalize_data_path("data/scripts/shared/run.py").unwrap(),
+            "scripts/shared/run.py"
+        );
+    }
+
+    #[test]
+    fn untyped_bare_path_defaults_under_artifacts() {
+        assert_eq!(
+            normalize_data_path("report.md").unwrap(),
+            "artifacts/report.md"
+        );
+        assert_eq!(
+            normalize_data_path("research/notes.md").unwrap(),
+            "artifacts/research/notes.md"
+        );
+    }
+
+    #[test]
+    fn explicit_data_root_untyped_path_is_rejected() {
+        // The footgun: data/.env must NOT silently become artifacts/.env.
+        let err = normalize_data_path("data/.env").unwrap_err();
+        assert!(err.contains("not writable"), "got: {err}");
+        assert!(err.contains("run_python"), "got: {err}");
+
+        // Any non-typed data-root target is refused, not just .env.
+        assert!(normalize_data_path("data/postgres/x").is_err());
+        assert!(normalize_data_path("data/report.md").is_err());
+        assert!(normalize_data_path("data/").is_err());
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        assert!(normalize_data_path("../secret").is_err());
+        assert!(normalize_data_path("/etc/passwd").is_err());
+        assert!(normalize_data_path("artifacts/../../escape").is_err());
+    }
 }

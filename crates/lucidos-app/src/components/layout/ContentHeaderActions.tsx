@@ -192,7 +192,7 @@ export function ContentHeaderActions() {
     }
   } else if (!overlay && activeMenuItem.value === 'files') {
     addAction('search',
-      <button class="icon-btn header-icon file-search-btn" onClick={openFileSearch} aria-label="Search files" data-tooltip="Search files">
+      <button class="icon-btn header-icon file-search-btn" onClick={(e) => openFileSearch(e.currentTarget)} aria-label="Search files" data-tooltip="Search files">
         <SearchIcon />
       </button>,
     );

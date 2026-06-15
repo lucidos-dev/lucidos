@@ -33,7 +33,7 @@ Use these — never hardcode the raw values:
 | `--z-drawer` | `300` | Side drawers |
 | `--z-control-panel` | `2200` | Floating header items (brand, route panel, collapsed thread actions) |
 | `--z-modal` | `2300` | Modal overlays — sits above the header so the dim backdrop blocks it |
-| `--z-toast` | `2400` | Toast notifications (must sit above `.restart-overlay` at `--z-control-panel + 100`) |
+| `--z-toast` | `2400` | Toast notifications (must sit above `.ui-blocking-overlay` at `--z-control-panel + 100`) |
 | `--z-tooltip` | `10000` | Tooltips |
 
 Raw z-index values 1-10 are fine for local stacking contexts within a component. Anything higher must use a token.

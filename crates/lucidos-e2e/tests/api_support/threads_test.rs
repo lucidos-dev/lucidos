@@ -25,6 +25,12 @@ async fn threads_list_returns_expected_shape() {
         body["active_threads"].is_array(),
         "active_threads should be array"
     );
+    // Total archived-pile size for the collapsed Archive badge — distinct from
+    // the loaded `archive` window.
+    assert!(
+        body["archive_count"].is_u64(),
+        "archive_count should be a non-negative integer"
+    );
 }
 
 #[tokio::test]

@@ -113,6 +113,7 @@ fn thread_event_type_name_extraction() {
         ),
         (
             ThreadEvent::SessionStarted {
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: "s".into(),
                 branch: String::new(),
                 repo_id: None,

@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, wipPreviewThreadId, threadMap, activeMenuItem } from '../../../store/store';
+import { panelOverlay, wipPreviewThreadId, threadMap, activeMenuItem, settingsSubview, CODING_AGENT_CHANNEL } from '../../../store/store';
 import type { App } from '../../../store/types';
+import { MENU_ITEMS } from '../../../store/types';
 import { makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER } from '../../../store/thread-events';
-import { getContentTitle } from '../headerHelpers';
+import { CHANNEL_OPTIONS, getContentTitle } from '../headerHelpers';
 
 vi.mock('../../../api/client', () => ({
   listAppsApi: vi.fn().mockResolvedValue([]),
@@ -14,7 +15,6 @@ const fakeApp: App = {
   id: 'habit-tracker',
   name: 'Habit Tracker',
   description: 'A test app',
-  knowhow: [],
 };
 
 function seedThread(id: string, title: string): void {
@@ -63,5 +63,32 @@ describe('getContentTitle — WIP preview', () => {
     panelOverlay.value = { type: 'app-ui', app: fakeApp };
     wipPreviewThreadId.value = 'unknown-thread';
     expect(getContentTitle()).toBe('Habit Tracker');
+  });
+});
+
+describe('getContentTitle — menu labels', () => {
+  beforeEach(() => {
+    panelOverlay.value = null;
+    wipPreviewThreadId.value = null;
+    settingsSubview.value = 'main';
+    activeMenuItem.value = 'apps';
+  });
+
+  it('every MENU_ITEMS value renders a non-empty content-header title', () => {
+    for (const item of MENU_ITEMS) {
+      activeMenuItem.value = item;
+      expect(getContentTitle(), `menu item "${item}" must have a header label`).not.toBe('');
+    }
+  });
+
+  it('thread-queue renders its canonical "Thread Queue" title', () => {
+    activeMenuItem.value = 'thread-queue';
+    expect(getContentTitle()).toBe('Thread Queue');
+  });
+});
+
+describe('CHANNEL_OPTIONS', () => {
+  it('labels the coding-agent channel generically for the thread filter', () => {
+    expect(CHANNEL_OPTIONS.find(opt => opt.value === CODING_AGENT_CHANNEL)?.label).toBe('Coding Agent');
   });
 });

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { TS, makeThreadState } from './thread-events-helpers';
-import { computeExchanges, groupIntoExchanges, handleEvent, resumeEngineNote, unresumedAbortIndex, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
+import { computeExchanges, exchangeStatus, groupIntoExchanges, handleEvent, resumeEngineNote, unresumedAbortIndex, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
 
 describe('aggregate-takes-precedence over event-type lookups', () => {
   function makeAggregate(overrides: Partial<ThreadAggregate> = {}): ThreadAggregate {
@@ -277,15 +277,16 @@ describe('groupIntoExchanges', () => {
 
   // Regression for the off-by-one rendering observed in real thread
   // 9b5a05aa: when the orphan-injection re-process loop stamped A's req_id
-  // onto a turn whose response actually belonged to B, the two events the
-  // chat loop emits BEFORE its first injection check (MemorySearched +
-  // ContextAssembled, plus ContextTokensMeasured at every step) used to
-  // bypass request-id routing and leak into B's exchange. ContextAssembled
-  // landing in B's empty exchange flipped the status heuristic to 'aborted'
+  // onto a turn whose response actually belonged to B, the events the chat
+  // loop emits BEFORE its first injection check (MemorySearched + the
+  // per-call ContextCaptured) used to bypass request-id routing and leak into
+  // B's exchange. The leaked step flipped the status heuristic to 'aborted'
   // (the "stale exchange" branch needs hasSteps=true). Route every chat-loop
   // event that carries request_event_id back to its anchor — none should
-  // fall through to `current`.
-  it('routes ContextAssembled/MemorySearched/ContextTokensMeasured by request_event_id, not current pointer', () => {
+  // fall through to `current`. `ContextCaptured` is the live event;
+  // `ContextAssembled`/`ContextTokensMeasured` are its retired predecessors,
+  // still routed for legacy DB rows.
+  it('routes ContextCaptured/MemorySearched (+ legacy context events) by request_event_id, not current pointer', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'A', _eventId: 'A' }],
       [2, { type: 'TextStreamed', text: 'a-reply', request_event_id: 'A' } as StoredEvent],
@@ -294,10 +295,12 @@ describe('groupIntoExchanges', () => {
       // (including the chat-loop preludes) lands AFTER B's MR in the seq stream.
       [4, { type: 'MessageReceived', text: 'B', _eventId: 'B' }],
       [5, { type: 'MemorySearched', queries: [], results: [], request_event_id: 'A' } as unknown as StoredEvent],
-      [6, { type: 'ContextAssembled', sections: [], tools: [], model: 'm', total_chars: 0, request_event_id: 'A' } as unknown as StoredEvent],
-      [7, { type: 'ContextTokensMeasured', tokens: 100, message_count: 1, request_event_id: 'A' } as unknown as StoredEvent],
-      [8, { type: 'TextStreamed', text: 'late', request_event_id: 'A' } as StoredEvent],
-      [9, { type: 'ResponseGenerated', text: 'late', request_event_id: 'A' } as StoredEvent],
+      [6, { type: 'ContextCaptured', producer: 'chat', model: 'm', context_window: 0, sections: [], tools: [], estimated_total_tokens: 0, request_event_id: 'A' } as unknown as StoredEvent],
+      // Retired predecessors — still routed so legacy threads behave.
+      [7, { type: 'ContextAssembled', sections: [], tools: [], model: 'm', total_chars: 0, request_event_id: 'A' } as unknown as StoredEvent],
+      [8, { type: 'ContextTokensMeasured', tokens: 100, message_count: 1, request_event_id: 'A' } as unknown as StoredEvent],
+      [9, { type: 'TextStreamed', text: 'late', request_event_id: 'A' } as StoredEvent],
+      [10, { type: 'ResponseGenerated', text: 'late', request_event_id: 'A' } as StoredEvent],
     ]);
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(2);
@@ -309,6 +312,7 @@ describe('groupIntoExchanges', () => {
       'TextStreamed',
       'ResponseGenerated',
       'MemorySearched',
+      'ContextCaptured',
       'ContextAssembled',
       'ContextTokensMeasured',
       'TextStreamed',
@@ -318,6 +322,46 @@ describe('groupIntoExchanges', () => {
     expect((exchanges[1].userEvent as { text: string }).text).toBe('B');
     // B has no events of its own — none stamped with req=B in this scenario.
     expect(exchanges[1].steps).toHaveLength(0);
+  });
+
+  // End-to-end regression for real thread ad178d6a: the user sent a follow-up
+  // ("hmm?") while A's response was mid-stream, then A's `ContextCaptured`
+  // (carrying A's req_id) arrived AFTER B's MR. Before the fix it fell through
+  // to `current` (= B's empty exchange), giving B a lone step; in the brief
+  // idle window before B's own response started, exchangeStatus read
+  // "isLast + hasSteps + !isComplete + threadIdle" as a stale crash and
+  // flashed 'aborted' — which then flipped to 'streaming'/'Working' once B's
+  // events landed. The user saw "Aborted → Working" on the follow-up. With
+  // ContextCaptured routed by req_id, B stays empty and reads 'done' at idle.
+  it('does not flash "aborted" on a follow-up when the prior response\'s ContextCaptured arrives late', () => {
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'Min side > Innboks > Kontakt oss?', _eventId: 'A' }],
+      [2, { type: 'MemorySearched', queries: [], results: [], request_event_id: 'A' } as unknown as StoredEvent],
+      [3, { type: 'ThoughtStreamed', text: '', request_event_id: 'A' } as unknown as StoredEvent],
+      // User fires the follow-up while A is still streaming.
+      [4, { type: 'MessageReceived', text: 'hmm?', _eventId: 'B' }],
+      // A's per-call ContextCaptured lands AFTER B's MR — the leaker.
+      [5, { type: 'ContextCaptured', producer: 'chat', model: 'm', context_window: 0, sections: [], tools: [], estimated_total_tokens: 0, request_event_id: 'A' } as unknown as StoredEvent],
+      [6, { type: 'TextStreamed', text: 'a-reply', request_event_id: 'A' } as StoredEvent],
+      [7, { type: 'ResponseGenerated', text: 'a-reply', request_event_id: 'A' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges).toHaveLength(2);
+
+    // ContextCaptured routes back to A, not the follow-up.
+    expect((exchanges[0].userEvent as { text: string }).text).toBe('Min side > Innboks > Kontakt oss?');
+    expect(exchanges[0].steps.map(s => s.event.type)).toContain('ContextCaptured');
+
+    // The follow-up exchange is empty — no leaked step.
+    const followUp = exchanges[1];
+    expect((followUp.userEvent as { text: string }).text).toBe('hmm?');
+    expect(followUp.steps).toHaveLength(0);
+
+    // In the idle window before B's own response starts, the follow-up reads
+    // 'done' (empty-idle), never 'aborted'.
+    expect(
+      exchangeStatus(followUp, '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ true),
+    ).toBe('done');
   });
 
   it('routes a late ResponseAborted to A (terminating it) and still opens a boundary exchange', () => {

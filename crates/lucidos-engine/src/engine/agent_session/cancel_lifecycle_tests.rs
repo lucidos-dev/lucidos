@@ -149,6 +149,7 @@ async fn cancel_does_not_terminate_session() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-cancel-1".into(),
             branch: "claude-code/cancel-test".into(),
             repo_id: None,

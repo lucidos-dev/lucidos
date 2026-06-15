@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { signal } from '@preact/signals';
 import { connectionStatus, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, restartRequired, updateAvailable, serviceWorkerBuildId, restartGroups, showConfirm, showToast } from '../../store/store';
 import { isNewerVersion } from '../../utils/version';
-import { requestServiceWorkerBuildId } from '../../hooks/sw-update';
+import { refreshClient, requestServiceWorkerBuildId } from '../../hooks/sw-update';
 import { initiateEngineRestart } from '../../store/actions/chat-changes';
 import { fetchWorkspaces } from '../../api/client';
 import type { WorkspaceInfo } from '../../api/client';
@@ -12,7 +12,7 @@ import { invoke } from '../../utils/tauri';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { CloseIcon } from '../shared/icons';
-import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
+import { Overlay } from '../shared/Overlay';
 import { viewportIsMobile } from '../../utils/viewport';
 import { ENGINE_VERSION } from 'virtual:engine-version';
 
@@ -23,7 +23,11 @@ export const controlPanelOpen = signal(false);
  *  in AppHeader / MobileAppHeader at open time. */
 export const controlPanelAnchor = signal<HTMLElement | null>(null);
 
-const apiUrl = typeof window !== 'undefined' && window.location ? window.location.origin : '';
+/** The SPA origin, read lazily (at call time, not module load) so importing
+ *  this module never touches the DOM. Origin is fixed for the page lifetime. */
+function getApiUrl(): string {
+  return typeof window !== 'undefined' && window.location ? window.location.origin : '';
+}
 
 export function controlPanelBadgeCount(): number {
   return (restartRequired.value ? 1 : 0) + (updateAvailable.value ? 1 : 0);
@@ -59,8 +63,9 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
   const engineVer = engineVersion.value;
   const latestEngineVer = latestEngineVersion.value;
   const latestTauriVer = latestTauriAppVersion.value;
-  const tauriClientVersion = isTauri() ? window.__LUCIDOS_APP_VERSION__ : undefined;
-  const clientVersion = tauriClientVersion ?? ENGINE_VERSION;
+  // Set only by the Tauri shell (lib.rs), so its presence selects the app-shell
+  // version; undefined on web falls through to the bundled ENGINE_VERSION.
+  const tauriClientVersion = window.__LUCIDOS_APP_VERSION__;
   const restart = restartRequired.value;
   const update = updateAvailable.value;
   const swBuildId = serviceWorkerBuildId.value;
@@ -69,12 +74,6 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
   const buildLabel = swBuildId
     ? (swBuildId.startsWith('__') ? 'dev' : swBuildId)
     : null;
-
-  // Anchor is the brand-label that opened the panel — re-clicking it routes
-  // through its own onClick toggle. Escape comes free with the hook.
-  useDismissOnOutside(effectiveOpen, ref, controlPanelAnchor.value, () => {
-    controlPanelOpen.value = false;
-  });
 
   // Refresh the SW build id each time the panel opens so the shown value is the
   // live worker's (it's also queried at startup and kept fresh on
@@ -95,7 +94,11 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
 
   const handleRefresh = useCallback(() => {
     controlPanelOpen.value = false;
-    window.location.reload();
+    // SW-aware: a bare reload keeps the current service worker, so it can't pick
+    // up a newer build the SW hasn't swapped to (the /assets/* graph is
+    // cache-first). refreshClient() checks for a new sw.js first, then reloads
+    // once the new worker controls the page (timeout fallback if there's nothing new).
+    refreshClient();
   }, []);
 
   const handleRestart = useCallback(async () => {
@@ -120,7 +123,7 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
   }, []);
 
   const copyApiUrl = useCallback(() => {
-    navigator.clipboard.writeText(apiUrl).then(
+    navigator.clipboard.writeText(getApiUrl()).then(
       () => showToast('Copied to clipboard', 'success'),
       () => showToast('Failed to copy', 'error')
     );
@@ -129,15 +132,29 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
   if (!effectiveOpen) return null;
 
   const hasEngineUpdate = engineVer && latestEngineVer && isNewerVersion(latestEngineVer, engineVer);
-  // Tauri shells compare against the on-disk Tauri app version. Web compares
-  // against the engine version on disk — the bundled ENGINE_VERSION is what
-  // engine VERSION was when this bundle loaded, so a newer disk value means
-  // the user should refresh to pick up the rebuilt bundle.
-  const latestClientVer = tauriClientVersion ? latestTauriVer : latestEngineVer;
-  const hasClientUpdate = clientVersion && latestClientVer && isNewerVersion(latestClientVer, clientVersion);
+  const clientVersion = tauriClientVersion ?? ENGINE_VERSION;
+  // "Client behind" signal. Tauri: the shell updates as a versioned unit, so the
+  // app-version comparison is exact and we can show the target version. Web: the
+  // bundled JS version legitimately lags the engine on engine-only bumps, so we
+  // do NOT compare against the engine version (that nagged with nothing to
+  // refresh to). Instead `updateAvailable` reflects the service-worker BUILD_ID
+  // check — true only when a newer frontend build actually exists.
+  const tauriHasUpdate = !!(tauriClientVersion && latestTauriVer && isNewerVersion(latestTauriVer, tauriClientVersion));
+  const clientBehind = tauriClientVersion ? tauriHasUpdate : update;
+  const clientBehindLabel = tauriClientVersion ? ` (latest: ${latestTauriVer})` : ' (update available)';
 
   return (
-    <div class="control-panel" ref={ref}>
+    // Anchor is the brand-label that opened the panel — re-clicking it routes
+    // through its own onClick toggle. backdrop={false}: positioned via CSS,
+    // re-using its container. Escape + dismiss + swallow come from <Overlay>.
+    <Overlay
+      open
+      onClose={() => { controlPanelOpen.value = false; }}
+      anchor={controlPanelAnchor.value}
+      backdrop={false}
+      panelClass="control-panel"
+      panelRef={ref}
+    >
       <div class="control-panel-section">
         <div class="control-panel-status-row">
           <span class={`status-dot ${status}`} />
@@ -201,8 +218,8 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
               <span class="control-panel-label">Client</span>
               <span class="control-panel-value">
                 {clientVersion}
-                {hasClientUpdate && (
-                  <span class="control-panel-update"> (latest: {latestClientVer})</span>
+                {clientBehind && (
+                  <span class="control-panel-update">{clientBehindLabel}</span>
                 )}
               </span>
             </div>
@@ -222,7 +239,7 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
           <div class="control-panel-info-row">
             <span class="control-panel-label">API</span>
             <button class="control-panel-value control-panel-api-url accent-link" onClick={copyApiUrl}>
-              {apiUrl}
+              {getApiUrl()}
             </button>
           </div>
           {release && releaseDirty && (
@@ -267,6 +284,6 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
           ))}
         </div>
       )}
-    </div>
+    </Overlay>
   );
 }

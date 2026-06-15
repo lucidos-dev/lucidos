@@ -80,6 +80,7 @@ import {
   focusedThreadId,
   threadMap,
   selectedScope,
+  selectedCodingAgent,
   connectionStatus,
 } from '../store';
 import { sendCompose } from './compose';
@@ -97,6 +98,7 @@ beforeEach(() => {
   threadMap.value = new Map();
   focusedThreadId.value = null;
   selectedScope.value = { kind: 'lucidos' };
+  selectedCodingAgent.value = 'claude-code';
   connectionStatus.value = 'connected';
   mockedSubmitChat.mockClear();
   mockedCancelChat.mockClear();
@@ -266,5 +268,52 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
 
     expect(lastBody().use_claude_code).toBe(true);
     expect(threadMap.value.get(draftId)?.meta.channel).toBe('claude_code');
+  });
+});
+
+
+describe('coding-agent backend binding at promotion', () => {
+  it('codex pick binds onto meta and rides the request body', async () => {
+    const draftId = 'codex-draft';
+    focusedThreadId.value = draftId;
+    selectedCodingAgent.value = 'codex';
+    putThread(draftId, { state: 'composing', channel: 'claude_code' });
+    setDraft(draftId, { text: 'port the parser', image_hashes: [], mode: 'claude_code' });
+
+    await sendCompose(draftId, { useClaudeCode: true });
+
+    const body = lastBody();
+    expect(body.use_claude_code).toBe(true);
+    expect(body.coding_agent).toBe('codex');
+    // Bound at promotion (drafts-are-threads rule) so later picker drift
+    // can't retarget this thread.
+    expect(threadMap.value.get(draftId)?.meta.codingAgent).toBe('codex');
+  });
+
+  it('claude-code default omits coding_agent from the body', async () => {
+    const draftId = 'cc-default-draft';
+    focusedThreadId.value = draftId;
+    putThread(draftId, { state: 'composing', channel: 'claude_code' });
+    setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
+
+    await sendCompose(draftId, { useClaudeCode: true });
+
+    const body = lastBody();
+    expect(body.use_claude_code).toBe(true);
+    expect(body.coding_agent).toBeUndefined();
+  });
+
+  it('lucidos sends never carry coding_agent even with codex picked', async () => {
+    const draftId = 'lucidos-draft';
+    focusedThreadId.value = draftId;
+    selectedCodingAgent.value = 'codex';
+    putThread(draftId, { state: 'composing', channel: 'chat' });
+    setDraft(draftId, { text: 'just a question', image_hashes: [], mode: 'lucidos' });
+
+    await sendCompose(draftId, { useClaudeCode: false });
+
+    const body = lastBody();
+    expect(body.use_claude_code).toBeUndefined();
+    expect(body.coding_agent).toBeUndefined();
   });
 });

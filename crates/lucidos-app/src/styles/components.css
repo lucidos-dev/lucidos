@@ -163,7 +163,7 @@
 }
 
 /* Toast notifications — positioned below header, centered in chat panel.
-   --z-toast sits above .restart-overlay so the restart toast stays visible
+   --z-toast sits above .ui-blocking-overlay so the restart toast stays visible
    when the dim overlay covers the header. */
 .toast-container {
     position: fixed;

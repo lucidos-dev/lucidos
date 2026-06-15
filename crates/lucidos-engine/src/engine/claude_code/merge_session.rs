@@ -146,6 +146,7 @@ impl CodingAgentChangeOps for LucidosEngine {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await;
             match result {
@@ -230,6 +231,7 @@ impl CodingAgentChangeOps for LucidosEngine {
             None,
             None,
             resume_token,
+            None,
             None,
             None,
             None,

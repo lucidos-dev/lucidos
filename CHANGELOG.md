@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.10.0 — 2026-06-15
+
+### Added
+- **Codex as a second coding-agent backend** — per-thread backend selection (Claude Code or Codex), app-server driver with permission cards, streaming and graceful interrupt; Codex taught the `lucidos` CLI + `ask_user_question` MCP tool (ADR 0005).
+- **Thread Queue** — system-wide admission control for all thread work; background spawns and user-initiated work share one capacity pool (ADR 0008), with a Thread Queue panel (Run now / Drop / edit policy) and policy tools.
+- **App coding-agent threads** — folder-scoped CC/Codex threads scoped to `data/apps/<id>` with a compose scope picker, WIP preview, app branch chip, and app-building knowhow served via the `lucidos knowhow` CLI.
+- **Command Safety** — interactive permission lane for chat commands, an LLM judge for the ambiguous middle, a static catastrophic-command block, checkpoint + undo for the reversible lane, and trigger side-effect grants (ADR 0002); grouped under Settings -> Permissions.
+- **Model providers** — OpenAI direct provider in Settings -> Providers, background tasks routed to OpenAI, a DB-backed model registry, direct Anthropic provider, Claude Opus 4.8 (now default, incl. 1M), and Fable 5.
+- **New agent tools** — `run_python_background` for long-running scientific-Python work, and `count_events` plus byte-budgeted `query_events`.
+- **Inline file editing** in the file preview.
+- **Backup** — persistent backup status on Settings -> Backup, `data/.backupignore` support, auto-generated key on scheduled backups, and a "View backups folder" link.
+- **Notifications** — native macOS push for the Tauri desktop app, Declarative Web Push for iOS, and structured `Tap` deep-link routing from the inbox.
+- **New-workspace welcome** with clickable starter suggestions; a single compose **destination picker** replacing the mode toggle + scope/agent chain.
+- Lucidos **theme inheritance is now the default** for new apps.
+- Wake-question (single-option ask) for genuinely unbounded waits.
+
+### Changed
+- Thread drawer reworked: needs-attention sorting by review tier, sort by last user action, context chips, status-dot tooltips, merged Active + Review into one **Current** section.
+- Every overlay migrated onto a unified `<Overlay>` component owning the dismiss contract; UI behind an open overlay is now inert.
+- Mobile navigation is swipe-only (drawer/content toggle icons dropped); raised the per-turn tool cap to 500 with a banner when reached.
+- Knowhow no longer stamped into app `manifest.json` / SDK `App` type.
+
+### Fixed
+- Large stability sweep: iOS-PWA blank/black thread recovery, deep-link scroll, auto-scroll re-pin, restart-overlay layering, notification badge/unread sync, change apply/discard idempotency and thread-state gating, worktree cleanup of stranded/orphaned worktrees, and many e2e flakes (WebKit reaper, Playwright 1.60).
+- Project-wide clippy/harden passes and large module splits (files-under-1k refactor).
+
+### Removed
+- Legacy `ModalOverlay` component (everything migrated to `<Overlay>`), the CC allowed-tools settings section, separator dividers app-wide, the compose mode toggle and "Discard draft" button.
 ## v0.9.9 — 2026-06-05
 
 ### Added

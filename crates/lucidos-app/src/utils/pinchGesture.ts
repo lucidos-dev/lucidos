@@ -77,6 +77,42 @@ export function clampPanTransform(
   };
 }
 
+export interface ImageLayout {
+  containerW: number;
+  containerH: number;
+  imgW: number;
+  imgH: number;
+  natCenterX: number;
+  natCenterY: number;
+}
+
+// Recover the *natural* (scale-1, untranslated) image geometry the pinch math
+// and clampPanTransform expect, from a bounding rect that already reflects the
+// live transform. getBoundingClientRect() includes CSS transforms, so when a
+// gesture starts while the image is already zoomed/panned, imgRect is scaled by
+// `scale` and its center shifted by (tx, ty). With transform-origin: center the
+// inversion is exact — divide the size by the scale and subtract the pan from
+// the center. Without this, a second pinch (or a one-finger pan after zooming)
+// would clamp against an inflated band (panning the image off its own edges)
+// and anchor against a shifted center (drifting sideways on unzoom).
+export function naturalImageLayout(
+  container: { width: number; height: number },
+  imgRect: { left: number; top: number; width: number; height: number },
+  scale: number,
+  tx: number,
+  ty: number,
+): ImageLayout {
+  const s = scale || 1;
+  return {
+    containerW: container.width,
+    containerH: container.height,
+    imgW: imgRect.width / s,
+    imgH: imgRect.height / s,
+    natCenterX: imgRect.left + imgRect.width / 2 - tx,
+    natCenterY: imgRect.top + imgRect.height / 2 - ty,
+  };
+}
+
 // Single-anchor zoom (wheel, double-tap). The screen point at (anchorX,
 // anchorY) stays fixed across the scale change.
 export function computeZoomAt(

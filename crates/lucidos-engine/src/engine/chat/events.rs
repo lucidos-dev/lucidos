@@ -159,20 +159,18 @@ fn synthesize_legacy_origin(
 /// Generate a brief description of user-attached images using Flash.
 /// Standalone function so it can be spawned into a background task.
 pub(super) async fn describe_images(
-    provider: &crate::llm::vertex::VertexProvider,
+    provider: &dyn crate::llm::provider::LlmProvider,
     images: &[crate::api::ChatImage],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::llm::provider::{ContentBlock, LlmProvider, Message, MessageContent};
+    use crate::llm::provider::{ContentBlock, Message, MessageContent};
 
     let mut blocks: Vec<ContentBlock> = vec![ContentBlock::Text {
         text: "Describe the image and transcribe ALL visible text exactly as it appears. Include every detail: names, dates, times, numbers, labels, headings. If multiple images, number them.".to_string(),
     }];
     for img in images {
-        blocks.push(ContentBlock::Image {
-            source_type: "base64".to_string(),
-            media_type: img.mime_type.clone(),
-            data: img.base64.clone(),
-        });
+        // Fit each image to the LLM size target (compress only if over) so the
+        // description pass can't trip the provider's per-image limit either.
+        blocks.push(super::images::image_content_block(img.clone().fit_for_llm()));
     }
 
     let messages = vec![Message {

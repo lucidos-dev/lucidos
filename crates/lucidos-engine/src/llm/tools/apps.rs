@@ -1,7 +1,6 @@
 //! LLM-facing schemas for app-management tools (create/list/refresh/capture,
 //! load_knowhow, refresh_file).
 
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
@@ -28,7 +27,7 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
                     },
                     "html_content": {
                         "type": "string",
-                        "description": "Initial HTML content for the app's index.html"
+                        "description": "Initial HTML content for the app's index.html. By default the app must inherit the Lucidos theme so it follows the user's light/dark (OS) appearance: in <head> include <script src=\"/api/v1/sdk-prefs.js\"></script>, <link rel=\"stylesheet\" href=\"/api/v1/sdk-iframe.css\">, and <script src=\"/api/v1/sdk.js\"></script>; call lucidos.ui.applyPreferences() and lucidos.ui.watchPreferences() on load; and style with the theme CSS variables (var(--bg-primary), var(--text-primary), var(--accent), var(--border-color), …) instead of hardcoded colors. See the building-an-app / js-sdk knowhow for the full scaffold and variable list. Opt out only for apps that ship their own complete visual identity (game, chart canvas, embedded third-party UI)."
                     }
                 },
                 "required": ["id", "name", "description", "html_content"]
@@ -51,7 +50,7 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "Know-how ID as shown in the know-how list (e.g., 'lucidos/cross-workspace')"
+                        "description": "Know-how ID as shown in the know-how list (e.g., 'system-knowhow/best-practices')"
                     }
                 },
                 "required": ["id"]
